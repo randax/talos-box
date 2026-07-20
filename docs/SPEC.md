@@ -52,6 +52,9 @@ Three components:
 | `tbxd` daemon | user (launchd agent) | owns VM processes (clusters survive terminal close), embedded DNS server, registry mirror, GoBGP, balloon manager |
 | `tbx-helper` | root (launchd daemon, installed once) | vmnet interface creation (FD passed to `tbxd`), `/etc/resolver/k8s.test`, `net.inet.ip.forwarding`, PF_ROUTE route injection |
 
+Every VM gets a virtio serial port (`hvc0`) attached to a per-node unix socket owned by
+`tbxd` — the transport for `tbx console` (§9).
+
 Boot: **EFI boot loader** (`VZEFIBootLoader` + per-VM variable store) from the node's disk.
 Designed fallback (G1): direct kernel boot via `VZLinuxBootLoader` — Image Factory kernels are
 EFI-zboot wrappers whose payload (offset/size at header bytes 8–15) must be extracted and
@@ -62,8 +65,14 @@ decompressed; the technique is proven in the prototype harness.
 ([Diagnose the Talos installer pull stall](https://github.com/randax/talos-box/issues/12),
 [Talos boot mechanics](https://github.com/randax/talos-box/issues/3))
 
-**Raw disk images, never in-VM installs.** Per schematic + Talos version, `tbx` downloads
-Image Factory's `metal-arm64.raw.xz` once into the cache, decompresses it, and provisions each
+**Raw disk images, never in-VM installs.** talosbox generates its **own default Image Factory
+schematic** — vanilla plus `customization.extraKernelArgs: ["console=hvc0"]` — because the
+stock metal image logs only to `ttyAMA0`/`tty0`, neither of which exists under
+Virtualization.framework; without the extra arg, `tbx console` would show nothing (observed in
+the boot prototypes). Schematics are content-addressed, so this is one deterministic POST to
+`factory.talos.dev/schematics`; user-supplied schematics get the arg appended the same way.
+Per schematic + Talos version, `tbx` downloads Image Factory's `metal-arm64.raw.xz` once into
+the cache, decompresses it, and provisions each
 node disk as an **APFS `clonefile` clone** grown (sparse) to the configured disk size.
 Validated results: node boots from disk straight to maintenance mode (unauthenticated apid on
 TCP 50000, Reader role for `talosctl --insecure`); `apply-config` lands in ~10 s with no
@@ -175,6 +184,7 @@ tbx node add|remove|start|stop <cluster> [node]
 tbx cluster suspend|resume <cluster>
 tbx snapshot create|restore|list|delete <cluster> [name]
 tbx status [cluster]      tbx manifests <cluster>
+tbx console <cluster> <node>
 tbx bgp enable|disable <cluster>
 tbx cache pull|prune      tbx doctor      tbx system install|uninstall
 ```
@@ -205,7 +215,13 @@ clusters:
 copy-pasteable next-step hints keyed to observed state (maintenance node → the
 `talosctl --insecure` probe; configured-but-no-CNI → `tbx manifests demo | kubectl apply -f -`).
 Hints **never execute anything**. `--quiet` suppresses them; all list/status commands support
-`-o json`. `tbx manifests` prints the cluster's matching `CiliumLoadBalancerIPPool`,
+`-o json`.
+
+**`tbx console <cluster> <node>`** attaches interactively to the node's serial console (hvc0)
+through the `tbxd`-owned socket — Talos renders its console dashboard and logs there, and
+maintenance-mode debugging works before any config exists. Detach with **`Ctrl-]`**; the
+session banner states the detach key. Attaching never blocks the VM; multiple attach/detach
+cycles are supported. `tbx manifests` prints the cluster's matching `CiliumLoadBalancerIPPool`,
 `CiliumBGPPeeringPolicy`, the `registryMirrors` machine-config patch, and the
 `virtio_balloon` module patch.
 
@@ -231,6 +247,9 @@ Implementation must close these before v1 ships:
   GlobalProtect-managed machine (the attribution evidence is strong but circumstantial).
 - **G5 — inter-cluster routing**: host forwarding across vmnet bridges is designed, not yet
   empirically verified — it is a first-class guarantee and needs a test.
+- **G6 — Talos console on hvc0**: only Alpine's hvc0 interactivity is empirically proven; the
+  Talos dashboard rendering on `console=hvc0` via the custom schematic must be verified (the
+  one direct-kernel attempt with that arg never booted far enough to tell).
 
 ## 13. Asset index
 
