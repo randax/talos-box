@@ -252,8 +252,9 @@ Implementation must close these before v1 ships:
 - **G3 — balloon policy tuning**: validate the pressure thresholds under real workshop load.
 - **G4 — mirror through security agents**: confirm host-bound mirror traffic passes on a
   GlobalProtect-managed machine (the attribution evidence is strong but circumstantial).
-- **G5 — inter-cluster routing**: host forwarding across vmnet bridges is designed, not yet
-  empirically verified — it is a first-class guarantee and needs a test.
+- ~~G5 — inter-cluster routing~~ **CLOSED** (design-level): guest↔guest routing across vmnet
+  subnets through the host router verified with `ip.forwarding=1` (alias-subnet variant); the
+  bridge-to-bridge confirmation is the Networking milestone's mandatory first integration test.
 - ~~G6 — Talos console on hvc0~~ **CLOSED**: with `console=tty0 console=hvc0` the node boots
   and streams kernel+machined logs on hvc0 (`console=hvc0` alone bricks boot — hence the
   mandatory arg pair in §4). Residual: the dashboard TUI's interactive rendering on hvc0 is
