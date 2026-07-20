@@ -40,6 +40,8 @@ func (c cli) run(args []string) error {
 		return c.runStatus(args[1:])
 	case "cache":
 		return c.runCache(args[1:])
+	case "system":
+		return c.runSystem(args[1:])
 	case "version":
 		_, err := fmt.Fprintln(c.out, version.Version)
 		return err
@@ -261,6 +263,7 @@ Commands:
   node add|remove
   status [cluster]
   cache pull|prune
+  system install|uninstall
   version
 `
 	_, _ = fmt.Fprint(output, help)
