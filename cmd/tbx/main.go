@@ -17,10 +17,11 @@ import (
 type cli struct {
 	out io.Writer
 	err io.Writer
+	in  io.Reader
 }
 
 func main() {
-	command := cli{out: os.Stdout, err: os.Stderr}
+	command := cli{out: os.Stdout, err: os.Stderr, in: os.Stdin}
 	if err := command.run(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "tbx: %v\n", err)
 		os.Exit(1)
@@ -47,6 +48,8 @@ func (c cli) run(args []string) error {
 		return c.runManifests(args[1:])
 	case "bgp":
 		return c.runBGP(args[1:])
+	case "snapshot":
+		return c.runSnapshot(args[1:])
 	case "console":
 		return c.runConsole(args[1:])
 	case "cache":

@@ -232,6 +232,14 @@ func (s *Server) handle(request Request) (any, error) {
 		return s.removeNode(request.Args)
 	case "status":
 		return s.status(request.Args)
+	case "snapshot.create":
+		return s.snapshotCreate(request.Args)
+	case "snapshot.restore":
+		return s.snapshotRestore(request.Args)
+	case "snapshot.list":
+		return s.snapshotList(request.Args)
+	case "snapshot.delete":
+		return s.snapshotDelete(request.Args)
 	case "bgp.enable":
 		return s.setBGP(request.Args, true)
 	case "bgp.disable":
