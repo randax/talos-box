@@ -1,0 +1,15 @@
+machine:
+  registries:
+    mirrors:
+      docker.io:
+        endpoints:
+          - http://172.30.0.1:5055
+      ghcr.io:
+        endpoints:
+          - http://172.30.0.1:5056
+      quay.io:
+        endpoints:
+          - http://172.30.0.1:5057
+      registry.k8s.io:
+        endpoints:
+          - http://172.30.0.1:5058

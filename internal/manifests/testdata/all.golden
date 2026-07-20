@@ -1,0 +1,45 @@
+# Apply with kubectl (once Cilium is installed):
+apiVersion: cilium.io/v2alpha1
+kind: CiliumLoadBalancerIPPool
+metadata:
+  name: demo-pool
+spec:
+  blocks:
+    - start: 172.30.0.200
+      stop: 172.30.0.239
+---
+apiVersion: cilium.io/v2alpha1
+kind: CiliumBGPPeeringPolicy
+metadata:
+  name: demo-bgp
+spec:
+  nodeSelector: {}
+  virtualRouters:
+    - localASN: 64600
+      exportPodCIDR: false
+      serviceSelector: {}
+      neighbors:
+        - peerAddress: 172.30.0.1/32
+          peerASN: 64512
+---
+# Apply with talosctl (machine config patches, e.g. talosctl patch mc -p @file):
+machine:
+  registries:
+    mirrors:
+      docker.io:
+        endpoints:
+          - http://172.30.0.1:5055
+      ghcr.io:
+        endpoints:
+          - http://172.30.0.1:5056
+      quay.io:
+        endpoints:
+          - http://172.30.0.1:5057
+      registry.k8s.io:
+        endpoints:
+          - http://172.30.0.1:5058
+---
+machine:
+  kernel:
+    modules:
+      - name: virtio_balloon
