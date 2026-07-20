@@ -70,6 +70,20 @@ func (c *Client) EnableForwarding() error {
 	return err
 }
 
+// EnableBGP starts the host BGP speaker for a cluster.
+func (c *Client) EnableBGP(cluster string, subnetIndex int, localASN, peerASN uint32) error {
+	_, _, err := c.call("bgp.enable", map[string]any{
+		"cluster": cluster, "subnetIndex": subnetIndex, "localASN": localASN, "peerASN": peerASN,
+	}, false)
+	return err
+}
+
+// DisableBGP stops a cluster's host BGP speaker.
+func (c *Client) DisableBGP(cluster string) error {
+	_, _, err := c.call("bgp.disable", map[string]any{"cluster": cluster}, false)
+	return err
+}
+
 // Ping verifies that the helper is responsive.
 func (c *Client) Ping() error {
 	response, _, err := c.call("ping", struct{}{}, false)

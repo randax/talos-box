@@ -22,7 +22,7 @@ func (c cli) runManifests(args []string) error {
 	}
 	for _, item := range clusters {
 		if item.Name == args[0] {
-			out, err := manifests.Render(manifests.Facts{Cluster: item.Name, SubnetIndex: item.SubnetIndex}, section)
+			out, err := manifests.Render(manifests.Facts{Cluster: item.Name, SubnetIndex: item.SubnetIndex, BGP: item.BGP}, section)
 			if err != nil {
 				return err
 			}

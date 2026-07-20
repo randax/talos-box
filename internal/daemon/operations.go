@@ -63,6 +63,7 @@ type ClusterSummary struct {
 	NodeDefaults  cluster.NodeDefaults `json:"nodeDefaults"`
 	TalosVersion  string               `json:"talosVersion"`
 	Schematic     string               `json:"schematic"`
+	BGP           bool                 `json:"bgp"`
 	Running       bool                 `json:"running"`
 }
 
@@ -80,6 +81,7 @@ type NodeStatus struct {
 type ClusterStatus struct {
 	Name    string       `json:"name"`
 	Subnet  string       `json:"subnet"`
+	BGP     bool         `json:"bgp"`
 	Running bool         `json:"running"`
 	Nodes   []NodeStatus `json:"nodes"`
 	Hints   []string     `json:"hints,omitempty"`
@@ -477,7 +479,7 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 
 	result := make([]ClusterStatus, 0, len(items))
 	for _, item := range items {
-		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Running: s.clusterRunning(item.Name)}
+		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), BGP: item.BGP, Running: s.clusterRunning(item.Name)}
 		for _, node := range item.Nodes {
 			clusterStatus.Nodes = append(clusterStatus.Nodes, nodeStatus(node, item.SubnetIndex, s.nodeRunning(item.Name, node.Name)))
 		}
@@ -582,6 +584,7 @@ func summary(item cluster.Cluster, running bool) ClusterSummary {
 		NodeDefaults:  item.NodeDefaults,
 		TalosVersion:  item.TalosVersion,
 		Schematic:     item.Schematic,
+		BGP:           item.BGP,
 		Running:       running,
 	}
 }

@@ -33,6 +33,7 @@ type serverReply struct {
 type Server struct {
 	opMu        sync.Mutex
 	attachments map[attachmentKey]int
+	speakers    map[string]bgpSpeaker
 
 	listenerMu   sync.Mutex
 	listener     net.Listener
@@ -231,6 +232,10 @@ func (s *Server) handle(request Request) (any, int, func(), error) {
 		return nil, -1, nil, err
 	case "forwarding.enable":
 		return nil, -1, nil, enableForwarding()
+	case "bgp.enable":
+		return nil, -1, nil, s.enableBGP(request.Args)
+	case "bgp.disable":
+		return nil, -1, nil, s.disableBGP(request.Args)
 	case "ping":
 		return map[string]bool{"pong": true}, -1, nil, nil
 	default:

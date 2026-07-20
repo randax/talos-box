@@ -232,6 +232,10 @@ func (s *Server) handle(request Request) (any, error) {
 		return s.removeNode(request.Args)
 	case "status":
 		return s.status(request.Args)
+	case "bgp.enable":
+		return s.setBGP(request.Args, true)
+	case "bgp.disable":
+		return s.setBGP(request.Args, false)
 	case "cache.pull":
 		return s.pullCache(request.Args)
 	case "cache.prune":

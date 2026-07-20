@@ -56,6 +56,13 @@ func printStatus(output io.Writer, clusters []daemon.ClusterStatus, quiet bool) 
 	if err := table.Flush(); err != nil {
 		return err
 	}
+	for _, item := range clusters {
+		if item.BGP {
+			if _, err := fmt.Fprintf(output, "cluster %s: BGP mode enabled\n", item.Name); err != nil {
+				return err
+			}
+		}
+	}
 	if quiet {
 		return nil
 	}

@@ -12,6 +12,7 @@ import (
 type Facts struct {
 	Cluster     string
 	SubnetIndex int
+	BGP         bool // cluster is in BGP mode: render BGP policy, not L2
 }
 
 // MirrorPorts fixes the upstream registry → host mirror port mapping.
@@ -33,6 +34,9 @@ const (
 	clusterASNBase = 64600
 )
 
+// ClusterASN is the BGP ASN for the cluster at the given subnet index.
+func ClusterASN(subnetIndex int) int { return clusterASNBase + subnetIndex }
+
 func (f Facts) hostIP(host int) string {
 	return fmt.Sprintf("172.30.%d.%d", f.SubnetIndex, host)
 }
@@ -49,6 +53,19 @@ spec:
     - start: %s
       stop: %s
 `, f.Cluster, f.hostIP(200), f.hostIP(239))
+}
+
+// L2Policy renders the CiliumL2AnnouncementPolicy that makes LB VIPs reachable
+// by having a node ARP-reply for them — the default (non-BGP) mechanism.
+func L2Policy(f Facts) string {
+	return fmt.Sprintf(`apiVersion: cilium.io/v2alpha1
+kind: CiliumL2AnnouncementPolicy
+metadata:
+  name: %s-l2
+spec:
+  loadBalancerIPs: true
+  nodeSelector: {}
+`, f.Cluster)
 }
 
 // BGPPolicy renders the CiliumBGPPeeringPolicy for "host as ToR": every node
@@ -68,7 +85,7 @@ spec:
       neighbors:
         - peerAddress: %s/32
           peerASN: %d
-`, f.Cluster, clusterASNBase+f.SubnetIndex, f.hostIP(1), HostASN)
+`, f.Cluster, ClusterASN(f.SubnetIndex), f.hostIP(1), HostASN)
 }
 
 // RegistryMirrors renders the Talos machine-config patch pointing every
@@ -96,7 +113,7 @@ func BalloonModule(Facts) string {
 func All(f Facts) string {
 	var b strings.Builder
 	b.WriteString("# Apply with kubectl (once Cilium is installed):\n")
-	b.WriteString(join(LBPool(f), BGPPolicy(f)))
+	b.WriteString(k8sSection(f))
 	b.WriteString("---\n")
 	b.WriteString("# Apply with talosctl (machine config patches, e.g. talosctl patch mc -p @file):\n")
 	b.WriteString(join(RegistryMirrors(f), BalloonModule(f)))
@@ -109,15 +126,30 @@ var sections = map[string]func(Facts) string{
 	"all":     All,
 	"lb-pool": LBPool,
 	"bgp":     BGPPolicy,
+	"l2":      L2Policy,
 	"mirrors": RegistryMirrors,
 	"balloon": BalloonModule,
-	"k8s":     func(f Facts) string { return join(LBPool(f), BGPPolicy(f)) },
+	"k8s":     k8sSection,
 	"talos":   func(f Facts) string { return join(RegistryMirrors(f), BalloonModule(f)) },
+}
+
+// k8sSection renders the LB pool plus exactly ONE announcement mechanism —
+// BGP when the cluster is in BGP mode, L2 otherwise — because the two are
+// mutually exclusive (SPEC §5: BGP "replaces" L2). Applying this section
+// switches the cluster's LB reachability to the current mode.
+func k8sSection(f Facts) string {
+	announce := L2Policy(f)
+	note := "# LB reachability via L2 announcements (default mode).\n"
+	if f.BGP {
+		announce = BGPPolicy(f)
+		note = "# LB reachability via BGP (this cluster has `tbx bgp enable`d).\n"
+	}
+	return note + join(LBPool(f), announce)
 }
 
 // Sections lists the valid section names in stable display order.
 func Sections() []string {
-	return []string{"lb-pool", "bgp", "mirrors", "balloon", "k8s", "talos", "all"}
+	return []string{"lb-pool", "bgp", "l2", "mirrors", "balloon", "k8s", "talos", "all"}
 }
 
 func join(docs ...string) string {

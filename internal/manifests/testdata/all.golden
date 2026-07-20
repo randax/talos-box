@@ -1,4 +1,5 @@
 # Apply with kubectl (once Cilium is installed):
+# LB reachability via L2 announcements (default mode).
 apiVersion: cilium.io/v2alpha1
 kind: CiliumLoadBalancerIPPool
 metadata:
@@ -9,18 +10,12 @@ spec:
       stop: 172.30.0.239
 ---
 apiVersion: cilium.io/v2alpha1
-kind: CiliumBGPPeeringPolicy
+kind: CiliumL2AnnouncementPolicy
 metadata:
-  name: demo-bgp
+  name: demo-l2
 spec:
+  loadBalancerIPs: true
   nodeSelector: {}
-  virtualRouters:
-    - localASN: 64600
-      exportPodCIDR: false
-      serviceSelector: {}
-      neighbors:
-        - peerAddress: 172.30.0.1/32
-          peerASN: 64512
 ---
 # Apply with talosctl (machine config patches, e.g. talosctl patch mc -p @file):
 machine:
