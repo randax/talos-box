@@ -119,7 +119,9 @@ host **ASN 64512**, listening on each enabled cluster's `.1:179`; cluster *n* no
 **ASN 64600+n**, eBGP to the host; learned routes are injected into the macOS FIB via
 `tbx-helper` (PF_ROUTE). When enabled, BGP advertisement **replaces** L2 announcements for the
 LB pool (each mechanism teachable in isolation). Pod-CIDR advertisement is accepted, not
-guaranteed.
+guaranteed. **L2-mode VIP failover latency: up to ~1 minute** — macOS ignores gratuitous ARP
+through vmnet and converges only via its own ARP revalidation (gate G2, closed); BGP mode is
+the fast-failover path and the docs should teach that contrast.
 
 **Registry mirror** (required — see evidence in
 [the installer-stall ticket](https://github.com/randax/talos-box/issues/12): corporate agents
@@ -244,8 +246,9 @@ Implementation must close these before v1 ships:
 
 - **G1 — macOS floor**: boot the pinned Talos on macOS 14 and 15 under vz. Hang → implement
   direct-kernel-boot fallback (§3) or raise the floor to the oldest passing version.
-- **G2 — GARP on failover**: L2-announcement VIP *failover* (gratuitous ARP moving a VIP
-  between nodes) was not separately tested — verify against vmnet; BGP mode is the fallback.
+- ~~G2 — GARP on failover~~ **CLOSED**: host ignores GARP through vmnet; L2 failover converges
+  via macOS ARP revalidation in ~40–50 s (§5 documents the latency; BGP mode for fast failover).
+  Residual: repeated-GARP bursts untested.
 - **G3 — balloon policy tuning**: validate the pressure thresholds under real workshop load.
 - **G4 — mirror through security agents**: confirm host-bound mirror traffic passes on a
   GlobalProtect-managed machine (the attribution evidence is strong but circumstantial).
