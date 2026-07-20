@@ -39,6 +39,8 @@ type Cluster struct {
 	Workers       int          `json:"workers"`
 	NodeDefaults  NodeDefaults `json:"nodeDefaults"`
 	Nodes         []Node       `json:"nodes"`
+	Schematic     string       `json:"schematic,omitempty"`
+	TalosVersion  string       `json:"talosVersion,omitempty"`
 }
 
 func New(name string, index, controlPlanes, workers int, defaults NodeDefaults) (Cluster, error) {

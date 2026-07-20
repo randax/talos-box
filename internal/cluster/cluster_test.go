@@ -71,3 +71,33 @@ func TestStateRoundTrip(t *testing.T) {
 		})
 	}
 }
+
+func TestNodeMutationKeepsNamesAndCountsStable(t *testing.T) {
+	t.Parallel()
+
+	c, err := New("demo", 1, 1, 1, NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	removed, err := RemoveNode(&c, "demo-worker-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed.Role != RoleWorker || c.Workers != 0 {
+		t.Fatalf("removed = %#v, workers = %d", removed, c.Workers)
+	}
+	added, err := AddNode(&c, RoleWorker, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if added.Name != "demo-worker-1" || c.Workers != 1 {
+		t.Fatalf("added = %#v, workers = %d", added, c.Workers)
+	}
+	controlPlane, err := AddNode(&c, RoleControlPlane, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if controlPlane.Name != "demo-cp-2" || c.ControlPlanes != 2 {
+		t.Fatalf("added = %#v, control planes = %d", controlPlane, c.ControlPlanes)
+	}
+}

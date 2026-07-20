@@ -1,38 +1,285 @@
 package main
 
 import (
+	"errors"
+	"flag"
 	"fmt"
-	"log"
+	"io"
 	"os"
 
+	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/daemon"
+	"github.com/randax/talos-box/internal/imagecache"
 	"github.com/randax/talos-box/internal/version"
 )
 
-func main() {
-	if len(os.Args) == 1 {
-		printHelp(os.Stdout)
-		return
-	}
+type cli struct {
+	out io.Writer
+	err io.Writer
+}
 
-	switch os.Args[1] {
-	case "version":
-		fmt.Println(version.Version)
-	case "help", "-h", "--help":
-		printHelp(os.Stdout)
-	default:
-		fmt.Fprintf(os.Stderr, "tbx: unknown command %q\n", os.Args[1])
-		printHelp(os.Stderr)
-		os.Exit(2)
+func main() {
+	command := cli{out: os.Stdout, err: os.Stderr}
+	if err := command.run(os.Args[1:]); err != nil {
+		fmt.Fprintf(os.Stderr, "tbx: %v\n", err)
+		os.Exit(1)
 	}
 }
 
-func printHelp(output *os.File) {
+func (c cli) run(args []string) error {
+	if len(args) == 0 {
+		c.printHelp(c.out)
+		return nil
+	}
+	switch args[0] {
+	case "cluster":
+		return c.runCluster(args[1:])
+	case "node":
+		return c.runNode(args[1:])
+	case "status":
+		return c.runStatus(args[1:])
+	case "cache":
+		return c.runCache(args[1:])
+	case "version":
+		_, err := fmt.Fprintln(c.out, version.Version)
+		return err
+	case "help", "-h", "--help":
+		c.printHelp(c.out)
+		return nil
+	default:
+		return fmt.Errorf("unknown command %q", args[0])
+	}
+}
+
+func (c cli) runCluster(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: tbx cluster create|start|stop|destroy|list")
+	}
+	switch args[0] {
+	case "create":
+		return c.createCluster(args[1:])
+	case "start", "stop":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: tbx cluster %s <name>", args[0])
+		}
+		var result daemon.ClusterSummary
+		if err := c.call("cluster."+args[0], map[string]string{"name": args[1]}, &result); err != nil {
+			return err
+		}
+		_, err := fmt.Fprintf(c.out, "%s cluster %s\n", pastTense(args[0]), result.Name)
+		return err
+	case "destroy":
+		return c.destroyCluster(args[1:])
+	case "list":
+		if len(args) != 1 {
+			return errors.New("usage: tbx cluster list")
+		}
+		var result []daemon.ClusterSummary
+		if err := c.call("cluster.list", struct{}{}, &result); err != nil {
+			return err
+		}
+		return printClusters(c.out, result)
+	default:
+		return fmt.Errorf("unknown cluster command %q", args[0])
+	}
+}
+
+func (c cli) createCluster(args []string) error {
+	flags := flag.NewFlagSet("cluster create", flag.ContinueOnError)
+	flags.SetOutput(c.err)
+	controlPlanes := flags.Int("cp", 1, "number of control planes")
+	workers := flags.Int("workers", 2, "number of workers")
+	memory := flags.Int("memory-mib", cluster.DefaultMemoryMiB, "memory per node in MiB")
+	cpus := flags.Int("cpus", cluster.DefaultCPUs, "CPUs per node")
+	disk := flags.Int("disk-gib", cluster.DefaultDiskGiB, "disk size per node in GiB")
+	talosVersion := flags.String("talos-version", daemon.DefaultTalosVersion, "Talos version")
+	schematic := flags.String("schematic", "", "Image Factory schematic")
+	positionals, err := parseInterspersed(flags, args)
+	if err != nil {
+		return err
+	}
+	if len(positionals) != 1 {
+		return errors.New("usage: tbx cluster create <name> [--cp N --workers N]")
+	}
+	resolvedSchematic, err := resolveSchematic(*schematic)
+	if err != nil {
+		return err
+	}
+	request := struct {
+		Name          string               `json:"name"`
+		ControlPlanes int                  `json:"controlPlanes"`
+		Workers       int                  `json:"workers"`
+		Node          cluster.NodeDefaults `json:"node"`
+		Schematic     string               `json:"schematic"`
+		Version       string               `json:"version"`
+	}{
+		Name: positionals[0], ControlPlanes: *controlPlanes, Workers: *workers,
+		Node:      cluster.NodeDefaults{MemoryMiB: *memory, CPUs: *cpus, DiskGiB: *disk},
+		Schematic: resolvedSchematic, Version: *talosVersion,
+	}
+	var result daemon.ClusterSummary
+	if err := c.call("cluster.create", request, &result); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(c.out, "created and started cluster %s (%d control plane, %d workers)\n",
+		result.Name, result.ControlPlanes, result.Workers)
+	return err
+}
+
+func (c cli) destroyCluster(args []string) error {
+	flags := flag.NewFlagSet("cluster destroy", flag.ContinueOnError)
+	flags.SetOutput(c.err)
+	force := flags.Bool("force", false, "confirm permanent deletion")
+	positionals, err := parseInterspersed(flags, args)
+	if err != nil {
+		return err
+	}
+	if len(positionals) != 1 {
+		return errors.New("usage: tbx cluster destroy <name> --force")
+	}
+	if !*force {
+		return errors.New("cluster destroy requires --force")
+	}
+	request := struct {
+		Name  string `json:"name"`
+		Force bool   `json:"force"`
+	}{Name: positionals[0], Force: true}
+	if err := c.call("cluster.destroy", request, nil); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(c.out, "destroyed cluster %s\n", positionals[0])
+	return err
+}
+
+func (c cli) runNode(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: tbx node add|remove <cluster> [node]")
+	}
+	switch args[0] {
+	case "add":
+		flags := flag.NewFlagSet("node add", flag.ContinueOnError)
+		flags.SetOutput(c.err)
+		role := flags.String("role", string(cluster.RoleWorker), "worker or control-plane")
+		positionals, err := parseInterspersed(flags, args[1:])
+		if err != nil {
+			return err
+		}
+		if len(positionals) < 1 || len(positionals) > 2 {
+			return errors.New("usage: tbx node add <cluster> [node] [--role worker|control-plane]")
+		}
+		name := ""
+		if len(positionals) == 2 {
+			name = positionals[1]
+		}
+		request := map[string]string{"cluster": positionals[0], "name": name, "role": *role}
+		var result daemon.NodeStatus
+		if err := c.call("node.add", request, &result); err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(c.out, "added node %s to cluster %s\n", result.Name, positionals[0])
+		return err
+	case "remove":
+		if len(args) != 3 {
+			return errors.New("usage: tbx node remove <cluster> <node>")
+		}
+		request := map[string]string{"cluster": args[1], "name": args[2]}
+		if err := c.call("node.remove", request, nil); err != nil {
+			return err
+		}
+		_, err := fmt.Fprintf(c.out, "removed node %s from cluster %s\n", args[2], args[1])
+		return err
+	default:
+		return fmt.Errorf("unknown node command %q", args[0])
+	}
+}
+
+func (c cli) runStatus(args []string) error {
+	if len(args) > 1 {
+		return errors.New("usage: tbx status [cluster]")
+	}
+	name := ""
+	if len(args) == 1 {
+		name = args[0]
+	}
+	var result []daemon.ClusterStatus
+	if err := c.call("status", map[string]string{"cluster": name}, &result); err != nil {
+		return err
+	}
+	return printStatus(c.out, result)
+}
+
+func (c cli) runCache(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: tbx cache pull|prune")
+	}
+	switch args[0] {
+	case "pull":
+		flags := flag.NewFlagSet("cache pull", flag.ContinueOnError)
+		flags.SetOutput(c.err)
+		talosVersion := flags.String("talos-version", daemon.DefaultTalosVersion, "Talos version")
+		schematic := flags.String("schematic", "", "Image Factory schematic")
+		positionals, err := parseInterspersed(flags, args[1:])
+		if err != nil {
+			return err
+		}
+		if len(positionals) != 0 {
+			return errors.New("usage: tbx cache pull [--talos-version VERSION --schematic ID]")
+		}
+		resolvedSchematic, err := resolveSchematic(*schematic)
+		if err != nil {
+			return err
+		}
+		request := map[string]string{"version": *talosVersion, "schematic": resolvedSchematic}
+		var result daemon.CachePullResult
+		if err := c.call("cache.pull", request, &result); err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(c.out, "cached Talos %s schematic %s at %s\n", result.Version, result.Schematic, result.Path)
+		return err
+	case "prune":
+		if len(args) != 1 {
+			return errors.New("usage: tbx cache prune")
+		}
+		var result struct {
+			Removed int `json:"removed"`
+		}
+		if err := c.call("cache.prune", struct{}{}, &result); err != nil {
+			return err
+		}
+		_, err := fmt.Fprintf(c.out, "pruned %d cached image(s)\n", result.Removed)
+		return err
+	default:
+		return fmt.Errorf("unknown cache command %q", args[0])
+	}
+}
+
+func (c cli) printHelp(output io.Writer) {
 	const help = `Usage: tbx <command>
 
 Commands:
-  version  print the talosbox version
+  cluster create|start|stop|destroy|list
+  node add|remove
+  status [cluster]
+  cache pull|prune
+  version
 `
-	if _, err := fmt.Fprint(output, help); err != nil {
-		log.Printf("tbx: write help: %v", err)
+	_, _ = fmt.Fprint(output, help)
+}
+
+func pastTense(command string) string {
+	if command == "stop" {
+		return "stopped"
 	}
+	return "started"
+}
+
+func resolveSchematic(schematic string) (string, error) {
+	if schematic != "" {
+		return schematic, nil
+	}
+	cache, err := imagecache.NewDefault()
+	if err != nil {
+		return "", err
+	}
+	return cache.Schematic()
 }

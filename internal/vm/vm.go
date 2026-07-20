@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/Code-Hex/vz/v3"
@@ -28,6 +29,8 @@ type VM struct {
 	machine     *vz.VirtualMachine
 	console     *consoleProxy
 	serialFiles [2]*os.File
+	closeMu     sync.Mutex
+	closed      bool
 }
 
 // New translates config to the Virtualization.framework devices required by Talos.
@@ -180,7 +183,8 @@ func (v *VM) Start() error {
 
 // Stop asks the guest to shut down, then forcibly stops it after a timeout.
 func (v *VM) Stop() error {
-	if v.State() == vz.VirtualMachineStateStopped {
+	state := v.State()
+	if state == vz.VirtualMachineStateStopped || state == vz.VirtualMachineStateError {
 		return nil
 	}
 
@@ -206,6 +210,30 @@ func (v *VM) Stop() error {
 	}
 
 	return v.forceStop(requestErr)
+}
+
+// Close stops the VM and releases its console and serial resources.
+func (v *VM) Close() error {
+	v.closeMu.Lock()
+	defer v.closeMu.Unlock()
+	if v.closed {
+		return nil
+	}
+	if err := v.Stop(); err != nil {
+		return err
+	}
+	v.console.close()
+	for _, file := range v.serialFiles {
+		_ = file.Close()
+	}
+	v.closed = true
+	return nil
+}
+
+// Active reports whether the VM is running or in an active transition.
+func (v *VM) Active() bool {
+	state := v.State()
+	return state != vz.VirtualMachineStateStopped && state != vz.VirtualMachineStateError
 }
 
 func (v *VM) forceStop(requestErr error) error {

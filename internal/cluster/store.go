@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 )
 
 const stateFile = "cluster.json"
@@ -73,6 +74,58 @@ func Load(name string) (Cluster, error) {
 		return Cluster{}, fmt.Errorf("decode cluster state: %w", err)
 	}
 	return c, nil
+}
+
+// List returns all persisted clusters ordered by name.
+func List() ([]Cluster, error) {
+	root, err := clustersDir()
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("list clusters: %w", err)
+	}
+
+	clusters := make([]Cluster, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		item, err := Load(entry.Name())
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		clusters = append(clusters, item)
+	}
+	sort.Slice(clusters, func(i, j int) bool { return clusters[i].Name < clusters[j].Name })
+	return clusters, nil
+}
+
+// Destroy removes all persisted state for name.
+func Destroy(name string) error {
+	dir, err := Dir(name)
+	if err != nil {
+		return err
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("destroy cluster: %w", err)
+	}
+	return nil
+}
+
+func clustersDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("find home directory: %w", err)
+	}
+	return filepath.Join(home, ".talosbox", "clusters"), nil
 }
 
 func validName(name string) error {
