@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/Code-Hex/vz/v3"
@@ -33,13 +34,17 @@ func main() {
 	var bootLoader vz.BootLoader
 	var err error
 	switch mode {
-	case "efi":
+	case "efi", "disk":
 		variableStore, verr := vz.NewEFIVariableStore("efi-vars.fd", vz.WithCreatingEFIVariableStore())
 		must(verr)
 		bootLoader, err = vz.NewEFIBootLoader(vz.WithEFIVariableStore(variableStore))
 	case "kernel":
+		cmdline := os.Getenv("CMDLINE")
+		if cmdline == "" {
+			cmdline = "init_on_alloc=1 slab_nomerge pti=on consoleblank=0 printk.devkmsg=on talos.platform=metal console=hvc0"
+		}
 		bootLoader, err = vz.NewLinuxBootLoader(os.Args[2],
-			vz.WithCommandLine("init_on_alloc=1 slab_nomerge pti=on consoleblank=0 printk.devkmsg=on talos.platform=metal console=hvc0"),
+			vz.WithCommandLine(cmdline),
 			vz.WithInitrd(os.Args[3]),
 		)
 	default:
@@ -75,13 +80,32 @@ func main() {
 	networkConfig.SetMACAddress(mac)
 	config.SetNetworkDevicesVirtualMachineConfiguration([]*vz.VirtioNetworkDeviceConfiguration{networkConfig})
 
-	// EFI mode boots the ISO as a virtio-blk device
+	// efi mode: ISO (vda, ro) + optional writable install disk (vdb)
+	// disk mode: previously-installed disk only (vda, rw)
+	var storage []vz.StorageDeviceConfiguration
 	if mode == "efi" {
 		isoAttachment, err := vz.NewDiskImageStorageDeviceAttachment(os.Args[2], true)
 		must(err)
 		iso, err := vz.NewVirtioBlockDeviceConfiguration(isoAttachment)
 		must(err)
-		config.SetStorageDevicesVirtualMachineConfiguration([]vz.StorageDeviceConfiguration{iso})
+		storage = append(storage, iso)
+		if len(os.Args) > 3 {
+			diskAttachment, err := vz.NewDiskImageStorageDeviceAttachment(os.Args[3], false)
+			must(err)
+			disk, err := vz.NewVirtioBlockDeviceConfiguration(diskAttachment)
+			must(err)
+			storage = append(storage, disk)
+		}
+	}
+	if mode == "disk" {
+		diskAttachment, err := vz.NewDiskImageStorageDeviceAttachment(os.Args[2], false)
+		must(err)
+		disk, err := vz.NewVirtioBlockDeviceConfiguration(diskAttachment)
+		must(err)
+		storage = append(storage, disk)
+	}
+	if len(storage) > 0 {
+		config.SetStorageDevicesVirtualMachineConfiguration(storage)
 	}
 
 	validated, err := config.Validate()
@@ -95,6 +119,16 @@ func main() {
 	must(err)
 	must(vm.Start())
 	fmt.Fprintf(os.Stderr, "[prototype] VM started in %s mode, mac=%s; polling dhcpd_leases + tcp/50000\n", mode, macAddr)
+
+	if os.Getenv("HOLD") != "" {
+		secs, _ := strconv.Atoi(os.Getenv("HOLD"))
+		if secs <= 0 {
+			secs = 600
+		}
+		fmt.Fprintf(os.Stderr, "[prototype] HOLD: no polling, holding VM for %ds\n", secs)
+		time.Sleep(time.Duration(secs) * time.Second)
+		os.Exit(0)
+	}
 
 	deadline := time.After(5 * time.Minute)
 	tick := time.NewTicker(5 * time.Second)
@@ -112,9 +146,13 @@ func main() {
 			if err == nil {
 				conn.Close()
 				fmt.Fprintf(os.Stderr, "\n[prototype] RESULT=SUCCESS apid reachable at %s:50000 (mode=%s)\n", ip, mode)
-				if os.Getenv("KEEP_ALIVE") != "" {
-					fmt.Fprintln(os.Stderr, "[prototype] KEEP_ALIVE set: holding VM for 120s for talosctl inspection")
-					time.Sleep(120 * time.Second)
+				if s := os.Getenv("KEEP_ALIVE"); s != "" {
+					secs, _ := strconv.Atoi(s)
+					if secs <= 0 {
+						secs = 120
+					}
+					fmt.Fprintf(os.Stderr, "[prototype] KEEP_ALIVE: holding VM for %ds\n", secs)
+					time.Sleep(time.Duration(secs) * time.Second)
 				}
 				os.Exit(0)
 			}
