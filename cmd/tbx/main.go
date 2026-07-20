@@ -45,6 +45,8 @@ func (c cli) run(args []string) error {
 		return c.runStatus(args[1:])
 	case "manifests":
 		return c.runManifests(args[1:])
+	case "console":
+		return c.runConsole(args[1:])
 	case "cache":
 		return c.runCache(args[1:])
 	case "system":

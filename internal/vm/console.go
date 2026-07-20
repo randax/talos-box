@@ -84,6 +84,8 @@ func (p *consoleProxy) accept() {
 			return
 		}
 		if !p.setClient(conn) {
+			_ = conn.SetWriteDeadline(time.Now().Add(consoleWriteTimeout))
+			_, _ = conn.Write([]byte("console busy: another client is attached\n"))
 			_ = conn.Close()
 			continue
 		}
