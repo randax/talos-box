@@ -66,11 +66,14 @@ decompressed; the technique is proven in the prototype harness.
 [Talos boot mechanics](https://github.com/randax/talos-box/issues/3))
 
 **Raw disk images, never in-VM installs.** talosbox generates its **own default Image Factory
-schematic** — vanilla plus `customization.extraKernelArgs: ["console=hvc0"]` — because the
-stock metal image logs only to `ttyAMA0`/`tty0`, neither of which exists under
-Virtualization.framework; without the extra arg, `tbx console` would show nothing (observed in
-the boot prototypes). Schematics are content-addressed, so this is one deterministic POST to
-`factory.talos.dev/schematics`; user-supplied schematics get the arg appended the same way.
+schematic** — vanilla plus `customization.extraKernelArgs: ["console=tty0", "console=hvc0"]` —
+because the stock metal image logs only to `ttyAMA0`/`tty0`, neither of which exists under
+Virtualization.framework; without the hvc0 arg, `tbx console` shows nothing. **Both args are
+mandatory and ordered**: Factory's extraKernelArgs *replace* the image's default console args,
+and `console=hvc0` alone bricks the boot under vz (verified: no boot, no output; with
+`console=tty0 console=hvc0` the node boots and streams kernel+machined logs on hvc0 — gate G6,
+closed). Schematics are content-addressed, so this is one deterministic POST to
+`factory.talos.dev/schematics`; user-supplied schematics get the args appended the same way.
 Per schematic + Talos version, `tbx` downloads Image Factory's `metal-arm64.raw.xz` once into
 the cache, decompresses it, and provisions each
 node disk as an **APFS `clonefile` clone** grown (sparse) to the configured disk size.
@@ -247,9 +250,11 @@ Implementation must close these before v1 ships:
   GlobalProtect-managed machine (the attribution evidence is strong but circumstantial).
 - **G5 — inter-cluster routing**: host forwarding across vmnet bridges is designed, not yet
   empirically verified — it is a first-class guarantee and needs a test.
-- **G6 — Talos console on hvc0**: only Alpine's hvc0 interactivity is empirically proven; the
-  Talos dashboard rendering on `console=hvc0` via the custom schematic must be verified (the
-  one direct-kernel attempt with that arg never booted far enough to tell).
+- ~~G6 — Talos console on hvc0~~ **CLOSED**: with `console=tty0 console=hvc0` the node boots
+  and streams kernel+machined logs on hvc0 (`console=hvc0` alone bricks boot — hence the
+  mandatory arg pair in §4). Residual: the dashboard TUI's interactive rendering on hvc0 is
+  unverified (logs confirmed); if it proves log-only, `tbx console` remains correct as a
+  log-streaming + maintenance-input console.
 
 ## 13. Asset index
 
