@@ -115,3 +115,44 @@ func TestConsoleSingleClientGuard(t *testing.T) {
 		t.Errorf("third client should be attached, write failed: %v", err)
 	}
 }
+
+func TestConsoleReplaysRecentOutputOnAttach(t *testing.T) {
+	path, _, guestWrite, cleanup := startProxy(t)
+	defer cleanup()
+
+	// guest speaks before anyone is attached
+	if _, err := guestWrite.Write([]byte("[talos] early boot line\n")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond) // let writeOutput drain into the ring
+
+	client := dial(t, path)
+	defer func() { _ = client.Close() }()
+	if got := readWithDeadline(t, client, 256); !strings.Contains(got, "early boot line") {
+		t.Errorf("attach did not replay recent output, got %q", got)
+	}
+
+	// and live output continues after the replay, in order
+	if _, err := guestWrite.Write([]byte("[talos] later line\n")); err != nil {
+		t.Fatal(err)
+	}
+	if got := readWithDeadline(t, client, 256); !strings.Contains(got, "later line") {
+		t.Errorf("live output after replay missing, got %q", got)
+	}
+}
+
+func TestRingBufferKeepsTail(t *testing.T) {
+	ring := newRingBuffer(8)
+	ring.Write([]byte("abcdefgh"))
+	if got := string(ring.Snapshot()); got != "abcdefgh" {
+		t.Errorf("full ring = %q", got)
+	}
+	ring.Write([]byte("XY"))
+	if got := string(ring.Snapshot()); got != "cdefghXY" {
+		t.Errorf("wrapped ring = %q, want cdefghXY", got)
+	}
+	ring.Write([]byte("0123456789ABCDEF")) // larger than capacity
+	if got := string(ring.Snapshot()); got != "89ABCDEF" {
+		t.Errorf("oversized write = %q, want 89ABCDEF", got)
+	}
+}

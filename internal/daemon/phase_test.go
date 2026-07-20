@@ -45,9 +45,9 @@ func TestHints(t *testing.T) {
 			want:  []string{"talosctl gen config", "apply-config --insecure"},
 		},
 		{
-			name:  "all configured suggests bootstrap",
+			name:  "all configured suggests bootstrap and the dashboard",
 			nodes: []NodeStatus{node("demo-cp-1", PhaseConfigured)},
-			want:  []string{"talosctl", "bootstrap"},
+			want:  []string{"talosctl", "bootstrap", "dashboard"},
 		},
 		{
 			name:  "stopped cluster suggests start",

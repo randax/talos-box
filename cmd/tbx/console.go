@@ -58,17 +58,17 @@ func (c cli) runConsole(args []string) error {
 	if len(statuses) == 0 {
 		return fmt.Errorf("cluster %q does not exist", clusterName)
 	}
-	found := false
-	for _, node := range statuses[0].Nodes {
+	var target *daemon.NodeStatus
+	for i, node := range statuses[0].Nodes {
 		if node.Name == nodeName {
-			found = true
-			if node.Phase == daemon.PhaseStopped {
-				return fmt.Errorf("node %s is stopped — start the cluster first", nodeName)
-			}
+			target = &statuses[0].Nodes[i]
 		}
 	}
-	if !found {
+	if target == nil {
 		return fmt.Errorf("node %q does not exist in cluster %q", nodeName, clusterName)
+	}
+	if target.Phase == daemon.PhaseStopped {
+		return fmt.Errorf("node %s is stopped — start the cluster first", nodeName)
 	}
 
 	dir, err := cluster.Dir(clusterName)
@@ -81,7 +81,10 @@ func (c cli) runConsole(args []string) error {
 	}
 	defer func() { _ = conn.Close() }()
 
-	_, _ = fmt.Fprintf(c.err, "attached to %s/%s console — detach with Ctrl-]\n", clusterName, nodeName)
+	_, _ = fmt.Fprintf(c.err, "attached to %s/%s console (kernel + machined logs; recent output replays) — detach with Ctrl-]\n", clusterName, nodeName)
+	if target.Phase == daemon.PhaseConfigured {
+		_, _ = fmt.Fprintf(c.err, "tip: this node is configured — for the Talos dashboard TUI run: talosctl dashboard --nodes %s\n", target.IP)
+	}
 
 	stdinFd := int(os.Stdin.Fd())
 	if term.IsTerminal(stdinFd) {

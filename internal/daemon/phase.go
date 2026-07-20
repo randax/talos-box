@@ -110,6 +110,7 @@ func Hints(status ClusterStatus) []string {
 		cp := status.controlPlaneOr(status.Nodes[0])
 		hints = append(hints,
 			fmt.Sprintf("all nodes configured. If etcd is not yet bootstrapped: talosctl --nodes %s bootstrap, then talosctl kubeconfig .", cp.IP),
+			fmt.Sprintf("node TUI (the Talos dashboard): talosctl dashboard --nodes %s", cp.IP),
 		)
 	}
 	if len(unreachable) > 0 {

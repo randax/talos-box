@@ -12,13 +12,21 @@ import (
 
 const consoleWriteTimeout = 2 * time.Second
 
+// consoleScrollback is how much recent guest output an attach replays.
+const consoleScrollback = 64 * 1024
+
 type consoleProxy struct {
 	listener *net.UnixListener
 	input    *os.File
 	output   *os.File
+	ring     *ringBuffer
 
 	mu     sync.Mutex
 	client net.Conn
+
+	// writeMu serializes attach-replay with live output so a new client sees
+	// scrollback strictly before anything the guest writes afterwards.
+	writeMu sync.Mutex
 }
 
 func newConsoleProxy(path string) (*consoleProxy, *os.File, *os.File, error) {
@@ -43,7 +51,7 @@ func newConsoleProxy(path string) (*consoleProxy, *os.File, *os.File, error) {
 		return nil, nil, nil, fmt.Errorf("create console output pipe: %w", err)
 	}
 
-	proxy := &consoleProxy{listener: listener, input: hostWrite, output: hostRead}
+	proxy := &consoleProxy{listener: listener, input: hostWrite, output: hostRead, ring: newRingBuffer(consoleScrollback)}
 	go proxy.accept()
 	go proxy.writeOutput()
 
@@ -83,12 +91,21 @@ func (p *consoleProxy) accept() {
 		if err != nil {
 			return
 		}
+		p.writeMu.Lock()
 		if !p.setClient(conn) {
+			p.writeMu.Unlock()
 			_ = conn.SetWriteDeadline(time.Now().Add(consoleWriteTimeout))
 			_, _ = conn.Write([]byte("console busy: another client is attached\n"))
 			_ = conn.Close()
 			continue
 		}
+		if scrollback := p.ring.Snapshot(); len(scrollback) > 0 {
+			_ = conn.SetWriteDeadline(time.Now().Add(consoleWriteTimeout))
+			if err := writeAll(conn, scrollback); err != nil {
+				p.clearClient(conn)
+			}
+		}
+		p.writeMu.Unlock()
 		go func() {
 			_, _ = io.Copy(p.input, conn)
 			p.clearClient(conn)
@@ -103,17 +120,22 @@ func (p *consoleProxy) writeOutput() {
 		if err != nil {
 			return
 		}
+		p.ring.Write(buf[:n])
+		p.writeMu.Lock()
 		conn := p.currentClient()
 		if conn == nil {
+			p.writeMu.Unlock()
 			continue
 		}
 		if err := conn.SetWriteDeadline(time.Now().Add(consoleWriteTimeout)); err != nil {
 			p.clearClient(conn)
+			p.writeMu.Unlock()
 			continue
 		}
 		if err := writeAll(conn, buf[:n]); err != nil {
 			p.clearClient(conn)
 		}
+		p.writeMu.Unlock()
 	}
 }
 
