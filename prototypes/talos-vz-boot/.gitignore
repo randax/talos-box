@@ -1,0 +1,4 @@
+talos-vz-boot
+efi-vars.fd
+*.log
+assets/
