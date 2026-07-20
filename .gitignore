@@ -1,0 +1,15 @@
+# Binaries and shared libraries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go test and coverage artifacts
+*.test
+*.out
+
+# Go workspace files
+go.work
+go.work.sum
