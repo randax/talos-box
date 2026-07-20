@@ -125,7 +125,8 @@ guaranteed.
 [the installer-stall ticket](https://github.com/randax/talos-box/issues/12): corporate agents
 such as GlobalProtect RST guest-originated TLS, so direct in-VM registry access must be treated
 as unreliable on attendee machines): `tbxd` runs pull-through mirrors for `docker.io`,
-`ghcr.io`, `quay.io`, `registry.k8s.io` (one listener per upstream, ports `5000+`), bound on
+`ghcr.io`, `quay.io`, `registry.k8s.io` (one listener per upstream, ports `5055+` — port 5000
+is macOS AirPlay Receiver, which answers 403 and poisons smoke tests; gate G4), bound on
 cluster gateway IPs; printed machine configs set `registryMirrors` accordingly. Mirror storage
 lives in the cache and doubles as the offline-venue answer.
 
