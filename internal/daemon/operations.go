@@ -337,11 +337,19 @@ func (s *Server) destroyCluster(raw json.RawMessage) (map[string]string, error) 
 	if !args.Force {
 		return nil, errors.New("cluster.destroy requires force=true")
 	}
-	if _, err := cluster.Load(args.Name); err != nil {
+	dir, err := cluster.Dir(args.Name)
+	if err != nil {
 		return nil, err
 	}
-	if err := s.stop(args.Name); err != nil {
-		return nil, err
+	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("cluster %q does not exist", args.Name)
+	}
+	// stop what we can, but a partially-destroyed cluster (state dir present,
+	// cluster.json gone) must still be removable
+	if _, loadErr := cluster.Load(args.Name); loadErr == nil {
+		if err := s.stop(args.Name); err != nil {
+			return nil, err
+		}
 	}
 	if err := cluster.Destroy(args.Name); err != nil {
 		return nil, err
