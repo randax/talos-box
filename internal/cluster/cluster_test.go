@@ -1,0 +1,73 @@
+package cluster
+
+import (
+	"net"
+	"reflect"
+	"testing"
+)
+
+func TestDeterministicMAC(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		cluster string
+		node    string
+		want    string
+	}{
+		{name: "control plane", cluster: "demo", node: "demo-cp-1", want: "52:54:00:94:25:87"},
+		{name: "worker", cluster: "demo", node: "demo-worker-1", want: "52:54:00:39:a2:1b"},
+		{name: "cluster contributes", cluster: "other", node: "demo-worker-1", want: "52:54:00:4c:c1:b6"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := DeterministicMAC(tt.cluster, tt.node)
+			if got != tt.want {
+				t.Fatalf("DeterministicMAC(%q, %q) = %q, want %q", tt.cluster, tt.node, got, tt.want)
+			}
+			mac, err := net.ParseMAC(got)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mac[0]&1 != 0 || mac[0]&2 == 0 {
+				t.Fatalf("MAC %q is not unicast and locally administered", got)
+			}
+		})
+	}
+}
+
+func TestStateRoundTrip(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	tests := []struct {
+		name     string
+		index    int
+		cp       int
+		workers  int
+		defaults NodeDefaults
+	}{
+		{name: "defaults", index: 3, cp: 1, workers: 2},
+		{name: "custom", index: 4, cp: 3, workers: 1, defaults: NodeDefaults{MemoryMiB: 4096, CPUs: 4, DiskGiB: 40}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			want, err := New(tt.name, tt.index, tt.cp, tt.workers, tt.defaults)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := Save(want); err != nil {
+				t.Fatal(err)
+			}
+			got, err := Load(want.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("Load(%q) = %#v, want %#v", want.Name, got, want)
+			}
+		})
+	}
+}
