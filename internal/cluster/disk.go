@@ -8,8 +8,11 @@ import (
 )
 
 func ProvisionDisks(c Cluster, cachedDisk string) error {
-	if c.NodeDefaults.DiskGiB <= 0 || int64(c.NodeDefaults.DiskGiB) > int64(^uint64(0)>>1)/(1<<30) {
-		return fmt.Errorf("invalid disk size %d GiB", c.NodeDefaults.DiskGiB)
+	for _, role := range []Role{RoleControlPlane, RoleWorker} {
+		d := c.DefaultsFor(role)
+		if d.DiskGiB <= 0 || int64(d.DiskGiB) > int64(^uint64(0)>>1)/(1<<30) {
+			return fmt.Errorf("invalid disk size %d GiB", d.DiskGiB)
+		}
 	}
 	dir, err := Dir(c.Name)
 	if err != nil {
@@ -23,7 +26,7 @@ func ProvisionDisks(c Cluster, cachedDisk string) error {
 		if err := validName(node.Name); err != nil {
 			return fmt.Errorf("invalid node name %q: %w", node.Name, err)
 		}
-		if err := provisionDisk(cachedDisk, filepath.Join(dir, node.Name+".img"), int64(c.NodeDefaults.DiskGiB)<<30); err != nil {
+		if err := provisionDisk(cachedDisk, filepath.Join(dir, node.Name+".img"), int64(c.DefaultsFor(node.Role).DiskGiB)<<30); err != nil {
 			return fmt.Errorf("provision disk for %s: %w", node.Name, err)
 		}
 	}

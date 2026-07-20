@@ -8,6 +8,7 @@ import (
 	"os"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/config"
 	"github.com/randax/talos-box/internal/daemon"
 	"github.com/randax/talos-box/internal/imagecache"
 	"github.com/randax/talos-box/internal/version"
@@ -36,6 +37,10 @@ func (c cli) run(args []string) error {
 		return c.runCluster(args[1:])
 	case "node":
 		return c.runNode(args[1:])
+	case "up":
+		return c.runUp(args[1:])
+	case "down":
+		return c.runDown(args[1:])
 	case "status":
 		return c.runStatus(args[1:])
 	case "cache":
@@ -125,8 +130,17 @@ func (c cli) createCluster(args []string) error {
 	if err := c.call("cluster.create", request, &result); err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(c.out, "created and started cluster %s (%d control plane, %d workers)\n",
-		result.Name, result.ControlPlanes, result.Workers)
+	if _, err := fmt.Fprintf(c.out, "created and started cluster %s (%d control plane, %d workers)\n",
+		result.Name, result.ControlPlanes, result.Workers); err != nil {
+		return err
+	}
+	stanza := config.Marshal(config.Config{
+		Talos: config.TalosSpec{Version: result.TalosVersion, Schematic: result.Schematic},
+		Clusters: []config.ClusterSpec{{
+			Name: result.Name, ControlPlanes: result.ControlPlanes, Workers: result.Workers,
+			Node: result.NodeDefaults,
+		}}})
+	_, err = fmt.Fprintf(c.out, "\nequivalent talosbox.yaml:\n%s", stanza)
 	return err
 }
 

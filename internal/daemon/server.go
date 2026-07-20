@@ -214,6 +214,10 @@ func (s *Server) handle(request Request) (any, error) {
 	switch request.Op {
 	case "daemon.ping":
 		return map[string]bool{"pong": true}, nil
+	case "up":
+		return s.up(request.Args)
+	case "down":
+		return s.down(request.Args)
 	case "cluster.create":
 		return s.createCluster(request.Args)
 	case "cluster.start":

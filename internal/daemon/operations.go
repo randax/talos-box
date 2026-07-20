@@ -4,10 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -16,14 +16,17 @@ import (
 )
 
 type createArgs struct {
-	Name          string               `json:"name"`
-	ControlPlanes *int                 `json:"controlPlanes"`
-	Workers       *int                 `json:"workers"`
-	Node          cluster.NodeDefaults `json:"node"`
-	NodeDefaults  cluster.NodeDefaults `json:"nodeDefaults"`
-	Schematic     string               `json:"schematic"`
-	Version       string               `json:"version"`
-	TalosVersion  string               `json:"talosVersion"`
+	Name          string                `json:"name"`
+	ControlPlanes *int                  `json:"controlPlanes"`
+	Workers       *int                  `json:"workers"`
+	Node          cluster.NodeDefaults  `json:"node"`
+	NodeDefaults  cluster.NodeDefaults  `json:"nodeDefaults"`
+	ControlPlane  *cluster.NodeDefaults `json:"controlPlane,omitempty"`
+	Worker        *cluster.NodeDefaults `json:"worker,omitempty"`
+	BGP           bool                  `json:"bgp,omitempty"`
+	Schematic     string                `json:"schematic"`
+	Version       string                `json:"version"`
+	TalosVersion  string                `json:"talosVersion"`
 }
 
 type nameArgs struct {
@@ -133,6 +136,9 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if err != nil {
 		return ClusterSummary{}, err
 	}
+	item.ControlPlaneDefaults = args.ControlPlane
+	item.WorkerDefaults = args.Worker
+	item.BGP = args.BGP
 	item.Schematic, item.TalosVersion, err = s.resolveImage(args.Schematic, args.Version)
 	if err != nil {
 		return ClusterSummary{}, err
@@ -215,9 +221,10 @@ func newVM(item cluster.Cluster, node cluster.Node) (*vm.VM, error) {
 	if err != nil {
 		return nil, err
 	}
+	sizing := item.DefaultsFor(node.Role)
 	machine, err := vm.New(vm.Config{
-		CPUs:              item.NodeDefaults.CPUs,
-		MemoryMiB:         item.NodeDefaults.MemoryMiB,
+		CPUs:              sizing.CPUs,
+		MemoryMiB:         sizing.MemoryMiB,
 		DiskPath:          filepath.Join(dir, node.Name+".img"),
 		MAC:               node.MAC,
 		NetworkFile:       networkFile,
@@ -243,16 +250,18 @@ func attachNetwork(item cluster.Cluster, node cluster.Node) (*os.File, func() er
 		return nil, nil, fmt.Errorf("attach helper network: %w", attachErr)
 	}
 	file := os.NewFile(uintptr(fd), item.Name+"/"+node.Name+".network")
+	// Detach is best-effort teardown: the helper reclaims the vmnet interface
+	// when the VM's fd closes, and explicit detach races that cleanup from
+	// either side. A cleanup problem must never wedge stop/destroy.
 	cleanup := func() error {
 		client, err := helper.Connect()
 		if err != nil {
-			return fmt.Errorf("detach network for %s: %w", node.Name, err)
+			log.Printf("detach network for %s: %v (ignored)", node.Name, err)
+			return nil
 		}
 		defer func() { _ = client.Close() }()
-		// tolerate helpers predating idempotent detach: a VM that already
-		// closed its fd was cleaned up by the pump — that is not a failure
-		if err := client.Detach(item.Name, node.Name); err != nil && !strings.Contains(err.Error(), "not attached") {
-			return fmt.Errorf("detach network for %s: %w", node.Name, err)
+		if err := client.Detach(item.Name, node.Name); err != nil {
+			log.Printf("detach network for %s: %v (ignored)", node.Name, err)
 		}
 		return nil
 	}

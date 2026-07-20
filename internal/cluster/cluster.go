@@ -40,9 +40,24 @@ type Cluster struct {
 	ControlPlanes int          `json:"controlPlanes"`
 	Workers       int          `json:"workers"`
 	NodeDefaults  NodeDefaults `json:"nodeDefaults"`
-	Nodes         []Node       `json:"nodes"`
-	Schematic     string       `json:"schematic,omitempty"`
-	TalosVersion  string       `json:"talosVersion,omitempty"`
+	// Per-role overrides; nil means "use NodeDefaults".
+	ControlPlaneDefaults *NodeDefaults `json:"controlPlaneDefaults,omitempty"`
+	WorkerDefaults       *NodeDefaults `json:"workerDefaults,omitempty"`
+	BGP                  bool          `json:"bgp,omitempty"`
+	Nodes                []Node        `json:"nodes"`
+	Schematic            string        `json:"schematic,omitempty"`
+	TalosVersion         string        `json:"talosVersion,omitempty"`
+}
+
+// DefaultsFor resolves the effective sizing for a node role.
+func (c Cluster) DefaultsFor(role Role) NodeDefaults {
+	switch {
+	case role == RoleControlPlane && c.ControlPlaneDefaults != nil:
+		return *c.ControlPlaneDefaults
+	case role == RoleWorker && c.WorkerDefaults != nil:
+		return *c.WorkerDefaults
+	}
+	return c.NodeDefaults
 }
 
 func New(name string, subnetIndex, controlPlanes, workers int, defaults NodeDefaults) (Cluster, error) {

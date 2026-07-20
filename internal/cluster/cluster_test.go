@@ -139,3 +139,18 @@ func TestNodeMutationKeepsNamesAndCountsStable(t *testing.T) {
 		t.Fatalf("added = %#v, control planes = %d", controlPlane, c.ControlPlanes)
 	}
 }
+
+func TestDefaultsFor(t *testing.T) {
+	base := NodeDefaults{MemoryMiB: 2048, CPUs: 2, DiskGiB: 20}
+	cp := NodeDefaults{MemoryMiB: 3072, CPUs: 2, DiskGiB: 20}
+	c := Cluster{
+		NodeDefaults:         base,
+		ControlPlaneDefaults: &cp,
+	}
+	if got := c.DefaultsFor(RoleControlPlane); got != cp {
+		t.Errorf("control plane defaults = %+v, want override %+v", got, cp)
+	}
+	if got := c.DefaultsFor(RoleWorker); got != base {
+		t.Errorf("worker defaults = %+v, want base %+v", got, base)
+	}
+}
