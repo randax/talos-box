@@ -21,8 +21,14 @@ import (
 	"github.com/Code-Hex/vz/v3"
 )
 
-// fixed MAC so we can find our lease in /var/db/dhcpd_leases
-const macAddr = "52:54:00:aa:bb:05"
+// fixed MAC so we can find our lease in /var/db/dhcpd_leases; override with MAC env
+// (lease polling only matches the default MAC — override runs use HOLD mode)
+var macAddr = func() string {
+	if m := os.Getenv("MAC"); m != "" {
+		return m
+	}
+	return "52:54:00:aa:bb:05"
+}()
 
 func main() {
 	if len(os.Args) < 2 {
