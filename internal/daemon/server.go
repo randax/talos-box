@@ -19,8 +19,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const apidPort = "50000"
-
 // Server owns all VMs started by one daemon process.
 type Server struct {
 	cache *imagecache.Cache

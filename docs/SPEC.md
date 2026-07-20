@@ -146,8 +146,11 @@ DHCP leases and DNS stay stable.
 Lifecycle: `create/start/stop/destroy` per cluster and per node, `node add/remove` while the
 cluster runs, `suspend/resume` (macOS 14+, vz save/restore, whole cluster). Nodes always come
 up **unconfigured** — talosbox never generates or applies machine config. `tbx status` reports
-each node's observed phase: `maintenance` (insecure apid answers), `configured` (TLS apid),
-`unreachable`.
+each node's observed phase — `stopped`, `unreachable`, `maintenance`, `configured` — derived
+from a credential-free TLS probe of apid: **both** apid modes serve TLS (empirical correction,
+#31 — the earlier "insecure = maintenance" model was wrong); maintenance mode presents the
+well-known `maintenance-service.talos.dev` certificate, a configured node presents its
+cluster-CA identity and demands a client certificate.
 
 ## 7. Snapshots and reset
 

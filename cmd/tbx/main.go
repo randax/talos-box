@@ -80,12 +80,22 @@ func (c cli) runCluster(args []string) error {
 	case "destroy":
 		return c.destroyCluster(args[1:])
 	case "list":
-		if len(args) != 1 {
-			return errors.New("usage: tbx cluster list")
+		flags := flag.NewFlagSet("cluster list", flag.ContinueOnError)
+		flags.SetOutput(c.err)
+		outputFormat := flags.String("o", "table", "output format: table|json")
+		positionals, err := parseInterspersed(flags, args[1:])
+		if err != nil {
+			return err
+		}
+		if len(positionals) != 0 {
+			return errors.New("usage: tbx cluster list [-o json]")
 		}
 		var result []daemon.ClusterSummary
 		if err := c.call("cluster.list", struct{}{}, &result); err != nil {
 			return err
+		}
+		if *outputFormat == "json" {
+			return encodeJSON(c.out, result)
 		}
 		return printClusters(c.out, result)
 	default:
@@ -212,18 +222,34 @@ func (c cli) runNode(args []string) error {
 }
 
 func (c cli) runStatus(args []string) error {
-	if len(args) > 1 {
-		return errors.New("usage: tbx status [cluster]")
+	flags := flag.NewFlagSet("status", flag.ContinueOnError)
+	flags.SetOutput(c.err)
+	quiet := flags.Bool("quiet", false, "suppress hints")
+	outputFormat := flags.String("o", "table", "output format: table|json")
+	positionals, err := parseInterspersed(flags, args)
+	if err != nil {
+		return err
+	}
+	if len(positionals) > 1 {
+		return errors.New("usage: tbx status [cluster] [--quiet] [-o json]")
 	}
 	name := ""
-	if len(args) == 1 {
-		name = args[0]
+	if len(positionals) == 1 {
+		name = positionals[0]
 	}
 	var result []daemon.ClusterStatus
 	if err := c.call("status", map[string]string{"cluster": name}, &result); err != nil {
 		return err
 	}
-	return printStatus(c.out, result)
+	if *quiet {
+		for i := range result {
+			result[i].Hints = nil
+		}
+	}
+	if *outputFormat == "json" {
+		return encodeJSON(c.out, result)
+	}
+	return printStatus(c.out, result, *quiet)
 }
 
 func (c cli) runCache(args []string) error {

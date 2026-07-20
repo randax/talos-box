@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"text/tabwriter"
@@ -31,34 +32,53 @@ func printClusters(output io.Writer, clusters []daemon.ClusterSummary) error {
 	return table.Flush()
 }
 
-func printStatus(output io.Writer, clusters []daemon.ClusterStatus) error {
+func printStatus(output io.Writer, clusters []daemon.ClusterStatus, quiet bool) error {
 	if len(clusters) == 0 {
 		_, err := fmt.Fprintln(output, "No clusters.")
 		return err
 	}
 	table := tabwriter.NewWriter(output, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(table, "CLUSTER\tSUBNET\tNODE\tROLE\tMAC\tIP\tAPID\tVM"); err != nil {
+	if _, err := fmt.Fprintln(table, "CLUSTER\tSUBNET\tNODE\tROLE\tMAC\tIP\tPHASE"); err != nil {
 		return err
 	}
 	for _, item := range clusters {
-		vmState := "stopped"
-		if item.Running {
-			vmState = "running"
-		}
 		for _, node := range item.Nodes {
 			ip := node.IP
 			if ip == "" {
 				ip = "-"
 			}
-			apid := "no"
-			if node.APIDReachable {
-				apid = "yes"
-			}
-			if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-				item.Name, item.Subnet, node.Name, node.Role, node.MAC, ip, apid, vmState); err != nil {
+			if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+				item.Name, item.Subnet, node.Name, node.Role, node.MAC, ip, node.Phase); err != nil {
 				return err
 			}
 		}
 	}
-	return table.Flush()
+	if err := table.Flush(); err != nil {
+		return err
+	}
+	if quiet {
+		return nil
+	}
+	printed := false
+	for _, item := range clusters {
+		for _, hint := range item.Hints {
+			if !printed {
+				if _, err := fmt.Fprintln(output); err != nil {
+					return err
+				}
+				printed = true
+			}
+			if _, err := fmt.Fprintf(output, "hint [%s]: %s\n", item.Name, hint); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// encodeJSON writes indented JSON — the machine-readable face of list/status.
+func encodeJSON(output io.Writer, value any) error {
+	encoder := json.NewEncoder(output)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(value)
 }

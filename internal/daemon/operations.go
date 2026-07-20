@@ -5,10 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"path/filepath"
-	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/helper"
@@ -75,6 +73,7 @@ type NodeStatus struct {
 	MAC           string       `json:"mac"`
 	IP            string       `json:"ip,omitempty"`
 	APIDReachable bool         `json:"apidReachable"`
+	Phase         Phase        `json:"phase"`
 }
 
 // ClusterStatus is the status result for one cluster.
@@ -83,6 +82,7 @@ type ClusterStatus struct {
 	Subnet  string       `json:"subnet"`
 	Running bool         `json:"running"`
 	Nodes   []NodeStatus `json:"nodes"`
+	Hints   []string     `json:"hints,omitempty"`
 }
 
 // CachePullResult describes the image made ready by cache.pull.
@@ -409,19 +409,19 @@ func (s *Server) addNode(raw json.RawMessage) (NodeStatus, error) {
 	if s.clusterRunning(item.Name) {
 		machine, err := newVM(item, node)
 		if err != nil {
-			return nodeStatus(node, item.SubnetIndex), fmt.Errorf("node added but failed to create VM: %w", err)
+			return nodeStatus(node, item.SubnetIndex, false), fmt.Errorf("node added but failed to create VM: %w", err)
 		}
 		if err := machine.Start(); err != nil {
 			startErr := fmt.Errorf("node added but failed to start: %w", err)
 			if closeErr := machine.Close(); closeErr != nil {
 				s.vms[item.Name][node.Name] = machine
-				return nodeStatus(node, item.SubnetIndex), errors.Join(startErr, fmt.Errorf("release failed VM: %w", closeErr))
+				return nodeStatus(node, item.SubnetIndex, false), errors.Join(startErr, fmt.Errorf("release failed VM: %w", closeErr))
 			}
-			return nodeStatus(node, item.SubnetIndex), startErr
+			return nodeStatus(node, item.SubnetIndex, false), startErr
 		}
 		s.vms[item.Name][node.Name] = machine
 	}
-	return nodeStatus(node, item.SubnetIndex), nil
+	return nodeStatus(node, item.SubnetIndex, s.nodeRunning(item.Name, node.Name)), nil
 }
 
 func (s *Server) removeNode(raw json.RawMessage) (NodeStatus, error) {
@@ -449,7 +449,7 @@ func (s *Server) removeNode(raw json.RawMessage) (NodeStatus, error) {
 	if err := removeNodeFiles(item.Name, node.Name); err != nil {
 		return NodeStatus{}, err
 	}
-	return nodeStatus(node, item.SubnetIndex), nil
+	return nodeStatus(node, item.SubnetIndex, false), nil
 }
 
 func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
@@ -479,11 +479,17 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 	for _, item := range items {
 		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Running: s.clusterRunning(item.Name)}
 		for _, node := range item.Nodes {
-			clusterStatus.Nodes = append(clusterStatus.Nodes, nodeStatus(node, item.SubnetIndex))
+			clusterStatus.Nodes = append(clusterStatus.Nodes, nodeStatus(node, item.SubnetIndex, s.nodeRunning(item.Name, node.Name)))
 		}
+		clusterStatus.Hints = Hints(clusterStatus)
 		result = append(result, clusterStatus)
 	}
 	return result, nil
+}
+
+func (s *Server) nodeRunning(clusterName, nodeName string) bool {
+	machine := s.vms[clusterName][nodeName]
+	return machine != nil && machine.Active()
 }
 
 func (s *Server) clusterRunning(name string) bool {
@@ -495,27 +501,20 @@ func (s *Server) clusterRunning(name string) bool {
 	return false
 }
 
-func nodeStatus(node cluster.Node, subnetIndex int) NodeStatus {
+func nodeStatus(node cluster.Node, subnetIndex int, vmRunning bool) NodeStatus {
 	ip := vm.LeaseIP(node.MAC, subnetIndex)
+	probe := ProbeResult{}
+	if ip != "" {
+		probe = probeAPID(ip)
+	}
 	return NodeStatus{
 		Name:          node.Name,
 		Role:          node.Role,
 		MAC:           node.MAC,
 		IP:            ip,
-		APIDReachable: apidReachable(ip),
+		APIDReachable: probe.Dialed,
+		Phase:         ClassifyPhase(vmRunning, probe),
 	}
-}
-
-func apidReachable(ip string) bool {
-	if ip == "" {
-		return false
-	}
-	connection, err := net.DialTimeout("tcp", net.JoinHostPort(ip, apidPort), 250*time.Millisecond)
-	if err != nil {
-		return false
-	}
-	_ = connection.Close()
-	return true
 }
 
 func (s *Server) pullCache(raw json.RawMessage) (CachePullResult, error) {

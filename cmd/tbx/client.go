@@ -31,7 +31,9 @@ func (c cli) call(op string, args, destination any) error {
 		if err := startDaemon(); err != nil {
 			return err
 		}
-		deadline := time.Now().Add(5 * time.Second)
+		// a daemon shutting down with live VMs can hold the lock for >10s before a
+		// replacement can bind — retry long enough to outlast that
+		deadline := time.Now().Add(20 * time.Second)
 		backoff := 50 * time.Millisecond
 		for {
 			response, err = exchange(socketPath, op, args)
