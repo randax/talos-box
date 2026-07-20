@@ -73,6 +73,10 @@ func Load(name string) (Cluster, error) {
 	if err := json.Unmarshal(data, &c); err != nil {
 		return Cluster{}, fmt.Errorf("decode cluster state: %w", err)
 	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err == nil && fields["subnetIndex"] == nil {
+		c.SubnetIndex = c.Index
+	}
 	return c, nil
 }
 

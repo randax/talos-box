@@ -281,16 +281,6 @@ func removeNodeFiles(clusterName, nodeName string) error {
 	return nil
 }
 
-func nextClusterIndex(clusters []cluster.Cluster) int {
-	index := 1
-	for _, item := range clusters {
-		if item.Index >= index {
-			index = item.Index + 1
-		}
-	}
-	return index
-}
-
 func sortedNodeNames(nodes map[string]*vm.VM) []string {
 	names := make([]string, 0, len(nodes))
 	for name := range nodes {

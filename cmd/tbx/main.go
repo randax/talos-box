@@ -42,6 +42,8 @@ func (c cli) run(args []string) error {
 		return c.runCache(args[1:])
 	case "system":
 		return c.runSystem(args[1:])
+	case "doctor":
+		return c.runDoctor(args[1:])
 	case "version":
 		_, err := fmt.Fprintln(c.out, version.Version)
 		return err
@@ -264,6 +266,7 @@ Commands:
   status [cluster]
   cache pull|prune
   system install|uninstall
+  doctor
   version
 `
 	_, _ = fmt.Fprint(output, help)

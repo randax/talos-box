@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/helper"
 	"github.com/randax/talos-box/internal/vm"
 )
 
@@ -54,6 +55,7 @@ type cachePullArgs struct {
 type ClusterSummary struct {
 	Name          string               `json:"name"`
 	Index         int                  `json:"index"`
+	SubnetIndex   int                  `json:"subnetIndex"`
 	ControlPlanes int                  `json:"controlPlanes"`
 	Workers       int                  `json:"workers"`
 	NodeDefaults  cluster.NodeDefaults `json:"nodeDefaults"`
@@ -74,6 +76,7 @@ type NodeStatus struct {
 // ClusterStatus is the status result for one cluster.
 type ClusterStatus struct {
 	Name    string       `json:"name"`
+	Subnet  string       `json:"subnet"`
 	Running bool         `json:"running"`
 	Nodes   []NodeStatus `json:"nodes"`
 }
@@ -113,12 +116,19 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return ClusterSummary{}, fmt.Errorf("inspect cluster directory: %w", err)
 	}
+	if err := requireHelper(); err != nil {
+		return ClusterSummary{}, err
+	}
 
 	clusters, err := cluster.List()
 	if err != nil {
 		return ClusterSummary{}, err
 	}
-	item, err := cluster.New(args.Name, nextClusterIndex(clusters), controlPlanes, workers, args.Node)
+	subnetIndex, err := cluster.LowestFreeSubnetIndex(clusters)
+	if err != nil {
+		return ClusterSummary{}, err
+	}
+	item, err := cluster.New(args.Name, subnetIndex, controlPlanes, workers, args.Node)
 	if err != nil {
 		return ClusterSummary{}, err
 	}
@@ -200,14 +210,66 @@ func newVM(item cluster.Cluster, node cluster.Node) (*vm.VM, error) {
 	if err != nil {
 		return nil, err
 	}
-	return vm.New(vm.Config{
+	networkFile, cleanup, err := attachNetwork(item, node)
+	if err != nil {
+		return nil, err
+	}
+	machine, err := vm.New(vm.Config{
 		CPUs:              item.NodeDefaults.CPUs,
 		MemoryMiB:         item.NodeDefaults.MemoryMiB,
 		DiskPath:          filepath.Join(dir, node.Name+".img"),
 		MAC:               node.MAC,
+		NetworkFile:       networkFile,
+		NetworkCleanup:    cleanup,
 		EFIVarsPath:       filepath.Join(dir, node.Name+".efi"),
 		ConsoleSocketPath: filepath.Join(dir, node.Name+".console.sock"),
 	})
+	if err != nil {
+		_ = networkFile.Close()
+		return nil, errors.Join(err, cleanup())
+	}
+	return machine, nil
+}
+
+func attachNetwork(item cluster.Cluster, node cluster.Node) (*os.File, func() error, error) {
+	client, err := helper.Connect()
+	if err != nil {
+		return nil, nil, helperInstallError(err)
+	}
+	fd, attachErr := client.Attach(item.Name, item.SubnetIndex, node.Name)
+	_ = client.Close()
+	if attachErr != nil {
+		return nil, nil, fmt.Errorf("attach helper network: %w", attachErr)
+	}
+	file := os.NewFile(uintptr(fd), item.Name+"/"+node.Name+".network")
+	cleanup := func() error {
+		client, err := helper.Connect()
+		if err != nil {
+			return fmt.Errorf("detach network for %s: %w", node.Name, err)
+		}
+		defer func() { _ = client.Close() }()
+		if err := client.Detach(item.Name, node.Name); err != nil {
+			return fmt.Errorf("detach network for %s: %w", node.Name, err)
+		}
+		return nil
+	}
+	return file, cleanup, nil
+}
+
+func helperInstallError(err error) error {
+	return fmt.Errorf("network helper unavailable; run `sudo tbx system install`: %w", err)
+}
+
+func requireHelper() error {
+	client, err := helper.Connect()
+	if err != nil {
+		return helperInstallError(err)
+	}
+	defer func() { _ = client.Close() }()
+	if err := client.Ping(); err != nil {
+		return helperInstallError(err)
+	}
+	return nil
 }
 
 func (s *Server) stopCluster(raw json.RawMessage) (ClusterSummary, error) {
@@ -327,19 +389,19 @@ func (s *Server) addNode(raw json.RawMessage) (NodeStatus, error) {
 	if s.clusterRunning(item.Name) {
 		machine, err := newVM(item, node)
 		if err != nil {
-			return nodeStatus(node), fmt.Errorf("node added but failed to create VM: %w", err)
+			return nodeStatus(node, item.SubnetIndex), fmt.Errorf("node added but failed to create VM: %w", err)
 		}
 		if err := machine.Start(); err != nil {
 			startErr := fmt.Errorf("node added but failed to start: %w", err)
 			if closeErr := machine.Close(); closeErr != nil {
 				s.vms[item.Name][node.Name] = machine
-				return nodeStatus(node), errors.Join(startErr, fmt.Errorf("release failed VM: %w", closeErr))
+				return nodeStatus(node, item.SubnetIndex), errors.Join(startErr, fmt.Errorf("release failed VM: %w", closeErr))
 			}
-			return nodeStatus(node), startErr
+			return nodeStatus(node, item.SubnetIndex), startErr
 		}
 		s.vms[item.Name][node.Name] = machine
 	}
-	return nodeStatus(node), nil
+	return nodeStatus(node, item.SubnetIndex), nil
 }
 
 func (s *Server) removeNode(raw json.RawMessage) (NodeStatus, error) {
@@ -367,7 +429,7 @@ func (s *Server) removeNode(raw json.RawMessage) (NodeStatus, error) {
 	if err := removeNodeFiles(item.Name, node.Name); err != nil {
 		return NodeStatus{}, err
 	}
-	return nodeStatus(node), nil
+	return nodeStatus(node, item.SubnetIndex), nil
 }
 
 func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
@@ -395,9 +457,9 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 
 	result := make([]ClusterStatus, 0, len(items))
 	for _, item := range items {
-		clusterStatus := ClusterStatus{Name: item.Name, Running: s.clusterRunning(item.Name)}
+		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Running: s.clusterRunning(item.Name)}
 		for _, node := range item.Nodes {
-			clusterStatus.Nodes = append(clusterStatus.Nodes, nodeStatus(node))
+			clusterStatus.Nodes = append(clusterStatus.Nodes, nodeStatus(node, item.SubnetIndex))
 		}
 		result = append(result, clusterStatus)
 	}
@@ -413,8 +475,8 @@ func (s *Server) clusterRunning(name string) bool {
 	return false
 }
 
-func nodeStatus(node cluster.Node) NodeStatus {
-	ip := vm.LeaseIP(node.MAC)
+func nodeStatus(node cluster.Node, subnetIndex int) NodeStatus {
+	ip := vm.LeaseIP(node.MAC, subnetIndex)
 	return NodeStatus{
 		Name:          node.Name,
 		Role:          node.Role,
@@ -495,6 +557,7 @@ func summary(item cluster.Cluster, running bool) ClusterSummary {
 	return ClusterSummary{
 		Name:          item.Name,
 		Index:         item.Index,
+		SubnetIndex:   item.SubnetIndex,
 		ControlPlanes: item.ControlPlanes,
 		Workers:       item.Workers,
 		NodeDefaults:  item.NodeDefaults,

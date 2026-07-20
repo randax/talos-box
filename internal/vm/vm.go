@@ -20,17 +20,21 @@ type Config struct {
 	MemoryMiB         int
 	DiskPath          string
 	MAC               string
+	NetworkFile       *os.File
+	NetworkCleanup    func() error
 	EFIVarsPath       string
 	ConsoleSocketPath string
 }
 
 // VM owns a Virtualization.framework VM and its reconnectable console socket.
 type VM struct {
-	machine     *vz.VirtualMachine
-	console     *consoleProxy
-	serialFiles [2]*os.File
-	closeMu     sync.Mutex
-	closed      bool
+	machine        *vz.VirtualMachine
+	console        *consoleProxy
+	serialFiles    [2]*os.File
+	networkFile    *os.File
+	networkCleanup func() error
+	closeMu        sync.Mutex
+	closed         bool
 }
 
 // New translates config to the Virtualization.framework devices required by Talos.
@@ -82,9 +86,11 @@ func New(config Config) (*VM, error) {
 	}
 	configured = true
 	return &VM{
-		machine:     machine,
-		console:     proxy,
-		serialFiles: [2]*os.File{guestRead, guestWrite},
+		machine:        machine,
+		console:        proxy,
+		serialFiles:    [2]*os.File{guestRead, guestWrite},
+		networkFile:    config.NetworkFile,
+		networkCleanup: config.NetworkCleanup,
 	}, nil
 }
 
@@ -98,6 +104,10 @@ func validateConfig(config Config) error {
 		return errors.New("disk path is required")
 	case config.MAC == "":
 		return errors.New("MAC address is required")
+	case config.NetworkFile == nil:
+		return errors.New("network file is required")
+	case config.NetworkCleanup == nil:
+		return errors.New("network cleanup is required")
 	case config.EFIVarsPath == "":
 		return errors.New("EFI variable store path is required")
 	case config.ConsoleSocketPath == "":
@@ -139,11 +149,11 @@ func configureDevices(machineConfig *vz.VirtualMachineConfiguration, config Conf
 	}
 	machineConfig.SetStorageDevicesVirtualMachineConfiguration([]vz.StorageDeviceConfiguration{disk})
 
-	nat, err := vz.NewNATNetworkDeviceAttachment()
+	attachment, err := vz.NewFileHandleNetworkDeviceAttachment(config.NetworkFile)
 	if err != nil {
-		return fmt.Errorf("create NAT attachment: %w", err)
+		return fmt.Errorf("create file-handle network attachment: %w", err)
 	}
-	networkDevice, err := vz.NewVirtioNetworkDeviceConfiguration(nat)
+	networkDevice, err := vz.NewVirtioNetworkDeviceConfiguration(attachment)
 	if err != nil {
 		return fmt.Errorf("create virtio network device: %w", err)
 	}
@@ -225,6 +235,21 @@ func (v *VM) Close() error {
 	v.console.close()
 	for _, file := range v.serialFiles {
 		_ = file.Close()
+	}
+	var cleanupErr error
+	if v.networkFile != nil {
+		cleanupErr = v.networkFile.Close()
+		v.networkFile = nil
+	}
+	if v.networkCleanup != nil {
+		if err := v.networkCleanup(); err != nil {
+			cleanupErr = errors.Join(cleanupErr, err)
+		} else {
+			v.networkCleanup = nil
+		}
+	}
+	if cleanupErr != nil {
+		return cleanupErr
 	}
 	v.closed = true
 	return nil

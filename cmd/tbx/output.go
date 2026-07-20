@@ -37,7 +37,7 @@ func printStatus(output io.Writer, clusters []daemon.ClusterStatus) error {
 		return err
 	}
 	table := tabwriter.NewWriter(output, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(table, "CLUSTER\tNODE\tROLE\tMAC\tIP\tAPID\tVM"); err != nil {
+	if _, err := fmt.Fprintln(table, "CLUSTER\tSUBNET\tNODE\tROLE\tMAC\tIP\tAPID\tVM"); err != nil {
 		return err
 	}
 	for _, item := range clusters {
@@ -54,8 +54,8 @@ func printStatus(output io.Writer, clusters []daemon.ClusterStatus) error {
 			if node.APIDReachable {
 				apid = "yes"
 			}
-			if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-				item.Name, node.Name, node.Role, node.MAC, ip, apid, vmState); err != nil {
+			if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+				item.Name, item.Subnet, node.Name, node.Role, node.MAC, ip, apid, vmState); err != nil {
 				return err
 			}
 		}

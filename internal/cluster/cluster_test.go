@@ -72,6 +72,44 @@ func TestStateRoundTrip(t *testing.T) {
 	}
 }
 
+func TestLowestFreeSubnetIndex(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		clusters []Cluster
+		want     int
+	}{
+		{name: "empty", want: 0},
+		{name: "fills first gap", clusters: []Cluster{{SubnetIndex: 0}, {SubnetIndex: 2}}, want: 1},
+		{name: "ignores order", clusters: []Cluster{{SubnetIndex: 3}, {SubnetIndex: 1}, {SubnetIndex: 0}}, want: 2},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := LowestFreeSubnetIndex(tt.clusters)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Fatalf("LowestFreeSubnetIndex() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLowestFreeSubnetIndexExhausted(t *testing.T) {
+	t.Parallel()
+	clusters := make([]Cluster, MaxSubnetIndex+1)
+	for index := range clusters {
+		clusters[index].SubnetIndex = index
+	}
+	if _, err := LowestFreeSubnetIndex(clusters); err == nil {
+		t.Fatal("LowestFreeSubnetIndex() succeeded with no free subnets")
+	}
+}
+
 func TestNodeMutationKeepsNamesAndCountsStable(t *testing.T) {
 	t.Parallel()
 

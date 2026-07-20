@@ -11,6 +11,7 @@ const (
 	DefaultMemoryMiB = 2048
 	DefaultCPUs      = 2
 	DefaultDiskGiB   = 20
+	MaxSubnetIndex   = 255
 )
 
 type Role string
@@ -35,6 +36,7 @@ type Node struct {
 type Cluster struct {
 	Name          string       `json:"name"`
 	Index         int          `json:"index"`
+	SubnetIndex   int          `json:"subnetIndex"`
 	ControlPlanes int          `json:"controlPlanes"`
 	Workers       int          `json:"workers"`
 	NodeDefaults  NodeDefaults `json:"nodeDefaults"`
@@ -43,12 +45,15 @@ type Cluster struct {
 	TalosVersion  string       `json:"talosVersion,omitempty"`
 }
 
-func New(name string, index, controlPlanes, workers int, defaults NodeDefaults) (Cluster, error) {
+func New(name string, subnetIndex, controlPlanes, workers int, defaults NodeDefaults) (Cluster, error) {
 	if err := validName(name); err != nil {
 		return Cluster{}, err
 	}
-	if index < 0 || controlPlanes < 0 || workers < 0 {
-		return Cluster{}, errors.New("cluster index and node counts cannot be negative")
+	if subnetIndex < 0 || subnetIndex > MaxSubnetIndex {
+		return Cluster{}, fmt.Errorf("subnet index must be between 0 and %d", MaxSubnetIndex)
+	}
+	if controlPlanes < 0 || workers < 0 {
+		return Cluster{}, errors.New("node counts cannot be negative")
 	}
 	if defaults.MemoryMiB < 0 || defaults.CPUs < 0 || defaults.DiskGiB < 0 {
 		return Cluster{}, errors.New("node defaults cannot be negative")
@@ -57,7 +62,8 @@ func New(name string, index, controlPlanes, workers int, defaults NodeDefaults) 
 	defaults = applyDefaults(defaults)
 	c := Cluster{
 		Name:          name,
-		Index:         index,
+		Index:         subnetIndex,
+		SubnetIndex:   subnetIndex,
 		ControlPlanes: controlPlanes,
 		Workers:       workers,
 		NodeDefaults:  defaults,
@@ -71,6 +77,27 @@ func New(name string, index, controlPlanes, workers int, defaults NodeDefaults) 
 	}
 
 	return c, nil
+}
+
+// LowestFreeSubnetIndex returns the first unallocated 172.30.n.0/24 subnet.
+func LowestFreeSubnetIndex(clusters []Cluster) (int, error) {
+	used := make([]bool, MaxSubnetIndex+1)
+	for _, item := range clusters {
+		if item.SubnetIndex >= 0 && item.SubnetIndex <= MaxSubnetIndex {
+			used[item.SubnetIndex] = true
+		}
+	}
+	for index, allocated := range used {
+		if !allocated {
+			return index, nil
+		}
+	}
+	return 0, errors.New("all cluster subnets are allocated")
+}
+
+// SubnetCIDR returns the cluster's vmnet subnet.
+func SubnetCIDR(index int) string {
+	return fmt.Sprintf("172.30.%d.0/24", index)
 }
 
 func DeterministicMAC(clusterName, nodeName string) string {
