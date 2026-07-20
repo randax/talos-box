@@ -288,7 +288,8 @@ func (s *Server) detach(raw json.RawMessage) error {
 	key := attachmentKey{cluster: args.Cluster, node: args.Node}
 	fd, ok := s.attachments[key]
 	if !ok {
-		return fmt.Errorf("network interface for %s/%s is not attached", args.Cluster, args.Node)
+		// idempotent: the pump already cleaned up when the VM closed its fd
+		return nil
 	}
 	delete(s.attachments, key)
 	return StopInterface(fd)

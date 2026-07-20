@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -248,7 +249,9 @@ func attachNetwork(item cluster.Cluster, node cluster.Node) (*os.File, func() er
 			return fmt.Errorf("detach network for %s: %w", node.Name, err)
 		}
 		defer func() { _ = client.Close() }()
-		if err := client.Detach(item.Name, node.Name); err != nil {
+		// tolerate helpers predating idempotent detach: a VM that already
+		// closed its fd was cleaned up by the pump — that is not a failure
+		if err := client.Detach(item.Name, node.Name); err != nil && !strings.Contains(err.Error(), "not attached") {
 			return fmt.Errorf("detach network for %s: %w", node.Name, err)
 		}
 		return nil
