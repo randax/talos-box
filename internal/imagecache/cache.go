@@ -40,14 +40,22 @@ func New(root string) *Cache {
 	}
 }
 
-// NewDefault returns a cache under the current user's home directory.
-func NewDefault() (*Cache, error) {
+// DefaultRoot is the cache directory under the current user's home.
+func DefaultRoot() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return nil, fmt.Errorf("find home directory: %w", err)
+		return "", fmt.Errorf("find home directory: %w", err)
 	}
+	return filepath.Join(home, ".talosbox", "cache"), nil
+}
 
-	return New(filepath.Join(home, ".talosbox", "cache")), nil
+// NewDefault returns a cache under the current user's home directory.
+func NewDefault() (*Cache, error) {
+	root, err := DefaultRoot()
+	if err != nil {
+		return nil, err
+	}
+	return New(root), nil
 }
 
 // Ensure returns a decompressed disk image, downloading it when necessary.
