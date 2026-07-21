@@ -198,7 +198,7 @@ func TestInstallResolver(t *testing.T) {
 func TestAttachRequiresSubnetIndex(t *testing.T) {
 	t.Parallel()
 
-	server := NewServer()
+	server := NewServer(nil)
 	_, _, _, err := server.attach(json.RawMessage("{\"cluster\":\"demo\",\"node\":\"demo-cp-1\"}"))
 	if err == nil {
 		t.Fatal("attach accepted a missing subnetIndex")
@@ -208,7 +208,7 @@ func TestAttachRequiresSubnetIndex(t *testing.T) {
 func TestDetachRequiresNames(t *testing.T) {
 	t.Parallel()
 
-	if err := NewServer().detach(json.RawMessage("{}")); err == nil {
+	if err := NewServer(nil).detach(json.RawMessage("{}")); err == nil {
 		t.Fatal("detach accepted missing cluster and node")
 	}
 }

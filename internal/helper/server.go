@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -34,6 +35,7 @@ type Server struct {
 	opMu        sync.Mutex
 	attachments map[attachmentKey]int
 	speakers    map[string]bgpSpeaker
+	allowedUID  *uint32
 
 	listenerMu   sync.Mutex
 	listener     net.Listener
@@ -43,8 +45,13 @@ type Server struct {
 }
 
 // NewServer creates an empty helper server.
-func NewServer() *Server {
-	return &Server{attachments: make(map[attachmentKey]int)}
+func NewServer(allowedUID *uint32) *Server {
+	server := &Server{attachments: make(map[attachmentKey]int)}
+	if allowedUID != nil {
+		uid := *allowedUID
+		server.allowedUID = &uid
+	}
+	return server
 }
 
 // Listen creates the helper socket, replacing it only when stale.
@@ -66,7 +73,8 @@ func Listen(path string) (net.Listener, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen on helper socket: %w", err)
 	}
-	// TODO: restrict access after adding peer-credential authorization.
+	// Keep the socket world-writable so rejected peers receive an explicit
+	// authorization response; peer credentials are the actual access gate.
 	if err := os.Chmod(path, 0o666); err != nil {
 		_ = listener.Close()
 		return nil, fmt.Errorf("set helper socket permissions: %w", err)
@@ -155,6 +163,20 @@ func (s *Server) Shutdown() error {
 
 func (s *Server) serveConnection(connection *net.UnixConn) {
 	defer func() { _ = connection.Close() }()
+	uid, err := peerUID(connection)
+	if err != nil {
+		authorizationErr := fmt.Errorf("read helper peer credentials: %w", err)
+		log.Printf("reject helper connection: %v", authorizationErr)
+		_ = sendResponse(connection, failure(authorizationErr), -1)
+		return
+	}
+	if !isAuthorizedUID(uid, s.allowedUID) {
+		authorizationErr := fmt.Errorf("unauthorized uid %d", uid)
+		log.Printf("reject helper connection: %v", authorizationErr)
+		_ = sendResponse(connection, failure(authorizationErr), -1)
+		return
+	}
+
 	decoder := json.NewDecoder(connection)
 	for {
 		var request Request
@@ -175,6 +197,10 @@ func (s *Server) serveConnection(connection *net.UnixConn) {
 			return
 		}
 	}
+}
+
+func isAuthorizedUID(uid uint32, allowedUID *uint32) bool {
+	return uid == 0 || allowedUID != nil && uid == *allowedUID
 }
 
 func sendResponse(connection *net.UnixConn, response Response, fd int) error {

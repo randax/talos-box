@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -56,7 +57,11 @@ func (c cli) installSystem(args []string) error {
 	if err := validateHelperBinary(helperPath); err != nil {
 		return err
 	}
-	plist, err := renderLaunchdPlist(helperPath)
+	allowedUID, err := allowedUIDFromSudoEnv(os.LookupEnv)
+	if err != nil {
+		return err
+	}
+	plist, err := renderLaunchdPlist(helperPath, allowedUID)
 	if err != nil {
 		return err
 	}
@@ -129,7 +134,7 @@ func validateHelperBinary(path string) error {
 	return nil
 }
 
-func renderLaunchdPlist(helperPath string) ([]byte, error) {
+func renderLaunchdPlist(helperPath string, allowedUID uint32) ([]byte, error) {
 	if !filepath.IsAbs(helperPath) {
 		return nil, errors.New("tbx-helper path must be absolute")
 	}
@@ -146,6 +151,8 @@ func renderLaunchdPlist(helperPath string) ([]byte, error) {
 		"  <key>ProgramArguments</key>\n" +
 		"  <array>\n" +
 		"    <string>%s</string>\n" +
+		"    <string>--allowed-uid</string>\n" +
+		"    <string>%d</string>\n" +
 		"  </array>\n" +
 		"  <key>RunAtLoad</key>\n" +
 		"  <true/>\n" +
@@ -153,7 +160,19 @@ func renderLaunchdPlist(helperPath string) ([]byte, error) {
 		"  <true/>\n" +
 		"</dict>\n" +
 		"</plist>\n"
-	return []byte(fmt.Sprintf(template, helperLaunchdLabel, escaped.String())), nil
+	return []byte(fmt.Sprintf(template, helperLaunchdLabel, escaped.String(), allowedUID)), nil
+}
+
+func allowedUIDFromSudoEnv(lookupEnv func(string) (string, bool)) (uint32, error) {
+	value, ok := lookupEnv("SUDO_UID")
+	if !ok || value == "" {
+		return 0, errors.New("SUDO_UID is not set; run `sudo tbx system install` from your own account")
+	}
+	uid, err := strconv.ParseUint(value, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("invalid SUDO_UID %q; run `sudo tbx system install` from your own account: %w", value, err)
+	}
+	return uint32(uid), nil
 }
 
 func reexecSystemWithSudo(args []string) error {
