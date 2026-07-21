@@ -254,7 +254,12 @@ Implementation must close these before v1 ships:
 - ~~G2 — GARP on failover~~ **CLOSED**: host ignores GARP through vmnet; L2 failover converges
   via macOS ARP revalidation in ~40–50 s (§5 documents the latency; BGP mode for fast failover).
   Residual: repeated-GARP bursts untested.
-- **G3 — balloon policy tuning**: validate the pressure thresholds under real workshop load.
+- ~~G3 — balloon policy tuning~~ **CLOSED** (#38): defaults are **6 GiB host reserve, 1 GiB
+  per-node floor, 5s poll** (`TBX_BALLOON_RESERVE_MIB` overrides the reserve). Verified live:
+  under a synthetic deficit a configured node's balloon inflated, dropping guest free memory
+  from ~2.45 GiB to ~0.6 GiB (≈ the deficit), and deflated back on release. Maintenance-mode
+  nodes are apid-probed out and exempt; the overcommit guard warns on create/start/node-add
+  with `--force` to override.
 - **G4 — mirror through security agents**: confirm host-bound mirror traffic passes on a
   GlobalProtect-managed machine (the attribution evidence is strong but circumstantial).
 - ~~G5 — inter-cluster routing~~ **CLOSED** (design-level): guest↔guest routing across vmnet

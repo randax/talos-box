@@ -22,6 +22,7 @@ type createArgs struct {
 	ControlPlane  *cluster.NodeDefaults `json:"controlPlane,omitempty"`
 	Worker        *cluster.NodeDefaults `json:"worker,omitempty"`
 	BGP           bool                  `json:"bgp,omitempty"`
+	Force         bool                  `json:"force"`
 	Schematic     string                `json:"schematic"`
 	Version       string                `json:"version"`
 	TalosVersion  string                `json:"talosVersion"`
@@ -29,6 +30,11 @@ type createArgs struct {
 
 type nameArgs struct {
 	Name string `json:"name"`
+}
+
+type startArgs struct {
+	Name  string `json:"name"`
+	Force bool   `json:"force"`
 }
 
 type destroyArgs struct {
@@ -40,6 +46,7 @@ type nodeArgs struct {
 	Cluster string       `json:"cluster"`
 	Name    string       `json:"name"`
 	Role    cluster.Role `json:"role"`
+	Force   bool         `json:"force"`
 }
 
 type statusArgs struct {
@@ -65,6 +72,7 @@ type ClusterSummary struct {
 	Schematic     string               `json:"schematic"`
 	BGP           bool                 `json:"bgp"`
 	Running       bool                 `json:"running"`
+	Warning       string               `json:"warning,omitempty"`
 }
 
 // NodeStatus is the observed host-side state of one node.
@@ -75,6 +83,7 @@ type NodeStatus struct {
 	IP            string       `json:"ip,omitempty"`
 	APIDReachable bool         `json:"apidReachable"`
 	Phase         Phase        `json:"phase"`
+	Warning       string       `json:"warning,omitempty"`
 }
 
 // ClusterStatus is the status result for one cluster.
@@ -125,6 +134,11 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if err := requireHelper(); err != nil {
 		return ClusterSummary{}, err
 	}
+	addMiB := (controlPlanes + workers) * memoryOr(args.Node.MemoryMiB, cluster.DefaultMemoryMiB)
+	overcommitWarning, err := s.checkOvercommit(addMiB, args.Force)
+	if err != nil {
+		return ClusterSummary{}, err
+	}
 
 	clusters, err := cluster.List()
 	if err != nil {
@@ -160,11 +174,13 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if err := s.start(item); err != nil {
 		return summary(item, false), fmt.Errorf("cluster created but failed to start: %w", err)
 	}
-	return summary(item, true), nil
+	result := summary(item, true)
+	result.Warning = overcommitWarning
+	return result, nil
 }
 
 func (s *Server) startCluster(raw json.RawMessage) (ClusterSummary, error) {
-	var args nameArgs
+	var args startArgs
 	if err := decodeArgs(raw, &args); err != nil {
 		return ClusterSummary{}, err
 	}
@@ -172,10 +188,20 @@ func (s *Server) startCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if err != nil {
 		return ClusterSummary{}, err
 	}
+	var overcommitWarning string
+	if !s.clusterRunning(item.Name) {
+		w, err := s.checkOvercommit(clusterMemoryMiB(item), args.Force)
+		if err != nil {
+			return ClusterSummary{}, err
+		}
+		overcommitWarning = w
+	}
 	if err := s.start(item); err != nil {
 		return ClusterSummary{}, err
 	}
-	return summary(item, true), nil
+	result := summary(item, true)
+	result.Warning = overcommitWarning
+	return result, nil
 }
 
 func (s *Server) start(item cluster.Cluster) error {
@@ -392,6 +418,11 @@ func (s *Server) addNode(raw json.RawMessage) (NodeStatus, error) {
 	if err != nil {
 		return NodeStatus{}, err
 	}
+	addMiB := item.DefaultsFor(args.Role).MemoryMiB
+	overcommitWarning, err := s.checkOvercommit(addMiB, args.Force)
+	if err != nil {
+		return NodeStatus{}, err
+	}
 	cachedDisk, err := s.cachedDisk(item)
 	if err != nil {
 		return NodeStatus{}, err
@@ -423,7 +454,9 @@ func (s *Server) addNode(raw json.RawMessage) (NodeStatus, error) {
 		}
 		s.vms[item.Name][node.Name] = machine
 	}
-	return nodeStatus(node, item.SubnetIndex, s.nodeRunning(item.Name, node.Name)), nil
+	status := nodeStatus(node, item.SubnetIndex, s.nodeRunning(item.Name, node.Name))
+	status.Warning = overcommitWarning
+	return status, nil
 }
 
 func (s *Server) removeNode(raw json.RawMessage) (NodeStatus, error) {
@@ -572,6 +605,13 @@ func (s *Server) cachedDisk(item cluster.Cluster) (string, error) {
 		return "", err
 	}
 	return s.cache.Ensure(schematic, talosVersion)
+}
+
+func memoryOr(mib, fallback int) int {
+	if mib > 0 {
+		return mib
+	}
+	return fallback
 }
 
 func summary(item cluster.Cluster, running bool) ClusterSummary {

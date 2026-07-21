@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/randax/talos-box/internal/balloon"
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/daemon"
 	tbxdns "github.com/randax/talos-box/internal/dns"
@@ -68,6 +69,10 @@ func run() error {
 	} else {
 		defer stopMirrors()
 	}
+
+	balloonStop := make(chan struct{})
+	go balloon.Run(balloon.DefaultConfig(), server.Balloonables, balloonStop)
+	defer close(balloonStop)
 
 	serveErrors := make(chan error, 2)
 	go func() { serveErrors <- server.Serve(listener) }()

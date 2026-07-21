@@ -84,8 +84,10 @@ func (c cli) runCluster(args []string) error {
 		if err := c.call("cluster."+args[0], map[string]string{"name": args[1]}, &result); err != nil {
 			return err
 		}
-		_, err := fmt.Fprintf(c.out, "%s cluster %s\n", pastTense(args[0]), result.Name)
-		return err
+		if _, err := fmt.Fprintf(c.out, "%s cluster %s\n", pastTense(args[0]), result.Name); err != nil {
+			return err
+		}
+		return printWarning(c.err, result.Warning)
 	case "destroy":
 		return c.destroyCluster(args[1:])
 	case "list":
@@ -122,6 +124,7 @@ func (c cli) createCluster(args []string) error {
 	disk := flags.Int("disk-gib", cluster.DefaultDiskGiB, "disk size per node in GiB")
 	talosVersion := flags.String("talos-version", daemon.DefaultTalosVersion, "Talos version")
 	schematic := flags.String("schematic", "", "Image Factory schematic")
+	force := flags.Bool("force", false, "proceed despite an overcommit warning")
 	positionals, err := parseInterspersed(flags, args)
 	if err != nil {
 		return err
@@ -138,12 +141,13 @@ func (c cli) createCluster(args []string) error {
 		ControlPlanes int                  `json:"controlPlanes"`
 		Workers       int                  `json:"workers"`
 		Node          cluster.NodeDefaults `json:"node"`
+		Force         bool                 `json:"force"`
 		Schematic     string               `json:"schematic"`
 		Version       string               `json:"version"`
 	}{
 		Name: positionals[0], ControlPlanes: *controlPlanes, Workers: *workers,
-		Node:      cluster.NodeDefaults{MemoryMiB: *memory, CPUs: *cpus, DiskGiB: *disk},
-		Schematic: resolvedSchematic, Version: *talosVersion,
+		Node:  cluster.NodeDefaults{MemoryMiB: *memory, CPUs: *cpus, DiskGiB: *disk},
+		Force: *force, Schematic: resolvedSchematic, Version: *talosVersion,
 	}
 	var result daemon.ClusterSummary
 	if err := c.call("cluster.create", request, &result); err != nil {
@@ -151,6 +155,9 @@ func (c cli) createCluster(args []string) error {
 	}
 	if _, err := fmt.Fprintf(c.out, "created and started cluster %s (%d control plane, %d workers)\n",
 		result.Name, result.ControlPlanes, result.Workers); err != nil {
+		return err
+	}
+	if err := printWarning(c.err, result.Warning); err != nil {
 		return err
 	}
 	stanza := config.Marshal(config.Config{
@@ -197,24 +204,27 @@ func (c cli) runNode(args []string) error {
 		flags := flag.NewFlagSet("node add", flag.ContinueOnError)
 		flags.SetOutput(c.err)
 		role := flags.String("role", string(cluster.RoleWorker), "worker or control-plane")
+		force := flags.Bool("force", false, "proceed despite an overcommit warning")
 		positionals, err := parseInterspersed(flags, args[1:])
 		if err != nil {
 			return err
 		}
 		if len(positionals) < 1 || len(positionals) > 2 {
-			return errors.New("usage: tbx node add <cluster> [node] [--role worker|control-plane]")
+			return errors.New("usage: tbx node add <cluster> [node] [--role worker|control-plane] [--force]")
 		}
 		name := ""
 		if len(positionals) == 2 {
 			name = positionals[1]
 		}
-		request := map[string]string{"cluster": positionals[0], "name": name, "role": *role}
+		request := map[string]any{"cluster": positionals[0], "name": name, "role": *role, "force": *force}
 		var result daemon.NodeStatus
 		if err := c.call("node.add", request, &result); err != nil {
 			return err
 		}
-		_, err = fmt.Fprintf(c.out, "added node %s to cluster %s\n", result.Name, positionals[0])
-		return err
+		if _, err := fmt.Fprintf(c.out, "added node %s to cluster %s\n", result.Name, positionals[0]); err != nil {
+			return err
+		}
+		return printWarning(c.err, result.Warning)
 	case "remove":
 		if len(args) != 3 {
 			return errors.New("usage: tbx node remove <cluster> <node>")
@@ -319,6 +329,14 @@ Commands:
   version
 `
 	_, _ = fmt.Fprint(output, help)
+}
+
+func printWarning(w io.Writer, warning string) error {
+	if warning == "" {
+		return nil
+	}
+	_, err := fmt.Fprintf(w, "warning: %s\n", warning)
+	return err
 }
 
 func pastTense(command string) string {

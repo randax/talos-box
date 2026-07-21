@@ -32,6 +32,8 @@ type VM struct {
 	console        *consoleProxy
 	serialFiles    [2]*os.File
 	networkFile    *os.File
+	configuredMiB  int
+	balloon        *vz.VirtioTraditionalMemoryBalloonDevice
 	networkCleanup func() error
 	closeMu        sync.Mutex
 	closed         bool
@@ -84,6 +86,13 @@ func New(config Config) (*VM, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create VM: %w", err)
 	}
+	// grab the balloon device ONCE — MemoryBalloonDevices() mints a fresh
+	// finalized wrapper on every call, so repeated calls over-release the
+	// underlying objc object and crash cgo (see #38).
+	var balloonDevice *vz.VirtioTraditionalMemoryBalloonDevice
+	if devices := machine.MemoryBalloonDevices(); len(devices) > 0 {
+		balloonDevice, _ = devices[0].(*vz.VirtioTraditionalMemoryBalloonDevice)
+	}
 	configured = true
 	return &VM{
 		machine:        machine,
@@ -91,6 +100,8 @@ func New(config Config) (*VM, error) {
 		serialFiles:    [2]*os.File{guestRead, guestWrite},
 		networkFile:    config.NetworkFile,
 		networkCleanup: config.NetworkCleanup,
+		configuredMiB:  config.MemoryMiB,
+		balloon:        balloonDevice,
 	}, nil
 }
 
@@ -174,6 +185,12 @@ func configureDevices(machineConfig *vz.VirtualMachineConfiguration, config Conf
 	}
 	machineConfig.SetEntropyDevicesVirtualMachineConfiguration([]*vz.VirtioEntropyDeviceConfiguration{entropy})
 
+	balloon, err := vz.NewVirtioTraditionalMemoryBalloonDeviceConfiguration()
+	if err != nil {
+		return fmt.Errorf("create memory balloon device: %w", err)
+	}
+	machineConfig.SetMemoryBalloonDevicesVirtualMachineConfiguration([]vz.MemoryBalloonDeviceConfiguration{balloon})
+
 	serialAttachment, err := vz.NewFileHandleSerialPortAttachment(guestRead, guestWrite)
 	if err != nil {
 		return fmt.Errorf("create serial attachment: %w", err)
@@ -189,6 +206,22 @@ func configureDevices(machineConfig *vz.VirtualMachineConfiguration, config Conf
 // Start starts the virtual machine.
 func (v *VM) Start() error {
 	return v.machine.Start()
+}
+
+// ConfiguredMiB is the node's full (deflated) memory size.
+func (v *VM) ConfiguredMiB() int { return v.configuredMiB }
+
+// SetMemoryTargetMiB sets the balloon target: below configured inflates the
+// balloon (reclaims guest RAM to the host), back to configured deflates it.
+func (v *VM) SetMemoryTargetMiB(targetMiB int) error {
+	if v.State() != vz.VirtualMachineStateRunning {
+		return errors.New("VM is not running")
+	}
+	if v.balloon == nil {
+		return errors.New("no memory balloon device")
+	}
+	v.balloon.SetTargetVirtualMachineMemorySize(uint64(targetMiB) * 1024 * 1024)
+	return nil
 }
 
 // Suspend pauses the running VM and saves its full state (RAM + devices) to
