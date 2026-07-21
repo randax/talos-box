@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -12,15 +13,26 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 const factoryURL = "https://factory.talos.dev"
 
+const (
+	schematicRequestTimeout    = 30 * time.Second
+	imageDialTimeout           = 10 * time.Second
+	imageTLSHandshakeTimeout   = 10 * time.Second
+	imageResponseHeaderTimeout = 30 * time.Second
+)
+
+var xzMagic = []byte{0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00}
+
 // Cache stores Talos disk images by schematic and version.
 type Cache struct {
-	root       string
-	factoryURL string
-	httpClient *http.Client
+	root            string
+	factoryURL      string
+	schematicClient *http.Client
+	downloadClient  *http.Client
 }
 
 // Entry is a ready-to-use disk image in the cache.
@@ -34,10 +46,32 @@ type Entry struct {
 // New returns a cache rooted at root.
 func New(root string) *Cache {
 	return &Cache{
-		root:       root,
-		factoryURL: factoryURL,
-		httpClient: http.DefaultClient,
+		root:            root,
+		factoryURL:      factoryURL,
+		schematicClient: &http.Client{Timeout: schematicRequestTimeout},
+		downloadClient:  newDownloadClient(),
 	}
+}
+
+func newDownloadClient() *http.Client {
+	transport, ok := http.DefaultTransport.(*http.Transport)
+	if ok {
+		transport = transport.Clone()
+	} else {
+		// DefaultTransport was replaced with a custom RoundTripper
+		transport = &http.Transport{
+			Proxy:             http.ProxyFromEnvironment,
+			ForceAttemptHTTP2: true,
+		}
+	}
+	transport.DialContext = (&net.Dialer{
+		Timeout:   imageDialTimeout,
+		KeepAlive: 30 * time.Second,
+	}).DialContext
+	transport.TLSHandshakeTimeout = imageTLSHandshakeTimeout
+	transport.ResponseHeaderTimeout = imageResponseHeaderTimeout
+
+	return &http.Client{Transport: transport}
 }
 
 // DefaultRoot is the cache directory under the current user's home.
@@ -156,7 +190,7 @@ func (c *Cache) Prune() error {
 }
 
 func (c *Cache) download(sourceURL, destination string) error {
-	response, err := c.httpClient.Get(sourceURL)
+	response, err := c.downloadClient.Get(sourceURL)
 	if err != nil {
 		return fmt.Errorf("download image: %w", err)
 	}
@@ -164,6 +198,17 @@ func (c *Cache) download(sourceURL, destination string) error {
 
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		return fmt.Errorf("download image: %s", response.Status)
+	}
+	if strings.EqualFold(strings.TrimSpace(strings.Split(response.Header.Get("Content-Type"), ";")[0]), "text/html") {
+		return fmt.Errorf("download image %s: response is text/html; possible proxy block page", sourceURL)
+	}
+
+	prefix := make([]byte, len(xzMagic))
+	if _, err := io.ReadFull(response.Body, prefix); err != nil {
+		return fmt.Errorf("download image %s: read response prefix: %w", sourceURL, err)
+	}
+	if !bytes.Equal(prefix, xzMagic) {
+		return fmt.Errorf("download image %s: response does not start with XZ magic; possible proxy block page", sourceURL)
 	}
 
 	temporary, err := os.CreateTemp(filepath.Dir(destination), ".metal-arm64.raw.xz-*")
@@ -173,7 +218,7 @@ func (c *Cache) download(sourceURL, destination string) error {
 	temporaryPath := temporary.Name()
 	defer func() { _ = os.Remove(temporaryPath) }()
 
-	if _, err := io.Copy(temporary, response.Body); err != nil {
+	if _, err := io.Copy(temporary, io.MultiReader(bytes.NewReader(prefix), response.Body)); err != nil {
 		_ = temporary.Close()
 		return fmt.Errorf("write image download: %w", err)
 	}
