@@ -106,7 +106,7 @@ helm install cilium cilium/cilium -n kube-system \
   --set ingressController.enabled=true \
   --set ingressController.default=true \
   --set ingressController.loadbalancerMode=shared \
-  --set ingressController.service.annotations."lbipam\.cilium\.io/ips"=172.30.0.200
+  --set 'ingressController.service.annotations.lbipam\.cilium\.io/ips=172.30.0.200'
 ```
 
 All images pull through the tbx mirrors; nodes go `Ready` in ~1–2 minutes. Then apply the
