@@ -61,6 +61,11 @@ func (c cli) installSystem(args []string) error {
 	if err != nil {
 		return err
 	}
+	if allowedUID == nil {
+		if _, err := fmt.Fprintln(c.err, "warning: SUDO_UID is not set; only root will be able to use tbx-helper; re-run `sudo tbx system install` from your account to authorize it"); err != nil {
+			return err
+		}
+	}
 	plist, err := renderLaunchdPlist(helperPath, allowedUID)
 	if err != nil {
 		return err
@@ -134,13 +139,17 @@ func validateHelperBinary(path string) error {
 	return nil
 }
 
-func renderLaunchdPlist(helperPath string, allowedUID uint32) ([]byte, error) {
+func renderLaunchdPlist(helperPath string, allowedUID *uint32) ([]byte, error) {
 	if !filepath.IsAbs(helperPath) {
 		return nil, errors.New("tbx-helper path must be absolute")
 	}
 	var escaped bytes.Buffer
 	if err := xml.EscapeText(&escaped, []byte(helperPath)); err != nil {
 		return nil, fmt.Errorf("escape helper path: %w", err)
+	}
+	uidArgs := ""
+	if allowedUID != nil {
+		uidArgs = fmt.Sprintf("    <string>--allowed-uid</string>\n    <string>%d</string>\n", *allowedUID)
 	}
 	const template = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
 		"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n" +
@@ -151,8 +160,7 @@ func renderLaunchdPlist(helperPath string, allowedUID uint32) ([]byte, error) {
 		"  <key>ProgramArguments</key>\n" +
 		"  <array>\n" +
 		"    <string>%s</string>\n" +
-		"    <string>--allowed-uid</string>\n" +
-		"    <string>%d</string>\n" +
+		"%s" +
 		"  </array>\n" +
 		"  <key>RunAtLoad</key>\n" +
 		"  <true/>\n" +
@@ -160,19 +168,22 @@ func renderLaunchdPlist(helperPath string, allowedUID uint32) ([]byte, error) {
 		"  <true/>\n" +
 		"</dict>\n" +
 		"</plist>\n"
-	return []byte(fmt.Sprintf(template, helperLaunchdLabel, escaped.String(), allowedUID)), nil
+	return []byte(fmt.Sprintf(template, helperLaunchdLabel, escaped.String(), uidArgs)), nil
 }
 
-func allowedUIDFromSudoEnv(lookupEnv func(string) (string, bool)) (uint32, error) {
+// allowedUIDFromSudoEnv returns nil when SUDO_UID is absent (e.g. a direct
+// root shell), which installs the helper in root-only mode.
+func allowedUIDFromSudoEnv(lookupEnv func(string) (string, bool)) (*uint32, error) {
 	value, ok := lookupEnv("SUDO_UID")
 	if !ok || value == "" {
-		return 0, errors.New("SUDO_UID is not set; run `sudo tbx system install` from your own account")
+		return nil, nil
 	}
 	uid, err := strconv.ParseUint(value, 10, 32)
 	if err != nil {
-		return 0, fmt.Errorf("invalid SUDO_UID %q; run `sudo tbx system install` from your own account: %w", value, err)
+		return nil, fmt.Errorf("invalid SUDO_UID %q; run `sudo tbx system install` from your own account: %w", value, err)
 	}
-	return uint32(uid), nil
+	allowed := uint32(uid)
+	return &allowed, nil
 }
 
 func reexecSystemWithSudo(args []string) error {

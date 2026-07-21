@@ -3,6 +3,7 @@
 package helper
 
 import (
+	"errors"
 	"fmt"
 	"net"
 
@@ -24,6 +25,9 @@ func peerUID(connection *net.UnixConn) (uint32, error) {
 	}
 	if credentialsErr != nil {
 		return 0, fmt.Errorf("get LOCAL_PEERCRED: %w", credentialsErr)
+	}
+	if credentials == nil {
+		return 0, errors.New("get LOCAL_PEERCRED: nil credentials")
 	}
 	return credentials.Uid, nil
 }
