@@ -36,7 +36,7 @@ func (s *Server) snapshotCreate(raw json.RawMessage) ([]cluster.SnapshotInfo, er
 	running := s.clusterRunning(item.Name)
 	err = withClusterStopped(running,
 		func() error { return s.stop(item.Name) },
-		func() error { return s.start(item) },
+		func() error { return s.startAndLogWarning(item) },
 		func() error { return cluster.CreateSnapshot(item, args.Name) },
 	)
 	if err != nil {
@@ -66,7 +66,7 @@ func (s *Server) snapshotRestore(raw json.RawMessage) ([]cluster.SnapshotInfo, e
 			if loadErr != nil {
 				return loadErr
 			}
-			return s.start(restored)
+			return s.startAndLogWarning(restored)
 		},
 		func() error { return cluster.RestoreSnapshot(item, args.Name) },
 	)

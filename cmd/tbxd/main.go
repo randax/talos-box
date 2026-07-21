@@ -58,6 +58,7 @@ func run() error {
 		return err
 	}
 	configureHostNetworking()
+	stopHostNetworkingMaintenance := startHostNetworkingMaintenance()
 	// registry mirrors are bound per cluster gateway by the daemon (see #39).
 
 	balloonStop := make(chan struct{})
@@ -75,9 +76,11 @@ func run() error {
 
 	select {
 	case err := <-serveErrors:
+		stopHostNetworkingMaintenance()
 		shutdownErr := errors.Join(server.Shutdown(), dnsServer.Close())
 		return errors.Join(err, <-serveErrors, shutdownErr)
 	case <-terminated:
+		stopHostNetworkingMaintenance()
 		shutdownErr := errors.Join(server.Shutdown(), dnsServer.Close())
 		return errors.Join(shutdownErr, <-serveErrors, <-serveErrors)
 	}

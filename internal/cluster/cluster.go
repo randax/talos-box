@@ -96,12 +96,7 @@ func New(name string, subnetIndex, controlPlanes, workers int, defaults NodeDefa
 
 // LowestFreeSubnetIndex returns the first unallocated 172.30.n.0/24 subnet.
 func LowestFreeSubnetIndex(clusters []Cluster) (int, error) {
-	used := make([]bool, MaxSubnetIndex+1)
-	for _, item := range clusters {
-		if item.SubnetIndex >= 0 && item.SubnetIndex <= MaxSubnetIndex {
-			used[item.SubnetIndex] = true
-		}
-	}
+	used := allocatedSubnetIndexes(clusters)
 	for index, allocated := range used {
 		if !allocated {
 			return index, nil

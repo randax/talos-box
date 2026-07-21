@@ -70,6 +70,10 @@ func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if err != nil {
 		return ClusterSummary{}, err
 	}
+	subnetWarning, err := cluster.CheckSubnetIndex(item.SubnetIndex, s.hostSubnetSources())
+	if err != nil {
+		return ClusterSummary{}, err
+	}
 	nodes := s.vms[item.Name]
 	if nodes == nil {
 		nodes = make(map[string]*vm.VM)
@@ -96,7 +100,9 @@ func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
 		}
 	}
 	go s.bindMirrors(item.SubnetIndex) // resume bypasses start(); rebind the gateway
-	return summary(item, true), nil
+	result := summary(item, true)
+	result.Warning = subnetWarning
+	return result, nil
 }
 
 // resumeNode tries to restore a node from its saved state; on a missing or

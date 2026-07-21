@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -145,7 +146,7 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if err != nil {
 		return ClusterSummary{}, err
 	}
-	subnetIndex, err := cluster.LowestFreeSubnetIndex(clusters)
+	subnetIndex, subnetWarning, err := cluster.LowestUsableSubnetIndex(clusters, s.hostSubnetSources())
 	if err != nil {
 		return ClusterSummary{}, err
 	}
@@ -172,11 +173,14 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 		_ = cluster.Destroy(item.Name)
 		return ClusterSummary{}, err
 	}
-	if err := s.start(item); err != nil {
-		return summary(item, false), fmt.Errorf("cluster created but failed to start: %w", err)
+	startWarning, err := s.start(item)
+	if err != nil {
+		result := summary(item, false)
+		result.Warning = joinWarnings(overcommitWarning, subnetWarning)
+		return result, fmt.Errorf("cluster created but failed to start: %w", err)
 	}
 	result := summary(item, true)
-	result.Warning = overcommitWarning
+	result.Warning = joinWarnings(overcommitWarning, subnetWarning, startWarning)
 	return result, nil
 }
 
@@ -197,15 +201,20 @@ func (s *Server) startCluster(raw json.RawMessage) (ClusterSummary, error) {
 		}
 		overcommitWarning = w
 	}
-	if err := s.start(item); err != nil {
+	subnetWarning, err := s.start(item)
+	if err != nil {
 		return ClusterSummary{}, err
 	}
 	result := summary(item, true)
-	result.Warning = overcommitWarning
+	result.Warning = joinWarnings(overcommitWarning, subnetWarning)
 	return result, nil
 }
 
-func (s *Server) start(item cluster.Cluster) error {
+func (s *Server) start(item cluster.Cluster) (string, error) {
+	subnetWarning, err := cluster.CheckSubnetIndex(item.SubnetIndex, s.hostSubnetSources())
+	if err != nil {
+		return "", err
+	}
 	nodes := s.vms[item.Name]
 	if nodes == nil {
 		nodes = make(map[string]*vm.VM)
@@ -218,24 +227,39 @@ func (s *Server) start(item cluster.Cluster) error {
 				continue
 			}
 			if err := existing.Close(); err != nil {
-				return fmt.Errorf("release inactive VM %s: %w", node.Name, err)
+				return "", fmt.Errorf("release inactive VM %s: %w", node.Name, err)
 			}
 			delete(nodes, node.Name)
 		}
 		machine, err := newVM(item, node)
 		if err != nil {
 			rollbackErr := s.rollbackStarted(item.Name, nodes, started)
-			return errors.Join(fmt.Errorf("create VM %s: %w", node.Name, err), rollbackErr)
+			return "", errors.Join(fmt.Errorf("create VM %s: %w", node.Name, err), rollbackErr)
 		}
 		nodes[node.Name] = machine
 		started = append(started, node.Name)
 		if err := machine.Start(); err != nil {
 			rollbackErr := s.rollbackStarted(item.Name, nodes, started)
-			return errors.Join(fmt.Errorf("start VM %s: %w", node.Name, err), rollbackErr)
+			return "", errors.Join(fmt.Errorf("start VM %s: %w", node.Name, err), rollbackErr)
 		}
 	}
 	go s.bindMirrors(item.SubnetIndex) // async: don't hold opMu across the retry
-	return nil
+	return subnetWarning, nil
+}
+
+func (s *Server) startAndLogWarning(item cluster.Cluster) error {
+	warning, err := s.start(item)
+	if warning != "" {
+		log.Printf("start %s: %s", item.Name, warning)
+	}
+	return err
+}
+
+func (s *Server) hostSubnetSources() cluster.SubnetSources {
+	if s.subnetSources.Interfaces == nil && s.subnetSources.Route == nil {
+		return cluster.SystemSubnetSources()
+	}
+	return s.subnetSources
 }
 
 func (s *Server) rollbackStarted(clusterName string, nodes map[string]*vm.VM, names []string) error {
@@ -455,6 +479,14 @@ func (s *Server) addNode(raw json.RawMessage) (NodeStatus, error) {
 	if err != nil {
 		return NodeStatus{}, err
 	}
+	running := s.clusterRunning(item.Name)
+	var subnetWarning string
+	if running {
+		subnetWarning, err = cluster.CheckSubnetIndex(item.SubnetIndex, s.hostSubnetSources())
+		if err != nil {
+			return NodeStatus{}, err
+		}
+	}
 	cachedDisk, err := s.cachedDisk(item)
 	if err != nil {
 		return NodeStatus{}, err
@@ -471,7 +503,7 @@ func (s *Server) addNode(raw json.RawMessage) (NodeStatus, error) {
 		_ = removeNodeFiles(item.Name, node.Name)
 		return NodeStatus{}, err
 	}
-	if s.clusterRunning(item.Name) {
+	if running {
 		machine, err := newVM(item, node)
 		if err != nil {
 			return nodeStatus(node, item.SubnetIndex, false), fmt.Errorf("node added but failed to create VM: %w", err)
@@ -487,7 +519,7 @@ func (s *Server) addNode(raw json.RawMessage) (NodeStatus, error) {
 		s.vms[item.Name][node.Name] = machine
 	}
 	status := nodeStatus(node, item.SubnetIndex, s.nodeRunning(item.Name, node.Name))
-	status.Warning = overcommitWarning
+	status.Warning = joinWarnings(overcommitWarning, subnetWarning)
 	return status, nil
 }
 
@@ -659,4 +691,17 @@ func summary(item cluster.Cluster, running bool) ClusterSummary {
 		BGP:           item.BGP,
 		Running:       running,
 	}
+}
+
+func joinWarnings(warnings ...string) string {
+	var result []string
+	seen := make(map[string]bool, len(warnings))
+	for _, warning := range warnings {
+		if warning == "" || seen[warning] {
+			continue
+		}
+		seen[warning] = true
+		result = append(result, warning)
+	}
+	return strings.Join(result, "; ")
 }
