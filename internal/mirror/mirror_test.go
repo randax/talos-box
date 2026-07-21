@@ -275,6 +275,14 @@ func TestManifestIntegrityBeforeCachingOrServing(t *testing.T) {
 			wantError:   "unsupported Content-Type",
 		},
 		{
+			name:        "manifest exceeding size limit",
+			requestRef:  "latest",
+			contentType: "application/vnd.oci.image.manifest.v1+json",
+			body:        `{"pad":"` + strings.Repeat("a", maxManifestBytes) + `"}`,
+			wantStatus:  http.StatusBadGateway,
+			wantError:   "exceeds",
+		},
+		{
 			name:        "invalid manifest JSON",
 			requestRef:  "latest",
 			contentType: "application/vnd.oci.image.manifest.v1+json",
@@ -365,6 +373,22 @@ func TestManifestIntegrityBeforeCachingOrServing(t *testing.T) {
 				t.Errorf("invalid manifest was served from cache: %q", cachedBody)
 			}
 		})
+	}
+}
+
+func TestManifestServedWhenCacheWriteFails(t *testing.T) {
+	f := newFakeRegistry(t, false)
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o555); err != nil { // storeManifest cannot create manifests/
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	ts := httptest.NewServer(NewServer(f.registry.URL, dir))
+	defer ts.Close()
+
+	resp, body := get(t, ts.URL+"/v2/app/manifests/latest")
+	if resp.StatusCode != http.StatusOK || body != manifestBody {
+		t.Fatalf("manifest with failing cache = %d %q, want 200 with manifest", resp.StatusCode, body)
 	}
 }
 

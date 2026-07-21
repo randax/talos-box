@@ -54,7 +54,16 @@ func New(root string) *Cache {
 }
 
 func newDownloadClient() *http.Client {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport, ok := http.DefaultTransport.(*http.Transport)
+	if ok {
+		transport = transport.Clone()
+	} else {
+		// DefaultTransport was replaced with a custom RoundTripper
+		transport = &http.Transport{
+			Proxy:             http.ProxyFromEnvironment,
+			ForceAttemptHTTP2: true,
+		}
+	}
 	transport.DialContext = (&net.Dialer{
 		Timeout:   imageDialTimeout,
 		KeepAlive: 30 * time.Second,
@@ -195,7 +204,10 @@ func (c *Cache) download(sourceURL, destination string) error {
 	}
 
 	prefix := make([]byte, len(xzMagic))
-	if _, err := io.ReadFull(response.Body, prefix); err != nil || !bytes.Equal(prefix, xzMagic) {
+	if _, err := io.ReadFull(response.Body, prefix); err != nil {
+		return fmt.Errorf("download image %s: read response prefix: %w", sourceURL, err)
+	}
+	if !bytes.Equal(prefix, xzMagic) {
 		return fmt.Errorf("download image %s: response does not start with XZ magic; possible proxy block page", sourceURL)
 	}
 

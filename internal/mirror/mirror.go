@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"os"
@@ -103,9 +104,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, fmt.Sprintf("upstream manifest: %v", err), http.StatusBadGateway)
 				return
 			}
+			// the validated manifest is already in memory; a cache write
+			// failure only costs offline replay, not this pull
 			if err := s.storeManifest(r.URL.Path, resp.Header.Get("Content-Type"), data); err != nil {
-				http.Error(w, fmt.Sprintf("cache manifest: %v", err), http.StatusInternalServerError)
-				return
+				log.Printf("mirror: cache manifest %s: %v", r.URL.Path, err)
 			}
 			copyResponseHeaders(w, resp)
 			w.WriteHeader(resp.StatusCode)
@@ -227,13 +229,37 @@ func (s *Server) storeManifest(requestPath, contentType string, data []byte) err
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create manifest cache directory: %w", err)
 	}
-	if err := os.WriteFile(path+".ct", []byte(contentType), 0o644); err != nil {
+	// the .ct sidecar publishes first so a published manifest always has one
+	if err := writeFileAtomic(path+".ct", []byte(contentType)); err != nil {
 		return fmt.Errorf("write manifest content type: %w", err)
 	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	if err := writeFileAtomic(path, data); err != nil {
 		return fmt.Errorf("write manifest: %w", err)
 	}
 	return nil
+}
+
+// writeFileAtomic stages data in a temp file and renames it into place, so
+// readers never observe a truncated file.
+func writeFileAtomic(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".partial-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpPath, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
 var manifestMediaTypes = map[string]struct{}{
@@ -244,11 +270,18 @@ var manifestMediaTypes = map[string]struct{}{
 	"application/vnd.oci.image.manifest.v1+json":                {},
 }
 
+// maxManifestBytes bounds manifest reads; real OCI/Docker manifests and
+// indexes are well under 1 MiB, so 10 MiB leaves generous headroom.
+const maxManifestBytes = 10 << 20
+
 func validateManifest(resp *http.Response, requestedReference string) ([]byte, error) {
 	manifestURL := responseURL(resp, "upstream URL")
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxManifestBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("read manifest from %s: %w", manifestURL, err)
+	}
+	if len(data) > maxManifestBytes {
+		return nil, fmt.Errorf("manifest response from %s exceeds %d bytes", manifestURL, maxManifestBytes)
 	}
 
 	contentType := resp.Header.Get("Content-Type")

@@ -120,6 +120,12 @@ func TestDownloadValidatesXZMagicBeforeCaching(t *testing.T) {
 			wantError:   "possible proxy block page",
 		},
 		{
+			name:        "truncated body reports the read error, not a block page",
+			contentType: "application/x-xz",
+			body:        xzMagic[:3],
+			wantError:   "read response prefix",
+		},
+		{
 			name:        "valid XZ is accepted with magic intact",
 			contentType: "application/x-xz",
 			body:        append(append([]byte(nil), xzMagic...), []byte("compressed-payload")...),
