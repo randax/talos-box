@@ -15,6 +15,7 @@ import (
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/imagecache"
+	"github.com/randax/talos-box/internal/mirror"
 	"github.com/randax/talos-box/internal/vm"
 	"golang.org/x/sys/unix"
 )
@@ -25,6 +26,7 @@ type Server struct {
 
 	opMu             sync.Mutex
 	vms              map[string]map[string]*vm.VM
+	mirrors          *mirror.Manager
 	defaultSchematic string
 
 	listenerMu   sync.Mutex
@@ -53,7 +55,15 @@ func NewServer() (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{cache: cache, vms: make(map[string]map[string]*vm.VM)}, nil
+	root, err := imagecache.DefaultRoot()
+	if err != nil {
+		return nil, err
+	}
+	return &Server{
+		cache:   cache,
+		vms:     make(map[string]map[string]*vm.VM),
+		mirrors: mirror.NewManager(mirror.DefaultDir(root)),
+	}, nil
 }
 
 // Listen creates the daemon socket, replacing it only when it is stale.
@@ -173,6 +183,9 @@ func (s *Server) Shutdown() error {
 	}
 	err := closeVMs(all)
 	s.vms = make(map[string]map[string]*vm.VM)
+	if s.mirrors != nil {
+		s.mirrors.Close()
+	}
 	return err
 }
 

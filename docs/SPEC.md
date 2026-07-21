@@ -129,8 +129,11 @@ such as GlobalProtect RST guest-originated TLS, so direct in-VM registry access 
 as unreliable on attendee machines): `tbxd` runs pull-through mirrors for `docker.io`,
 `ghcr.io`, `quay.io`, `registry.k8s.io` (one listener per upstream, ports `5055+` — port 5000
 is macOS AirPlay Receiver, which answers 403 and poisons smoke tests; gate G4), bound on
-cluster gateway IPs; printed machine configs set `registryMirrors` accordingly. Mirror storage
-lives in the cache and doubles as the offline-venue answer.
+each **cluster gateway IP** (`172.30.<n>.1`) — not `0.0.0.0` — with the bind set added when a
+cluster starts and removed when it stops (#39), so the ports never surface on the host's
+physical/VPN interfaces and distinct gateways share the fixed ports without conflict. Printed
+machine configs set `registryMirrors` accordingly. Mirror storage lives in the cache and
+doubles as the offline-venue answer.
 
 **Reachability guarantees** (the tested surface): host ↔ node IPs; host ↔ LB VIPs (L2 or BGP);
 **cluster ↔ cluster** (nodes and VIPs) through the host as inter-subnet router — first-class,

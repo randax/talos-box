@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/helper"
@@ -233,6 +234,7 @@ func (s *Server) start(item cluster.Cluster) error {
 			return errors.Join(fmt.Errorf("start VM %s: %w", node.Name, err), rollbackErr)
 		}
 	}
+	go s.bindMirrors(item.SubnetIndex) // async: don't hold opMu across the retry
 	return nil
 }
 
@@ -328,12 +330,42 @@ func (s *Server) stopCluster(raw json.RawMessage) (ClusterSummary, error) {
 }
 
 func (s *Server) stop(name string) error {
+	if item, err := cluster.Load(name); err == nil {
+		s.unbindMirrors(item.SubnetIndex)
+	} else {
+		log.Printf("unbind mirrors for %s: cluster state unreadable: %v", name, err)
+	}
 	nodes := s.vms[name]
 	if len(nodes) == 0 {
 		delete(s.vms, name)
 		return nil
 	}
 	return s.closeNodes(name, nodes, sortedNodeNames(nodes))
+}
+
+// bindMirrors serves the registry mirrors on a cluster's gateway once its
+// vmnet interface is up. Runs in its own goroutine (Bind has its own lock and
+// must not hold opMu across the retry sleep); best-effort with a short retry as
+// the gateway address appears, a failure is logged, not fatal.
+func (s *Server) bindMirrors(subnetIndex int) {
+	if s.mirrors == nil {
+		return
+	}
+	gateway := cluster.Gateway(subnetIndex)
+	var err error
+	for attempt := 0; attempt < 10; attempt++ {
+		if err = s.mirrors.Bind(gateway); err == nil {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	log.Printf("registry mirrors not bound on %s: %v", gateway, err)
+}
+
+func (s *Server) unbindMirrors(subnetIndex int) {
+	if s.mirrors != nil {
+		s.mirrors.Unbind(cluster.Gateway(subnetIndex))
+	}
 }
 
 func (s *Server) closeNodes(clusterName string, nodes map[string]*vm.VM, names []string) error {

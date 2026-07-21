@@ -110,6 +110,11 @@ func LowestFreeSubnetIndex(clusters []Cluster) (int, error) {
 	return 0, errors.New("all cluster subnets are allocated")
 }
 
+// Gateway returns the host-side gateway address for a cluster's subnet.
+func Gateway(index int) string {
+	return fmt.Sprintf("172.30.%d.1", index)
+}
+
 // SubnetCIDR returns the cluster's vmnet subnet.
 func SubnetCIDR(index int) string {
 	return fmt.Sprintf("172.30.%d.0/24", index)

@@ -95,6 +95,7 @@ func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
 			log.Printf("resume %s: %s", node.Name, warning)
 		}
 	}
+	go s.bindMirrors(item.SubnetIndex) // resume bypasses start(); rebind the gateway
 	return summary(item, true), nil
 }
 

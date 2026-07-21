@@ -14,8 +14,6 @@ import (
 	"github.com/randax/talos-box/internal/daemon"
 	tbxdns "github.com/randax/talos-box/internal/dns"
 	"github.com/randax/talos-box/internal/helper"
-	"github.com/randax/talos-box/internal/imagecache"
-	"github.com/randax/talos-box/internal/mirror"
 	"github.com/randax/talos-box/internal/version"
 	"github.com/randax/talos-box/internal/vm"
 )
@@ -60,15 +58,7 @@ func run() error {
 		return err
 	}
 	configureHostNetworking()
-
-	cacheRoot, err := imagecache.DefaultRoot()
-	if err != nil {
-		log.Printf("mirror cache root unavailable: %v (mirrors disabled)", err)
-	} else if stopMirrors, mirrorErr := mirror.StartAll(mirror.DefaultDir(cacheRoot)); mirrorErr != nil {
-		log.Printf("registry mirrors not started: %v", mirrorErr)
-	} else {
-		defer stopMirrors()
-	}
+	// registry mirrors are bound per cluster gateway by the daemon (see #39).
 
 	balloonStop := make(chan struct{})
 	go balloon.Run(balloon.DefaultConfig(), server.Balloonables, balloonStop)

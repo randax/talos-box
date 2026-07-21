@@ -6,9 +6,16 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"sync"
 
 	"github.com/randax/talos-box/internal/manifests"
 )
+
+// portBinding is one upstream registry served on a fixed port.
+type portBinding struct {
+	Upstream string
+	Port     int
+}
 
 // baseFor maps an upstream name to its real registry API base.
 func baseFor(upstream string) string {
@@ -18,41 +25,90 @@ func baseFor(upstream string) string {
 	return "https://" + upstream
 }
 
-// StartAll serves one pull-through mirror per manifests.MirrorPorts entry.
-//
-// NOTE: listeners currently bind 0.0.0.0, so guests reach them via their
-// gateway IP but the ports are also exposed on the host's other interfaces.
-// SPEC §5 wants them bound to the cluster gateway IPs only; doing so needs
-// per-cluster rebinding as clusters come and go (gateway IPs exist only while
-// a cluster's vmnet interface is up) — tracked as a follow-up. The mirror
-// serves anonymous public images read-only, so LAN exposure is low-risk.
-//
-// Returns a stop function; a port already in use fails startup (another
-// daemon or AirPlay-style squatter — surface it, don't half-serve).
-func StartAll(cacheRoot string) (stop func(), err error) {
+// Manager serves pull-through mirrors bound to cluster gateway IPs, adding and
+// removing a gateway's bind set as its cluster starts and stops — so the mirror
+// ports are reachable from guests but never exposed on the host's other
+// interfaces (SPEC §5). One listener per (gateway, upstream port).
+type Manager struct {
+	cacheRoot    string
+	ports        []portBinding
+	baseOverride string // tests only: point every upstream at one fake registry
+
+	mu    sync.Mutex
+	bound map[string][]*http.Server // gateway IP -> its servers
+}
+
+// NewManager mirrors manifests.MirrorPorts, caching under cacheRoot.
+func NewManager(cacheRoot string) *Manager {
+	ports := make([]portBinding, len(manifests.MirrorPorts))
+	for i, e := range manifests.MirrorPorts {
+		ports[i] = portBinding{Upstream: e.Upstream, Port: e.Port}
+	}
+	return newManagerWithPorts(cacheRoot, ports)
+}
+
+func newManagerWithPorts(cacheRoot string, ports []portBinding) *Manager {
+	return &Manager{cacheRoot: cacheRoot, ports: ports, bound: map[string][]*http.Server{}}
+}
+
+// Bind starts the mirror listeners on gatewayIP, idempotently. On any listen
+// failure it rolls back the partial bind for this gateway.
+func (m *Manager) Bind(gatewayIP string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.bound[gatewayIP]; ok {
+		return nil
+	}
 	var servers []*http.Server
-	stop = func() {
-		for _, server := range servers {
-			_ = server.Close()
+	rollback := func() {
+		for _, s := range servers {
+			_ = s.Close()
 		}
 	}
-	for _, entry := range manifests.MirrorPorts {
-		listener, listenErr := net.Listen("tcp", fmt.Sprintf(":%d", entry.Port))
-		if listenErr != nil {
-			stop()
-			return nil, fmt.Errorf("mirror %s on :%d: %w", entry.Upstream, entry.Port, listenErr)
+	for _, entry := range m.ports {
+		listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", gatewayIP, entry.Port))
+		if err != nil {
+			rollback()
+			return fmt.Errorf("mirror %s on %s:%d: %w", entry.Upstream, gatewayIP, entry.Port, err)
 		}
-		server := &http.Server{
-			Handler: NewServer(baseFor(entry.Upstream), filepath.Join(cacheRoot, entry.Upstream)),
+		base := baseFor(entry.Upstream)
+		if m.baseOverride != "" {
+			base = m.baseOverride
 		}
+		server := &http.Server{Handler: NewServer(base, filepath.Join(m.cacheRoot, entry.Upstream))}
 		servers = append(servers, server)
 		go func() {
-			if serveErr := server.Serve(listener); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
-				_ = serveErr // listener owned by Close; nothing to do
+			if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				_ = err
 			}
 		}()
 	}
-	return stop, nil
+	m.bound[gatewayIP] = servers
+	return nil
+}
+
+// Unbind stops a gateway's listeners; unknown gateways are a no-op.
+func (m *Manager) Unbind(gatewayIP string) {
+	m.mu.Lock()
+	servers := m.bound[gatewayIP]
+	delete(m.bound, gatewayIP)
+	m.mu.Unlock()
+	for _, s := range servers {
+		_ = s.Close()
+	}
+}
+
+// Close stops every gateway's listeners.
+func (m *Manager) Close() {
+	m.mu.Lock()
+	all := m.bound
+	m.bound = map[string][]*http.Server{}
+	m.mu.Unlock()
+	for _, servers := range all {
+		for _, s := range servers {
+			_ = s.Close()
+		}
+	}
 }
 
 // DefaultDir is the mirror cache root under the talosbox cache.
