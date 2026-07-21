@@ -71,7 +71,7 @@ func (c cli) run(args []string) error {
 
 func (c cli) runCluster(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tbx cluster create|start|stop|destroy|list")
+		return errors.New("usage: tbx cluster create|start|stop|suspend|resume|destroy|list")
 	}
 	switch args[0] {
 	case "create":
@@ -320,9 +320,14 @@ func (c cli) printHelp(output io.Writer) {
 	const help = `Usage: tbx <command>
 
 Commands:
-  cluster create|start|stop|destroy|list
+  up|down [-f talosbox.yaml]
+  cluster create|start|stop|suspend|resume|destroy|list
   node add|remove
+  snapshot create|restore|list|delete
   status [cluster]
+  manifests <cluster> [section]
+  console <cluster> <node>
+  bgp enable|disable <cluster>
   cache pull|prune
   system install|uninstall
   doctor

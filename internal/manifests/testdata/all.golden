@@ -1,6 +1,7 @@
-# Apply with kubectl (once Cilium is installed):
+# Apply with kubectl once Cilium is installed — this section alone:
+#   tbx manifests demo k8s | kubectl apply -f -
 # LB reachability via L2 announcements (default mode).
-apiVersion: cilium.io/v2alpha1
+apiVersion: cilium.io/v2
 kind: CiliumLoadBalancerIPPool
 metadata:
   name: demo-pool
@@ -17,7 +18,8 @@ spec:
   loadBalancerIPs: true
   nodeSelector: {}
 ---
-# Apply with talosctl (machine config patches, e.g. talosctl patch mc -p @file):
+# Apply with talosctl (machine config patches, e.g. talosctl patch mc -p @file) — this section alone:
+#   tbx manifests demo talos
 machine:
   registries:
     mirrors:

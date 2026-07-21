@@ -227,7 +227,7 @@ clusters:
 
 `tbx status` is **state-aware**: alongside nodes/IPs/DNS names/LB pool/BGP state it appends
 copy-pasteable next-step hints keyed to observed state (maintenance node → the
-`talosctl --insecure` probe; configured-but-no-CNI → `tbx manifests demo | kubectl apply -f -`).
+`talosctl --insecure` probe; configured-but-no-CNI → `tbx manifests demo k8s | kubectl apply -f -`).
 Hints **never execute anything**. `--quiet` suppresses them; all list/status commands support
 `-o json`.
 

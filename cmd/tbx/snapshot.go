@@ -14,7 +14,7 @@ import (
 
 func (c cli) runSnapshot(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tbx snapshot create|restore|list|delete <cluster> [name]")
+		return errors.New("usage: tbx snapshot create|restore|list|delete")
 	}
 	switch args[0] {
 	case "create":
