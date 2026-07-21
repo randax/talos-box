@@ -255,11 +255,17 @@ func (s *Server) startAndLogWarning(item cluster.Cluster) error {
 	return err
 }
 
+// hostSubnetSources merges injected sources with system defaults per field, so
+// a partially-configured Server never yields a nil source.
 func (s *Server) hostSubnetSources() cluster.SubnetSources {
-	if s.subnetSources.Interfaces == nil && s.subnetSources.Route == nil {
-		return cluster.SystemSubnetSources()
+	sources := cluster.SystemSubnetSources()
+	if s.subnetSources.Interfaces != nil {
+		sources.Interfaces = s.subnetSources.Interfaces
 	}
-	return s.subnetSources
+	if s.subnetSources.Route != nil {
+		sources.Route = s.subnetSources.Route
+	}
+	return sources
 }
 
 func (s *Server) rollbackStarted(clusterName string, nodes map[string]*vm.VM, names []string) error {

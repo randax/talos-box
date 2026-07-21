@@ -221,7 +221,9 @@ func systemInterfaces() ([]HostInterface, error) {
 	for _, current := range interfaces {
 		addresses, err := current.Addrs()
 		if err != nil {
-			return nil, fmt.Errorf("read addresses for %s: %w", current.Name, err)
+			// an interface that vanished between enumeration and query (VPN
+			// churn) has no addresses to collide with; don't block cluster ops
+			continue
 		}
 		result = append(result, HostInterface{Name: current.Name, Addrs: addresses})
 	}

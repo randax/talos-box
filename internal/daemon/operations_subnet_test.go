@@ -10,6 +10,25 @@ import (
 	"github.com/randax/talos-box/internal/vm"
 )
 
+func TestHostSubnetSourcesMergesPartialOverrides(t *testing.T) {
+	interfacesCalled := false
+	service := &Server{
+		subnetSources: cluster.SubnetSources{
+			Interfaces: func() ([]cluster.HostInterface, error) {
+				interfacesCalled = true
+				return nil, nil
+			},
+		},
+	}
+	sources := service.hostSubnetSources()
+	if sources.Route == nil {
+		t.Fatal("hostSubnetSources() left Route nil for a partial override")
+	}
+	if _, err := sources.Interfaces(); err != nil || !interfacesCalled {
+		t.Fatalf("hostSubnetSources() did not keep the injected interface source (err %v)", err)
+	}
+}
+
 func TestStartClusterAttachesSubnetWarning(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 

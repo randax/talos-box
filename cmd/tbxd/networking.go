@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -16,6 +17,7 @@ import (
 const (
 	resolverPath             = "/etc/resolver/k8s.test"
 	hostNetworkingCheckEvery = 60 * time.Second
+	hostCommandTimeout       = 10 * time.Second
 )
 
 type hostNetworkingDrift struct {
@@ -122,8 +124,16 @@ func reassertHostNetworking(drift hostNetworkingDrift, connect func() (hostNetwo
 	return repairErr
 }
 
+// runHostCommand is bounded so a stuck utility cannot wedge the maintenance
+// loop, whose stop function waits for the loop to exit during shutdown.
 func runHostCommand(name string, args ...string) ([]byte, error) {
-	return exec.Command(name, args...).Output()
+	ctx, cancel := context.WithTimeout(context.Background(), hostCommandTimeout)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, name, args...).Output()
+	if ctx.Err() != nil {
+		return output, fmt.Errorf("%s timed out after %s", name, hostCommandTimeout)
+	}
+	return output, err
 }
 
 func connectHostNetworkingHelper() (hostNetworkingClient, error) {
