@@ -111,21 +111,35 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 			return err
 		}
 
-		statuses, statusErr := deps.getStatus()
-		routeFinding := doctorFinding{level: "PASS", check: "routes"}
-		var routeProblems []string
-		if statusErr != nil {
-			routeProblems = append(routeProblems,
-				fmt.Sprintf("cluster status unavailable; node routes could not be checked: %v", statusErr))
+		anyRunning := false
+		for _, item := range clusters {
+			if item.Running {
+				anyRunning = true
+				break
+			}
 		}
-		if err := checkClusterRoutes(clusters, statuses, deps.command); err != nil {
-			routeProblems = append(routeProblems, err.Error())
-		}
-		if len(routeProblems) != 0 {
-			routeFinding.level, routeFinding.detail = "FAIL", strings.Join(routeProblems, "; ")
-		}
-		if err := writeFindings(routeFinding); err != nil {
-			return err
+		if !anyRunning {
+			// stopped clusters have no interfaces to route through
+			if err := writeFindings(doctorFinding{level: "SKIP", check: "routes", detail: "no clusters are running"}); err != nil {
+				return err
+			}
+		} else {
+			statuses, statusErr := deps.getStatus()
+			routeFinding := doctorFinding{level: "PASS", check: "routes"}
+			var routeProblems []string
+			if statusErr != nil {
+				routeProblems = append(routeProblems,
+					fmt.Sprintf("cluster status unavailable; node routes could not be checked: %v", statusErr))
+			}
+			if err := checkClusterRoutes(clusters, statuses, deps.command); err != nil {
+				routeProblems = append(routeProblems, err.Error())
+			}
+			if len(routeProblems) != 0 {
+				routeFinding.level, routeFinding.detail = "FAIL", strings.Join(routeProblems, "; ")
+			}
+			if err := writeFindings(routeFinding); err != nil {
+				return err
+			}
 		}
 	}
 

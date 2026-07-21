@@ -2,10 +2,12 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/daemon"
@@ -13,15 +15,32 @@ import (
 
 type commandOutput func(name string, args ...string) ([]byte, error)
 
+// commandProbeTimeout bounds each diagnostic subprocess; system utilities can
+// stall behind stuck directory services or security agents.
+const commandProbeTimeout = 10 * time.Second
+
 func execCombinedOutput(name string, args ...string) ([]byte, error) {
-	return exec.Command(name, args...).CombinedOutput()
+	ctx, cancel := context.WithTimeout(context.Background(), commandProbeTimeout)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	if ctx.Err() != nil {
+		return output, fmt.Errorf("%s timed out after %s", name, commandProbeTimeout)
+	}
+	return output, err
 }
 
+// checkClusterRoutes verifies routes only for running clusters: a stopped
+// cluster has no bridge/vmnet interface, so its subnet legitimately resolves
+// via the default route and would read as a false VPN/ZTNA capture.
 func checkClusterRoutes(clusters []daemon.ClusterSummary, statuses []daemon.ClusterStatus, command commandOutput) error {
 	firstNodeIP := make(map[string]string, len(statuses))
 	for _, status := range statuses {
+		if !status.Running {
+			continue
+		}
 		for _, node := range status.Nodes {
-			if node.IP != "" {
+			// a stopped node's IP is a stale DHCP lease, not a live route target
+			if node.IP != "" && node.Phase != daemon.PhaseStopped {
 				firstNodeIP[status.Name] = node.IP
 				break
 			}
@@ -34,6 +53,9 @@ func checkClusterRoutes(clusters []daemon.ClusterSummary, statuses []daemon.Clus
 	}
 	var problems []string
 	for _, item := range clusters {
+		if !item.Running {
+			continue
+		}
 		targets := []routeTarget{{ip: cluster.Gateway(item.SubnetIndex), localOK: true}}
 		if nodeIP := firstNodeIP[item.Name]; nodeIP != "" && nodeIP != targets[0].ip {
 			targets = append(targets, routeTarget{ip: nodeIP})

@@ -289,10 +289,10 @@ func TestRunDoctorRunsLaterChecksAfterSystemDNSFailure(t *testing.T) {
 		checkDirectDNS:  pass,
 		checkForwarding: pass,
 		listClusters: func() ([]daemon.ClusterSummary, error) {
-			return []daemon.ClusterSummary{{Name: "demo", SubnetIndex: 3}}, nil
+			return []daemon.ClusterSummary{{Name: "demo", SubnetIndex: 3, Running: true}}, nil
 		},
 		getStatus: func() ([]daemon.ClusterStatus, error) {
-			return []daemon.ClusterStatus{{Name: "demo"}}, nil
+			return []daemon.ClusterStatus{{Name: "demo", Running: true}}, nil
 		},
 		command: func(name string, args ...string) ([]byte, error) {
 			switch name {
@@ -380,7 +380,7 @@ func TestRunDoctorClusterListOperationErrorFailsChecks(t *testing.T) {
 func TestRunDoctorStatusErrorFailsRoutes(t *testing.T) {
 	deps := passingDoctorDependencies()
 	deps.listClusters = func() ([]daemon.ClusterSummary, error) {
-		return []daemon.ClusterSummary{{Name: "demo", SubnetIndex: 3}}, nil
+		return []daemon.ClusterSummary{{Name: "demo", SubnetIndex: 3, Running: true}}, nil
 	}
 	deps.getStatus = func() ([]daemon.ClusterStatus, error) {
 		return nil, errors.New("status unavailable")
@@ -440,12 +440,12 @@ func TestCheckSystemDNSChecksEveryCluster(t *testing.T) {
 
 func TestCheckClusterRoutesChecksGatewayAndNodeForEveryCluster(t *testing.T) {
 	clusters := []daemon.ClusterSummary{
-		{Name: "alpha", SubnetIndex: 2},
-		{Name: "beta", SubnetIndex: 9},
+		{Name: "alpha", SubnetIndex: 2, Running: true},
+		{Name: "beta", SubnetIndex: 9, Running: true},
 	}
 	statuses := []daemon.ClusterStatus{
-		{Name: "alpha", Nodes: []daemon.NodeStatus{{IP: "172.30.2.7"}}},
-		{Name: "beta", Nodes: []daemon.NodeStatus{{IP: "172.30.9.4"}}},
+		{Name: "alpha", Running: true, Nodes: []daemon.NodeStatus{{IP: "172.30.2.7"}}},
+		{Name: "beta", Running: true, Nodes: []daemon.NodeStatus{{IP: "172.30.9.4"}}},
 	}
 	var targets []string
 	command := func(name string, args ...string) ([]byte, error) {
@@ -461,6 +461,59 @@ func TestCheckClusterRoutesChecksGatewayAndNodeForEveryCluster(t *testing.T) {
 	want := []string{"172.30.2.1", "172.30.2.7", "172.30.9.1", "172.30.9.4"}
 	if fmt.Sprint(targets) != fmt.Sprint(want) {
 		t.Fatalf("route targets = %v, want %v", targets, want)
+	}
+}
+
+func TestCheckClusterRoutesSkipsStoppedClustersAndNodes(t *testing.T) {
+	clusters := []daemon.ClusterSummary{
+		{Name: "running", SubnetIndex: 2, Running: true},
+		{Name: "stopped", SubnetIndex: 9},
+	}
+	statuses := []daemon.ClusterStatus{
+		{Name: "running", Running: true, Nodes: []daemon.NodeStatus{
+			{Name: "cp-1", IP: "172.30.2.7", Phase: daemon.PhaseStopped}, // stale lease
+			{Name: "cp-2", IP: "172.30.2.8", Phase: daemon.PhaseConfigured},
+		}},
+		{Name: "stopped", Nodes: []daemon.NodeStatus{{IP: "172.30.9.4"}}},
+	}
+	var targets []string
+	command := func(_ string, args ...string) ([]byte, error) {
+		targets = append(targets, args[len(args)-1])
+		return []byte("interface: bridge100\n"), nil
+	}
+	if err := checkClusterRoutes(clusters, statuses, command); err != nil {
+		t.Fatalf("checkClusterRoutes() = %v", err)
+	}
+	want := []string{"172.30.2.1", "172.30.2.8"}
+	if fmt.Sprint(targets) != fmt.Sprint(want) {
+		t.Fatalf("route targets = %v, want %v (stopped cluster and stopped node must be skipped)", targets, want)
+	}
+}
+
+func TestRunDoctorSkipsRoutesWhenNoClustersRunning(t *testing.T) {
+	deps := passingDoctorDependencies()
+	deps.listClusters = func() ([]daemon.ClusterSummary, error) {
+		return []daemon.ClusterSummary{{Name: "demo", SubnetIndex: 3}}, nil
+	}
+	deps.getStatus = func() ([]daemon.ClusterStatus, error) {
+		t.Fatal("status should not be requested when no clusters are running")
+		return nil, nil
+	}
+	deps.command = func(name string, args ...string) ([]byte, error) {
+		if name == "/sbin/route" {
+			t.Fatalf("route probe ran for a stopped cluster: %s %v", name, args)
+		}
+		if name == "/usr/bin/dscacheutil" {
+			return []byte("ip_address: 172.30.3.200\n"), nil
+		}
+		return nil, nil
+	}
+	var output strings.Builder
+	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
+		t.Fatalf("runDoctorWithDependencies() = %v", err)
+	}
+	if !strings.Contains(output.String(), "SKIP routes: no clusters are running") {
+		t.Fatalf("output missing routes SKIP:\n%s", output.String())
 	}
 }
 
@@ -483,10 +536,11 @@ func passingDoctorDependencies() doctorDependencies {
 }
 
 func TestCheckRoutesAllowsLoopbackGatewayButNotLoopbackNode(t *testing.T) {
-	clusters := []daemon.ClusterSummary{{Name: "demo", SubnetIndex: 0}}
+	clusters := []daemon.ClusterSummary{{Name: "demo", SubnetIndex: 0, Running: true}}
 	statuses := []daemon.ClusterStatus{{
-		Name:  "demo",
-		Nodes: []daemon.NodeStatus{{Name: "demo-cp-1", IP: "172.30.0.2"}},
+		Name:    "demo",
+		Running: true,
+		Nodes:   []daemon.NodeStatus{{Name: "demo-cp-1", IP: "172.30.0.2"}},
 	}}
 	gatewayLocal := func(_ string, args ...string) ([]byte, error) {
 		iface := "bridge100"
@@ -508,10 +562,11 @@ func TestCheckRoutesAllowsLoopbackGatewayButNotLoopbackNode(t *testing.T) {
 }
 
 func TestCheckRoutesDetectsCapturedSubnet(t *testing.T) {
-	clusters := []daemon.ClusterSummary{{Name: "demo", SubnetIndex: 3}}
+	clusters := []daemon.ClusterSummary{{Name: "demo", SubnetIndex: 3, Running: true}}
 	statuses := []daemon.ClusterStatus{{
-		Name:  "demo",
-		Nodes: []daemon.NodeStatus{{Name: "demo-cp-1", IP: "172.30.3.2"}},
+		Name:    "demo",
+		Running: true,
+		Nodes:   []daemon.NodeStatus{{Name: "demo-cp-1", IP: "172.30.3.2"}},
 	}}
 	command := func(_ string, args ...string) ([]byte, error) {
 		iface := "bridge100"

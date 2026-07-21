@@ -29,7 +29,18 @@ const (
 )
 
 func newDoctorHTTPClient() *http.Client {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// a cloned transport has an empty connection pool, guaranteeing the probe
+	// performs a fresh TLS handshake instead of reusing a pooled connection
+	transport, ok := http.DefaultTransport.(*http.Transport)
+	if ok {
+		transport = transport.Clone()
+	} else {
+		// DefaultTransport was replaced with a custom RoundTripper
+		transport = &http.Transport{
+			Proxy:             http.ProxyFromEnvironment,
+			ForceAttemptHTTP2: true,
+		}
+	}
 	return &http.Client{
 		Transport: transport,
 		Timeout:   5 * time.Second,
@@ -56,6 +67,9 @@ func probeFactoryEgress(do httpDo) error {
 		return err
 	}
 	response, err := do(request)
+	if response != nil && response.Body != nil {
+		defer func() { _ = response.Body.Close() }()
+	}
 	if err != nil {
 		// Response status and post-handshake HTTP failures are irrelevant to this
 		// probe; it is specifically testing whether the TLS handshake can complete.
@@ -63,9 +77,6 @@ func probeFactoryEgress(do httpDo) error {
 			return nil
 		}
 		return err
-	}
-	if response != nil && response.Body != nil {
-		_ = response.Body.Close()
 	}
 	return nil
 }
