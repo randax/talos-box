@@ -76,7 +76,7 @@ func (c cli) runCluster(args []string) error {
 	switch args[0] {
 	case "create":
 		return c.createCluster(args[1:])
-	case "start", "stop":
+	case "start", "stop", "suspend", "resume":
 		if len(args) != 2 {
 			return fmt.Errorf("usage: tbx cluster %s <name>", args[0])
 		}
@@ -322,10 +322,16 @@ Commands:
 }
 
 func pastTense(command string) string {
-	if command == "stop" {
+	switch command {
+	case "stop":
 		return "stopped"
+	case "suspend":
+		return "suspended"
+	case "resume":
+		return "resumed"
+	default:
+		return "started"
 	}
-	return "started"
 }
 
 func resolveSchematic(schematic string) (string, error) {

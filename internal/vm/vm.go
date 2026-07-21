@@ -191,6 +191,33 @@ func (v *VM) Start() error {
 	return v.machine.Start()
 }
 
+// Suspend pauses the running VM and saves its full state (RAM + devices) to
+// savePath (vz save/restore, macOS 14+). The VM is left paused; the caller
+// closes it afterward.
+func (v *VM) Suspend(savePath string) error {
+	if err := v.machine.Pause(); err != nil {
+		return fmt.Errorf("pause: %w", err)
+	}
+	if err := v.machine.SaveMachineStateToPath(savePath); err != nil {
+		return fmt.Errorf("save machine state: %w", err)
+	}
+	return nil
+}
+
+// RestoreState restores a freshly-created (Stopped) VM from a saved state file
+// and resumes it. NOTE: vz RestoreMachineStateFromURL fails with "invalid
+// argument" against talosbox's device set (fresh console/serial handles on
+// recreation), so in practice resume falls back to a cold boot — see #37.
+func (v *VM) RestoreState(savePath string) error {
+	if err := v.machine.RestoreMachineStateFromURL(savePath); err != nil {
+		return fmt.Errorf("restore machine state: %w", err)
+	}
+	if err := v.machine.Resume(); err != nil {
+		return fmt.Errorf("resume: %w", err)
+	}
+	return nil
+}
+
 // Stop asks the guest to shut down, then forcibly stops it after a timeout.
 func (v *VM) Stop() error {
 	state := v.State()

@@ -144,7 +144,9 @@ A **cluster** is a named group of VMs on its own subnet; nodes are `<cluster>-cp
 DHCP leases and DNS stay stable.
 
 Lifecycle: `create/start/stop/destroy` per cluster and per node, `node add/remove` while the
-cluster runs, `suspend/resume` (macOS 14+, vz save/restore, whole cluster). Nodes always come
+cluster runs, `suspend/resume` (macOS 14+, vz save/restore, whole cluster — but see gate G7:
+memory-preserving restore currently fails against talosbox's device set and degrades to a
+graceful cold boot). Nodes always come
 up **unconfigured** — talosbox never generates or applies machine config. `tbx status` reports
 each node's observed phase — `stopped`, `unreachable`, `maintenance`, `configured` — derived
 from a credential-free TLS probe of apid: **both** apid modes serve TLS (empirical correction,
@@ -258,6 +260,13 @@ Implementation must close these before v1 ships:
 - ~~G5 — inter-cluster routing~~ **CLOSED** (design-level): guest↔guest routing across vmnet
   subnets through the host router verified with `ip.forwarding=1` (alias-subnet variant); the
   bridge-to-bridge confirmation is the Networking milestone's mandatory first integration test.
+- **G7 — suspend/resume memory restore**: `tbx cluster suspend` saves state correctly, but vz
+  `RestoreMachineStateFromURL` fails with `ErrorRestore` "invalid argument" against talosbox's
+  device configuration, so `resume` falls back to a cold boot (#37). Ruled out: the network fd
+  identity (an fd-preserving resume was implemented and still failed). Remaining suspects: the
+  console/serial file-handle devices recreated on resume. Until closed, suspend/resume is a
+  safe stop/save + cold-restart, not memory-preserving. Host sleep covers the "laptop overnight"
+  case without this feature.
 - ~~G6 — Talos console on hvc0~~ **CLOSED**: with `console=tty0 console=hvc0` the node boots
   and streams kernel+machined logs on hvc0 (`console=hvc0` alone bricks boot — hence the
   mandatory arg pair in §4). Residual: the dashboard TUI's interactive rendering on hvc0 is

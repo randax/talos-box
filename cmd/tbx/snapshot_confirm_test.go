@@ -24,3 +24,14 @@ func TestDefaultSnapshotNameShape(t *testing.T) {
 		t.Errorf("default snapshot name %q has unexpected shape", name)
 	}
 }
+
+func TestSuspendResumeAreClusterVerbs(t *testing.T) {
+	// unknown cluster verbs should error clearly; suspend/resume must be known
+	for _, verb := range []string{"suspend", "resume"} {
+		c := cli{out: &bytes.Buffer{}, err: &bytes.Buffer{}, in: strings.NewReader("")}
+		err := c.runCluster([]string{verb})
+		if err == nil || !strings.Contains(err.Error(), "usage") {
+			t.Errorf("%s should be a known verb needing an arg, got %v", verb, err)
+		}
+	}
+}

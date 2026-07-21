@@ -232,6 +232,10 @@ func (s *Server) handle(request Request) (any, error) {
 		return s.removeNode(request.Args)
 	case "status":
 		return s.status(request.Args)
+	case "cluster.suspend":
+		return s.suspendCluster(request.Args)
+	case "cluster.resume":
+		return s.resumeCluster(request.Args)
 	case "snapshot.create":
 		return s.snapshotCreate(request.Args)
 	case "snapshot.restore":
