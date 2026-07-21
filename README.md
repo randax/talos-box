@@ -69,3 +69,5 @@ sudo bin/tbx system uninstall          # remove the helper and resolver file
 ```
 
 Run `bin/tbx help` for the full command surface.
+
+For the complete path from `cluster create` to a browsable nginx URL — talosctl config, Cilium install, ingress — see the [Cilium ingress walkthrough](docs/walkthrough-cilium-ingress.md).

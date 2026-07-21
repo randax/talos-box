@@ -320,9 +320,14 @@ func (c cli) printHelp(output io.Writer) {
 	const help = `Usage: tbx <command>
 
 Commands:
-  cluster create|start|stop|destroy|list
+  up|down [-f talosbox.yaml]
+  cluster create|start|stop|suspend|resume|destroy|list
   node add|remove
+  snapshot create|restore|list|delete <cluster> [name]
   status [cluster]
+  manifests <cluster> [section]
+  console <cluster> <node>
+  bgp enable|disable <cluster>
   cache pull|prune
   system install|uninstall
   doctor

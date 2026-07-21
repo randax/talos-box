@@ -44,7 +44,7 @@ func (f Facts) hostIP(host int) string {
 // LBPool renders the CiliumLoadBalancerIPPool covering the cluster's static
 // range (.200–.239, with .200 the conventional ingress VIP).
 func LBPool(f Facts) string {
-	return fmt.Sprintf(`apiVersion: cilium.io/v2alpha1
+	return fmt.Sprintf(`apiVersion: cilium.io/v2
 kind: CiliumLoadBalancerIPPool
 metadata:
   name: %s-pool
@@ -109,13 +109,14 @@ func BalloonModule(Facts) string {
 `
 }
 
-// All renders every document with comments naming the consuming tool.
+// All renders every document with comments naming the consuming tool and the
+// per-tool section that pipes cleanly into it.
 func All(f Facts) string {
 	var b strings.Builder
-	b.WriteString("# Apply with kubectl (once Cilium is installed):\n")
+	fmt.Fprintf(&b, "# Apply with kubectl once Cilium is installed — this section alone:\n#   tbx manifests %s k8s | kubectl apply -f -\n", f.Cluster)
 	b.WriteString(k8sSection(f))
 	b.WriteString("---\n")
-	b.WriteString("# Apply with talosctl (machine config patches, e.g. talosctl patch mc -p @file):\n")
+	fmt.Fprintf(&b, "# Apply with talosctl (machine config patches, e.g. talosctl patch mc -p @file) — this section alone:\n#   tbx manifests %s talos\n", f.Cluster)
 	b.WriteString(join(RegistryMirrors(f), BalloonModule(f)))
 	return b.String()
 }
