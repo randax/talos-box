@@ -25,7 +25,7 @@ func (c *Cache) Schematic(extraArgs ...string) (string, error) {
 	}
 	request.Header.Set("Content-Type", "application/json")
 
-	response, err := c.httpClient.Do(request)
+	response, err := c.schematicClient.Do(request)
 	if err != nil {
 		return "", fmt.Errorf("post schematic: %w", err)
 	}

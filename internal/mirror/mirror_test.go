@@ -7,12 +7,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
 )
 
 const blobDigest = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+const manifestBody = `{"schemaVersion":2}`
 
 // fakeRegistry stands in for an upstream: manifest at /v2/app/manifests/latest,
 // blob behind a 302 to a "CDN", optional bearer-token gate.
@@ -59,8 +61,8 @@ func newFakeRegistry(t *testing.T, requireToken bool) *fakeRegistry {
 			w.WriteHeader(http.StatusOK)
 		case r.URL.Path == "/v2/app/manifests/latest":
 			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
-			w.Header().Set("Docker-Content-Digest", blobDigest)
-			_, _ = fmt.Fprint(w, `{"schemaVersion":2}`)
+			w.Header().Set("Docker-Content-Digest", "sha256:"+sha256Hex([]byte(manifestBody)))
+			_, _ = fmt.Fprint(w, manifestBody)
 		case strings.HasPrefix(r.URL.Path, "/v2/app/blobs/sha256:"):
 			http.Redirect(w, r, f.cdn.URL+"/cdn-blob", http.StatusFound)
 		default:
@@ -106,12 +108,13 @@ func TestPullThroughManifestAndBlob(t *testing.T) {
 	if resp.StatusCode != http.StatusOK || !strings.Contains(body, "schemaVersion") {
 		t.Fatalf("manifest = %d %q", resp.StatusCode, body)
 	}
-	if got := resp.Header.Get("Docker-Content-Digest"); got != blobDigest {
+	if got, want := resp.Header.Get("Docker-Content-Digest"), "sha256:"+sha256Hex([]byte(manifestBody)); got != want {
 		t.Errorf("digest header %q not forwarded", got)
 	}
 
 	// blob: mirror must follow the CDN redirect server-side
-	resp, body = get(t, mirror.URL+"/v2/app/blobs/"+blobDigest)
+	realDigest := "sha256:" + sha256Hex([]byte("blob-bytes"))
+	resp, body = get(t, mirror.URL+"/v2/app/blobs/"+realDigest)
 	if resp.StatusCode != http.StatusOK || body != "blob-bytes" {
 		t.Fatalf("blob = %d %q", resp.StatusCode, body)
 	}
@@ -178,34 +181,190 @@ func TestVersionPingAnsweredLocally(t *testing.T) {
 	}
 }
 
-func TestCorruptBlobNotCached(t *testing.T) {
-	// upstream serves bytes that do NOT hash to the requested digest — the
-	// mirror must serve them through (client verifies) but never cache them
-	f := newFakeRegistry(t, false)
-	dir := t.TempDir()
-	ts := httptest.NewServer(NewServer(f.registry.URL, dir))
-	defer ts.Close()
+func TestBlobIntegrityBeforeServing(t *testing.T) {
+	tests := []struct {
+		name       string
+		digest     string
+		wantStatus int
+		wantBody   string
+		wantCached bool
+	}{
+		{
+			name:       "digest mismatch is rejected",
+			digest:     blobDigest,
+			wantStatus: http.StatusBadGateway,
+			wantCached: false,
+		},
+		{
+			name:       "verified blob is served and cached",
+			digest:     "sha256:" + sha256Hex([]byte("blob-bytes")),
+			wantStatus: http.StatusOK,
+			wantBody:   "blob-bytes",
+			wantCached: true,
+		},
+	}
 
-	_, _ = get(t, ts.URL+"/v2/app/blobs/"+blobDigest) // "blob-bytes" != digest 1111...
-	hits := f.blobHits.Load()
-	_, _ = get(t, ts.URL+"/v2/app/blobs/"+blobDigest)
-	if f.blobHits.Load() == hits {
-		t.Error("mismatched blob was cached; digest verification missing")
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			f := newFakeRegistry(t, false)
+			dir := t.TempDir()
+			server := NewServer(f.registry.URL, dir)
+			ts := httptest.NewServer(server)
+			defer ts.Close()
+
+			resp, body := get(t, ts.URL+"/v2/app/blobs/"+test.digest)
+			if resp.StatusCode != test.wantStatus {
+				t.Fatalf("status = %d, want %d; body = %q", resp.StatusCode, test.wantStatus, body)
+			}
+			if test.wantBody != "" && body != test.wantBody {
+				t.Fatalf("body = %q, want %q", body, test.wantBody)
+			}
+			if !test.wantCached && body == "blob-bytes" {
+				t.Fatal("corrupt bytes were served to the first puller")
+			}
+
+			_, err := os.Stat(server.blobPath(test.digest))
+			if gotCached := err == nil; gotCached != test.wantCached {
+				t.Fatalf("cached = %t, want %t (stat error: %v)", gotCached, test.wantCached, err)
+			}
+
+			hits := f.blobHits.Load()
+			_, _ = get(t, ts.URL+"/v2/app/blobs/"+test.digest)
+			if gotHitAgain := f.blobHits.Load() > hits; gotHitAgain == test.wantCached {
+				t.Errorf("upstream hit behavior after first request does not match cached=%t", test.wantCached)
+			}
+		})
 	}
 }
 
-func TestVerifiedBlobCached(t *testing.T) {
-	f := newFakeRegistry(t, false)
-	realDigest := "sha256:" + sha256Hex([]byte("blob-bytes"))
-	dir := t.TempDir()
-	ts := httptest.NewServer(NewServer(f.registry.URL, dir))
-	defer ts.Close()
+func TestManifestIntegrityBeforeCachingOrServing(t *testing.T) {
+	validBody := []byte(manifestBody)
+	validDigest := "sha256:" + sha256Hex(validBody)
+	tests := []struct {
+		name         string
+		requestRef   string
+		contentType  string
+		digestHeader string
+		body         string
+		wantStatus   int
+		wantError    string
+		wantCached   bool
+	}{
+		{
+			name:        "HTML block page",
+			requestRef:  "latest",
+			contentType: "text/html; charset=utf-8",
+			body:        "<html>blocked by policy</html>",
+			wantStatus:  http.StatusBadGateway,
+			wantError:   "looks like a web-filter/proxy block page",
+		},
+		{
+			name:        "HTML-shaped body with misleading content type",
+			requestRef:  "latest",
+			contentType: "application/json",
+			body:        "<html>blocked by policy</html>",
+			wantStatus:  http.StatusBadGateway,
+			wantError:   "looks like a web-filter/proxy block page",
+		},
+		{
+			name:        "unsupported manifest media type",
+			requestRef:  "latest",
+			contentType: "application/octet-stream",
+			body:        manifestBody,
+			wantStatus:  http.StatusBadGateway,
+			wantError:   "unsupported Content-Type",
+		},
+		{
+			name:        "invalid manifest JSON",
+			requestRef:  "latest",
+			contentType: "application/vnd.oci.image.manifest.v1+json",
+			body:        "not-json",
+			wantStatus:  http.StatusBadGateway,
+			wantError:   "not valid JSON",
+		},
+		{
+			name:         "digest header mismatch",
+			requestRef:   "latest",
+			contentType:  "application/vnd.oci.image.manifest.v1+json",
+			digestHeader: blobDigest,
+			body:         manifestBody,
+			wantStatus:   http.StatusBadGateway,
+			wantError:    "Docker-Content-Digest",
+		},
+		{
+			name:         "requested digest mismatch",
+			requestRef:   blobDigest,
+			contentType:  "application/vnd.oci.image.manifest.v1+json",
+			digestHeader: validDigest,
+			body:         manifestBody,
+			wantStatus:   http.StatusBadGateway,
+			wantError:    "requested digest",
+		},
+		{
+			name:         "valid manifest",
+			requestRef:   "latest",
+			contentType:  "application/vnd.oci.image.manifest.v1+json",
+			digestHeader: validDigest,
+			body:         manifestBody,
+			wantStatus:   http.StatusOK,
+			wantCached:   true,
+		},
+		{
+			name:         "valid manifest requested by digest",
+			requestRef:   validDigest,
+			contentType:  "application/vnd.oci.image.manifest.v1+json",
+			digestHeader: validDigest,
+			body:         manifestBody,
+			wantStatus:   http.StatusOK,
+			wantCached:   true,
+		},
+	}
 
-	_, _ = get(t, ts.URL+"/v2/app/blobs/"+realDigest)
-	hits := f.blobHits.Load()
-	_, body := get(t, ts.URL+"/v2/app/blobs/"+realDigest)
-	if body != "blob-bytes" || f.blobHits.Load() != hits {
-		t.Errorf("verified blob not served from cache (hits %d -> %d)", hits, f.blobHits.Load())
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", test.contentType)
+				if test.digestHeader != "" {
+					w.Header().Set("Docker-Content-Digest", test.digestHeader)
+				}
+				_, _ = fmt.Fprint(w, test.body)
+			}))
+
+			dir := t.TempDir()
+			server := NewServer(upstream.URL, dir)
+			mirror := httptest.NewServer(server)
+			defer mirror.Close()
+			path := "/v2/app/manifests/" + test.requestRef
+
+			resp, body := get(t, mirror.URL+path)
+			if resp.StatusCode != test.wantStatus {
+				t.Fatalf("status = %d, want %d; body = %q", resp.StatusCode, test.wantStatus, body)
+			}
+			if test.wantError != "" && !strings.Contains(body, test.wantError) {
+				t.Errorf("error body %q does not contain %q", body, test.wantError)
+			}
+			if test.wantError == "looks like a web-filter/proxy block page" && !strings.Contains(body, upstream.URL) {
+				t.Errorf("block-page error %q does not name upstream URL %q", body, upstream.URL)
+			}
+			if test.wantCached && body != manifestBody {
+				t.Errorf("body = %q, want valid manifest", body)
+			}
+
+			_, err := os.Stat(server.manifestPath(path))
+			if gotCached := err == nil; gotCached != test.wantCached {
+				t.Fatalf("cached = %t, want %t (stat error: %v)", gotCached, test.wantCached, err)
+			}
+
+			upstream.Close()
+			resp, cachedBody := get(t, mirror.URL+path)
+			if test.wantCached {
+				if resp.StatusCode != http.StatusOK || cachedBody != manifestBody {
+					t.Errorf("cached response = %d %q", resp.StatusCode, cachedBody)
+				}
+			} else if resp.StatusCode == http.StatusOK {
+				t.Errorf("invalid manifest was served from cache: %q", cachedBody)
+			}
+		})
 	}
 }
 
