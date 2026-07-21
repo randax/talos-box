@@ -37,7 +37,7 @@ func (s *Server) up(raw json.RawMessage) ([]Action, error) {
 			if err != nil {
 				return actions[:i], err
 			}
-			if err := s.start(item); err != nil {
+			if err := s.startAndLogWarning(item); err != nil {
 				return actions[:i], fmt.Errorf("start %s: %w", spec.Name, err)
 			}
 		}

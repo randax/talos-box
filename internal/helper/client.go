@@ -8,12 +8,20 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
 
 // SocketPath is the helper's system-wide Unix socket.
 const SocketPath = "/var/run/tbx-helper.sock"
+
+// The helper only performs short admin operations, so every interaction is
+// bounded: a stuck helper must not wedge daemon shutdown or cluster ops.
+const (
+	dialTimeout = 5 * time.Second
+	callTimeout = 30 * time.Second
+)
 
 // Client is a serialized connection to tbx-helper.
 type Client struct {
@@ -23,11 +31,12 @@ type Client struct {
 
 // Connect connects to the system helper.
 func Connect() (*Client, error) {
-	connection, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: SocketPath, Net: "unix"})
+	dialer := net.Dialer{Timeout: dialTimeout}
+	connection, err := dialer.Dial("unix", SocketPath)
 	if err != nil {
 		return nil, fmt.Errorf("connect to helper: %w", err)
 	}
-	return &Client{connection: connection}, nil
+	return &Client{connection: connection.(*net.UnixConn)}, nil
 }
 
 // Close closes the helper connection.
@@ -105,6 +114,11 @@ func (c *Client) Ping() error {
 func (c *Client) call(op string, args any, wantFD bool) (Response, int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if err := c.connection.SetDeadline(time.Now().Add(callTimeout)); err != nil {
+		return Response{}, -1, fmt.Errorf("set helper call deadline: %w", err)
+	}
+	defer func() { _ = c.connection.SetDeadline(time.Time{}) }()
 
 	rawArgs, err := json.Marshal(args)
 	if err != nil {

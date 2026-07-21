@@ -28,6 +28,7 @@ type Server struct {
 	vms              map[string]map[string]*vm.VM
 	mirrors          *mirror.Manager
 	defaultSchematic string
+	subnetSources    cluster.SubnetSources
 
 	listenerMu   sync.Mutex
 	listener     net.Listener
@@ -60,9 +61,10 @@ func NewServer() (*Server, error) {
 		return nil, err
 	}
 	return &Server{
-		cache:   cache,
-		vms:     make(map[string]map[string]*vm.VM),
-		mirrors: mirror.NewManager(mirror.DefaultDir(root)),
+		cache:         cache,
+		vms:           make(map[string]map[string]*vm.VM),
+		mirrors:       mirror.NewManager(mirror.DefaultDir(root)),
+		subnetSources: cluster.SystemSubnetSources(),
 	}, nil
 }
 
