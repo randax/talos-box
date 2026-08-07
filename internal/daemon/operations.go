@@ -133,6 +133,10 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return ClusterSummary{}, fmt.Errorf("inspect cluster directory: %w", err)
 	}
+	hostPressureWarning, err := s.checkHostPressure(dir, args.Force)
+	if err != nil {
+		return ClusterSummary{}, err
+	}
 	if err := requireHelper(); err != nil {
 		return ClusterSummary{}, err
 	}
@@ -141,7 +145,6 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if err != nil {
 		return ClusterSummary{}, err
 	}
-
 	clusters, err := cluster.List()
 	if err != nil {
 		return ClusterSummary{}, err
@@ -176,11 +179,11 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	startWarning, err := s.start(item)
 	if err != nil {
 		result := summary(item, false)
-		result.Warning = joinWarnings(overcommitWarning, subnetWarning)
+		result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, subnetWarning)
 		return result, fmt.Errorf("cluster created but failed to start: %w", err)
 	}
 	result := summary(item, true)
-	result.Warning = joinWarnings(overcommitWarning, subnetWarning, startWarning)
+	result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, subnetWarning, startWarning)
 	return result, nil
 }
 
@@ -201,12 +204,20 @@ func (s *Server) startCluster(raw json.RawMessage) (ClusterSummary, error) {
 		}
 		overcommitWarning = w
 	}
+	dir, err := cluster.Dir(item.Name)
+	if err != nil {
+		return ClusterSummary{}, err
+	}
+	hostPressureWarning, err := s.checkHostPressure(dir, args.Force)
+	if err != nil {
+		return ClusterSummary{}, err
+	}
 	subnetWarning, err := s.start(item)
 	if err != nil {
 		return ClusterSummary{}, err
 	}
 	result := summary(item, true)
-	result.Warning = joinWarnings(overcommitWarning, subnetWarning)
+	result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, subnetWarning)
 	return result, nil
 }
 
@@ -485,6 +496,14 @@ func (s *Server) addNode(raw json.RawMessage) (NodeStatus, error) {
 	if err != nil {
 		return NodeStatus{}, err
 	}
+	dir, err := cluster.Dir(item.Name)
+	if err != nil {
+		return NodeStatus{}, err
+	}
+	hostPressureWarning, err := s.checkHostPressure(dir, args.Force)
+	if err != nil {
+		return NodeStatus{}, err
+	}
 	running := s.clusterRunning(item.Name)
 	var subnetWarning string
 	if running {
@@ -525,7 +544,7 @@ func (s *Server) addNode(raw json.RawMessage) (NodeStatus, error) {
 		s.vms[item.Name][node.Name] = machine
 	}
 	status := nodeStatus(node, item.SubnetIndex, s.nodeRunning(item.Name, node.Name))
-	status.Warning = joinWarnings(overcommitWarning, subnetWarning)
+	status.Warning = joinWarnings(overcommitWarning, hostPressureWarning, subnetWarning)
 	return status, nil
 }
 

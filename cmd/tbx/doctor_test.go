@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/randax/talos-box/internal/daemon"
+	"github.com/randax/talos-box/internal/hostpressure"
 )
 
 func TestParseDSCacheAddresses(t *testing.T) {
@@ -358,6 +359,28 @@ func TestRunDoctorNoClustersSkipsAndEgressWarnIsNonFatal(t *testing.T) {
 	}
 }
 
+func TestRunDoctorWarnsOnExtremeHostPressure(t *testing.T) {
+	deps := passingDoctorDependencies()
+	deps.hostPressure = func() (hostpressure.Snapshot, error) {
+		return hostpressure.Snapshot{
+			Swap:       hostpressure.Usage{TotalBytes: 10 << 30, AvailableBytes: 1 << 30},
+			DataVolume: hostpressure.Usage{TotalBytes: 100 << 30, AvailableBytes: 5 << 30},
+		}, nil
+	}
+	var output strings.Builder
+	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
+		t.Fatalf("runDoctorWithDependencies() = %v for warning-only host pressure", err)
+	}
+	for _, line := range []string{
+		"WARN host-pressure: host swap is 90% used",
+		"WARN host-pressure: talosbox data volume is 95% used",
+	} {
+		if !strings.Contains(output.String(), line) {
+			t.Errorf("output missing %q:\n%s", line, output.String())
+		}
+	}
+}
+
 func TestRunDoctorClusterListOperationErrorFailsChecks(t *testing.T) {
 	deps := passingDoctorDependencies()
 	deps.listClusters = func() ([]daemon.ClusterSummary, error) {
@@ -526,6 +549,7 @@ func passingDoctorDependencies() doctorDependencies {
 		checkForwarding: pass,
 		listClusters:    func() ([]daemon.ClusterSummary, error) { return nil, nil },
 		getStatus:       func() ([]daemon.ClusterStatus, error) { return nil, nil },
+		hostPressure:    func() (hostpressure.Snapshot, error) { return hostpressure.Snapshot{}, nil },
 		command: func(string, ...string) ([]byte, error) {
 			return nil, nil
 		},

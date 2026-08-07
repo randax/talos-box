@@ -2,9 +2,11 @@ package daemon
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/randax/talos-box/internal/balloon"
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/hostpressure"
 	"github.com/randax/talos-box/internal/vm"
 )
 
@@ -78,6 +80,25 @@ func (s *Server) checkOvercommit(addMiB int, force bool) (string, error) {
 		return "", fmt.Errorf("%s (use --force to override; ballooning will reclaim under pressure)", msg)
 	}
 	return msg + " (forced — ballooning will reclaim under pressure)", nil
+}
+
+func (s *Server) checkHostPressure(path string, force bool) (string, error) {
+	measure := s.hostPressure
+	if measure == nil {
+		measure = hostpressure.SystemSnapshot
+	}
+	snapshot, err := measure(path)
+	if err != nil {
+		return fmt.Sprintf("host-pressure probe failed: %v; proceeding without host-pressure protection", err), nil
+	}
+	warning := strings.Join(hostpressure.Warnings(snapshot), "; ")
+	if warning == "" {
+		return "", nil
+	}
+	if !force {
+		return "", fmt.Errorf("%s (use --force to override)", warning)
+	}
+	return warning + " (forced)", nil
 }
 
 func clusterMemoryMiB(item cluster.Cluster) int {

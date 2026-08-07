@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/config"
 )
 
@@ -13,7 +14,7 @@ func TestPlanUp(t *testing.T) {
 	}
 	existing := map[string]ClusterState{
 		"beta":  {Exists: true, Running: false},
-		"gamma": {Exists: true, Running: true},
+		"gamma": {Exists: true, Running: true, Ready: true},
 	}
 	got := PlanUp(desired, existing)
 	want := []Action{
@@ -23,6 +24,32 @@ func TestPlanUp(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("PlanUp = %+v, want %+v", got, want)
+	}
+}
+
+func TestPlanUpStartsPartiallyRunningCluster(t *testing.T) {
+	desired := []config.ClusterSpec{{Name: "partial"}}
+	existing := map[string]ClusterState{
+		"partial": {Exists: true, Running: true, Ready: false},
+	}
+
+	got := PlanUp(desired, existing)
+	want := []Action{{Cluster: "partial", Kind: ActionStart}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("PlanUp = %+v, want %+v", got, want)
+	}
+}
+
+func TestClusterReadyRequiresEveryPersistedNode(t *testing.T) {
+	item := cluster.Cluster{Nodes: []cluster.Node{{Name: "cp-1"}, {Name: "worker-1"}}}
+	active := map[string]bool{"cp-1": true, "worker-1": false}
+
+	if clusterReady(item, func(name string) bool { return active[name] }) {
+		t.Fatal("clusterReady() = true with an inactive persisted node")
+	}
+	active["worker-1"] = true
+	if !clusterReady(item, func(name string) bool { return active[name] }) {
+		t.Fatal("clusterReady() = false with every persisted node active")
 	}
 }
 

@@ -188,6 +188,13 @@ Any other hostname under `.demo.k8s.test` works the same way; just add Ingress r
 
 ## Observed gotchas
 
+- Run `tbx doctor` before creating or starting a workshop cluster. Extreme host swap or
+  data-volume pressure can reset guests during image unpack and corrupt Talos EPHEMERAL data;
+  free memory/disk space or reduce the cluster size instead of overriding the preflight.
+- If a Talos system service reports `exec format error` (or exits 139) after an unexpected
+  guest reset, assume its unpacked EPHEMERAL snapshot is truncated. Re-pulling the image does
+  not replace the pinned corrupt snapshot chain; destroy and recreate the affected node or
+  cluster after relieving host pressure.
 - The kube-apiserver refuses connections for a minute or two after `bootstrap` while
   control-plane images pull; keep polling.
 - The default namespace's PodSecurity warning on the nginx deployment is harmless for a demo.
