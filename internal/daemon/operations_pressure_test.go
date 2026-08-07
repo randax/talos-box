@@ -99,13 +99,3 @@ func TestAddNodeSurfacesHostPressureProbeFailure(t *testing.T) {
 		t.Fatalf("NodeStatus.Warning = %q, want probe failure", result.Warning)
 	}
 }
-
-func extremeSwapPressure(string) (hostpressure.Snapshot, error) {
-	return hostpressure.Snapshot{
-		Swap: hostpressure.Usage{TotalBytes: 10 << 30, AvailableBytes: 1 << 30},
-	}, nil
-}
-
-func noHostPressure(string) (hostpressure.Snapshot, error) {
-	return hostpressure.Snapshot{}, nil
-}
