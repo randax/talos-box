@@ -12,12 +12,16 @@ import (
 const defaultConfigFile = "talosbox.yaml"
 
 func (c cli) runUp(args []string) error {
-	cfg, err := loadConfigFile(args, "up")
+	cfg, force, err := loadUpConfigFile(args)
 	if err != nil {
 		return err
 	}
 	var actions []daemon.Action
-	if err := c.call("up", cfg, &actions); err != nil {
+	request := struct {
+		config.Config
+		Force bool `json:"force"`
+	}{Config: cfg, Force: force}
+	if err := c.call("up", request, &actions); err != nil {
 		return err
 	}
 	return c.printActions(actions, map[daemon.ActionKind]string{
@@ -52,8 +56,26 @@ func (c cli) printActions(actions []daemon.Action, wording map[daemon.ActionKind
 		if _, err := fmt.Fprintf(c.out, format+"\n", action.Cluster); err != nil {
 			return err
 		}
+		if err := printWarning(c.err, action.Warning); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func loadUpConfigFile(args []string) (config.Config, bool, error) {
+	fs := flag.NewFlagSet("up", flag.ContinueOnError)
+	path := fs.String("f", defaultConfigFile, "path to talosbox.yaml")
+	force := fs.Bool("force", false, "override overcommit or host-pressure safeguards")
+	if err := fs.Parse(args); err != nil {
+		return config.Config{}, false, err
+	}
+	data, err := os.ReadFile(*path)
+	if err != nil {
+		return config.Config{}, false, fmt.Errorf("read %s: %w", *path, err)
+	}
+	cfg, err := config.Parse(data)
+	return cfg, *force, err
 }
 
 func loadConfigFile(args []string, verb string) (config.Config, error) {

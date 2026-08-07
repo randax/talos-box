@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/hostpressure"
 	"github.com/randax/talos-box/internal/imagecache"
 	"github.com/randax/talos-box/internal/mirror"
 	"github.com/randax/talos-box/internal/vm"
@@ -29,6 +30,7 @@ type Server struct {
 	mirrors          *mirror.Manager
 	defaultSchematic string
 	subnetSources    cluster.SubnetSources
+	hostPressure     func(string) (hostpressure.Snapshot, error)
 
 	listenerMu   sync.Mutex
 	listener     net.Listener
@@ -65,6 +67,7 @@ func NewServer() (*Server, error) {
 		vms:           make(map[string]map[string]*vm.VM),
 		mirrors:       mirror.NewManager(mirror.DefaultDir(root)),
 		subnetSources: cluster.SystemSubnetSources(),
+		hostPressure:  hostpressure.SystemSnapshot,
 	}, nil
 }
 

@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/randax/talos-box/internal/daemon"
 	tbxdns "github.com/randax/talos-box/internal/dns"
 	"github.com/randax/talos-box/internal/helper"
+	"github.com/randax/talos-box/internal/hostpressure"
 )
 
 const resolverPath = "/etc/resolver/k8s.test"
@@ -22,6 +24,7 @@ type doctorDependencies struct {
 	checkForwarding func() error
 	listClusters    func() ([]daemon.ClusterSummary, error)
 	getStatus       func() ([]daemon.ClusterStatus, error)
+	hostPressure    func() (hostpressure.Snapshot, error)
 	command         commandOutput
 	doHTTP          httpDo
 }
@@ -75,6 +78,26 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		}
 		if err := writeFindings(finding); err != nil {
 			return err
+		}
+	}
+
+	if deps.hostPressure == nil {
+		if err := writeFindings(doctorFinding{level: "SKIP", check: "host-pressure", detail: "probe unavailable"}); err != nil {
+			return err
+		}
+	} else if snapshot, err := deps.hostPressure(); err != nil {
+		if err := writeFindings(doctorFinding{level: "SKIP", check: "host-pressure", detail: err.Error()}); err != nil {
+			return err
+		}
+	} else if warnings := hostpressure.Warnings(snapshot); len(warnings) == 0 {
+		if err := writeFindings(doctorFinding{level: "PASS", check: "host-pressure"}); err != nil {
+			return err
+		}
+	} else {
+		for _, warning := range warnings {
+			if err := writeFindings(doctorFinding{level: "WARN", check: "host-pressure", detail: warning}); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -180,6 +203,13 @@ func (c cli) doctorDependencies() doctorDependencies {
 			var result []daemon.ClusterStatus
 			err := c.doctorCall("status", map[string]string{"cluster": ""}, &result)
 			return result, err
+		},
+		hostPressure: func() (hostpressure.Snapshot, error) {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return hostpressure.Snapshot{}, fmt.Errorf("find home directory: %w", err)
+			}
+			return hostpressure.SystemSnapshot(filepath.Join(home, ".talosbox"))
 		},
 		command: command,
 		doHTTP:  newDoctorHTTPClient().Do,

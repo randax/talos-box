@@ -6,6 +6,7 @@ import "github.com/randax/talos-box/internal/config"
 type ClusterState struct {
 	Exists  bool
 	Running bool
+	Ready   bool
 }
 
 // ActionKind is what `tbx up`/`down` decided to do with one cluster.
@@ -24,6 +25,7 @@ const (
 type Action struct {
 	Cluster string     `json:"cluster"`
 	Kind    ActionKind `json:"action"`
+	Warning string     `json:"warning,omitempty"`
 }
 
 // PlanUp decides, per desired cluster: create it, start it, or leave it.
@@ -33,11 +35,11 @@ func PlanUp(desired []config.ClusterSpec, existing map[string]ClusterState) []Ac
 		state := existing[spec.Name]
 		switch {
 		case !state.Exists:
-			actions = append(actions, Action{spec.Name, ActionCreate})
-		case !state.Running:
-			actions = append(actions, Action{spec.Name, ActionStart})
+			actions = append(actions, Action{Cluster: spec.Name, Kind: ActionCreate})
+		case !state.Ready:
+			actions = append(actions, Action{Cluster: spec.Name, Kind: ActionStart})
 		default:
-			actions = append(actions, Action{spec.Name, ActionNone})
+			actions = append(actions, Action{Cluster: spec.Name, Kind: ActionNone})
 		}
 	}
 	return actions
@@ -50,11 +52,11 @@ func PlanDown(desired []config.ClusterSpec, existing map[string]ClusterState) []
 		state := existing[spec.Name]
 		switch {
 		case !state.Exists:
-			actions = append(actions, Action{spec.Name, ActionMissing})
+			actions = append(actions, Action{Cluster: spec.Name, Kind: ActionMissing})
 		case state.Running:
-			actions = append(actions, Action{spec.Name, ActionStop})
+			actions = append(actions, Action{Cluster: spec.Name, Kind: ActionStop})
 		default:
-			actions = append(actions, Action{spec.Name, ActionNone})
+			actions = append(actions, Action{Cluster: spec.Name, Kind: ActionNone})
 		}
 	}
 	return actions

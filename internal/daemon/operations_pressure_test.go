@@ -1,0 +1,63 @@
+package daemon
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/hostpressure"
+	"github.com/randax/talos-box/internal/vm"
+)
+
+func TestCreateClusterChecksHostPressureBeforeMutation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	service := &Server{hostPressure: extremeSwapPressure}
+	raw, err := json.Marshal(createArgs{Name: "unsafe-create"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.createCluster(raw)
+	if err == nil || !strings.Contains(err.Error(), "host swap is 90% used") {
+		t.Fatalf("createCluster() error = %v, want host-pressure refusal", err)
+	}
+	if _, loadErr := cluster.Load("unsafe-create"); loadErr == nil {
+		t.Fatal("createCluster() persisted state despite host-pressure refusal")
+	}
+}
+
+func TestAddNodeChecksHostPressureBeforeMutation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("unsafe-add", 0, 0, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	service := &Server{
+		vms:          make(map[string]map[string]*vm.VM),
+		hostPressure: extremeSwapPressure,
+	}
+	raw, err := json.Marshal(nodeArgs{Cluster: item.Name, Name: "unsafe-worker", Role: cluster.RoleWorker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.addNode(raw)
+	if err == nil || !strings.Contains(err.Error(), "host swap is 90% used") {
+		t.Fatalf("addNode() error = %v, want host-pressure refusal", err)
+	}
+	reloaded, err := cluster.Load(item.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded.Nodes) != 0 {
+		t.Fatalf("addNode() persisted %d nodes despite host-pressure refusal", len(reloaded.Nodes))
+	}
+}
+
+func extremeSwapPressure(string) (hostpressure.Snapshot, error) {
+	return hostpressure.Snapshot{
+		Swap: hostpressure.Usage{TotalBytes: 10 << 30, AvailableBytes: 1 << 30},
+	}, nil
+}

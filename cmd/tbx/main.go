@@ -76,7 +76,24 @@ func (c cli) runCluster(args []string) error {
 	switch args[0] {
 	case "create":
 		return c.createCluster(args[1:])
-	case "start", "stop", "suspend", "resume":
+	case "start":
+		name, force, err := parseClusterStartArgs(args[1:], c.err)
+		if err != nil {
+			return err
+		}
+		request := struct {
+			Name  string `json:"name"`
+			Force bool   `json:"force"`
+		}{Name: name, Force: force}
+		var result daemon.ClusterSummary
+		if err := c.call("cluster.start", request, &result); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(c.out, "started cluster %s\n", result.Name); err != nil {
+			return err
+		}
+		return printWarning(c.err, result.Warning)
+	case "stop", "suspend", "resume":
 		if len(args) != 2 {
 			return fmt.Errorf("usage: tbx cluster %s <name>", args[0])
 		}
@@ -114,6 +131,20 @@ func (c cli) runCluster(args []string) error {
 	}
 }
 
+func parseClusterStartArgs(args []string, output io.Writer) (string, bool, error) {
+	flags := flag.NewFlagSet("cluster start", flag.ContinueOnError)
+	flags.SetOutput(output)
+	force := flags.Bool("force", false, "proceed despite an overcommit or host-pressure warning")
+	positionals, err := parseInterspersed(flags, args)
+	if err != nil {
+		return "", false, err
+	}
+	if len(positionals) != 1 {
+		return "", false, errors.New("usage: tbx cluster start <name> [--force]")
+	}
+	return positionals[0], *force, nil
+}
+
 func (c cli) createCluster(args []string) error {
 	flags := flag.NewFlagSet("cluster create", flag.ContinueOnError)
 	flags.SetOutput(c.err)
@@ -124,7 +155,7 @@ func (c cli) createCluster(args []string) error {
 	disk := flags.Int("disk-gib", cluster.DefaultDiskGiB, "disk size per node in GiB")
 	talosVersion := flags.String("talos-version", daemon.DefaultTalosVersion, "Talos version")
 	schematic := flags.String("schematic", "", "Image Factory schematic")
-	force := flags.Bool("force", false, "proceed despite an overcommit warning")
+	force := flags.Bool("force", false, "proceed despite an overcommit or host-pressure warning")
 	positionals, err := parseInterspersed(flags, args)
 	if err != nil {
 		return err
@@ -204,7 +235,7 @@ func (c cli) runNode(args []string) error {
 		flags := flag.NewFlagSet("node add", flag.ContinueOnError)
 		flags.SetOutput(c.err)
 		role := flags.String("role", string(cluster.RoleWorker), "worker or control-plane")
-		force := flags.Bool("force", false, "proceed despite an overcommit warning")
+		force := flags.Bool("force", false, "proceed despite an overcommit or host-pressure warning")
 		positionals, err := parseInterspersed(flags, args[1:])
 		if err != nil {
 			return err
@@ -320,7 +351,8 @@ func (c cli) printHelp(output io.Writer) {
 	const help = `Usage: tbx <command>
 
 Commands:
-  up|down [-f talosbox.yaml]
+  up [-f talosbox.yaml] [--force]
+  down [-f talosbox.yaml]
   cluster create|start|stop|suspend|resume|destroy|list
   node add|remove
   snapshot create|restore|list|delete
