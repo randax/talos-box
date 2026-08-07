@@ -89,7 +89,7 @@ func (s *Server) checkHostPressure(path string, force bool) (string, error) {
 	}
 	snapshot, err := measure(path)
 	if err != nil {
-		return "", nil // diagnostics report probe failures; operations remain portable
+		return fmt.Sprintf("host-pressure probe failed: %v; proceeding without host-pressure protection", err), nil
 	}
 	warning := strings.Join(hostpressure.Warnings(snapshot), "; ")
 	if warning == "" {

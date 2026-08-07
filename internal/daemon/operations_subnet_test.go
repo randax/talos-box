@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"encoding/json"
+	"errors"
 	"net"
 	"strings"
 	"testing"
@@ -45,7 +46,8 @@ func TestStartClusterAttachesSubnetWarning(t *testing.T) {
 		t.Fatal(err)
 	}
 	service := &Server{
-		vms: make(map[string]map[string]*vm.VM),
+		vms:          make(map[string]map[string]*vm.VM),
+		hostPressure: noHostPressure,
 		subnetSources: cluster.SubnetSources{
 			Interfaces: func() ([]cluster.HostInterface, error) { return nil, nil },
 			Route: func(net.IP) (cluster.HostRoute, error) {
@@ -137,5 +139,38 @@ func TestStartClusterForceSurfacesExtremeHostPressureWarning(t *testing.T) {
 		if !strings.Contains(result.Warning, fragment) {
 			t.Errorf("ClusterSummary.Warning = %q, missing %q", result.Warning, fragment)
 		}
+	}
+}
+
+func TestStartClusterSurfacesHostPressureProbeFailure(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	item, err := cluster.New("pressure-probe-failure", 0, 0, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	service := &Server{
+		vms: make(map[string]map[string]*vm.VM),
+		hostPressure: func(string) (hostpressure.Snapshot, error) {
+			return hostpressure.Snapshot{}, errors.New("sysctl unavailable")
+		},
+		subnetSources: cluster.SubnetSources{
+			Interfaces: func() ([]cluster.HostInterface, error) { return nil, nil },
+			Route:      func(net.IP) (cluster.HostRoute, error) { return cluster.HostRoute{}, nil },
+		},
+	}
+	raw, err := json.Marshal(startArgs{Name: item.Name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.startCluster(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result.Warning, "host-pressure probe failed: sysctl unavailable") {
+		t.Fatalf("ClusterSummary.Warning = %q, want probe failure", result.Warning)
 	}
 }
