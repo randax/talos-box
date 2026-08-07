@@ -32,7 +32,7 @@ func TestCreateClusterChecksHostPressureBeforeMutation(t *testing.T) {
 
 func TestAddNodeChecksHostPressureBeforeMutation(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	item, err := cluster.New("unsafe-add", 0, 0, 0, cluster.NodeDefaults{})
+	item, err := cluster.New("unsafe-add", 0, 0, 0, cluster.NodeDefaults{MemoryMiB: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func TestAddNodeChecksHostPressureBeforeMutation(t *testing.T) {
 func TestAddNodeSurfacesHostPressureProbeFailure(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	item, err := cluster.New("probe-failed-add", 0, 0, 0, cluster.NodeDefaults{DiskGiB: 1})
+	item, err := cluster.New("probe-failed-add", 0, 0, 0, cluster.NodeDefaults{MemoryMiB: 1, DiskGiB: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
