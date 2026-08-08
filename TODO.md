@@ -147,9 +147,9 @@ Acceptance:
 - Upgrade and uninstall preserve/remove the helper and resolver state exactly as documented.
 - The release contract is reusable by #95 instead of creating competing tag workflows.
 
-### 1.3 Verify and close #22; then run #27
+### 1.3 #22 verified; run #27
 
-The code history shows the networking slices landed, but #22 remains open. Re-run its mandatory two-cluster bridge test and host-to-VIP/guest-to-guest checks. If green, close the milestone; if not, file a bounded leaf defect rather than reopening the whole milestone.
+The mandatory physical-Mac test now passes with two helper-backed vmnet bridges on pinned `/24`s: freshly leased nodes reach each other in both directions before any priming traffic, host-to-node and host-to-VIP probes succeed, and nodes reach the remote VIP. The PID-gated regression test is `TestHelperNetworkingE2E`; #22 closes with its implementation PR.
 
 #27 is the release gate: run the attendee flow from the brew-installed binary through cluster creation, manual Talos bootstrap, Cilium through mirrors, ingress VIP, snapshots, BGP, and the second routed cluster. Incorporate #84's safe-host preflight and #42's documented restore boundary.
 
@@ -248,7 +248,7 @@ Acceptance for the parent:
 
 - **#13 and #29:** retain as v1 map/PRD until #27 passes; then reconcile their checklists and close with links to release evidence. Do not implement against them directly.
 - **#18:** run only on real macOS 14/15 Apple Silicon hardware. Record the verified floor or raise it; this remains explicitly non-blocking.
-- **#22:** close after its specific two-cluster networking exit test, not merely because its code commits exist.
+- **#22:** verified by its physical-Mac, PID-gated two-bridge networking exit test; close with the implementation PR.
 - **#102:** close only after its new child DAG and end-to-end provisioning acceptance are complete.
 
 ## Verification strategy

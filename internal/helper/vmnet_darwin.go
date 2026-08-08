@@ -9,7 +9,6 @@ package helper
 #include <dispatch/dispatch.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <pthread.h>
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -28,9 +27,7 @@ typedef struct tbx_vmnet {
 	int peer_fd;
 	size_t max_packet_size;
 	void *read_buffer;
-	void *write_buffer;
-	pthread_t writer_thread;
-	int writer_started;
+	atomic_ulong drain_send_failures;
 	atomic_bool stopping;
 } tbx_vmnet_t;
 
@@ -99,41 +96,22 @@ static void tbx_drain_vmnet(tbx_vmnet_t *state) {
 		do {
 			written = send(state->pump_fd, state->read_buffer, packet.vm_pkt_size, MSG_DONTWAIT);
 		} while (written < 0 && errno == EINTR);
+		if (written == (ssize_t)packet.vm_pkt_size) {
+			continue;
+		}
+		unsigned long failure_count = atomic_fetch_add(&state->drain_send_failures, 1) + 1;
+		if (failure_count == 1 || (failure_count & (failure_count - 1)) == 0) {
+			int saved_errno = written < 0 ? errno : 0;
+			fprintf(
+				stderr,
+				"tbx vmnet drain drop count=%lu wrote=%zd want=%zu errno=%d\n",
+				failure_count,
+				written,
+				packet.vm_pkt_size,
+				saved_errno
+			);
+		}
 		// Dropping on socket backpressure keeps the serial vmnet event queue live.
-	}
-}
-
-static void *tbx_write_vmnet(void *opaque) {
-	tbx_vmnet_t *state = opaque;
-	for (;;) {
-		struct iovec iov = {
-			.iov_base = state->write_buffer,
-			.iov_len = state->max_packet_size,
-		};
-		struct msghdr message = {
-			.msg_iov = &iov,
-			.msg_iovlen = 1,
-		};
-		ssize_t size = recvmsg(state->pump_fd, &message, 0);
-		if (size < 0 && errno == EINTR) {
-			continue;
-		}
-		if (size <= 0 || atomic_load(&state->stopping)) {
-			return NULL;
-		}
-		if ((message.msg_flags & MSG_TRUNC) != 0) {
-			continue;
-		}
-
-		iov.iov_len = (size_t)size;
-		struct vmpktdesc packet = {
-			.vm_pkt_size = (size_t)size,
-			.vm_pkt_iov = &iov,
-			.vm_pkt_iovcnt = 1,
-			.vm_flags = 0,
-		};
-		int packet_count = 1;
-		(void)vmnet_write(state->interface, &packet, &packet_count);
 	}
 }
 
@@ -145,7 +123,6 @@ static void tbx_free_start_state(tbx_vmnet_t *state) {
 		close(state->peer_fd);
 	}
 	free(state->read_buffer);
-	free(state->write_buffer);
 	free(state);
 }
 
@@ -225,10 +202,10 @@ static int tbx_vmnet_start(
 	state->peer_fd = -1;
 	state->max_packet_size = (size_t)max_packet_size;
 	atomic_init(&state->stopping, false);
+	atomic_init(&state->drain_send_failures, 0);
 
 	state->read_buffer = malloc(state->max_packet_size);
-	state->write_buffer = malloc(state->max_packet_size);
-	if (state->read_buffer == NULL || state->write_buffer == NULL) {
+	if (state->read_buffer == NULL) {
 		tbx_stop_and_release(interface, queue);
 		tbx_free_start_state(state);
 		*out_errno = ENOMEM;
@@ -278,24 +255,40 @@ static int tbx_vmnet_start(
 		*out_vmnet_status = callback_status;
 		return -1;
 	}
-
-	int thread_error = pthread_create(&state->writer_thread, NULL, tbx_write_vmnet, state);
-	if (thread_error != 0) {
-		atomic_store(&state->stopping, true);
-		(void)vmnet_interface_set_event_callback(interface, 0, NULL, NULL);
-		dispatch_sync(queue, ^{});
-		tbx_stop_and_release(interface, queue);
-		tbx_free_start_state(state);
-		*out_errno = thread_error;
-		return -1;
-	}
-	state->writer_started = 1;
 	*out_state = state;
 	*out_fd = state->peer_fd;
 	return 0;
 }
 
-static int tbx_vmnet_stop(
+static int tbx_vmnet_prepare_stop(
+	tbx_vmnet_t *state,
+	int *out_errno,
+	uint32_t *out_callback_status
+) {
+	*out_errno = 0;
+	*out_callback_status = VMNET_SUCCESS;
+	atomic_store(&state->stopping, true);
+
+	vmnet_return_t callback_status =
+		vmnet_interface_set_event_callback(
+			state->interface,
+			0,
+			NULL,
+			NULL
+		);
+	dispatch_sync(state->queue, ^{});
+	if (state->pump_fd >= 0 && shutdown(state->pump_fd, SHUT_RDWR) != 0 && errno != ENOTCONN) {
+		int saved_errno = errno;
+		(void)close(state->pump_fd);
+		state->pump_fd = -1;
+		fprintf(stderr, "tbx vmnet prepare stop fallback close errno=%d\n", saved_errno);
+		*out_errno = saved_errno;
+	}
+	*out_callback_status = callback_status;
+	return 0;
+}
+
+static int tbx_vmnet_finish_stop(
 	tbx_vmnet_t *state,
 	int *out_errno,
 	uint32_t *out_vmnet_status,
@@ -304,21 +297,6 @@ static int tbx_vmnet_stop(
 	*out_errno = 0;
 	*out_vmnet_status = VMNET_SUCCESS;
 	*out_retain = 0;
-	atomic_store(&state->stopping, true);
-
-	vmnet_return_t callback_status =
-		vmnet_interface_set_event_callback(state->interface, 0, NULL, NULL);
-	dispatch_sync(state->queue, ^{});
-	(void)shutdown(state->pump_fd, SHUT_RDWR);
-	if (state->writer_started) {
-		int thread_error = pthread_join(state->writer_thread, NULL);
-		if (thread_error != 0) {
-			*out_errno = thread_error;
-			*out_retain = 1;
-			return -1;
-		}
-		state->writer_started = 0;
-	}
 	bool stop_scheduled = false;
 	vmnet_return_t stop_status = tbx_stop_ref(state->interface, state->queue, &stop_scheduled);
 	if (!stop_scheduled) {
@@ -330,32 +308,79 @@ static int tbx_vmnet_stop(
 
 	tbx_dispatch_release(state->queue);
 	tbx_free_start_state(state);
-	if (callback_status != VMNET_SUCCESS) {
-		*out_vmnet_status = callback_status;
-		return -1;
-	}
 	if (stop_status != VMNET_SUCCESS) {
 		*out_vmnet_status = stop_status;
 		return -1;
 	}
-	if (*out_errno != 0) {
+	return 0;
+}
+
+static int tbx_vmnet_write_frame(
+	tbx_vmnet_t *state,
+	const void *buffer,
+	size_t size,
+	int *out_errno,
+	uint32_t *out_vmnet_status
+) {
+	*out_errno = 0;
+	*out_vmnet_status = VMNET_SUCCESS;
+	if (size == 0 || size > state->max_packet_size) {
+		*out_vmnet_status = VMNET_INVALID_ARGUMENT;
+		return -1;
+	}
+	struct iovec iov = {
+		.iov_base = (void *)buffer,
+		.iov_len = size,
+	};
+	struct vmpktdesc packet = {
+		.vm_pkt_size = size,
+		.vm_pkt_iov = &iov,
+		.vm_pkt_iovcnt = 1,
+		.vm_flags = 0,
+	};
+	int packet_count = 1;
+	vmnet_return_t status = vmnet_write(state->interface, &packet, &packet_count);
+	if (status != VMNET_SUCCESS || packet_count != 1) {
+		*out_vmnet_status = status == VMNET_SUCCESS ? VMNET_FAILURE : status;
 		return -1;
 	}
 	return 0;
+}
+
+static int tbx_vmnet_pump_fd(tbx_vmnet_t *state) {
+	return state->pump_fd;
+}
+
+static size_t tbx_vmnet_max_packet_size(tbx_vmnet_t *state) {
+	return state->max_packet_size;
 }
 */
 import "C"
 
 import (
 	"fmt"
+	"log"
 	"sync"
 	"syscall"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
+
+type vmnetHandle struct {
+	state              *C.tbx_vmnet_t
+	port               *routerPort
+	pumpDone           chan struct{}
+	localForwardErrors failureLogLimiter
+	vmnetWriteErrors   failureLogLimiter
+}
 
 var vmnetInterfaces = struct {
 	sync.Mutex
-	byFD map[int]*C.tbx_vmnet_t
-}{byFD: make(map[int]*C.tbx_vmnet_t)}
+	byFD map[int]*vmnetHandle
+}{byFD: make(map[int]*vmnetHandle)}
+
+var helperFrameRouter = newFrameRouter()
 
 // StartInterface starts one shared-mode vmnet interface for a cluster subnet.
 func StartInterface(subnetIndex int) (int, error) {
@@ -376,9 +401,15 @@ func StartInterface(subnetIndex int) (int, error) {
 		return -1, vmnetError("start", systemError, vmnetStatus)
 	}
 
+	handle := &vmnetHandle{state: state}
+	handle.port = helperFrameRouter.addPort(subnetIndex, func(frame []byte) error {
+		return sendPumpFrame(int(C.tbx_vmnet_pump_fd(state)), frame)
+	})
+	handle.pumpDone = startVMNetPump(handle)
+
 	result := int(fd)
 	vmnetInterfaces.Lock()
-	vmnetInterfaces.byFD[result] = state
+	vmnetInterfaces.byFD[result] = handle
 	vmnetInterfaces.Unlock()
 	return result, nil
 }
@@ -386,7 +417,7 @@ func StartInterface(subnetIndex int) (int, error) {
 // StopInterface stops the interface associated with a handoff descriptor.
 func StopInterface(fd int) error {
 	vmnetInterfaces.Lock()
-	state, ok := vmnetInterfaces.byFD[fd]
+	handle, ok := vmnetInterfaces.byFD[fd]
 	if ok {
 		delete(vmnetInterfaces.byFD, fd)
 	}
@@ -395,17 +426,105 @@ func StopInterface(fd int) error {
 		return fmt.Errorf("vmnet interface for file descriptor %d is not running", fd)
 	}
 
-	var systemError C.int
-	var vmnetStatus C.uint32_t
-	var retain C.int
-	if C.tbx_vmnet_stop(state, &systemError, &vmnetStatus, &retain) != 0 {
-		if retain != 0 {
+	helperFrameRouter.removePort(handle.port)
+
+	var prepareSystemError C.int
+	var callbackStatus C.uint32_t
+	if C.tbx_vmnet_prepare_stop(handle.state, &prepareSystemError, &callbackStatus) != 0 {
+		return wrapVMNetStopError(vmnetError("stop", prepareSystemError, callbackStatus), false)
+	}
+
+	<-handle.pumpDone
+
+	var finishSystemError C.int
+	var stopStatus C.uint32_t
+	var finishRetain C.int
+	if C.tbx_vmnet_finish_stop(handle.state, &finishSystemError, &stopStatus, &finishRetain) != 0 {
+		if finishRetain != 0 {
 			vmnetInterfaces.Lock()
-			vmnetInterfaces.byFD[fd] = state
+			vmnetInterfaces.byFD[fd] = handle
 			vmnetInterfaces.Unlock()
 		}
-		return vmnetError("stop", systemError, vmnetStatus)
+		return wrapVMNetStopError(vmnetError("stop", finishSystemError, stopStatus), finishRetain != 0)
 	}
+	if prepareSystemError != 0 {
+		return wrapVMNetStopError(vmnetError("stop", prepareSystemError, 0), false)
+	}
+	// macOS can report VMNET_INVALID_ARGUMENT while disabling an installed
+	// callback with the documented zero-mask/nil callback form. Once the
+	// subsequent vmnet_stop_interface call succeeds, the callback is inert and
+	// all local state has been released, so only other callback errors matter.
+	if callbackStatus != C.VMNET_SUCCESS && callbackStatus != C.VMNET_INVALID_ARGUMENT {
+		return wrapVMNetStopError(vmnetError("stop", 0, callbackStatus), false)
+	}
+	return nil
+}
+
+func startVMNetPump(handle *vmnetHandle) chan struct{} {
+	done := make(chan struct{})
+	pumpFD := int(C.tbx_vmnet_pump_fd(handle.state))
+	maxPacketSize := int(C.tbx_vmnet_max_packet_size(handle.state))
+
+	go func() {
+		defer close(done)
+
+		buffer := make([]byte, maxPacketSize)
+		for {
+			n, _, flags, _, err := unix.Recvmsg(pumpFD, buffer, nil, 0)
+			if err == unix.EINTR {
+				continue
+			}
+			if err != nil || n <= 0 {
+				return
+			}
+			if flags&unix.MSG_TRUNC != 0 {
+				continue
+			}
+
+			frame := append([]byte(nil), buffer[:n]...)
+			handled, err := helperFrameRouter.route(handle.port, frame)
+			if err != nil && handle.localForwardErrors.ShouldLog() {
+				log.Printf("helper vmnet local forward failed on subnet %d: %v", handle.port.subnet, err)
+			}
+			if handled {
+				continue
+			}
+			if err := writeVMNetFrame(handle.state, frame); err != nil && handle.vmnetWriteErrors.ShouldLog() {
+				log.Printf("helper vmnet write failed on subnet %d: %v", handle.port.subnet, err)
+			}
+		}
+	}()
+
+	return done
+}
+
+func sendPumpFrame(fd int, frame []byte) error {
+	if len(frame) == 0 {
+		return nil
+	}
+	_, err := unix.SendmsgN(fd, frame, nil, nil, unix.MSG_DONTWAIT)
+	if err != nil {
+		return fmt.Errorf("send locally forwarded frame to pump fd %d: %w", fd, err)
+	}
+	return nil
+}
+
+func writeVMNetFrame(state *C.tbx_vmnet_t, frame []byte) error {
+	if len(frame) == 0 {
+		return nil
+	}
+	var systemError C.int
+	var vmnetStatus C.uint32_t
+	if C.tbx_vmnet_write_frame(
+		state,
+		unsafe.Pointer(&frame[0]),
+		C.size_t(len(frame)),
+		&systemError,
+		&vmnetStatus,
+	) != 0 {
+		return vmnetError("write", systemError, vmnetStatus)
+	}
+	// The pump goroutine owns logging for vmnet writes so errors surface once.
 	return nil
 }
 
