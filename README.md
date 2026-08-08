@@ -61,12 +61,16 @@ bin/tbx manifests demo         # print Cilium LB pool / BGP manifests and machin
 ```sh
 bin/tbx cluster stop demo              # shut down VMs, keep disks
 bin/tbx cluster start demo
-bin/tbx cluster suspend demo           # save state; resume with `cluster resume`
+bin/tbx cluster suspend demo           # save state; same-daemon resume preserves memory
 bin/tbx snapshot create demo before-upgrade
 bin/tbx node add demo --role worker
 bin/tbx cluster destroy demo --force   # permanent
 sudo bin/tbx system uninstall          # remove the helper and resolver file
 ```
+
+Suspend/resume preserves guest memory while the same `tbxd` process remains alive. Restarting
+the daemon loses vz's file-handle-backed device identity, so resume reports a warning and safely
+cold-boots instead.
 
 Run `bin/tbx help` for the full command surface.
 
