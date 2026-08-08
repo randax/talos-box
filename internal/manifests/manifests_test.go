@@ -1,7 +1,9 @@
 package manifests
 
 import (
+	"errors"
 	"flag"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -62,7 +64,7 @@ func TestRenderedYAMLParses(t *testing.T) {
 				var doc any
 				err := decoder.Decode(&doc)
 				if err != nil {
-					if err.Error() == "EOF" {
+					if errors.Is(err, io.EOF) {
 						break
 					}
 					t.Fatalf("doc %d does not parse: %v", docs, err)
@@ -180,7 +182,7 @@ func decodeYAMLDocuments(t *testing.T, rendered string) []map[string]any {
 	for {
 		var doc map[string]any
 		if err := decoder.Decode(&doc); err != nil {
-			if err.Error() == "EOF" {
+			if errors.Is(err, io.EOF) {
 				return docs
 			}
 			t.Fatalf("decode rendered YAML: %v", err)
