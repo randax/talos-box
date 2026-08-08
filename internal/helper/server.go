@@ -19,6 +19,11 @@ import (
 
 const resolverPath = "/etc/resolver/k8s.test"
 
+var (
+	startInterface = StartInterface
+	stopInterface  = StopInterface
+)
+
 type attachmentKey struct {
 	cluster string
 	node    string
@@ -155,7 +160,14 @@ func (s *Server) Shutdown() error {
 	defer s.opMu.Unlock()
 	var result error
 	for key, fd := range s.attachments {
-		result = errors.Join(result, StopInterface(fd))
+		if err := stopInterface(fd); err != nil {
+			result = errors.Join(result, err)
+			if stopErrorRetained(err) {
+				continue
+			}
+			delete(s.attachments, key)
+			continue
+		}
 		delete(s.attachments, key)
 	}
 	return result
@@ -291,15 +303,16 @@ func (s *Server) attach(raw json.RawMessage) (any, int, func(), error) {
 	if _, exists := s.attachments[key]; exists {
 		return nil, -1, nil, fmt.Errorf("network interface for %s/%s is already attached", args.Cluster, args.Node)
 	}
-	fd, err := StartInterface(*args.SubnetIndex)
+	fd, err := startInterface(*args.SubnetIndex)
 	if err != nil {
 		return nil, -1, nil, err
 	}
 	s.attachments[key] = fd
 	cleanup := func() {
 		if current, ok := s.attachments[key]; ok && current == fd {
-			delete(s.attachments, key)
-			_ = StopInterface(fd)
+			if err := stopInterface(fd); err == nil || !stopErrorRetained(err) {
+				delete(s.attachments, key)
+			}
 		}
 	}
 	return map[string]string{"cluster": args.Cluster, "node": args.Node}, fd, cleanup, nil
@@ -322,8 +335,14 @@ func (s *Server) detach(raw json.RawMessage) error {
 		// idempotent: the pump already cleaned up when the VM closed its fd
 		return nil
 	}
+	if err := stopInterface(fd); err != nil {
+		if !stopErrorRetained(err) {
+			delete(s.attachments, key)
+		}
+		return err
+	}
 	delete(s.attachments, key)
-	return StopInterface(fd)
+	return nil
 }
 
 func decodeArgs(raw json.RawMessage, destination any) error {
