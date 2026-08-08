@@ -12,8 +12,14 @@ import (
 	"github.com/randax/talos-box/internal/vm"
 )
 
-// suspendCluster pauses and saves every running VM's state, then closes them.
-// The cluster is left "suspended": VMs stopped, save files on disk.
+type savedMachine interface {
+	Suspend(string) error
+	StopAfterSave() error
+	Close() error
+}
+
+// suspendCluster pauses and saves every running VM's state, then stops them
+// while retaining their device configurations for same-daemon restoration.
 func (s *Server) suspendCluster(raw json.RawMessage) (ClusterSummary, error) {
 	var args nameArgs
 	if err := decodeArgs(raw, &args); err != nil {
@@ -34,18 +40,18 @@ func (s *Server) suspendCluster(raw json.RawMessage) (ClusterSummary, error) {
 	var errs []error
 	for name, machine := range nodes {
 		savePath := saveStatePath(dir, name)
-		if err := machine.Suspend(savePath); err != nil {
+		retain, err := prepareSavedMachine(machine, savePath)
+		if err != nil {
 			errs = append(errs, fmt.Errorf("suspend %s: %w", name, err))
 			_ = os.Remove(savePath) // no partial save left behind
-		}
-		// always release the VM: a failed Suspend leaves it paused, and the
-		// map is dropped below — closing here prevents a leaked vz VM still
-		// holding its network fd and MAC
-		if err := machine.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("close %s: %w", name, err))
+			if !retain {
+				delete(nodes, name)
+			}
 		}
 	}
-	delete(s.vms, item.Name)
+	if len(nodes) == 0 {
+		delete(s.vms, item.Name)
+	}
 	if len(errs) > 0 {
 		return ClusterSummary{}, errors.Join(errs...)
 	}
@@ -79,12 +85,18 @@ func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
 		nodes = make(map[string]*vm.VM)
 		s.vms[item.Name] = nodes
 	}
+	warnings := []string{subnetWarning}
+	var attempted []string
 	for _, node := range item.Nodes {
-		machine, err := newVM(item, node)
+		machine, err := machineForResume(nodes[node.Name], func() (*vm.VM, error) {
+			return newVM(item, node)
+		})
 		if err != nil {
-			return ClusterSummary{}, fmt.Errorf("create VM %s: %w", node.Name, err)
+			rollbackErr := s.closeNodes(item.Name, nodes, attempted)
+			return ClusterSummary{}, errors.Join(fmt.Errorf("create VM %s: %w", node.Name, err), rollbackErr)
 		}
 		nodes[node.Name] = machine
+		attempted = append(attempted, node.Name)
 		savePath := saveStatePath(dir, node.Name)
 		_, saveErr := os.Stat(savePath)
 		warning, resumeErr := resumeNode(saveErr == nil,
@@ -93,16 +105,40 @@ func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
 		)
 		_ = os.Remove(savePath) // consumed, unusable, or absent — never reuse a stale save
 		if resumeErr != nil {
-			return ClusterSummary{}, fmt.Errorf("resume %s: %w", node.Name, resumeErr)
+			rollbackErr := s.closeNodes(item.Name, nodes, attempted)
+			return ClusterSummary{}, errors.Join(fmt.Errorf("resume %s: %w", node.Name, resumeErr), rollbackErr)
 		}
 		if warning != "" {
 			log.Printf("resume %s: %s", node.Name, warning)
+			warnings = append(warnings, fmt.Sprintf("%s: %s", node.Name, warning))
 		}
 	}
 	go s.bindMirrors(item.SubnetIndex) // resume bypasses start(); rebind the gateway
 	result := summary(item, true)
-	result.Warning = subnetWarning
+	result.Warning = joinWarnings(warnings...)
 	return result, nil
+}
+
+// prepareSavedMachine leaves a successfully-saved VM stopped but otherwise
+// intact. On failure, retain reports whether cleanup failed and the daemon
+// must keep tracking the machine so a later lifecycle operation can retry it.
+func prepareSavedMachine(machine savedMachine, savePath string) (retain bool, err error) {
+	if err := machine.Suspend(savePath); err != nil {
+		closeErr := machine.Close()
+		return closeErr != nil, errors.Join(err, closeErr)
+	}
+	if err := machine.StopAfterSave(); err != nil {
+		closeErr := machine.Close()
+		return closeErr != nil, errors.Join(err, closeErr)
+	}
+	return true, nil
+}
+
+func machineForResume(retained *vm.VM, create func() (*vm.VM, error)) (*vm.VM, error) {
+	if retained != nil {
+		return retained, nil
+	}
+	return create()
 }
 
 // resumeNode tries to restore a node from its saved state; on a missing or

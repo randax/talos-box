@@ -225,8 +225,7 @@ func (v *VM) SetMemoryTargetMiB(targetMiB int) error {
 }
 
 // Suspend pauses the running VM and saves its full state (RAM + devices) to
-// savePath (vz save/restore, macOS 14+). The VM is left paused; the caller
-// closes it afterward.
+// savePath (vz save/restore, macOS 14+). The VM is left paused.
 func (v *VM) Suspend(savePath string) error {
 	if err := v.machine.Pause(); err != nil {
 		return fmt.Errorf("pause: %w", err)
@@ -237,10 +236,17 @@ func (v *VM) Suspend(savePath string) error {
 	return nil
 }
 
-// RestoreState restores a freshly-created (Stopped) VM from a saved state file
-// and resumes it. NOTE: vz RestoreMachineStateFromURL fails with "invalid
-// argument" against talosbox's device set (fresh console/serial handles on
-// recreation), so in practice resume falls back to a cold boot — see #37.
+// StopAfterSave stops a paused VM without releasing its configuration or
+// device resources. Retaining that object graph is required for a compatible
+// same-process restore when the configuration contains file-handle devices.
+func (v *VM) StopAfterSave() error {
+	if err := v.machine.Stop(); err != nil {
+		return fmt.Errorf("stop saved VM: %w", err)
+	}
+	return nil
+}
+
+// RestoreState restores a stopped VM from a saved state file and resumes it.
 func (v *VM) RestoreState(savePath string) error {
 	if err := v.machine.RestoreMachineStateFromURL(savePath); err != nil {
 		return fmt.Errorf("restore machine state: %w", err)

@@ -2,8 +2,128 @@ package daemon
 
 import (
 	"errors"
+	"reflect"
 	"testing"
+
+	"github.com/randax/talos-box/internal/vm"
 )
+
+type suspendMachineFake struct {
+	calls      []string
+	suspendErr error
+	stopErr    error
+	closeErr   error
+}
+
+func (f *suspendMachineFake) Suspend(path string) error {
+	f.calls = append(f.calls, "suspend "+path)
+	return f.suspendErr
+}
+
+func (f *suspendMachineFake) StopAfterSave() error {
+	f.calls = append(f.calls, "stop-after-save")
+	return f.stopErr
+}
+
+func (f *suspendMachineFake) Close() error {
+	f.calls = append(f.calls, "close")
+	return f.closeErr
+}
+
+func TestPrepareSavedMachineRetainsResourcesAfterStopping(t *testing.T) {
+	machine := &suspendMachineFake{}
+
+	retain, err := prepareSavedMachine(machine, "/tmp/node.vzstate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !retain {
+		t.Fatal("successfully saved machine must remain tracked for restore")
+	}
+
+	want := []string{"suspend /tmp/node.vzstate", "stop-after-save"}
+	if !reflect.DeepEqual(machine.calls, want) {
+		t.Fatalf("calls = %v, want %v", machine.calls, want)
+	}
+}
+
+func TestPrepareSavedMachineClosesAfterSaveFailure(t *testing.T) {
+	machine := &suspendMachineFake{suspendErr: errors.New("save failed")}
+
+	retain, err := prepareSavedMachine(machine, "/tmp/node.vzstate")
+	if !errors.Is(err, machine.suspendErr) {
+		t.Fatalf("error = %v, want save failure", err)
+	}
+	if retain {
+		t.Fatal("released machine must not remain tracked")
+	}
+	want := []string{"suspend /tmp/node.vzstate", "close"}
+	if !reflect.DeepEqual(machine.calls, want) {
+		t.Fatalf("calls = %v, want %v", machine.calls, want)
+	}
+}
+
+func TestPrepareSavedMachineClosesAfterStopFailure(t *testing.T) {
+	machine := &suspendMachineFake{stopErr: errors.New("stop failed")}
+
+	retain, err := prepareSavedMachine(machine, "/tmp/node.vzstate")
+	if !errors.Is(err, machine.stopErr) {
+		t.Fatalf("error = %v, want stop failure", err)
+	}
+	if retain {
+		t.Fatal("released machine must not remain tracked")
+	}
+	want := []string{"suspend /tmp/node.vzstate", "stop-after-save", "close"}
+	if !reflect.DeepEqual(machine.calls, want) {
+		t.Fatalf("calls = %v, want %v", machine.calls, want)
+	}
+}
+
+func TestPrepareSavedMachineRetainsMachineWhenCloseFails(t *testing.T) {
+	machine := &suspendMachineFake{
+		suspendErr: errors.New("save failed"),
+		closeErr:   errors.New("close failed"),
+	}
+
+	retain, err := prepareSavedMachine(machine, "/tmp/node.vzstate")
+	if !errors.Is(err, machine.suspendErr) || !errors.Is(err, machine.closeErr) {
+		t.Fatalf("error = %v, want joined save and close failures", err)
+	}
+	if !retain {
+		t.Fatal("machine must remain tracked when cleanup fails")
+	}
+}
+
+func TestMachineForResumeReusesRetainedInstance(t *testing.T) {
+	retained := &vm.VM{}
+	created := false
+
+	got, err := machineForResume(retained, func() (*vm.VM, error) {
+		created = true
+		return &vm.VM{}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != retained {
+		t.Fatal("resume did not reuse the retained VM")
+	}
+	if created {
+		t.Fatal("resume recreated the VM despite retained device state")
+	}
+}
+
+func TestMachineForResumeCreatesInstanceWithoutRetainedState(t *testing.T) {
+	created := &vm.VM{}
+
+	got, err := machineForResume(nil, func() (*vm.VM, error) { return created, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != created {
+		t.Fatal("resume did not return the freshly-created VM")
+	}
+}
 
 func TestResumeNodeRestoresWhenSaveValid(t *testing.T) {
 	var restored, coldBooted bool
