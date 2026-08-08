@@ -1,6 +1,7 @@
-// Package manifests renders the ready-to-apply Cilium resources and Talos
-// machine-config patches that match a cluster's networking (SPEC §5, §10).
-// talosbox prints these; applying them is the attendees' work.
+// Package manifests renders the Cilium Helm values, ready-to-apply Cilium
+// resources, and Talos machine-config patches that match a cluster's
+// networking (SPEC §5, §10). talosbox prints these; applying them is the
+// attendees' work.
 package manifests
 
 import (
@@ -12,7 +13,7 @@ import (
 type Facts struct {
 	Cluster     string
 	SubnetIndex int
-	BGP         bool // cluster is in BGP mode: render BGP policy, not L2
+	BGP         bool // cluster is in BGP mode: configure BGP, not L2 announcements
 }
 
 // MirrorPorts fixes the upstream registry → host mirror port mapping.
@@ -32,6 +33,10 @@ const (
 	HostASN = 64512
 	// clusterASNBase + subnet index = the cluster's ASN.
 	clusterASNBase = 64600
+	// The LB pool has 40 addresses and Cilium renews L2 leases every 5 seconds:
+	// 40 * (1 / 5s) = 8 QPS. Burst stays slightly above that calculated rate.
+	ciliumClientQPS   = 8
+	ciliumClientBurst = 10
 )
 
 // ClusterASN is the BGP ASN for the cluster at the given subnet index.
@@ -68,24 +73,103 @@ spec:
 `, f.Cluster)
 }
 
-// BGPPolicy renders the CiliumBGPPeeringPolicy for "host as ToR": every node
-// peers eBGP with the host gateway. (The BGP milestone validates this against
-// a live Cilium and may bump the API version.)
+// CiliumValues renders the supported Helm values used by the manual Cilium
+// install path. It is host-platform neutral; only cluster facts vary.
+func CiliumValues(f Facts) string {
+	return fmt.Sprintf(`ipam:
+  mode: kubernetes
+kubeProxyReplacement: true
+k8sServiceHost: localhost
+k8sServicePort: 7445
+securityContext:
+  capabilities:
+    ciliumAgent:
+      - CHOWN
+      - KILL
+      - NET_ADMIN
+      - NET_RAW
+      - IPC_LOCK
+      - SYS_ADMIN
+      - SYS_RESOURCE
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    cleanCiliumState:
+      - NET_ADMIN
+      - SYS_ADMIN
+      - SYS_RESOURCE
+cgroup:
+  autoMount:
+    enabled: false
+  hostRoot: /sys/fs/cgroup
+l2announcements:
+  enabled: %t
+bgpControlPlane:
+  enabled: true
+k8sClientRateLimit:
+  qps: %d
+  burst: %d
+ingressController:
+  enabled: true
+  default: true
+  loadbalancerMode: shared
+  service:
+    annotations:
+      lbipam.cilium.io/ips: %s
+`, !f.BGP, ciliumClientQPS, ciliumClientBurst, f.hostIP(200))
+}
+
+// BGPPolicy renders Cilium's BGP v2 resources for "host as ToR": every node
+// peers eBGP with the host gateway and advertises LoadBalancer Service IPs.
 func BGPPolicy(f Facts) string {
-	return fmt.Sprintf(`apiVersion: cilium.io/v2alpha1
-kind: CiliumBGPPeeringPolicy
+	return fmt.Sprintf(`apiVersion: cilium.io/v2
+kind: CiliumBGPClusterConfig
 metadata:
   name: %s-bgp
 spec:
   nodeSelector: {}
-  virtualRouters:
-    - localASN: %d
-      exportPodCIDR: false
-      serviceSelector: {}
-      neighbors:
-        - peerAddress: %s/32
+  bgpInstances:
+    - name: %s-bgp
+      localASN: %d
+      peers:
+        - name: host-gateway
           peerASN: %d
-`, f.Cluster, ClusterASN(f.SubnetIndex), f.hostIP(1), HostASN)
+          peerAddress: %s
+          peerConfigRef:
+            name: %s-bgp-peer
+---
+apiVersion: cilium.io/v2
+kind: CiliumBGPPeerConfig
+metadata:
+  name: %s-bgp-peer
+spec:
+  families:
+    - afi: ipv4
+      safi: unicast
+      advertisements:
+        matchLabels:
+          talosbox.dev/advertisement: service-load-balancer
+---
+apiVersion: cilium.io/v2
+kind: CiliumBGPAdvertisement
+metadata:
+  name: %s-bgp-advertisement
+  labels:
+    talosbox.dev/advertisement: service-load-balancer
+spec:
+  advertisements:
+    - advertisementType: Service
+      service:
+        addresses:
+          - LoadBalancerIP
+      selector:
+        matchExpressions:
+          - key: talosbox.dev/never-used
+            operator: NotIn
+            values:
+              - never
+`, f.Cluster, f.Cluster, ClusterASN(f.SubnetIndex), HostASN, f.hostIP(1), f.Cluster, f.Cluster, f.Cluster)
 }
 
 // RegistryMirrors renders the Talos machine-config patch pointing every
@@ -116,22 +200,26 @@ func All(f Facts) string {
 	fmt.Fprintf(&b, "# Apply with kubectl once Cilium is installed — this section alone:\n#   tbx manifests %s k8s | kubectl apply -f -\n", f.Cluster)
 	b.WriteString(k8sSection(f))
 	b.WriteString("---\n")
+	fmt.Fprintf(&b, "# Pass to Helm when installing Cilium — save this section alone:\n#   tbx manifests %s cilium-values > cilium-values.yaml\n", f.Cluster)
+	b.WriteString(CiliumValues(f))
+	b.WriteString("---\n")
 	fmt.Fprintf(&b, "# Apply with talosctl (machine config patches, e.g. talosctl patch mc -p @file) — this section alone:\n#   tbx manifests %s talos\n", f.Cluster)
 	b.WriteString(join(RegistryMirrors(f), BalloonModule(f)))
 	return b.String()
 }
 
 // sections is the single registry driving Render, its error text, and the CLI
-// usage string. "k8s" and "talos" group the documents by consuming tool.
+// usage string. Grouped sections keep output consumable by one tool.
 var sections = map[string]func(Facts) string{
-	"all":     All,
-	"lb-pool": LBPool,
-	"bgp":     BGPPolicy,
-	"l2":      L2Policy,
-	"mirrors": RegistryMirrors,
-	"balloon": BalloonModule,
-	"k8s":     k8sSection,
-	"talos":   func(f Facts) string { return join(RegistryMirrors(f), BalloonModule(f)) },
+	"all":           All,
+	"lb-pool":       LBPool,
+	"bgp":           BGPPolicy,
+	"l2":            L2Policy,
+	"cilium-values": CiliumValues,
+	"mirrors":       RegistryMirrors,
+	"balloon":       BalloonModule,
+	"k8s":           k8sSection,
+	"talos":         func(f Facts) string { return join(RegistryMirrors(f), BalloonModule(f)) },
 }
 
 // k8sSection renders the LB pool plus exactly ONE announcement mechanism —
@@ -150,7 +238,7 @@ func k8sSection(f Facts) string {
 
 // Sections lists the valid section names in stable display order.
 func Sections() []string {
-	return []string{"lb-pool", "bgp", "l2", "mirrors", "balloon", "k8s", "talos", "all"}
+	return []string{"lb-pool", "bgp", "l2", "cilium-values", "mirrors", "balloon", "k8s", "talos", "all"}
 }
 
 func join(docs ...string) string {

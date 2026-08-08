@@ -90,24 +90,19 @@ Talos specifics: KubePrism serves the API on `localhost:7445`, cgroups are pre-m
 the agent needs an explicit capability list. talosbox specifics: enable **L2 announcements**
 (the default LB reachability mode) and the **ingress controller**, and pin the shared ingress
 LoadBalancer to **`.200`** — the embedded DNS resolves `*.<cluster>.k8s.test` to the
-cluster's `.200` by convention.
+cluster's `.200` by convention. The BGP control plane stays enabled but idle so the cluster can
+later switch to the BGP resources rendered by `tbx manifests`.
 
 ```sh
+tbx manifests demo cilium-values > cilium-values.yaml
 helm repo add cilium https://helm.cilium.io/
-helm install cilium cilium/cilium -n kube-system \
-  --set ipam.mode=kubernetes \
-  --set kubeProxyReplacement=true \
-  --set k8sServiceHost=localhost --set k8sServicePort=7445 \
-  --set 'securityContext.capabilities.ciliumAgent={CHOWN,KILL,NET_ADMIN,NET_RAW,IPC_LOCK,SYS_ADMIN,SYS_RESOURCE,DAC_OVERRIDE,FOWNER,SETGID,SETUID}' \
-  --set 'securityContext.capabilities.cleanCiliumState={NET_ADMIN,SYS_ADMIN,SYS_RESOURCE}' \
-  --set cgroup.autoMount.enabled=false \
-  --set cgroup.hostRoot=/sys/fs/cgroup \
-  --set l2announcements.enabled=true \
-  --set ingressController.enabled=true \
-  --set ingressController.default=true \
-  --set ingressController.loadbalancerMode=shared \
-  --set 'ingressController.service.annotations.lbipam\.cilium\.io/ips=172.30.0.200'
+helm install cilium cilium/cilium --version 1.19.6 -n kube-system \
+  --values cilium-values.yaml
 ```
+
+The rendered values include the Talos-specific settings above and size Cilium's Kubernetes
+client for up to 40 single-address LB Services with the default 5-second lease renewal
+deadline: `40 × (1 / 5s) = 8 QPS`, with burst 10 slightly above that calculated rate.
 
 All images pull through the tbx mirrors; nodes go `Ready` in ~1–2 minutes. Then apply the
 LB pool and L2 announcement policy (the `k8s` section of `tbx manifests`; the `talos` section

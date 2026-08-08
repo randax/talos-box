@@ -17,7 +17,7 @@ import (
 // Manual prerequisites (this test only asserts the host-side observable):
 //  1. sudo tbx system install   (helper with BGP support)
 //  2. tbx cluster create demo && configure + bootstrap + install Cilium
-//  3. kubectl apply the CiliumBGPPeeringPolicy from `tbx manifests demo bgp`
+//  3. kubectl apply the Cilium BGP resources from `tbx manifests demo bgp`
 //     and an LB Service so Cilium advertises a .200-.239 VIP
 //  4. tbx bgp enable demo
 func TestBGPRouteInjectionE2E(t *testing.T) {
