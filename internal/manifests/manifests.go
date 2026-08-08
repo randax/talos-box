@@ -34,9 +34,9 @@ const (
 	// clusterASNBase + subnet index = the cluster's ASN.
 	clusterASNBase = 64600
 	// The LB pool has 40 addresses and Cilium renews L2 leases every 5 seconds:
-	// 40 * (1 / 5s) = 8 QPS. Burst stays slightly above that calculated rate.
-	ciliumClientQPS   = 8
-	ciliumClientBurst = 10
+	// 40 * (1 / 5s) = 8 QPS. Do not undercut Cilium 1.19.6's 10/20 defaults.
+	ciliumClientQPS   = 10
+	ciliumClientBurst = 20
 )
 
 // ClusterASN is the BGP ASN for the cluster at the given subnet index.
@@ -224,8 +224,9 @@ var sections = map[string]func(Facts) string{
 
 // k8sSection renders the LB pool plus exactly ONE announcement mechanism —
 // BGP when the cluster is in BGP mode, L2 otherwise — because the two are
-// mutually exclusive (SPEC §5: BGP "replaces" L2). Applying this section
-// switches the cluster's LB reachability to the current mode.
+// mutually exclusive (SPEC §5: BGP "replaces" L2). Callers switching a live
+// cluster must remove the previously applied policy; kubectl apply does not
+// prune objects omitted from this output.
 func k8sSection(f Facts) string {
 	announce := L2Policy(f)
 	note := "# LB reachability via L2 announcements (default mode).\n"

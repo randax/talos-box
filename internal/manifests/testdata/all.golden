@@ -52,8 +52,8 @@ l2announcements:
 bgpControlPlane:
   enabled: true
 k8sClientRateLimit:
-  qps: 8
-  burst: 10
+  qps: 10
+  burst: 20
 ingressController:
   enabled: true
   default: true

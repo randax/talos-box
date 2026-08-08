@@ -166,8 +166,8 @@ func TestCiliumValuesSizeClientRateLimitForL2Announcements(t *testing.T) {
 			if values.L2Announcements.Enabled != tt.wantL2 {
 				t.Errorf("L2 announcements enabled = %t, want %t", values.L2Announcements.Enabled, tt.wantL2)
 			}
-			if tt.wantLimit && (values.ClientRateLimit.QPS != 8 || values.ClientRateLimit.Burst != 10) {
-				t.Errorf("client rate limit = %d QPS/%d burst, want 8 QPS/10 burst", values.ClientRateLimit.QPS, values.ClientRateLimit.Burst)
+			if tt.wantLimit && (values.ClientRateLimit.QPS != 10 || values.ClientRateLimit.Burst != 20) {
+				t.Errorf("client rate limit = %d QPS/%d burst, want 10 QPS/20 burst", values.ClientRateLimit.QPS, values.ClientRateLimit.Burst)
 			}
 		})
 	}
@@ -292,7 +292,7 @@ func TestSubnetValuesFlowThrough(t *testing.T) {
 	}{
 		{LBPool, []string{"172.30.3.200", "172.30.3.239", "edge"}},
 		{BGPPolicy, []string{"64603", "64512", "172.30.3.1"}},
-		{CiliumValues, []string{"172.30.3.200", "qps: 8", "burst: 10"}},
+		{CiliumValues, []string{"172.30.3.200", "qps: 10", "burst: 20"}},
 		{RegistryMirrors, []string{"http://172.30.3.1:5055", "http://172.30.3.1:5058", "registry.k8s.io"}},
 		{BalloonModule, []string{"virtio_balloon"}},
 	} {

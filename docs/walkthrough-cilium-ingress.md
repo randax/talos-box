@@ -90,8 +90,8 @@ Talos specifics: KubePrism serves the API on `localhost:7445`, cgroups are pre-m
 the agent needs an explicit capability list. talosbox specifics: enable **L2 announcements**
 (the default LB reachability mode) and the **ingress controller**, and pin the shared ingress
 LoadBalancer to **`.200`** — the embedded DNS resolves `*.<cluster>.k8s.test` to the
-cluster's `.200` by convention. The BGP control plane stays enabled but idle so the cluster can
-later switch to the BGP resources rendered by `tbx manifests`.
+cluster's `.200` by convention. The BGP control plane is enabled but remains idle until BGP
+resources are applied.
 
 ```sh
 tbx manifests demo cilium-values > cilium-values.yaml
@@ -100,9 +100,9 @@ helm install cilium cilium/cilium --version 1.19.6 -n kube-system \
   --values cilium-values.yaml
 ```
 
-The rendered values include the Talos-specific settings above and size Cilium's Kubernetes
-client for up to 40 single-address LB Services with the default 5-second lease renewal
-deadline: `40 × (1 / 5s) = 8 QPS`, with burst 10 slightly above that calculated rate.
+The rendered values include the Talos-specific settings above. Forty single-address LB Services
+with the default 5-second lease renewal deadline require 8 QPS (`40 × (1 / 5s)`), below Cilium
+1.19.6's 10 QPS / 20 burst defaults, so talosbox explicitly preserves that higher floor.
 
 All images pull through the tbx mirrors; nodes go `Ready` in ~1–2 minutes. Then apply the
 LB pool and L2 announcement policy (the `k8s` section of `tbx manifests`; the `talos` section
@@ -183,6 +183,13 @@ Any other hostname under `.demo.k8s.test` works the same way; just add Ingress r
 
 ## Observed gotchas
 
+- `kubectl apply` does not prune the announcement mode you previously applied. Before switching
+  an existing L2 cluster to BGP, run `tbx bgp enable <cluster>`, rerender `cilium-values`, apply
+  them with `helm upgrade`, and delete the old policy with
+  `kubectl delete ciliuml2announcementpolicy <cluster>-l2 --ignore-not-found`; then apply
+  `tbx manifests <cluster> k8s`. When migrating a pre-1.19 Cilium cluster, also delete its
+  `CiliumBGPPeeringPolicy` named `<cluster>-bgp` while that legacy API is still served, before
+  upgrading Cilium and applying the v2 resources.
 - Run `tbx doctor` before creating or starting a workshop cluster. Extreme host swap or
   data-volume pressure can reset guests during image unpack and corrupt Talos EPHEMERAL data;
   free memory/disk space or reduce the cluster size instead of overriding the preflight.
