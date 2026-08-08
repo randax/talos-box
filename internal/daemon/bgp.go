@@ -10,7 +10,7 @@ import (
 
 // setBGP enables or disables host-side BGP for a cluster: it starts/stops the
 // speaker in the helper and persists the mode. The attendee still applies the
-// CiliumBGPPeeringPolicy from `tbx manifests` — this brings up the host peer.
+// Cilium BGP resources from `tbx manifests` — this brings up the host peer.
 func (s *Server) setBGP(raw json.RawMessage, enable bool) (ClusterSummary, error) {
 	var args nameArgs
 	if err := decodeArgs(raw, &args); err != nil {

@@ -235,8 +235,10 @@ Hints **never execute anything**. `--quiet` suppresses them; all list/status com
 through the `tbxd`-owned socket — Talos renders its console dashboard and logs there, and
 maintenance-mode debugging works before any config exists. Detach with **`Ctrl-]`**; the
 session banner states the detach key. Attaching never blocks the VM; multiple attach/detach
-cycles are supported. `tbx manifests` prints the cluster's matching `CiliumLoadBalancerIPPool`,
-`CiliumBGPPeeringPolicy`, the `registryMirrors` machine-config patch, and the
+cycles are supported. `tbx manifests` prints the cluster's curated Cilium Helm values,
+matching `CiliumLoadBalancerIPPool`,
+`CiliumBGPClusterConfig`/`CiliumBGPPeerConfig`/`CiliumBGPAdvertisement` resources, the
+`registryMirrors` machine-config patch, and the
 `virtio_balloon` module patch.
 
 ## 11. Distribution
