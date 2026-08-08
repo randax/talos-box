@@ -85,15 +85,13 @@ func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
 		nodes = make(map[string]*vm.VM)
 		s.vms[item.Name] = nodes
 	}
-	warnings := []string{subnetWarning}
 	var attempted []string
-	for _, node := range item.Nodes {
+	warnings, err := resumeNodeBatch(item.Nodes, func(node cluster.Node) (resumedNode, error) {
 		machine, err := machineForResume(nodes[node.Name], func() (*vm.VM, error) {
 			return newVM(item, node)
 		})
 		if err != nil {
-			rollbackErr := s.closeNodes(item.Name, nodes, attempted)
-			return ClusterSummary{}, errors.Join(fmt.Errorf("create VM %s: %w", node.Name, err), rollbackErr)
+			return resumedNode{}, fmt.Errorf("create VM %s: %w", node.Name, err)
 		}
 		nodes[node.Name] = machine
 		attempted = append(attempted, node.Name)
@@ -103,20 +101,57 @@ func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
 			func() error { return machine.RestoreState(savePath) },
 			machine.Start,
 		)
-		_ = os.Remove(savePath) // consumed, unusable, or absent — never reuse a stale save
 		if resumeErr != nil {
-			rollbackErr := s.closeNodes(item.Name, nodes, attempted)
-			return ClusterSummary{}, errors.Join(fmt.Errorf("resume %s: %w", node.Name, resumeErr), rollbackErr)
+			return resumedNode{}, fmt.Errorf("resume %s: %w", node.Name, resumeErr)
 		}
+		var nodeWarning string
 		if warning != "" {
 			log.Printf("resume %s: %s", node.Name, warning)
-			warnings = append(warnings, fmt.Sprintf("%s: %s", node.Name, warning))
+			nodeWarning = fmt.Sprintf("%s: %s", node.Name, warning)
 		}
+		return resumedNode{savePath: savePath, warning: nodeWarning}, nil
+	}, func() error {
+		return s.closeNodes(item.Name, nodes, attempted)
+	})
+	if err != nil {
+		return ClusterSummary{}, err
 	}
 	go s.bindMirrors(item.SubnetIndex) // resume bypasses start(); rebind the gateway
 	result := summary(item, true)
-	result.Warning = joinWarnings(warnings...)
+	result.Warning = joinWarnings(append([]string{subnetWarning}, warnings...)...)
 	return result, nil
+}
+
+type resumedNode struct {
+	savePath string
+	warning  string
+}
+
+// resumeNodeBatch is the cluster-wide commit boundary: a failed node rolls
+// back attempted VMs without consuming any saved states, while full success
+// consumes the complete batch together.
+func resumeNodeBatch[T any](nodes []T, resume func(T) (resumedNode, error), rollback func() error) ([]string, error) {
+	var savePaths, warnings []string
+	for _, node := range nodes {
+		result, err := resume(node)
+		if err != nil {
+			return nil, errors.Join(err, rollback())
+		}
+		savePaths = append(savePaths, result.savePath)
+		if result.warning != "" {
+			warnings = append(warnings, result.warning)
+		}
+	}
+	removeSaveStateFiles(savePaths)
+	return warnings, nil
+}
+
+// removeSaveStateFiles commits a successful cluster-wide resume. Callers keep
+// the batch intact on rollback so a later resume can retry every saved node.
+func removeSaveStateFiles(paths []string) {
+	for _, path := range paths {
+		_ = os.Remove(path)
+	}
 }
 
 // prepareSavedMachine leaves a successfully-saved VM stopped but otherwise

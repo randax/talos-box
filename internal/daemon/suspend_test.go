@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -122,6 +124,62 @@ func TestMachineForResumeCreatesInstanceWithoutRetainedState(t *testing.T) {
 	}
 	if got != created {
 		t.Fatal("resume did not return the freshly-created VM")
+	}
+}
+
+func TestResumeNodeBatchCommitsSaveStatesOnlyAfterAllNodesResume(t *testing.T) {
+	dir := t.TempDir()
+	paths := map[string]string{
+		"cp-1":     filepath.Join(dir, "cp-1.vzstate"),
+		"worker-1": filepath.Join(dir, "worker-1.vzstate"),
+	}
+	for _, path := range paths {
+		if err := os.WriteFile(path, []byte("saved state"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rollbackCalled := false
+	_, err := resumeNodeBatch(
+		[]string{"cp-1", "worker-1"},
+		func(node string) (resumedNode, error) {
+			if node == "worker-1" {
+				return resumedNode{}, errors.New("worker resume failed")
+			}
+			return resumedNode{savePath: paths[node]}, nil
+		},
+		func() error {
+			rollbackCalled = true
+			return nil
+		},
+	)
+	if err == nil {
+		t.Fatal("later node failure must fail the batch")
+	}
+	if !rollbackCalled {
+		t.Fatal("later node failure did not trigger rollback")
+	}
+	for _, path := range paths {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("failed resume consumed retryable save state %s: %v", path, err)
+		}
+	}
+
+	_, err = resumeNodeBatch(
+		[]string{"cp-1", "worker-1"},
+		func(node string) (resumedNode, error) {
+			return resumedNode{savePath: paths[node]}, nil
+		},
+		func() error { return errors.New("unexpected rollback") },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, path := range paths {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("save state %s still exists or stat failed: %v", path, err)
+		}
 	}
 }
 
