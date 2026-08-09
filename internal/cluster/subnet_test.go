@@ -158,6 +158,19 @@ func TestCheckSubnetIndexRejectsForeignBridgeRoute(t *testing.T) {
 	}
 }
 
+func TestCheckSubnetIndexRejectsDifferentTalosBoxBridgeRoute(t *testing.T) {
+	t.Parallel()
+
+	sources := SubnetSources{
+		Interfaces: func() ([]HostInterface, error) { return nil, nil },
+		Route:      staticRoute("bridge108", "172.30.7.0/24"),
+	}
+	_, err := CheckSubnetIndex(7, sources)
+	if err == nil || !strings.Contains(err.Error(), "bridge108") {
+		t.Fatalf("CheckSubnetIndex() error = %v, want different-bridge route collision", err)
+	}
+}
+
 func TestSelectMostSpecificRouteSkipsOwnedBridgeRoute(t *testing.T) {
 	t.Parallel()
 
