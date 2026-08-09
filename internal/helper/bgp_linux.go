@@ -1,4 +1,4 @@
-//go:build !darwin && !linux
+//go:build linux
 
 package helper
 
@@ -7,7 +7,7 @@ import (
 	"errors"
 )
 
-var errBGPUnsupported = errors.New("BGP is only available on macOS")
+var errBGPUnsupported = errors.New("BGP helper support is not implemented on Linux")
 
 func (s *Server) enableBGP(json.RawMessage) error  { return errBGPUnsupported }
 func (s *Server) disableBGP(json.RawMessage) error { return errBGPUnsupported }

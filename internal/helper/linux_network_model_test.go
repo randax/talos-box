@@ -31,6 +31,7 @@ func TestStartLinuxAttachmentRejectsCollidingSubnetWithHint(t *testing.T) {
 			"172.30.6.2": mustRoute("en0", "0.0.0.0/0"),
 			"172.30.8.2": mustRoute("en0", "0.0.0.0/0"),
 		},
+		defaultRoute: mustRoute("eth0", "0.0.0.0/0"),
 	}
 	nft := &fakeLinuxNFTConverger{}
 
@@ -123,6 +124,7 @@ func TestConvergeLinuxManagedStateReassertsExistingBridges(t *testing.T) {
 			{Name: "eth0", Addrs: []net.Addr{mustCIDR("10.0.0.5/24")}},
 			{Name: bridgeNameForSubnet(3), Alias: bridgeAliasForSubnet(3), Addrs: []net.Addr{mustCIDR("172.30.3.1/24")}},
 		},
+		defaultRoute: mustRoute("eth0", "0.0.0.0/0"),
 	}
 	nft := &fakeLinuxNFTConverger{}
 
@@ -156,7 +158,8 @@ func TestConvergeLinuxManagedStateRecreatesBridgeForConfiguredSubnet(t *testing.
 	t.Parallel()
 
 	ops := &fakeLinuxNetworkOps{
-		links: []linuxLinkState{{Name: tapNameForNode(12, "demo", "cp-1"), Alias: tapAliasForSubnet(12)}},
+		links:        []linuxLinkState{{Name: tapNameForNode(12, "demo", "cp-1"), Alias: tapAliasForSubnet(12)}},
+		defaultRoute: mustRoute("eth0", "0.0.0.0/0"),
 	}
 	nft := &fakeLinuxNFTConverger{}
 	if err := convergeLinuxManagedState(ops, nft, []int{12}); err != nil {
@@ -181,7 +184,7 @@ func TestConvergeLinuxManagedStateRecreatesBridgeForConfiguredSubnet(t *testing.
 func TestConvergeLinuxManagedStateRecreatesColdBootBridgesFromInventory(t *testing.T) {
 	t.Parallel()
 
-	ops := &fakeLinuxNetworkOps{}
+	ops := &fakeLinuxNetworkOps{defaultRoute: mustRoute("eth0", "0.0.0.0/0")}
 	nft := &fakeLinuxNFTConverger{}
 	if err := convergeLinuxManagedState(ops, nft, []int{14}); err != nil {
 		t.Fatal(err)
@@ -199,6 +202,29 @@ func TestConvergeLinuxManagedStateRecreatesColdBootBridgesFromInventory(t *testi
 	}
 	if got := nft.subnetIndexes; !reflect.DeepEqual(got, []int{14}) {
 		t.Fatalf("nft subnet indexes = %v, want [14]", got)
+	}
+}
+
+func TestConvergeLinuxManagedStatePreflightsBeforeMutationAndSkipsAllocatedHint(t *testing.T) {
+	t.Parallel()
+
+	ops := &fakeLinuxNetworkOps{routes: map[string]cluster.HostRoute{
+		"172.30.0.2": mustRoute("eth0", "0.0.0.0/0"),
+		"172.30.1.2": mustRoute("eth0", "0.0.0.0/0"),
+		"172.30.7.2": mustRoute("vpn0", "172.30.6.0/23"),
+	}}
+	nft := &fakeLinuxNFTConverger{}
+	err := convergeLinuxManagedState(ops, nft, []int{0, 7})
+	if err == nil {
+		t.Fatal("convergeLinuxManagedState() error = nil, want collision")
+	}
+	for _, fragment := range []string{"vpn0", "try subnet index 1"} {
+		if !strings.Contains(err.Error(), fragment) {
+			t.Fatalf("error = %q, want %q", err, fragment)
+		}
+	}
+	if len(ops.calls) != 0 || nft.calls != 0 {
+		t.Fatalf("mutation after preflight failure: network=%v nft=%d", ops.calls, nft.calls)
 	}
 }
 

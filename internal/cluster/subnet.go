@@ -246,7 +246,7 @@ func isTalosBoxBridgeName(name string, index int) bool {
 		return true
 	}
 	bridgeIndex, err := strconv.Atoi(strings.TrimPrefix(name, "bridge"))
-	return err == nil && strings.HasPrefix(name, "bridge") && bridgeIndex >= 100
+	return err == nil && strings.HasPrefix(name, "bridge") && bridgeIndex == 100+index
 }
 
 func routeNotFound(output []byte) bool {

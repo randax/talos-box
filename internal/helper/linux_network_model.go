@@ -143,7 +143,7 @@ func linuxClusterSources(inspector linuxSubnetInspector) cluster.SubnetSources {
 	}
 }
 
-func preflightLinuxSubnet(index int, inspector linuxSubnetInspector) (string, error) {
+func preflightLinuxSubnet(index int, inspector linuxSubnetInspector, reserved []int) (string, error) {
 	sources := linuxClusterSources(inspector)
 	warning, err := cluster.CheckSubnetIndex(index, sources)
 	if err == nil && warning == "" {
@@ -153,19 +153,22 @@ func preflightLinuxSubnet(index int, inspector linuxSubnetInspector) (string, er
 	if conflict == nil {
 		conflict = fmt.Errorf("subnet %s is not safe to attach: %s", cluster.SubnetCIDR(index), warning)
 	}
-	hint, hintErr := lowestSafeLinuxSubnet(inspector)
+	hint, hintErr := lowestSafeLinuxSubnet(inspector, reserved)
 	if hintErr != nil || hint == index {
 		return "", conflict
 	}
 	return "", fmt.Errorf("%w; try subnet index %d (%s)", conflict, hint, cluster.SubnetCIDR(hint))
 }
 
-func lowestSafeLinuxSubnet(inspector linuxSubnetInspector) (int, error) {
+func lowestSafeLinuxSubnet(inspector linuxSubnetInspector, reserved []int) (int, error) {
 	links, err := inspector.Interfaces()
 	if err != nil {
 		return 0, err
 	}
 	managed := make(map[int]struct{})
+	for _, index := range normalizeLinuxSubnetIndexes(reserved) {
+		managed[index] = struct{}{}
+	}
 	for _, index := range managedSubnetIndexes(links) {
 		managed[index] = struct{}{}
 	}
@@ -183,10 +186,16 @@ func lowestSafeLinuxSubnet(inspector linuxSubnetInspector) (int, error) {
 }
 
 func convergeLinuxManagedState(netOps linuxNetworkOps, nft linuxNFTConverger, configured []int) error {
+	desired := normalizeLinuxSubnetIndexes(configured)
+	inspector := linuxSubnetInspector{Interfaces: netOps.ListLinks, Route: netOps.Route}
+	for _, index := range desired {
+		if _, err := preflightLinuxSubnet(index, inspector, desired); err != nil {
+			return err
+		}
+	}
 	if err := netOps.EnsureIPv4Forwarding(); err != nil {
 		return err
 	}
-	desired := normalizeLinuxSubnetIndexes(configured)
 	for _, index := range desired {
 		if err := ensureLinuxBridge(netOps, index); err != nil {
 			return err
@@ -202,7 +211,7 @@ func startLinuxAttachment(netOps linuxNetworkOps, nft linuxNFTConverger, configu
 	_, err := preflightLinuxSubnet(subnetIndex, linuxSubnetInspector{
 		Interfaces: netOps.ListLinks,
 		Route:      netOps.Route,
-	})
+	}, configured)
 	if err != nil {
 		return nil, err
 	}
