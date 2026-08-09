@@ -62,3 +62,18 @@ func TestVerifyQMPPeerMatchesSpawnedProcess(t *testing.T) {
 		t.Fatal("verifyQMPPeer accepted a different process")
 	}
 }
+
+func TestNewQEMUConsoleProxyCreatesNestedDirectory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "console", "node.sock")
+	proxy, guest, err := newQEMUConsoleProxy(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy.close()
+	if err := guest.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Dir(path)); err != nil {
+		t.Fatalf("console directory was not created: %v", err)
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 
 	"golang.org/x/sys/unix"
@@ -116,6 +117,9 @@ func verifyQMPPeer(connection net.Conn, process *qemuProcess) error {
 }
 
 func newQEMUConsoleProxy(path string) (*consoleProxy, *os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, nil, fmt.Errorf("create QEMU console directory: %w", err)
+	}
 	descriptors, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
 		return nil, nil, fmt.Errorf("create QEMU console socketpair: %w", err)

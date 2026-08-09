@@ -443,6 +443,15 @@ func (m *qemuMachine) Suspend(ctx context.Context, savePath string) (result erro
 	if err := m.quitLocked(ctx); err != nil {
 		return fmt.Errorf("stop QEMU after suspend: %w", err)
 	}
+	// The retained machine keeps its console and network attachment, but the
+	// QMP connection belongs to the QEMU process that just exited. Close it now
+	// instead of retaining the descriptor until a future resume or Close.
+	_ = m.qmp.close()
+	m.qmp = nil
+	if m.qmpPath != "" {
+		_ = os.Remove(m.qmpPath)
+		m.qmpPath = ""
+	}
 	saved = true
 	return nil
 }

@@ -296,6 +296,9 @@ func TestQEMUSuspendUsesFileMigrationAndRetainsMachine(t *testing.T) {
 	if backend.saved[savePath] != machine {
 		t.Fatal("suspended machine was not retained for same-daemon resume")
 	}
+	if machine.qmp != nil {
+		t.Fatal("suspended machine retained the exited QEMU process's QMP client")
+	}
 	if machine.Active() {
 		t.Fatal("machine remained active after suspend")
 	}
