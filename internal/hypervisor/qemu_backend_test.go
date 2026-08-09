@@ -304,6 +304,49 @@ func TestQEMUSuspendUsesFileMigrationAndRetainsMachine(t *testing.T) {
 	}
 }
 
+func TestCleanupExitedQMPPreservesFailedCleanup(t *testing.T) {
+	closeErr := errors.New("close QMP connection")
+	client := &qmpClient{conn: closeErrorConn{err: closeErr}}
+	qmpPath := filepath.Join(t.TempDir(), "qmp.sock")
+	if err := os.Mkdir(qmpPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(qmpPath, "keep"), []byte("occupied"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	machine := &qemuMachine{qmp: client, qmpPath: qmpPath}
+
+	machine.cleanupExitedQMP()
+
+	if machine.qmp != client {
+		t.Fatal("cleanup discarded QMP client after close failure")
+	}
+	if machine.qmpPath != qmpPath {
+		t.Fatal("cleanup discarded QMP socket path after removal failure")
+	}
+	if err := machine.qmp.close(); !errors.Is(err, closeErr) {
+		t.Fatalf("retained QMP client close error = %v, want %v", err, closeErr)
+	}
+}
+
+func TestCleanupExitedQMPClearsSuccessfulAndMissingCleanup(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer func() { _ = serverConn.Close() }()
+	machine := &qemuMachine{
+		qmp:     &qmpClient{conn: clientConn},
+		qmpPath: filepath.Join(t.TempDir(), "missing", "qmp.sock"),
+	}
+
+	machine.cleanupExitedQMP()
+
+	if machine.qmp != nil {
+		t.Fatal("cleanup retained successfully closed QMP client")
+	}
+	if machine.qmpPath != "" {
+		t.Fatalf("cleanup retained missing QMP socket path %q", machine.qmpPath)
+	}
+}
+
 func TestWaitQEMUIncomingRejectsFailedMigration(t *testing.T) {
 	client, server := qmpClientForTest(t, func(request qmpTestRequest) (any, bool) {
 		if request.Execute != "query-migrate" {
@@ -317,6 +360,15 @@ func TestWaitQEMUIncomingRejectsFailedMigration(t *testing.T) {
 	if !errors.Is(err, ErrIncompatibleSave) || !strings.Contains(err.Error(), "bad stream") {
 		t.Fatalf("waitQEMUIncoming() = %v, want ErrIncompatibleSave with migration failure", err)
 	}
+}
+
+type closeErrorConn struct {
+	net.Conn
+	err error
+}
+
+func (c closeErrorConn) Close() error {
+	return c.err
 }
 
 func qmpClientForTest(t *testing.T, respond func(qmpTestRequest) (any, bool)) (*qmpClient, net.Conn) {

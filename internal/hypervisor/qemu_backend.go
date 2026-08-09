@@ -446,14 +446,22 @@ func (m *qemuMachine) Suspend(ctx context.Context, savePath string) (result erro
 	// The retained machine keeps its console and network attachment, but the
 	// QMP connection belongs to the QEMU process that just exited. Close it now
 	// instead of retaining the descriptor until a future resume or Close.
-	_ = m.qmp.close()
-	m.qmp = nil
-	if m.qmpPath != "" {
-		_ = os.Remove(m.qmpPath)
-		m.qmpPath = ""
-	}
+	m.cleanupExitedQMP()
 	saved = true
 	return nil
+}
+
+func (m *qemuMachine) cleanupExitedQMP() {
+	if m.qmp != nil {
+		if err := m.qmp.close(); err == nil {
+			m.qmp = nil
+		}
+	}
+	if m.qmpPath != "" {
+		if err := os.Remove(m.qmpPath); err == nil || errors.Is(err, os.ErrNotExist) {
+			m.qmpPath = ""
+		}
+	}
 }
 
 func waitQEMUMigration(ctx context.Context, client *qmpClient) error {
