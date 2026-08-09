@@ -3,6 +3,7 @@
 package helper
 
 import (
+	"fmt"
 	"os"
 	"testing"
 )
@@ -29,4 +30,34 @@ func TestLinuxSocketAuthorizedPeerUsesFilesystemGate(t *testing.T) {
 	if !isAuthorizedPeer(uint32(os.Geteuid()), nil) {
 		t.Fatal("peer admitted by the Linux socket permissions was rejected")
 	}
+}
+
+func TestLinuxUnauthorizedPeerReceivesServerError(t *testing.T) {
+	t.Parallel()
+
+	uid := uint32(os.Geteuid())
+	if uid == 0 {
+		t.Skip("root is always authorized")
+	}
+	allowedUID := uid + 1
+	server := NewServer(&allowedUID)
+	left, right := unixSocketpair(t)
+	defer func() { _ = right.Close() }()
+
+	done := make(chan struct{})
+	go func() {
+		server.serveConnection(left)
+		close(done)
+	}()
+
+	client := &Client{connection: right}
+	err := client.Ping()
+	if err == nil {
+		t.Fatal("unauthorized peer received no error")
+	}
+	want := fmt.Sprintf("unauthorized uid %d", uid)
+	if err.Error() != want {
+		t.Fatalf("error = %q, want %q", err, want)
+	}
+	<-done
 }

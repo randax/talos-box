@@ -144,9 +144,30 @@ func (c *Client) call(op string, args any, wantFD bool) (Response, int, error) {
 	}
 	wire = append(wire, '\n')
 	if err := writeAll(c.connection, wire); err != nil {
+		if responseErr := earlyHelperResponse(c.connection, err); responseErr != nil {
+			return Response{}, -1, responseErr
+		}
 		return Response{}, -1, fmt.Errorf("write helper request: %w", err)
 	}
 	return receiveResponse(c.connection, wantFD)
+}
+
+func earlyHelperResponse(connection *net.UnixConn, writeErr error) error {
+	if !errors.Is(writeErr, unix.EPIPE) && !errors.Is(writeErr, unix.ECONNRESET) {
+		return nil
+	}
+	_, _, err := receiveResponse(connection, false)
+	if err == nil {
+		return nil
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return nil
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
+		return nil
+	}
+	return err
 }
 
 func receiveResponse(connection *net.UnixConn, wantFD bool) (Response, int, error) {
