@@ -8,7 +8,7 @@ import (
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/config"
-	"github.com/randax/talos-box/internal/vm"
+	"github.com/randax/talos-box/internal/hypervisor"
 )
 
 func TestUpForceSurfacesHostPressureWarning(t *testing.T) {
@@ -21,7 +21,7 @@ func TestUpForceSurfacesHostPressureWarning(t *testing.T) {
 		t.Fatal(err)
 	}
 	service := &Server{
-		vms:          make(map[string]map[string]*vm.VM),
+		vms:          make(map[string]map[string]hypervisor.Machine),
 		hostPressure: extremeSwapPressure,
 		subnetSources: cluster.SubnetSources{
 			Interfaces: func() ([]cluster.HostInterface, error) { return nil, nil },

@@ -10,8 +10,8 @@ import (
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/hostpressure"
+	"github.com/randax/talos-box/internal/hypervisor"
 	"github.com/randax/talos-box/internal/imagecache"
-	"github.com/randax/talos-box/internal/vm"
 )
 
 func TestCreateClusterChecksHostPressureBeforeMutation(t *testing.T) {
@@ -40,7 +40,7 @@ func TestAddNodeChecksHostPressureBeforeMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	service := &Server{
-		vms:          make(map[string]map[string]*vm.VM),
+		vms:          make(map[string]map[string]hypervisor.Machine),
 		hostPressure: extremeSwapPressure,
 	}
 	raw, err := json.Marshal(nodeArgs{Cluster: item.Name, Name: "unsafe-worker", Role: cluster.RoleWorker})
@@ -82,7 +82,7 @@ func TestAddNodeSurfacesHostPressureProbeFailure(t *testing.T) {
 	}
 	service := &Server{
 		cache: imagecache.New(cacheRoot),
-		vms:   make(map[string]map[string]*vm.VM),
+		vms:   make(map[string]map[string]hypervisor.Machine),
 		hostPressure: func(string) (hostpressure.Snapshot, error) {
 			return hostpressure.Snapshot{}, errors.New("statfs unavailable")
 		},

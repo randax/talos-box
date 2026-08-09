@@ -1,9 +1,7 @@
-package vm
+package hypervisor
 
 import "sync"
 
-// ringBuffer retains the most recent writes up to a fixed capacity — the
-// console scrollback replayed to a client on attach.
 type ringBuffer struct {
 	mu    sync.Mutex
 	data  []byte

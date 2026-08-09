@@ -9,7 +9,7 @@ import (
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/hostpressure"
-	"github.com/randax/talos-box/internal/vm"
+	"github.com/randax/talos-box/internal/hypervisor"
 )
 
 func TestHostSubnetSourcesMergesPartialOverrides(t *testing.T) {
@@ -46,7 +46,7 @@ func TestStartClusterAttachesSubnetWarning(t *testing.T) {
 		t.Fatal(err)
 	}
 	service := &Server{
-		vms:          make(map[string]map[string]*vm.VM),
+		vms:          make(map[string]map[string]hypervisor.Machine),
 		hostPressure: noHostPressure,
 		subnetSources: cluster.SubnetSources{
 			Interfaces: func() ([]cluster.HostInterface, error) { return nil, nil },
@@ -79,7 +79,7 @@ func TestStartClusterRefusesExtremeHostPressure(t *testing.T) {
 		t.Fatal(err)
 	}
 	service := &Server{
-		vms: make(map[string]map[string]*vm.VM),
+		vms: make(map[string]map[string]hypervisor.Machine),
 		hostPressure: func(string) (hostpressure.Snapshot, error) {
 			return hostpressure.Snapshot{
 				Swap: hostpressure.Usage{TotalBytes: 10 << 30, AvailableBytes: 1 << 30},
@@ -116,7 +116,7 @@ func TestStartClusterForceSurfacesExtremeHostPressureWarning(t *testing.T) {
 		t.Fatal(err)
 	}
 	service := &Server{
-		vms: make(map[string]map[string]*vm.VM),
+		vms: make(map[string]map[string]hypervisor.Machine),
 		hostPressure: func(string) (hostpressure.Snapshot, error) {
 			return hostpressure.Snapshot{
 				DataVolume: hostpressure.Usage{TotalBytes: 100 << 30, AvailableBytes: 5 << 30},
@@ -153,7 +153,7 @@ func TestStartClusterSurfacesHostPressureProbeFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	service := &Server{
-		vms: make(map[string]map[string]*vm.VM),
+		vms: make(map[string]map[string]hypervisor.Machine),
 		hostPressure: func(string) (hostpressure.Snapshot, error) {
 			return hostpressure.Snapshot{}, errors.New("sysctl unavailable")
 		},

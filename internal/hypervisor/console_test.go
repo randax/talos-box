@@ -1,4 +1,4 @@
-package vm
+package hypervisor
 
 import (
 	"io"
