@@ -1,4 +1,4 @@
-package vm
+package cluster
 
 import (
 	"bufio"
@@ -17,7 +17,6 @@ func LeaseIP(mac string, subnetIndex int) string {
 	if err != nil {
 		return ""
 	}
-
 	return parseLeaseIP(string(data), mac, subnetIndex)
 }
 
@@ -26,7 +25,6 @@ func parseLeaseIP(data, mac string, subnetIndex int) string {
 	if err != nil {
 		return ""
 	}
-
 	var ip string
 	scanner := bufio.NewScanner(strings.NewReader(data))
 	for scanner.Scan() {
@@ -43,7 +41,6 @@ func parseLeaseIP(data, mac string, subnetIndex int) string {
 			}
 		}
 	}
-
 	return ""
 }
 
@@ -62,11 +59,9 @@ func leaseMAC(mac string) (string, error) {
 	if len(hardwareAddr) != 6 {
 		return "", fmt.Errorf("MAC address must contain 6 octets")
 	}
-
 	parts := make([]string, len(hardwareAddr))
 	for i, octet := range hardwareAddr {
 		parts[i] = fmt.Sprintf("%x", octet)
 	}
-
 	return strings.Join(parts, ":"), nil
 }

@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,18 +16,19 @@ import (
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/hostpressure"
+	"github.com/randax/talos-box/internal/hypervisor"
 	"github.com/randax/talos-box/internal/imagecache"
 	"github.com/randax/talos-box/internal/mirror"
-	"github.com/randax/talos-box/internal/vm"
 	"golang.org/x/sys/unix"
 )
 
 // Server owns all VMs started by one daemon process.
 type Server struct {
-	cache *imagecache.Cache
+	cache      *imagecache.Cache
+	hypervisor hypervisor.Hypervisor
 
 	opMu             sync.Mutex
-	vms              map[string]map[string]*vm.VM
+	vms              map[string]map[string]hypervisor.Machine
 	mirrors          *mirror.Manager
 	defaultSchematic string
 	subnetSources    cluster.SubnetSources
@@ -44,6 +46,8 @@ type lockedListener struct {
 	lock *os.File
 }
 
+const machineStopTimeout = 30 * time.Second
+
 func (l *lockedListener) Close() error {
 	// Keep the process lock until exit so a replacement daemon cannot bind while
 	// this daemon is still stopping VMs and cleaning up its socket.
@@ -52,8 +56,13 @@ func (l *lockedListener) Close() error {
 	return err
 }
 
-// NewServer creates a daemon using the default image cache.
-func NewServer() (*Server, error) {
+// NewServer creates a daemon using the default image cache and probes the host
+// hypervisor once before accepting requests.
+func NewServer(ctx context.Context) (*Server, error) {
+	backend, err := hypervisor.New(ctx)
+	if err != nil {
+		return nil, err
+	}
 	cache, err := imagecache.NewDefault()
 	if err != nil {
 		return nil, err
@@ -64,7 +73,8 @@ func NewServer() (*Server, error) {
 	}
 	return &Server{
 		cache:         cache,
-		vms:           make(map[string]map[string]*vm.VM),
+		hypervisor:    backend,
+		vms:           make(map[string]map[string]hypervisor.Machine),
 		mirrors:       mirror.NewManager(mirror.DefaultDir(root)),
 		subnetSources: cluster.SystemSubnetSources(),
 		hostPressure:  hostpressure.SystemSnapshot,
@@ -180,14 +190,14 @@ func (s *Server) Shutdown() error {
 
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
-	var all []*vm.VM
+	var all []hypervisor.Machine
 	for _, nodes := range s.vms {
 		for _, machine := range nodes {
 			all = append(all, machine)
 		}
 	}
 	err := closeVMs(all)
-	s.vms = make(map[string]map[string]*vm.VM)
+	s.vms = make(map[string]map[string]hypervisor.Machine)
 	if s.mirrors != nil {
 		s.mirrors.Close()
 	}
@@ -285,14 +295,14 @@ func decodeArgs(raw json.RawMessage, destination any) error {
 	return nil
 }
 
-func closeVMs(machines []*vm.VM) error {
+func closeVMs(machines []hypervisor.Machine) error {
 	errorsByVM := make(chan error, len(machines))
 	var wait sync.WaitGroup
 	for _, machine := range machines {
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
-			errorsByVM <- machine.Close()
+			errorsByVM <- closeMachine(machine)
 		}()
 	}
 	wait.Wait()
@@ -302,6 +312,16 @@ func closeVMs(machines []*vm.VM) error {
 		result = errors.Join(result, err)
 	}
 	return result
+}
+
+func closeMachine(machine hypervisor.Machine) error {
+	return errors.Join(stopMachine(machine), machine.Close())
+}
+
+func stopMachine(machine hypervisor.Machine) error {
+	ctx, cancel := context.WithTimeout(context.Background(), machineStopTimeout)
+	defer cancel()
+	return machine.Stop(ctx)
 }
 
 func removeNodeFiles(clusterName, nodeName string) error {
@@ -317,7 +337,7 @@ func removeNodeFiles(clusterName, nodeName string) error {
 	return nil
 }
 
-func sortedNodeNames(nodes map[string]*vm.VM) []string {
+func sortedNodeNames(nodes map[string]hypervisor.Machine) []string {
 	names := make([]string, 0, len(nodes))
 	for name := range nodes {
 		names = append(names, name)

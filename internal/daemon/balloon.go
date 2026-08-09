@@ -7,8 +7,19 @@ import (
 	"github.com/randax/talos-box/internal/balloon"
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/hostpressure"
-	"github.com/randax/talos-box/internal/vm"
+	"github.com/randax/talos-box/internal/hypervisor"
 )
+
+type balloonMachine struct {
+	machine       hypervisor.Machine
+	configuredMiB int
+}
+
+func (m balloonMachine) ConfiguredMiB() int { return m.configuredMiB }
+
+func (m balloonMachine) SetMemoryTargetMiB(targetMiB int) error {
+	return m.machine.SetMemoryTargetMiB(targetMiB)
+}
 
 // Balloonables snapshots the CONFIGURED running nodes for the balloon manager,
 // reading s.vms under opMu so the manager never races an op. Maintenance-mode
@@ -17,8 +28,9 @@ import (
 // only the TLS-configured ones are managed.
 func (s *Server) Balloonables() map[string]balloon.Balloonable {
 	type entry struct {
-		machine *vm.VM
-		ip      string
+		machine       hypervisor.Machine
+		configuredMiB int
+		ip            string
 	}
 	s.opMu.Lock()
 	candidates := map[string]entry{}
@@ -36,7 +48,11 @@ func (s *Server) Balloonables() map[string]balloon.Balloonable {
 			if !ok || !machine.Active() {
 				continue
 			}
-			candidates[clusterName+"/"+nodeName] = entry{machine, vm.LeaseIP(node.MAC, item.SubnetIndex)}
+			candidates[clusterName+"/"+nodeName] = entry{
+				machine:       machine,
+				configuredMiB: item.DefaultsFor(node.Role).MemoryMiB,
+				ip:            cluster.LeaseIP(node.MAC, item.SubnetIndex),
+			}
 		}
 	}
 	s.opMu.Unlock()
@@ -44,7 +60,7 @@ func (s *Server) Balloonables() map[string]balloon.Balloonable {
 	out := map[string]balloon.Balloonable{}
 	for key, e := range candidates {
 		if e.ip != "" && ClassifyPhase(true, probeAPID(e.ip)) == PhaseConfigured {
-			out[key] = e.machine
+			out[key] = balloonMachine{machine: e.machine, configuredMiB: e.configuredMiB}
 		}
 	}
 	return out

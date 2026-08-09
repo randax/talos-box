@@ -1,4 +1,4 @@
-package vm
+package hypervisor
 
 import (
 	"fmt"
@@ -10,10 +10,10 @@ import (
 	"time"
 )
 
-const consoleWriteTimeout = 2 * time.Second
-
-// consoleScrollback is how much recent guest output an attach replays.
-const consoleScrollback = 64 * 1024
+const (
+	consoleWriteTimeout = 2 * time.Second
+	consoleScrollback   = 64 * 1024
+)
 
 type consoleProxy struct {
 	listener *net.UnixListener
@@ -24,8 +24,7 @@ type consoleProxy struct {
 	mu     sync.Mutex
 	client net.Conn
 
-	// writeMu serializes attach-replay with live output so a new client sees
-	// scrollback strictly before anything the guest writes afterwards.
+	// writeMu keeps attach replay strictly before subsequent live output.
 	writeMu sync.Mutex
 }
 
@@ -33,7 +32,6 @@ func newConsoleProxy(path string) (*consoleProxy, *os.File, *os.File, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, nil, nil, fmt.Errorf("create console directory: %w", err)
 	}
-
 	listener, err := listenUnix(path)
 	if err != nil {
 		return nil, nil, nil, err
@@ -54,7 +52,6 @@ func newConsoleProxy(path string) (*consoleProxy, *os.File, *os.File, error) {
 	proxy := &consoleProxy{listener: listener, input: hostWrite, output: hostRead, ring: newRingBuffer(consoleScrollback)}
 	go proxy.accept()
 	go proxy.writeOutput()
-
 	return proxy, guestRead, guestWrite, nil
 }
 
@@ -64,7 +61,6 @@ func listenUnix(path string) (*net.UnixListener, error) {
 	if err == nil {
 		return listener, nil
 	}
-
 	info, statErr := os.Lstat(path)
 	if statErr != nil || info.Mode()&os.ModeSocket == 0 {
 		return nil, fmt.Errorf("listen on console socket: %w", err)
@@ -77,7 +73,6 @@ func listenUnix(path string) (*net.UnixListener, error) {
 	if removeErr := os.Remove(path); removeErr != nil {
 		return nil, fmt.Errorf("remove stale console socket: %w", removeErr)
 	}
-
 	listener, err = net.ListenUnix("unix", addr)
 	if err != nil {
 		return nil, fmt.Errorf("listen on console socket: %w", err)
@@ -100,9 +95,9 @@ func (p *consoleProxy) accept() {
 			continue
 		}
 		if scrollback := p.ring.Snapshot(); len(scrollback) > 0 {
-			_ = conn.SetWriteDeadline(time.Now().Add(consoleWriteTimeout))
-			if err := writeAll(conn, scrollback); err != nil {
-				p.clearClient(conn)
+			if !p.writeClient(conn, scrollback) {
+				p.writeMu.Unlock()
+				continue
 			}
 		}
 		p.writeMu.Unlock()
@@ -121,22 +116,31 @@ func (p *consoleProxy) writeOutput() {
 			return
 		}
 		p.ring.Write(buf[:n])
-		p.writeMu.Lock()
-		conn := p.currentClient()
-		if conn == nil {
-			p.writeMu.Unlock()
-			continue
-		}
-		if err := conn.SetWriteDeadline(time.Now().Add(consoleWriteTimeout)); err != nil {
-			p.clearClient(conn)
-			p.writeMu.Unlock()
-			continue
-		}
-		if err := writeAll(conn, buf[:n]); err != nil {
-			p.clearClient(conn)
-		}
-		p.writeMu.Unlock()
+		p.writeLiveOutput(buf[:n])
 	}
+}
+
+func (p *consoleProxy) writeLiveOutput(data []byte) {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	if conn := p.currentClient(); conn != nil {
+		p.writeClient(conn, data)
+	}
+}
+
+// writeClient is called with writeMu held so replay remains strictly ordered
+// before live output. Never write when the timeout cannot be installed: a
+// blocking write here would also block every future attach and replay.
+func (p *consoleProxy) writeClient(conn net.Conn, data []byte) bool {
+	if err := conn.SetWriteDeadline(time.Now().Add(consoleWriteTimeout)); err != nil {
+		p.clearClient(conn)
+		return false
+	}
+	if err := writeAll(conn, data); err != nil {
+		p.clearClient(conn)
+		return false
+	}
+	return true
 }
 
 func writeAll(writer io.Writer, data []byte) error {

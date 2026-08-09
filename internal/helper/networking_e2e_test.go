@@ -138,19 +138,18 @@ func (h *syntheticNodeHarness) attachNode(label string, subnet int, mac net.Hard
 
 	cluster := fmt.Sprintf("issue22-%s-%s", label, h.env.runID)
 	name := fmt.Sprintf("node-%s", label)
-	fd, err := h.env.client.Attach(cluster, subnet, name)
+	attachment, err := Attach(cluster, subnet, name)
 	if err != nil {
 		h.t.Fatalf("attach %s subnet %d: %v", label, subnet, err)
 	}
+	fd := int(attachment.File.Fd())
 	if socketType, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_TYPE); err != nil {
 		h.t.Fatalf("inspect helper fd for %s: %v", label, err)
 	} else if socketType != unix.SOCK_DGRAM {
 		h.t.Fatalf("helper fd for %s has type %d, want SOCK_DGRAM", label, socketType)
 	}
 
-	file := os.NewFile(uintptr(fd), fmt.Sprintf("helper-%s", label))
-	connAny, err := net.FileConn(file)
-	_ = file.Close()
+	connAny, err := net.FileConn(attachment.File)
 	if err != nil {
 		h.t.Fatalf("convert helper fd for %s to conn: %v", label, err)
 	}
@@ -164,10 +163,10 @@ func (h *syntheticNodeHarness) attachNode(label string, subnet int, mac net.Hard
 	go node.readLoop()
 
 	h.t.Cleanup(func() {
-		if err := h.env.client.Detach(cluster, name); err != nil {
+		node.close()
+		if err := attachment.Close(); err != nil {
 			h.t.Errorf("detach %s/%s: %v", cluster, name, err)
 		}
-		node.close()
 	})
 	return node
 }

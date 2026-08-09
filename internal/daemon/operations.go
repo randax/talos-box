@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,7 +13,7 @@ import (
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/helper"
-	"github.com/randax/talos-box/internal/vm"
+	"github.com/randax/talos-box/internal/hypervisor"
 )
 
 type createArgs struct {
@@ -228,7 +229,7 @@ func (s *Server) start(item cluster.Cluster) (string, error) {
 	}
 	nodes := s.vms[item.Name]
 	if nodes == nil {
-		nodes = make(map[string]*vm.VM)
+		nodes = make(map[string]hypervisor.Machine)
 		s.vms[item.Name] = nodes
 	}
 	var started []string
@@ -242,17 +243,13 @@ func (s *Server) start(item cluster.Cluster) (string, error) {
 			}
 			delete(nodes, node.Name)
 		}
-		machine, err := newVM(item, node)
+		machine, err := s.launchMachine(item, node, nil)
 		if err != nil {
 			rollbackErr := s.rollbackStarted(item.Name, nodes, started)
 			return "", errors.Join(fmt.Errorf("create VM %s: %w", node.Name, err), rollbackErr)
 		}
 		nodes[node.Name] = machine
 		started = append(started, node.Name)
-		if err := machine.Start(); err != nil {
-			rollbackErr := s.rollbackStarted(item.Name, nodes, started)
-			return "", errors.Join(fmt.Errorf("start VM %s: %w", node.Name, err), rollbackErr)
-		}
 	}
 	go s.bindMirrors(item.SubnetIndex) // async: don't hold opMu across the retry
 	return subnetWarning, nil
@@ -279,64 +276,32 @@ func (s *Server) hostSubnetSources() cluster.SubnetSources {
 	return sources
 }
 
-func (s *Server) rollbackStarted(clusterName string, nodes map[string]*vm.VM, names []string) error {
+func (s *Server) rollbackStarted(clusterName string, nodes map[string]hypervisor.Machine, names []string) error {
 	return s.closeNodes(clusterName, nodes, names)
 }
 
-func newVM(item cluster.Cluster, node cluster.Node) (*vm.VM, error) {
+func (s *Server) launchMachine(item cluster.Cluster, node cluster.Node, restore *hypervisor.Restore) (hypervisor.Machine, error) {
 	dir, err := cluster.Dir(item.Name)
 	if err != nil {
 		return nil, err
 	}
-	networkFile, cleanup, err := attachNetwork(item, node)
-	if err != nil {
-		return nil, err
-	}
 	sizing := item.DefaultsFor(node.Role)
-	machine, err := vm.New(vm.Config{
-		CPUs:              sizing.CPUs,
-		MemoryMiB:         sizing.MemoryMiB,
-		DiskPath:          filepath.Join(dir, node.Name+".img"),
-		MAC:               node.MAC,
-		NetworkFile:       networkFile,
-		NetworkCleanup:    cleanup,
+	return s.hypervisor.Launch(context.Background(), hypervisor.Spec{
+		CPUs:      sizing.CPUs,
+		MemoryMiB: sizing.MemoryMiB,
+		DiskPath:  filepath.Join(dir, node.Name+".img"),
+		MAC:       node.MAC,
+		Network: func() (*helper.Attachment, error) {
+			attachment, err := helper.Attach(item.Name, item.SubnetIndex, node.Name)
+			if errors.Is(err, helper.ErrUnavailable) {
+				return nil, helperInstallError(err)
+			}
+			return attachment, err
+		},
 		EFIVarsPath:       filepath.Join(dir, node.Name+".efi"),
 		ConsoleSocketPath: filepath.Join(dir, node.Name+".console.sock"),
+		Restore:           restore,
 	})
-	if err != nil {
-		_ = networkFile.Close()
-		return nil, errors.Join(err, cleanup())
-	}
-	return machine, nil
-}
-
-func attachNetwork(item cluster.Cluster, node cluster.Node) (*os.File, func() error, error) {
-	client, err := helper.Connect()
-	if err != nil {
-		return nil, nil, helperInstallError(err)
-	}
-	fd, attachErr := client.Attach(item.Name, item.SubnetIndex, node.Name)
-	_ = client.Close()
-	if attachErr != nil {
-		return nil, nil, fmt.Errorf("attach helper network: %w", attachErr)
-	}
-	file := os.NewFile(uintptr(fd), item.Name+"/"+node.Name+".network")
-	// Detach is best-effort teardown: the helper reclaims the vmnet interface
-	// when the VM's fd closes, and explicit detach races that cleanup from
-	// either side. A cleanup problem must never wedge stop/destroy.
-	cleanup := func() error {
-		client, err := helper.Connect()
-		if err != nil {
-			log.Printf("detach network for %s: %v (ignored)", node.Name, err)
-			return nil
-		}
-		defer func() { _ = client.Close() }()
-		if err := client.Detach(item.Name, node.Name); err != nil {
-			log.Printf("detach network for %s: %v (ignored)", node.Name, err)
-		}
-		return nil
-	}
-	return file, cleanup, nil
 }
 
 func helperInstallError(err error) error {
@@ -409,7 +374,7 @@ func (s *Server) unbindMirrors(subnetIndex int) {
 	}
 }
 
-func (s *Server) closeNodes(clusterName string, nodes map[string]*vm.VM, names []string) error {
+func (s *Server) closeNodes(clusterName string, nodes map[string]hypervisor.Machine, names []string) error {
 	type result struct {
 		name string
 		err  error
@@ -417,7 +382,7 @@ func (s *Server) closeNodes(clusterName string, nodes map[string]*vm.VM, names [
 	results := make(chan result, len(names))
 	for _, name := range names {
 		machine := nodes[name]
-		go func() { results <- result{name: name, err: machine.Close()} }()
+		go func() { results <- result{name: name, err: closeMachine(machine)} }()
 	}
 	errorsByName := make(map[string]error, len(names))
 	for range names {
@@ -529,17 +494,9 @@ func (s *Server) addNode(raw json.RawMessage) (NodeStatus, error) {
 		return NodeStatus{}, err
 	}
 	if running {
-		machine, err := newVM(item, node)
+		machine, err := s.launchMachine(item, node, nil)
 		if err != nil {
 			return nodeStatus(node, item.SubnetIndex, false), fmt.Errorf("node added but failed to create VM: %w", err)
-		}
-		if err := machine.Start(); err != nil {
-			startErr := fmt.Errorf("node added but failed to start: %w", err)
-			if closeErr := machine.Close(); closeErr != nil {
-				s.vms[item.Name][node.Name] = machine
-				return nodeStatus(node, item.SubnetIndex, false), errors.Join(startErr, fmt.Errorf("release failed VM: %w", closeErr))
-			}
-			return nodeStatus(node, item.SubnetIndex, false), startErr
 		}
 		s.vms[item.Name][node.Name] = machine
 	}
@@ -562,7 +519,7 @@ func (s *Server) removeNode(raw json.RawMessage) (NodeStatus, error) {
 		return NodeStatus{}, err
 	}
 	if machine := s.vms[item.Name][node.Name]; machine != nil {
-		if err := machine.Close(); err != nil {
+		if err := closeMachine(machine); err != nil {
 			return NodeStatus{}, fmt.Errorf("stop node %s: %w", node.Name, err)
 		}
 		delete(s.vms[item.Name], node.Name)
@@ -626,7 +583,7 @@ func (s *Server) clusterRunning(name string) bool {
 }
 
 func nodeStatus(node cluster.Node, subnetIndex int, vmRunning bool) NodeStatus {
-	ip := vm.LeaseIP(node.MAC, subnetIndex)
+	ip := cluster.LeaseIP(node.MAC, subnetIndex)
 	probe := ProbeResult{}
 	if ip != "" {
 		probe = probeAPID(ip)

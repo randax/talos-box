@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -15,7 +16,6 @@ import (
 	tbxdns "github.com/randax/talos-box/internal/dns"
 	"github.com/randax/talos-box/internal/helper"
 	"github.com/randax/talos-box/internal/version"
-	"github.com/randax/talos-box/internal/vm"
 )
 
 func main() {
@@ -40,7 +40,7 @@ func run() error {
 	}
 	defer func() { _ = os.Remove(socketPath) }()
 
-	server, err := daemon.NewServer()
+	server, err := daemon.NewServer(context.Background())
 	if err != nil {
 		_ = listener.Close()
 		return err
@@ -51,7 +51,7 @@ func run() error {
 			log.Printf("DNS state refresh failed: %v", err)
 			return nil
 		}
-		return tbxdns.Resolve(name, clusters, vm.LeaseIP)
+		return tbxdns.Resolve(name, clusters, cluster.LeaseIP)
 	})
 	if err != nil {
 		_ = listener.Close()

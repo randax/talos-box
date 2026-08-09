@@ -1,0 +1,67 @@
+// Package hypervisor defines the platform-neutral virtual-machine boundary.
+package hypervisor
+
+import (
+	"context"
+	"errors"
+
+	"github.com/randax/talos-box/internal/helper"
+)
+
+var (
+	// ErrUnsupported reports a feature or backend unavailable on this host.
+	ErrUnsupported = errors.New("hypervisor feature unsupported")
+	// ErrDeviceNotActive reports an operation that requires a running device.
+	ErrDeviceNotActive = errors.New("hypervisor device is not active")
+	// ErrIncompatibleSave reports saved state that cannot be restored by the
+	// current machine configuration or backend.
+	ErrIncompatibleSave = errors.New("hypervisor saved state is incompatible")
+)
+
+// FeatureStatus describes whether a runtime-conditional feature is usable.
+type FeatureStatus struct {
+	Supported bool
+	Reason    string
+}
+
+// Capabilities is the set of optional features detected for a backend.
+type Capabilities struct {
+	Suspend         FeatureStatus
+	BalloonReadback FeatureStatus
+}
+
+// Restore asks Launch to restore saved state. Launch falls back to a cold boot
+// and reports why through Fallback when the state is missing or incompatible.
+type Restore struct {
+	Path     string
+	Fallback func(error)
+}
+
+// Spec contains the resources needed to create and start one machine.
+// Network is lazy so an in-process restore can reuse its retained attachment;
+// once invoked, ownership of the returned attachment belongs to the backend.
+type Spec struct {
+	CPUs              int
+	MemoryMiB         int
+	DiskPath          string
+	MAC               string
+	Network           func() (*helper.Attachment, error)
+	EFIVarsPath       string
+	ConsoleSocketPath string
+	Restore           *Restore
+}
+
+// Hypervisor creates machines and reports runtime capabilities.
+type Hypervisor interface {
+	Launch(context.Context, Spec) (Machine, error)
+	Capabilities() Capabilities
+}
+
+// Machine is a running or retained virtual machine.
+type Machine interface {
+	Active() bool
+	SetMemoryTargetMiB(int) error
+	Stop(context.Context) error
+	Suspend(context.Context, string) error
+	Close() error
+}

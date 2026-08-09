@@ -44,8 +44,8 @@ func (c *Client) Close() error {
 	return c.connection.Close()
 }
 
-// Attach creates a vmnet interface and returns its datagram socket descriptor.
-func (c *Client) Attach(cluster string, subnetIndex int, node string) (int, error) {
+// attach creates a vmnet interface and returns its datagram socket descriptor.
+func (c *Client) attach(cluster string, subnetIndex int, node string) (int, error) {
 	args := struct {
 		Cluster     string `json:"cluster"`
 		SubnetIndex int    `json:"subnetIndex"`

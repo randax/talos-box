@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,14 +10,8 @@ import (
 	"path/filepath"
 
 	"github.com/randax/talos-box/internal/cluster"
-	"github.com/randax/talos-box/internal/vm"
+	"github.com/randax/talos-box/internal/hypervisor"
 )
-
-type savedMachine interface {
-	Suspend(string) error
-	StopAfterSave() error
-	Close() error
-}
 
 // suspendCluster pauses and saves every running VM's state, then stops them
 // while retaining their device configurations for same-daemon restoration.
@@ -31,6 +26,10 @@ func (s *Server) suspendCluster(raw json.RawMessage) (ClusterSummary, error) {
 	}
 	if !s.clusterRunning(item.Name) {
 		return ClusterSummary{}, fmt.Errorf("cluster %q is not running", item.Name)
+	}
+	capability := s.hypervisor.Capabilities().Suspend
+	if !capability.Supported {
+		return ClusterSummary{}, fmt.Errorf("%w: %s", hypervisor.ErrUnsupported, capability.Reason)
 	}
 	dir, err := cluster.Dir(item.Name)
 	if err != nil {
@@ -82,31 +81,33 @@ func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
 	}
 	nodes := s.vms[item.Name]
 	if nodes == nil {
-		nodes = make(map[string]*vm.VM)
+		nodes = make(map[string]hypervisor.Machine)
 		s.vms[item.Name] = nodes
 	}
 	var attempted []string
 	warnings, err := resumeNodeBatch(item.Nodes, func(node cluster.Node) (resumedNode, error) {
-		machine, err := machineForResume(nodes[node.Name], func() (*vm.VM, error) {
-			return newVM(item, node)
+		savePath := saveStatePath(dir, node.Name)
+		_, saveErr := os.Stat(savePath)
+		var fallbackErr error
+		delete(nodes, node.Name)
+		machine, err := s.launchMachine(item, node, &hypervisor.Restore{
+			Path: savePath,
+			Fallback: func(err error) {
+				fallbackErr = err
+			},
 		})
 		if err != nil {
-			return resumedNode{}, fmt.Errorf("create VM %s: %w", node.Name, err)
+			return resumedNode{}, fmt.Errorf("resume %s: %w", node.Name, err)
 		}
 		nodes[node.Name] = machine
 		attempted = append(attempted, node.Name)
-		savePath := saveStatePath(dir, node.Name)
-		_, saveErr := os.Stat(savePath)
-		warning, resumeErr := resumeNode(saveErr == nil,
-			func() error { return machine.RestoreState(savePath) },
-			machine.Start,
-		)
-		if resumeErr != nil {
-			return resumedNode{}, fmt.Errorf("resume %s: %w", node.Name, resumeErr)
-		}
 		var nodeWarning string
-		if warning != "" {
-			log.Printf("resume %s: %s", node.Name, warning)
+		if fallbackErr != nil {
+			warning := "saved state could not be restored; cold-booting instead"
+			if saveErr != nil {
+				warning = "no saved state found; cold-booting instead"
+			}
+			log.Printf("resume %s: %s: %v", node.Name, warning, fallbackErr)
 			nodeWarning = fmt.Sprintf("%s: %s", node.Name, warning)
 		}
 		return resumedNode{savePath: savePath, warning: nodeWarning}, nil
@@ -155,43 +156,19 @@ func removeSaveStateFiles(paths []string) {
 }
 
 // prepareSavedMachine leaves a successfully-saved VM stopped but otherwise
-// intact. On failure, retain reports whether cleanup failed and the daemon
-// must keep tracking the machine so a later lifecycle operation can retry it.
-func prepareSavedMachine(machine savedMachine, savePath string) (retain bool, err error) {
-	if err := machine.Suspend(savePath); err != nil {
-		closeErr := machine.Close()
+// intact. On failure, retain reports whether the daemon must keep tracking the
+// machine. A failed stop is always retained because Close does not prove that
+// the machine stopped.
+func prepareSavedMachine(machine hypervisor.Machine, savePath string) (retain bool, err error) {
+	if err := machine.Suspend(context.Background(), savePath); err != nil {
+		closeErr := closeMachine(machine)
 		return closeErr != nil, errors.Join(err, closeErr)
 	}
-	if err := machine.StopAfterSave(); err != nil {
+	if err := stopMachine(machine); err != nil {
 		closeErr := machine.Close()
-		return closeErr != nil, errors.Join(err, closeErr)
+		return true, errors.Join(err, closeErr)
 	}
 	return true, nil
-}
-
-func machineForResume(retained *vm.VM, create func() (*vm.VM, error)) (*vm.VM, error) {
-	if retained != nil {
-		return retained, nil
-	}
-	return create()
-}
-
-// resumeNode tries to restore a node from its saved state; on a missing or
-// unusable save it falls back to a cold boot and returns a warning. Only a
-// cold-boot failure (nothing left to try) is fatal.
-func resumeNode(saveExists bool, restore, coldStart func() error) (warning string, err error) {
-	if saveExists {
-		if err := restore(); err == nil {
-			return "", nil
-		}
-		warning = "saved state could not be restored; cold-booting instead"
-	} else {
-		warning = "no saved state found; cold-booting instead"
-	}
-	if err := coldStart(); err != nil {
-		return "", err
-	}
-	return warning, nil
 }
 
 func saveStatePath(dir, node string) string {
