@@ -67,23 +67,43 @@ func Listen(path string) (net.Listener, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, fmt.Errorf("create helper socket directory: %w", err)
 	}
-	listener, err := net.Listen("unix", path)
+	listener, err := listenUnixSocket(path, net.Listen, net.DialTimeout, os.Remove)
 	if err != nil {
-		if connection, dialErr := net.DialTimeout("unix", path, 100*time.Millisecond); dialErr == nil {
-			_ = connection.Close()
-			return nil, fmt.Errorf("helper socket is already in use: %s", path)
-		}
-		if removeErr := os.Remove(path); removeErr != nil {
-			return nil, fmt.Errorf("remove stale helper socket: %w", removeErr)
-		}
-		listener, err = net.Listen("unix", path)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("listen on helper socket: %w", err)
+		return nil, err
 	}
 	if err := os.Chmod(path, helperSocketMode()); err != nil {
 		_ = listener.Close()
 		return nil, fmt.Errorf("set helper socket permissions: %w", err)
+	}
+	return listener, nil
+}
+
+func listenUnixSocket(
+	path string,
+	listen func(string, string) (net.Listener, error),
+	dial func(string, string, time.Duration) (net.Conn, error),
+	remove func(string) error,
+) (net.Listener, error) {
+	listener, bindErr := listen("unix", path)
+	if bindErr == nil {
+		return listener, nil
+	}
+	if !errors.Is(bindErr, unix.EADDRINUSE) {
+		return nil, fmt.Errorf("listen on helper socket %s: %w", path, bindErr)
+	}
+	if connection, dialErr := dial("unix", path, 100*time.Millisecond); dialErr == nil {
+		_ = connection.Close()
+		return nil, fmt.Errorf("helper socket is already in use: %s", path)
+	}
+	if removeErr := remove(path); removeErr != nil {
+		return nil, errors.Join(
+			fmt.Errorf("listen on helper socket %s: %w", path, bindErr),
+			fmt.Errorf("remove stale helper socket %s: %w", path, removeErr),
+		)
+	}
+	listener, err := listen("unix", path)
+	if err != nil {
+		return nil, fmt.Errorf("listen on helper socket %s after removing stale path: %w", path, err)
 	}
 	return listener, nil
 }

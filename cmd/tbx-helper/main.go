@@ -39,14 +39,19 @@ func run(args []string) error {
 		return err
 	}
 	warnMissingAllowedUID(allowedUID)
-	if err := helper.ConvergeNetworking(); err != nil {
-		return fmt.Errorf("converge helper networking: %w", err)
+	socketPath, err := helper.ServerSocketPath(allowedUID)
+	if err != nil {
+		return fmt.Errorf("resolve helper socket path: %w", err)
 	}
-	listener, err := helper.Listen(helper.SocketPath)
+	listener, err := helper.Listen(socketPath)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = os.Remove(helper.SocketPath) }()
+	defer func() { _ = os.Remove(socketPath) }()
+	if err := helper.ConvergeNetworking(); err != nil {
+		_ = listener.Close()
+		return fmt.Errorf("converge helper networking: %w", err)
+	}
 
 	server := helper.NewServer(allowedUID)
 	serveErrors := make(chan error, 1)

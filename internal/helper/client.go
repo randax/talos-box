@@ -13,9 +13,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// SocketPath is the helper's system-wide Unix socket.
-const SocketPath = "/var/run/tbx-helper.sock"
-
 // The helper only performs short admin operations, so every interaction is
 // bounded: a stuck helper must not wedge daemon shutdown or cluster ops.
 const (
@@ -29,12 +26,16 @@ type Client struct {
 	mu         sync.Mutex
 }
 
-// Connect connects to the system helper.
+// Connect connects to the helper socket selected for this process.
 func Connect() (*Client, error) {
-	dialer := net.Dialer{Timeout: dialTimeout}
-	connection, err := dialer.Dial("unix", SocketPath)
+	socketPath, err := SocketPath()
 	if err != nil {
-		return nil, fmt.Errorf("connect to helper: %w", err)
+		return nil, err
+	}
+	dialer := net.Dialer{Timeout: dialTimeout}
+	connection, err := dialer.Dial("unix", socketPath)
+	if err != nil {
+		return nil, fmt.Errorf("connect to helper at %s: %w", socketPath, err)
 	}
 	return &Client{connection: connection.(*net.UnixConn)}, nil
 }

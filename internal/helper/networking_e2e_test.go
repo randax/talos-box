@@ -64,8 +64,12 @@ func requireHelperNetworking(t *testing.T) helperNetworkingEnv {
 	if activePID != requiredPID {
 		t.Fatalf("%s=%d but active %s pid is %d; rebuild/restart helper and export the current pid before running e2e", helperE2EPIDEnv, requiredPID, helperLaunchdLabel, activePID)
 	}
-	if _, err := os.Stat(SocketPath); err != nil {
-		t.Skipf("tbx-helper socket unavailable at %s: %v", SocketPath, err)
+	socketPath, err := SocketPath()
+	if err != nil {
+		t.Skipf("resolve tbx-helper socket: %v", err)
+	}
+	if _, err := os.Stat(socketPath); err != nil {
+		t.Skipf("tbx-helper socket unavailable at %s: %v", socketPath, err)
 	}
 
 	pingPath := "/sbin/ping"

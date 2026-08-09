@@ -1,6 +1,47 @@
 package helper
 
-import "testing"
+import (
+	"errors"
+	"net"
+	"os"
+	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
+)
+
+func TestListenUnixSocketPreservesNonCollisionBindError(t *testing.T) {
+	t.Parallel()
+
+	removeCalled := false
+	_, err := listenUnixSocket(
+		"/restricted/tbx-helper.sock",
+		func(string, string) (net.Listener, error) { return nil, os.ErrPermission },
+		func(string, string, time.Duration) (net.Conn, error) {
+			t.Fatal("dial called for permission error")
+			return nil, nil
+		},
+		func(string) error { removeCalled = true; return nil },
+	)
+	if !errors.Is(err, os.ErrPermission) || removeCalled {
+		t.Fatalf("listenUnixSocket() error = %v, removeCalled = %t; want original permission error only", err, removeCalled)
+	}
+}
+
+func TestListenUnixSocketRetainsBindErrorWhenStaleRemovalFails(t *testing.T) {
+	t.Parallel()
+
+	removeErr := errors.New("remove denied")
+	_, err := listenUnixSocket(
+		"/run/tbx-helper.sock",
+		func(string, string) (net.Listener, error) { return nil, unix.EADDRINUSE },
+		func(string, string, time.Duration) (net.Conn, error) { return nil, errors.New("connection refused") },
+		func(string) error { return removeErr },
+	)
+	if !errors.Is(err, unix.EADDRINUSE) || !errors.Is(err, removeErr) {
+		t.Fatalf("listenUnixSocket() error = %v, want original bind and cleanup errors", err)
+	}
+}
 
 func TestIsAuthorizedUID(t *testing.T) {
 	t.Parallel()
