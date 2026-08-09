@@ -95,9 +95,9 @@ func (p *consoleProxy) accept() {
 			continue
 		}
 		if scrollback := p.ring.Snapshot(); len(scrollback) > 0 {
-			_ = conn.SetWriteDeadline(time.Now().Add(consoleWriteTimeout))
-			if err := writeAll(conn, scrollback); err != nil {
-				p.clearClient(conn)
+			if !p.writeClient(conn, scrollback) {
+				p.writeMu.Unlock()
+				continue
 			}
 		}
 		p.writeMu.Unlock()
@@ -116,16 +116,31 @@ func (p *consoleProxy) writeOutput() {
 			return
 		}
 		p.ring.Write(buf[:n])
-		p.writeMu.Lock()
-		conn := p.currentClient()
-		if conn != nil {
-			_ = conn.SetWriteDeadline(time.Now().Add(consoleWriteTimeout))
-			if err := writeAll(conn, buf[:n]); err != nil {
-				p.clearClient(conn)
-			}
-		}
-		p.writeMu.Unlock()
+		p.writeLiveOutput(buf[:n])
 	}
+}
+
+func (p *consoleProxy) writeLiveOutput(data []byte) {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	if conn := p.currentClient(); conn != nil {
+		p.writeClient(conn, data)
+	}
+}
+
+// writeClient is called with writeMu held so replay remains strictly ordered
+// before live output. Never write when the timeout cannot be installed: a
+// blocking write here would also block every future attach and replay.
+func (p *consoleProxy) writeClient(conn net.Conn, data []byte) bool {
+	if err := conn.SetWriteDeadline(time.Now().Add(consoleWriteTimeout)); err != nil {
+		p.clearClient(conn)
+		return false
+	}
+	if err := writeAll(conn, data); err != nil {
+		p.clearClient(conn)
+		return false
+	}
+	return true
 }
 
 func writeAll(writer io.Writer, data []byte) error {

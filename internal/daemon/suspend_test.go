@@ -13,6 +13,7 @@ type suspendMachineFake struct {
 	calls      []string
 	suspendErr error
 	stopErr    error
+	stopErrs   []error
 	closeErr   error
 }
 
@@ -27,6 +28,11 @@ func (f *suspendMachineFake) Suspend(_ context.Context, path string) error {
 
 func (f *suspendMachineFake) Stop(context.Context) error {
 	f.calls = append(f.calls, "stop")
+	if len(f.stopErrs) > 0 {
+		err := f.stopErrs[0]
+		f.stopErrs = f.stopErrs[1:]
+		return err
+	}
 	return f.stopErr
 }
 
@@ -69,16 +75,33 @@ func TestPrepareSavedMachineClosesAfterSaveFailure(t *testing.T) {
 }
 
 func TestPrepareSavedMachineClosesAfterStopFailure(t *testing.T) {
+	stopErr := errors.New("stop failed")
+	machine := &suspendMachineFake{stopErrs: []error{stopErr, nil}}
+
+	retain, err := prepareSavedMachine(machine, "/tmp/node.vzstate")
+	if !errors.Is(err, stopErr) {
+		t.Fatalf("error = %v, want stop failure", err)
+	}
+	if retain {
+		t.Fatal("released machine must not remain tracked")
+	}
+	want := []string{"suspend /tmp/node.vzstate", "stop", "stop", "close"}
+	if !reflect.DeepEqual(machine.calls, want) {
+		t.Fatalf("calls = %v, want %v", machine.calls, want)
+	}
+}
+
+func TestPrepareSavedMachineRetainsWhenCleanupStopAlsoFails(t *testing.T) {
 	machine := &suspendMachineFake{stopErr: errors.New("stop failed")}
 
 	retain, err := prepareSavedMachine(machine, "/tmp/node.vzstate")
 	if !errors.Is(err, machine.stopErr) {
 		t.Fatalf("error = %v, want stop failure", err)
 	}
-	if retain {
-		t.Fatal("released machine must not remain tracked")
+	if !retain {
+		t.Fatal("machine must remain tracked when cleanup cannot confirm it stopped")
 	}
-	want := []string{"suspend /tmp/node.vzstate", "stop", "close"}
+	want := []string{"suspend /tmp/node.vzstate", "stop", "stop", "close"}
 	if !reflect.DeepEqual(machine.calls, want) {
 		t.Fatalf("calls = %v, want %v", machine.calls, want)
 	}

@@ -164,7 +164,7 @@ func prepareSavedMachine(machine hypervisor.Machine, savePath string) (retain bo
 		return closeErr != nil, errors.Join(err, closeErr)
 	}
 	if err := stopMachine(machine); err != nil {
-		closeErr := machine.Close()
+		closeErr := closeMachine(machine)
 		return closeErr != nil, errors.Join(err, closeErr)
 	}
 	return true, nil

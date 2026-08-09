@@ -1,6 +1,7 @@
 package hypervisor
 
 import (
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -9,6 +10,25 @@ import (
 	"testing"
 	"time"
 )
+
+type deadlineFailureConn struct {
+	net.Conn
+	err    error
+	writes int
+	closed bool
+}
+
+func (c *deadlineFailureConn) SetWriteDeadline(time.Time) error { return c.err }
+
+func (c *deadlineFailureConn) Write(data []byte) (int, error) {
+	c.writes++
+	return len(data), nil
+}
+
+func (c *deadlineFailureConn) Close() error {
+	c.closed = true
+	return nil
+}
 
 func startProxy(t *testing.T) (path string, guestRead, guestWrite *os.File, cleanup func()) {
 	t.Helper()
@@ -57,6 +77,24 @@ func TestConsoleRelaysGuestOutput(t *testing.T) {
 	}
 	if got := readWithDeadline(t, client, 64); !strings.Contains(got, "[talos] booting") {
 		t.Errorf("client read %q, want guest output", got)
+	}
+}
+
+func TestConsoleDropsClientWhenWriteDeadlineCannotBeApplied(t *testing.T) {
+	deadlineErr := errors.New("deadline unavailable")
+	client := &deadlineFailureConn{err: deadlineErr}
+	proxy := &consoleProxy{client: client}
+
+	proxy.writeLiveOutput([]byte("guest output"))
+
+	if client.writes != 0 {
+		t.Fatalf("client writes = %d, want none after deadline failure", client.writes)
+	}
+	if !client.closed {
+		t.Fatal("client was not closed after deadline failure")
+	}
+	if proxy.currentClient() != nil {
+		t.Fatal("client remains attached after deadline failure")
 	}
 }
 
