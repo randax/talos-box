@@ -127,6 +127,37 @@ func TestCheckSubnetIndexAllowsExistingTalosBoxBridge(t *testing.T) {
 	}
 }
 
+func TestCheckSubnetIndexAllowsExistingLinuxTalosBoxBridge(t *testing.T) {
+	t.Parallel()
+
+	sources := SubnetSources{
+		Interfaces: func() ([]HostInterface, error) {
+			return []HostInterface{{Name: "br-tbx9", Addrs: []net.Addr{hostAddress("172.30.9.1/24")}}}, nil
+		},
+		Route: staticRoute("br-tbx9", "172.30.9.0/24"),
+	}
+	warning, err := CheckSubnetIndex(9, sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if warning != "" {
+		t.Fatalf("warning = %q, want empty", warning)
+	}
+}
+
+func TestCheckSubnetIndexRejectsForeignBridgeRoute(t *testing.T) {
+	t.Parallel()
+
+	sources := SubnetSources{
+		Interfaces: func() ([]HostInterface, error) { return nil, nil },
+		Route:      staticRoute("bridge0", "172.30.9.0/24"),
+	}
+	_, err := CheckSubnetIndex(9, sources)
+	if err == nil || !strings.Contains(err.Error(), "bridge0") {
+		t.Fatalf("CheckSubnetIndex() error = %v, want foreign bridge route collision", err)
+	}
+}
+
 func TestRouteNotFound(t *testing.T) {
 	t.Parallel()
 

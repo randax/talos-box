@@ -31,11 +31,12 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	if os.Geteuid() != 0 {
-		return errors.New("tbx-helper must run as root")
+	if err := requirePrivileges(); err != nil {
+		return err
 	}
-	if allowedUID == nil {
-		log.Print("warning: --allowed-uid is not configured; only root can use tbx-helper; re-run `sudo tbx system install` from your account")
+	warnMissingAllowedUID(allowedUID)
+	if err := helper.ConvergeNetworking(); err != nil {
+		return fmt.Errorf("converge helper networking: %w", err)
 	}
 	listener, err := helper.Listen(helper.SocketPath)
 	if err != nil {

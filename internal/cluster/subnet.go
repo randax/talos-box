@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os/exec"
 	"strconv"
 	"strings"
 )
@@ -154,7 +153,10 @@ func inspectSubnet(
 	if route.Interface == "" || route.Network == nil {
 		return subnetInspection{}, fmt.Errorf("inspect route to %s: incomplete route information", destination)
 	}
-	if strings.HasPrefix(route.Interface, "bridge") || !networksOverlap(candidate, route.Network) {
+	if !networksOverlap(candidate, route.Network) {
+		return subnetInspection{}, nil
+	}
+	if allowTalosBoxBridge && isTalosBoxBridgeName(route.Interface, index) {
 		return subnetInspection{}, nil
 	}
 	ones, bits := route.Network.Mask.Size()
@@ -208,37 +210,15 @@ func networksOverlap(left, right *net.IPNet) bool {
 
 func isTalosBoxBridge(name string, ip net.IP, network *net.IPNet, index int) bool {
 	ones, bits := network.Mask.Size()
+	return bits == 32 && ones == 24 && ip.Equal(net.ParseIP(Gateway(index))) && isTalosBoxBridgeName(name, index)
+}
+
+func isTalosBoxBridgeName(name string, index int) bool {
+	if name == fmt.Sprintf("br-tbx%d", index) {
+		return true
+	}
 	bridgeIndex, err := strconv.Atoi(strings.TrimPrefix(name, "bridge"))
-	return err == nil && bridgeIndex >= 100 && bits == 32 && ones == 24 && ip.Equal(net.ParseIP(Gateway(index)))
-}
-
-func systemInterfaces() ([]HostInterface, error) {
-	interfaces, err := net.Interfaces()
-	if err != nil {
-		return nil, err
-	}
-	result := make([]HostInterface, 0, len(interfaces))
-	for _, current := range interfaces {
-		addresses, err := current.Addrs()
-		if err != nil {
-			// an interface that vanished between enumeration and query (VPN
-			// churn) has no addresses to collide with; don't block cluster ops
-			continue
-		}
-		result = append(result, HostInterface{Name: current.Name, Addrs: addresses})
-	}
-	return result, nil
-}
-
-func systemRoute(destination net.IP) (HostRoute, error) {
-	output, err := exec.Command("/sbin/route", "-n", "get", destination.String()).CombinedOutput()
-	if err != nil {
-		if routeNotFound(output) {
-			return HostRoute{}, nil
-		}
-		return HostRoute{}, fmt.Errorf("run /sbin/route: %w (%s)", err, strings.TrimSpace(string(output)))
-	}
-	return parseHostRoute(output, destination)
+	return err == nil && strings.HasPrefix(name, "bridge") && bridgeIndex >= 100
 }
 
 func routeNotFound(output []byte) bool {

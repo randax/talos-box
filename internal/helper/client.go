@@ -45,14 +45,28 @@ func (c *Client) Close() error {
 }
 
 // attach creates a vmnet interface and returns its datagram socket descriptor.
-func (c *Client) attach(cluster string, subnetIndex int, node string) (int, error) {
+func (c *Client) attach(cluster string, subnetIndex int, node string) (AttachmentKind, int, error) {
 	args := struct {
 		Cluster     string `json:"cluster"`
 		SubnetIndex int    `json:"subnetIndex"`
 		Node        string `json:"node"`
 	}{Cluster: cluster, SubnetIndex: subnetIndex, Node: node}
-	_, fd, err := c.call("net.attach", args, true)
-	return fd, err
+	response, fd, err := c.call("net.attach", args, true)
+	if err != nil {
+		return "", -1, err
+	}
+	var data struct {
+		Kind AttachmentKind `json:"kind"`
+	}
+	if err := json.Unmarshal(response.Data, &data); err != nil {
+		_ = unix.Close(fd)
+		return "", -1, fmt.Errorf("decode attach response: %w", err)
+	}
+	if data.Kind == "" {
+		_ = unix.Close(fd)
+		return "", -1, errors.New("attach response omitted attachment kind")
+	}
+	return data.Kind, fd, nil
 }
 
 // Detach stops and removes a node's vmnet interface.

@@ -383,9 +383,9 @@ var vmnetInterfaces = struct {
 var helperFrameRouter = newFrameRouter()
 
 // StartInterface starts one shared-mode vmnet interface for a cluster subnet.
-func StartInterface(subnetIndex int) (int, error) {
+func StartInterface(subnetIndex int, _, _ string) (*platformAttachment, error) {
 	if subnetIndex < 0 || subnetIndex > 255 {
-		return -1, fmt.Errorf("subnet index %d is outside 0..255", subnetIndex)
+		return nil, fmt.Errorf("subnet index %d is outside 0..255", subnetIndex)
 	}
 	var state *C.tbx_vmnet_t
 	var fd C.int
@@ -398,7 +398,7 @@ func StartInterface(subnetIndex int) (int, error) {
 		&systemError,
 		&vmnetStatus,
 	) != 0 {
-		return -1, vmnetError("start", systemError, vmnetStatus)
+		return nil, vmnetError("start", systemError, vmnetStatus)
 	}
 
 	handle := &vmnetHandle{state: state}
@@ -411,11 +411,14 @@ func StartInterface(subnetIndex int) (int, error) {
 	vmnetInterfaces.Lock()
 	vmnetInterfaces.byFD[result] = handle
 	vmnetInterfaces.Unlock()
-	return result, nil
+	return &platformAttachment{
+		Kind: AttachmentDatagramFD,
+		FD:   result,
+		stop: func() error { return stopVMNetInterface(result) },
+	}, nil
 }
 
-// StopInterface stops the interface associated with a handoff descriptor.
-func StopInterface(fd int) error {
+func stopVMNetInterface(fd int) error {
 	vmnetInterfaces.Lock()
 	handle, ok := vmnetInterfaces.byFD[fd]
 	if ok {

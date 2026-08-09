@@ -64,7 +64,7 @@ func Attach(cluster string, subnetIndex int, node string) (*Attachment, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrUnavailable, err)
 	}
-	fd, attachErr := client.attach(cluster, subnetIndex, node)
+	kind, fd, attachErr := client.attach(cluster, subnetIndex, node)
 	_ = client.Close()
 	if attachErr != nil {
 		return nil, attachErr
@@ -87,5 +87,5 @@ func Attach(cluster string, subnetIndex int, node string) (*Attachment, error) {
 		}
 		return nil
 	}
-	return newAttachment(AttachmentDatagramFD, file, release), nil
+	return newAttachment(kind, file, release), nil
 }
