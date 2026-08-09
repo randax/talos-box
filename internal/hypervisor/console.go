@@ -1,6 +1,7 @@
 package hypervisor
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -17,8 +18,9 @@ const (
 
 type consoleProxy struct {
 	listener *net.UnixListener
-	input    *os.File
-	output   *os.File
+	input    io.Writer
+	output   io.Reader
+	closeIO  func() error
 	ring     *ringBuffer
 
 	mu     sync.Mutex
@@ -49,10 +51,23 @@ func newConsoleProxy(path string) (*consoleProxy, *os.File, *os.File, error) {
 		return nil, nil, nil, fmt.Errorf("create console output pipe: %w", err)
 	}
 
-	proxy := &consoleProxy{listener: listener, input: hostWrite, output: hostRead, ring: newRingBuffer(consoleScrollback)}
+	proxy := startConsoleProxy(listener, hostWrite, hostRead, func() error {
+		return errors.Join(hostWrite.Close(), hostRead.Close())
+	})
+	return proxy, guestRead, guestWrite, nil
+}
+
+func startConsoleProxy(listener *net.UnixListener, input io.Writer, output io.Reader, closeIO func() error) *consoleProxy {
+	proxy := &consoleProxy{
+		listener: listener,
+		input:    input,
+		output:   output,
+		closeIO:  closeIO,
+		ring:     newRingBuffer(consoleScrollback),
+	}
 	go proxy.accept()
 	go proxy.writeOutput()
-	return proxy, guestRead, guestWrite, nil
+	return proxy
 }
 
 func listenUnix(path string) (*net.UnixListener, error) {
@@ -184,8 +199,9 @@ func (p *consoleProxy) clearClient(conn net.Conn) {
 
 func (p *consoleProxy) close() {
 	_ = p.listener.Close()
-	_ = p.input.Close()
-	_ = p.output.Close()
+	if p.closeIO != nil {
+		_ = p.closeIO()
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.client != nil {
