@@ -31,8 +31,10 @@ func TestDetachKeepsAttachmentOnStopFailure(t *testing.T) {
 	}
 }
 
-func TestAttachCleanupKeepsAttachmentOnStopFailure(t *testing.T) {
+func TestAttachCleanupDropsAttachmentOnRetainedStopFailure(t *testing.T) {
 	server := NewServer(nil)
+	startCalls := 0
+	stopCalls := make(map[int]int)
 
 	originalStart := startInterface
 	originalStop := stopInterface
@@ -40,13 +42,23 @@ func TestAttachCleanupKeepsAttachmentOnStopFailure(t *testing.T) {
 		if subnet != 7 {
 			t.Fatalf("startInterface subnet = %d, want 7", subnet)
 		}
-		return 99, nil
+		startCalls++
+		return 98 + startCalls, nil
 	}
 	stopInterface = func(fd int) error {
-		if fd != 99 {
-			t.Fatalf("stopInterface fd = %d, want 99", fd)
+		stopCalls[fd]++
+		switch fd {
+		case 99:
+			if stopCalls[fd] == 1 {
+				return wrapVMNetStopError(errors.New("retry later"), true)
+			}
+			return nil
+		case 100:
+			return nil
+		default:
+			t.Fatalf("unexpected stopInterface fd = %d", fd)
+			return nil
 		}
-		return wrapVMNetStopError(errors.New("retry later"), true)
 	}
 	t.Cleanup(func() {
 		startInterface = originalStart
@@ -63,8 +75,30 @@ func TestAttachCleanupKeepsAttachmentOnStopFailure(t *testing.T) {
 	cleanup()
 
 	key := attachmentKey{cluster: "demo", node: "cp-1"}
-	if got := server.attachments[key]; got != 99 {
-		t.Fatalf("attachment mapping after cleanup = %d, want 99", got)
+	if _, ok := server.attachments[key]; ok {
+		t.Fatal("attachment mapping retained after failed response cleanup")
+	}
+	if _, ok := server.pendingStops[99]; !ok {
+		t.Fatal("retained stop was not recorded for shutdown retry")
+	}
+
+	_, retryFD, retryCleanup, err := server.attach(json.RawMessage(`{"cluster":"demo","subnetIndex":7,"node":"cp-1"}`))
+	if err != nil {
+		t.Fatalf("retry attach() error = %v", err)
+	}
+	if retryFD != 100 {
+		t.Fatalf("retry attach fd = %d, want 100", retryFD)
+	}
+
+	retryCleanup()
+	if err := server.Shutdown(); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+	if got := stopCalls[99]; got != 2 {
+		t.Fatalf("stopInterface calls for retained fd = %d, want 2", got)
+	}
+	if len(server.pendingStops) != 0 {
+		t.Fatalf("pending stops after successful shutdown retry = %v, want empty", server.pendingStops)
 	}
 }
 

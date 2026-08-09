@@ -36,23 +36,32 @@ type frameRouter struct {
 	mu       sync.Mutex
 	nextPort int
 	ports    map[int]*routerPort
-	ipToPort map[string]*routerPort
+	ipToPort map[routerIP]*routerPort
 }
 
 type routerPort struct {
-	id      int
-	subnet  int
-	send    func([]byte) error
-	mac     net.HardwareAddr
-	gateway net.HardwareAddr
-	nodeIP  string
-	ips     map[string]struct{}
+	id         int
+	subnet     int
+	sendMu     sync.RWMutex
+	send       func([]byte) error
+	closed     bool
+	mac        routerMAC
+	macSet     bool
+	gateway    routerMAC
+	gatewaySet bool
+	nodeIP     routerIP
+	nodeIPSet  bool
+	ips        map[routerIP]struct{}
 }
+
+type routerIP [4]byte
+
+type routerMAC [6]byte
 
 func newFrameRouter() *frameRouter {
 	return &frameRouter{
 		ports:    make(map[int]*routerPort),
-		ipToPort: make(map[string]*routerPort),
+		ipToPort: make(map[routerIP]*routerPort),
 	}
 }
 
@@ -65,7 +74,7 @@ func (r *frameRouter) addPort(subnet int, send func([]byte) error) *routerPort {
 		id:     r.nextPort,
 		subnet: subnet,
 		send:   send,
-		ips:    make(map[string]struct{}),
+		ips:    make(map[routerIP]struct{}),
 	}
 	r.ports[port.id] = port
 	return port
@@ -77,10 +86,10 @@ func (r *frameRouter) removePort(port *routerPort) {
 	}
 
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	current, ok := r.ports[port.id]
 	if !ok || current != port {
+		r.mu.Unlock()
 		return
 	}
 	delete(r.ports, port.id)
@@ -89,92 +98,118 @@ func (r *frameRouter) removePort(port *routerPort) {
 			delete(r.ipToPort, ip)
 		}
 	}
+	r.mu.Unlock()
+
+	port.closeSend()
 }
 
 func (r *frameRouter) route(port *routerPort, frame []byte) (bool, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if port == nil || port.send == nil || r.ports[port.id] != port {
-		return false, nil
-	}
-
 	dstMAC, srcMAC, etherType, payload, ok := parseRouterEthernetFrame(frame)
 	if !ok {
 		return false, nil
 	}
-	if !r.acceptPortSourceMAC(port, srcMAC) {
+	if etherType != routerEtherTypeARP && etherType != routerEtherTypeIPv4 {
 		return false, nil
 	}
 
-	switch etherType {
-	case routerEtherTypeARP:
+	var (
+		headerLen  int
+		ttl        byte
+		protocol   byte
+		fragmented bool
+		srcIP      net.IP
+		dstIP      net.IP
+		l4Payload  []byte
+	)
+	if etherType == routerEtherTypeIPv4 {
+		headerLen, ttl, protocol, fragmented, srcIP, dstIP, l4Payload, ok = parseRouterIPv4Packet(payload)
+		if !ok {
+			return false, nil
+		}
+	}
+
+	r.mu.Lock()
+	if port == nil || r.ports[port.id] != port || !r.acceptPortSourceMAC(port, srcMAC) {
+		r.mu.Unlock()
+		return false, nil
+	}
+	if etherType == routerEtherTypeARP {
 		r.learnARPSender(port, srcMAC, payload)
-		return false, nil
-	case routerEtherTypeIPv4:
-	default:
+		r.mu.Unlock()
 		return false, nil
 	}
 
-	headerLen, ttl, protocol, fragmented, srcIP, dstIP, l4Payload, ok := parseRouterIPv4Packet(payload)
-	if !ok {
-		return false, nil
-	}
 	if protocol == routerIPProtocolUDP && !fragmented {
 		r.learnDHCPRequestedIP(port, srcMAC, l4Payload)
 	}
 
-	if owner := r.ipToPort[srcIP.String()]; owner != port {
+	srcKey, ok := routerIPKey(srcIP)
+	if !ok || r.ipToPort[srcKey] != port {
+		r.mu.Unlock()
 		return false, nil
 	}
 	dstSubnet, ok := talosboxSubnet(dstIP)
 	if !ok || dstSubnet == port.subnet || !isOwnedTalosboxIP(dstIP, dstSubnet) {
+		r.mu.Unlock()
+		return false, nil
+	}
+	dstKey, ok := routerIPKey(dstIP)
+	if !ok {
+		r.mu.Unlock()
 		return false, nil
 	}
 
 	if isUnicastMAC(dstMAC) {
-		port.gateway = copyRouterMAC(dstMAC)
+		port.gateway = dstMAC
+		port.gatewaySet = true
 	}
 
-	target := r.targetFor(dstIP, dstSubnet)
+	target := r.targetFor(dstKey, dstSubnet)
 	if target == nil {
+		r.mu.Unlock()
 		return false, nil
 	}
 	if ttl <= 1 {
+		r.mu.Unlock()
 		return true, nil
 	}
+	targetMAC := target.mac
+	sourceMAC := target.sourceMAC()
+	targetSubnet := target.subnet
+	r.mu.Unlock()
 
 	forwarded := append([]byte(nil), frame...)
-	copy(forwarded[0:6], target.mac)
-	copy(forwarded[6:12], target.sourceMAC())
+	copy(forwarded[0:6], targetMAC[:])
+	copy(forwarded[6:12], sourceMAC[:])
 	forwarded[routerEthernetHeaderLen+8] = ttl - 1
-	binary.BigEndian.PutUint16(
-		forwarded[routerEthernetHeaderLen+10:routerEthernetHeaderLen+12],
-		routerIPv4Checksum(forwarded[routerEthernetHeaderLen:routerEthernetHeaderLen+headerLen]),
-	)
-	if err := target.send(forwarded); err != nil {
-		return true, fmt.Errorf("forward %s -> %s via subnet %d: %w", srcIP, dstIP, target.subnet, err)
+	header := forwarded[routerEthernetHeaderLen : routerEthernetHeaderLen+headerLen]
+	header[10] = 0
+	header[11] = 0
+	binary.BigEndian.PutUint16(header[10:12], routerInternetChecksum(header))
+	if err := target.sendFrame(forwarded); err != nil {
+		return true, fmt.Errorf("forward %s -> %s via subnet %d: %w", srcIP, dstIP, targetSubnet, err)
 	}
 	return true, nil
 }
 
-func (r *frameRouter) acceptPortSourceMAC(port *routerPort, mac net.HardwareAddr) bool {
+func (r *frameRouter) acceptPortSourceMAC(port *routerPort, mac routerMAC) bool {
 	if !isUnicastMAC(mac) {
 		return false
 	}
-	if len(port.mac) == 0 {
-		port.mac = copyRouterMAC(mac)
+	if !port.macSet {
+		port.mac = mac
+		port.macSet = true
 		return true
 	}
-	return routerMACEqual(port.mac, mac)
+	return port.mac == mac
 }
 
-func (r *frameRouter) learnARPSender(port *routerPort, frameSrcMAC net.HardwareAddr, payload []byte) {
+func (r *frameRouter) learnARPSender(port *routerPort, frameSrcMAC routerMAC, payload []byte) {
 	op, senderMAC, senderIP, targetIP, ok := parseRouterARP(payload)
 	if !ok {
 		return
 	}
-	if !routerMACEqual(senderMAC, frameSrcMAC) || !isVIP(senderIP, port.subnet) {
+	if senderMAC != frameSrcMAC || !isVIP(senderIP, port.subnet) {
 		return
 	}
 	switch op {
@@ -186,7 +221,7 @@ func (r *frameRouter) learnARPSender(port *routerPort, frameSrcMAC net.HardwareA
 	}
 }
 
-func (r *frameRouter) learnDHCPRequestedIP(port *routerPort, frameSrcMAC net.HardwareAddr, payload []byte) {
+func (r *frameRouter) learnDHCPRequestedIP(port *routerPort, frameSrcMAC routerMAC, payload []byte) {
 	srcPort, dstPort, body, ok := parseRouterUDP(payload)
 	if !ok || srcPort != routerDHCPClientPort || dstPort != routerDHCPServerPort {
 		return
@@ -194,8 +229,8 @@ func (r *frameRouter) learnDHCPRequestedIP(port *routerPort, frameSrcMAC net.Har
 	requestedIP, serverIP, clientMAC, messageType, ok := parseRouterDHCPRequest(body)
 	if !ok ||
 		messageType != routerDHCPMessageRequest ||
-		!routerMACEqual(clientMAC, frameSrcMAC) ||
-		!routerMACEqual(clientMAC, port.mac) ||
+		clientMAC != frameSrcMAC ||
+		clientMAC != port.mac ||
 		!isNodeIP(requestedIP, port.subnet) ||
 		!routerDHCPServerIDMatchesSubnet(serverIP, port.subnet) {
 		return
@@ -215,20 +250,24 @@ func (r *frameRouter) learnNodeIP(port *routerPort, ip net.IP) {
 	if !isNodeIP(ip4, port.subnet) {
 		return
 	}
-	key := ip4.String()
-	if port.nodeIP == key {
+	key, ok := routerIPKey(ip4)
+	if !ok {
+		return
+	}
+	if port.nodeIPSet && port.nodeIP == key {
 		return
 	}
 	if owner := r.ipToPort[key]; owner != nil && owner != port {
 		return
 	}
-	if port.nodeIP != "" {
+	if port.nodeIPSet {
 		if owner := r.ipToPort[port.nodeIP]; owner == port {
 			delete(r.ipToPort, port.nodeIP)
 		}
 		delete(port.ips, port.nodeIP)
 	}
 	port.nodeIP = key
+	port.nodeIPSet = true
 	port.ips[key] = struct{}{}
 	r.ipToPort[key] = port
 }
@@ -241,7 +280,10 @@ func (r *frameRouter) learnVIPIP(port *routerPort, ip net.IP) {
 	if !isVIP(ip4, port.subnet) {
 		return
 	}
-	key := ip4.String()
+	key, ok := routerIPKey(ip4)
+	if !ok {
+		return
+	}
 	if owner := r.ipToPort[key]; owner != nil && owner != port {
 		delete(owner.ips, key)
 	}
@@ -249,33 +291,52 @@ func (r *frameRouter) learnVIPIP(port *routerPort, ip net.IP) {
 	r.ipToPort[key] = port
 }
 
-func (r *frameRouter) targetFor(ip net.IP, subnet int) *routerPort {
-	if target := r.ipToPort[ip.String()]; target != nil && target.subnet == subnet && len(target.mac) == 6 {
+func (r *frameRouter) targetFor(ip routerIP, subnet int) *routerPort {
+	if target := r.ipToPort[ip]; target != nil && target.subnet == subnet && target.macSet {
 		return target
 	}
 	return nil
 }
 
-func (p *routerPort) sourceMAC() net.HardwareAddr {
-	if len(p.gateway) == 6 {
-		return copyRouterMAC(p.gateway)
+func (p *routerPort) sourceMAC() routerMAC {
+	if p.gatewaySet {
+		return p.gateway
 	}
-	return routerGatewayMAC(p.subnet)
+	return routerGatewayMACKey(p.subnet)
+}
+
+func (p *routerPort) sendFrame(frame []byte) error {
+	p.sendMu.RLock()
+	defer p.sendMu.RUnlock()
+
+	if p.closed {
+		return fmt.Errorf("router port %d is closed", p.id)
+	}
+	return p.send(frame)
+}
+
+func (p *routerPort) closeSend() {
+	p.sendMu.Lock()
+	p.closed = true
+	p.sendMu.Unlock()
 }
 
 func routerGatewayMAC(subnet int) net.HardwareAddr {
-	return net.HardwareAddr{0x02, 0x54, 0x30, 0x00, byte(subnet), 0x01}
+	mac := routerGatewayMACKey(subnet)
+	return net.HardwareAddr(mac[:])
 }
 
-func parseRouterEthernetFrame(frame []byte) (dst, src net.HardwareAddr, etherType uint16, payload []byte, ok bool) {
+func routerGatewayMACKey(subnet int) routerMAC {
+	return routerMAC{0x02, 0x54, 0x30, 0x00, byte(subnet), 0x01}
+}
+
+func parseRouterEthernetFrame(frame []byte) (dst, src routerMAC, etherType uint16, payload []byte, ok bool) {
 	if len(frame) < routerEthernetHeaderLen {
-		return nil, nil, 0, nil, false
+		return routerMAC{}, routerMAC{}, 0, nil, false
 	}
-	return copyRouterMAC(frame[0:6]),
-		copyRouterMAC(frame[6:12]),
-		binary.BigEndian.Uint16(frame[12:14]),
-		frame[14:],
-		true
+	copy(dst[:], frame[0:6])
+	copy(src[:], frame[6:12])
+	return dst, src, binary.BigEndian.Uint16(frame[12:14]), frame[14:], true
 }
 
 func parseRouterIPv4Packet(payload []byte) (headerLen int, ttl, protocol byte, fragmented bool, srcIP, dstIP net.IP, l4Payload []byte, ok bool) {
@@ -306,18 +367,19 @@ func parseRouterIPv4Packet(payload []byte) (headerLen int, ttl, protocol byte, f
 		true
 }
 
-func parseRouterARP(payload []byte) (op uint16, senderMAC net.HardwareAddr, senderIP, targetIP net.IP, ok bool) {
+func parseRouterARP(payload []byte) (op uint16, senderMAC routerMAC, senderIP, targetIP net.IP, ok bool) {
 	if len(payload) < 28 {
-		return 0, nil, nil, nil, false
+		return 0, routerMAC{}, nil, nil, false
 	}
 	if binary.BigEndian.Uint16(payload[0:2]) != 1 ||
 		binary.BigEndian.Uint16(payload[2:4]) != routerEtherTypeIPv4 ||
 		payload[4] != 6 ||
 		payload[5] != 4 {
-		return 0, nil, nil, nil, false
+		return 0, routerMAC{}, nil, nil, false
 	}
+	copy(senderMAC[:], payload[8:14])
 	return binary.BigEndian.Uint16(payload[6:8]),
-		copyRouterMAC(payload[8:14]),
+		senderMAC,
 		net.IP(payload[14:18]).To4(),
 		net.IP(payload[24:28]).To4(),
 		true
@@ -337,14 +399,14 @@ func parseRouterUDP(payload []byte) (srcPort, dstPort uint16, body []byte, ok bo
 		true
 }
 
-func parseRouterDHCPRequest(payload []byte) (requestedIP, serverIP net.IP, clientMAC net.HardwareAddr, messageType byte, ok bool) {
+func parseRouterDHCPRequest(payload []byte) (requestedIP, serverIP net.IP, clientMAC routerMAC, messageType byte, ok bool) {
 	if len(payload) < 240 || payload[0] != 1 || payload[1] != 1 || payload[2] != 6 {
-		return nil, nil, nil, 0, false
+		return nil, nil, routerMAC{}, 0, false
 	}
 	if binary.BigEndian.Uint32(payload[236:240]) != routerDHCPMagicCookie {
-		return nil, nil, nil, 0, false
+		return nil, nil, routerMAC{}, 0, false
 	}
-	clientMAC = copyRouterMAC(payload[28:34])
+	copy(clientMAC[:], payload[28:34])
 	for i := 240; i < len(payload); {
 		option := payload[i]
 		i++
@@ -355,12 +417,12 @@ func parseRouterDHCPRequest(payload []byte) (requestedIP, serverIP net.IP, clien
 			return requestedIP, serverIP, clientMAC, messageType, requestedIP != nil
 		}
 		if i >= len(payload) {
-			return nil, nil, nil, 0, false
+			return nil, nil, routerMAC{}, 0, false
 		}
 		length := int(payload[i])
 		i++
 		if i+length > len(payload) {
-			return nil, nil, nil, 0, false
+			return nil, nil, routerMAC{}, 0, false
 		}
 		value := payload[i : i+length]
 		switch option {
@@ -415,27 +477,21 @@ func isVIP(ip net.IP, subnet int) bool {
 	return ip4[3] >= 200 && ip4[3] <= 239
 }
 
-func isUnicastMAC(mac net.HardwareAddr) bool {
-	return len(mac) == 6 && mac[0]&1 == 0
+func routerIPKey(ip net.IP) (routerIP, bool) {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return routerIP{}, false
+	}
+	return routerIP{ip4[0], ip4[1], ip4[2], ip4[3]}, true
 }
 
-func copyRouterMAC(value net.HardwareAddr) net.HardwareAddr {
-	return append(net.HardwareAddr(nil), value...)
-}
-
-func routerMACEqual(a, b net.HardwareAddr) bool {
-	return len(a) == len(b) && copyRouterMAC(a).String() == copyRouterMAC(b).String()
+func isUnicastMAC(mac routerMAC) bool {
+	return mac[0]&1 == 0
 }
 
 func routerDHCPServerIDMatchesSubnet(serverIP net.IP, subnet int) bool {
 	ip4 := serverIP.To4()
 	return ip4 != nil && ip4[0] == 172 && ip4[1] == 30 && int(ip4[2]) == subnet && ip4[3] == 1
-}
-
-func routerIPv4Checksum(header []byte) uint16 {
-	copyHeader := append([]byte(nil), header...)
-	copy(copyHeader[10:12], []byte{0, 0})
-	return routerInternetChecksum(copyHeader)
 }
 
 func routerInternetChecksum(payload []byte) uint16 {

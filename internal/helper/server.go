@@ -37,10 +37,11 @@ type serverReply struct {
 
 // Server owns helper-created vmnet interfaces.
 type Server struct {
-	opMu        sync.Mutex
-	attachments map[attachmentKey]int
-	speakers    map[string]bgpSpeaker
-	allowedUID  *uint32
+	opMu         sync.Mutex
+	attachments  map[attachmentKey]int
+	pendingStops map[int]struct{}
+	speakers     map[string]bgpSpeaker
+	allowedUID   *uint32
 
 	listenerMu   sync.Mutex
 	listener     net.Listener
@@ -51,7 +52,10 @@ type Server struct {
 
 // NewServer creates an empty helper server.
 func NewServer(allowedUID *uint32) *Server {
-	server := &Server{attachments: make(map[attachmentKey]int)}
+	server := &Server{
+		attachments:  make(map[attachmentKey]int),
+		pendingStops: make(map[int]struct{}),
+	}
 	if allowedUID != nil {
 		uid := *allowedUID
 		server.allowedUID = &uid
@@ -169,6 +173,15 @@ func (s *Server) Shutdown() error {
 			continue
 		}
 		delete(s.attachments, key)
+	}
+	for fd := range s.pendingStops {
+		if err := stopInterface(fd); err != nil {
+			result = errors.Join(result, err)
+			if stopErrorRetained(err) {
+				continue
+			}
+		}
+		delete(s.pendingStops, fd)
 	}
 	return result
 }
@@ -310,8 +323,23 @@ func (s *Server) attach(raw json.RawMessage) (any, int, func(), error) {
 	s.attachments[key] = fd
 	cleanup := func() {
 		if current, ok := s.attachments[key]; ok && current == fd {
-			if err := stopInterface(fd); err == nil || !stopErrorRetained(err) {
-				delete(s.attachments, key)
+			err := stopInterface(fd)
+			// The response (and therefore the descriptor) never reached the
+			// caller. Always release the logical attachment so its natural retry
+			// cannot be wedged by a teardown-only retained vmnet handle.
+			delete(s.attachments, key)
+			if err != nil {
+				if stopErrorRetained(err) {
+					s.pendingStops[fd] = struct{}{}
+				}
+				log.Printf(
+					"clean up undelivered network attachment %s/%s fd %d (retained=%t): %v",
+					args.Cluster,
+					args.Node,
+					fd,
+					stopErrorRetained(err),
+					err,
+				)
 			}
 		}
 	}

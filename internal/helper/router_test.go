@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"testing"
+	"time"
 )
 
 func TestFrameRouterDHCPRequestImmediatelyEstablishesRoute(t *testing.T) {
@@ -473,6 +474,75 @@ func TestFrameRouterPropagatesTargetSendErrors(t *testing.T) {
 	}
 }
 
+func TestFrameRouterDoesNotHoldLockDuringForwardSend(t *testing.T) {
+	router := newFrameRouter()
+	sourceMAC := mustMAC(t, "02:00:00:00:f0:62")
+	sourceIP := hostIP(240, 2)
+	source := router.addPort(240, func([]byte) error { return nil })
+	learnNodeOwner(t, router, source, sourceMAC, sourceIP)
+
+	targetMAC := mustMAC(t, "02:00:00:00:f1:62")
+	targetIP := hostIP(241, 2)
+	gatewayMAC := mustMAC(t, "02:00:00:00:f0:01")
+	sendStarted := make(chan struct{})
+	releaseSend := make(chan struct{})
+	target := router.addPort(241, func([]byte) error {
+		close(sendStarted)
+		<-releaseSend
+		return nil
+	})
+	learnNodeOwner(t, router, target, targetMAC, targetIP)
+
+	type routeResult struct {
+		handled bool
+		err     error
+	}
+	routeDone := make(chan routeResult, 1)
+	go func() {
+		handled, err := router.route(source, buildICMPEchoFrameWithTTL(
+			sourceMAC,
+			gatewayMAC,
+			sourceIP,
+			targetIP,
+			0x2062,
+			62,
+			nil,
+			64,
+		))
+		routeDone <- routeResult{handled: handled, err: err}
+	}()
+
+	select {
+	case <-sendStarted:
+	case <-time.After(time.Second):
+		t.Fatal("forward send did not start")
+	}
+
+	mapUpdateDone := make(chan struct{})
+	go func() {
+		router.addPort(242, func([]byte) error { return nil })
+		close(mapUpdateDone)
+	}()
+
+	select {
+	case <-mapUpdateDone:
+		close(releaseSend)
+	case <-time.After(100 * time.Millisecond):
+		close(releaseSend)
+		<-routeDone
+		<-mapUpdateDone
+		t.Fatal("router map update blocked behind forwarding send")
+	}
+
+	result := <-routeDone
+	if result.err != nil {
+		t.Fatalf("route() error = %v", result.err)
+	}
+	if !result.handled {
+		t.Fatal("route() handled = false, want true")
+	}
+}
+
 func TestFrameRouterRejectsMismatchedDHCPChaddr(t *testing.T) {
 	router := newFrameRouter()
 
@@ -732,6 +802,42 @@ func TestFrameRouterLeavesSameSubnetTrafficOnVMNet(t *testing.T) {
 	}
 	if handled {
 		t.Fatal("same-subnet frame should fall through to vmnet")
+	}
+}
+
+func BenchmarkFrameRouterRoute(b *testing.B) {
+	router := newFrameRouter()
+	sourceMAC := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0xf0, 0xee}
+	targetMAC := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0xf1, 0xee}
+	sourceIP := hostIP(240, 2)
+	targetIP := hostIP(241, 2)
+	source := router.addPort(240, func([]byte) error { return nil })
+	target := router.addPort(241, func([]byte) error { return nil })
+
+	if handled, err := router.route(source, buildDHCPFrame(sourceMAC, 1, dhcpMessageRequest, sourceIP, hostIP(240, 1))); err != nil || handled {
+		b.Fatalf("learn source: handled=%t error=%v", handled, err)
+	}
+	if handled, err := router.route(target, buildDHCPFrame(targetMAC, 2, dhcpMessageRequest, targetIP, hostIP(241, 1))); err != nil || handled {
+		b.Fatalf("learn target: handled=%t error=%v", handled, err)
+	}
+	frame := buildICMPEchoFrameWithTTL(
+		sourceMAC,
+		net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0xf0, 0x01},
+		sourceIP,
+		targetIP,
+		0x20ee,
+		238,
+		nil,
+		64,
+	)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		handled, err := router.route(source, frame)
+		if err != nil || !handled {
+			b.Fatalf("route: handled=%t error=%v", handled, err)
+		}
 	}
 }
 
