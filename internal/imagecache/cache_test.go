@@ -175,6 +175,7 @@ func TestDownloadValidatesXZMagicBeforeCaching(t *testing.T) {
 }
 
 func TestEnsureCachesArchitecturesSideBySide(t *testing.T) {
+	requireXZ(t)
 	t.Parallel()
 
 	archives := map[string][]byte{
@@ -251,6 +252,7 @@ func TestEnsureCachesArchitecturesSideBySide(t *testing.T) {
 }
 
 func TestEnsureMigratesLegacyArm64DiskWithoutUsingItForAMD64(t *testing.T) {
+	requireXZ(t)
 	t.Parallel()
 
 	root := t.TempDir()
@@ -341,4 +343,11 @@ func compressXZ(t *testing.T, contents string) []byte {
 		t.Fatalf("compress XZ test fixture: %v", err)
 	}
 	return archive
+}
+
+func requireXZ(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("xz"); err != nil {
+		t.Skip("xz not installed; skipping imagecache Ensure test")
+	}
 }
