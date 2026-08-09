@@ -107,9 +107,14 @@ cluster:
 | Range | Use |
 |---|---|
 | `.1` | host: gateway, NAT, DNS/mirror bind, BGP peer, inter-cluster router |
-| `.10–.179` | node DHCP range |
+| `.2–.179` | node DHCP range (vmnet assigns every address after the `.1` gateway) |
 | `.200–.239` | Cilium LB-IPAM pool; **`.200` is the ingress VIP by convention** |
 | `.240–.254` | reserved (tool-owned) |
+
+Pinned shared-mode vmnet interfaces only intercommunicate within the same subnet. To preserve
+the per-cluster `/24` model, `tbx-helper` routes `172.30.0.0/16` frames between helper-owned
+attachments before they enter vmnet, learning node and VIP ownership from DHCP and ARP. vmnet
+continues to provide same-subnet switching, DHCP, NAT egress, and host reachability.
 
 **DNS**: embedded resolver in `tbxd` on `127.0.0.1`, wired once via `/etc/resolver/k8s.test`.
 `*.<cluster>.k8s.test` → that cluster's `.200`; `<node>.<cluster>.k8s.test` → node IP.
@@ -267,9 +272,9 @@ Implementation must close these before v1 ships:
   with `--force` to override.
 - **G4 — mirror through security agents**: confirm host-bound mirror traffic passes on a
   GlobalProtect-managed machine (the attribution evidence is strong but circumstantial).
-- ~~G5 — inter-cluster routing~~ **CLOSED** (design-level): guest↔guest routing across vmnet
-  subnets through the host router verified with `ip.forwarding=1` (alias-subnet variant); the
-  bridge-to-bridge confirmation is the Networking milestone's mandatory first integration test.
+- ~~G5 — inter-cluster routing~~ **CLOSED** (physical Mac): two helper-backed vmnet bridges on
+  pinned `/24`s pass bidirectional node↔node routing immediately after DHCP, host↔node/VIP,
+  node↔remote-VIP, and clean detach in the PID-gated `TestHelperNetworkingE2E` regression.
 - ~~G7 — suspend/resume memory restore~~ **CLOSED (same daemon)**: after saving, talosbox stops
   the VM but retains the exact vz configuration and file-handle-backed devices. Restoring that
   stopped VM preserves memory (#42); hardware verification continued the same Talos boot from

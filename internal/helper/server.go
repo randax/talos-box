@@ -17,7 +17,16 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const resolverPath = "/etc/resolver/k8s.test"
+const (
+	resolverPath                  = "/etc/resolver/k8s.test"
+	shutdownStopMaxAttempts       = 5
+	shutdownStopInitialRetryDelay = 25 * time.Millisecond
+)
+
+var (
+	startInterface = StartInterface
+	stopInterface  = StopInterface
+)
 
 type attachmentKey struct {
 	cluster string
@@ -32,10 +41,11 @@ type serverReply struct {
 
 // Server owns helper-created vmnet interfaces.
 type Server struct {
-	opMu        sync.Mutex
-	attachments map[attachmentKey]int
-	speakers    map[string]bgpSpeaker
-	allowedUID  *uint32
+	opMu         sync.Mutex
+	attachments  map[attachmentKey]int
+	pendingStops map[int]struct{}
+	speakers     map[string]bgpSpeaker
+	allowedUID   *uint32
 
 	listenerMu   sync.Mutex
 	listener     net.Listener
@@ -46,7 +56,10 @@ type Server struct {
 
 // NewServer creates an empty helper server.
 func NewServer(allowedUID *uint32) *Server {
-	server := &Server{attachments: make(map[attachmentKey]int)}
+	server := &Server{
+		attachments:  make(map[attachmentKey]int),
+		pendingStops: make(map[int]struct{}),
+	}
 	if allowedUID != nil {
 		uid := *allowedUID
 		server.allowedUID = &uid
@@ -154,11 +167,37 @@ func (s *Server) Shutdown() error {
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 	var result error
-	for key, fd := range s.attachments {
-		result = errors.Join(result, StopInterface(fd))
-		delete(s.attachments, key)
+	for attempt := 1; ; attempt++ {
+		var retainedResult error
+		stop := func(fd int) bool {
+			err := stopInterface(fd)
+			if err == nil {
+				return false
+			}
+			if stopErrorRetained(err) {
+				retainedResult = errors.Join(retainedResult, err)
+				return true
+			}
+			result = errors.Join(result, err)
+			return false
+		}
+
+		for key, fd := range s.attachments {
+			if !stop(fd) {
+				delete(s.attachments, key)
+			}
+		}
+		for fd := range s.pendingStops {
+			if !stop(fd) {
+				delete(s.pendingStops, fd)
+			}
+		}
+
+		if retainedResult == nil || attempt == shutdownStopMaxAttempts {
+			return errors.Join(result, retainedResult)
+		}
+		time.Sleep(shutdownStopInitialRetryDelay * time.Duration(attempt))
 	}
-	return result
 }
 
 func (s *Server) serveConnection(connection *net.UnixConn) {
@@ -291,15 +330,31 @@ func (s *Server) attach(raw json.RawMessage) (any, int, func(), error) {
 	if _, exists := s.attachments[key]; exists {
 		return nil, -1, nil, fmt.Errorf("network interface for %s/%s is already attached", args.Cluster, args.Node)
 	}
-	fd, err := StartInterface(*args.SubnetIndex)
+	fd, err := startInterface(*args.SubnetIndex)
 	if err != nil {
 		return nil, -1, nil, err
 	}
 	s.attachments[key] = fd
 	cleanup := func() {
 		if current, ok := s.attachments[key]; ok && current == fd {
+			err := stopInterface(fd)
+			// The response (and therefore the descriptor) never reached the
+			// caller. Always release the logical attachment so its natural retry
+			// cannot be wedged by a teardown-only retained vmnet handle.
 			delete(s.attachments, key)
-			_ = StopInterface(fd)
+			if err != nil {
+				if stopErrorRetained(err) {
+					s.pendingStops[fd] = struct{}{}
+				}
+				log.Printf(
+					"clean up undelivered network attachment %s/%s fd %d (retained=%t): %v",
+					args.Cluster,
+					args.Node,
+					fd,
+					stopErrorRetained(err),
+					err,
+				)
+			}
 		}
 	}
 	return map[string]string{"cluster": args.Cluster, "node": args.Node}, fd, cleanup, nil
@@ -322,8 +377,14 @@ func (s *Server) detach(raw json.RawMessage) error {
 		// idempotent: the pump already cleaned up when the VM closed its fd
 		return nil
 	}
+	if err := stopInterface(fd); err != nil {
+		if !stopErrorRetained(err) {
+			delete(s.attachments, key)
+		}
+		return err
+	}
 	delete(s.attachments, key)
-	return StopInterface(fd)
+	return nil
 }
 
 func decodeArgs(raw json.RawMessage, destination any) error {
