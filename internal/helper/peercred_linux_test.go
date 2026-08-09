@@ -24,11 +24,23 @@ func TestLinuxPeerUID(t *testing.T) {
 	}
 }
 
-func TestLinuxSocketAuthorizedPeerUsesFilesystemGate(t *testing.T) {
+func TestLinuxSocketAuthorizationAlwaysUsesPeerUID(t *testing.T) {
 	t.Parallel()
 
-	if !isAuthorizedPeer(uint32(os.Geteuid()), nil) {
-		t.Fatal("peer admitted by the Linux socket permissions was rejected")
+	uid := uint32(os.Geteuid())
+	if uid != 0 && isAuthorizedPeer(uid, nil) {
+		t.Fatal("non-root peer was authorized without an allowed UID")
+	}
+	if !isAuthorizedPeer(0, nil) {
+		t.Fatal("root peer was rejected")
+	}
+}
+
+func TestLinuxHelperSocketModeAllowsPeerCredentialGate(t *testing.T) {
+	t.Parallel()
+
+	if got := helperSocketMode().Perm(); got != 0o666 {
+		t.Fatalf("helper socket mode = %#o, want 0666 so SO_PEERCRED can authorize clients", got)
 	}
 }
 

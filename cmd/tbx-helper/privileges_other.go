@@ -15,6 +15,8 @@ func requirePrivileges() error {
 	return nil
 }
 
+func resolveAllowedUID(explicit *uint32) (*uint32, error) { return explicit, nil }
+
 func warnMissingAllowedUID(allowedUID *uint32) {
 	if allowedUID == nil {
 		log.Print("warning: --allowed-uid is not configured; only root can use tbx-helper; re-run `sudo tbx system install` from your account")

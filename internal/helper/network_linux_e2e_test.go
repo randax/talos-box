@@ -3,9 +3,11 @@
 package helper
 
 import (
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -308,6 +310,73 @@ func TestLinuxNetworkingWithCapabilitySet(t *testing.T) {
 	output, err := command.CombinedOutput()
 	if err != nil {
 		t.Fatalf("capsh capability probe failed: %v\n%s", err, output)
+	}
+}
+
+func TestLinuxWorldConnectableSocketAuthorizesPeerUID(t *testing.T) {
+	requireLinuxHelperE2E(t)
+	const childEnv = "TBX_LINUX_SOCKET_CLIENT_CHILD"
+	const socketEnv = "TBX_LINUX_SOCKET_CLIENT_PATH"
+	if os.Getenv(childEnv) == "1" {
+		address, err := net.ResolveUnixAddr("unix", os.Getenv(socketEnv))
+		if err != nil {
+			t.Fatal(err)
+		}
+		connection, err := net.DialUnix("unix", nil, address)
+		if err != nil {
+			t.Fatalf("unprivileged dial: %v", err)
+		}
+		client := &Client{connection: connection}
+		defer func() { _ = client.Close() }()
+		if err := client.Ping(); err != nil {
+			t.Fatalf("authorized unprivileged ping: %v", err)
+		}
+		return
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("root is required to launch a different-UID client")
+	}
+	capsh, err := exec.LookPath("capsh")
+	if err != nil {
+		t.Skip("capsh is not installed")
+	}
+	nobody, err := user.Lookup("nobody")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsedUID, err := strconv.ParseUint(nobody.Uid, 10, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowedUID := uint32(parsedUID)
+	socketPath := fmt.Sprintf("/tmp/tbx-helper-auth-%d.sock", os.Getpid())
+	listener, err := Listen(socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(&allowedUID)
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(listener) }()
+	t.Cleanup(func() {
+		_ = server.Shutdown()
+		<-done
+		_ = os.Remove(socketPath)
+	})
+
+	binary, err := filepath.Abs(os.Args[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(
+		capsh,
+		"--user=nobody",
+		"--",
+		"-c",
+		`exec "$TBX_CAP_TEST_BINARY" -test.run '^TestLinuxWorldConnectableSocketAuthorizesPeerUID$' -test.v`,
+	)
+	command.Env = append(os.Environ(), childEnv+"=1", socketEnv+"="+socketPath, "TBX_CAP_TEST_BINARY="+binary)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("unprivileged socket client failed: %v\n%s", err, output)
 	}
 }
 

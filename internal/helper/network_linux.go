@@ -69,17 +69,39 @@ func configuredLinuxSubnetIndexes() ([]int, error) {
 }
 
 func (realLinuxNetworkOps) ListLinks() ([]linuxLinkState, error) {
-	interfaces, err := cluster.SystemSubnetSources().Interfaces()
+	links, err := netlink.LinkList()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("dump netlink links: %w", err)
 	}
-	result := make([]linuxLinkState, 0, len(interfaces))
-	for _, current := range interfaces {
-		link, lookupErr := netlink.LinkByName(current.Name)
-		if lookupErr != nil {
-			return nil, fmt.Errorf("inspect link metadata for %s: %w", current.Name, lookupErr)
+	return listLinuxLinkStates(links, netlink.AddrList, netlink.LinkByIndex)
+}
+
+func listLinuxLinkStates(
+	links []netlink.Link,
+	addrList func(netlink.Link, int) ([]netlink.Addr, error),
+	linkByIndex func(int) (netlink.Link, error),
+) ([]linuxLinkState, error) {
+	result := make([]linuxLinkState, 0, len(links))
+	for _, link := range links {
+		addresses, err := addrList(link, netlink.FAMILY_V4)
+		if err != nil {
+			_, lookupErr := linkByIndex(link.Attrs().Index)
+			var notFound netlink.LinkNotFoundError
+			if errors.As(lookupErr, &notFound) {
+				continue
+			}
+			if lookupErr != nil {
+				return nil, fmt.Errorf("inspect link metadata for %s: %w", link.Attrs().Name, lookupErr)
+			}
+			return nil, fmt.Errorf("dump netlink addresses for %s: %w", link.Attrs().Name, err)
 		}
-		result = append(result, linuxLinkState{Name: current.Name, Alias: link.Attrs().Alias, Addrs: current.Addrs})
+		current := linuxLinkState{Name: link.Attrs().Name, Alias: link.Attrs().Alias, Addrs: make([]net.Addr, 0, len(addresses))}
+		for _, address := range addresses {
+			if address.IPNet != nil {
+				current.Addrs = append(current.Addrs, address.IPNet)
+			}
+		}
+		result = append(result, current)
 	}
 	return result, nil
 }

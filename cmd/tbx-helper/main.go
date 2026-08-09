@@ -31,6 +31,10 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	allowedUID, err = resolveAllowedUID(allowedUID)
+	if err != nil {
+		return err
+	}
 	if err := requirePrivileges(); err != nil {
 		return err
 	}
@@ -66,7 +70,7 @@ func run(args []string) error {
 func parseAllowedUID(args []string) (*uint32, error) {
 	flags := flag.NewFlagSet("tbx-helper", flag.ContinueOnError)
 	var allowedUID *uint32
-	flags.Func("allowed-uid", "UID authorized to use the helper", func(value string) error {
+	flags.Func("allowed-uid", "UID authorized to use the helper (Linux defaults to SUDO_UID or the helper UID)", func(value string) error {
 		parsed, err := strconv.ParseUint(value, 10, 32)
 		if err != nil {
 			return fmt.Errorf("invalid uid %q: %w", value, err)

@@ -3,6 +3,7 @@
 package cluster
 
 import (
+	"errors"
 	"fmt"
 	"net"
 
@@ -39,13 +40,25 @@ func systemRoute(destination net.IP) (HostRoute, error) {
 	if err != nil {
 		return HostRoute{}, fmt.Errorf("dump netlink IPv4 routes: %w", err)
 	}
+	return selectLinuxSystemRoute(destination, routes, netlink.LinkByIndex)
+}
+
+func selectLinuxSystemRoute(
+	destination net.IP,
+	routes []netlink.Route,
+	linkByIndex func(int) (netlink.Link, error),
+) (HostRoute, error) {
 	observed := make([]HostRoute, 0, len(routes))
 	ignored := make(map[string]bool)
 	for _, route := range routes {
 		interfaceName := "netlink-route"
 		if route.LinkIndex != 0 {
-			link, err := netlink.LinkByIndex(route.LinkIndex)
+			link, err := linkByIndex(route.LinkIndex)
 			if err != nil {
+				var notFound netlink.LinkNotFoundError
+				if errors.As(err, &notFound) {
+					continue
+				}
 				return HostRoute{}, fmt.Errorf("resolve route interface %d: %w", route.LinkIndex, err)
 			}
 			interfaceName = link.Attrs().Name
