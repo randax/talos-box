@@ -73,7 +73,7 @@ func TestAddNodeSurfacesHostPressureProbeFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	cacheRoot := filepath.Join(home, "cache")
-	cachedDisk := filepath.Join(cacheRoot, item.Schematic, item.TalosVersion, "disk.raw")
+	cachedDisk := filepath.Join(cacheRoot, item.Schematic, item.TalosVersion, "arm64", "disk.raw")
 	if err := os.MkdirAll(filepath.Dir(cachedDisk), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -81,8 +81,9 @@ func TestAddNodeSurfacesHostPressureProbeFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	service := &Server{
-		cache: imagecache.New(cacheRoot),
-		vms:   make(map[string]map[string]hypervisor.Machine),
+		cache:      imagecache.New(cacheRoot),
+		hypervisor: &fakeHypervisor{architecture: hypervisor.ArchitectureARM64},
+		vms:        make(map[string]map[string]hypervisor.Machine),
 		hostPressure: func(string) (hostpressure.Snapshot, error) {
 			return hostpressure.Snapshot{}, errors.New("statfs unavailable")
 		},

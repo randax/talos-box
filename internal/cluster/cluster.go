@@ -12,6 +12,9 @@ const (
 	DefaultCPUs      = 2
 	DefaultDiskGiB   = 20
 	MaxSubnetIndex   = 255
+	// LegacyImageArchitecture is the architecture of every cluster image
+	// created before architecture was persisted in cluster state.
+	LegacyImageArchitecture = "arm64"
 )
 
 type Role string
@@ -47,6 +50,7 @@ type Cluster struct {
 	Nodes                []Node        `json:"nodes"`
 	Schematic            string        `json:"schematic,omitempty"`
 	TalosVersion         string        `json:"talosVersion,omitempty"`
+	ImageArchitecture    string        `json:"imageArchitecture,omitempty"`
 }
 
 // DefaultsFor resolves the effective sizing for a node role.

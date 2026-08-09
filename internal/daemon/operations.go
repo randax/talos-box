@@ -14,6 +14,7 @@ import (
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/helper"
 	"github.com/randax/talos-box/internal/hypervisor"
+	"github.com/randax/talos-box/internal/imagecache"
 )
 
 type createArgs struct {
@@ -101,9 +102,10 @@ type ClusterStatus struct {
 
 // CachePullResult describes the image made ready by cache.pull.
 type CachePullResult struct {
-	Schematic string `json:"schematic"`
-	Version   string `json:"version"`
-	Path      string `json:"path"`
+	Schematic    string                  `json:"schematic"`
+	Version      string                  `json:"version"`
+	Architecture hypervisor.Architecture `json:"architecture"`
+	Path         string                  `json:"path"`
 }
 
 func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
@@ -161,11 +163,12 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	item.ControlPlaneDefaults = args.ControlPlane
 	item.WorkerDefaults = args.Worker
 	item.BGP = args.BGP
+	item.ImageArchitecture = string(s.hypervisor.Architecture())
 	item.Schematic, item.TalosVersion, err = s.resolveImage(args.Schematic, args.Version)
 	if err != nil {
 		return ClusterSummary{}, err
 	}
-	cachedDisk, err := s.cache.Ensure(item.Schematic, item.TalosVersion)
+	cachedDisk, err := s.cache.Ensure(item.Schematic, item.TalosVersion, s.imageArchitecture())
 	if err != nil {
 		return ClusterSummary{}, err
 	}
@@ -281,6 +284,9 @@ func (s *Server) rollbackStarted(clusterName string, nodes map[string]hypervisor
 }
 
 func (s *Server) launchMachine(item cluster.Cluster, node cluster.Node, restore *hypervisor.Restore) (hypervisor.Machine, error) {
+	if _, err := s.clusterImageArchitecture(item); err != nil {
+		return nil, err
+	}
 	dir, err := cluster.Dir(item.Name)
 	if err != nil {
 		return nil, err
@@ -610,11 +616,12 @@ func (s *Server) pullCache(raw json.RawMessage) (CachePullResult, error) {
 	if err != nil {
 		return CachePullResult{}, err
 	}
-	path, err := s.cache.Ensure(schematic, talosVersion)
+	architecture := s.hypervisor.Architecture()
+	path, err := s.cache.Ensure(schematic, talosVersion, imagecache.Architecture(architecture))
 	if err != nil {
 		return CachePullResult{}, err
 	}
-	return CachePullResult{Schematic: schematic, Version: talosVersion, Path: path}, nil
+	return CachePullResult{Schematic: schematic, Version: talosVersion, Architecture: architecture, Path: path}, nil
 }
 
 func (s *Server) pruneCache() (map[string]int, error) {
@@ -650,7 +657,27 @@ func (s *Server) cachedDisk(item cluster.Cluster) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return s.cache.Ensure(schematic, talosVersion)
+	architecture, err := s.clusterImageArchitecture(item)
+	if err != nil {
+		return "", err
+	}
+	return s.cache.Ensure(schematic, talosVersion, architecture)
+}
+
+func (s *Server) imageArchitecture() imagecache.Architecture {
+	return imagecache.Architecture(s.hypervisor.Architecture())
+}
+
+func (s *Server) clusterImageArchitecture(item cluster.Cluster) (imagecache.Architecture, error) {
+	architecture := item.ImageArchitecture
+	if architecture == "" {
+		architecture = cluster.LegacyImageArchitecture
+	}
+	active := s.hypervisor.Architecture()
+	if hypervisor.Architecture(architecture) != active {
+		return "", fmt.Errorf("cluster %q uses %s images, but the active hypervisor targets %s", item.Name, architecture, active)
+	}
+	return imagecache.Architecture(architecture), nil
 }
 
 func memoryOr(mib, fallback int) int {

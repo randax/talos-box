@@ -74,15 +74,15 @@ and `console=hvc0` alone bricks the boot under vz (verified: no boot, no output;
 `console=tty0 console=hvc0` the node boots and streams kernel+machined logs on hvc0 — gate G6,
 closed). Schematics are content-addressed, so this is one deterministic POST to
 `factory.talos.dev/schematics`; user-supplied schematics get the args appended the same way.
-Per schematic + Talos version, `tbx` downloads Image Factory's `metal-arm64.raw.xz` once into
-the cache, decompresses it, and provisions each
+Per schematic + Talos version + target hypervisor architecture, `tbx` downloads Image Factory's
+`metal-arm64.raw.xz` or `metal-amd64.raw.xz` once into the cache, decompresses it, and provisions each
 node disk as an **APFS `clonefile` clone** grown (sparse) to the configured disk size.
 Validated results: node boots from disk straight to maintenance mode (unauthenticated apid on
 TCP 50000, Reader role for `talosctl --insecure`); `apply-config` lands in ~10 s with no
 reboot and zero network; a configured node cold-boots in ~16 s. The ISO+install path is
 dropped.
 
-- Cache: `~/.talosbox/cache/<schematic>/<version>/` — `tbx cache pull` (eager, pre-venue),
+- Cache: `~/.talosbox/cache/<schematic>/<version>/<architecture>/` — `tbx cache pull` (eager, pre-venue),
   `tbx cache prune`.
 - Node disks: `~/.talosbox/clusters/<name>/<node>.img`, **20 GB sparse** default.
 - **Talos version matrix**: each tbx release pins one tested default Talos version (initially
