@@ -39,37 +39,32 @@ func systemRoute(destination net.IP) (HostRoute, error) {
 	if err != nil {
 		return HostRoute{}, fmt.Errorf("dump netlink IPv4 routes: %w", err)
 	}
-	var selected *netlink.Route
-	selectedPrefix := -1
-	for index := range routes {
-		route := &routes[index]
-		prefix := 0
-		if route.Dst != nil {
-			if !route.Dst.Contains(destination) {
-				continue
+	observed := make([]HostRoute, 0, len(routes))
+	ignored := make(map[string]bool)
+	for _, route := range routes {
+		interfaceName := "netlink-route"
+		if route.LinkIndex != 0 {
+			link, err := netlink.LinkByIndex(route.LinkIndex)
+			if err != nil {
+				return HostRoute{}, fmt.Errorf("resolve route interface %d: %w", route.LinkIndex, err)
 			}
-			prefix, _ = route.Dst.Mask.Size()
+			interfaceName = link.Attrs().Name
+			if ip := destination.To4(); ip != nil {
+				index := int(ip[2])
+				if interfaceName == LinuxBridgeName(index) && link.Attrs().Alias == LinuxBridgeAlias(index) {
+					ignored[interfaceName] = true
+				}
+			}
 		}
-		if prefix > selectedPrefix {
-			selected = route
-			selectedPrefix = prefix
+		network := route.Dst
+		if network == nil {
+			network = &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)}
 		}
+		observed = append(observed, HostRoute{Interface: interfaceName, Network: network})
 	}
-	if selected == nil {
+	selected := selectMostSpecificRoute(destination, observed, ignored)
+	if selected.Interface == "" && selected.Network == nil {
 		return HostRoute{}, nil
 	}
-
-	interfaceName := "netlink-route"
-	if selected.LinkIndex != 0 {
-		link, err := netlink.LinkByIndex(selected.LinkIndex)
-		if err != nil {
-			return HostRoute{}, fmt.Errorf("resolve route interface %d: %w", selected.LinkIndex, err)
-		}
-		interfaceName = link.Attrs().Name
-	}
-	network := selected.Dst
-	if network == nil {
-		network = &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)}
-	}
-	return HostRoute{Interface: interfaceName, Network: network}, nil
+	return selected, nil
 }

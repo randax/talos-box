@@ -22,6 +22,17 @@ type HostRoute struct {
 	Network   *net.IPNet
 }
 
+// LinuxBridgeName and LinuxBridgeAlias are the netlink identity of a bridge
+// owned by Talos Box. The alias is provenance; the name alone is never enough
+// to authorize privileged mutation of a host link.
+func LinuxBridgeName(index int) string {
+	return fmt.Sprintf("br-tbx%d", index)
+}
+
+func LinuxBridgeAlias(index int) string {
+	return fmt.Sprintf("talos-box:bridge:%d", index)
+}
+
 // SubnetSources supplies unprivileged host interface and route observations.
 type SubnetSources struct {
 	Interfaces func() ([]HostInterface, error)
@@ -208,13 +219,30 @@ func networksOverlap(left, right *net.IPNet) bool {
 	return left.Contains(right.IP) || right.Contains(left.IP)
 }
 
+func selectMostSpecificRoute(destination net.IP, routes []HostRoute, ignoredInterfaces map[string]bool) HostRoute {
+	selected := HostRoute{}
+	selectedPrefix := -1
+	for _, route := range routes {
+		if ignoredInterfaces[route.Interface] || route.Network == nil || !route.Network.Contains(destination) {
+			continue
+		}
+		prefix, bits := route.Network.Mask.Size()
+		if bits != 32 || prefix < 0 || prefix <= selectedPrefix {
+			continue
+		}
+		selected = route
+		selectedPrefix = prefix
+	}
+	return selected
+}
+
 func isTalosBoxBridge(name string, ip net.IP, network *net.IPNet, index int) bool {
 	ones, bits := network.Mask.Size()
 	return bits == 32 && ones == 24 && ip.Equal(net.ParseIP(Gateway(index))) && isTalosBoxBridgeName(name, index)
 }
 
 func isTalosBoxBridgeName(name string, index int) bool {
-	if name == fmt.Sprintf("br-tbx%d", index) {
+	if name == LinuxBridgeName(index) {
 		return true
 	}
 	bridgeIndex, err := strconv.Atoi(strings.TrimPrefix(name, "bridge"))

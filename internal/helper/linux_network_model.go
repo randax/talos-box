@@ -14,8 +14,11 @@ import (
 
 const linuxBridgePrefix = "br-tbx"
 
+const linuxLinkAliasPrefix = "talos-box:"
+
 type linuxLinkState struct {
 	Name  string
+	Alias string
 	Addrs []net.Addr
 }
 
@@ -29,7 +32,7 @@ type linuxNetworkOps interface {
 	Route(net.IP) (cluster.HostRoute, error)
 	EnsureIPv4Forwarding() error
 	EnsureInterfaceForwarding(name string) error
-	EnsureManagedTaps() error
+	EnsureManagedTaps(subnetIndexes []int) error
 	EnsureBridge(name string) error
 	EnsureBridgeSTP(name string, enabled bool) error
 	EnsureBridgeAddress(name, cidr string) error
@@ -42,7 +45,15 @@ type linuxNFTConverger interface {
 }
 
 func bridgeNameForSubnet(index int) string {
-	return fmt.Sprintf("%s%d", linuxBridgePrefix, index)
+	return cluster.LinuxBridgeName(index)
+}
+
+func bridgeAliasForSubnet(index int) string {
+	return cluster.LinuxBridgeAlias(index)
+}
+
+func tapAliasForSubnet(index int) string {
+	return fmt.Sprintf("%stap:%d", linuxLinkAliasPrefix, index)
 }
 
 func tapNameForNode(subnetIndex int, clusterName, node string) string {
@@ -74,11 +85,11 @@ func subnetIndexFromTapName(name string) (int, bool) {
 func managedSubnetIndexes(links []linuxLinkState) []int {
 	indexes := make([]int, 0, len(links))
 	for _, link := range links {
-		if index, ok := subnetIndexFromBridgeName(link.Name); ok {
+		if index, ok := subnetIndexFromBridgeName(link.Name); ok && link.Alias == bridgeAliasForSubnet(index) {
 			indexes = append(indexes, index)
 			continue
 		}
-		if index, ok := subnetIndexFromTapName(link.Name); ok {
+		if index, ok := subnetIndexFromTapName(link.Name); ok && link.Alias == tapAliasForSubnet(index) {
 			indexes = append(indexes, index)
 		}
 	}
@@ -99,6 +110,7 @@ func subnetIndexFromBridgeName(name string) (int, bool) {
 }
 
 func linuxClusterSources(inspector linuxSubnetInspector) cluster.SubnetSources {
+	ownedBridges := make(map[string]int)
 	return cluster.SubnetSources{
 		Interfaces: func() ([]cluster.HostInterface, error) {
 			links, err := inspector.Interfaces()
@@ -108,14 +120,26 @@ func linuxClusterSources(inspector linuxSubnetInspector) cluster.SubnetSources {
 			result := make([]cluster.HostInterface, 0, len(links))
 			for _, link := range links {
 				name := link.Name
-				if index, ok := subnetIndexFromBridgeName(link.Name); ok {
+				if index, ok := subnetIndexFromBridgeName(link.Name); ok && link.Alias == bridgeAliasForSubnet(index) {
+					ownedBridges[link.Name] = index
 					name = fmt.Sprintf("bridge%d", 100+index)
 				}
 				result = append(result, cluster.HostInterface{Name: name, Addrs: link.Addrs})
 			}
 			return result, nil
 		},
-		Route: inspector.Route,
+		Route: func(destination net.IP) (cluster.HostRoute, error) {
+			route, err := inspector.Route(destination)
+			if err != nil {
+				return cluster.HostRoute{}, err
+			}
+			if index, ok := ownedBridges[route.Interface]; ok {
+				route.Interface = fmt.Sprintf("bridge%d", 100+index)
+			} else if _, looksManaged := subnetIndexFromBridgeName(route.Interface); looksManaged {
+				route.Interface = "foreign:" + route.Interface
+			}
+			return route, nil
+		},
 	}
 }
 
@@ -158,27 +182,23 @@ func lowestSafeLinuxSubnet(inspector linuxSubnetInspector) (int, error) {
 	return 0, fmt.Errorf("no collision-free cluster subnet is available")
 }
 
-func convergeLinuxManagedState(netOps linuxNetworkOps, nft linuxNFTConverger) error {
-	links, err := netOps.ListLinks()
-	if err != nil {
-		return fmt.Errorf("list helper-managed links: %w", err)
-	}
+func convergeLinuxManagedState(netOps linuxNetworkOps, nft linuxNFTConverger, configured []int) error {
 	if err := netOps.EnsureIPv4Forwarding(); err != nil {
 		return err
 	}
-	managed := managedSubnetIndexes(links)
-	for _, index := range managed {
+	desired := normalizeLinuxSubnetIndexes(configured)
+	for _, index := range desired {
 		if err := ensureLinuxBridge(netOps, index); err != nil {
 			return err
 		}
 	}
-	if err := netOps.EnsureManagedTaps(); err != nil {
+	if err := netOps.EnsureManagedTaps(desired); err != nil {
 		return err
 	}
-	return nft.Converge(managed)
+	return nft.Converge(desired)
 }
 
-func startLinuxAttachment(netOps linuxNetworkOps, nft linuxNFTConverger, subnetIndex int, clusterName, node string) (*os.File, error) {
+func startLinuxAttachment(netOps linuxNetworkOps, nft linuxNFTConverger, configured []int, subnetIndex int, clusterName, node string) (*os.File, error) {
 	_, err := preflightLinuxSubnet(subnetIndex, linuxSubnetInspector{
 		Interfaces: netOps.ListLinks,
 		Route:      netOps.Route,
@@ -192,16 +212,12 @@ func startLinuxAttachment(netOps linuxNetworkOps, nft linuxNFTConverger, subnetI
 	if err := ensureLinuxBridge(netOps, subnetIndex); err != nil {
 		return nil, err
 	}
-	links, err := netOps.ListLinks()
-	if err != nil {
-		return nil, fmt.Errorf("list helper-managed links: %w", err)
+	desired := normalizeLinuxSubnetIndexes(configured)
+	if !slices.Contains(desired, subnetIndex) {
+		desired = append(desired, subnetIndex)
+		slices.Sort(desired)
 	}
-	managed := managedSubnetIndexes(links)
-	if !slices.Contains(managed, subnetIndex) {
-		managed = append(managed, subnetIndex)
-		slices.Sort(managed)
-	}
-	if err := nft.Converge(managed); err != nil {
+	if err := nft.Converge(desired); err != nil {
 		return nil, err
 	}
 	file, err := netOps.CreateTap(tapNameForNode(subnetIndex, clusterName, node), bridgeNameForSubnet(subnetIndex))
@@ -209,6 +225,17 @@ func startLinuxAttachment(netOps linuxNetworkOps, nft linuxNFTConverger, subnetI
 		return nil, err
 	}
 	return file, nil
+}
+
+func normalizeLinuxSubnetIndexes(indexes []int) []int {
+	normalized := make([]int, 0, len(indexes))
+	for _, index := range indexes {
+		if index >= 0 && index <= cluster.MaxSubnetIndex {
+			normalized = append(normalized, index)
+		}
+	}
+	slices.Sort(normalized)
+	return slices.Compact(normalized)
 }
 
 func ensureLinuxBridge(netOps linuxNetworkOps, subnetIndex int) error {

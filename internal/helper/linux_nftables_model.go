@@ -1,13 +1,15 @@
 package helper
 
 import (
-	"fmt"
 	"slices"
 
 	"github.com/randax/talos-box/internal/cluster"
 )
 
-const linuxNFTTableName = "tbx"
+const (
+	linuxNFTTableName        = "tbx"
+	linuxNFTOwnerMarkerChain = "__talos_box_owned_v1"
+)
 
 type linuxNFTRuleKind uint8
 
@@ -54,7 +56,7 @@ func buildLinuxNFTPlan(subnetIndexes []int) linuxNFTPlan {
 				kind:       linuxNFTRuleMasquerade,
 				chain:      "postrouting",
 				bridge:     bridge,
-				sourceCIDR: fmt.Sprintf("172.30.%d.0/24", index),
+				sourceCIDR: cluster.SubnetCIDR(index),
 			},
 			linuxNFTRule{kind: linuxNFTRuleForwardIn, chain: "forward", bridge: bridge},
 			linuxNFTRule{kind: linuxNFTRuleForwardOut, chain: "forward", bridge: bridge},

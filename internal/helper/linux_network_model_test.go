@@ -18,7 +18,7 @@ func TestStartLinuxAttachmentRejectsCollidingSubnetWithHint(t *testing.T) {
 
 	ops := &fakeLinuxNetworkOps{
 		links: []linuxLinkState{
-			{Name: bridgeNameForSubnet(4), Addrs: []net.Addr{mustCIDR("172.30.4.1/24")}},
+			{Name: bridgeNameForSubnet(4), Alias: bridgeAliasForSubnet(4), Addrs: []net.Addr{mustCIDR("172.30.4.1/24")}},
 		},
 		routes: map[string]cluster.HostRoute{
 			"172.30.7.2": mustRoute("utun7", "172.30.7.0/24"),
@@ -34,7 +34,7 @@ func TestStartLinuxAttachmentRejectsCollidingSubnetWithHint(t *testing.T) {
 	}
 	nft := &fakeLinuxNFTConverger{}
 
-	_, err := startLinuxAttachment(ops, nft, 7, "demo", "cp-1")
+	_, err := startLinuxAttachment(ops, nft, []int{4, 7}, 7, "demo", "cp-1")
 	if err == nil {
 		t.Fatal("startLinuxAttachment() error = nil, want conflict")
 	}
@@ -61,7 +61,7 @@ func TestStartLinuxAttachmentRejectsBroaderVPNRouteWithHint(t *testing.T) {
 		},
 	}
 
-	_, err := startLinuxAttachment(ops, &fakeLinuxNFTConverger{}, 7, "demo", "cp-1")
+	_, err := startLinuxAttachment(ops, &fakeLinuxNFTConverger{}, []int{7}, 7, "demo", "cp-1")
 	if err == nil {
 		t.Fatal("startLinuxAttachment() error = nil, want broad VPN collision")
 	}
@@ -83,14 +83,14 @@ func TestStartLinuxAttachmentConvergesBridgeAndReturnsTap(t *testing.T) {
 
 	ops := &fakeLinuxNetworkOps{
 		links: []linuxLinkState{
-			{Name: bridgeNameForSubnet(2), Addrs: []net.Addr{mustCIDR("172.30.2.1/24")}},
+			{Name: bridgeNameForSubnet(2), Alias: bridgeAliasForSubnet(2), Addrs: []net.Addr{mustCIDR("172.30.2.1/24")}},
 		},
 		defaultRoute: mustRoute("en0", "0.0.0.0/0"),
 		tap:          tap,
 	}
 	nft := &fakeLinuxNFTConverger{}
 
-	got, err := startLinuxAttachment(ops, nft, 3, "demo", "cp-1")
+	got, err := startLinuxAttachment(ops, nft, []int{2, 3}, 3, "demo", "cp-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,14 +119,14 @@ func TestConvergeLinuxManagedStateReassertsExistingBridges(t *testing.T) {
 
 	ops := &fakeLinuxNetworkOps{
 		links: []linuxLinkState{
-			{Name: bridgeNameForSubnet(7), Addrs: []net.Addr{mustCIDR("172.30.7.1/24")}},
+			{Name: bridgeNameForSubnet(7), Alias: bridgeAliasForSubnet(7), Addrs: []net.Addr{mustCIDR("172.30.7.1/24")}},
 			{Name: "eth0", Addrs: []net.Addr{mustCIDR("10.0.0.5/24")}},
-			{Name: bridgeNameForSubnet(3), Addrs: []net.Addr{mustCIDR("172.30.3.1/24")}},
+			{Name: bridgeNameForSubnet(3), Alias: bridgeAliasForSubnet(3), Addrs: []net.Addr{mustCIDR("172.30.3.1/24")}},
 		},
 	}
 	nft := &fakeLinuxNFTConverger{}
 
-	if err := convergeLinuxManagedState(ops, nft); err != nil {
+	if err := convergeLinuxManagedState(ops, nft, []int{7, 3}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -142,7 +142,7 @@ func TestConvergeLinuxManagedStateReassertsExistingBridges(t *testing.T) {
 		"addr:" + bridgeNameForSubnet(7) + "=172.30.7.1/24",
 		"up:" + bridgeNameForSubnet(7),
 		"iface-forwarding:" + bridgeNameForSubnet(7),
-		"managed-taps",
+		"managed-taps:3,7",
 	}
 	if !reflect.DeepEqual(ops.calls, wantCalls) {
 		t.Fatalf("network calls = %#v, want %#v", ops.calls, wantCalls)
@@ -152,14 +152,14 @@ func TestConvergeLinuxManagedStateReassertsExistingBridges(t *testing.T) {
 	}
 }
 
-func TestConvergeLinuxManagedStateRecreatesBridgeForSurvivingTap(t *testing.T) {
+func TestConvergeLinuxManagedStateRecreatesBridgeForConfiguredSubnet(t *testing.T) {
 	t.Parallel()
 
 	ops := &fakeLinuxNetworkOps{
-		links: []linuxLinkState{{Name: tapNameForNode(12, "demo", "cp-1")}},
+		links: []linuxLinkState{{Name: tapNameForNode(12, "demo", "cp-1"), Alias: tapAliasForSubnet(12)}},
 	}
 	nft := &fakeLinuxNFTConverger{}
-	if err := convergeLinuxManagedState(ops, nft); err != nil {
+	if err := convergeLinuxManagedState(ops, nft, []int{12}); err != nil {
 		t.Fatal(err)
 	}
 	if got, want := ops.calls, []string{
@@ -169,12 +169,50 @@ func TestConvergeLinuxManagedStateRecreatesBridgeForSurvivingTap(t *testing.T) {
 		"addr:" + bridgeNameForSubnet(12) + "=172.30.12.1/24",
 		"up:" + bridgeNameForSubnet(12),
 		"iface-forwarding:" + bridgeNameForSubnet(12),
-		"managed-taps",
+		"managed-taps:12",
 	}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("network calls = %#v, want %#v", got, want)
 	}
 	if got := nft.subnetIndexes; !reflect.DeepEqual(got, []int{12}) {
 		t.Fatalf("nft subnet indexes = %v, want [12]", got)
+	}
+}
+
+func TestConvergeLinuxManagedStateRecreatesColdBootBridgesFromInventory(t *testing.T) {
+	t.Parallel()
+
+	ops := &fakeLinuxNetworkOps{}
+	nft := &fakeLinuxNFTConverger{}
+	if err := convergeLinuxManagedState(ops, nft, []int{14}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := ops.calls, []string{
+		"ipv4-forwarding",
+		"bridge:" + bridgeNameForSubnet(14),
+		"stp:" + bridgeNameForSubnet(14) + "=false",
+		"addr:" + bridgeNameForSubnet(14) + "=172.30.14.1/24",
+		"up:" + bridgeNameForSubnet(14),
+		"iface-forwarding:" + bridgeNameForSubnet(14),
+		"managed-taps:14",
+	}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("network calls = %#v, want %#v", got, want)
+	}
+	if got := nft.subnetIndexes; !reflect.DeepEqual(got, []int{14}) {
+		t.Fatalf("nft subnet indexes = %v, want [14]", got)
+	}
+}
+
+func TestManagedSubnetIndexesRequireOwnershipAlias(t *testing.T) {
+	t.Parallel()
+
+	links := []linuxLinkState{
+		{Name: bridgeNameForSubnet(3)},
+		{Name: bridgeNameForSubnet(4), Alias: bridgeAliasForSubnet(4)},
+		{Name: tapNameForNode(5, "demo", "cp-1")},
+		{Name: tapNameForNode(6, "demo", "cp-1"), Alias: tapAliasForSubnet(6)},
+	}
+	if got, want := managedSubnetIndexes(links), []int{4, 6}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("managedSubnetIndexes() = %v, want %v", got, want)
 	}
 }
 
@@ -201,7 +239,7 @@ func TestLinuxClusterSourcesTreatManagedBridgeAsTalosBoxBridge(t *testing.T) {
 
 	sources := linuxClusterSources(linuxSubnetInspector{
 		Interfaces: func() ([]linuxLinkState, error) {
-			return []linuxLinkState{{Name: bridgeNameForSubnet(9), Addrs: []net.Addr{mustCIDR("172.30.9.1/24")}}}, nil
+			return []linuxLinkState{{Name: bridgeNameForSubnet(9), Alias: bridgeAliasForSubnet(9), Addrs: []net.Addr{mustCIDR("172.30.9.1/24")}}}, nil
 		},
 		Route: func(net.IP) (cluster.HostRoute, error) {
 			return mustRoute("bridge109", "172.30.9.0/24"), nil
@@ -242,8 +280,12 @@ func (f *fakeLinuxNetworkOps) EnsureInterfaceForwarding(name string) error {
 	f.calls = append(f.calls, "iface-forwarding:"+name)
 	return nil
 }
-func (f *fakeLinuxNetworkOps) EnsureManagedTaps() error {
-	f.calls = append(f.calls, "managed-taps")
+func (f *fakeLinuxNetworkOps) EnsureManagedTaps(indexes []int) error {
+	values := make([]string, len(indexes))
+	for index, value := range indexes {
+		values[index] = strconv.Itoa(value)
+	}
+	f.calls = append(f.calls, "managed-taps:"+strings.Join(values, ","))
 	return nil
 }
 func (f *fakeLinuxNetworkOps) EnsureBridge(name string) error {

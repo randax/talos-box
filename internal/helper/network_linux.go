@@ -27,7 +27,11 @@ var (
 // StartInterface converges the cluster's host networking and returns a tap
 // descriptor for QEMU. The helper retains its copy until Detach.
 func StartInterface(subnetIndex int, clusterName, node string) (*platformAttachment, error) {
-	file, err := startLinuxAttachment(linuxNetwork, linuxNFT, subnetIndex, clusterName, node)
+	configured, err := configuredLinuxSubnetIndexes()
+	if err != nil {
+		return nil, err
+	}
+	file, err := startLinuxAttachment(linuxNetwork, linuxNFT, configured, subnetIndex, clusterName, node)
 	if err != nil {
 		return nil, err
 	}
@@ -39,7 +43,11 @@ func StartInterface(subnetIndex int, clusterName, node string) (*platformAttachm
 }
 
 func convergeNetworking() error {
-	return convergeLinuxManagedState(linuxNetwork, linuxNFT)
+	configured, err := configuredLinuxSubnetIndexes()
+	if err != nil {
+		return err
+	}
+	return convergeLinuxManagedState(linuxNetwork, linuxNFT, configured)
 }
 
 func enableForwarding() error {
@@ -48,6 +56,18 @@ func enableForwarding() error {
 
 type realLinuxNetworkOps struct{}
 
+func configuredLinuxSubnetIndexes() ([]int, error) {
+	clusters, err := cluster.List()
+	if err != nil {
+		return nil, fmt.Errorf("load configured cluster networking: %w", err)
+	}
+	indexes := make([]int, 0, len(clusters))
+	for _, item := range clusters {
+		indexes = append(indexes, item.SubnetIndex)
+	}
+	return normalizeLinuxSubnetIndexes(indexes), nil
+}
+
 func (realLinuxNetworkOps) ListLinks() ([]linuxLinkState, error) {
 	interfaces, err := cluster.SystemSubnetSources().Interfaces()
 	if err != nil {
@@ -55,7 +75,11 @@ func (realLinuxNetworkOps) ListLinks() ([]linuxLinkState, error) {
 	}
 	result := make([]linuxLinkState, 0, len(interfaces))
 	for _, current := range interfaces {
-		result = append(result, linuxLinkState{Name: current.Name, Addrs: current.Addrs})
+		link, lookupErr := netlink.LinkByName(current.Name)
+		if lookupErr != nil {
+			return nil, fmt.Errorf("inspect link metadata for %s: %w", current.Name, lookupErr)
+		}
+		result = append(result, linuxLinkState{Name: current.Name, Alias: link.Attrs().Alias, Addrs: current.Addrs})
 	}
 	return result, nil
 }
@@ -75,7 +99,11 @@ func (realLinuxNetworkOps) EnsureInterfaceForwarding(name string) error {
 	return ensureLinuxSysctl(filepath.Join("/proc/sys/net/ipv4/conf", name, "forwarding"))
 }
 
-func (realLinuxNetworkOps) EnsureManagedTaps() error {
+func (realLinuxNetworkOps) EnsureManagedTaps(subnetIndexes []int) error {
+	desired := make(map[int]struct{}, len(subnetIndexes))
+	for _, index := range subnetIndexes {
+		desired[index] = struct{}{}
+	}
 	links, err := netlink.LinkList()
 	if err != nil {
 		return fmt.Errorf("dump links while converging taps: %w", err)
@@ -83,6 +111,12 @@ func (realLinuxNetworkOps) EnsureManagedTaps() error {
 	for _, link := range links {
 		index, ok := subnetIndexFromTapName(link.Attrs().Name)
 		if !ok {
+			continue
+		}
+		if link.Attrs().Alias != tapAliasForSubnet(index) {
+			continue
+		}
+		if _, ok := desired[index]; !ok {
 			continue
 		}
 		tap, ok := link.(*netlink.Tuntap)
@@ -119,21 +153,44 @@ func ensureLinuxSysctl(path string) error {
 
 func (realLinuxNetworkOps) EnsureBridge(name string) error {
 	link, err := netlink.LinkByName(name)
+	created := false
 	if err != nil {
 		var notFound netlink.LinkNotFoundError
 		if !errors.As(err, &notFound) {
 			return fmt.Errorf("inspect bridge %s: %w", name, err)
 		}
+		index, ok := subnetIndexFromBridgeName(name)
+		if !ok {
+			return fmt.Errorf("refuse to create unmanaged bridge %q", name)
+		}
 		if err := netlink.LinkAdd(&netlink.Bridge{LinkAttrs: netlink.LinkAttrs{Name: name}}); err != nil {
 			return fmt.Errorf("create bridge %s: %w", name, err)
 		}
+		created = true
 		link, err = netlink.LinkByName(name)
 		if err != nil {
 			return fmt.Errorf("inspect created bridge %s: %w", name, err)
 		}
+		if err := netlink.LinkSetAlias(link, bridgeAliasForSubnet(index)); err != nil {
+			_ = netlink.LinkDel(link)
+			return fmt.Errorf("mark bridge %s as Talos Box-owned: %w", name, err)
+		}
+		markedLink := link
+		link, err = netlink.LinkByName(name)
+		if err != nil {
+			_ = netlink.LinkDel(markedLink)
+			return fmt.Errorf("verify bridge %s ownership: %w", name, err)
+		}
 	}
 	if _, ok := link.(*netlink.Bridge); !ok {
 		return fmt.Errorf("interface %s already exists with type %s, want bridge", name, link.Type())
+	}
+	index, ok := subnetIndexFromBridgeName(name)
+	if !ok || link.Attrs().Alias != bridgeAliasForSubnet(index) {
+		if created {
+			_ = netlink.LinkDel(link)
+		}
+		return fmt.Errorf("interface %s is not owned by Talos Box; refusing to modify it", name)
 	}
 	return nil
 }
@@ -204,6 +261,10 @@ func (realLinuxNetworkOps) EnsureLinkUp(name string) error {
 }
 
 func (realLinuxNetworkOps) CreateTap(name, bridgeName string) (*os.File, error) {
+	subnetIndex, ok := subnetIndexFromTapName(name)
+	if !ok || bridgeName != bridgeNameForSubnet(subnetIndex) {
+		return nil, fmt.Errorf("refuse to create unmanaged tap %q for bridge %q", name, bridgeName)
+	}
 	bridge, err := requireLinuxBridge(bridgeName)
 	if err != nil {
 		return nil, err
@@ -218,7 +279,7 @@ func (realLinuxNetworkOps) CreateTap(name, bridgeName string) (*os.File, error) 
 	}
 
 	tap := &netlink.Tuntap{
-		LinkAttrs:  netlink.LinkAttrs{Name: name, MasterIndex: bridge.Attrs().Index},
+		LinkAttrs:  netlink.LinkAttrs{Name: name, Alias: tapAliasForSubnet(subnetIndex), MasterIndex: bridge.Attrs().Index},
 		Mode:       netlink.TUNTAP_MODE_TAP,
 		Flags:      netlink.TUNTAP_DEFAULTS,
 		NonPersist: true,
@@ -238,6 +299,10 @@ func (realLinuxNetworkOps) CreateTap(name, bridgeName string) (*os.File, error) 
 		closeTap()
 		return nil, fmt.Errorf("create tap %s returned %d descriptors, want 1", name, len(tap.Fds))
 	}
+	if err := netlink.LinkSetAlias(tap, tapAliasForSubnet(subnetIndex)); err != nil {
+		closeTap()
+		return nil, fmt.Errorf("mark tap %s as Talos Box-owned: %w", name, err)
+	}
 	if err := netlink.LinkSetUp(tap); err != nil {
 		closeTap()
 		return nil, fmt.Errorf("bring tap %s up: %w", name, err)
@@ -253,6 +318,10 @@ func requireLinuxBridge(name string) (*netlink.Bridge, error) {
 	bridge, ok := link.(*netlink.Bridge)
 	if !ok {
 		return nil, fmt.Errorf("interface %s has type %s, want bridge", name, link.Type())
+	}
+	index, ok := subnetIndexFromBridgeName(name)
+	if !ok || bridge.Attrs().Alias != bridgeAliasForSubnet(index) {
+		return nil, fmt.Errorf("interface %s is not owned by Talos Box; refusing to modify it", name)
 	}
 	return bridge, nil
 }
@@ -271,11 +340,19 @@ func (realLinuxNFTConverger) Converge(subnetIndexes []int) error {
 	}
 	for _, table := range tables {
 		if table.Name == plan.tableName {
+			owned, err := linuxNFTTableOwned(connection, table)
+			if err != nil {
+				return err
+			}
+			if !owned {
+				return fmt.Errorf("table inet %s already exists without Talos Box ownership marker; refusing to replace it", plan.tableName)
+			}
 			connection.DelTable(table)
 		}
 	}
 
 	table := connection.AddTable(&nftables.Table{Name: plan.tableName, Family: nftables.TableFamilyINet})
+	connection.AddChain(&nftables.Chain{Name: linuxNFTOwnerMarkerChain, Table: table})
 	accept := nftables.ChainPolicyAccept
 	forward := connection.AddChain(&nftables.Chain{
 		Name:     "forward",
@@ -307,6 +384,19 @@ func (realLinuxNFTConverger) Converge(subnetIndexes []int) error {
 	return nil
 }
 
+func linuxNFTTableOwned(connection *nftables.Conn, table *nftables.Table) (bool, error) {
+	chains, err := connection.ListChainsOfTableFamily(nftables.TableFamilyINet)
+	if err != nil {
+		return false, fmt.Errorf("inspect ownership of table inet %s: %w", table.Name, err)
+	}
+	for _, chain := range chains {
+		if chain.Table != nil && chain.Table.Name == table.Name && chain.Name == linuxNFTOwnerMarkerChain {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func linuxNFTExpressions(rule linuxNFTRule) ([]expr.Any, error) {
 	switch rule.kind {
 	case linuxNFTRuleMasquerade:
@@ -315,6 +405,8 @@ func linuxNFTExpressions(rule linuxNFTRule) ([]expr.Any, error) {
 			return nil, fmt.Errorf("parse nftables source %s: %w", rule.sourceCIDR, err)
 		}
 		return []expr.Any{
+			&expr.Meta{Key: expr.MetaKeyNFPROTO, Register: 1},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{unix.NFPROTO_IPV4}},
 			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 12, Len: 4},
 			&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: []byte(network.Mask), Xor: []byte{0, 0, 0, 0}},
 			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: network.IP.To4()},

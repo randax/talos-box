@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/google/nftables"
+	"github.com/randax/talos-box/internal/cluster"
 	"github.com/vishvananda/netlink"
 )
 
@@ -32,6 +33,11 @@ func TestLinuxNetworkingConvergesIdempotently(t *testing.T) {
 	bridgeName := bridgeNameForSubnet(subnetIndex)
 	t.Cleanup(func() { removeLinuxE2EBridge(bridgeName) })
 	t.Cleanup(removeLinuxE2ETable)
+	persistLinuxE2ECluster(t, "e2e", subnetIndex)
+
+	if err := ConvergeNetworking(); err != nil {
+		t.Fatalf("cold-boot convergence: %v", err)
+	}
 
 	attachment, err := StartInterface(subnetIndex, "e2e", "cp-1")
 	if err != nil {
@@ -67,6 +73,9 @@ func TestLinuxNetworkingConvergesIdempotently(t *testing.T) {
 	if strings.TrimSpace(string(stp)) != "0" {
 		t.Fatalf("bridge STP state = %q, want 0", strings.TrimSpace(string(stp)))
 	}
+	if bridge.Attrs().Alias != bridgeAliasForSubnet(subnetIndex) {
+		t.Fatalf("bridge alias = %q, want %q", bridge.Attrs().Alias, bridgeAliasForSubnet(subnetIndex))
+	}
 	for _, path := range []string{
 		"/proc/sys/net/ipv4/ip_forward",
 		"/proc/sys/net/ipv4/conf/" + bridgeName + "/forwarding",
@@ -85,6 +94,9 @@ func TestLinuxNetworkingConvergesIdempotently(t *testing.T) {
 	}
 	if tap.Attrs().MasterIndex != bridge.Attrs().Index {
 		t.Fatalf("tap master = %d, want bridge index %d", tap.Attrs().MasterIndex, bridge.Attrs().Index)
+	}
+	if tap.Attrs().Alias != tapAliasForSubnet(subnetIndex) {
+		t.Fatalf("tap alias = %q, want %q", tap.Attrs().Alias, tapAliasForSubnet(subnetIndex))
 	}
 
 	connection := &nftables.Conn{}
@@ -121,8 +133,61 @@ func TestLinuxNetworkingConvergesIdempotently(t *testing.T) {
 		}
 		ruleCount += len(rules)
 	}
-	if chainCount != 2 || ruleCount != 3 {
-		t.Fatalf("owned nftables state = %d chains/%d rules, want 2/3", chainCount, ruleCount)
+	if chainCount != 3 || ruleCount != 3 {
+		t.Fatalf("owned nftables state = %d chains/%d rules, want 3/3", chainCount, ruleCount)
+	}
+}
+
+func TestLinuxNetworkingRefusesForeignNFTTable(t *testing.T) {
+	requireLinuxHelperE2E(t)
+	t.Cleanup(removeLinuxE2ETable)
+
+	connection := &nftables.Conn{}
+	table := connection.AddTable(&nftables.Table{Name: linuxNFTTableName, Family: nftables.TableFamilyINet})
+	connection.AddChain(&nftables.Chain{Name: "foreign-policy", Table: table})
+	if err := connection.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	err := (realLinuxNFTConverger{}).Converge([]int{247})
+	if err == nil || !strings.Contains(err.Error(), "without Talos Box ownership marker") {
+		t.Fatalf("Converge() error = %v, want ownership refusal", err)
+	}
+	chains, err := connection.ListChainsOfTableFamily(nftables.TableFamilyINet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, chain := range chains {
+		if chain.Table.Name == linuxNFTTableName && chain.Name == "foreign-policy" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("foreign nftables table was modified after ownership refusal")
+	}
+}
+
+func TestLinuxNetworkingRefusesForeignLookalikeBridge(t *testing.T) {
+	requireLinuxHelperE2E(t)
+	const subnetIndex = 247
+	name := bridgeNameForSubnet(subnetIndex)
+	foreign := &netlink.Bridge{LinkAttrs: netlink.LinkAttrs{Name: name}}
+	if err := netlink.LinkAdd(foreign); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { removeLinuxE2EBridge(name) })
+
+	err := (realLinuxNetworkOps{}).EnsureBridge(name)
+	if err == nil || !strings.Contains(err.Error(), "not owned by Talos Box") {
+		t.Fatalf("EnsureBridge() error = %v, want ownership refusal", err)
+	}
+	link, err := netlink.LinkByName(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if link.Attrs().Alias != "" {
+		t.Fatalf("foreign bridge alias changed to %q", link.Attrs().Alias)
 	}
 }
 
@@ -156,6 +221,44 @@ func TestLinuxNetworkingRejectsVPNCollisionWithFreeIndex(t *testing.T) {
 	}
 }
 
+func TestLinuxNetworkingDetectsVPNRouteBehindOwnedBridgeRoute(t *testing.T) {
+	requireLinuxHelperE2E(t)
+	const subnetIndex = 246
+	bridgeName := bridgeNameForSubnet(subnetIndex)
+	t.Cleanup(func() { removeLinuxE2EBridge(bridgeName) })
+	t.Cleanup(removeLinuxE2ETable)
+	persistLinuxE2ECluster(t, "route-e2e", subnetIndex)
+	if err := ConvergeNetworking(); err != nil {
+		t.Fatal(err)
+	}
+
+	vpn := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "tbx-vpn-route"}}
+	if err := netlink.LinkAdd(vpn); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = netlink.LinkDel(vpn) })
+	if err := netlink.LinkSetUp(vpn); err != nil {
+		t.Fatal(err)
+	}
+	_, network, err := net.ParseCIDR("172.30.246.0/23")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := netlink.RouteAdd(&netlink.Route{LinkIndex: vpn.Attrs().Index, Dst: network}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = StartInterface(subnetIndex, "route-e2e", "cp-1")
+	if err == nil {
+		t.Fatal("StartInterface() error = nil, want VPN route collision")
+	}
+	for _, fragment := range []string{"172.30.246.0/24", "tbx-vpn-route", "try subnet index"} {
+		if !strings.Contains(err.Error(), fragment) {
+			t.Fatalf("error = %q, want %q", err, fragment)
+		}
+	}
+}
+
 func TestLinuxNetworkingWithCapabilitySet(t *testing.T) {
 	requireLinuxHelperE2E(t)
 	const childEnv = "TBX_LINUX_CAPSH_CHILD"
@@ -165,6 +268,7 @@ func TestLinuxNetworkingWithCapabilitySet(t *testing.T) {
 			t.Fatal("capability probe still runs as root")
 		}
 		assertLinuxCapabilitySet(t)
+		persistLinuxE2ECluster(t, "cap-e2e", subnetIndex)
 		t.Cleanup(func() { removeLinuxE2EBridge(bridgeNameForSubnet(subnetIndex)) })
 		t.Cleanup(removeLinuxE2ETable)
 		attachment, err := StartInterface(subnetIndex, "cap-e2e", "cp-1")
@@ -204,6 +308,18 @@ func TestLinuxNetworkingWithCapabilitySet(t *testing.T) {
 	output, err := command.CombinedOutput()
 	if err != nil {
 		t.Fatalf("capsh capability probe failed: %v\n%s", err, output)
+	}
+}
+
+func persistLinuxE2ECluster(t *testing.T, name string, subnetIndex int) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New(name, subnetIndex, 1, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
 	}
 }
 

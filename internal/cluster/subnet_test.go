@@ -158,6 +158,44 @@ func TestCheckSubnetIndexRejectsForeignBridgeRoute(t *testing.T) {
 	}
 }
 
+func TestSelectMostSpecificRouteSkipsOwnedBridgeRoute(t *testing.T) {
+	t.Parallel()
+
+	destination := net.ParseIP("172.30.9.2")
+	routes := []HostRoute{
+		mustHostRoute(t, "br-tbx9", "172.30.9.0/24"),
+		mustHostRoute(t, "vpn0", "172.16.0.0/12"),
+		mustHostRoute(t, "eth0", "0.0.0.0/0"),
+	}
+	got := selectMostSpecificRoute(destination, routes, map[string]bool{"br-tbx9": true})
+	if got.Interface != "vpn0" || got.Network.String() != "172.16.0.0/12" {
+		t.Fatalf("selected route = %+v, want vpn0 172.16.0.0/12", got)
+	}
+}
+
+func TestSelectMostSpecificRouteFallsBackToDefaultAfterOwnedBridge(t *testing.T) {
+	t.Parallel()
+
+	destination := net.ParseIP("172.30.9.2")
+	routes := []HostRoute{
+		mustHostRoute(t, "br-tbx9", "172.30.9.0/24"),
+		mustHostRoute(t, "eth0", "0.0.0.0/0"),
+	}
+	got := selectMostSpecificRoute(destination, routes, map[string]bool{"br-tbx9": true})
+	if got.Interface != "eth0" || got.Network.String() != "0.0.0.0/0" {
+		t.Fatalf("selected route = %+v, want eth0 0.0.0.0/0", got)
+	}
+}
+
+func mustHostRoute(t *testing.T, name, cidr string) HostRoute {
+	t.Helper()
+	_, network, err := net.ParseCIDR(cidr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return HostRoute{Interface: name, Network: network}
+}
+
 func TestRouteNotFound(t *testing.T) {
 	t.Parallel()
 
