@@ -63,6 +63,8 @@ func New(ctx context.Context) (Hypervisor, error) {
 
 func (h *vzHypervisor) Capabilities() Capabilities { return h.capabilities }
 
+func (h *vzHypervisor) Architecture() Architecture { return ArchitectureARM64 }
+
 // Launch transactionally constructs and starts or restores a VZ machine.
 func (h *vzHypervisor) Launch(ctx context.Context, spec Spec) (Machine, error) {
 	if err := validateSpec(spec); err != nil {

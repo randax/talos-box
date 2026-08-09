@@ -27,7 +27,15 @@ const (
 
 var xzMagic = []byte{0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00}
 
-// Cache stores Talos disk images by schematic and version.
+// Architecture identifies a Talos Image Factory machine architecture.
+type Architecture string
+
+const (
+	ArchitectureAMD64 Architecture = "amd64"
+	ArchitectureARM64 Architecture = "arm64"
+)
+
+// Cache stores Talos disk images by schematic, version, and architecture.
 type Cache struct {
 	root            string
 	factoryURL      string
@@ -37,10 +45,11 @@ type Cache struct {
 
 // Entry is a ready-to-use disk image in the cache.
 type Entry struct {
-	Schematic string
-	Version   string
-	Path      string
-	Size      int64
+	Schematic    string
+	Version      string
+	Architecture Architecture
+	Path         string
+	Size         int64
 }
 
 // New returns a cache rooted at root.
@@ -92,16 +101,20 @@ func NewDefault() (*Cache, error) {
 	return New(root), nil
 }
 
-// Ensure returns a decompressed disk image, downloading it when necessary.
-func (c *Cache) Ensure(schematic, version string) (string, error) {
+// Ensure returns a decompressed disk image for architecture, downloading it
+// when necessary.
+func (c *Cache) Ensure(schematic, version string, architecture Architecture) (string, error) {
 	if err := validateComponent("schematic", schematic); err != nil {
 		return "", err
 	}
 	if err := validateComponent("version", version); err != nil {
 		return "", err
 	}
+	if err := validateArchitecture(architecture); err != nil {
+		return "", err
+	}
 
-	dir := filepath.Join(c.root, schematic, version)
+	dir := filepath.Join(c.root, schematic, version, string(architecture))
 	diskPath := filepath.Join(dir, "disk.raw")
 	if fileReady(diskPath) {
 		return diskPath, nil
@@ -109,11 +122,22 @@ func (c *Cache) Ensure(schematic, version string) (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("create cache directory: %w", err)
 	}
+	if architecture == ArchitectureARM64 {
+		legacyPath := filepath.Join(c.root, schematic, version, "disk.raw")
+		migrated, err := migrateLegacyDisk(legacyPath, diskPath)
+		if err != nil {
+			return "", err
+		}
+		if migrated {
+			return diskPath, nil
+		}
+	}
 
-	archivePath := filepath.Join(dir, "metal-arm64.raw.xz")
+	asset := fmt.Sprintf("metal-%s.raw.xz", architecture)
+	archivePath := filepath.Join(dir, asset)
 	if !fileReady(archivePath) {
-		assetURL := fmt.Sprintf("%s/image/%s/%s/metal-arm64.raw.xz",
-			strings.TrimRight(c.factoryURL, "/"), url.PathEscape(schematic), url.PathEscape(version))
+		assetURL := fmt.Sprintf("%s/image/%s/%s/%s",
+			strings.TrimRight(c.factoryURL, "/"), url.PathEscape(schematic), url.PathEscape(version), asset)
 		if err := c.download(assetURL, archivePath); err != nil {
 			return "", err
 		}
@@ -148,31 +172,39 @@ func (c *Cache) List() ([]Entry, error) {
 			if !version.IsDir() {
 				continue
 			}
-			path := filepath.Join(c.root, schematic.Name(), version.Name(), "disk.raw")
-			info, err := os.Stat(path)
-			if errors.Is(err, os.ErrNotExist) {
+			versionDir := filepath.Join(c.root, schematic.Name(), version.Name())
+			for _, architecture := range []Architecture{ArchitectureAMD64, ArchitectureARM64} {
+				path := filepath.Join(versionDir, string(architecture), "disk.raw")
+				entry, ok, err := cacheEntry(schematic.Name(), version.Name(), architecture, path)
+				if err != nil {
+					return nil, err
+				}
+				if ok {
+					entries = append(entries, entry)
+				}
+			}
+			if fileReady(filepath.Join(versionDir, string(ArchitectureARM64), "disk.raw")) {
 				continue
 			}
+			legacyPath := filepath.Join(versionDir, "disk.raw")
+			entry, ok, err := cacheEntry(schematic.Name(), version.Name(), ArchitectureARM64, legacyPath)
 			if err != nil {
-				return nil, fmt.Errorf("stat cached image %q: %w", path, err)
+				return nil, err
 			}
-			if !info.Mode().IsRegular() || info.Size() == 0 {
-				continue
+			if ok {
+				entries = append(entries, entry)
 			}
-			entries = append(entries, Entry{
-				Schematic: schematic.Name(),
-				Version:   version.Name(),
-				Path:      path,
-				Size:      info.Size(),
-			})
 		}
 	}
 
 	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].Schematic == entries[j].Schematic {
+		if entries[i].Schematic != entries[j].Schematic {
+			return entries[i].Schematic < entries[j].Schematic
+		}
+		if entries[i].Version != entries[j].Version {
 			return entries[i].Version < entries[j].Version
 		}
-		return entries[i].Schematic < entries[j].Schematic
+		return entries[i].Architecture < entries[j].Architecture
 	})
 
 	return entries, nil
@@ -211,7 +243,7 @@ func (c *Cache) download(sourceURL, destination string) error {
 		return fmt.Errorf("download image %s: response does not start with XZ magic; possible proxy block page", sourceURL)
 	}
 
-	temporary, err := os.CreateTemp(filepath.Dir(destination), ".metal-arm64.raw.xz-*")
+	temporary, err := os.CreateTemp(filepath.Dir(destination), "."+filepath.Base(destination)+"-*")
 	if err != nil {
 		return fmt.Errorf("create image download: %w", err)
 	}
@@ -261,6 +293,48 @@ func decompress(source, destination string) error {
 func fileReady(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.Mode().IsRegular() && info.Size() > 0
+}
+
+func migrateLegacyDisk(legacyPath, destination string) (bool, error) {
+	if !fileReady(legacyPath) {
+		return false, nil
+	}
+	if err := os.Rename(legacyPath, destination); err != nil {
+		if fileReady(destination) {
+			return true, nil
+		}
+		return false, fmt.Errorf("migrate legacy arm64 image: %w", err)
+	}
+	return true, nil
+}
+
+func cacheEntry(schematic, version string, architecture Architecture, path string) (Entry, bool, error) {
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return Entry{}, false, nil
+	}
+	if err != nil {
+		return Entry{}, false, fmt.Errorf("stat cached image %q: %w", path, err)
+	}
+	if !info.Mode().IsRegular() || info.Size() == 0 {
+		return Entry{}, false, nil
+	}
+	return Entry{
+		Schematic:    schematic,
+		Version:      version,
+		Architecture: architecture,
+		Path:         path,
+		Size:         info.Size(),
+	}, true, nil
+}
+
+func validateArchitecture(architecture Architecture) error {
+	switch architecture {
+	case ArchitectureAMD64, ArchitectureARM64:
+		return nil
+	default:
+		return fmt.Errorf("unsupported architecture %q", architecture)
+	}
 }
 
 func validateComponent(name, value string) error {

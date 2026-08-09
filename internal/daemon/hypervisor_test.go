@@ -12,9 +12,11 @@ import (
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/hypervisor"
+	"github.com/randax/talos-box/internal/imagecache"
 )
 
 type fakeHypervisor struct {
+	architecture hypervisor.Architecture
 	capabilities hypervisor.Capabilities
 	launch       func(context.Context, hypervisor.Spec) (hypervisor.Machine, error)
 	specs        []hypervisor.Spec
@@ -29,6 +31,13 @@ func (f *fakeHypervisor) Launch(ctx context.Context, spec hypervisor.Spec) (hype
 }
 
 func (f *fakeHypervisor) Capabilities() hypervisor.Capabilities { return f.capabilities }
+
+func (f *fakeHypervisor) Architecture() hypervisor.Architecture {
+	if f.architecture == "" {
+		return hypervisor.ArchitectureARM64
+	}
+	return f.architecture
+}
 
 type fakeMachine struct {
 	active        bool
@@ -80,6 +89,57 @@ func TestStartLaunchesMachinesThroughInjectedHypervisor(t *testing.T) {
 	}
 	if !service.nodeRunning(item.Name, item.Nodes[0].Name) {
 		t.Fatal("launched fake machine is not tracked as running")
+	}
+}
+
+func TestCachedDiskUsesHypervisorArchitecture(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	for architecture, contents := range map[hypervisor.Architecture]string{
+		hypervisor.ArchitectureAMD64: "amd64 disk",
+		hypervisor.ArchitectureARM64: "arm64 disk",
+	} {
+		path := filepath.Join(root, "test-schematic", "v1.2.3", string(architecture), "disk.raw")
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	service := &Server{
+		cache:      imagecache.New(root),
+		hypervisor: &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
+	}
+	item := cluster.Cluster{Schematic: "test-schematic", TalosVersion: "v1.2.3", ImageArchitecture: "amd64"}
+	path, err := service.cachedDisk(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(root, "test-schematic", "v1.2.3", "amd64", "disk.raw")
+	if path != want {
+		t.Fatalf("cachedDisk() = %q, want target hypervisor path %q", path, want)
+	}
+}
+
+func TestCachedDiskRejectsClusterHypervisorArchitectureMismatch(t *testing.T) {
+	t.Parallel()
+
+	service := &Server{
+		cache:      imagecache.New(t.TempDir()),
+		hypervisor: &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
+	}
+	item := cluster.Cluster{
+		Name:              "arm-cluster",
+		Schematic:         "test-schematic",
+		TalosVersion:      "v1.2.3",
+		ImageArchitecture: "arm64",
+	}
+	_, err := service.cachedDisk(item)
+	if err == nil || !strings.Contains(err.Error(), "cluster \"arm-cluster\" uses arm64 images, but the active hypervisor targets amd64") {
+		t.Fatalf("cachedDisk() error = %v, want architecture mismatch", err)
 	}
 }
 

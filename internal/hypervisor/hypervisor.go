@@ -30,6 +30,14 @@ type Capabilities struct {
 	BalloonReadback FeatureStatus
 }
 
+// Architecture is the machine architecture produced by a hypervisor backend.
+type Architecture string
+
+const (
+	ArchitectureAMD64 Architecture = "amd64"
+	ArchitectureARM64 Architecture = "arm64"
+)
+
 // Restore asks Launch to restore saved state. Launch falls back to a cold boot
 // and reports why through Fallback when the state is missing or incompatible.
 type Restore struct {
@@ -55,6 +63,7 @@ type Spec struct {
 type Hypervisor interface {
 	Launch(context.Context, Spec) (Machine, error)
 	Capabilities() Capabilities
+	Architecture() Architecture
 }
 
 // Machine is a running or retained virtual machine.

@@ -58,6 +58,7 @@ func TestStateRoundTrip(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			want.ImageArchitecture = "amd64"
 			if err := Save(want); err != nil {
 				t.Fatal(err)
 			}
@@ -69,6 +70,25 @@ func TestStateRoundTrip(t *testing.T) {
 				t.Fatalf("Load(%q) = %#v, want %#v", want.Name, got, want)
 			}
 		})
+	}
+}
+
+func TestLoadDefaultsLegacyImageArchitectureToArm64(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	item, err := New("legacy", 0, 1, 0, NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Save(item); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(item.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.ImageArchitecture != LegacyImageArchitecture {
+		t.Fatalf("legacy image architecture = %q, want %q", loaded.ImageArchitecture, LegacyImageArchitecture)
 	}
 }
 

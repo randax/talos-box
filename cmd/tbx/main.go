@@ -328,7 +328,7 @@ func (c cli) runCache(args []string) error {
 		if err := c.call("cache.pull", request, &result); err != nil {
 			return err
 		}
-		_, err = fmt.Fprintf(c.out, "cached Talos %s schematic %s at %s\n", result.Version, result.Schematic, result.Path)
+		_, err = fmt.Fprintf(c.out, "cached Talos %s %s schematic %s at %s\n", result.Version, result.Architecture, result.Schematic, result.Path)
 		return err
 	case "prune":
 		if len(args) != 1 {
