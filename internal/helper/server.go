@@ -17,7 +17,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const resolverPath = "/etc/resolver/k8s.test"
+const (
+	resolverPath                  = "/etc/resolver/k8s.test"
+	shutdownStopMaxAttempts       = 5
+	shutdownStopInitialRetryDelay = 25 * time.Millisecond
+)
 
 var (
 	startInterface = StartInterface
@@ -163,27 +167,37 @@ func (s *Server) Shutdown() error {
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 	var result error
-	for key, fd := range s.attachments {
-		if err := stopInterface(fd); err != nil {
-			result = errors.Join(result, err)
-			if stopErrorRetained(err) {
-				continue
+	for attempt := 1; ; attempt++ {
+		var retainedResult error
+		stop := func(fd int) bool {
+			err := stopInterface(fd)
+			if err == nil {
+				return false
 			}
-			delete(s.attachments, key)
-			continue
-		}
-		delete(s.attachments, key)
-	}
-	for fd := range s.pendingStops {
-		if err := stopInterface(fd); err != nil {
-			result = errors.Join(result, err)
 			if stopErrorRetained(err) {
-				continue
+				retainedResult = errors.Join(retainedResult, err)
+				return true
+			}
+			result = errors.Join(result, err)
+			return false
+		}
+
+		for key, fd := range s.attachments {
+			if !stop(fd) {
+				delete(s.attachments, key)
 			}
 		}
-		delete(s.pendingStops, fd)
+		for fd := range s.pendingStops {
+			if !stop(fd) {
+				delete(s.pendingStops, fd)
+			}
+		}
+
+		if retainedResult == nil || attempt == shutdownStopMaxAttempts {
+			return errors.Join(result, retainedResult)
+		}
+		time.Sleep(shutdownStopInitialRetryDelay * time.Duration(attempt))
 	}
-	return result
 }
 
 func (s *Server) serveConnection(connection *net.UnixConn) {

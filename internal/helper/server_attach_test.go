@@ -102,6 +102,68 @@ func TestAttachCleanupDropsAttachmentOnRetainedStopFailure(t *testing.T) {
 	}
 }
 
+func TestShutdownRetriesRetainedAttachmentStops(t *testing.T) {
+	server := NewServer(nil)
+	key := attachmentKey{cluster: "demo", node: "cp-1"}
+	server.attachments[key] = 42
+	stopCalls := 0
+
+	original := stopInterface
+	stopInterface = func(fd int) error {
+		if fd != 42 {
+			t.Fatalf("stopInterface fd = %d, want 42", fd)
+		}
+		stopCalls++
+		if stopCalls == 1 {
+			return wrapVMNetStopError(errors.New("retry later"), true)
+		}
+		return nil
+	}
+	t.Cleanup(func() {
+		stopInterface = original
+	})
+
+	if err := server.Shutdown(); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+	if stopCalls != 2 {
+		t.Fatalf("stopInterface calls = %d, want 2", stopCalls)
+	}
+	if _, ok := server.attachments[key]; ok {
+		t.Fatal("attachment retained after successful shutdown retry")
+	}
+}
+
+func TestShutdownBoundsRetainedStopRetries(t *testing.T) {
+	server := NewServer(nil)
+	server.pendingStops[42] = struct{}{}
+	stopCalls := 0
+	stopErr := errors.New("retry later")
+
+	original := stopInterface
+	stopInterface = func(fd int) error {
+		if fd != 42 {
+			t.Fatalf("stopInterface fd = %d, want 42", fd)
+		}
+		stopCalls++
+		return wrapVMNetStopError(stopErr, true)
+	}
+	t.Cleanup(func() {
+		stopInterface = original
+	})
+
+	err := server.Shutdown()
+	if !errors.Is(err, stopErr) {
+		t.Fatalf("Shutdown() error = %v, want %v", err, stopErr)
+	}
+	if stopCalls != shutdownStopMaxAttempts {
+		t.Fatalf("stopInterface calls = %d, want %d", stopCalls, shutdownStopMaxAttempts)
+	}
+	if _, ok := server.pendingStops[42]; !ok {
+		t.Fatal("retained stop removed after exhausting shutdown retries")
+	}
+}
+
 func TestDetachDropsAttachmentOnTerminalStopFailure(t *testing.T) {
 	server := NewServer(nil)
 	key := attachmentKey{cluster: "demo", node: "cp-1"}

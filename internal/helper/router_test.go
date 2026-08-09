@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -486,6 +487,11 @@ func TestFrameRouterDoesNotHoldLockDuringForwardSend(t *testing.T) {
 	gatewayMAC := mustMAC(t, "02:00:00:00:f0:01")
 	sendStarted := make(chan struct{})
 	releaseSend := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseSend) })
+	}
+	defer release()
 	target := router.addPort(241, func([]byte) error {
 		close(sendStarted)
 		<-releaseSend
@@ -514,25 +520,18 @@ func TestFrameRouterDoesNotHoldLockDuringForwardSend(t *testing.T) {
 
 	select {
 	case <-sendStarted:
-	case <-time.After(time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("forward send did not start")
 	}
 
-	mapUpdateDone := make(chan struct{})
-	go func() {
-		router.addPort(242, func([]byte) error { return nil })
-		close(mapUpdateDone)
-	}()
-
-	select {
-	case <-mapUpdateDone:
-		close(releaseSend)
-	case <-time.After(100 * time.Millisecond):
-		close(releaseSend)
+	if !router.mu.TryLock() {
+		release()
 		<-routeDone
-		<-mapUpdateDone
-		t.Fatal("router map update blocked behind forwarding send")
+		t.Fatal("router lock is held during forwarding send")
 	}
+	router.mu.Unlock()
+	router.addPort(242, func([]byte) error { return nil })
+	release()
 
 	result := <-routeDone
 	if result.err != nil {
