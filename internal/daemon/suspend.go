@@ -156,16 +156,17 @@ func removeSaveStateFiles(paths []string) {
 }
 
 // prepareSavedMachine leaves a successfully-saved VM stopped but otherwise
-// intact. On failure, retain reports whether cleanup failed and the daemon
-// must keep tracking the machine so a later lifecycle operation can retry it.
+// intact. On failure, retain reports whether the daemon must keep tracking the
+// machine. A failed stop is always retained because Close does not prove that
+// the machine stopped.
 func prepareSavedMachine(machine hypervisor.Machine, savePath string) (retain bool, err error) {
 	if err := machine.Suspend(context.Background(), savePath); err != nil {
 		closeErr := closeMachine(machine)
 		return closeErr != nil, errors.Join(err, closeErr)
 	}
 	if err := stopMachine(machine); err != nil {
-		closeErr := closeMachine(machine)
-		return closeErr != nil, errors.Join(err, closeErr)
+		closeErr := machine.Close()
+		return true, errors.Join(err, closeErr)
 	}
 	return true, nil
 }
