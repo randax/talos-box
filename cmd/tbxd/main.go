@@ -60,7 +60,7 @@ func run() error {
 			return nil
 		}
 		return tbxdns.Resolve(name, clusters, cluster.LookupIP)
-	}, tbxdns.Authority((&clusterDomainSource{}).domains))
+	}, tbxdns.Authority(newPrimedDomainSource().domains))
 	if err != nil {
 		_ = listener.Close()
 		return err

@@ -125,9 +125,9 @@ func Parse(data []byte) (Config, error) {
 		if effective == "" {
 			effective = rc.Name + "." + cluster.DefaultDomainSuffix
 			// The name regexp does not bound length; the default domain the
-			// name produces must still be a valid DNS name.
-			if _, err := domain.Validate(effective, true); err != nil {
-				return Config{}, fmt.Errorf("cluster %q does not form a valid domain: %w", rc.Name, err)
+			// name produces must already be a canonical DNS name.
+			if canonical, err := domain.Validate(effective, true); err != nil || canonical != effective {
+				return Config{}, fmt.Errorf("cluster %q does not form a valid domain", rc.Name)
 			}
 		}
 		if owner, taken := seenDomains[effective]; taken {

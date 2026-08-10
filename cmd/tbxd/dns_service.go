@@ -22,6 +22,14 @@ type clusterDomainSource struct {
 	last []string
 }
 
+// newPrimedDomainSource loads the initial domain set before DNS starts, so
+// the fail-closed cache is not empty for the first queries after startup.
+func newPrimedDomainSource() *clusterDomainSource {
+	source := &clusterDomainSource{}
+	source.domains()
+	return source
+}
+
 func (s *clusterDomainSource) domains() []string {
 	// The state read happens under the lock so two overlapping refreshes
 	// cannot store out of order and regress the set to an older read.

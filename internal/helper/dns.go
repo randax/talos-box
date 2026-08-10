@@ -71,11 +71,12 @@ func decodeDNSIdentity(raw []byte) (string, int, error) {
 	}
 	name := args.Domain
 	if name == "" {
-		return args.Cluster + "." + cluster.DefaultDomainSuffix, *args.SubnetIndex, nil
+		name = args.Cluster + "." + cluster.DefaultDomainSuffix
 	}
 	// The helper runs as root and hands this string to resolvectl; refuse
-	// anything but a canonical validated domain (SPEC §11), so a buggy or
-	// hostile client cannot register e.g. "~." and hijack all host DNS.
+	// anything but a canonical validated domain — derived defaults included —
+	// so a buggy or hostile client cannot register e.g. "~." and hijack all
+	// host DNS.
 	canonical, err := domain.Validate(name, true)
 	if err != nil {
 		return "", 0, fmt.Errorf("refuse DNS registration: %w", err)

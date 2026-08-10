@@ -190,10 +190,11 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if effectiveDomain == "" {
 		effectiveDomain = args.Name + "." + cluster.DefaultDomainSuffix
 		// The default domain derives from the cluster name, which is only
-		// path-checked; a name that is not a valid DNS label must fail here,
-		// not at helper registration time.
-		if _, err := domain.Validate(effectiveDomain, true); err != nil {
-			return ClusterSummary{}, fmt.Errorf("cluster name %q does not form a valid domain: %w", args.Name, err)
+		// path-checked; a name that does not already form a canonical DNS
+		// name (case included) must fail here, not at helper registration.
+		canonical, err := domain.Validate(effectiveDomain, true)
+		if err != nil || canonical != effectiveDomain {
+			return ClusterSummary{}, fmt.Errorf("cluster name %q does not form a valid domain (lowercase DNS labels required)", args.Name)
 		}
 	}
 	if cluster.DomainInUse(effectiveDomain, clusters) {

@@ -1,8 +1,8 @@
 // Package resolverset plans the set of per-domain macOS resolver files
 // (/etc/resolver/<domain>) for clusters with custom domains. The shared
 // default-suffix file is not managed here; it is static and installed once.
-// Only files carrying the ownership marker are ever removed, so a user's own
-// resolver files are never touched (SPEC §11).
+// Files without the ownership marker are never created over, rewritten, or
+// removed, so a user's own resolver files are never touched (SPEC §11).
 package resolverset
 
 import (
