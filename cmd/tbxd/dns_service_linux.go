@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -161,15 +162,44 @@ func (r *dnsReconciler) close(client clusterDNSClient) error {
 }
 
 func (s *linuxDNSService) closeListeners() error {
-	client, err := helper.Connect()
+	return s.closeListenersWithConnect(helper.Connect)
+}
+
+func (s *linuxDNSService) closeListenersWithConnect(connect func() (*helper.Client, error)) error {
+	client, err := connect()
 	if err != nil {
 		// Resolver mutations stay behind the privileged helper boundary. The
-		// error makes incomplete cleanup visible; a restarted daemon overwrites
-		// active per-link registrations during its first reconciliation.
-		return errors.Join(fmt.Errorf("connect to helper while closing DNS: %w", err), s.closeServers())
+		// next daemon reasserts registrations for current clusters, but it cannot
+		// discover stale registrations for clusters deleted before this shutdown.
+		// Preserve the tracked indexes long enough to report exact recovery steps.
+		indexes := sortedListenerIndexes(s.reconciler.listeners)
+		connectErr := resolvedShutdownError(err, indexes)
+		if len(indexes) != 0 {
+			log.Printf("DNS shutdown warning: %v", connectErr)
+		}
+		return errors.Join(connectErr, s.closeServers())
 	}
 	defer func() { _ = client.Close() }()
 	return s.reconciler.close(helperDNSClient{client: client})
+}
+
+func resolvedShutdownError(cause error, subnetIndexes []int) error {
+	connectErr := fmt.Errorf("connect to helper while closing DNS: %w", cause)
+	if len(subnetIndexes) == 0 {
+		return connectErr
+	}
+	return fmt.Errorf(
+		"%w; systemd-resolved registrations may remain; manually revert them with: %s",
+		connectErr, strings.Join(resolvedRevertSteps(subnetIndexes), "; "),
+	)
+}
+
+func resolvedRevertSteps(subnetIndexes []int) []string {
+	steps := make([]string, 0, len(subnetIndexes))
+	for _, subnetIndex := range subnetIndexes {
+		steps = append(steps, "sudo resolvectl revert "+cluster.LinuxBridgeName(subnetIndex))
+	}
+	return steps
 }
 
 func (s *linuxDNSService) closeServers() error {
