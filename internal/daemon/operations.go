@@ -589,18 +589,28 @@ func (s *Server) clusterRunning(name string) bool {
 }
 
 func nodeStatus(node cluster.Node, subnetIndex int, vmRunning bool) NodeStatus {
-	ip := cluster.LookupIP(node.MAC, subnetIndex)
-	probe := ProbeResult{}
-	if ip != "" {
-		probe = probeAPID(ip)
+	return nodeStatusWith(node, subnetIndex, vmRunning, cluster.LookupIP, probeAPID)
+}
+
+func nodeStatusWith(
+	node cluster.Node,
+	subnetIndex int,
+	vmRunning bool,
+	lookupIP func(string, int) string,
+	probe func(string) ProbeResult,
+) NodeStatus {
+	ip := lookupIP(node.MAC, subnetIndex)
+	probeResult := ProbeResult{}
+	if vmRunning && ip != "" {
+		probeResult = probe(ip)
 	}
 	return NodeStatus{
 		Name:          node.Name,
 		Role:          node.Role,
 		MAC:           node.MAC,
 		IP:            ip,
-		APIDReachable: probe.Dialed,
-		Phase:         ClassifyPhase(vmRunning, probe),
+		APIDReachable: probeResult.Dialed,
+		Phase:         ClassifyPhase(vmRunning, probeResult),
 	}
 }
 
