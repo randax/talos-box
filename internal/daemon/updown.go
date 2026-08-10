@@ -85,7 +85,7 @@ func checkDomainUnchanged(spec config.ClusterSpec) error {
 	if err != nil {
 		return nil // partially-created state; create/start surfaces the real error
 	}
-	if spec.Domain != item.Domain {
+	if specEffectiveDomain(spec) != item.EffectiveDomain() {
 		return fmt.Errorf(
 			"cluster %q: domain is immutable (cluster has %q, talosbox.yaml wants %q); destroy and recreate the cluster to change it",
 			spec.Name, item.EffectiveDomain(), specEffectiveDomain(spec),

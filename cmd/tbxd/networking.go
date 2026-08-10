@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/daemon"
 	tbxdns "github.com/randax/talos-box/internal/dns"
 	"github.com/randax/talos-box/internal/helper"
 	"github.com/randax/talos-box/internal/resolverset"
@@ -33,7 +34,6 @@ type hostNetworkingDrift struct {
 
 type hostNetworkingClient interface {
 	InstallDNS(port int) error
-	SyncDomainResolvers(domains []string, port int) error
 	EnableForwarding() error
 	Close() error
 }
@@ -48,14 +48,12 @@ func configureHostNetworking() {
 	if err := client.InstallDNS(tbxdns.Port); err != nil {
 		log.Printf("install DNS resolver: %v", err)
 	}
-	if domains, err := customClusterDomains(); err != nil {
-		log.Printf("skip custom-domain resolver sync: %v", err)
-	} else if err := client.SyncDomainResolvers(domains, tbxdns.Port); err != nil {
-		log.Printf("sync custom-domain resolvers: %v", err)
-	}
 	if err := client.EnableForwarding(); err != nil {
 		log.Printf("enable IP forwarding: %v", err)
 	}
+	// Resolver-file mutation has a single serialized owner so this can never
+	// race the create/destroy paths with a stale domain set.
+	daemon.SyncResolverFiles()
 }
 
 // customClusterDomains lists the explicit domains of live clusters; clusters
@@ -152,7 +150,7 @@ func startHostNetworkingMaintenance() func() {
 	ticker := time.NewTicker(hostNetworkingCheckEvery)
 	go func() {
 		defer close(done)
-		maintainHostNetworking(stop, ticker.C, customClusterDomains, os.ReadFile, listResolverFiles, runHostCommand, connectHostNetworkingHelper)
+		maintainHostNetworking(stop, ticker.C, customClusterDomains, os.ReadFile, listResolverFiles, runHostCommand, daemon.SyncResolverFiles, connectHostNetworkingHelper)
 	}()
 	return func() {
 		ticker.Stop()
@@ -168,6 +166,7 @@ func maintainHostNetworking(
 	readFile func(string) ([]byte, error),
 	listResolvers func() (map[string][]byte, error),
 	run func(string, ...string) ([]byte, error),
+	syncDomains func(),
 	connect func() (hostNetworkingClient, error),
 ) {
 	for {
@@ -186,7 +185,7 @@ func maintainHostNetworking(
 			if !drift.any() {
 				continue
 			}
-			if err := reassertHostNetworking(drift, domains, connect); err != nil {
+			if err := reassertHostNetworking(drift, syncDomains, connect); err != nil {
 				log.Printf("host networking drift detected (%s); re-assertion failed: %v", drift.description(), err)
 				continue
 			}
@@ -195,7 +194,16 @@ func maintainHostNetworking(
 	}
 }
 
-func reassertHostNetworking(drift hostNetworkingDrift, customDomains []string, connect func() (hostNetworkingClient, error)) error {
+func reassertHostNetworking(drift hostNetworkingDrift, syncDomains func(), connect func() (hostNetworkingClient, error)) error {
+	if drift.domains {
+		// The repair re-reads state under the daemon's resolver-sync lock,
+		// so a domain set observed before a concurrent create/destroy is
+		// never applied.
+		syncDomains()
+	}
+	if !drift.dns && !drift.forwarding {
+		return nil
+	}
 	client, err := connect()
 	if err != nil {
 		return fmt.Errorf("connect to helper: %w", err)
@@ -206,11 +214,6 @@ func reassertHostNetworking(drift hostNetworkingDrift, customDomains []string, c
 	if drift.dns {
 		if err := client.InstallDNS(tbxdns.Port); err != nil {
 			repairErr = errors.Join(repairErr, fmt.Errorf("install DNS resolver: %w", err))
-		}
-	}
-	if drift.domains {
-		if err := client.SyncDomainResolvers(customDomains, tbxdns.Port); err != nil {
-			repairErr = errors.Join(repairErr, fmt.Errorf("sync custom-domain resolvers: %w", err))
 		}
 	}
 	if drift.forwarding {

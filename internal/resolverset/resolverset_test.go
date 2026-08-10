@@ -7,7 +7,7 @@ import (
 
 func TestPlanCreatesMissingAndDriftedFiles(t *testing.T) {
 	observed := map[string][]byte{
-		"lab.internal": []byte("stale content"),
+		"lab.internal": []byte(Marker + "\nstale managed content\n"),
 	}
 	create, remove := Plan([]string{"lab.internal", "corp.example.com"}, observed, 5399)
 	if want := []string{"corp.example.com", "lab.internal"}; !reflect.DeepEqual(create, want) {
@@ -15,6 +15,18 @@ func TestPlanCreatesMissingAndDriftedFiles(t *testing.T) {
 	}
 	if len(remove) != 0 {
 		t.Errorf("remove = %v, want none", remove)
+	}
+}
+
+func TestPlanNeverOverwritesUnmanagedWantedFile(t *testing.T) {
+	// The user already has their own /etc/resolver/lab.internal; creating a
+	// cluster with that domain must not clobber it as root.
+	observed := map[string][]byte{
+		"lab.internal": []byte("nameserver 10.0.0.1\n"),
+	}
+	create, remove := Plan([]string{"lab.internal"}, observed, 5399)
+	if len(create) != 0 || len(remove) != 0 {
+		t.Errorf("create = %v remove = %v, want none (unmanaged conflict)", create, remove)
 	}
 }
 

@@ -179,6 +179,24 @@ func TestParseDomainErrors(t *testing.T) {
 	}
 }
 
+func TestParseRejectsNameFormingInvalidDefaultDomain(t *testing.T) {
+	long := strings.Repeat("a", 64) // valid for nameRe, invalid as a DNS label
+	_, err := Parse([]byte("version: 1\nclusters: [{name: " + long + "}]"))
+	if err == nil {
+		t.Fatal("Parse accepted a 64-char cluster name whose default domain is invalid")
+	}
+}
+
+func TestParseNormalizesExplicitOwnDefaultDomain(t *testing.T) {
+	cfg, err := Parse([]byte("version: 1\nclusters:\n  - name: demo\n    domain: demo.k8s.test\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Clusters[0].Domain; got != "" {
+		t.Fatalf("domain = %q, want empty (own default normalizes away)", got)
+	}
+}
+
 func TestParseUnsafeDomainOptIn(t *testing.T) {
 	cfg, err := Parse([]byte("version: 1\nclusters:\n  - name: demo\n    domain: corp.example.com\n    allowUnsafeDomain: true\n"))
 	if err != nil {

@@ -23,9 +23,11 @@ type clusterDomainSource struct {
 }
 
 func (s *clusterDomainSource) domains() []string {
-	clusters, err := cluster.List()
+	// The state read happens under the lock so two overlapping refreshes
+	// cannot store out of order and regress the set to an older read.
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	clusters, err := cluster.List()
 	if err != nil {
 		log.Printf("DNS state refresh failed; keeping last-known domain set: %v", err)
 		return s.last

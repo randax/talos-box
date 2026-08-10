@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -179,10 +180,21 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 		if err != nil {
 			return ClusterSummary{}, err
 		}
+		// An explicit domain equal to the cluster's own default is the
+		// default; storing it as such keeps every comparison canonical.
+		if canonicalDomain == args.Name+"."+cluster.DefaultDomainSuffix {
+			canonicalDomain = ""
+		}
 	}
 	effectiveDomain := canonicalDomain
 	if effectiveDomain == "" {
 		effectiveDomain = args.Name + "." + cluster.DefaultDomainSuffix
+		// The default domain derives from the cluster name, which is only
+		// path-checked; a name that is not a valid DNS label must fail here,
+		// not at helper registration time.
+		if _, err := domain.Validate(effectiveDomain, true); err != nil {
+			return ClusterSummary{}, fmt.Errorf("cluster name %q does not form a valid domain: %w", args.Name, err)
+		}
 	}
 	if cluster.DomainInUse(effectiveDomain, clusters) {
 		return ClusterSummary{}, fmt.Errorf("domain %q is already used by another cluster", effectiveDomain)
@@ -218,7 +230,7 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 		return ClusterSummary{}, err
 	}
 	if item.Domain != "" {
-		syncDomainResolverFiles()
+		SyncResolverFiles()
 	}
 	startWarning, err := s.start(item)
 	if err != nil {
@@ -475,15 +487,24 @@ func (s *Server) destroyCluster(raw json.RawMessage) (map[string]string, error) 
 	if err := cluster.Destroy(args.Name); err != nil {
 		return nil, err
 	}
-	syncDomainResolverFiles()
+	SyncResolverFiles()
 	return map[string]string{"name": args.Name}, nil
 }
 
-// syncDomainResolverFiles converges the host's per-domain resolver files to
-// the clusters now in state, so a custom domain resolves the moment create
+// resolverSyncMu makes SyncResolverFiles the single owner of resolver-file
+// mutation: every caller re-reads state under the lock, so a concurrent
+// create/destroy and the periodic drift repair can never apply a stale
+// domain set (which would delete a just-created file or resurrect a
+// just-removed one).
+var resolverSyncMu sync.Mutex
+
+// SyncResolverFiles converges the host's per-domain resolver files to the
+// clusters now in state, so a custom domain resolves the moment create
 // returns and its file disappears at destroy rather than on the next drift
 // tick. Best-effort: the tbxd reconciler re-asserts on its own cadence.
-func syncDomainResolverFiles() {
+func SyncResolverFiles() {
+	resolverSyncMu.Lock()
+	defer resolverSyncMu.Unlock()
 	clusters, err := cluster.List()
 	if err != nil {
 		log.Printf("skip resolver-file sync: %v", err)

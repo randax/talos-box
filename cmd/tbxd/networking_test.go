@@ -127,7 +127,7 @@ func TestReassertHostNetworkingRepairsOnlyDrift(t *testing.T) {
 	t.Parallel()
 
 	client := &fakeHostNetworkingClient{}
-	err := reassertHostNetworking(hostNetworkingDrift{dns: true}, nil, func() (hostNetworkingClient, error) {
+	err := reassertHostNetworking(hostNetworkingDrift{dns: true}, func() {}, func() (hostNetworkingClient, error) {
 		return client, nil
 	})
 	if err != nil {
@@ -154,6 +154,7 @@ func TestMaintainHostNetworkingRetriesAfterHelperUnavailable(t *testing.T) {
 			func(string) ([]byte, error) { return nil, errors.New("resolver missing") },
 			func() (map[string][]byte, error) { return nil, nil },
 			func(string, ...string) ([]byte, error) { return []byte("1\n"), nil },
+			func() {},
 			func() (hostNetworkingClient, error) {
 				calls++
 				connectCalls <- calls
@@ -183,14 +184,8 @@ func TestMaintainHostNetworkingRetriesAfterHelperUnavailable(t *testing.T) {
 
 type fakeHostNetworkingClient struct {
 	installDNSCalls       int
-	syncDomainCalls       int
 	enableForwardingCalls int
 	closeCalls            int
-}
-
-func (c *fakeHostNetworkingClient) SyncDomainResolvers([]string, int) error {
-	c.syncDomainCalls++
-	return nil
 }
 
 func (c *fakeHostNetworkingClient) InstallDNS(int) error {

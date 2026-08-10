@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 
 	"github.com/randax/talos-box/internal/domain"
 	"github.com/randax/talos-box/internal/resolverset"
@@ -38,6 +39,10 @@ func syncDomainResolvers(domains []string, port int) error {
 	if port < 1 || port > 65535 {
 		return fmt.Errorf("DNS port %d is outside 1..65535", port)
 	}
+	// Connections are served concurrently; observe-plan-mutate must not
+	// interleave with itself.
+	resolverSyncMu.Lock()
+	defer resolverSyncMu.Unlock()
 	wanted := make([]string, 0, len(domains))
 	for _, name := range domains {
 		canonical, err := domain.Validate(name, true)
@@ -81,11 +86,24 @@ func syncDomainResolvers(domains []string, port int) error {
 			return fmt.Errorf("remove resolver file %s: %w", name, err)
 		}
 	}
-	if len(create) != 0 || len(remove) != 0 {
-		return hupMDNSResponder()
+	if len(create) != 0 || len(remove) != 0 || pendingHUP {
+		if err := hupMDNSResponder(); err != nil {
+			// Files converged but the reload didn't land; remember, or the
+			// next converged sync would never retry it.
+			pendingHUP = true
+			return err
+		}
+		pendingHUP = false
 	}
 	return nil
 }
+
+// pendingHUP records a failed mDNSResponder reload so a later sync retries
+// it even when the file set is already converged. Guarded by resolverSyncMu.
+var (
+	resolverSyncMu sync.Mutex
+	pendingHUP     bool
+)
 
 func uninstallHostResolver() error {
 	err := os.Remove(resolverPath)

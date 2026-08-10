@@ -8,7 +8,9 @@ import (
 )
 
 const (
-	protocolVersion = 1
+	// Version 2 added dns.syncDomains and the domain argument (with helper-side
+	// validation) on dns.listen/dns.register.
+	protocolVersion = 2
 	helperInfoOp    = "helper.info"
 )
 

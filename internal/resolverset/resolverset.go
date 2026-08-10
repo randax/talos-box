@@ -32,13 +32,16 @@ func Managed(content []byte) bool {
 
 // Plan compares the wanted custom domains against the observed files
 // (name → content) and returns the file names to (re)create and to remove,
-// sorted. Unmarked files are never scheduled for removal.
+// sorted. Unmarked files are never touched in either direction: a wanted
+// domain whose file exists without the marker is a conflict the user owns
+// (doctor reports it), never an overwrite.
 func Plan(customDomains []string, observed map[string][]byte, port int) (create, remove []string) {
 	want := Content(port)
 	wanted := make(map[string]bool, len(customDomains))
 	for _, domain := range customDomains {
 		wanted[domain] = true
-		if string(observed[domain]) != want {
+		content, exists := observed[domain]
+		if !exists || (Managed(content) && string(content) != want) {
 			create = append(create, domain)
 		}
 	}
