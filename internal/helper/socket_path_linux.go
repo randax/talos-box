@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 )
 
-// SocketPath returns the path used by an invoking helper client.
+// SocketPath returns the path used by an invoking helper client. Root clients
+// launched through sudo follow SUDO_UID to the authorized user's runtime socket.
 func SocketPath() (string, error) {
 	override := os.Getenv(helperSocketEnv)
-	path, err := linuxClientSocketPath(uint32(os.Geteuid()), override)
+	path, err := linuxClientSocketPath(uint32(os.Geteuid()), os.Getenv("SUDO_UID"), override)
 	return validateLinuxSocketPath(path, override, err)
 }
 
@@ -34,14 +36,17 @@ func socketPathOverride(value string) (string, error) {
 	return filepath.Clean(value), nil
 }
 
-func linuxClientSocketPath(effectiveUID uint32, override string) (string, error) {
+func linuxClientSocketPath(effectiveUID uint32, sudoUID, override string) (string, error) {
 	if path, err := socketPathOverride(override); path != "" || err != nil {
 		return path, err
 	}
-	if effectiveUID == 0 {
-		return systemHelperSocketPath, nil
+	if effectiveUID != 0 {
+		return linuxUserSocketPath(effectiveUID), nil
 	}
-	return linuxUserSocketPath(effectiveUID), nil
+	if parsed, err := strconv.ParseUint(sudoUID, 10, 32); err == nil && parsed != 0 {
+		return linuxUserSocketPath(uint32(parsed)), nil
+	}
+	return systemHelperSocketPath, nil
 }
 
 func linuxServerSocketPath(effectiveUID uint32, allowedUID *uint32, override string) (string, error) {

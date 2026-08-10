@@ -15,19 +15,25 @@ func TestLinuxClientSocketPath(t *testing.T) {
 	tests := []struct {
 		name     string
 		euid     uint32
+		sudoUID  string
 		override string
 		want     string
 		wantErr  string
 	}{
 		{name: "non-root runtime directory", euid: 501, want: "/run/user/501/tbx-helper.sock"},
+		{name: "non-root ignores sudo uid", euid: 501, sudoUID: "502", want: "/run/user/501/tbx-helper.sock"},
 		{name: "root system socket", euid: 0, want: systemHelperSocketPath},
+		{name: "sudo root runtime directory", euid: 0, sudoUID: "501", want: "/run/user/501/tbx-helper.sock"},
+		{name: "sudo root uid zero uses system socket", euid: 0, sudoUID: "0", want: systemHelperSocketPath},
+		{name: "invalid sudo uid uses system socket", euid: 0, sudoUID: "invalid", want: systemHelperSocketPath},
+		{name: "sudo root override wins", euid: 0, sudoUID: "501", override: "/tmp/custom.sock", want: "/tmp/custom.sock"},
 		{name: "absolute override", euid: 501, override: "/tmp/custom.sock", want: "/tmp/custom.sock"},
 		{name: "relative override rejected", euid: 501, override: "custom.sock", wantErr: helperSocketEnv},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := linuxClientSocketPath(test.euid, test.override)
+			got, err := linuxClientSocketPath(test.euid, test.sudoUID, test.override)
 			if test.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
 					t.Fatalf("linuxClientSocketPath() error = %v, want containing %q", err, test.wantErr)
@@ -41,6 +47,23 @@ func TestLinuxClientSocketPath(t *testing.T) {
 				t.Fatalf("linuxClientSocketPath() = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestLinuxSudoClientAndServerSocketPathsMatch(t *testing.T) {
+	t.Parallel()
+
+	allowedUID := uint32(501)
+	clientPath, err := linuxClientSocketPath(0, "501", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverPath, err := linuxServerSocketPath(0, &allowedUID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clientPath != serverPath {
+		t.Fatalf("sudo client/server paths = %q/%q, want them to match", clientPath, serverPath)
 	}
 }
 
