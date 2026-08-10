@@ -1,0 +1,6 @@
+[Unit]
+Description=Talos Box daemon
+
+[Service]
+ExecStart=/usr/bin/tbxd
+Restart=on-failure

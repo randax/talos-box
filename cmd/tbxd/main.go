@@ -14,6 +14,7 @@ import (
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/daemon"
 	tbxdns "github.com/randax/talos-box/internal/dns"
+	"github.com/randax/talos-box/internal/systemd"
 	"github.com/randax/talos-box/internal/version"
 )
 
@@ -33,11 +34,19 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	listener, err := daemon.Listen(socketPath)
+	listener, activated, err := systemd.InheritedListener(socketPath)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = os.Remove(socketPath) }()
+	if !activated {
+		listener, err = daemon.Listen(socketPath)
+	}
+	if err != nil {
+		return err
+	}
+	if !activated {
+		defer func() { _ = os.Remove(socketPath) }()
+	}
 
 	server, err := daemon.NewServer(context.Background())
 	if err != nil {

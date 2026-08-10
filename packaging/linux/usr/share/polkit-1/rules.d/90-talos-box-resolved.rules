@@ -1,0 +1,10 @@
+polkit.addRule(function(action, subject) {
+    if (subject.user == "tbx" && (
+        action.id == "org.freedesktop.resolve1.set-dns-servers" ||
+        action.id == "org.freedesktop.resolve1.set-domains" ||
+        action.id == "org.freedesktop.resolve1.revert"
+    )) {
+        return polkit.Result.YES;
+    }
+    return polkit.Result.NOT_HANDLED;
+});

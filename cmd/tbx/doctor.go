@@ -4,10 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/daemon"
 	"github.com/randax/talos-box/internal/helper"
 	"github.com/randax/talos-box/internal/hostpressure"
@@ -19,10 +22,16 @@ type doctorDependencies struct {
 	checkDirectDNS  func() error
 	checkForwarding func() error
 	listClusters    func() ([]daemon.ClusterSummary, error)
+	listConfig      func() ([]cluster.Cluster, error)
 	getStatus       func() ([]daemon.ClusterStatus, error)
 	hostPressure    func() (hostpressure.Snapshot, error)
 	command         commandOutput
+	readFile        func(string) ([]byte, error)
+	accessRW        func(string) error
+	listenPacket    func(string, string) (net.PacketConn, error)
+	listenStream    func(string, string) (io.Closer, error)
 	doHTTP          httpDo
+	platform        func() []doctorFinding
 }
 
 type doctorFinding struct {
@@ -30,6 +39,10 @@ type doctorFinding struct {
 	check  string
 	detail string
 }
+
+type skippedDoctorCheck struct{ detail string }
+
+func (e skippedDoctorCheck) Error() string { return e.detail }
 
 func (c cli) runDoctor(args []string) error {
 	return c.runDoctorWithDependencies(args, c.doctorDependencies())
@@ -70,12 +83,21 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 	} {
 		finding := doctorFinding{level: "PASS", check: check.name}
 		if err := check.run(); err != nil {
-			finding.level, finding.detail = "FAIL", err.Error()
-			if check.name == "resolver" {
+			var skipped skippedDoctorCheck
+			if errors.As(err, &skipped) {
+				finding.level, finding.detail = "SKIP", skipped.Error()
+			} else if check.name == "resolver" {
 				finding.level, finding.detail = classifyResolverFailure(err)
+			} else {
+				finding.level, finding.detail = "FAIL", err.Error()
 			}
 		}
 		if err := writeFindings(finding); err != nil {
+			return err
+		}
+	}
+	if deps.platform != nil {
+		if err := writeFindings(deps.platform()...); err != nil {
 			return err
 		}
 	}
@@ -188,11 +210,12 @@ func isDaemonUnavailable(err error) bool {
 
 func (c cli) doctorDependencies() doctorDependencies {
 	command := execCombinedOutput
-	return doctorDependencies{
+	deps := doctorDependencies{
 		checkHelper:     checkHelper,
 		checkResolver:   checkResolver,
 		checkDirectDNS:  checkPlatformDirectDNS,
 		checkForwarding: checkForwarding,
+		listConfig:      cluster.List,
 		listClusters: func() ([]daemon.ClusterSummary, error) {
 			var result []daemon.ClusterSummary
 			err := c.doctorCall("cluster.list", struct{}{}, &result)
@@ -210,9 +233,25 @@ func (c cli) doctorDependencies() doctorDependencies {
 			}
 			return hostpressure.SystemSnapshot(filepath.Join(home, ".talosbox"))
 		},
-		command: command,
-		doHTTP:  newDoctorHTTPClient().Do,
+		command:  command,
+		readFile: os.ReadFile,
+		accessRW: func(path string) error {
+			file, err := os.OpenFile(path, os.O_RDWR, 0)
+			if err != nil {
+				return err
+			}
+			return file.Close()
+		},
+		listenPacket: func(network, address string) (net.PacketConn, error) {
+			return net.ListenPacket(network, address)
+		},
+		listenStream: func(network, address string) (io.Closer, error) {
+			return net.Listen(network, address)
+		},
+		doHTTP: newDoctorHTTPClient().Do,
 	}
+	platformDoctorDependencies(&deps)
+	return deps
 }
 
 // doctorCall deliberately uses exchange directly instead of cli.call: diagnostics

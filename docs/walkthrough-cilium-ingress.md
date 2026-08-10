@@ -102,7 +102,11 @@ helm install cilium cilium/cilium --version 1.19.6 -n kube-system \
 
 The rendered values include the Talos-specific settings above. Forty single-address LB Services
 with the default 5-second lease renewal deadline require 8 QPS (`40 × (1 / 5s)`), below Cilium
-1.19.6's 10 QPS / 20 burst defaults, so talosbox explicitly preserves that higher floor.
+1.19.6's 10 QPS / 20 burst defaults, so talosbox explicitly preserves that higher floor. On
+Linux hosts, the default L2 announcement path already converges quickly on the helper-owned
+bridge; reach for BGP when your upstream is routed, when you want ECMP, or when
+`externalTrafficPolicy: Local` should advertise only nodes with local backends. On macOS, BGP
+also doubles as the fast-failover path because vmnet does not honor gratuitous ARP.
 
 All images pull through the tbx mirrors; nodes go `Ready` in ~1–2 minutes. Then apply the
 LB pool and L2 announcement policy (the `k8s` section of `tbx manifests`; the `talos` section

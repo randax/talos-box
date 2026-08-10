@@ -361,6 +361,29 @@ func TestRunDoctorNoClustersSkipsAndEgressWarnIsNonFatal(t *testing.T) {
 	}
 }
 
+func TestRunDoctorReportsRuntimeDependentChecksAsSkipped(t *testing.T) {
+	deps := passingDoctorDependencies()
+	deps.checkResolver = func() error {
+		return skippedDoctorCheck{detail: "daemon unavailable: connection refused"}
+	}
+	deps.checkDirectDNS = func() error {
+		return skippedDoctorCheck{detail: "daemon unavailable: connection refused"}
+	}
+
+	var output strings.Builder
+	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
+		t.Fatalf("runDoctorWithDependencies() = %v for skipped checks", err)
+	}
+	for _, line := range []string{
+		"SKIP resolver: daemon unavailable: connection refused",
+		"SKIP DNS: daemon unavailable: connection refused",
+	} {
+		if !strings.Contains(output.String(), line) {
+			t.Errorf("output missing %q:\n%s", line, output.String())
+		}
+	}
+}
+
 func TestRunDoctorWarnsOnExtremeHostPressure(t *testing.T) {
 	deps := passingDoctorDependencies()
 	deps.hostPressure = func() (hostpressure.Snapshot, error) {

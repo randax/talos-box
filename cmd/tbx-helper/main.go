@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/randax/talos-box/internal/helper"
+	"github.com/randax/talos-box/internal/systemd"
 	"github.com/randax/talos-box/internal/version"
 )
 
@@ -31,6 +32,7 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	explicitAllowedUID := allowedUID != nil
 	allowedUID, err = resolveAllowedUID(allowedUID)
 	if err != nil {
 		return err
@@ -43,17 +45,25 @@ func run(args []string) error {
 	if err != nil {
 		return fmt.Errorf("resolve helper socket path: %w", err)
 	}
-	listener, err := helper.Listen(socketPath)
+	listener, activated, err := systemd.InheritedListener(socketPath)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = os.Remove(socketPath) }()
+	if !activated {
+		listener, err = helper.Listen(socketPath)
+	}
+	if err != nil {
+		return err
+	}
+	if !activated {
+		defer func() { _ = os.Remove(socketPath) }()
+	}
 	if err := helper.ConvergeNetworking(); err != nil {
 		_ = listener.Close()
 		return fmt.Errorf("converge helper networking: %w", err)
 	}
 
-	server := helper.NewServer(allowedUID)
+	server := helper.NewServer(serverAllowedUID(allowedUID, explicitAllowedUID, activated), activated)
 	if err := server.ConvergeServices(); err != nil {
 		_ = listener.Close()
 		return fmt.Errorf("converge helper services: %w", err)
@@ -74,6 +84,13 @@ func run(args []string) error {
 		serveErr := <-serveErrors
 		return errors.Join(shutdownErr, serveErr)
 	}
+}
+
+func serverAllowedUID(resolved *uint32, explicit, activated bool) *uint32 {
+	if activated && !explicit {
+		return nil
+	}
+	return resolved
 }
 
 func parseAllowedUID(args []string) (*uint32, error) {
