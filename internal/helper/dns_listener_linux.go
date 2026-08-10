@@ -54,6 +54,9 @@ func platformUnregisterDNS(subnetIndex int) error {
 }
 
 func runResolvedCommand(name string, args ...string) error {
+	// resolvectl is systemd's supported D-Bus client. Keeping that protocol
+	// boundary in the helper exercises resolved's polkit authorization without
+	// adding a second D-Bus implementation dependency to talos-box.
 	ctx, cancel := context.WithTimeout(context.Background(), resolvedCommandTimeout)
 	defer cancel()
 	output, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
