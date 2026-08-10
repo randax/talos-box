@@ -5,17 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
 	"github.com/randax/talos-box/internal/daemon"
-	tbxdns "github.com/randax/talos-box/internal/dns"
 	"github.com/randax/talos-box/internal/helper"
 	"github.com/randax/talos-box/internal/hostpressure"
 )
-
-const resolverPath = "/etc/resolver/k8s.test"
 
 type doctorDependencies struct {
 	checkHelper     func() error
@@ -75,6 +71,9 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		finding := doctorFinding{level: "PASS", check: check.name}
 		if err := check.run(); err != nil {
 			finding.level, finding.detail = "FAIL", err.Error()
+			if check.name == "resolver" {
+				finding.level, finding.detail = classifyResolverFailure(err)
+			}
 		}
 		if err := writeFindings(finding); err != nil {
 			return err
@@ -128,7 +127,7 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 	} else {
 		dnsFinding := doctorFinding{level: "PASS", check: "system-dns"}
 		if err := checkSystemDNS(clusters, deps.command); err != nil {
-			dnsFinding.level, dnsFinding.detail = "FAIL", err.Error()
+			dnsFinding.level, dnsFinding.detail = classifySystemDNSFailure(err)
 		}
 		if err := writeFindings(dnsFinding); err != nil {
 			return err
@@ -192,7 +191,7 @@ func (c cli) doctorDependencies() doctorDependencies {
 	return doctorDependencies{
 		checkHelper:     checkHelper,
 		checkResolver:   checkResolver,
-		checkDirectDNS:  func() error { return tbxdns.Probe(tbxdns.Address) },
+		checkDirectDNS:  checkPlatformDirectDNS,
 		checkForwarding: checkForwarding,
 		listClusters: func() ([]daemon.ClusterSummary, error) {
 			var result []daemon.ClusterSummary
@@ -248,26 +247,4 @@ func checkHelper() error {
 	}
 	defer func() { _ = client.Close() }()
 	return client.Ping()
-}
-
-func checkResolver() error {
-	info, err := os.Stat(resolverPath)
-	if err != nil {
-		return err
-	}
-	if !info.Mode().IsRegular() {
-		return errors.New("resolver path is not a regular file")
-	}
-	return nil
-}
-
-func checkForwarding() error {
-	output, err := exec.Command("/usr/sbin/sysctl", "-n", "net.inet.ip.forwarding").Output()
-	if err != nil {
-		return err
-	}
-	if strings.TrimSpace(string(output)) != "1" {
-		return fmt.Errorf("net.inet.ip.forwarding is %q, want 1", strings.TrimSpace(string(output)))
-	}
-	return nil
 }

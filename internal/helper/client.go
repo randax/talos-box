@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -85,6 +86,60 @@ func (c *Client) InstallDNS(port int) error {
 // UninstallDNS removes the k8s.test scoped resolver.
 func (c *Client) UninstallDNS() error {
 	_, _, err := c.call("dns.uninstall", struct{}{}, false)
+	return err
+}
+
+// ListenDNS asks the helper to bind a cluster gateway's UDP/53 socket and
+// transfers ownership of the bound descriptor to the caller.
+func (c *Client) ListenDNS(cluster string, subnetIndex int) (*net.UDPConn, DNSRegistration, error) {
+	response, fd, err := c.call("dns.listen", map[string]any{
+		"cluster": cluster, "subnetIndex": subnetIndex,
+	}, true)
+	if err != nil {
+		return nil, DNSRegistration{}, err
+	}
+	var registration DNSRegistration
+	if err := json.Unmarshal(response.Data, &registration); err != nil {
+		_ = unix.Close(fd)
+		return nil, DNSRegistration{}, fmt.Errorf("decode DNS registration: %w", err)
+	}
+	file := os.NewFile(uintptr(fd), fmt.Sprintf("%s.dns", cluster))
+	if file == nil {
+		_ = unix.Close(fd)
+		return nil, DNSRegistration{}, fmt.Errorf("wrap DNS descriptor %d", fd)
+	}
+	connection, err := net.FilePacketConn(file)
+	_ = file.Close()
+	if err != nil {
+		return nil, DNSRegistration{}, fmt.Errorf("open passed DNS descriptor: %w", err)
+	}
+	udp, ok := connection.(*net.UDPConn)
+	if !ok {
+		_ = connection.Close()
+		return nil, DNSRegistration{}, fmt.Errorf("passed DNS descriptor is %T, want UDP", connection)
+	}
+	return udp, registration, nil
+}
+
+// RegisterDNS re-asserts the systemd-resolved route-only domain for a
+// cluster. Registration failure is represented in the returned status.
+func (c *Client) RegisterDNS(cluster string, subnetIndex int) (DNSRegistration, error) {
+	response, _, err := c.call("dns.register", map[string]any{
+		"cluster": cluster, "subnetIndex": subnetIndex,
+	}, false)
+	if err != nil {
+		return DNSRegistration{}, err
+	}
+	var registration DNSRegistration
+	if err := json.Unmarshal(response.Data, &registration); err != nil {
+		return DNSRegistration{}, fmt.Errorf("decode DNS registration: %w", err)
+	}
+	return registration, nil
+}
+
+// UnregisterDNS removes a cluster's systemd-resolved per-link configuration.
+func (c *Client) UnregisterDNS(subnetIndex int) error {
+	_, _, err := c.call("dns.unregister", map[string]int{"subnetIndex": subnetIndex}, false)
 	return err
 }
 

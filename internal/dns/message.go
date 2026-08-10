@@ -101,6 +101,21 @@ func answer(query []byte, lookup func(string) net.IP) ([]byte, error) {
 	return response, nil
 }
 
+func errorAnswer(query []byte, rcode uint16) ([]byte, error) {
+	q, err := parseQuestion(query)
+	if err != nil {
+		return nil, err
+	}
+	response := append([]byte(nil), query[:q.end]...)
+	flags := uint16(0x8000) | binary.BigEndian.Uint16(query[2:])&0x0100 | rcode&0xf
+	binary.BigEndian.PutUint16(response[2:], flags)
+	binary.BigEndian.PutUint16(response[4:], 1)
+	binary.BigEndian.PutUint16(response[6:], 0)
+	binary.BigEndian.PutUint16(response[8:], 0)
+	binary.BigEndian.PutUint16(response[10:], 0)
+	return response, nil
+}
+
 func parseAnswerIP(message []byte, id uint16) (net.IP, int, error) {
 	if len(message) < 12 || binary.BigEndian.Uint16(message) != id || binary.BigEndian.Uint16(message[2:])&0x8000 == 0 {
 		return nil, 0, errors.New("invalid DNS response")
