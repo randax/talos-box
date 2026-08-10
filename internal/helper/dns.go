@@ -66,6 +66,19 @@ func decodeDNSIdentity(raw []byte) (string, int, error) {
 	return args.Cluster, *args.SubnetIndex, nil
 }
 
+func decodeDNSSubnet(raw []byte) (int, error) {
+	var args struct {
+		SubnetIndex *int `json:"subnetIndex"`
+	}
+	if err := decodeArgs(raw, &args); err != nil {
+		return 0, err
+	}
+	if args.SubnetIndex == nil || *args.SubnetIndex < 0 || *args.SubnetIndex > cluster.MaxSubnetIndex {
+		return 0, fmt.Errorf("subnetIndex must be between 0 and %d", cluster.MaxSubnetIndex)
+	}
+	return *args.SubnetIndex, nil
+}
+
 func dnsListenerReply(raw []byte) serverReply {
 	clusterName, subnetIndex, err := decodeDNSIdentity(raw)
 	if err != nil {

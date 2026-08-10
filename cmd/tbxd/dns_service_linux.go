@@ -44,7 +44,6 @@ type linuxDNSService struct {
 	lookup                   func(string) net.IP
 	reconciler               *dnsReconciler
 	serveDone                chan dnsServeResult
-	errors                   chan error
 	stop                     chan struct{}
 	done                     chan struct{}
 	closeOnce                sync.Once
@@ -58,7 +57,6 @@ func startDNSService(lookup func(string) net.IP) (daemonDNSService, error) {
 	service := &linuxDNSService{
 		lookup:    lookup,
 		serveDone: make(chan dnsServeResult, 256),
-		errors:    make(chan error),
 		stop:      make(chan struct{}),
 		done:      make(chan struct{}),
 	}
@@ -76,7 +74,10 @@ func startDNSService(lookup func(string) net.IP) (daemonDNSService, error) {
 	return service, nil
 }
 
-func (s *linuxDNSService) Errors() <-chan error { return s.errors }
+// Linux listener failures are recoverable: the reconciliation loop drops the
+// failed socket and reacquires it from the helper. A nil channel explicitly
+// disables main's fatal-DNS branch for this self-healing service.
+func (s *linuxDNSService) Errors() <-chan error { return nil }
 
 func (s *linuxDNSService) run() {
 	defer close(s.done)
@@ -162,6 +163,9 @@ func (r *dnsReconciler) close(client clusterDNSClient) error {
 func (s *linuxDNSService) closeListeners() error {
 	client, err := helper.Connect()
 	if err != nil {
+		// Resolver mutations stay behind the privileged helper boundary. The
+		// error makes incomplete cleanup visible; a restarted daemon overwrites
+		// active per-link registrations during its first reconciliation.
 		return errors.Join(fmt.Errorf("connect to helper while closing DNS: %w", err), s.closeServers())
 	}
 	defer func() { _ = client.Close() }()

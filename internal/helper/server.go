@@ -318,16 +318,11 @@ func (s *Server) handle(request Request) (any, int, func(), error) {
 		}
 		return registerDNS(clusterName, subnetIndex), -1, nil, nil
 	case "dns.unregister":
-		var args struct {
-			SubnetIndex *int `json:"subnetIndex"`
-		}
-		if err := decodeArgs(request.Args, &args); err != nil {
+		subnetIndex, err := decodeDNSSubnet(request.Args)
+		if err != nil {
 			return nil, -1, nil, err
 		}
-		if args.SubnetIndex == nil || *args.SubnetIndex < 0 || *args.SubnetIndex > 255 {
-			return nil, -1, nil, errors.New("valid subnetIndex is required")
-		}
-		return nil, -1, nil, unregisterDNS(*args.SubnetIndex)
+		return nil, -1, nil, unregisterDNS(subnetIndex)
 	case "forwarding.enable":
 		return nil, -1, nil, enableForwarding()
 	case "bgp.enable":
