@@ -490,6 +490,10 @@ func installResolver(path string, port int) error {
 	if err != nil {
 		return err
 	}
+	// Writing follows symlinks; as root that must never happen.
+	if info, err := os.Lstat(path); err == nil && !info.Mode().IsRegular() {
+		return fmt.Errorf("resolver path %s exists but is not a regular file; remove it manually", path)
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create resolver directory: %w", err)
 	}

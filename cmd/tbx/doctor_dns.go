@@ -61,10 +61,22 @@ func customDomainResolverProblems(clusters []daemon.ClusterSummary) []string {
 			continue
 		}
 		path := filepath.Join(filepath.Dir(resolverPath), item.Domain)
-		content, err := os.ReadFile(path)
+		info, err := os.Lstat(path)
 		switch {
 		case errors.Is(err, os.ErrNotExist):
 			problems = append(problems, fmt.Sprintf("%s: resolver file %s is missing; tbxd re-creates it within a minute if the helper is healthy", item.Name, path))
+			continue
+		case err != nil:
+			problems = append(problems, fmt.Sprintf("%s: resolver file %s is unreadable: %v", item.Name, path, err))
+			continue
+		case !info.Mode().IsRegular():
+			// Reading a FIFO would hang doctor; a symlink would hide what the
+			// helper (correctly) refuses to touch.
+			problems = append(problems, fmt.Sprintf("%s: resolver path %s is not a regular file; talosbox will not touch it — remove it manually", item.Name, path))
+			continue
+		}
+		content, err := os.ReadFile(path)
+		switch {
 		case err != nil:
 			problems = append(problems, fmt.Sprintf("%s: resolver file %s is unreadable: %v", item.Name, path, err))
 		case !resolverset.Managed(content):

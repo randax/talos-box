@@ -25,6 +25,9 @@ var (
 func installHostResolver(port int) error {
 	resolverSyncMu.Lock()
 	defer resolverSyncMu.Unlock()
+	// Owe the reload before mutating: a write that half-lands (or a chmod
+	// failure) must still get its HUP replayed later.
+	pendingHUP = true
 	if err := installResolver(resolverPath, port); err != nil {
 		return err
 	}
@@ -36,19 +39,22 @@ func uninstallHostResolver() error {
 	defer resolverSyncMu.Unlock()
 	err := os.Remove(resolverPath)
 	if errors.Is(err, os.ErrNotExist) {
+		if pendingHUP {
+			return reloadResolverCache()
+		}
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("remove resolver file: %w", err)
 	}
+	pendingHUP = true
 	return reloadResolverCache()
 }
 
 // reloadResolverCache HUPs mDNSResponder (its pickup of resolver-file changes
-// is undocumented) and tracks the debt in pendingHUP: set before the attempt,
-// cleared only on success, so partial syncs and failed reloads are retried by
-// a later call even when the file set is already converged. Callers hold
-// resolverSyncMu.
+// is undocumented). pendingHUP is cleared only on success, so failed reloads
+// are retried by a later call even when the file set is already converged.
+// Callers hold resolverSyncMu and set pendingHUP before mutating files.
 func reloadResolverCache() error {
 	pendingHUP = true
 	if err := exec.Command("/usr/bin/killall", "-HUP", "mDNSResponder").Run(); err != nil {
@@ -85,14 +91,14 @@ func syncDomainResolvers(domains []string, port int) error {
 
 	directory := filepath.Dir(resolverPath)
 	observed := map[string][]byte{}
-	occupied := map[string]bool{}
+	nonRegular := map[string]bool{}
 	entries, err := os.ReadDir(directory)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("read resolver directory: %w", err)
 	}
 	for _, entry := range entries {
-		occupied[entry.Name()] = true
 		if !entry.Type().IsRegular() {
+			nonRegular[entry.Name()] = true
 			continue
 		}
 		content, err := os.ReadFile(filepath.Join(directory, entry.Name()))
@@ -108,26 +114,29 @@ func syncDomainResolvers(domains []string, port int) error {
 		// gets its HUP retried on the next sync.
 		pendingHUP = true
 	}
+	var syncErr error
 	for _, name := range create {
-		if occupied[name] {
-			// Present but not a regular file (e.g. a symlink): writing would
-			// follow it as root. Not ours; report, never touch.
-			return fmt.Errorf("resolver path %s exists but is not a managed regular file; remove it manually", filepath.Join(directory, name))
+		if nonRegular[name] {
+			// A symlink/FIFO/etc squatting on the name: writing would follow
+			// it as root. Not ours; report and keep converging the rest.
+			syncErr = errors.Join(syncErr, fmt.Errorf("resolver path %s exists but is not a regular file; remove it manually", filepath.Join(directory, name)))
+			continue
 		}
 		if err := os.MkdirAll(directory, 0o755); err != nil {
-			return fmt.Errorf("create resolver directory: %w", err)
+			syncErr = errors.Join(syncErr, fmt.Errorf("create resolver directory: %w", err))
+			continue
 		}
 		if err := os.WriteFile(filepath.Join(directory, name), []byte(resolverset.Content(port)), 0o644); err != nil {
-			return fmt.Errorf("write resolver file %s: %w", name, err)
+			syncErr = errors.Join(syncErr, fmt.Errorf("write resolver file %s: %w", name, err))
 		}
 	}
 	for _, name := range remove {
 		if err := os.Remove(filepath.Join(directory, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove resolver file %s: %w", name, err)
+			syncErr = errors.Join(syncErr, fmt.Errorf("remove resolver file %s: %w", name, err))
 		}
 	}
 	if pendingHUP {
-		return reloadResolverCache()
+		syncErr = errors.Join(syncErr, reloadResolverCache())
 	}
-	return nil
+	return syncErr
 }

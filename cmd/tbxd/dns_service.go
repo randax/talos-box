@@ -16,14 +16,16 @@ import (
 // authority predicate, retaining the last good read: a transient state error
 // must never shrink the set, or queries for live custom domains would be
 // forwarded to the upstream resolver (leaking names, or answering from real
-// DNS for unsafe domains).
+// DNS for unsafe domains). Until the first successful read it fails closed
+// with the "*" sentinel, which Authority treats as claiming every name.
 type clusterDomainSource struct {
-	mu   sync.Mutex
-	last []string
+	mu       sync.Mutex
+	last     []string
+	everRead bool
 }
 
 // newPrimedDomainSource loads the initial domain set before DNS starts, so
-// the fail-closed cache is not empty for the first queries after startup.
+// the cache is normally populated for the first queries after startup.
 func newPrimedDomainSource() *clusterDomainSource {
 	source := &clusterDomainSource{}
 	source.domains()
@@ -37,6 +39,10 @@ func (s *clusterDomainSource) domains() []string {
 	defer s.mu.Unlock()
 	clusters, err := cluster.List()
 	if err != nil {
+		if !s.everRead {
+			log.Printf("DNS state has never been readable; answering all queries locally: %v", err)
+			return []string{"*"}
+		}
 		log.Printf("DNS state refresh failed; keeping last-known domain set: %v", err)
 		return s.last
 	}
@@ -44,7 +50,7 @@ func (s *clusterDomainSource) domains() []string {
 	for _, item := range clusters {
 		domains = append(domains, item.EffectiveDomain())
 	}
-	s.last = domains
+	s.last, s.everRead = domains, true
 	return domains
 }
 

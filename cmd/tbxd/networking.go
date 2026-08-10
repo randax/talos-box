@@ -166,7 +166,7 @@ func maintainHostNetworking(
 	readFile func(string) ([]byte, error),
 	listResolvers func() (map[string][]byte, error),
 	run func(string, ...string) ([]byte, error),
-	syncDomains func(),
+	syncDomains func() error,
 	connect func() (hostNetworkingClient, error),
 ) {
 	for {
@@ -194,23 +194,22 @@ func maintainHostNetworking(
 	}
 }
 
-func reassertHostNetworking(drift hostNetworkingDrift, syncDomains func(), connect func() (hostNetworkingClient, error)) error {
+func reassertHostNetworking(drift hostNetworkingDrift, syncDomains func() error, connect func() (hostNetworkingClient, error)) error {
+	var repairErr error
 	if drift.domains {
 		// The repair re-reads state under the daemon's resolver-sync lock,
 		// so a domain set observed before a concurrent create/destroy is
 		// never applied.
-		syncDomains()
+		repairErr = errors.Join(repairErr, syncDomains())
 	}
 	if !drift.dns && !drift.forwarding {
-		return nil
+		return repairErr
 	}
 	client, err := connect()
 	if err != nil {
-		return fmt.Errorf("connect to helper: %w", err)
+		return errors.Join(repairErr, fmt.Errorf("connect to helper: %w", err))
 	}
 	defer func() { _ = client.Close() }()
-
-	var repairErr error
 	if drift.dns {
 		if err := client.InstallDNS(tbxdns.Port); err != nil {
 			repairErr = errors.Join(repairErr, fmt.Errorf("install DNS resolver: %w", err))

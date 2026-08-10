@@ -231,7 +231,9 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 		return ClusterSummary{}, err
 	}
 	if item.Domain != "" {
-		SyncResolverFiles()
+		if err := SyncResolverFiles(); err != nil {
+			log.Printf("resolver files for %s: %v", item.Name, err)
+		}
 	}
 	startWarning, err := s.start(item)
 	if err != nil {
@@ -488,7 +490,9 @@ func (s *Server) destroyCluster(raw json.RawMessage) (map[string]string, error) 
 	if err := cluster.Destroy(args.Name); err != nil {
 		return nil, err
 	}
-	SyncResolverFiles()
+	if err := SyncResolverFiles(); err != nil {
+		log.Printf("resolver files after destroying %s: %v", args.Name, err)
+	}
 	return map[string]string{"name": args.Name}, nil
 }
 
@@ -502,14 +506,15 @@ var resolverSyncMu sync.Mutex
 // SyncResolverFiles converges the host's per-domain resolver files to the
 // clusters now in state, so a custom domain resolves the moment create
 // returns and its file disappears at destroy rather than on the next drift
-// tick. Best-effort: the tbxd reconciler re-asserts on its own cadence.
-func SyncResolverFiles() {
+// tick. Best-effort for the create/destroy callers (the tbxd reconciler
+// re-asserts on its own cadence); the error return lets that reconciler
+// report repair failures honestly.
+func SyncResolverFiles() error {
 	resolverSyncMu.Lock()
 	defer resolverSyncMu.Unlock()
 	clusters, err := cluster.List()
 	if err != nil {
-		log.Printf("skip resolver-file sync: %v", err)
-		return
+		return fmt.Errorf("skip resolver-file sync: %w", err)
 	}
 	var domains []string
 	for _, item := range clusters {
@@ -519,13 +524,13 @@ func SyncResolverFiles() {
 	}
 	client, err := helper.Connect()
 	if err != nil {
-		log.Printf("skip resolver-file sync: %v", err)
-		return
+		return fmt.Errorf("skip resolver-file sync: %w", err)
 	}
 	defer func() { _ = client.Close() }()
 	if err := client.SyncDomainResolvers(domains, dns.Port); err != nil {
-		log.Printf("sync custom-domain resolvers: %v", err)
+		return fmt.Errorf("sync custom-domain resolvers: %w", err)
 	}
+	return nil
 }
 
 func (s *Server) listClusters() ([]ClusterSummary, error) {

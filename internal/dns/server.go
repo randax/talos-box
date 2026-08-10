@@ -44,7 +44,10 @@ func Listen(address string, lookup func(string) net.IP, authoritative func(strin
 
 // Authority builds the authoritative-name predicate from the live set of
 // cluster domains. The default suffix k8s.test is always ours; matches are
-// label-wise (equal, or ending in "."+domain).
+// label-wise (equal, or ending in "."+domain). The sentinel "*" claims every
+// name — a domain source returns it while cluster state has never been
+// readable, so a query is answered NXDOMAIN locally rather than leaked to
+// the upstream resolver.
 func Authority(domains func() []string) func(string) bool {
 	return func(name string) bool {
 		name = strings.ToLower(strings.TrimSuffix(name, "."))
@@ -55,7 +58,7 @@ func Authority(domains func() []string) func(string) bool {
 			return false
 		}
 		for _, domain := range domains() {
-			if name == domain || strings.HasSuffix(name, "."+domain) {
+			if domain == "*" || name == domain || strings.HasSuffix(name, "."+domain) {
 				return true
 			}
 		}
