@@ -40,6 +40,7 @@ type Server struct {
 	attachments  map[attachmentKey]*platformAttachment
 	pendingStops map[int]*platformAttachment
 	speakers     map[string]bgpSpeaker
+	dhcp         dhcpManager
 	allowedUID   *uint32
 
 	listenerMu   sync.Mutex
@@ -54,6 +55,7 @@ func NewServer(allowedUID *uint32) *Server {
 	server := &Server{
 		attachments:  make(map[attachmentKey]*platformAttachment),
 		pendingStops: make(map[int]*platformAttachment),
+		dhcp:         newPlatformDHCPManager(),
 	}
 	if allowedUID != nil {
 		uid := *allowedUID
@@ -179,7 +181,7 @@ func (s *Server) Shutdown() error {
 
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
-	var result error
+	result := s.dhcp.Close()
 	for attempt := 1; ; attempt++ {
 		var retainedResult error
 		stop := func(attachment *platformAttachment) bool {
@@ -346,6 +348,9 @@ func (s *Server) attach(raw json.RawMessage) (any, int, func(), error) {
 	attachment, err := startInterface(*args.SubnetIndex, args.Cluster, args.Node)
 	if err != nil {
 		return nil, -1, nil, err
+	}
+	if err := s.dhcp.Converge(); err != nil {
+		return nil, -1, nil, errors.Join(err, attachment.close())
 	}
 	s.attachments[key] = attachment
 	cleanup := func() {

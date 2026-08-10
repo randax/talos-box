@@ -51,7 +51,7 @@ func (s *Server) Balloonables() map[string]balloon.Balloonable {
 			candidates[clusterName+"/"+nodeName] = entry{
 				machine:       machine,
 				configuredMiB: item.DefaultsFor(node.Role).MemoryMiB,
-				ip:            cluster.LeaseIP(node.MAC, item.SubnetIndex),
+				ip:            cluster.LookupIP(node.MAC, item.SubnetIndex),
 			}
 		}
 	}

@@ -54,6 +54,10 @@ func run(args []string) error {
 	}
 
 	server := helper.NewServer(allowedUID)
+	if err := server.ConvergeServices(); err != nil {
+		_ = listener.Close()
+		return fmt.Errorf("converge helper services: %w", err)
+	}
 	serveErrors := make(chan error, 1)
 	go func() { serveErrors <- server.Serve(listener) }()
 

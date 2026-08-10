@@ -93,6 +93,33 @@ func TestAttachCleanupDropsAttachmentOnRetainedStopFailure(t *testing.T) {
 	}
 }
 
+func TestAttachRollsBackInterfaceWhenDHCPConvergenceFails(t *testing.T) {
+	server := NewServer(nil)
+	convergeErr := errors.New("DHCP unavailable")
+	server.dhcp = &testDHCPManager{convergeErr: convergeErr}
+	stopCalls := 0
+
+	originalStart := startInterface
+	startInterface = func(int, string, string) (*platformAttachment, error) {
+		return testPlatformAttachment(77, func(int) error {
+			stopCalls++
+			return nil
+		}), nil
+	}
+	t.Cleanup(func() { startInterface = originalStart })
+
+	_, _, _, err := server.attach(json.RawMessage(`{"cluster":"demo","subnetIndex":7,"node":"cp-1"}`))
+	if !errors.Is(err, convergeErr) {
+		t.Fatalf("attach() error = %v, want %v", err, convergeErr)
+	}
+	if stopCalls != 1 {
+		t.Fatalf("attachment stop calls = %d, want 1", stopCalls)
+	}
+	if len(server.attachments) != 0 {
+		t.Fatalf("attachments = %v, want empty", server.attachments)
+	}
+}
+
 func TestShutdownRetriesRetainedAttachmentStops(t *testing.T) {
 	server := NewServer(nil)
 	key := attachmentKey{cluster: "demo", node: "cp-1"}
@@ -116,6 +143,16 @@ func TestShutdownRetriesRetainedAttachmentStops(t *testing.T) {
 	}
 	if _, ok := server.attachments[key]; ok {
 		t.Fatal("attachment retained after successful shutdown retry")
+	}
+}
+
+func TestShutdownClosesDHCPService(t *testing.T) {
+	server := NewServer(nil)
+	closeErr := errors.New("close DHCP")
+	server.dhcp = &testDHCPManager{closeErr: closeErr}
+
+	if err := server.Shutdown(); !errors.Is(err, closeErr) {
+		t.Fatalf("Shutdown() error = %v, want %v", err, closeErr)
 	}
 }
 
@@ -171,3 +208,12 @@ func testPlatformAttachment(fd int, stop func(int) error) *platformAttachment {
 		},
 	}
 }
+
+type testDHCPManager struct {
+	convergeErr error
+	closeErr    error
+}
+
+func (m *testDHCPManager) Converge() error { return m.convergeErr }
+
+func (m *testDHCPManager) Close() error { return m.closeErr }
