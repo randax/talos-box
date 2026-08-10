@@ -406,6 +406,29 @@ func (s *Server) attach(raw json.RawMessage) (any, int, func(), error) {
 	return map[string]any{"cluster": args.Cluster, "node": args.Node, "kind": attachment.Kind}, attachment.FD, cleanup, nil
 }
 
+func validateBGPEnableArgs(cluster string, subnetIndex *int, localASN, peerASN uint32) error {
+	if err := validateBGPCluster(cluster); err != nil {
+		return err
+	}
+	if subnetIndex == nil {
+		return errors.New("subnetIndex is required")
+	}
+	if *subnetIndex < 0 || *subnetIndex > 255 {
+		return fmt.Errorf("subnet index %d is outside 0..255", *subnetIndex)
+	}
+	if localASN == 0 || peerASN == 0 {
+		return errors.New("BGP ASNs must be non-zero")
+	}
+	return nil
+}
+
+func validateBGPCluster(cluster string) error {
+	if cluster == "" {
+		return errors.New("cluster is required")
+	}
+	return nil
+}
+
 func (s *Server) detach(raw json.RawMessage) error {
 	var args struct {
 		Cluster string `json:"cluster"`

@@ -17,28 +17,21 @@ func InheritedListener(name string) (net.Listener, bool, error) {
 func inheritedListener(name string, pid int, getenv func(string) string, fd int) (net.Listener, bool, error) {
 	listenPID := getenv("LISTEN_PID")
 	listenFDS := getenv("LISTEN_FDS")
+	// Ignore activation metadata unless it forms the exact contract this
+	// process expects, preserving normal startup under inherited shell state.
 	if listenPID == "" && listenFDS == "" {
 		return nil, false, nil
 	}
 	if listenPID == "" || listenFDS == "" {
-		return nil, false, fmt.Errorf("incomplete systemd socket activation environment")
+		return nil, false, nil
 	}
 	activatedPID, err := strconv.Atoi(listenPID)
-	if err != nil {
-		return nil, false, fmt.Errorf("parse LISTEN_PID: %w", err)
-	}
-	if activatedPID != pid {
+	if err != nil || activatedPID != pid {
 		return nil, false, nil
 	}
 	count, err := strconv.Atoi(listenFDS)
-	if err != nil {
-		return nil, false, fmt.Errorf("parse LISTEN_FDS: %w", err)
-	}
-	if count == 0 {
+	if err != nil || count != 1 {
 		return nil, false, nil
-	}
-	if count != 1 {
-		return nil, false, fmt.Errorf("expected exactly one activated listener for %s, got %d", name, count)
 	}
 	file := os.NewFile(uintptr(fd), name)
 	if file == nil {

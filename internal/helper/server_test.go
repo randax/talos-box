@@ -1,14 +1,44 @@
 package helper
 
 import (
+	"encoding/json"
 	"errors"
 	"net"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+func TestBGPRejectsInvalidArguments(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		op      string
+		args    string
+		wantErr string
+	}{
+		{name: "enable requires cluster", op: "bgp.enable", args: `{"subnetIndex":7,"localASN":64512,"peerASN":64600}`, wantErr: "cluster is required"},
+		{name: "disable requires cluster", op: "bgp.disable", args: `{}`, wantErr: "cluster is required"},
+		{name: "subnet is required", op: "bgp.enable", args: `{"cluster":"demo","localASN":64512,"peerASN":64600}`, wantErr: "subnetIndex is required"},
+		{name: "negative subnet", op: "bgp.enable", args: `{"cluster":"demo","subnetIndex":-1,"localASN":64512,"peerASN":64600}`, wantErr: "outside 0..255"},
+		{name: "subnet above IPv4 octet", op: "bgp.enable", args: `{"cluster":"demo","subnetIndex":256,"localASN":64512,"peerASN":64600}`, wantErr: "outside 0..255"},
+		{name: "local ASN is required", op: "bgp.enable", args: `{"cluster":"demo","subnetIndex":7,"peerASN":64600}`, wantErr: "ASNs must be non-zero"},
+		{name: "peer ASN is required", op: "bgp.enable", args: `{"cluster":"demo","subnetIndex":7,"localASN":64512}`, wantErr: "ASNs must be non-zero"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			reply := NewServer(nil).dispatch(Request{Op: test.op, Args: json.RawMessage(test.args)})
+			if reply.response.OK || !strings.Contains(reply.response.Error, test.wantErr) {
+				t.Fatalf("dispatch(%s) response = %+v, want error containing %q", test.op, reply.response, test.wantErr)
+			}
+		})
+	}
+}
 
 func TestListenUnixSocketPreservesNonCollisionBindError(t *testing.T) {
 	t.Parallel()

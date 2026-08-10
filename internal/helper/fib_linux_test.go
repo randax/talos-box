@@ -150,7 +150,8 @@ func TestEnableBGPLinuxStartsSpeakerIdempotently(t *testing.T) {
 	t.Cleanup(func() { startLinuxBGPSpeaker = original })
 
 	server := &Server{}
-	args, err := json.Marshal(bgpArgs{Cluster: "demo", SubnetIndex: 7, LocalASN: 64512, PeerASN: 64600})
+	subnetIndex := 7
+	args, err := json.Marshal(bgpArgs{Cluster: "demo", SubnetIndex: &subnetIndex, LocalASN: 64512, PeerASN: 64600})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +178,8 @@ func TestEnableBGPLinuxWrapsStartError(t *testing.T) {
 	t.Cleanup(func() { startLinuxBGPSpeaker = original })
 
 	server := &Server{}
-	args, err := json.Marshal(bgpArgs{Cluster: "demo", SubnetIndex: 0, LocalASN: 64512, PeerASN: 64600})
+	subnetIndex := 0
+	args, err := json.Marshal(bgpArgs{Cluster: "demo", SubnetIndex: &subnetIndex, LocalASN: 64512, PeerASN: 64600})
 	if err != nil {
 		t.Fatal(err)
 	}
