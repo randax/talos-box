@@ -54,6 +54,32 @@ type Cluster struct {
 	Schematic            string        `json:"schematic,omitempty"`
 	TalosVersion         string        `json:"talosVersion,omitempty"`
 	ImageArchitecture    string        `json:"imageArchitecture,omitempty"`
+	// Domain is the canonical cluster domain when explicitly chosen at
+	// create; empty means the default, <name>.k8s.test.
+	Domain string `json:"domain,omitempty"`
+}
+
+// DefaultDomainSuffix is the suffix under which default cluster domains live.
+const DefaultDomainSuffix = "k8s.test"
+
+// EffectiveDomain returns the domain this cluster is reachable under.
+func (c Cluster) EffectiveDomain() string {
+	if c.Domain != "" {
+		return c.Domain
+	}
+	return c.Name + "." + DefaultDomainSuffix
+}
+
+// DomainInUse reports whether domain is already the effective domain of an
+// existing cluster. Exact matches only: nested domains are allowed and
+// resolve longest-suffix-wins.
+func DomainInUse(domain string, clusters []Cluster) bool {
+	for _, item := range clusters {
+		if item.EffectiveDomain() == domain {
+			return true
+		}
+	}
+	return false
 }
 
 // DefaultsFor resolves the effective sizing for a node role.

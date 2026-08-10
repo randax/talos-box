@@ -6,7 +6,52 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/randax/talos-box/internal/resolverset"
 )
+
+func TestCheckHostNetworkingDetectsCustomDomainDrift(t *testing.T) {
+	t.Parallel()
+
+	healthy := func(string) ([]byte, error) { return []byte("nameserver 127.0.0.1\nport 53535\n"), nil }
+	forwarding := func(string, ...string) ([]byte, error) { return []byte("1\n"), nil }
+	tests := []struct {
+		name     string
+		domains  []string
+		observed map[string][]byte
+		want     bool
+	}{
+		{
+			name:     "converged",
+			domains:  []string{"lab.internal"},
+			observed: map[string][]byte{"lab.internal": []byte(resolverset.Content(53535))},
+		},
+		{
+			name:    "file missing",
+			domains: []string{"lab.internal"},
+			want:    true,
+		},
+		{
+			name:     "marked orphan needs removal",
+			observed: map[string][]byte{"gone.internal": []byte(resolverset.Content(53535))},
+			want:     true,
+		},
+		{
+			name:     "unmarked files are not ours",
+			observed: map[string][]byte{"corp.vpn": []byte("nameserver 10.0.0.1\n")},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			got := checkHostNetworking(53535, test.domains, healthy,
+				func() (map[string][]byte, error) { return test.observed, nil }, forwarding)
+			if got.domains != test.want {
+				t.Fatalf("drift.domains = %v, want %v", got.domains, test.want)
+			}
+		})
+	}
+}
 
 func TestCheckHostNetworking(t *testing.T) {
 	t.Parallel()
@@ -53,13 +98,14 @@ func TestCheckHostNetworking(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			got := checkHostNetworking(53535,
+			got := checkHostNetworking(53535, nil,
 				func(path string) ([]byte, error) {
 					if path != resolverPath {
 						t.Fatalf("read path = %q, want %q", path, resolverPath)
 					}
 					return []byte(test.resolver), test.resolverErr
 				},
+				func() (map[string][]byte, error) { return nil, nil },
 				func(name string, args ...string) ([]byte, error) {
 					if name != "/usr/sbin/sysctl" {
 						t.Fatalf("command = %q, want /usr/sbin/sysctl", name)
@@ -81,7 +127,7 @@ func TestReassertHostNetworkingRepairsOnlyDrift(t *testing.T) {
 	t.Parallel()
 
 	client := &fakeHostNetworkingClient{}
-	err := reassertHostNetworking(hostNetworkingDrift{dns: true}, func() (hostNetworkingClient, error) {
+	err := reassertHostNetworking(hostNetworkingDrift{dns: true}, nil, func() (hostNetworkingClient, error) {
 		return client, nil
 	})
 	if err != nil {
@@ -104,7 +150,9 @@ func TestMaintainHostNetworkingRetriesAfterHelperUnavailable(t *testing.T) {
 		maintainHostNetworking(
 			stop,
 			ticks,
+			func() []string { return nil },
 			func(string) ([]byte, error) { return nil, errors.New("resolver missing") },
+			func() (map[string][]byte, error) { return nil, nil },
 			func(string, ...string) ([]byte, error) { return []byte("1\n"), nil },
 			func() (hostNetworkingClient, error) {
 				calls++
@@ -135,8 +183,14 @@ func TestMaintainHostNetworkingRetriesAfterHelperUnavailable(t *testing.T) {
 
 type fakeHostNetworkingClient struct {
 	installDNSCalls       int
+	syncDomainCalls       int
 	enableForwardingCalls int
 	closeCalls            int
+}
+
+func (c *fakeHostNetworkingClient) SyncDomainResolvers([]string, int) error {
+	c.syncDomainCalls++
+	return nil
 }
 
 func (c *fakeHostNetworkingClient) InstallDNS(int) error {

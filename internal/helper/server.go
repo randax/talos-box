@@ -315,6 +315,15 @@ func (s *Server) handle(request Request) (any, int, func(), error) {
 		return nil, -1, nil, installHostResolver(args.Port)
 	case "dns.uninstall":
 		return nil, -1, nil, uninstallHostResolver()
+	case "dns.syncDomains":
+		var args struct {
+			Domains []string `json:"domains"`
+			Port    int      `json:"port"`
+		}
+		if err := decodeArgs(request.Args, &args); err != nil {
+			return nil, -1, nil, err
+		}
+		return nil, -1, nil, syncDomainResolvers(args.Domains, args.Port)
 	case "dns.register":
 		clusterName, subnetIndex, err := decodeDNSIdentity(request.Args)
 		if err != nil {

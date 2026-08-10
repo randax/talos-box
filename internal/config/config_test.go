@@ -142,6 +142,78 @@ func TestParseErrors(t *testing.T) {
 	}
 }
 
+func TestParseDomainFields(t *testing.T) {
+	cfg, err := Parse([]byte("version: 1\nclusters:\n  - name: demo\n    domain: Lab.Internal.\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Clusters[0].Domain; got != "lab.internal" {
+		t.Errorf("domain = %q, want canonical %q", got, "lab.internal")
+	}
+	if cfg.Clusters[0].AllowUnsafeDomain {
+		t.Error("allowUnsafeDomain should default to false")
+	}
+}
+
+func TestParseDomainErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		yaml    string
+		wantErr string
+	}{
+		{"rejected TLD", "version: 1\nclusters: [{name: a, domain: a.local}]", "mDNS"},
+		{"unsafe without opt-in", "version: 1\nclusters: [{name: a, domain: corp.example.com}]", "allow-unsafe-domain"},
+		{"duplicate explicit domains", "version: 1\nclusters: [{name: a, domain: lab.test}, {name: b, domain: lab.test}]", "domain"},
+		{"explicit collides with default", "version: 1\nclusters: [{name: a}, {name: b, domain: a.k8s.test}]", "domain"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse([]byte(tt.yaml))
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error %q does not mention %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestParseUnsafeDomainOptIn(t *testing.T) {
+	cfg, err := Parse([]byte("version: 1\nclusters:\n  - name: demo\n    domain: corp.example.com\n    allowUnsafeDomain: true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Clusters[0].Domain; got != "corp.example.com" {
+		t.Errorf("domain = %q, want %q", got, "corp.example.com")
+	}
+	if !cfg.Clusters[0].AllowUnsafeDomain {
+		t.Error("allowUnsafeDomain not carried through")
+	}
+}
+
+func TestMarshalEmitsDomainOnlyWhenSet(t *testing.T) {
+	base := ClusterSpec{Name: "demo", ControlPlanes: 1, Workers: 2, Node: cluster.NodeDefaults{MemoryMiB: 2048, CPUs: 2, DiskGiB: 20}}
+	if out := Marshal(Config{Clusters: []ClusterSpec{base}}); strings.Contains(out, "domain") {
+		t.Errorf("Marshal emitted domain for default cluster:\n%s", out)
+	}
+
+	withDomain := base
+	withDomain.Domain = "corp.example.com"
+	withDomain.AllowUnsafeDomain = true
+	out := Marshal(Config{Clusters: []ClusterSpec{withDomain}})
+	if !strings.Contains(out, "domain: corp.example.com\n") || !strings.Contains(out, "allowUnsafeDomain: true\n") {
+		t.Errorf("Marshal missing domain fields:\n%s", out)
+	}
+	back, err := Parse([]byte(out))
+	if err != nil {
+		t.Fatalf("re-Parse of marshaled config: %v", err)
+	}
+	if back.Clusters[0] != withDomain {
+		t.Errorf("round trip = %+v, want %+v", back.Clusters[0], withDomain)
+	}
+}
+
 func TestMarshalRoundTrip(t *testing.T) {
 	spec := ClusterSpec{
 		Name: "demo", ControlPlanes: 1, Workers: 2,

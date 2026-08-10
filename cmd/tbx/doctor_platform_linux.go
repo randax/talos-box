@@ -160,7 +160,7 @@ func checkLinuxResolver(
 				),
 			}
 		}
-		domain := "~" + item.Name + ".k8s.test"
+		domain := "~" + item.EffectiveDomain()
 		if resolvedLinkHasGatewayAndDomain(output, cluster.Gateway(item.SubnetIndex), domain) {
 			continue
 		}

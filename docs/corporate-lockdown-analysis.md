@@ -236,7 +236,8 @@ Related robustness gaps in the same category: the embedded DNS is **UDP-only**
 - **Charles/local proxies**: a system-wide HTTP proxy pointing at localhost captures
   host curl testing (`curl` honors proxy env; the browser honors system proxy) — user
   sees proxy errors for `http://*.k8s.test` URLs. Recommend `NO_PROXY=.k8s.test,172.30.0.0/16`
-  guidance in docs.
+  guidance in docs (clusters with a custom domain need their domain appended, e.g.
+  `NO_PROXY=.k8s.test,.lab.internal,172.30.0.0/16`).
 - **World-writable helper socket** (`/var/run/tbx-helper.sock`, 0666, no peer auth,
   TODO at `internal/helper/server.go:69-70`): not a lockdown-breakage issue but the
   kind of finding a corporate security review flags before permitting the tool. Worth

@@ -119,7 +119,7 @@ func TestServerForwardsPublicQueryThroughUDPSocket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := NewServer(listener, func(string) net.IP { return nil }, func(query []byte) ([]byte, error) {
+	server := NewServer(listener, func(string) net.IP { return nil }, Authority(nil), func(query []byte) ([]byte, error) {
 		return exchangeDNS(query, upstream.LocalAddr().String())
 	})
 	serveErr := make(chan error, 1)

@@ -24,9 +24,11 @@ var (
 	unregisterDNS = platformUnregisterDNS
 )
 
-func applyResolvedRegistration(clusterName string, subnetIndex int, run dnsCommandRunner) DNSRegistration {
+// applyResolvedRegistration routes clusterDomain (the cluster's effective
+// domain) to the cluster bridge via systemd-resolved.
+func applyResolvedRegistration(clusterDomain string, subnetIndex int, run dnsCommandRunner) DNSRegistration {
 	bridge := bridgeNameForSubnet(subnetIndex)
-	domain := "~" + clusterName + ".k8s.test"
+	domain := "~" + clusterDomain
 	manualStep := fmt.Sprintf(
 		"sudo resolvectl dns %s %s && sudo resolvectl domain %s %q",
 		bridge, cluster.Gateway(subnetIndex), bridge, domain,
@@ -46,9 +48,12 @@ func applyResolvedRegistration(clusterName string, subnetIndex int, run dnsComma
 	return DNSRegistration{Registered: true, Domain: domain, ManualStep: manualStep}
 }
 
+// decodeDNSIdentity returns the cluster's effective domain and subnet index.
+// An absent domain means the default, <cluster>.k8s.test.
 func decodeDNSIdentity(raw []byte) (string, int, error) {
 	var args struct {
 		Cluster     string `json:"cluster"`
+		Domain      string `json:"domain"`
 		SubnetIndex *int   `json:"subnetIndex"`
 	}
 	if err := decodeArgs(raw, &args); err != nil {
@@ -63,7 +68,11 @@ func decodeDNSIdentity(raw []byte) (string, int, error) {
 	if *args.SubnetIndex < 0 || *args.SubnetIndex > cluster.MaxSubnetIndex {
 		return "", 0, fmt.Errorf("subnet index %d is outside 0..%d", *args.SubnetIndex, cluster.MaxSubnetIndex)
 	}
-	return args.Cluster, *args.SubnetIndex, nil
+	domain := args.Domain
+	if domain == "" {
+		domain = args.Cluster + "." + cluster.DefaultDomainSuffix
+	}
+	return domain, *args.SubnetIndex, nil
 }
 
 func decodeDNSSubnet(raw []byte) (int, error) {
@@ -80,7 +89,7 @@ func decodeDNSSubnet(raw []byte) (int, error) {
 }
 
 func dnsListenerReply(raw []byte) serverReply {
-	clusterName, subnetIndex, err := decodeDNSIdentity(raw)
+	clusterDomain, subnetIndex, err := decodeDNSIdentity(raw)
 	if err != nil {
 		return serverReply{response: failure(err), fd: -1}
 	}
@@ -89,7 +98,7 @@ func dnsListenerReply(raw []byte) serverReply {
 		return serverReply{response: failure(err), fd: -1}
 	}
 	return serverReply{
-		response: success(registerDNS(clusterName, subnetIndex)),
+		response: success(registerDNS(clusterDomain, subnetIndex)),
 		fd:       int(file.Fd()),
 		finalize: func() { _ = file.Close() },
 	}

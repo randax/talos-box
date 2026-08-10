@@ -89,7 +89,7 @@ func resolvedManualSteps(clusters []cluster.Cluster) []string {
 		bridge := cluster.LinuxBridgeName(item.SubnetIndex)
 		steps = append(steps, fmt.Sprintf(
 			"sudo resolvectl dns %s %s && sudo resolvectl domain %s %q",
-			bridge, cluster.Gateway(item.SubnetIndex), bridge, "~"+item.Name+".k8s.test",
+			bridge, cluster.Gateway(item.SubnetIndex), bridge, "~"+item.EffectiveDomain(),
 		))
 	}
 	return steps

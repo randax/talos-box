@@ -17,7 +17,7 @@ const resolverBypassMessage = "scoped resolver is being bypassed (DNS filtering 
 func checkSystemDNS(clusters []daemon.ClusterSummary, command commandOutput) error {
 	var problems []string
 	for _, item := range clusters {
-		name := fmt.Sprintf("doctor-probe.%s.k8s.test", item.Name)
+		name := "doctor-probe." + item.EffectiveDomain()
 		expected := net.ParseIP(fmt.Sprintf("172.30.%d.200", item.SubnetIndex))
 
 		// dscacheutil goes through macOS SystemConfiguration and therefore exercises

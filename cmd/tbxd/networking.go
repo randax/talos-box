@@ -9,11 +9,14 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/randax/talos-box/internal/cluster"
 	tbxdns "github.com/randax/talos-box/internal/dns"
 	"github.com/randax/talos-box/internal/helper"
+	"github.com/randax/talos-box/internal/resolverset"
 )
 
 const (
@@ -24,11 +27,13 @@ const (
 
 type hostNetworkingDrift struct {
 	dns        bool
+	domains    bool
 	forwarding bool
 }
 
 type hostNetworkingClient interface {
 	InstallDNS(port int) error
+	SyncDomainResolvers(domains []string, port int) error
 	EnableForwarding() error
 	Close() error
 }
@@ -43,36 +48,94 @@ func configureHostNetworking() {
 	if err := client.InstallDNS(tbxdns.Port); err != nil {
 		log.Printf("install DNS resolver: %v", err)
 	}
+	if err := client.SyncDomainResolvers(customClusterDomains(), tbxdns.Port); err != nil {
+		log.Printf("sync custom-domain resolvers: %v", err)
+	}
 	if err := client.EnableForwarding(); err != nil {
 		log.Printf("enable IP forwarding: %v", err)
 	}
+}
+
+// customClusterDomains lists the explicit domains of live clusters; clusters
+// on the default domain are served by the shared resolver file.
+func customClusterDomains() []string {
+	clusters, err := cluster.List()
+	if err != nil {
+		log.Printf("load clusters for resolver maintenance: %v", err)
+		return nil
+	}
+	var domains []string
+	for _, item := range clusters {
+		if item.Domain != "" {
+			domains = append(domains, item.Domain)
+		}
+	}
+	return domains
+}
+
+// listResolverFiles reads /etc/resolver as name → content; observation only,
+// mutations stay behind the privileged helper.
+func listResolverFiles() (map[string][]byte, error) {
+	directory := filepath.Dir(resolverPath)
+	entries, err := os.ReadDir(directory)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	observed := make(map[string][]byte, len(entries))
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() {
+			continue
+		}
+		content, err := os.ReadFile(filepath.Join(directory, entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+		observed[entry.Name()] = content
+	}
+	return observed, nil
 }
 
 // checkHostNetworking only observes unprivileged host state. Its inputs are
 // injected so the drift classification remains deterministic in tests.
 func checkHostNetworking(
 	port int,
+	customDomains []string,
 	readFile func(string) ([]byte, error),
+	listResolvers func() (map[string][]byte, error),
 	run func(string, ...string) ([]byte, error),
 ) hostNetworkingDrift {
 	wantResolver := fmt.Sprintf("nameserver 127.0.0.1\nport %d\n", port)
 	resolver, err := readFile(resolverPath)
 	dnsDrifted := err != nil || string(resolver) != wantResolver
 
+	observed, err := listResolvers()
+	domainsDrifted := err != nil
+	if err == nil {
+		delete(observed, filepath.Base(resolverPath))
+		create, remove := resolverset.Plan(customDomains, observed, port)
+		domainsDrifted = len(create) != 0 || len(remove) != 0
+	}
+
 	forwarding, err := run("/usr/sbin/sysctl", "-n", "net.inet.ip.forwarding")
 	forwardingDrifted := err != nil || strings.TrimSpace(string(forwarding)) != "1"
 
-	return hostNetworkingDrift{dns: dnsDrifted, forwarding: forwardingDrifted}
+	return hostNetworkingDrift{dns: dnsDrifted, domains: domainsDrifted, forwarding: forwardingDrifted}
 }
 
 func (d hostNetworkingDrift) any() bool {
-	return d.dns || d.forwarding
+	return d.dns || d.domains || d.forwarding
 }
 
 func (d hostNetworkingDrift) description() string {
 	var names []string
 	if d.dns {
 		names = append(names, "DNS resolver")
+	}
+	if d.domains {
+		names = append(names, "custom-domain resolvers")
 	}
 	if d.forwarding {
 		names = append(names, "IP forwarding")
@@ -86,7 +149,7 @@ func startHostNetworkingMaintenance() func() {
 	ticker := time.NewTicker(hostNetworkingCheckEvery)
 	go func() {
 		defer close(done)
-		maintainHostNetworking(stop, ticker.C, os.ReadFile, runHostCommand, connectHostNetworkingHelper)
+		maintainHostNetworking(stop, ticker.C, customClusterDomains, os.ReadFile, listResolverFiles, runHostCommand, connectHostNetworkingHelper)
 	}()
 	return func() {
 		ticker.Stop()
@@ -98,7 +161,9 @@ func startHostNetworkingMaintenance() func() {
 func maintainHostNetworking(
 	stop <-chan struct{},
 	ticks <-chan time.Time,
+	customDomains func() []string,
 	readFile func(string) ([]byte, error),
+	listResolvers func() (map[string][]byte, error),
 	run func(string, ...string) ([]byte, error),
 	connect func() (hostNetworkingClient, error),
 ) {
@@ -107,11 +172,12 @@ func maintainHostNetworking(
 		case <-stop:
 			return
 		case <-ticks:
-			drift := checkHostNetworking(tbxdns.Port, readFile, run)
+			domains := customDomains()
+			drift := checkHostNetworking(tbxdns.Port, domains, readFile, listResolvers, run)
 			if !drift.any() {
 				continue
 			}
-			if err := reassertHostNetworking(drift, connect); err != nil {
+			if err := reassertHostNetworking(drift, domains, connect); err != nil {
 				log.Printf("host networking drift detected (%s); re-assertion failed: %v", drift.description(), err)
 				continue
 			}
@@ -120,7 +186,7 @@ func maintainHostNetworking(
 	}
 }
 
-func reassertHostNetworking(drift hostNetworkingDrift, connect func() (hostNetworkingClient, error)) error {
+func reassertHostNetworking(drift hostNetworkingDrift, customDomains []string, connect func() (hostNetworkingClient, error)) error {
 	client, err := connect()
 	if err != nil {
 		return fmt.Errorf("connect to helper: %w", err)
@@ -131,6 +197,11 @@ func reassertHostNetworking(drift hostNetworkingDrift, connect func() (hostNetwo
 	if drift.dns {
 		if err := client.InstallDNS(tbxdns.Port); err != nil {
 			repairErr = errors.Join(repairErr, fmt.Errorf("install DNS resolver: %w", err))
+		}
+	}
+	if drift.domains {
+		if err := client.SyncDomainResolvers(customDomains, tbxdns.Port); err != nil {
+			repairErr = errors.Join(repairErr, fmt.Errorf("sync custom-domain resolvers: %w", err))
 		}
 	}
 	if drift.forwarding {

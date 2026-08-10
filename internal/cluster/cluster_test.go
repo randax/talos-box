@@ -174,3 +174,30 @@ func TestDefaultsFor(t *testing.T) {
 		t.Errorf("worker defaults = %+v, want base %+v", got, base)
 	}
 }
+
+func TestEffectiveDomainDefaultsToClusterName(t *testing.T) {
+	c := Cluster{Name: "demo"}
+	if got := c.EffectiveDomain(); got != "demo.k8s.test" {
+		t.Fatalf("EffectiveDomain = %q, want %q", got, "demo.k8s.test")
+	}
+}
+
+func TestEffectiveDomainUsesExplicitDomain(t *testing.T) {
+	c := Cluster{Name: "demo", Domain: "lab.internal"}
+	if got := c.EffectiveDomain(); got != "lab.internal" {
+		t.Fatalf("EffectiveDomain = %q, want %q", got, "lab.internal")
+	}
+}
+
+func TestDomainInUseDetectsExactDuplicate(t *testing.T) {
+	existing := []Cluster{{Name: "demo"}, {Name: "other", Domain: "lab.internal"}}
+	if !DomainInUse("lab.internal", existing) {
+		t.Fatal("DomainInUse missed explicit duplicate")
+	}
+	if !DomainInUse("demo.k8s.test", existing) {
+		t.Fatal("DomainInUse missed default-domain duplicate")
+	}
+	if DomainInUse("staging.lab.internal", existing) {
+		t.Fatal("DomainInUse rejected nested domain; nesting is allowed")
+	}
+}

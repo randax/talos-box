@@ -12,7 +12,7 @@ func TestResolvedRegistrationUsesPerClusterRouteOnlyDomain(t *testing.T) {
 	t.Parallel()
 
 	var calls [][]string
-	registration := applyResolvedRegistration("demo", 7, func(name string, args ...string) error {
+	registration := applyResolvedRegistration("demo.k8s.test", 7, func(name string, args ...string) error {
 		calls = append(calls, append([]string{name}, args...))
 		return nil
 	})
@@ -28,10 +28,28 @@ func TestResolvedRegistrationUsesPerClusterRouteOnlyDomain(t *testing.T) {
 	}
 }
 
+func TestResolvedRegistrationUsesCustomDomain(t *testing.T) {
+	t.Parallel()
+
+	var domains []string
+	registration := applyResolvedRegistration("staging.lab.internal", 9, func(name string, args ...string) error {
+		if len(args) > 0 && args[0] == "domain" {
+			domains = append(domains, args[2])
+		}
+		return nil
+	})
+	if !reflect.DeepEqual(domains, []string{"~staging.lab.internal"}) {
+		t.Fatalf("registered domains = %v, want [~staging.lab.internal]", domains)
+	}
+	if !registration.Registered || registration.Domain != "~staging.lab.internal" {
+		t.Fatalf("registration = %#v", registration)
+	}
+}
+
 func TestResolvedRegistrationFailureIsNonFatalAndActionable(t *testing.T) {
 	t.Parallel()
 
-	registration := applyResolvedRegistration("demo", 7, func(string, ...string) error {
+	registration := applyResolvedRegistration("demo.k8s.test", 7, func(string, ...string) error {
 		return errors.New("resolvectl not found")
 	})
 	if registration.Registered {
@@ -56,9 +74,9 @@ func TestDispatchDNSListenReturnsOwnedDescriptorAndRegistration(t *testing.T) {
 		}
 		return file, nil
 	}
-	registerDNS = func(cluster string, subnetIndex int) DNSRegistration {
-		if cluster != "demo" || subnetIndex != 7 {
-			t.Fatalf("register = %s/%d, want demo/7", cluster, subnetIndex)
+	registerDNS = func(domain string, subnetIndex int) DNSRegistration {
+		if domain != "demo.k8s.test" || subnetIndex != 7 {
+			t.Fatalf("register = %s/%d, want demo.k8s.test/7", domain, subnetIndex)
 		}
 		return DNSRegistration{Registered: true, Domain: "~demo.k8s.test"}
 	}

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/domain"
 	"github.com/randax/talos-box/internal/helper"
 	"github.com/randax/talos-box/internal/hypervisor"
 	"github.com/randax/talos-box/internal/imagecache"
@@ -26,10 +27,15 @@ type createArgs struct {
 	ControlPlane  *cluster.NodeDefaults `json:"controlPlane,omitempty"`
 	Worker        *cluster.NodeDefaults `json:"worker,omitempty"`
 	BGP           bool                  `json:"bgp,omitempty"`
-	Force         bool                  `json:"force"`
-	Schematic     string                `json:"schematic"`
-	Version       string                `json:"version"`
-	TalosVersion  string                `json:"talosVersion"`
+	// Domain is the requested cluster domain; empty means the default,
+	// <name>.k8s.test. AllowUnsafeDomain is the explicit opt-in for domains
+	// that can shadow real DNS.
+	Domain            string `json:"domain,omitempty"`
+	AllowUnsafeDomain bool   `json:"allowUnsafeDomain,omitempty"`
+	Force             bool   `json:"force"`
+	Schematic         string `json:"schematic"`
+	Version           string `json:"version"`
+	TalosVersion      string `json:"talosVersion"`
 }
 
 type nameArgs struct {
@@ -75,8 +81,20 @@ type ClusterSummary struct {
 	TalosVersion  string               `json:"talosVersion"`
 	Schematic     string               `json:"schematic"`
 	BGP           bool                 `json:"bgp"`
-	Running       bool                 `json:"running"`
-	Warning       string               `json:"warning,omitempty"`
+	// Domain is the explicitly chosen cluster domain; empty means the
+	// default, <name>.k8s.test.
+	Domain            string `json:"domain,omitempty"`
+	AllowUnsafeDomain bool   `json:"allowUnsafeDomain,omitempty"`
+	Running           bool   `json:"running"`
+	Warning           string `json:"warning,omitempty"`
+}
+
+// EffectiveDomain returns the domain the cluster is reachable under.
+func (s ClusterSummary) EffectiveDomain() string {
+	if s.Domain != "" {
+		return s.Domain
+	}
+	return s.Name + "." + cluster.DefaultDomainSuffix
 }
 
 // NodeStatus is the observed host-side state of one node.
@@ -92,8 +110,10 @@ type NodeStatus struct {
 
 // ClusterStatus is the status result for one cluster.
 type ClusterStatus struct {
-	Name    string       `json:"name"`
-	Subnet  string       `json:"subnet"`
+	Name   string `json:"name"`
+	Subnet string `json:"subnet"`
+	// Domain is the cluster's effective domain (explicit or defaulted).
+	Domain  string       `json:"domain"`
 	BGP     bool         `json:"bgp"`
 	Running bool         `json:"running"`
 	Nodes   []NodeStatus `json:"nodes"`
@@ -152,6 +172,20 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if err != nil {
 		return ClusterSummary{}, err
 	}
+	canonicalDomain := ""
+	if args.Domain != "" {
+		canonicalDomain, err = domain.Validate(args.Domain, args.AllowUnsafeDomain)
+		if err != nil {
+			return ClusterSummary{}, err
+		}
+	}
+	effectiveDomain := canonicalDomain
+	if effectiveDomain == "" {
+		effectiveDomain = args.Name + "." + cluster.DefaultDomainSuffix
+	}
+	if cluster.DomainInUse(effectiveDomain, clusters) {
+		return ClusterSummary{}, fmt.Errorf("domain %q is already used by another cluster", effectiveDomain)
+	}
 	subnetIndex, subnetWarning, err := cluster.LowestUsableSubnetIndex(clusters, s.hostSubnetSources())
 	if err != nil {
 		return ClusterSummary{}, err
@@ -163,6 +197,7 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	item.ControlPlaneDefaults = args.ControlPlane
 	item.WorkerDefaults = args.Worker
 	item.BGP = args.BGP
+	item.Domain = canonicalDomain
 	item.ImageArchitecture = string(s.hypervisor.Architecture())
 	item.Schematic, item.TalosVersion, err = s.resolveImage(args.Schematic, args.Version)
 	if err != nil {
@@ -564,7 +599,7 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 
 	result := make([]ClusterStatus, 0, len(items))
 	for _, item := range items {
-		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), BGP: item.BGP, Running: s.clusterRunning(item.Name)}
+		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), BGP: item.BGP, Running: s.clusterRunning(item.Name)}
 		for _, node := range item.Nodes {
 			clusterStatus.Nodes = append(clusterStatus.Nodes, nodeStatus(node, item.SubnetIndex, s.nodeRunning(item.Name, node.Name)))
 		}
@@ -699,16 +734,18 @@ func memoryOr(mib, fallback int) int {
 
 func summary(item cluster.Cluster, running bool) ClusterSummary {
 	return ClusterSummary{
-		Name:          item.Name,
-		Index:         item.Index,
-		SubnetIndex:   item.SubnetIndex,
-		ControlPlanes: item.ControlPlanes,
-		Workers:       item.Workers,
-		NodeDefaults:  item.NodeDefaults,
-		TalosVersion:  item.TalosVersion,
-		Schematic:     item.Schematic,
-		BGP:           item.BGP,
-		Running:       running,
+		Name:              item.Name,
+		Index:             item.Index,
+		SubnetIndex:       item.SubnetIndex,
+		ControlPlanes:     item.ControlPlanes,
+		Workers:           item.Workers,
+		NodeDefaults:      item.NodeDefaults,
+		TalosVersion:      item.TalosVersion,
+		Schematic:         item.Schematic,
+		BGP:               item.BGP,
+		Domain:            item.Domain,
+		AllowUnsafeDomain: item.Domain != "" && !domain.Safe(item.Domain),
+		Running:           running,
 	}
 }
 

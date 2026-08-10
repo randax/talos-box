@@ -105,16 +105,18 @@ func clusterReady(item cluster.Cluster, nodeActive func(string) bool) bool {
 // createFromSpec provisions and starts one cluster from a config spec.
 func (s *Server) createFromSpec(spec config.ClusterSpec, talos config.TalosSpec, force bool) (ClusterSummary, error) {
 	args := createArgs{
-		Name:          spec.Name,
-		ControlPlanes: &spec.ControlPlanes,
-		Workers:       &spec.Workers,
-		Node:          spec.Node,
-		ControlPlane:  spec.ControlPlane,
-		Worker:        spec.Worker,
-		BGP:           spec.BGP,
-		Force:         force,
-		Schematic:     talos.Schematic,
-		Version:       talos.Version,
+		Name:              spec.Name,
+		ControlPlanes:     &spec.ControlPlanes,
+		Workers:           &spec.Workers,
+		Node:              spec.Node,
+		ControlPlane:      spec.ControlPlane,
+		Worker:            spec.Worker,
+		BGP:               spec.BGP,
+		Domain:            spec.Domain,
+		AllowUnsafeDomain: spec.AllowUnsafeDomain,
+		Force:             force,
+		Schematic:         talos.Schematic,
+		Version:           talos.Version,
 	}
 	encoded, err := json.Marshal(args)
 	if err != nil {

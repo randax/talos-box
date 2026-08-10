@@ -38,7 +38,7 @@ func printStatus(output io.Writer, clusters []daemon.ClusterStatus, quiet bool) 
 		return err
 	}
 	table := tabwriter.NewWriter(output, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(table, "CLUSTER\tSUBNET\tNODE\tROLE\tMAC\tIP\tPHASE"); err != nil {
+	if _, err := fmt.Fprintln(table, "CLUSTER\tSUBNET\tDOMAIN\tNODE\tROLE\tMAC\tIP\tPHASE"); err != nil {
 		return err
 	}
 	for _, item := range clusters {
@@ -47,8 +47,8 @@ func printStatus(output io.Writer, clusters []daemon.ClusterStatus, quiet bool) 
 			if ip == "" {
 				ip = "-"
 			}
-			if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-				item.Name, item.Subnet, node.Name, node.Role, node.MAC, ip, node.Phase); err != nil {
+			if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+				item.Name, item.Subnet, item.Domain, node.Name, node.Role, node.MAC, ip, node.Phase); err != nil {
 				return err
 			}
 		}

@@ -22,9 +22,9 @@ type dnsServing interface {
 }
 
 type clusterDNSClient interface {
-	ListenDNS(string, int) (net.PacketConn, helper.DNSRegistration, error)
-	RegisterDNS(string, int) (helper.DNSRegistration, error)
-	UnregisterDNS(int) error
+	ListenDNS(clusterName, domain string, subnetIndex int) (net.PacketConn, helper.DNSRegistration, error)
+	RegisterDNS(clusterName, domain string, subnetIndex int) (helper.DNSRegistration, error)
+	UnregisterDNS(subnetIndex int) error
 }
 
 type managedDNSListener struct {
@@ -85,7 +85,7 @@ func (r *dnsReconciler) reconcileWithRegistration(
 			if !reassertRegistration {
 				continue
 			}
-			registration, err := client.RegisterDNS(item.Name, item.SubnetIndex)
+			registration, err := client.RegisterDNS(item.Name, item.EffectiveDomain(), item.SubnetIndex)
 			if err != nil {
 				result = errors.Join(result, fmt.Errorf("register DNS for %s: %w", item.Name, err))
 			} else {
@@ -94,7 +94,7 @@ func (r *dnsReconciler) reconcileWithRegistration(
 			continue
 		}
 
-		connection, registration, err := client.ListenDNS(item.Name, item.SubnetIndex)
+		connection, registration, err := client.ListenDNS(item.Name, item.EffectiveDomain(), item.SubnetIndex)
 		if err != nil {
 			result = errors.Join(result, fmt.Errorf("listen for DNS on %s: %w", cluster.Gateway(item.SubnetIndex), err))
 			continue

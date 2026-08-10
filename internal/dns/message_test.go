@@ -93,6 +93,51 @@ func TestResolve(t *testing.T) {
 	}
 }
 
+func TestResolveCustomAndNestedDomains(t *testing.T) {
+	t.Parallel()
+
+	clusters := []cluster.Cluster{
+		{
+			Name: "outer", SubnetIndex: 3, Domain: "lab.test",
+			Nodes: []cluster.Node{{Name: "outer-cp-1", MAC: "52:54:00:00:00:03"}},
+		},
+		{
+			Name: "inner", SubnetIndex: 9, Domain: "staging.lab.test",
+			Nodes: []cluster.Node{{Name: "inner-cp-1", MAC: "52:54:00:00:00:09"}},
+		},
+	}
+	lease := func(mac string, subnetIndex int) string {
+		switch mac {
+		case "52:54:00:00:00:03":
+			return "172.30.3.2"
+		case "52:54:00:00:00:09":
+			return "172.30.9.2"
+		}
+		return ""
+	}
+	tests := []struct {
+		name string
+		want net.IP
+	}{
+		{name: "outer-cp-1.lab.test", want: net.IPv4(172, 30, 3, 2)},
+		{name: "inner-cp-1.staging.lab.test", want: net.IPv4(172, 30, 9, 2)},
+		{name: "app.lab.test", want: net.IPv4(172, 30, 3, 200)},
+		// longest suffix wins: never falls through to the enclosing cluster
+		{name: "app.staging.lab.test", want: net.IPv4(172, 30, 9, 200)},
+		{name: "deep.app.staging.lab.test", want: net.IPv4(172, 30, 9, 200)},
+		{name: "lab.test"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := Resolve(tt.name, clusters, lease)
+			if (got == nil) != (tt.want == nil) || got != nil && !got.Equal(tt.want) {
+				t.Fatalf("Resolve(%q) = %v, want %v", tt.name, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestNodeWithoutLeaseDoesNotUseWildcard(t *testing.T) {
 	t.Parallel()
 	clusters := []cluster.Cluster{{Name: "demo", Nodes: []cluster.Node{{Name: "node"}}}}

@@ -29,6 +29,12 @@ func Marshal(cfg Config) string {
 		if c.BGP {
 			b.WriteString("    bgp: true\n")
 		}
+		if c.Domain != "" {
+			fmt.Fprintf(&b, "    domain: %s\n", c.Domain)
+		}
+		if c.AllowUnsafeDomain {
+			b.WriteString("    allowUnsafeDomain: true\n")
+		}
 		writeNode(&b, "node", c.Node)
 		if c.ControlPlane != nil {
 			writeNode(&b, "controlPlane", *c.ControlPlane)

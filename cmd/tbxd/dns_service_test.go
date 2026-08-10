@@ -28,14 +28,14 @@ func TestDNSReconcilerAddsReassertsAndRemovesClusterListeners(t *testing.T) {
 	if err := reconciler.reconcile(client, clusters, lookup); err != nil {
 		t.Fatal(err)
 	}
-	if len(client.listenCalls) != 1 || client.listenCalls[0] != "demo/7" {
+	if len(client.listenCalls) != 1 || client.listenCalls[0] != "demo/demo.k8s.test/7" {
 		t.Fatalf("listen calls = %v", client.listenCalls)
 	}
 
 	if err := reconciler.reconcile(client, clusters, lookup); err != nil {
 		t.Fatal(err)
 	}
-	if len(client.listenCalls) != 1 || len(client.registerCalls) != 1 || client.registerCalls[0] != "demo/7" {
+	if len(client.listenCalls) != 1 || len(client.registerCalls) != 1 || client.registerCalls[0] != "demo/demo.k8s.test/7" {
 		t.Fatalf("listen/register calls = %v / %v", client.listenCalls, client.registerCalls)
 	}
 
@@ -56,13 +56,13 @@ type fakeClusterDNSClient struct {
 	unregisterCalls []int
 }
 
-func (c *fakeClusterDNSClient) ListenDNS(clusterName string, subnetIndex int) (net.PacketConn, helper.DNSRegistration, error) {
-	c.listenCalls = append(c.listenCalls, fmt.Sprintf("%s/%d", clusterName, subnetIndex))
+func (c *fakeClusterDNSClient) ListenDNS(clusterName, domain string, subnetIndex int) (net.PacketConn, helper.DNSRegistration, error) {
+	c.listenCalls = append(c.listenCalls, fmt.Sprintf("%s/%s/%d", clusterName, domain, subnetIndex))
 	return nil, helper.DNSRegistration{Registered: true}, nil
 }
 
-func (c *fakeClusterDNSClient) RegisterDNS(clusterName string, subnetIndex int) (helper.DNSRegistration, error) {
-	c.registerCalls = append(c.registerCalls, fmt.Sprintf("%s/%d", clusterName, subnetIndex))
+func (c *fakeClusterDNSClient) RegisterDNS(clusterName, domain string, subnetIndex int) (helper.DNSRegistration, error) {
+	c.registerCalls = append(c.registerCalls, fmt.Sprintf("%s/%s/%d", clusterName, domain, subnetIndex))
 	return helper.DNSRegistration{Registered: true}, nil
 }
 

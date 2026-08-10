@@ -116,8 +116,18 @@ the per-cluster `/24` model, `tbx-helper` routes `172.30.0.0/16` frames between 
 attachments before they enter vmnet, learning node and VIP ownership from DHCP and ARP. vmnet
 continues to provide same-subnet switching, DHCP, NAT egress, and host reachability.
 
-**DNS**: embedded resolver in `tbxd` on `127.0.0.1`, wired once via `/etc/resolver/k8s.test`.
-`*.<cluster>.k8s.test` → that cluster's `.200`; `<node>.<cluster>.k8s.test` → node IP.
+**DNS**: embedded resolver in `tbxd` on `127.0.0.1`. Every cluster has a **cluster domain** —
+chosen at create (`--domain` / `domain:`), immutable, unique across clusters, defaulting to
+`<cluster>.k8s.test`. `*.<domain>` → that cluster's `.200`; `<node>.<domain>` → node IP;
+domains may nest across clusters and resolve longest-suffix-wins. Safe domains (`.test`,
+`.internal`, `home.arpa`) are accepted outright; `.local`/`.localhost`/`.invalid`/single-label
+are always rejected; anything else can shadow real DNS and requires the explicit
+`--allow-unsafe-domain` / `allowUnsafeDomain: true` opt-in (non-interactive, so scripted paths
+stay deterministic). Host wiring: default-domain clusters share the static
+`/etc/resolver/k8s.test` file; each custom-domain cluster gets `/etc/resolver/<domain>`,
+written with an ownership marker by the helper, reconciled by `tbxd` (recreate missing,
+remove marked orphans, never touch unmarked files), with a `killall -HUP mDNSResponder`
+after changes.
 
 **BGP mode** (`tbx bgp enable <cluster>`): "host as ToR" — one embedded GoBGP instance,
 host **ASN 64512**, listening on each enabled cluster's `.1:179`; cluster *n* nodes speak
@@ -222,6 +232,8 @@ clusters:
     controlPlanes: 1
     workers: 2
     bgp: false
+    domain: lab.internal   # optional cluster domain; default <name>.k8s.test
+    allowUnsafeDomain: false # explicit opt-in for domains that can shadow real DNS
     node:                  # defaults for all nodes
       memory: 2GiB
       cpus: 2
@@ -255,7 +267,10 @@ matching `CiliumLoadBalancerIPPool`,
   entitlements needed (bridged networking deliberately unused).
 - **`sudo tbx system install`** (one-time) installs `tbx-helper` as a root launchd daemon and
   the `/etc/resolver/k8s.test` file; `tbx doctor` verifies helper, vmnet, DNS wiring, and
-  forwarding. Everything else runs unprivileged.
+  forwarding. Everything else runs unprivileged. The helper's macOS filesystem writes are a
+  state-derived allow-list: `/etc/resolver/k8s.test` plus `/etc/resolver/<domain>` for
+  canonical validated cluster domains, and it only ever deletes files carrying its ownership
+  marker.
 
 ## 12. Verification gates and risk register
 
