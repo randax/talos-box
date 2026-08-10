@@ -51,7 +51,7 @@ func run() error {
 			log.Printf("DNS state refresh failed: %v", err)
 			return nil
 		}
-		return tbxdns.Resolve(name, clusters, cluster.LeaseIP)
+		return tbxdns.Resolve(name, clusters, cluster.LookupIP)
 	})
 	if err != nil {
 		_ = listener.Close()

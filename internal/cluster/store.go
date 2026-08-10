@@ -80,6 +80,15 @@ func Load(name string) (Cluster, error) {
 	if err := json.Unmarshal(data, &fields); err == nil && fields["subnetIndex"] == nil {
 		c.SubnetIndex = c.Index
 	}
+	migrated, err := ensureNodeReservations(&c)
+	if err != nil {
+		return Cluster{}, fmt.Errorf("load cluster reservations: %w", err)
+	}
+	if migrated {
+		if err := Save(c); err != nil {
+			return Cluster{}, fmt.Errorf("persist cluster reservation migration: %w", err)
+		}
+	}
 	return c, nil
 }
 

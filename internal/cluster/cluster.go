@@ -12,6 +12,8 @@ const (
 	DefaultCPUs      = 2
 	DefaultDiskGiB   = 20
 	MaxSubnetIndex   = 255
+	firstNodeHost    = 2
+	lastNodeHost     = 179
 	// LegacyImageArchitecture is the architecture of every cluster image
 	// created before architecture was persisted in cluster state.
 	LegacyImageArchitecture = "arm64"
@@ -34,6 +36,7 @@ type Node struct {
 	Name string `json:"name"`
 	Role Role   `json:"role"`
 	MAC  string `json:"mac"`
+	IP   string `json:"ip"`
 }
 
 type Cluster struct {
@@ -74,6 +77,9 @@ func New(name string, subnetIndex, controlPlanes, workers int, defaults NodeDefa
 	if controlPlanes < 0 || workers < 0 {
 		return Cluster{}, errors.New("node counts cannot be negative")
 	}
+	if controlPlanes+workers > lastNodeHost-firstNodeHost+1 {
+		return Cluster{}, fmt.Errorf("cluster cannot contain more than %d nodes", lastNodeHost-firstNodeHost+1)
+	}
 	if defaults.MemoryMiB < 0 || defaults.CPUs < 0 || defaults.DiskGiB < 0 {
 		return Cluster{}, errors.New("node defaults cannot be negative")
 	}
@@ -89,10 +95,20 @@ func New(name string, subnetIndex, controlPlanes, workers int, defaults NodeDefa
 		Nodes:         make([]Node, 0, controlPlanes+workers),
 	}
 	for i := 1; i <= controlPlanes; i++ {
-		c.Nodes = append(c.Nodes, newNode(name, fmt.Sprintf("%s-cp-%d", name, i), RoleControlPlane))
+		c.Nodes = append(c.Nodes, newNode(
+			name,
+			fmt.Sprintf("%s-cp-%d", name, i),
+			RoleControlPlane,
+			reservationIP(subnetIndex, firstNodeHost+len(c.Nodes)),
+		))
 	}
 	for i := 1; i <= workers; i++ {
-		c.Nodes = append(c.Nodes, newNode(name, fmt.Sprintf("%s-worker-%d", name, i), RoleWorker))
+		c.Nodes = append(c.Nodes, newNode(
+			name,
+			fmt.Sprintf("%s-worker-%d", name, i),
+			RoleWorker,
+			reservationIP(subnetIndex, firstNodeHost+len(c.Nodes)),
+		))
 	}
 
 	return c, nil
@@ -125,11 +141,12 @@ func DeterministicMAC(clusterName, nodeName string) string {
 	return mac.String()
 }
 
-func newNode(clusterName, nodeName string, role Role) Node {
+func newNode(clusterName, nodeName string, role Role, ip string) Node {
 	return Node{
 		Name: nodeName,
 		Role: role,
 		MAC:  DeterministicMAC(clusterName, nodeName),
+		IP:   ip,
 	}
 }
 

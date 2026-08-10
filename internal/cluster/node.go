@@ -23,7 +23,11 @@ func AddNode(c *Cluster, role Role, name string) (Node, error) {
 		}
 	}
 
-	node := newNode(c.Name, name, role)
+	ip, err := nextReservationIP(*c)
+	if err != nil {
+		return Node{}, err
+	}
+	node := newNode(c.Name, name, role, ip)
 	c.Nodes = append(c.Nodes, node)
 	if role == RoleControlPlane {
 		c.ControlPlanes++

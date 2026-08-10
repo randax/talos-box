@@ -4,20 +4,13 @@ import (
 	"bufio"
 	"fmt"
 	"net"
-	"os"
 	"strings"
 )
 
-const dhcpLeasesPath = "/var/db/dhcpd_leases"
-
-// LeaseIP returns the current vmnet DHCP lease for mac, or an empty string if
-// the lease file cannot be read or does not contain the address.
+// LeaseIP is kept as a compatibility alias for callers outside this module.
+// New code should use LookupIP, whose implementation is platform-specific.
 func LeaseIP(mac string, subnetIndex int) string {
-	data, err := os.ReadFile(dhcpLeasesPath)
-	if err != nil {
-		return ""
-	}
-	return parseLeaseIP(string(data), mac, subnetIndex)
+	return LookupIP(mac, subnetIndex)
 }
 
 func parseLeaseIP(data, mac string, subnetIndex int) string {

@@ -589,7 +589,7 @@ func (s *Server) clusterRunning(name string) bool {
 }
 
 func nodeStatus(node cluster.Node, subnetIndex int, vmRunning bool) NodeStatus {
-	ip := cluster.LeaseIP(node.MAC, subnetIndex)
+	ip := cluster.LookupIP(node.MAC, subnetIndex)
 	probe := ProbeResult{}
 	if ip != "" {
 		probe = probeAPID(ip)
