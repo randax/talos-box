@@ -8,9 +8,7 @@ import (
 	"log"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -23,10 +21,7 @@ const (
 	shutdownStopInitialRetryDelay = 25 * time.Millisecond
 )
 
-var (
-	startInterface = StartInterface
-	stopInterface  = StopInterface
-)
+var startInterface = StartInterface
 
 type attachmentKey struct {
 	cluster string
@@ -42,8 +37,8 @@ type serverReply struct {
 // Server owns helper-created vmnet interfaces.
 type Server struct {
 	opMu         sync.Mutex
-	attachments  map[attachmentKey]int
-	pendingStops map[int]struct{}
+	attachments  map[attachmentKey]*platformAttachment
+	pendingStops map[int]*platformAttachment
 	speakers     map[string]bgpSpeaker
 	allowedUID   *uint32
 
@@ -57,8 +52,8 @@ type Server struct {
 // NewServer creates an empty helper server.
 func NewServer(allowedUID *uint32) *Server {
 	server := &Server{
-		attachments:  make(map[attachmentKey]int),
-		pendingStops: make(map[int]struct{}),
+		attachments:  make(map[attachmentKey]*platformAttachment),
+		pendingStops: make(map[int]*platformAttachment),
 	}
 	if allowedUID != nil {
 		uid := *allowedUID
@@ -72,25 +67,43 @@ func Listen(path string) (net.Listener, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, fmt.Errorf("create helper socket directory: %w", err)
 	}
-	listener, err := net.Listen("unix", path)
+	listener, err := listenUnixSocket(path, net.Listen, net.DialTimeout, os.Remove)
 	if err != nil {
-		if connection, dialErr := net.DialTimeout("unix", path, 100*time.Millisecond); dialErr == nil {
-			_ = connection.Close()
-			return nil, fmt.Errorf("helper socket is already in use: %s", path)
-		}
-		if removeErr := os.Remove(path); removeErr != nil {
-			return nil, fmt.Errorf("remove stale helper socket: %w", removeErr)
-		}
-		listener, err = net.Listen("unix", path)
+		return nil, err
 	}
-	if err != nil {
-		return nil, fmt.Errorf("listen on helper socket: %w", err)
-	}
-	// Keep the socket world-writable so rejected peers receive an explicit
-	// authorization response; peer credentials are the actual access gate.
-	if err := os.Chmod(path, 0o666); err != nil {
+	if err := os.Chmod(path, helperSocketMode()); err != nil {
 		_ = listener.Close()
 		return nil, fmt.Errorf("set helper socket permissions: %w", err)
+	}
+	return listener, nil
+}
+
+func listenUnixSocket(
+	path string,
+	listen func(string, string) (net.Listener, error),
+	dial func(string, string, time.Duration) (net.Conn, error),
+	remove func(string) error,
+) (net.Listener, error) {
+	listener, bindErr := listen("unix", path)
+	if bindErr == nil {
+		return listener, nil
+	}
+	if !errors.Is(bindErr, unix.EADDRINUSE) {
+		return nil, fmt.Errorf("listen on helper socket %s: %w", path, bindErr)
+	}
+	if connection, dialErr := dial("unix", path, 100*time.Millisecond); dialErr == nil {
+		_ = connection.Close()
+		return nil, fmt.Errorf("helper socket is already in use: %s", path)
+	}
+	if removeErr := remove(path); removeErr != nil {
+		return nil, errors.Join(
+			fmt.Errorf("listen on helper socket %s: %w", path, bindErr),
+			fmt.Errorf("remove stale helper socket %s: %w", path, removeErr),
+		)
+	}
+	listener, err := listen("unix", path)
+	if err != nil {
+		return nil, fmt.Errorf("listen on helper socket %s after removing stale path: %w", path, err)
 	}
 	return listener, nil
 }
@@ -169,8 +182,8 @@ func (s *Server) Shutdown() error {
 	var result error
 	for attempt := 1; ; attempt++ {
 		var retainedResult error
-		stop := func(fd int) bool {
-			err := stopInterface(fd)
+		stop := func(attachment *platformAttachment) bool {
+			err := attachment.close()
 			if err == nil {
 				return false
 			}
@@ -182,13 +195,13 @@ func (s *Server) Shutdown() error {
 			return false
 		}
 
-		for key, fd := range s.attachments {
-			if !stop(fd) {
+		for key, attachment := range s.attachments {
+			if !stop(attachment) {
 				delete(s.attachments, key)
 			}
 		}
-		for fd := range s.pendingStops {
-			if !stop(fd) {
+		for fd, attachment := range s.pendingStops {
+			if !stop(attachment) {
 				delete(s.pendingStops, fd)
 			}
 		}
@@ -209,7 +222,7 @@ func (s *Server) serveConnection(connection *net.UnixConn) {
 		_ = sendResponse(connection, failure(authorizationErr), -1)
 		return
 	}
-	if !isAuthorizedUID(uid, s.allowedUID) {
+	if !isAuthorizedPeer(uid, s.allowedUID) {
 		authorizationErr := fmt.Errorf("unauthorized uid %d", uid)
 		log.Printf("reject helper connection: %v", authorizationErr)
 		_ = sendResponse(connection, failure(authorizationErr), -1)
@@ -330,34 +343,34 @@ func (s *Server) attach(raw json.RawMessage) (any, int, func(), error) {
 	if _, exists := s.attachments[key]; exists {
 		return nil, -1, nil, fmt.Errorf("network interface for %s/%s is already attached", args.Cluster, args.Node)
 	}
-	fd, err := startInterface(*args.SubnetIndex)
+	attachment, err := startInterface(*args.SubnetIndex, args.Cluster, args.Node)
 	if err != nil {
 		return nil, -1, nil, err
 	}
-	s.attachments[key] = fd
+	s.attachments[key] = attachment
 	cleanup := func() {
-		if current, ok := s.attachments[key]; ok && current == fd {
-			err := stopInterface(fd)
+		if current, ok := s.attachments[key]; ok && current == attachment {
+			err := attachment.close()
 			// The response (and therefore the descriptor) never reached the
 			// caller. Always release the logical attachment so its natural retry
 			// cannot be wedged by a teardown-only retained vmnet handle.
 			delete(s.attachments, key)
 			if err != nil {
 				if stopErrorRetained(err) {
-					s.pendingStops[fd] = struct{}{}
+					s.pendingStops[attachment.FD] = attachment
 				}
 				log.Printf(
 					"clean up undelivered network attachment %s/%s fd %d (retained=%t): %v",
 					args.Cluster,
 					args.Node,
-					fd,
+					attachment.FD,
 					stopErrorRetained(err),
 					err,
 				)
 			}
 		}
 	}
-	return map[string]string{"cluster": args.Cluster, "node": args.Node}, fd, cleanup, nil
+	return map[string]any{"cluster": args.Cluster, "node": args.Node, "kind": attachment.Kind}, attachment.FD, cleanup, nil
 }
 
 func (s *Server) detach(raw json.RawMessage) error {
@@ -372,12 +385,13 @@ func (s *Server) detach(raw json.RawMessage) error {
 		return errors.New("cluster and node are required")
 	}
 	key := attachmentKey{cluster: args.Cluster, node: args.Node}
-	fd, ok := s.attachments[key]
+	attachment, ok := s.attachments[key]
 	if !ok {
-		// idempotent: the pump already cleaned up when the VM closed its fd
+		// Idempotent: the descriptor owner may already have released a
+		// non-persistent tap, or the helper may have restarted since attach.
 		return nil
 	}
-	if err := stopInterface(fd); err != nil {
+	if err := attachment.close(); err != nil {
 		if !stopErrorRetained(err) {
 			delete(s.attachments, key)
 		}
@@ -417,14 +431,6 @@ func installResolver(path string, port int) error {
 	}
 	if err := os.Chmod(path, 0o644); err != nil {
 		return fmt.Errorf("set resolver permissions: %w", err)
-	}
-	return nil
-}
-
-func enableForwarding() error {
-	output, err := exec.Command("/usr/sbin/sysctl", "-w", "net.inet.ip.forwarding=1").CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("enable IP forwarding: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 	return nil
 }

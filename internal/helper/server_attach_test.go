@@ -9,17 +9,11 @@ import (
 func TestDetachKeepsAttachmentOnStopFailure(t *testing.T) {
 	server := NewServer(nil)
 	key := attachmentKey{cluster: "demo", node: "cp-1"}
-	server.attachments[key] = 42
-
-	original := stopInterface
-	stopInterface = func(fd int) error {
+	server.attachments[key] = testPlatformAttachment(42, func(fd int) error {
 		if fd != 42 {
-			t.Fatalf("stopInterface fd = %d, want 42", fd)
+			t.Fatalf("stop attachment fd = %d, want 42", fd)
 		}
 		return wrapVMNetStopError(errors.New("retry later"), true)
-	}
-	t.Cleanup(func() {
-		stopInterface = original
 	})
 
 	err := server.detach(json.RawMessage(`{"cluster":"demo","node":"cp-1"}`))
@@ -37,32 +31,29 @@ func TestAttachCleanupDropsAttachmentOnRetainedStopFailure(t *testing.T) {
 	stopCalls := make(map[int]int)
 
 	originalStart := startInterface
-	originalStop := stopInterface
-	startInterface = func(subnet int) (int, error) {
+	startInterface = func(subnet int, _, _ string) (*platformAttachment, error) {
 		if subnet != 7 {
 			t.Fatalf("startInterface subnet = %d, want 7", subnet)
 		}
 		startCalls++
-		return 98 + startCalls, nil
-	}
-	stopInterface = func(fd int) error {
-		stopCalls[fd]++
-		switch fd {
-		case 99:
-			if stopCalls[fd] == 1 {
-				return wrapVMNetStopError(errors.New("retry later"), true)
+		return testPlatformAttachment(98+startCalls, func(fd int) error {
+			stopCalls[fd]++
+			switch fd {
+			case 99:
+				if stopCalls[fd] == 1 {
+					return wrapVMNetStopError(errors.New("retry later"), true)
+				}
+				return nil
+			case 100:
+				return nil
+			default:
+				t.Fatalf("unexpected stop attachment fd = %d", fd)
+				return nil
 			}
-			return nil
-		case 100:
-			return nil
-		default:
-			t.Fatalf("unexpected stopInterface fd = %d", fd)
-			return nil
-		}
+		}), nil
 	}
 	t.Cleanup(func() {
 		startInterface = originalStart
-		stopInterface = originalStop
 	})
 
 	_, fd, cleanup, err := server.attach(json.RawMessage(`{"cluster":"demo","subnetIndex":7,"node":"cp-1"}`))
@@ -105,22 +96,16 @@ func TestAttachCleanupDropsAttachmentOnRetainedStopFailure(t *testing.T) {
 func TestShutdownRetriesRetainedAttachmentStops(t *testing.T) {
 	server := NewServer(nil)
 	key := attachmentKey{cluster: "demo", node: "cp-1"}
-	server.attachments[key] = 42
 	stopCalls := 0
-
-	original := stopInterface
-	stopInterface = func(fd int) error {
+	server.attachments[key] = testPlatformAttachment(42, func(fd int) error {
 		if fd != 42 {
-			t.Fatalf("stopInterface fd = %d, want 42", fd)
+			t.Fatalf("stop attachment fd = %d, want 42", fd)
 		}
 		stopCalls++
 		if stopCalls == 1 {
 			return wrapVMNetStopError(errors.New("retry later"), true)
 		}
 		return nil
-	}
-	t.Cleanup(func() {
-		stopInterface = original
 	})
 
 	if err := server.Shutdown(); err != nil {
@@ -136,20 +121,14 @@ func TestShutdownRetriesRetainedAttachmentStops(t *testing.T) {
 
 func TestShutdownBoundsRetainedStopRetries(t *testing.T) {
 	server := NewServer(nil)
-	server.pendingStops[42] = struct{}{}
 	stopCalls := 0
 	stopErr := errors.New("retry later")
-
-	original := stopInterface
-	stopInterface = func(fd int) error {
+	server.pendingStops[42] = testPlatformAttachment(42, func(fd int) error {
 		if fd != 42 {
-			t.Fatalf("stopInterface fd = %d, want 42", fd)
+			t.Fatalf("stop attachment fd = %d, want 42", fd)
 		}
 		stopCalls++
 		return wrapVMNetStopError(stopErr, true)
-	}
-	t.Cleanup(func() {
-		stopInterface = original
 	})
 
 	err := server.Shutdown()
@@ -167,17 +146,11 @@ func TestShutdownBoundsRetainedStopRetries(t *testing.T) {
 func TestDetachDropsAttachmentOnTerminalStopFailure(t *testing.T) {
 	server := NewServer(nil)
 	key := attachmentKey{cluster: "demo", node: "cp-1"}
-	server.attachments[key] = 42
-
-	original := stopInterface
-	stopInterface = func(fd int) error {
+	server.attachments[key] = testPlatformAttachment(42, func(fd int) error {
 		if fd != 42 {
-			t.Fatalf("stopInterface fd = %d, want 42", fd)
+			t.Fatalf("stop attachment fd = %d, want 42", fd)
 		}
 		return wrapVMNetStopError(errors.New("released"), false)
-	}
-	t.Cleanup(func() {
-		stopInterface = original
 	})
 
 	err := server.detach(json.RawMessage(`{"cluster":"demo","node":"cp-1"}`))
@@ -186,5 +159,15 @@ func TestDetachDropsAttachmentOnTerminalStopFailure(t *testing.T) {
 	}
 	if _, ok := server.attachments[key]; ok {
 		t.Fatal("attachment mapping was retained after terminal stop failure")
+	}
+}
+
+func testPlatformAttachment(fd int, stop func(int) error) *platformAttachment {
+	return &platformAttachment{
+		Kind: AttachmentDatagramFD,
+		FD:   fd,
+		stop: func() error {
+			return stop(fd)
+		},
 	}
 }

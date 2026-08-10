@@ -13,9 +13,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// SocketPath is the helper's system-wide Unix socket.
-const SocketPath = "/var/run/tbx-helper.sock"
-
 // The helper only performs short admin operations, so every interaction is
 // bounded: a stuck helper must not wedge daemon shutdown or cluster ops.
 const (
@@ -29,12 +26,16 @@ type Client struct {
 	mu         sync.Mutex
 }
 
-// Connect connects to the system helper.
+// Connect connects to the helper socket selected for this process.
 func Connect() (*Client, error) {
-	dialer := net.Dialer{Timeout: dialTimeout}
-	connection, err := dialer.Dial("unix", SocketPath)
+	socketPath, err := SocketPath()
 	if err != nil {
-		return nil, fmt.Errorf("connect to helper: %w", err)
+		return nil, err
+	}
+	dialer := net.Dialer{Timeout: dialTimeout}
+	connection, err := dialer.Dial("unix", socketPath)
+	if err != nil {
+		return nil, fmt.Errorf("connect to helper at %s: %w", socketPath, err)
 	}
 	return &Client{connection: connection.(*net.UnixConn)}, nil
 }
@@ -45,14 +46,28 @@ func (c *Client) Close() error {
 }
 
 // attach creates a vmnet interface and returns its datagram socket descriptor.
-func (c *Client) attach(cluster string, subnetIndex int, node string) (int, error) {
+func (c *Client) attach(cluster string, subnetIndex int, node string) (AttachmentKind, int, error) {
 	args := struct {
 		Cluster     string `json:"cluster"`
 		SubnetIndex int    `json:"subnetIndex"`
 		Node        string `json:"node"`
 	}{Cluster: cluster, SubnetIndex: subnetIndex, Node: node}
-	_, fd, err := c.call("net.attach", args, true)
-	return fd, err
+	response, fd, err := c.call("net.attach", args, true)
+	if err != nil {
+		return "", -1, err
+	}
+	var data struct {
+		Kind AttachmentKind `json:"kind"`
+	}
+	if err := json.Unmarshal(response.Data, &data); err != nil {
+		_ = unix.Close(fd)
+		return "", -1, fmt.Errorf("decode attach response: %w", err)
+	}
+	if data.Kind == "" {
+		_ = unix.Close(fd)
+		return "", -1, errors.New("attach response omitted attachment kind")
+	}
+	return data.Kind, fd, nil
 }
 
 // Detach stops and removes a node's vmnet interface.
@@ -130,9 +145,30 @@ func (c *Client) call(op string, args any, wantFD bool) (Response, int, error) {
 	}
 	wire = append(wire, '\n')
 	if err := writeAll(c.connection, wire); err != nil {
+		if responseErr := earlyHelperResponse(c.connection, err); responseErr != nil {
+			return Response{}, -1, responseErr
+		}
 		return Response{}, -1, fmt.Errorf("write helper request: %w", err)
 	}
 	return receiveResponse(c.connection, wantFD)
+}
+
+func earlyHelperResponse(connection *net.UnixConn, writeErr error) error {
+	if !errors.Is(writeErr, unix.EPIPE) && !errors.Is(writeErr, unix.ECONNRESET) {
+		return nil
+	}
+	_, _, err := receiveResponse(connection, false)
+	if err == nil {
+		return nil
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return nil
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
+		return nil
+	}
+	return err
 }
 
 func receiveResponse(connection *net.UnixConn, wantFD bool) (Response, int, error) {

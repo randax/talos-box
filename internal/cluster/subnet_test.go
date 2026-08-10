@@ -127,6 +127,88 @@ func TestCheckSubnetIndexAllowsExistingTalosBoxBridge(t *testing.T) {
 	}
 }
 
+func TestCheckSubnetIndexAllowsExistingLinuxTalosBoxBridge(t *testing.T) {
+	t.Parallel()
+
+	sources := SubnetSources{
+		Interfaces: func() ([]HostInterface, error) {
+			return []HostInterface{{Name: "br-tbx9", Addrs: []net.Addr{hostAddress("172.30.9.1/24")}}}, nil
+		},
+		Route: staticRoute("br-tbx9", "172.30.9.0/24"),
+	}
+	warning, err := CheckSubnetIndex(9, sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if warning != "" {
+		t.Fatalf("warning = %q, want empty", warning)
+	}
+}
+
+func TestCheckSubnetIndexRejectsForeignBridgeRoute(t *testing.T) {
+	t.Parallel()
+
+	sources := SubnetSources{
+		Interfaces: func() ([]HostInterface, error) { return nil, nil },
+		Route:      staticRoute("bridge0", "172.30.9.0/24"),
+	}
+	_, err := CheckSubnetIndex(9, sources)
+	if err == nil || !strings.Contains(err.Error(), "bridge0") {
+		t.Fatalf("CheckSubnetIndex() error = %v, want foreign bridge route collision", err)
+	}
+}
+
+func TestCheckSubnetIndexRejectsDifferentTalosBoxBridgeRoute(t *testing.T) {
+	t.Parallel()
+
+	sources := SubnetSources{
+		Interfaces: func() ([]HostInterface, error) { return nil, nil },
+		Route:      staticRoute("bridge108", "172.30.7.0/24"),
+	}
+	_, err := CheckSubnetIndex(7, sources)
+	if err == nil || !strings.Contains(err.Error(), "bridge108") {
+		t.Fatalf("CheckSubnetIndex() error = %v, want different-bridge route collision", err)
+	}
+}
+
+func TestSelectMostSpecificRouteSkipsOwnedBridgeRoute(t *testing.T) {
+	t.Parallel()
+
+	destination := net.ParseIP("172.30.9.2")
+	routes := []HostRoute{
+		mustHostRoute(t, "br-tbx9", "172.30.9.0/24"),
+		mustHostRoute(t, "vpn0", "172.16.0.0/12"),
+		mustHostRoute(t, "eth0", "0.0.0.0/0"),
+	}
+	got := selectMostSpecificRoute(destination, routes, map[string]bool{"br-tbx9": true})
+	if got.Interface != "vpn0" || got.Network.String() != "172.16.0.0/12" {
+		t.Fatalf("selected route = %+v, want vpn0 172.16.0.0/12", got)
+	}
+}
+
+func TestSelectMostSpecificRouteFallsBackToDefaultAfterOwnedBridge(t *testing.T) {
+	t.Parallel()
+
+	destination := net.ParseIP("172.30.9.2")
+	routes := []HostRoute{
+		mustHostRoute(t, "br-tbx9", "172.30.9.0/24"),
+		mustHostRoute(t, "eth0", "0.0.0.0/0"),
+	}
+	got := selectMostSpecificRoute(destination, routes, map[string]bool{"br-tbx9": true})
+	if got.Interface != "eth0" || got.Network.String() != "0.0.0.0/0" {
+		t.Fatalf("selected route = %+v, want eth0 0.0.0.0/0", got)
+	}
+}
+
+func mustHostRoute(t *testing.T, name, cidr string) HostRoute {
+	t.Helper()
+	_, network, err := net.ParseCIDR(cidr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return HostRoute{Interface: name, Network: network}
+}
+
 func TestRouteNotFound(t *testing.T) {
 	t.Parallel()
 

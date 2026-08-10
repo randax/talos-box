@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os/exec"
 	"strconv"
 	"strings"
 )
@@ -21,6 +20,17 @@ type HostInterface struct {
 type HostRoute struct {
 	Interface string
 	Network   *net.IPNet
+}
+
+// LinuxBridgeName and LinuxBridgeAlias are the netlink identity of a bridge
+// owned by Talos Box. The alias is provenance; the name alone is never enough
+// to authorize privileged mutation of a host link.
+func LinuxBridgeName(index int) string {
+	return fmt.Sprintf("br-tbx%d", index)
+}
+
+func LinuxBridgeAlias(index int) string {
+	return fmt.Sprintf("talos-box:bridge:%d", index)
 }
 
 // SubnetSources supplies unprivileged host interface and route observations.
@@ -154,7 +164,10 @@ func inspectSubnet(
 	if route.Interface == "" || route.Network == nil {
 		return subnetInspection{}, fmt.Errorf("inspect route to %s: incomplete route information", destination)
 	}
-	if strings.HasPrefix(route.Interface, "bridge") || !networksOverlap(candidate, route.Network) {
+	if !networksOverlap(candidate, route.Network) {
+		return subnetInspection{}, nil
+	}
+	if allowTalosBoxBridge && isTalosBoxBridgeName(route.Interface, index) {
 		return subnetInspection{}, nil
 	}
 	ones, bits := route.Network.Mask.Size()
@@ -206,39 +219,34 @@ func networksOverlap(left, right *net.IPNet) bool {
 	return left.Contains(right.IP) || right.Contains(left.IP)
 }
 
-func isTalosBoxBridge(name string, ip net.IP, network *net.IPNet, index int) bool {
-	ones, bits := network.Mask.Size()
-	bridgeIndex, err := strconv.Atoi(strings.TrimPrefix(name, "bridge"))
-	return err == nil && bridgeIndex >= 100 && bits == 32 && ones == 24 && ip.Equal(net.ParseIP(Gateway(index)))
-}
-
-func systemInterfaces() ([]HostInterface, error) {
-	interfaces, err := net.Interfaces()
-	if err != nil {
-		return nil, err
-	}
-	result := make([]HostInterface, 0, len(interfaces))
-	for _, current := range interfaces {
-		addresses, err := current.Addrs()
-		if err != nil {
-			// an interface that vanished between enumeration and query (VPN
-			// churn) has no addresses to collide with; don't block cluster ops
+func selectMostSpecificRoute(destination net.IP, routes []HostRoute, ignoredInterfaces map[string]bool) HostRoute {
+	selected := HostRoute{}
+	selectedPrefix := -1
+	for _, route := range routes {
+		if ignoredInterfaces[route.Interface] || route.Network == nil || !route.Network.Contains(destination) {
 			continue
 		}
-		result = append(result, HostInterface{Name: current.Name, Addrs: addresses})
+		prefix, bits := route.Network.Mask.Size()
+		if bits != 32 || prefix < 0 || prefix <= selectedPrefix {
+			continue
+		}
+		selected = route
+		selectedPrefix = prefix
 	}
-	return result, nil
+	return selected
 }
 
-func systemRoute(destination net.IP) (HostRoute, error) {
-	output, err := exec.Command("/sbin/route", "-n", "get", destination.String()).CombinedOutput()
-	if err != nil {
-		if routeNotFound(output) {
-			return HostRoute{}, nil
-		}
-		return HostRoute{}, fmt.Errorf("run /sbin/route: %w (%s)", err, strings.TrimSpace(string(output)))
+func isTalosBoxBridge(name string, ip net.IP, network *net.IPNet, index int) bool {
+	ones, bits := network.Mask.Size()
+	return bits == 32 && ones == 24 && ip.Equal(net.ParseIP(Gateway(index))) && isTalosBoxBridgeName(name, index)
+}
+
+func isTalosBoxBridgeName(name string, index int) bool {
+	if name == LinuxBridgeName(index) {
+		return true
 	}
-	return parseHostRoute(output, destination)
+	bridgeIndex, err := strconv.Atoi(strings.TrimPrefix(name, "bridge"))
+	return err == nil && strings.HasPrefix(name, "bridge") && bridgeIndex == 100+index
 }
 
 func routeNotFound(output []byte) bool {

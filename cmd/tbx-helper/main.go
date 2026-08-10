@@ -31,17 +31,27 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	if os.Geteuid() != 0 {
-		return errors.New("tbx-helper must run as root")
-	}
-	if allowedUID == nil {
-		log.Print("warning: --allowed-uid is not configured; only root can use tbx-helper; re-run `sudo tbx system install` from your account")
-	}
-	listener, err := helper.Listen(helper.SocketPath)
+	allowedUID, err = resolveAllowedUID(allowedUID)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = os.Remove(helper.SocketPath) }()
+	if err := requirePrivileges(); err != nil {
+		return err
+	}
+	warnMissingAllowedUID(allowedUID)
+	socketPath, err := helper.ServerSocketPath(allowedUID)
+	if err != nil {
+		return fmt.Errorf("resolve helper socket path: %w", err)
+	}
+	listener, err := helper.Listen(socketPath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.Remove(socketPath) }()
+	if err := helper.ConvergeNetworking(); err != nil {
+		_ = listener.Close()
+		return fmt.Errorf("converge helper networking: %w", err)
+	}
 
 	server := helper.NewServer(allowedUID)
 	serveErrors := make(chan error, 1)
@@ -65,7 +75,7 @@ func run(args []string) error {
 func parseAllowedUID(args []string) (*uint32, error) {
 	flags := flag.NewFlagSet("tbx-helper", flag.ContinueOnError)
 	var allowedUID *uint32
-	flags.Func("allowed-uid", "UID authorized to use the helper", func(value string) error {
+	flags.Func("allowed-uid", "UID authorized to use the helper (Linux defaults to SUDO_UID or the helper UID)", func(value string) error {
 		parsed, err := strconv.ParseUint(value, 10, 32)
 		if err != nil {
 			return fmt.Errorf("invalid uid %q: %w", value, err)
