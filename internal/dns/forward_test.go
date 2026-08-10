@@ -163,3 +163,44 @@ func TestServerForwardsPublicQueryThroughUDPSocket(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func BenchmarkExchangeUDP(b *testing.B) {
+	upstream, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = upstream.Close() }()
+
+	query, err := encodeQuery("example.com", 41)
+	if err != nil {
+		b.Fatal(err)
+	}
+	response, err := answer(query, func(string) net.IP { return net.IPv4(192, 0, 2, 8) })
+	if err != nil {
+		b.Fatal(err)
+	}
+	go func() {
+		buffer := make([]byte, 4096)
+		for {
+			_, peer, err := upstream.ReadFromUDP(buffer)
+			if err != nil {
+				return
+			}
+			if _, err := upstream.WriteToUDP(response, peer); err != nil {
+				return
+			}
+		}
+	}()
+
+	address := upstream.LocalAddr().String()
+	if _, err := exchangeUDP(query, address); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err := exchangeUDP(query, address); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

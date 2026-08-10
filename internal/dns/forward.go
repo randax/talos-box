@@ -9,10 +9,20 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
-const upstreamTimeout = 2 * time.Second
+const (
+	upstreamTimeout      = 2 * time.Second
+	maxUDPResponseLength = 65535
+)
+
+var udpResponseBuffers = sync.Pool{
+	New: func() any {
+		return new([maxUDPResponseLength]byte)
+	},
+}
 
 // SystemForward forwards a DNS packet through the name servers selected by
 // the host resolver configuration. On systemd-resolved hosts this targets the
@@ -76,12 +86,21 @@ func exchangeUDP(query []byte, address string) ([]byte, error) {
 	if _, err := connection.Write(query); err != nil {
 		return nil, err
 	}
-	response := make([]byte, 65535)
-	size, err := connection.Read(response)
+	responseBuffer := udpResponseBuffers.Get().(*[maxUDPResponseLength]byte)
+	defer udpResponseBuffers.Put(responseBuffer)
+
+	size, err := connection.Read(responseBuffer[:])
 	if err != nil {
 		return nil, err
 	}
-	return validateForwardedResponse(query, response[:size])
+	response, err := validateForwardedResponse(query, responseBuffer[:size])
+	if err != nil {
+		return nil, err
+	}
+
+	// The pooled buffer must not escape: callers retain the response after this
+	// function returns and another exchange may immediately reuse the buffer.
+	return append([]byte(nil), response...), nil
 }
 
 func exchangeTCP(query []byte, address string) ([]byte, error) {
