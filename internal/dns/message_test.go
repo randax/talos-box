@@ -138,6 +138,25 @@ func TestResolveCustomAndNestedDomains(t *testing.T) {
 	}
 }
 
+func TestNodeRecordNeverCrossesIntoNestedDomain(t *testing.T) {
+	t.Parallel()
+
+	// The outer cluster has a node whose FQDN equals the inner cluster's
+	// domain apex. Longest-suffix ownership means the inner cluster owns the
+	// name, and its apex has no record.
+	clusters := []cluster.Cluster{
+		{
+			Name: "outer", SubnetIndex: 3, Domain: "lab.test",
+			Nodes: []cluster.Node{{Name: "app", MAC: "52:54:00:00:00:03"}},
+		},
+		{Name: "inner", SubnetIndex: 9, Domain: "app.lab.test"},
+	}
+	lease := func(string, int) string { return "172.30.3.2" }
+	if got := Resolve("app.lab.test", clusters, lease); got != nil {
+		t.Fatalf("Resolve(app.lab.test) = %v, want nil (inner apex owns the name)", got)
+	}
+}
+
 func TestNodeWithoutLeaseDoesNotUseWildcard(t *testing.T) {
 	t.Parallel()
 	clusters := []cluster.Cluster{{Name: "demo", Nodes: []cluster.Node{{Name: "node"}}}}

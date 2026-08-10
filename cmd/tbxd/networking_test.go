@@ -150,7 +150,7 @@ func TestMaintainHostNetworkingRetriesAfterHelperUnavailable(t *testing.T) {
 		maintainHostNetworking(
 			stop,
 			ticks,
-			func() []string { return nil },
+			func() ([]string, error) { return nil, nil },
 			func(string) ([]byte, error) { return nil, errors.New("resolver missing") },
 			func() (map[string][]byte, error) { return nil, nil },
 			func(string, ...string) ([]byte, error) { return []byte("1\n"), nil },

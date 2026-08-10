@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+
+	"github.com/randax/talos-box/internal/cluster"
 )
 
 // Rejected TLDs collide with host resolver machinery: .local is routed to
@@ -40,6 +42,9 @@ func Validate(input string, allowUnsafe bool) (string, error) {
 	}
 	if reason, rejected := rejectedTLDs[labels[len(labels)-1]]; rejected {
 		return "", fmt.Errorf("domain %q is not usable: %s", name, reason)
+	}
+	if name == cluster.DefaultDomainSuffix {
+		return "", fmt.Errorf("domain %q is reserved as the shared suffix for default cluster domains", name)
 	}
 	if !Safe(name) && !allowUnsafe {
 		return "", fmt.Errorf("domain %q can shadow real DNS; pass --allow-unsafe-domain to use it anyway", name)

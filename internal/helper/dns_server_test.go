@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -57,6 +58,33 @@ func TestResolvedRegistrationFailureIsNonFatalAndActionable(t *testing.T) {
 	}
 	if registration.Detail == "" || registration.ManualStep == "" {
 		t.Fatalf("registration lacks detail or manual step: %#v", registration)
+	}
+}
+
+func TestDecodeDNSIdentityRefusesHostileDomains(t *testing.T) {
+	t.Parallel()
+
+	// The helper is root and hands the domain to resolvectl; anything but a
+	// canonical validated domain must be refused (a bare "." would register
+	// "~." and hijack all host DNS).
+	for _, raw := range []string{
+		`{"cluster":"a","domain":".","subnetIndex":0}`,
+		`{"cluster":"a","domain":"","subnetIndex":0}`, // empty falls back to the default — allowed
+		`{"cluster":"a","domain":"Lab.Internal","subnetIndex":0}`,
+		`{"cluster":"a","domain":"lab.internal.","subnetIndex":0}`,
+		`{"cluster":"a","domain":"../etc","subnetIndex":0}`,
+		`{"cluster":"a","domain":"a/b.test","subnetIndex":0}`,
+	} {
+		domain, _, err := decodeDNSIdentity([]byte(raw))
+		if strings.Contains(raw, `"domain":""`) {
+			if err != nil || domain != "a.k8s.test" {
+				t.Fatalf("empty domain: got %q, %v; want default a.k8s.test", domain, err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Fatalf("decodeDNSIdentity accepted %s as %q", raw, domain)
+		}
 	}
 }
 

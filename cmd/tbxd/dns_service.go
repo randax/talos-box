@@ -6,10 +6,37 @@ import (
 	"log"
 	"net"
 	"sort"
+	"sync"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/helper"
 )
+
+// clusterDomainSource serves the live cluster domain set for the DNS
+// authority predicate, retaining the last good read: a transient state error
+// must never shrink the set, or queries for live custom domains would be
+// forwarded to the upstream resolver (leaking names, or answering from real
+// DNS for unsafe domains).
+type clusterDomainSource struct {
+	mu   sync.Mutex
+	last []string
+}
+
+func (s *clusterDomainSource) domains() []string {
+	clusters, err := cluster.List()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err != nil {
+		log.Printf("DNS state refresh failed; keeping last-known domain set: %v", err)
+		return s.last
+	}
+	domains := make([]string, 0, len(clusters))
+	for _, item := range clusters {
+		domains = append(domains, item.EffectiveDomain())
+	}
+	s.last = domains
+	return domains
+}
 
 type daemonDNSService interface {
 	Errors() <-chan error

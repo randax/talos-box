@@ -28,6 +28,11 @@ func (s *Server) up(raw json.RawMessage) ([]Action, error) {
 	actions := PlanUp(args.Clusters, existing)
 	for i, action := range actions {
 		spec := args.Clusters[i]
+		if action.Kind == ActionStart || action.Kind == ActionNone {
+			if err := checkDomainUnchanged(spec); err != nil {
+				return actions[:i], err
+			}
+		}
 		switch action.Kind {
 		case ActionCreate:
 			result, err := s.createFromSpec(spec, args.Talos, args.Force)
@@ -70,6 +75,30 @@ func (s *Server) down(raw json.RawMessage) ([]Action, error) {
 		}
 	}
 	return actions, nil
+}
+
+// checkDomainUnchanged rejects a talosbox.yaml that asks an existing cluster
+// for a different domain: the domain is immutable (cert SANs bake it in), so
+// silence here would misreport reality as reconciled.
+func checkDomainUnchanged(spec config.ClusterSpec) error {
+	item, err := cluster.Load(spec.Name)
+	if err != nil {
+		return nil // partially-created state; create/start surfaces the real error
+	}
+	if spec.Domain != item.Domain {
+		return fmt.Errorf(
+			"cluster %q: domain is immutable (cluster has %q, talosbox.yaml wants %q); destroy and recreate the cluster to change it",
+			spec.Name, item.EffectiveDomain(), specEffectiveDomain(spec),
+		)
+	}
+	return nil
+}
+
+func specEffectiveDomain(spec config.ClusterSpec) string {
+	if spec.Domain != "" {
+		return spec.Domain
+	}
+	return spec.Name + "." + cluster.DefaultDomainSuffix
 }
 
 func (s *Server) existingStates() (map[string]ClusterState, error) {

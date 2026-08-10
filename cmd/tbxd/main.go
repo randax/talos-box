@@ -60,18 +60,7 @@ func run() error {
 			return nil
 		}
 		return tbxdns.Resolve(name, clusters, cluster.LookupIP)
-	}, tbxdns.Authority(func() []string {
-		clusters, err := cluster.List()
-		if err != nil {
-			log.Printf("DNS state refresh failed: %v", err)
-			return nil
-		}
-		domains := make([]string, 0, len(clusters))
-		for _, item := range clusters {
-			domains = append(domains, item.EffectiveDomain())
-		}
-		return domains
-	}))
+	}, tbxdns.Authority((&clusterDomainSource{}).domains))
 	if err != nil {
 		_ = listener.Close()
 		return err

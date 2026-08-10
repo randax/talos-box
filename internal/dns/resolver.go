@@ -8,29 +8,35 @@ import (
 )
 
 // Resolve returns a node address or the ingress wildcard for a live cluster.
-// Domains may nest across clusters; the longest matching suffix wins, so a
-// name under the nested cluster's domain never falls through to the enclosing
-// one.
+// Domains may nest across clusters; the cluster with the longest matching
+// domain suffix owns the name outright, so a name under the nested cluster's
+// domain never falls through to the enclosing one — not even to its node
+// records. The domain apex itself has no record.
 func Resolve(name string, clusters []cluster.Cluster, lease func(mac string, subnetIndex int) string) net.IP {
 	name = strings.ToLower(strings.TrimSuffix(name, "."))
-	for _, item := range clusters {
-		domain := strings.ToLower(item.EffectiveDomain())
-		for _, node := range item.Nodes {
-			if name == strings.ToLower(node.Name)+"."+domain {
-				return net.ParseIP(lease(node.MAC, item.SubnetIndex)).To4()
-			}
-		}
-	}
 
-	bestIndex, bestSuffix := -1, ""
-	for _, item := range clusters {
-		suffix := "." + strings.ToLower(item.EffectiveDomain())
-		if len(suffix) > len(bestSuffix) && strings.HasSuffix(name, suffix) {
-			bestIndex, bestSuffix = item.SubnetIndex, suffix
+	var owner *cluster.Cluster
+	ownerDomain := ""
+	for i, item := range clusters {
+		domain := strings.ToLower(item.EffectiveDomain())
+		if len(domain) <= len(ownerDomain) {
+			continue
+		}
+		if name == domain || strings.HasSuffix(name, "."+domain) {
+			owner, ownerDomain = &clusters[i], domain
 		}
 	}
-	if bestIndex < 0 || bestIndex > cluster.MaxSubnetIndex {
+	if owner == nil || name == ownerDomain {
 		return nil
 	}
-	return net.IPv4(172, 30, byte(bestIndex), 200)
+	if owner.SubnetIndex < 0 || owner.SubnetIndex > cluster.MaxSubnetIndex {
+		return nil
+	}
+
+	for _, node := range owner.Nodes {
+		if name == strings.ToLower(node.Name)+"."+ownerDomain {
+			return net.ParseIP(lease(node.MAC, owner.SubnetIndex)).To4()
+		}
+	}
+	return net.IPv4(172, 30, byte(owner.SubnetIndex), 200)
 }

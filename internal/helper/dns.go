@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/domain"
 )
 
 // DNSRegistration describes the host resolver routing configured for a
@@ -68,11 +69,21 @@ func decodeDNSIdentity(raw []byte) (string, int, error) {
 	if *args.SubnetIndex < 0 || *args.SubnetIndex > cluster.MaxSubnetIndex {
 		return "", 0, fmt.Errorf("subnet index %d is outside 0..%d", *args.SubnetIndex, cluster.MaxSubnetIndex)
 	}
-	domain := args.Domain
-	if domain == "" {
-		domain = args.Cluster + "." + cluster.DefaultDomainSuffix
+	name := args.Domain
+	if name == "" {
+		return args.Cluster + "." + cluster.DefaultDomainSuffix, *args.SubnetIndex, nil
 	}
-	return domain, *args.SubnetIndex, nil
+	// The helper runs as root and hands this string to resolvectl; refuse
+	// anything but a canonical validated domain (SPEC §11), so a buggy or
+	// hostile client cannot register e.g. "~." and hijack all host DNS.
+	canonical, err := domain.Validate(name, true)
+	if err != nil {
+		return "", 0, fmt.Errorf("refuse DNS registration: %w", err)
+	}
+	if canonical != name {
+		return "", 0, fmt.Errorf("refuse DNS registration: domain %q is not canonical", name)
+	}
+	return name, *args.SubnetIndex, nil
 }
 
 func decodeDNSSubnet(raw []byte) (int, error) {

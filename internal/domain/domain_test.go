@@ -18,6 +18,7 @@ func TestValidateRejects(t *testing.T) {
 		{"trailing hyphen label", "demo-.test"},
 		{"empty label", "demo..test"},
 		{"label over 63", "a123456789012345678901234567890123456789012345678901234567890123.test"},
+		{"default suffix is reserved", "k8s.test"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

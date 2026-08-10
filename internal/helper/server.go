@@ -13,10 +13,12 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/randax/talos-box/internal/resolverset"
 )
 
 const (
-	resolverPath                  = "/etc/resolver/k8s.test"
+	resolverPath                  = resolverset.SharedPath
 	shutdownStopMaxAttempts       = 5
 	shutdownStopInitialRetryDelay = 25 * time.Millisecond
 )

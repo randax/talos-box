@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/dns"
 	"github.com/randax/talos-box/internal/domain"
 	"github.com/randax/talos-box/internal/helper"
 	"github.com/randax/talos-box/internal/hypervisor"
@@ -198,6 +199,7 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	item.WorkerDefaults = args.Worker
 	item.BGP = args.BGP
 	item.Domain = canonicalDomain
+	item.AllowUnsafeDomain = canonicalDomain != "" && args.AllowUnsafeDomain
 	item.ImageArchitecture = string(s.hypervisor.Architecture())
 	item.Schematic, item.TalosVersion, err = s.resolveImage(args.Schematic, args.Version)
 	if err != nil {
@@ -214,6 +216,9 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if err := cluster.Save(item); err != nil {
 		_ = cluster.Destroy(item.Name)
 		return ClusterSummary{}, err
+	}
+	if item.Domain != "" {
+		syncDomainResolverFiles()
 	}
 	startWarning, err := s.start(item)
 	if err != nil {
@@ -470,7 +475,35 @@ func (s *Server) destroyCluster(raw json.RawMessage) (map[string]string, error) 
 	if err := cluster.Destroy(args.Name); err != nil {
 		return nil, err
 	}
+	syncDomainResolverFiles()
 	return map[string]string{"name": args.Name}, nil
+}
+
+// syncDomainResolverFiles converges the host's per-domain resolver files to
+// the clusters now in state, so a custom domain resolves the moment create
+// returns and its file disappears at destroy rather than on the next drift
+// tick. Best-effort: the tbxd reconciler re-asserts on its own cadence.
+func syncDomainResolverFiles() {
+	clusters, err := cluster.List()
+	if err != nil {
+		log.Printf("skip resolver-file sync: %v", err)
+		return
+	}
+	var domains []string
+	for _, item := range clusters {
+		if item.Domain != "" {
+			domains = append(domains, item.Domain)
+		}
+	}
+	client, err := helper.Connect()
+	if err != nil {
+		log.Printf("skip resolver-file sync: %v", err)
+		return
+	}
+	defer func() { _ = client.Close() }()
+	if err := client.SyncDomainResolvers(domains, dns.Port); err != nil {
+		log.Printf("sync custom-domain resolvers: %v", err)
+	}
 }
 
 func (s *Server) listClusters() ([]ClusterSummary, error) {
@@ -744,7 +777,7 @@ func summary(item cluster.Cluster, running bool) ClusterSummary {
 		Schematic:         item.Schematic,
 		BGP:               item.BGP,
 		Domain:            item.Domain,
-		AllowUnsafeDomain: item.Domain != "" && !domain.Safe(item.Domain),
+		AllowUnsafeDomain: item.AllowUnsafeDomain,
 		Running:           running,
 	}
 }

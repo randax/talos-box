@@ -119,7 +119,8 @@ continues to provide same-subnet switching, DHCP, NAT egress, and host reachabil
 **DNS**: embedded resolver in `tbxd` on `127.0.0.1`. Every cluster has a **cluster domain** —
 chosen at create (`--domain` / `domain:`), immutable, unique across clusters, defaulting to
 `<cluster>.k8s.test`. `*.<domain>` → that cluster's `.200`; `<node>.<domain>` → node IP;
-domains may nest across clusters and resolve longest-suffix-wins. Safe domains (`.test`,
+the domain apex itself has no record. Domains may nest across clusters and resolve
+longest-suffix-wins — the owning cluster answers (or NXDOMAINs) alone. Safe domains (`.test`,
 `.internal`, `home.arpa`) are accepted outright; `.local`/`.localhost`/`.invalid`/single-label
 are always rejected; anything else can shadow real DNS and requires the explicit
 `--allow-unsafe-domain` / `allowUnsafeDomain: true` opt-in (non-interactive, so scripted paths

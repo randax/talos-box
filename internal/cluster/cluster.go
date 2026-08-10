@@ -55,8 +55,11 @@ type Cluster struct {
 	TalosVersion         string        `json:"talosVersion,omitempty"`
 	ImageArchitecture    string        `json:"imageArchitecture,omitempty"`
 	// Domain is the canonical cluster domain when explicitly chosen at
-	// create; empty means the default, <name>.k8s.test.
-	Domain string `json:"domain,omitempty"`
+	// create; empty means the default, <name>.k8s.test. AllowUnsafeDomain
+	// records the opt-in the user passed for it, so emitted config
+	// round-trips regardless of how the safe-TLD policy evolves.
+	Domain            string `json:"domain,omitempty"`
+	AllowUnsafeDomain bool   `json:"allowUnsafeDomain,omitempty"`
 }
 
 // DefaultDomainSuffix is the suffix under which default cluster domains live.

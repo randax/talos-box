@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	resolverPath             = "/etc/resolver/k8s.test"
+	resolverPath             = resolverset.SharedPath
 	hostNetworkingCheckEvery = 60 * time.Second
 	hostCommandTimeout       = 10 * time.Second
 )
@@ -48,7 +48,9 @@ func configureHostNetworking() {
 	if err := client.InstallDNS(tbxdns.Port); err != nil {
 		log.Printf("install DNS resolver: %v", err)
 	}
-	if err := client.SyncDomainResolvers(customClusterDomains(), tbxdns.Port); err != nil {
+	if domains, err := customClusterDomains(); err != nil {
+		log.Printf("skip custom-domain resolver sync: %v", err)
+	} else if err := client.SyncDomainResolvers(domains, tbxdns.Port); err != nil {
 		log.Printf("sync custom-domain resolvers: %v", err)
 	}
 	if err := client.EnableForwarding(); err != nil {
@@ -57,12 +59,13 @@ func configureHostNetworking() {
 }
 
 // customClusterDomains lists the explicit domains of live clusters; clusters
-// on the default domain are served by the shared resolver file.
-func customClusterDomains() []string {
+// on the default domain are served by the shared resolver file. The error
+// matters: an unreadable state must never be treated as "no custom domains",
+// or the reconciler would delete every live custom-domain resolver file.
+func customClusterDomains() ([]string, error) {
 	clusters, err := cluster.List()
 	if err != nil {
-		log.Printf("load clusters for resolver maintenance: %v", err)
-		return nil
+		return nil, fmt.Errorf("load clusters for resolver maintenance: %w", err)
 	}
 	var domains []string
 	for _, item := range clusters {
@@ -70,7 +73,7 @@ func customClusterDomains() []string {
 			domains = append(domains, item.Domain)
 		}
 	}
-	return domains
+	return domains, nil
 }
 
 // listResolverFiles reads /etc/resolver as name → content; observation only,
@@ -161,7 +164,7 @@ func startHostNetworkingMaintenance() func() {
 func maintainHostNetworking(
 	stop <-chan struct{},
 	ticks <-chan time.Time,
-	customDomains func() []string,
+	customDomains func() ([]string, error),
 	readFile func(string) ([]byte, error),
 	listResolvers func() (map[string][]byte, error),
 	run func(string, ...string) ([]byte, error),
@@ -172,7 +175,13 @@ func maintainHostNetworking(
 		case <-stop:
 			return
 		case <-ticks:
-			domains := customDomains()
+			domains, err := customDomains()
+			if err != nil {
+				// Fail closed: without trustworthy state, reconciling would
+				// treat live custom domains as orphans and delete their files.
+				log.Printf("skip host networking check: %v", err)
+				continue
+			}
 			drift := checkHostNetworking(tbxdns.Port, domains, readFile, listResolvers, run)
 			if !drift.any() {
 				continue

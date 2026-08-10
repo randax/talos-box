@@ -15,6 +15,11 @@ import (
 // with; deletion is gated on it.
 const Marker = "# managed by talosbox"
 
+// SharedPath is the static resolver file covering every default-domain
+// cluster. It predates per-domain files, carries no marker, and is installed
+// and removed only by the explicit install/uninstall flow — never by Plan.
+const SharedPath = "/etc/resolver/k8s.test"
+
 // Content is the resolver file body for a custom cluster domain.
 func Content(port int) string {
 	return fmt.Sprintf("%s\nnameserver 127.0.0.1\nport %d\n", Marker, port)
