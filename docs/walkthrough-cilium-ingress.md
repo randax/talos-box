@@ -1,12 +1,62 @@
 # Walkthrough: from `tbx cluster create` to a browsable nginx URL
 
-End-to-end recipe validated 2026-07-21 on an Apple Silicon Mac: create a cluster with
-talosbox, configure it with `talosctl`, install Cilium (as CNI **and** ingress controller),
-deploy nginx, and open `http://nginx.demo.k8s.test/` in a browser. Total time from
-`cluster create` to HTTP 200 was about 10 minutes with a warm image cache.
+This guest-side recipe is shared by macOS and Linux: create a cluster with talosbox, configure
+it with `talosctl`, install Cilium (as CNI **and** ingress controller), deploy nginx, and open
+`http://nginx.demo.k8s.test/` in a browser. It was validated end to end on 2026-07-21 on an
+Apple Silicon Mac; total time from `cluster create` to HTTP 200 was about 10 minutes with a
+warm image cache. The Linux substrate implements the same contract, but its full-cluster CI
+gate remains [#97](https://github.com/randax/talos-box/issues/97).
 
-Prerequisites: `tbx` installed with `sudo tbx system install` done and `tbx doctor` passing,
-plus `talosctl` (matching the tbx-pinned Talos version, here v1.13.6), `kubectl`, and `helm`.
+Prerequisites: `tbx` installed, its platform helper active, and `tbx doctor` passing.
+On macOS, activate the helper with `sudo tbx system install`. On Linux, follow the
+[Linux host setup](linux.md); do not run the macOS installer there.
+
+## Install the cluster administration tools
+
+The walkthrough pins `talosctl` to the Talos version used by talosbox and `kubectl` to the
+matching Kubernetes minor. These Linux commands support both host architectures and verify
+the downloaded clients before installing them:
+
+```sh
+case "$(uname -m)" in
+  x86_64) TOOL_ARCH=amd64 ;;
+  aarch64|arm64) TOOL_ARCH=arm64 ;;
+  *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+
+TALOS_VERSION=v1.13.6
+curl -fLO \
+  "https://github.com/siderolabs/talos/releases/download/${TALOS_VERSION}/talosctl-linux-${TOOL_ARCH}"
+curl -fLO "https://github.com/siderolabs/talos/releases/download/${TALOS_VERSION}/sha256sum.txt"
+grep "  talosctl-linux-${TOOL_ARCH}$" sha256sum.txt | sha256sum --check
+sudo install -m 0755 "talosctl-linux-${TOOL_ARCH}" /usr/local/bin/talosctl
+rm "talosctl-linux-${TOOL_ARCH}" sha256sum.txt
+
+KUBERNETES_VERSION=v1.36.2
+curl -fLo kubectl \
+  "https://dl.k8s.io/release/${KUBERNETES_VERSION}/bin/linux/${TOOL_ARCH}/kubectl"
+curl -fLo kubectl.sha256 \
+  "https://dl.k8s.io/release/${KUBERNETES_VERSION}/bin/linux/${TOOL_ARCH}/kubectl.sha256"
+printf '%s  kubectl\n' "$(cat kubectl.sha256)" | sha256sum --check
+sudo install -m 0755 kubectl /usr/local/bin/kubectl
+rm kubectl kubectl.sha256
+```
+
+Install Helm 3 with its official, checksum-verifying installer. Review the downloaded script
+before executing it if required by local policy:
+
+```sh
+curl -fsSLo get-helm-3 https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+chmod 700 get-helm-3
+DESIRED_VERSION=v3.21.1 ./get-helm-3
+rm get-helm-3
+
+talosctl version --client
+kubectl version --client
+helm version --short
+```
+
+macOS users can install the same three clients with Homebrew, keeping `talosctl` on v1.13.6.
 
 ## 1. Create the cluster
 
@@ -59,7 +109,8 @@ cluster:
 ```
 
 Generate the config (the endpoint DNS name comes from the `tbx status` hint;
-`<node>.<cluster>.k8s.test` resolves via the resolver `tbx system install` set up):
+`<node>.<cluster>.k8s.test` resolves through `/etc/resolver` on macOS or the bridge's
+systemd-resolved route-only domain on Linux):
 
 ```sh
 talosctl gen config demo https://demo-cp-1.demo.k8s.test:6443 --output-dir . \
@@ -194,7 +245,9 @@ Any other hostname under `.demo.k8s.test` works the same way; just add Ingress r
   `tbx manifests <cluster> k8s`. When migrating a pre-1.19 Cilium cluster, also delete its
   `CiliumBGPPeeringPolicy` named `<cluster>-bgp` while that legacy API is still served, before
   upgrading Cilium and applying the v2 resources.
-- Run `tbx doctor` before creating or starting a workshop cluster. Extreme host swap or
+- Run `tbx doctor` before creating or starting a workshop cluster. On Linux, run it again once
+  the cluster bridge exists and use the [Linux doctor reference](linux.md#what-tbx-doctor-checks-on-linux)
+  for the platform-specific checks. Extreme host swap or
   data-volume pressure can reset guests during image unpack and corrupt Talos EPHEMERAL data;
   free memory/disk space or reduce the cluster size instead of overriding the preflight.
 - If a Talos system service reports `exec format error` (or exits 139) after an unexpected
