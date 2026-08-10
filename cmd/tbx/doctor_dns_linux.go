@@ -1,4 +1,4 @@
-//go:build darwin
+//go:build linux
 
 package main
 
@@ -12,23 +12,22 @@ import (
 	"github.com/randax/talos-box/internal/daemon"
 )
 
-const resolverBypassMessage = "scoped resolver is being bypassed (DNS filtering agent or browser/system DoH)"
+const resolverBypassMessage = "systemd-resolved route-only domain is missing or being bypassed"
 
 func checkSystemDNS(clusters []daemon.ClusterSummary, command commandOutput) error {
+	if _, err := command("resolvectl", "status"); err != nil {
+		return optionalHostDNSError{detail: resolvedUnavailableDetail(err)}
+	}
 	var problems []string
 	for _, item := range clusters {
 		name := fmt.Sprintf("doctor-probe.%s.k8s.test", item.Name)
 		expected := net.ParseIP(fmt.Sprintf("172.30.%d.200", item.SubnetIndex))
-
-		// dscacheutil goes through macOS SystemConfiguration and therefore exercises
-		// scoped /etc/resolver domains directly. That is more reliable here than
-		// depending on whether this Go build selects cgo getaddrinfo at runtime.
-		output, err := command("/usr/bin/dscacheutil", "-q", "host", "-a", "name", name)
+		output, err := command("getent", "ahostsv4", name)
 		if err != nil {
 			problems = append(problems, fmt.Sprintf("%s: %s: lookup failed: %v", item.Name, resolverBypassMessage, err))
 			continue
 		}
-		addresses := parseDSCacheAddresses(output)
+		addresses := parseGetentAddresses(output)
 		matched := false
 		for _, address := range addresses {
 			if address.Equal(expected) {
@@ -47,15 +46,15 @@ func checkSystemDNS(clusters []daemon.ClusterSummary, command commandOutput) err
 	return nil
 }
 
-func parseDSCacheAddresses(output []byte) []net.IP {
+func parseGetentAddresses(output []byte) []net.IP {
 	var addresses []net.IP
 	scanner := bufio.NewScanner(strings.NewReader(string(output)))
 	for scanner.Scan() {
-		key, value, ok := strings.Cut(strings.TrimSpace(scanner.Text()), ":")
-		if !ok || (key != "ip_address" && key != "ipv6_address") {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) == 0 {
 			continue
 		}
-		if address := net.ParseIP(strings.TrimSpace(value)); address != nil {
+		if address := net.ParseIP(fields[0]); address != nil {
 			addresses = append(addresses, address)
 		}
 	}

@@ -32,6 +32,7 @@ type serverReply struct {
 	response Response
 	fd       int
 	cleanup  func()
+	finalize func()
 }
 
 // Server owns helper-created vmnet interfaces.
@@ -246,6 +247,9 @@ func (s *Server) serveConnection(connection *net.UnixConn) {
 		if err != nil && reply.cleanup != nil {
 			reply.cleanup()
 		}
+		if reply.finalize != nil {
+			reply.finalize()
+		}
 		s.opMu.Unlock()
 		if err != nil {
 			return
@@ -281,6 +285,9 @@ func sendResponse(connection *net.UnixConn, response Response, fd int) error {
 }
 
 func (s *Server) dispatch(request Request) serverReply {
+	if request.Op == "dns.listen" {
+		return dnsListenerReply(request.Args)
+	}
 	data, fd, cleanup, err := s.handle(request)
 	if err != nil {
 		return serverReply{response: failure(err), fd: -1}
@@ -301,15 +308,26 @@ func (s *Server) handle(request Request) (any, int, func(), error) {
 		if err := decodeArgs(request.Args, &args); err != nil {
 			return nil, -1, nil, err
 		}
-		return nil, -1, nil, installResolver(resolverPath, args.Port)
+		return nil, -1, nil, installHostResolver(args.Port)
 	case "dns.uninstall":
-		err := os.Remove(resolverPath)
-		if errors.Is(err, os.ErrNotExist) {
-			err = nil
-		} else if err != nil {
-			err = fmt.Errorf("remove resolver file: %w", err)
+		return nil, -1, nil, uninstallHostResolver()
+	case "dns.register":
+		clusterName, subnetIndex, err := decodeDNSIdentity(request.Args)
+		if err != nil {
+			return nil, -1, nil, err
 		}
-		return nil, -1, nil, err
+		return registerDNS(clusterName, subnetIndex), -1, nil, nil
+	case "dns.unregister":
+		var args struct {
+			SubnetIndex *int `json:"subnetIndex"`
+		}
+		if err := decodeArgs(request.Args, &args); err != nil {
+			return nil, -1, nil, err
+		}
+		if args.SubnetIndex == nil || *args.SubnetIndex < 0 || *args.SubnetIndex > 255 {
+			return nil, -1, nil, errors.New("valid subnetIndex is required")
+		}
+		return nil, -1, nil, unregisterDNS(*args.SubnetIndex)
 	case "forwarding.enable":
 		return nil, -1, nil, enableForwarding()
 	case "bgp.enable":

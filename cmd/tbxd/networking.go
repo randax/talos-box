@@ -1,3 +1,5 @@
+//go:build darwin
+
 package main
 
 import (
@@ -29,6 +31,21 @@ type hostNetworkingClient interface {
 	InstallDNS(port int) error
 	EnableForwarding() error
 	Close() error
+}
+
+func configureHostNetworking() {
+	client, err := helper.Connect()
+	if err != nil {
+		log.Printf("network helper unavailable; run sudo tbx system install: %v", err)
+		return
+	}
+	defer func() { _ = client.Close() }()
+	if err := client.InstallDNS(tbxdns.Port); err != nil {
+		log.Printf("install DNS resolver: %v", err)
+	}
+	if err := client.EnableForwarding(); err != nil {
+		log.Printf("enable IP forwarding: %v", err)
+	}
 }
 
 // checkHostNetworking only observes unprivileged host state. Its inputs are

@@ -14,7 +14,6 @@ import (
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/daemon"
 	tbxdns "github.com/randax/talos-box/internal/dns"
-	"github.com/randax/talos-box/internal/helper"
 	"github.com/randax/talos-box/internal/version"
 )
 
@@ -45,7 +44,7 @@ func run() error {
 		_ = listener.Close()
 		return err
 	}
-	dnsServer, err := tbxdns.Listen(tbxdns.Address, func(name string) net.IP {
+	dnsService, err := startDNSService(func(name string) net.IP {
 		clusters, err := cluster.List()
 		if err != nil {
 			log.Printf("DNS state refresh failed: %v", err)
@@ -67,7 +66,6 @@ func run() error {
 
 	serveErrors := make(chan error, 2)
 	go func() { serveErrors <- server.Serve(listener) }()
-	go func() { serveErrors <- dnsServer.Serve() }()
 
 	signal.Ignore(os.Interrupt)
 	terminated := make(chan os.Signal, 1)
@@ -77,26 +75,15 @@ func run() error {
 	select {
 	case err := <-serveErrors:
 		stopHostNetworkingMaintenance()
-		shutdownErr := errors.Join(server.Shutdown(), dnsServer.Close())
+		shutdownErr := errors.Join(server.Shutdown(), dnsService.Close())
+		return errors.Join(err, shutdownErr)
+	case err := <-dnsService.Errors():
+		stopHostNetworkingMaintenance()
+		shutdownErr := errors.Join(server.Shutdown(), dnsService.Close())
 		return errors.Join(err, <-serveErrors, shutdownErr)
 	case <-terminated:
 		stopHostNetworkingMaintenance()
-		shutdownErr := errors.Join(server.Shutdown(), dnsServer.Close())
-		return errors.Join(shutdownErr, <-serveErrors, <-serveErrors)
-	}
-}
-
-func configureHostNetworking() {
-	client, err := helper.Connect()
-	if err != nil {
-		log.Printf("network helper unavailable; run `sudo tbx system install`: %v", err)
-		return
-	}
-	defer func() { _ = client.Close() }()
-	if err := client.InstallDNS(tbxdns.Port); err != nil {
-		log.Printf("install DNS resolver: %v", err)
-	}
-	if err := client.EnableForwarding(); err != nil {
-		log.Printf("enable IP forwarding: %v", err)
+		shutdownErr := errors.Join(server.Shutdown(), dnsService.Close())
+		return errors.Join(shutdownErr, <-serveErrors)
 	}
 }
