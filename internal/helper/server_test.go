@@ -51,6 +51,7 @@ func TestIsAuthorizedUID(t *testing.T) {
 		name       string
 		uid        uint32
 		allowedUID *uint32
+		allowAny   bool
 		want       bool
 	}{
 		{name: "allowed uid", uid: 501, allowedUID: &allowedUID, want: true},
@@ -58,12 +59,14 @@ func TestIsAuthorizedUID(t *testing.T) {
 		{name: "other uid", uid: 502, allowedUID: &allowedUID, want: false},
 		{name: "unset allows root", uid: 0, want: true},
 		{name: "unset rejects user", uid: 501, want: false},
+		{name: "socket-admitted group peer", uid: 501, allowAny: true, want: true},
+		{name: "explicit uid remains authoritative for activated socket", uid: 502, allowedUID: &allowedUID, allowAny: true, want: false},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			if got := isAuthorizedUID(test.uid, test.allowedUID); got != test.want {
+			if got := isAuthorizedUID(test.uid, test.allowedUID, test.allowAny); got != test.want {
 				t.Fatalf("isAuthorizedUID(%d) = %t, want %t", test.uid, got, test.want)
 			}
 		})

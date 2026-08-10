@@ -6,7 +6,11 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/hypervisor"
 )
 
 type suspendMachineFake struct {
@@ -171,5 +175,41 @@ func TestResumeNodeBatchCommitsSaveStatesOnlyAfterAllNodesResume(t *testing.T) {
 		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("save state %s still exists or stat failed: %v", path, err)
 		}
+	}
+}
+
+func TestSuspendClusterFastFailsWithCapabilityReason(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("suspend-unsupported", 0, 1, 0, cluster.NodeDefaults{MemoryMiB: 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+
+	machine := &suspendMachineFake{}
+	service := &Server{
+		hypervisor: &fakeHypervisor{
+			capabilities: hypervisor.Capabilities{
+				Suspend: hypervisor.FeatureStatus{
+					Reason: "suspend requires QEMU >= 8.2 (found 6.2) — upgrade to Ubuntu 24.04+",
+				},
+			},
+		},
+		vms: map[string]map[string]hypervisor.Machine{
+			item.Name: {item.Nodes[0].Name: machine},
+		},
+	}
+
+	_, err = service.suspendCluster([]byte(`{"name":"suspend-unsupported"}`))
+	if !errors.Is(err, hypervisor.ErrUnsupported) {
+		t.Fatalf("suspendCluster() error = %v, want ErrUnsupported", err)
+	}
+	if !strings.Contains(err.Error(), "suspend requires QEMU >= 8.2 (found 6.2) — upgrade to Ubuntu 24.04+") {
+		t.Fatalf("suspendCluster() error = %q, want capability reason", err)
+	}
+	if len(machine.calls) != 0 {
+		t.Fatalf("suspendCluster() touched machine despite unsupported capability: %v", machine.calls)
 	}
 }

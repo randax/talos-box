@@ -121,12 +121,14 @@ continues to provide same-subnet switching, DHCP, NAT egress, and host reachabil
 
 **BGP mode** (`tbx bgp enable <cluster>`): "host as ToR" — one embedded GoBGP instance,
 host **ASN 64512**, listening on each enabled cluster's `.1:179`; cluster *n* nodes speak
-**ASN 64600+n**, eBGP to the host; learned routes are injected into the macOS FIB via
-`tbx-helper` (PF_ROUTE). When enabled, BGP advertisement **replaces** L2 announcements for the
-LB pool (each mechanism teachable in isolation). Pod-CIDR advertisement is accepted, not
-guaranteed. **L2-mode VIP failover latency: up to ~1 minute** — macOS ignores gratuitous ARP
-through vmnet and converges only via its own ARP revalidation (gate G2, closed); BGP mode is
-the fast-failover path and the docs should teach that contrast.
+**ASN 64600+n**, eBGP to the host; learned routes are injected into the host FIB via
+`tbx-helper` (PF_ROUTE on macOS, rtnetlink `RTM_NEWROUTE`/`RTM_DELROUTE` on Linux). When
+enabled, BGP advertisement **replaces** L2 announcements for the LB pool (each mechanism
+teachable in isolation). Pod-CIDR advertisement is accepted, not guaranteed. On Linux, this
+mode is mainly for routed upstreams, ECMP, or `externalTrafficPolicy: Local` where only nodes
+with local endpoints should advertise. The slow-L2 failover caveat is macOS/vmnet-specific:
+macOS ignores gratuitous ARP through vmnet and converges only via its own ARP revalidation,
+so BGP remains the fast-failover path there.
 
 **Registry mirror** (required — see evidence in
 [the installer-stall ticket](https://github.com/randax/talos-box/issues/12): corporate agents
@@ -261,8 +263,9 @@ Implementation must close these before v1 ships:
 
 - **G1 — macOS floor**: boot the pinned Talos on macOS 14 and 15 under vz. Hang → implement
   direct-kernel-boot fallback (§3) or raise the floor to the oldest passing version.
-- ~~G2 — GARP on failover~~ **CLOSED**: host ignores GARP through vmnet; L2 failover converges
-  via macOS ARP revalidation in ~40–50 s (§5 documents the latency; BGP mode for fast failover).
+- ~~G2 — GARP on failover~~ **CLOSED**: on macOS, the host ignores GARP through vmnet; L2
+  failover converges via macOS ARP revalidation in ~40–50 s (§5 documents the latency; BGP mode
+  for fast failover there). Linux shared-bridge mode does not have this gate.
   Residual: repeated-GARP bursts untested.
 - ~~G3 — balloon policy tuning~~ **CLOSED** (#38): defaults are **6 GiB host reserve, 1 GiB
   per-node floor, 5s poll** (`TBX_BALLOON_RESERVE_MIB` overrides the reserve). Verified live:

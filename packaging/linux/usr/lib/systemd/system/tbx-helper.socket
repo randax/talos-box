@@ -1,0 +1,12 @@
+[Unit]
+Description=Talos Box privileged helper socket
+
+[Socket]
+ListenStream=/var/run/tbx-helper.sock
+SocketUser=tbx
+SocketGroup=tbx
+SocketMode=0660
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

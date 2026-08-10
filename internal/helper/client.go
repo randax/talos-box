@@ -23,7 +23,9 @@ const (
 
 // Client is a serialized connection to tbx-helper.
 type Client struct {
+	socketPath string
 	connection *net.UnixConn
+	info       Info
 	mu         sync.Mutex
 }
 
@@ -33,17 +35,38 @@ func Connect() (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	connection, info, err := dialHelper(socketPath)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{socketPath: socketPath, connection: connection, info: info}, nil
+}
+
+func dialHelper(socketPath string) (*net.UnixConn, Info, error) {
 	dialer := net.Dialer{Timeout: dialTimeout}
 	connection, err := dialer.Dial("unix", socketPath)
 	if err != nil {
-		return nil, fmt.Errorf("connect to helper at %s: %w", socketPath, err)
+		return nil, Info{}, fmt.Errorf("connect to helper at %s: %w", socketPath, err)
 	}
-	return &Client{connection: connection.(*net.UnixConn)}, nil
+	unixConnection := connection.(*net.UnixConn)
+	info, err := handshakeHelper(unixConnection)
+	if err != nil {
+		_ = unixConnection.Close()
+		return nil, Info{}, err
+	}
+	return unixConnection, info, nil
 }
 
 // Close closes the helper connection.
 func (c *Client) Close() error {
 	return c.connection.Close()
+}
+
+// Info returns the connected helper's self-reported protocol and capability state.
+func (c *Client) Info() (Info, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.info, nil
 }
 
 // attach creates a vmnet interface and returns its datagram socket descriptor.
@@ -184,7 +207,20 @@ func (c *Client) Ping() error {
 func (c *Client) call(op string, args any, wantFD bool) (Response, int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	response, fd, err := c.callLocked(op, args, wantFD)
+	if err == nil {
+		return response, fd, nil
+	}
+	if !shouldReconnect(op, err) {
+		return Response{}, -1, err
+	}
+	if reconnectErr := c.reconnectLocked(); reconnectErr != nil {
+		return Response{}, -1, errors.Join(err, reconnectErr)
+	}
+	return c.callLocked(op, args, wantFD)
+}
 
+func (c *Client) callLocked(op string, args any, wantFD bool) (Response, int, error) {
 	if err := c.connection.SetDeadline(time.Now().Add(callTimeout)); err != nil {
 		return Response{}, -1, fmt.Errorf("set helper call deadline: %w", err)
 	}
@@ -208,6 +244,83 @@ func (c *Client) call(op string, args any, wantFD bool) (Response, int, error) {
 	return receiveResponse(c.connection, wantFD)
 }
 
+func (c *Client) reconnectLocked() error {
+	_ = c.connection.Close()
+	connection, info, err := dialHelper(c.socketPath)
+	if err != nil {
+		return fmt.Errorf("reconnect to helper at %s: %w", c.socketPath, err)
+	}
+	c.connection = connection
+	c.info = info
+	return nil
+}
+
+func handshakeHelper(connection *net.UnixConn) (Info, error) {
+	response, _, err := exchangeRequest(connection, helperInfoOp, map[string]int{"protocolVersion": protocolVersion}, false)
+	if err != nil {
+		return Info{}, err
+	}
+	if !response.OK {
+		return Info{}, protocolHandshakeFailure(response.Error)
+	}
+	var info Info
+	if err := json.Unmarshal(response.Data, &info); err != nil {
+		return Info{}, fmt.Errorf("decode helper info: %w", err)
+	}
+	if info.ProtocolVersion != protocolVersion {
+		return Info{}, protocolMismatchError(protocolVersion, info.ProtocolVersion)
+	}
+	return info, nil
+}
+
+func exchangeRequest(connection *net.UnixConn, op string, args any, wantFD bool) (Response, int, error) {
+	if err := connection.SetDeadline(time.Now().Add(callTimeout)); err != nil {
+		return Response{}, -1, fmt.Errorf("set helper call deadline: %w", err)
+	}
+	defer func() { _ = connection.SetDeadline(time.Time{}) }()
+
+	rawArgs, err := json.Marshal(args)
+	if err != nil {
+		return Response{}, -1, fmt.Errorf("encode request arguments: %w", err)
+	}
+	wire, err := json.Marshal(Request{Op: op, Args: rawArgs})
+	if err != nil {
+		return Response{}, -1, fmt.Errorf("encode request: %w", err)
+	}
+	wire = append(wire, '\n')
+	if err := writeAll(connection, wire); err != nil {
+		if responseErr := earlyHelperResponse(connection, err); responseErr != nil {
+			return Response{}, -1, responseErr
+		}
+		return Response{}, -1, fmt.Errorf("write helper request: %w", err)
+	}
+	return receiveRawResponse(connection, wantFD)
+}
+
+func receiveRawResponse(connection *net.UnixConn, wantFD bool) (Response, int, error) {
+	return receiveDecodedResponse(connection, wantFD, false)
+}
+
+func shouldReconnect(op string, err error) bool {
+	if !safeRetryOperation(op) {
+		return false
+	}
+	return errors.Is(err, unix.EPIPE) ||
+		errors.Is(err, unix.ECONNRESET) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, net.ErrClosed)
+}
+
+func safeRetryOperation(op string) bool {
+	switch op {
+	case helperInfoOp, "ping", "net.detach", "dns.install", "dns.uninstall", "dns.register", "dns.unregister", "forwarding.enable", "bgp.enable", "bgp.disable":
+		return true
+	default:
+		return false
+	}
+}
+
 func earlyHelperResponse(connection *net.UnixConn, writeErr error) error {
 	if !errors.Is(writeErr, unix.EPIPE) && !errors.Is(writeErr, unix.ECONNRESET) {
 		return nil
@@ -227,6 +340,10 @@ func earlyHelperResponse(connection *net.UnixConn, writeErr error) error {
 }
 
 func receiveResponse(connection *net.UnixConn, wantFD bool) (Response, int, error) {
+	return receiveDecodedResponse(connection, wantFD, true)
+}
+
+func receiveDecodedResponse(connection *net.UnixConn, wantFD, failOnResponseError bool) (Response, int, error) {
 	const maxResponseSize = 1 << 20
 	var payload bytes.Buffer
 	rights := make([]int, 0, 1)
@@ -280,7 +397,7 @@ func receiveResponse(connection *net.UnixConn, wantFD bool) (Response, int, erro
 		closeRights()
 		return Response{}, -1, fmt.Errorf("decode helper response: %w", err)
 	}
-	if !response.OK {
+	if !response.OK && failOnResponseError {
 		closeRights()
 		if response.Error == "" {
 			return response, -1, errors.New("helper operation failed")

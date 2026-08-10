@@ -17,22 +17,28 @@ type optionalHostDNSError struct{ detail string }
 
 func (e optionalHostDNSError) Error() string { return e.detail }
 
-func checkResolver() error {
-	if _, err := execCombinedOutput("resolvectl", "status"); err != nil {
-		return optionalHostDNSError{detail: resolvedUnavailableDetail(err)}
-	}
-	return nil
+func checkPlatformDirectDNS() error {
+	return checkLinuxDirectDNS(cluster.List, os.ReadFile, tbxdns.Probe)
 }
 
-func checkPlatformDirectDNS() error {
-	clusters, err := cluster.List()
+func checkLinuxDirectDNS(
+	listClusters func() ([]cluster.Cluster, error),
+	readFile func(string) ([]byte, error),
+	probe func(string) error,
+) error {
+	clusters, err := listClusters()
 	if err != nil {
 		return fmt.Errorf("list clusters: %w", err)
 	}
 	var result error
 	for _, item := range clusters {
+		bridge := cluster.LinuxBridgeName(item.SubnetIndex)
+		if _, err := readFile("/sys/class/net/" + bridge + "/ifindex"); err != nil {
+			result = errors.Join(result, fmt.Errorf("%s: inspect %s: %w", item.Name, bridge, err))
+			continue
+		}
 		address := net.JoinHostPort(cluster.Gateway(item.SubnetIndex), "53")
-		if err := tbxdns.Probe(address); err != nil {
+		if err := probe(address); err != nil {
 			result = errors.Join(result, fmt.Errorf("%s (%s): %w", item.Name, address, err))
 		}
 	}

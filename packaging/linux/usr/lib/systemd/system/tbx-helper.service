@@ -1,0 +1,21 @@
+[Unit]
+Description=Talos Box privileged helper
+
+[Service]
+ExecStart=/usr/bin/tbx-helper
+User=tbx
+Group=tbx
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+NoNewPrivileges=yes
+DynamicUser=no
+PrivateNetwork=no
+ProtectSystem=strict
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+DeviceAllow=/dev/net/tun rw

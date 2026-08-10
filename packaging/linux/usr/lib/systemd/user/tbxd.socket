@@ -1,0 +1,11 @@
+[Unit]
+Description=Talos Box daemon socket
+
+[Socket]
+ListenStream=%h/.talosbox/tbxd.sock
+SocketMode=0600
+DirectoryMode=0700
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

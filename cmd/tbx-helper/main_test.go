@@ -44,6 +44,22 @@ func TestParseAllowedUIDRejectsInvalidValue(t *testing.T) {
 	}
 }
 
+func TestServerAllowedUIDUsesSocketAdmissionOnlyWhenImplicitAndActivated(t *testing.T) {
+	t.Parallel()
+
+	serviceUID := uint32(995)
+	userUID := uint32(501)
+	if got := serverAllowedUID(&serviceUID, false, true); got != nil {
+		t.Fatalf("implicit activated UID = %v, want socket admission", got)
+	}
+	if got := serverAllowedUID(&userUID, true, true); got == nil || *got != userUID {
+		t.Fatalf("explicit activated UID = %v, want %d", got, userUID)
+	}
+	if got := serverAllowedUID(&userUID, false, false); got == nil || *got != userUID {
+		t.Fatalf("manual helper UID = %v, want %d", got, userUID)
+	}
+}
+
 func uint32Pointer(value uint32) *uint32 {
 	return &value
 }

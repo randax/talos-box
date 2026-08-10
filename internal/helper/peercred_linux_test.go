@@ -28,10 +28,10 @@ func TestLinuxSocketAuthorizationAlwaysUsesPeerUID(t *testing.T) {
 	t.Parallel()
 
 	uid := uint32(os.Geteuid())
-	if uid != 0 && isAuthorizedPeer(uid, nil) {
+	if uid != 0 && isAuthorizedPeer(uid, nil, false) {
 		t.Fatal("non-root peer was authorized without an allowed UID")
 	}
-	if !isAuthorizedPeer(0, nil) {
+	if !isAuthorizedPeer(0, nil, false) {
 		t.Fatal("root peer was rejected")
 	}
 }

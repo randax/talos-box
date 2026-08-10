@@ -11,6 +11,9 @@ import (
 
 func TestLinuxClientSocketPath(t *testing.T) {
 	t.Parallel()
+	originalStat := statSocketPath
+	t.Cleanup(func() { statSocketPath = originalStat })
+	statSocketPath = func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
 
 	tests := []struct {
 		name     string
@@ -52,6 +55,9 @@ func TestLinuxClientSocketPath(t *testing.T) {
 
 func TestLinuxSudoClientAndServerSocketPathsMatch(t *testing.T) {
 	t.Parallel()
+	originalStat := statSocketPath
+	t.Cleanup(func() { statSocketPath = originalStat })
+	statSocketPath = func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
 
 	allowedUID := uint32(501)
 	clientPath, err := linuxClientSocketPath(0, "501", "")
@@ -103,6 +109,44 @@ func TestLinuxSocketOverrideIsSharedByClientAndServer(t *testing.T) {
 	defer func() { _ = client.Close() }()
 	if err := client.Ping(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLinuxClientSocketPathPrefersSystemSocket(t *testing.T) {
+	originalStat := statSocketPath
+	t.Cleanup(func() { statSocketPath = originalStat })
+	statSocketPath = func(path string) (os.FileInfo, error) {
+		if path == systemHelperSocketPath {
+			return os.Stat("/")
+		}
+		return nil, os.ErrNotExist
+	}
+
+	got, err := linuxClientSocketPath(501, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != systemHelperSocketPath {
+		t.Fatalf("linuxClientSocketPath() = %q, want %q", got, systemHelperSocketPath)
+	}
+}
+
+func TestLinuxClientSocketPathPreservesExistingUserHelper(t *testing.T) {
+	originalStat := statSocketPath
+	t.Cleanup(func() { statSocketPath = originalStat })
+	statSocketPath = func(path string) (os.FileInfo, error) {
+		if path == systemHelperSocketPath || path == linuxUserSocketPath(501) {
+			return os.Stat("/")
+		}
+		return nil, os.ErrNotExist
+	}
+
+	got, err := linuxClientSocketPath(501, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := linuxUserSocketPath(501); got != want {
+		t.Fatalf("linuxClientSocketPath() = %q, want existing user helper %q", got, want)
 	}
 }
 

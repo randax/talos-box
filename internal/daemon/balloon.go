@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -11,27 +12,35 @@ import (
 )
 
 type balloonMachine struct {
-	machine       hypervisor.Machine
-	configuredMiB int
+	machine                 hypervisor.Machine
+	configuredMiB           int
+	tolerateDeviceNotActive bool
 }
 
 func (m balloonMachine) ConfiguredMiB() int { return m.configuredMiB }
 
 func (m balloonMachine) SetMemoryTargetMiB(targetMiB int) error {
-	return m.machine.SetMemoryTargetMiB(targetMiB)
+	err := m.machine.SetMemoryTargetMiB(targetMiB)
+	if m.tolerateDeviceNotActive && errors.Is(err, hypervisor.ErrDeviceNotActive) {
+		return nil
+	}
+	return err
 }
 
 // Balloonables snapshots the CONFIGURED running nodes for the balloon manager,
-// reading s.vms under opMu so the manager never races an op. Maintenance-mode
-// nodes are exempt (SPEC §8): their guest has no virtio_balloon driver, and
-// setting a target on one crashes vz — so each running node is apid-probed and
-// only the TLS-configured ones are managed.
+// reading s.vms under opMu so the manager never races an op. Backends with
+// guest-visible balloon readback can manage every active node directly. On VZ
+// without readback, maintenance-mode nodes remain exempt (SPEC §8): their
+// guest has no virtio_balloon driver, and setting a target on one crashes vz,
+// so only TLS-configured nodes observed through apid are managed.
 func (s *Server) Balloonables() map[string]balloon.Balloonable {
 	type entry struct {
-		machine       hypervisor.Machine
-		configuredMiB int
-		ip            string
+		machine                 hypervisor.Machine
+		configuredMiB           int
+		ip                      string
+		tolerateDeviceNotActive bool
 	}
+	balloonReadback := s.hypervisor.Capabilities().BalloonReadback.Supported
 	s.opMu.Lock()
 	candidates := map[string]entry{}
 	for clusterName, nodes := range s.vms {
@@ -49,9 +58,10 @@ func (s *Server) Balloonables() map[string]balloon.Balloonable {
 				continue
 			}
 			candidates[clusterName+"/"+nodeName] = entry{
-				machine:       machine,
-				configuredMiB: item.DefaultsFor(node.Role).MemoryMiB,
-				ip:            cluster.LookupIP(node.MAC, item.SubnetIndex),
+				machine:                 machine,
+				configuredMiB:           item.DefaultsFor(node.Role).MemoryMiB,
+				ip:                      cluster.LookupIP(node.MAC, item.SubnetIndex),
+				tolerateDeviceNotActive: balloonReadback,
 			}
 		}
 	}
@@ -59,8 +69,12 @@ func (s *Server) Balloonables() map[string]balloon.Balloonable {
 
 	out := map[string]balloon.Balloonable{}
 	for key, e := range candidates {
-		if e.ip != "" && ClassifyPhase(true, probeAPID(e.ip)) == PhaseConfigured {
-			out[key] = balloonMachine{machine: e.machine, configuredMiB: e.configuredMiB}
+		if balloonReadback || (e.ip != "" && ClassifyPhase(true, probeAPID(e.ip)) == PhaseConfigured) {
+			out[key] = balloonMachine{
+				machine:                 e.machine,
+				configuredMiB:           e.configuredMiB,
+				tolerateDeviceNotActive: e.tolerateDeviceNotActive,
+			}
 		}
 	}
 	return out

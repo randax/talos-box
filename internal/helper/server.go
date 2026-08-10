@@ -43,6 +43,7 @@ type Server struct {
 	speakers     map[string]bgpSpeaker
 	dhcp         dhcpManager
 	allowedUID   *uint32
+	allowAnyUID  bool
 
 	listenerMu   sync.Mutex
 	listener     net.Listener
@@ -52,7 +53,7 @@ type Server struct {
 }
 
 // NewServer creates an empty helper server.
-func NewServer(allowedUID *uint32) *Server {
+func NewServer(allowedUID *uint32, allowAnyUID ...bool) *Server {
 	server := &Server{
 		attachments:  make(map[attachmentKey]*platformAttachment),
 		pendingStops: make(map[int]*platformAttachment),
@@ -61,6 +62,9 @@ func NewServer(allowedUID *uint32) *Server {
 	if allowedUID != nil {
 		uid := *allowedUID
 		server.allowedUID = &uid
+	}
+	if len(allowAnyUID) != 0 {
+		server.allowAnyUID = allowAnyUID[0]
 	}
 	return server
 }
@@ -225,7 +229,7 @@ func (s *Server) serveConnection(connection *net.UnixConn) {
 		_ = sendResponse(connection, failure(authorizationErr), -1)
 		return
 	}
-	if !isAuthorizedPeer(uid, s.allowedUID) {
+	if !isAuthorizedPeer(uid, s.allowedUID, s.allowAnyUID) {
 		authorizationErr := fmt.Errorf("unauthorized uid %d", uid)
 		log.Printf("reject helper connection: %v", authorizationErr)
 		_ = sendResponse(connection, failure(authorizationErr), -1)
@@ -257,8 +261,8 @@ func (s *Server) serveConnection(connection *net.UnixConn) {
 	}
 }
 
-func isAuthorizedUID(uid uint32, allowedUID *uint32) bool {
-	return uid == 0 || allowedUID != nil && uid == *allowedUID
+func isAuthorizedUID(uid uint32, allowedUID *uint32, allowAnyUID bool) bool {
+	return uid == 0 || allowedUID != nil && uid == *allowedUID || allowAnyUID && allowedUID == nil
 }
 
 func sendResponse(connection *net.UnixConn, response Response, fd int) error {
@@ -329,6 +333,17 @@ func (s *Server) handle(request Request) (any, int, func(), error) {
 		return nil, -1, nil, s.enableBGP(request.Args)
 	case "bgp.disable":
 		return nil, -1, nil, s.disableBGP(request.Args)
+	case helperInfoOp:
+		var args struct {
+			ProtocolVersion int `json:"protocolVersion"`
+		}
+		if err := decodeArgs(request.Args, &args); err != nil {
+			return nil, -1, nil, err
+		}
+		if args.ProtocolVersion != protocolVersion {
+			return nil, -1, nil, protocolMismatchError(args.ProtocolVersion, protocolVersion)
+		}
+		return currentHelperInfo()
 	case "ping":
 		return map[string]bool{"pong": true}, -1, nil, nil
 	default:
