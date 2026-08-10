@@ -1,10 +1,10 @@
 # talosbox — Specification v1
 
 **talosbox** (command: **`tbx`**) is a workshop-environment tool that attendees run on their own
-Apple Silicon Macs to manage the full lifecycle of hypervisor-based Talos Linux VM clusters.
-Nodes boot **unconfigured** (maintenance mode) on networking realistic enough for
-production-style Cilium: shared L2 with host-routable IPs by default, optional BGP peer mode,
-reachable ingress, and first-class inter-cluster routing.
+Apple Silicon macOS or amd64/arm64 Linux hosts to manage the full lifecycle of hypervisor-based
+Talos Linux VM clusters. Nodes boot **unconfigured** (maintenance mode) on networking realistic
+enough for production-style Cilium: shared L2 with host-routable IPs by default, optional BGP
+peer mode, reachable ingress, and first-class inter-cluster routing.
 
 Every decision in this spec was resolved on the
 [wayfinder map](https://github.com/randax/talos-box/issues/1); each section links its ticket,
@@ -20,21 +20,38 @@ generates and applies Talos machine config, bootstraps Kubernetes, and reconcile
 and optional LoadBalancer resources from the host. Ingress controllers and attendee workloads
 remain **attendee work**; Cilium's built-in ingress controller is disabled.
 
-Out of scope ([map](https://github.com/randax/talos-box/issues/1)): workshop curriculum,
-instructor-side orchestration, Intel Macs, Linux/Windows hosts, machines under 16 GB RAM, and
-arbitrary application or ingress installation. The curated CNI/LoadBalancer path is an explicit
-opt-in; substrate-only clusters retain the original manual workflow and guided hints (§10).
+Out of scope ([original map](https://github.com/randax/talos-box/issues/1),
+[Linux map](https://github.com/randax/talos-box/issues/71)): workshop curriculum,
+instructor-side orchestration, Intel Macs, Windows/WSL2 hosts, machines under 16 GB RAM,
+rootless Linux networking, and arbitrary application or ingress installation. The curated
+CNI/LoadBalancer path is an explicit opt-in; substrate-only clusters retain the original manual
+workflow and guided hints (§10).
 
-## 2. Supported platform
+## 2. Supported platforms
 
-- **Hardware**: Apple Silicon (M1 or newer), **16 GB RAM minimum** (hard requirement).
-- **macOS**: target floor **macOS 14 (Sonoma)**, with a verification gate (§12 G1): Talos EFI
-  boot under Virtualization.framework is empirically proven only on macOS 26.5
-  ([Confirm Talos boots under Virtualization.framework](https://github.com/randax/talos-box/issues/11));
-  the historical entropy hang (talos#11865) was reported on earlier macOS. If G1 finds the hang
-  on 14/15, either implement the direct-kernel-boot fallback (§4) or raise the floor — decide on
-  evidence, not assumption.
-- `tbx cluster suspend|resume` requires macOS 14+ regardless (vz save/restore API).
+All supported hosts require **16 GB RAM minimum**.
+
+| Host | Architecture | Version floor | Hypervisor | Notes |
+|---|---|---|---|---|
+| macOS | Apple Silicon (arm64) | macOS 14 (Sonoma) | Virtualization.framework | The macOS 14/15 boot gate remains open (§12 G1); Intel Macs are unsupported |
+| Ubuntu LTS | amd64, arm64 | Ubuntu 22.04 / QEMU 6.2 | QEMU/KVM | Tier one; suspend requires QEMU 8.2+, normally Ubuntu 24.04+ |
+| Fedora | amd64, arm64 | Current stable / QEMU 6.2 | QEMU/KVM | Tier one |
+| Arch Linux | amd64, arm64 | Rolling / QEMU 6.2 | QEMU/KVM | Tier one |
+| NixOS | amd64, arm64 | Current stable / QEMU 6.2 | QEMU/KVM | Tier-one design target; release support waits for the flake/module in #96 |
+| Debian, openSUSE | amd64, arm64 | QEMU 6.2 | QEMU/KVM | Best effort |
+
+The Linux host and guest architectures must match; TCG emulation is never a fallback. KVM must
+be available through a readable+writable `/dev/kvm`, and the installed QEMU package must provide
+`q35` on amd64 or `virt` on arm64 plus matching OVMF/AAVMF firmware.
+
+Suspend/resume is capability-gated rather than part of the general QEMU floor
+([decision #83](https://github.com/randax/talos-box/issues/83)):
+
+- macOS requires macOS 14+ and retains the exact in-process Virtualization.framework device
+  graph; a daemon restart degrades resume to a warned cold boot.
+- Linux requires QEMU 8.2+ (`migrate` to/from a file with raw disks). QEMU 6.2–8.1 supports
+  every other operation, and `tbx doctor` reports the unavailable capability with an upgrade
+  hint. Restore requires the same QEMU version, architecture, and machine type.
 
 ## 3. Architecture
 
@@ -42,25 +59,30 @@ opt-in; substrate-only clusters retain the original manual workflow and guided h
 override of the owner's Rust default; ecosystem gravity: importable Talos machinery,
 `Code-Hex/vz`).
 
-Hypervisor: **Virtualization.framework directly via `Code-Hex/vz` v3**
-([Select the hypervisor stack](https://github.com/randax/talos-box/issues/2)). Fallback if vz
-becomes untenable: wrapping `vfkit` over REST. QEMU, lima, and tart are not used.
+The platform-neutral `internal/hypervisor` boundary has one host backend per operating system:
 
-Three components:
+- macOS uses **Virtualization.framework directly via `Code-Hex/vz` v3**
+  ([Select the macOS hypervisor stack](https://github.com/randax/talos-box/issues/2)). Fallback
+  if vz becomes untenable: wrapping `vfkit` over REST.
+- Linux uses **QEMU/KVM directly over QMP**, with no libvirt
+  ([Linux hypervisor design](https://github.com/randax/talos-box/issues/77)).
 
-| Component | Privilege | Responsibilities |
-|---|---|---|
-| `tbx` CLI | user | command surface, config parsing, talks to `tbxd` over a unix socket |
-| `tbxd` daemon | user (launchd agent) | owns VM processes (clusters survive terminal close), embedded DNS server, registry mirror, GoBGP, balloon manager |
-| `tbx-helper` | root (launchd daemon, installed once) | vmnet interface creation (FD passed to `tbxd`), `/etc/resolver/k8s.test`, `net.inet.ip.forwarding`, PF_ROUTE route injection |
+Lima and tart are not used on either platform.
+
+| Component | macOS | Linux | Responsibilities |
+|---|---|---|---|
+| `tbx` CLI | user | user | command surface, config parsing, talks to `tbxd` over a Unix socket |
+| `tbxd` daemon | launchd user agent / on-demand child | systemd user socket/service / on-demand child | owns VM processes, embedded DNS, registry mirror, GoBGP, balloon manager |
+| `tbx-helper` | root launchd daemon | `tbx` system user with only `CAP_NET_ADMIN`, `CAP_NET_BIND_SERVICE`, `CAP_NET_RAW` | creates platform network attachments, converges forwarding/DNS integration, and updates host routes |
 
 Every VM gets a virtio serial port (`hvc0`) attached to a per-node unix socket owned by
 `tbxd` — the transport for `tbx console` (§9).
 
-Boot: **EFI boot loader** (`VZEFIBootLoader` + per-VM variable store) from the node's disk.
-Designed fallback (G1): direct kernel boot via `VZLinuxBootLoader` — Image Factory kernels are
-EFI-zboot wrappers whose payload (offset/size at header bytes 8–15) must be extracted and
-decompressed; the technique is proven in the prototype harness.
+Boot is EFI from the node's disk with a per-VM variable store: `VZEFIBootLoader` on macOS and
+QEMU pflash with OVMF/AAVMF on Linux. The macOS designed fallback (G1) is direct kernel boot via
+`VZLinuxBootLoader` — Image Factory kernels are EFI-zboot wrappers whose payload (offset/size
+at header bytes 8–15) must be extracted and decompressed; the technique is proven in the
+prototype harness.
 
 ## 4. Provisioning pipeline
 
@@ -69,20 +91,20 @@ decompressed; the technique is proven in the prototype harness.
 
 **Raw disk images, never in-VM installs.** talosbox generates its **own default Image Factory
 schematic** — vanilla plus `customization.extraKernelArgs: ["console=tty0", "console=hvc0"]` —
-because the stock metal image logs only to `ttyAMA0`/`tty0`, neither of which exists under
-Virtualization.framework; without the hvc0 arg, `tbx console` shows nothing. **Both args are
-mandatory and ordered**: Factory's extraKernelArgs *replace* the image's default console args,
-and `console=hvc0` alone bricks the boot under vz (verified: no boot, no output; with
+because both backends expose the Talos console as virtio `hvc0`. **Both args are mandatory and
+ordered**: Factory's extraKernelArgs *replace* the image's default console args, and
+`console=hvc0` alone bricks the boot under vz (verified: no boot, no output; with
 `console=tty0 console=hvc0` the node boots and streams kernel+machined logs on hvc0 — gate G6,
 closed). Schematics are content-addressed, so this is one deterministic POST to
 `factory.talos.dev/schematics`; user-supplied schematics get the args appended the same way.
 Per schematic + Talos version + target hypervisor architecture, `tbx` downloads Image Factory's
-`metal-arm64.raw.xz` or `metal-amd64.raw.xz` once into the cache, decompresses it, and provisions each
-node disk as an **APFS `clonefile` clone** grown (sparse) to the configured disk size.
-Validated results: node boots from disk straight to maintenance mode (unauthenticated apid on
-TCP 50000, Reader role for `talosctl --insecure`); `apply-config` lands in ~10 s with no
-reboot and zero network; a configured node cold-boots in ~16 s. The ISO+install path is
-dropped.
+`metal-arm64.raw.xz` or `metal-amd64.raw.xz` once into the cache and decompresses it. macOS
+provisions each node disk as an APFS `clonefile` clone; Linux currently copies the cached raw
+image, then both platforms grow the result sparsely to the configured disk size. On the
+validated macOS path, a node boots from disk straight to maintenance mode (unauthenticated
+apid on TCP 50000, Reader role for `talosctl --insecure`); `apply-config` lands in ~10 s with
+no reboot and zero network; a configured node cold-boots in ~16 s. The equivalent Linux
+end-to-end timing and cluster-up gate remains #97. The ISO+install path is dropped.
 
 - Cache: `~/.talosbox/cache/` stores Talos disk images by
   `<schematic>/<version>/<architecture>/` and registry-mirror content separately. `tbx cache pull`
@@ -101,13 +123,34 @@ dropped.
 
 ([Networking design](https://github.com/randax/talos-box/issues/6),
 [macOS networking substrate](https://github.com/randax/talos-box/issues/4),
-[Verify Cilium L2 announcements survive vmnet anti-spoofing](https://github.com/randax/talos-box/issues/10))
+[Verify Cilium L2 announcements survive vmnet anti-spoofing](https://github.com/randax/talos-box/issues/10),
+[Linux networking design](https://github.com/randax/talos-box/issues/78))
 
-Substrate: **one vmnet shared-mode network per cluster, subnet pinned** via the
-start/end/mask keys (no Apple entitlement; created by `tbx-helper`, FD handed to the VM's
+The logical model is identical on both platforms: one shared L2 domain and one pinned `/24`
+per cluster, host-routable node addresses, NAT egress, and a gateway that joins cluster
+subnets. The attachment and host integration are platform-specific.
+
+### macOS substrate
+
+One vmnet shared-mode network per cluster, pinned via the start/end/mask keys (no Apple
+entitlement; created by `tbx-helper`, with a datagram FD handed to the VM's
 `VZFileHandleNetworkDeviceAttachment`). vmnet provides DHCP and NAT egress. Empirically
-verified: ARP for addresses vmnet never assigned passes unfiltered — L2-announced VIPs are
+verified: ARP for addresses vmnet never assigned passes unfiltered, so L2-announced VIPs are
 host-reachable.
+
+### Linux substrate
+
+One `br-tbx<n>` bridge per cluster with STP disabled and gateway `172.30.<n>.1/24`; one
+helper-created tap per node is enslaved to the bridge and passed to QEMU as a tap FD. The
+helper serves static DHCP reservations derived from each node's deterministic MAC, enables
+IPv4 forwarding, and converges a talosbox-owned `table inet tbx` containing only the required
+forwarding and masquerade rules. It never edits foreign nftables tables or chains. Subnet
+selection rejects collisions with existing host addresses/routes and suggests a free subnet.
+
+The bridge is ordinary Linux L2, so Cilium L2 announcements and their failover work without
+host-side GARP machinery. Host networking is declarative desired state: bridge, taps, nftables,
+DHCP, DNS, and resolved registration are reconverged on helper startup because kernel state
+does not survive a reboot.
 
 **Subnets**: cluster *n* → `172.30.<n>.0/24` (base configurable). Layout, identical in every
 cluster:
@@ -115,28 +158,33 @@ cluster:
 | Range | Use |
 |---|---|
 | `.1` | host: gateway, NAT, DNS/mirror bind, BGP peer, inter-cluster router |
-| `.2–.179` | node DHCP range (vmnet assigns every address after the `.1` gateway) |
+| `.2–.179` | node DHCP range (vmnet dynamic leases on macOS; deterministic reservations on Linux) |
 | `.200–.239` | Cilium LB-IPAM pool; **`.200` is the ingress VIP by convention** |
 | `.240–.254` | reserved (tool-owned) |
 
-Pinned shared-mode vmnet interfaces only intercommunicate within the same subnet. To preserve
-the per-cluster `/24` model, `tbx-helper` routes `172.30.0.0/16` frames between helper-owned
-attachments before they enter vmnet, learning node and VIP ownership from DHCP and ARP. vmnet
-continues to provide same-subnet switching, DHCP, NAT egress, and host reachability.
+On macOS, pinned shared-mode vmnet interfaces only intercommunicate within the same subnet. To
+preserve the per-cluster `/24` model, `tbx-helper` routes `172.30.0.0/16` frames between
+helper-owned attachments before they enter vmnet, learning node and VIP ownership from DHCP
+and ARP. On Linux, the kernel routes between the helper-owned bridges through the converged
+forwarding policy.
 
-**DNS**: embedded resolver in `tbxd` on `127.0.0.1`. Every cluster has a **cluster domain** —
-chosen at create (`--domain` / `domain:`), immutable, unique across clusters, defaulting to
-`<cluster>.k8s.test`. `*.<domain>` → that cluster's `.200`; `<node>.<domain>` → node IP;
-the domain apex itself has no record. Domains may nest across clusters and resolve
-longest-suffix-wins — the owning cluster answers (or NXDOMAINs) alone. Safe domains (`.test`,
-`.internal`, `home.arpa`) are accepted outright; `.local`/`.localhost`/`.invalid`/single-label
-are always rejected; anything else can shadow real DNS and requires the explicit
-`--allow-unsafe-domain` / `allowUnsafeDomain: true` opt-in (non-interactive, so scripted paths
-stay deterministic). Host wiring: default-domain clusters share the static
-`/etc/resolver/k8s.test` file; each custom-domain cluster gets `/etc/resolver/<domain>`,
+**DNS**: every cluster has a **cluster domain** — chosen at create (`--domain` / `domain:`),
+immutable, unique across clusters, defaulting to `<cluster>.k8s.test`. `*.<domain>` → that
+cluster's `.200`; `<node>.<domain>` → node IP; the domain apex itself has no record. Domains
+may nest across clusters and resolve longest-suffix-wins — the owning cluster answers (or
+NXDOMAINs) alone. Safe domains (`.test`, `.internal`, `home.arpa`) are accepted outright;
+`.local`/`.localhost`/`.invalid`/single-label are always rejected; anything else can shadow
+real DNS and requires the explicit `--allow-unsafe-domain` / `allowUnsafeDomain: true` opt-in
+(non-interactive, so scripted paths stay deterministic). On macOS, the embedded resolver in
+`tbxd` listens on `127.0.0.1`; default-domain clusters share the static
+`/etc/resolver/k8s.test` file, while each custom-domain cluster gets `/etc/resolver/<domain>`,
 written with an ownership marker by the helper, reconciled by `tbxd` (recreate missing,
-remove marked orphans, never touch unmarked files), with a `killall -HUP mDNSResponder`
-after changes.
+remove marked orphans, never touch unmarked files), with a `killall -HUP mDNSResponder` after
+changes. On Linux, the helper binds the cluster gateway's port 53 and passes the listener FD
+to the unprivileged DNS server; guest queries are forwarded upstream, and when
+systemd-resolved is available the helper registers `~<domain>` as a route-only domain on the
+bridge through D-Bus. Hosts without resolved retain guest and by-IP access, and `tbx doctor`
+prints the required `resolvectl` fallback without writing `/etc/resolv.conf`.
 
 **BGP mode** (`tbx bgp enable <cluster>`): "host as ToR" — one embedded GoBGP instance,
 host **ASN 64512**, listening on each enabled cluster's `.1:179`; cluster *n* nodes speak
@@ -166,10 +214,11 @@ mode; `tbx mirror offline on` permits cached responses only and rejects cache mi
 upstream fallback, while `tbx mirror offline off` restores pull-through behavior. Mirror content
 is shared cache state, not cluster state: it survives cluster destruction and recreation.
 
-**Reachability guarantees** (the tested surface): host ↔ node IPs; host ↔ LB VIPs (L2 or BGP);
-**cluster ↔ cluster** (nodes and VIPs) through the host as inter-subnet router — first-class,
-per owner decision. Pod/service CIDRs stay internal; printed configs standardize
-`10.244.0.0/16` / `10.96.0.0/12`.
+**Reachability contract**: host ↔ node IPs; host ↔ LB VIPs (L2 or BGP); **cluster ↔ cluster**
+(nodes and VIPs) through the host as inter-subnet router — first-class, per owner decision.
+The complete contract is hardware-validated on macOS and component/integration-tested for the
+Linux helper; the Linux full-cluster CI gate remains #97. Pod/service CIDRs stay internal;
+printed configs standardize `10.244.0.0/16` / `10.96.0.0/12`.
 
 ## 6. Cluster model and VM lifecycle
 
@@ -178,15 +227,17 @@ A **cluster** is a named group of VMs on its own subnet; nodes are `<cluster>-cp
 DHCP leases and DNS stay stable.
 
 Lifecycle: `create/start/stop/destroy` per cluster and per node, `node add/remove` while the
-cluster runs, and whole-cluster `suspend/resume` (macOS 14+, vz save/restore). Same-daemon
-resume preserves memory; after a daemon restart it warns and gracefully cold-boots because
-the file-handle-backed device identity required by vz restore no longer exists. Nodes always come
-up **unconfigured** — talosbox never generates or applies machine config. `tbx status` reports
-each node's observed phase — `stopped`, `unreachable`, `maintenance`, `configured` — derived
-from a credential-free TLS probe of apid: **both** apid modes serve TLS (empirical correction,
-#31 — the earlier "insecure = maintenance" model was wrong); maintenance mode presents the
-well-known `maintenance-service.talos.dev` certificate, a configured node presents its
-cluster-CA identity and demands a client certificate.
+cluster runs, and capability-gated whole-cluster `suspend/resume`. macOS same-daemon resume
+preserves memory; after a daemon restart it warns and gracefully cold-boots because the
+file-handle-backed device identity required by vz restore no longer exists. Linux QEMU 8.2+
+saves to a versioned file and can restore after a daemon restart when the QEMU version,
+architecture, and machine type match; older QEMU refuses suspend with the capability reason.
+Nodes always come up **unconfigured** — talosbox never generates or applies machine config.
+`tbx status` reports each node's observed phase — `stopped`, `unreachable`, `maintenance`,
+`configured` — derived from a credential-free TLS probe of apid: **both** apid modes serve TLS
+(empirical correction, #31 — the earlier "insecure = maintenance" model was wrong);
+maintenance mode presents the well-known `maintenance-service.talos.dev` certificate, a
+configured node presents its cluster-CA identity and demands a client certificate.
 
 ## 7. Snapshots and reset
 
@@ -196,7 +247,8 @@ cluster-CA identity and demands a client certificate.
 [name]`. Create/restore stop the cluster (with confirmation), `clonefile` every node disk as
 one crash-consistent set, and restart. No per-node snapshots (etcd split-brain bait), no
 auto-snapshots, no live checkpoints — restore always passes through a stop; a restore costs a
-~1-minute cold boot. Works on every supported macOS.
+~1-minute cold boot. macOS uses APFS clonefile; Linux falls back to a full raw-image copy when
+the filesystem clone primitive is unavailable.
 
 ## 8. Resource model
 
@@ -205,13 +257,15 @@ auto-snapshots, no live checkpoints — restore always passes through a stop; a 
 - **Default topology: 1 control plane + 2 workers, 2 GiB RAM / 2 vCPU per node** (6 GiB
   total). All sizes overridable per role in `talosbox.yaml`. HA control planes via scale-up,
   not default.
-- **Active memory ballooning** (owner decision): `tbxd` monitors host memory pressure and
+- **Active memory ballooning** (owner decision): on macOS, `tbxd` monitors host memory pressure and
   inflates virtio balloons proportionally across running configured nodes when host free memory
   drops below the reserve, never below a **1 GiB per-node floor**, deflating on release.
   Verified: Talos arm64 kernel has `CONFIG_VIRTIO_BALLOON=m` — printed config snippets MUST
   include `machine.kernel.modules: [{name: virtio_balloon}]`; maintenance-mode nodes are exempt
-  from balloon management.
-- **Overcommit guard** (backstop): before `up`/`start`/`node add`, warn when the sum of
+  from balloon management. The QEMU backend supports balloon target/readback and tolerates an
+  inactive guest device, but the Linux host-free-memory sampler is not implemented yet, so the
+  automatic pressure policy is presently inactive there.
+- **Overcommit guard** (backstop, currently macOS): before `up`/`start`/`node add`, warn when the sum of
   configured VM memory exceeds host RAM minus a 6 GiB host reserve; `--force` overrides.
 
 ## 9. CLI and `talosbox.yaml`
@@ -301,6 +355,8 @@ Local-path has no CRD barrier, so apply `storage-namespaces` before `storage-obj
 
 ## 11. Distribution
 
+### macOS
+
 - **Homebrew** (`brew install randax/tap/talosbox`); binary is Developer-ID signed and
   notarized with the `com.apple.security.virtualization` entitlement — no restricted
   entitlements needed (bridged networking deliberately unused).
@@ -312,6 +368,27 @@ Local-path has no CRD barrier, so apply `storage-namespaces` before `storage-obj
   files, and only ever deletes files carrying its ownership marker. Like every helper
   operation, the domain set itself is trusted from the authorized client (the daemon derives
   it from cluster state) — the helper validates shape, not provenance.
+
+### Linux
+
+- goreleaser cross-builds `tbx`, `tbxd`, and `tbx-helper` for amd64/arm64; nfpm emits `.deb`
+  and `.rpm` packages with systemd units, sysusers, and the resolved polkit rule.
+- Cloudsmith hosts the public apt/dnf repository; GitHub Releases holds canonical artifacts;
+  AUR `tbx-bin` pins those artifacts; the in-repo Nix flake exposes packages, an overlay, and
+  `nixosModules.default` under `virtualisation.talosbox`.
+- Packages install the socket-activated helper as the `tbx` system user with only
+  `CAP_NET_ADMIN`, `CAP_NET_BIND_SERVICE`, and `CAP_NET_RAW`, plus a socket-activated `tbxd`
+  user service. Linux must not use the macOS `tbx system install` command.
+
+These Linux channels are the release design, not a statement of current publication. Until
+#95, #96, and #101 close, the only documented Linux installation is the source-preview path
+in [Linux host setup](linux.md).
+
+On both platforms, `tbx doctor` verifies the platform helper, hypervisor, DNS/forwarding,
+routes, and external image access; host-capacity sampling is currently macOS-only. Linux adds
+the detailed KVM/QEMU, bridge/firewall, reverse-path filter, port, systemd-unit, group, and
+capability checks listed in
+[Linux host setup](linux.md#what-tbx-doctor-checks-on-linux).
 
 ## 12. Verification gates and risk register
 
@@ -346,12 +423,19 @@ Implementation must close these before v1 ships:
   mandatory arg pair in §4). Residual: the dashboard TUI's interactive rendering on hvc0 is
   unverified (logs confirmed); if it proves log-only, `tbx console` remains correct as a
   log-streaming + maintenance-input console.
+- **G8 — Linux release channels**: publish and smoke-test Cloudsmith apt/dnf, AUR `tbx-bin`,
+  and the Nix flake/module (#95, #96, #101). Documentation must not expose placeholder URLs.
+- **G9 — Linux full-cluster CI**: run build/unit on amd64+arm64 and the substrate-only
+  1-control-plane + 2-worker KVM e2e on amd64, with a hard writable-`/dev/kvm` gate (#97).
 
 ## 13. Asset index
 
 - Research: `docs/research/` on branches `research/hypervisor-stack`,
-  `research/talos-boot-mechanics`, `research/macos-networking-substrate`
+  `research/talos-boot-mechanics`, `research/macos-networking-substrate`,
+  `research/qemu-qmp-parity`, `research/linux-l2-bgp-vip`, and
+  `research/distro-packaging-lsm`
 - Prototypes: `prototypes/talos-vz-boot/` on branches `prototype/talos-vz-boot` (boot
   validation) and `prototype/vmnet-arp` (ARP filter, Alpine serial harness, raw-image and
   registry experiments)
-- Decision index: [the wayfinder map](https://github.com/randax/talos-box/issues/1)
+- Decision indexes: [macOS wayfinder map](https://github.com/randax/talos-box/issues/1) and
+  [Linux parity map](https://github.com/randax/talos-box/issues/71)

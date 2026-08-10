@@ -6,8 +6,10 @@ the host, applies it with server-side apply, and waits for its own LoadBalancer 
 answer. Cilium's ingress controller is deliberately disabled; applications request
 ordinary `LoadBalancer` Services instead.
 
-Prerequisites: `tbx` installed, `sudo tbx system install` completed, `tbx doctor`
-passing, and `kubectl` available for the application steps.
+Prerequisites: `tbx` installed, its platform helper active, and `tbx doctor` passing.
+On macOS, activate the helper with `sudo tbx system install`. On Linux, follow the
+[Linux host setup](linux.md); do not run the macOS installer there.
+Install `kubectl` for the application steps.
 
 ## 1. Create and provision the cluster
 
@@ -129,3 +131,16 @@ safe once provisioning has begun.
 To keep bootstrapping and CNI installation entirely attendee-managed, omit `cni` when
 creating the cluster. That substrate-only behavior remains unchanged and does not run
 the curated provisioning pipeline.
+
+## Observed gotchas
+
+- Run `tbx doctor` before creating or starting a workshop cluster. On Linux, run it again once
+  the cluster bridge exists and use the [Linux doctor reference](linux.md#what-tbx-doctor-checks-on-linux)
+  for the platform-specific checks. Extreme host swap or
+  data-volume pressure can reset guests during image unpack and corrupt Talos EPHEMERAL data;
+  free memory/disk space or reduce the cluster size instead of overriding the preflight.
+- If a Talos system service reports `exec format error` (or exits 139) after an unexpected
+  guest reset, assume its unpacked EPHEMERAL snapshot is truncated. Re-pulling the image does
+  not replace the pinned corrupt snapshot chain; destroy and recreate the affected node or
+  cluster after relieving host pressure.
+- The default namespace's PodSecurity warning on the nginx deployment is harmless for a demo.

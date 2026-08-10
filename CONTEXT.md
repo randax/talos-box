@@ -18,6 +18,14 @@ A CNI from talosbox's fixed, tested set (initially `cilium` and `flannel`). Each
 
 A storage engine from talosbox's fixed, tested set (`longhorn` or `local-path`). It is available only through the provisioning path, where talosbox applies its pinned rendered objects and verifies a storage write/readback probe. Bring-your-own CSI remains unsupported above the substrate; `tbx manifests <cluster> storage` prints the Talos mounts and PSA guidance needed to prepare a substrate-only cluster, and `talos.schematic` is the escape hatch for engines requiring other image extensions.
 
+## Host substrate
+
+The platform-specific VM, networking, DNS, and service-manager implementation beneath the shared talosbox cluster model. A host substrate may have different mechanics without changing the guest-visible contract.
+
+## Capability gate
+
+A host feature whose availability is detected at runtime and reported with a reason. An unavailable capability disables only that feature rather than making the whole host unsupported.
+
 ## Cluster domain
 
 The DNS domain a cluster is reachable under on the host, from which its node records and ingress wildcard both derive. Chosen at cluster create and immutable thereafter; every cluster has exactly one, and no two clusters share one. A substrate concept — it exists regardless of provisioning path.
@@ -25,3 +33,11 @@ The DNS domain a cluster is reachable under on the host, from which its node rec
 ## Safe domain
 
 A cluster domain under a top-level name reserved away from real DNS, so it can never collide with or shadow public names. Anything else is an **unsafe domain**: accepted only by explicit opt-in, because it can silently shadow real DNS for the host.
+
+## L2 announcement path
+
+The default ingress-VIP reachability mode in which the active cluster node announces ownership directly on the cluster's shared link.
+
+## BGP mode
+
+The optional ingress-VIP mode in which route advertisements integrate the cluster with routed networks. It supports ECMP and endpoint-local advertisement semantics.
