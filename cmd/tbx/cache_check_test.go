@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/randax/talos-box/internal/daemon"
@@ -211,5 +212,60 @@ func TestRunCacheWarmRejectsDeepWithoutCheck(t *testing.T) {
 	}
 	if stdout.Len() != 0 {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+}
+
+func TestRunCacheWarmCheckReportsEveryRefBeforeFailing(t *testing.T) {
+	t.Setenv("HOME", shortTestHome(t))
+	socketPath, err := daemon.SocketPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	listPath := filepath.Join(t.TempDir(), "images.txt")
+	refs := []string{
+		"docker.io/library/pause:3.10",
+		"ghcr.io/example/app@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+	}
+	if err := os.WriteFile(listPath, []byte(strings.Join(refs, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go serveSingleDaemonRequest(t, listener, func(request daemon.Request) daemon.Response {
+		return daemon.Response{OK: true, Data: mustJSON(t, daemon.CacheCheckResult{
+			Entries: []daemon.CacheCheckEntry{
+				{Ref: refs[0], Status: daemon.CacheCheckStatusFailed, Reason: "blob missing"},
+				{Ref: refs[1], Status: daemon.CacheCheckStatusComplete},
+			},
+			Complete: 1,
+			Failed:   1,
+		})}
+	}, done)
+
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr, in: bytes.NewBuffer(nil)}
+	err = command.run([]string{"cache", "warm", "--check", listPath})
+	<-done
+	if err == nil || err.Error() != "cache check failed for 1 ref(s)" {
+		t.Fatalf("err = %v, want cache check failed for 1 ref(s)", err)
+	}
+	wantStdout := "" +
+		"\u2717 docker.io/library/pause:3.10 blob missing\n" +
+		"\u2713 ghcr.io/example/app@sha256:1111111111111111111111111111111111111111111111111111111111111111 complete\n" +
+		"summary: 1 complete, 1 failed\n"
+	if got := stdout.String(); got != wantStdout {
+		t.Fatalf("stdout = %q, want %q", got, wantStdout)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 }
