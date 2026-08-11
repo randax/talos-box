@@ -28,6 +28,7 @@ type fakeRegistry struct {
 	token    *httptest.Server
 
 	requireToken bool
+	manifestHits atomic.Int64
 	blobHits     atomic.Int64
 	tokenHits    atomic.Int64
 }
@@ -64,6 +65,7 @@ func newFakeRegistry(t *testing.T, requireToken bool) *fakeRegistry {
 		case r.URL.Path == "/v2/":
 			w.WriteHeader(http.StatusOK)
 		case r.URL.Path == "/v2/app/manifests/latest":
+			f.manifestHits.Add(1)
 			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
 			w.Header().Set("Docker-Content-Digest", "sha256:"+sha256Hex([]byte(manifestBody)))
 			_, _ = fmt.Fprint(w, manifestBody)
@@ -757,6 +759,85 @@ func TestManifestOfflineFallback(t *testing.T) {
 	}
 	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "manifest") {
 		t.Errorf("offline manifest content-type %q not preserved", ct)
+	}
+}
+
+func TestCachedDigestManifestServesWithoutUpstreamByDefault(t *testing.T) {
+	validDigest := "sha256:" + sha256Hex([]byte(manifestBody))
+	var upstreamHits atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		w.Header().Set("Docker-Content-Digest", validDigest)
+		_, _ = fmt.Fprint(w, manifestBody)
+	}))
+	defer upstream.Close()
+
+	server := newLoopbackMirrorServer(t, upstream.URL, t.TempDir())
+	mirror := httptest.NewServer(server)
+	defer mirror.Close()
+	path := "/v2/app/manifests/" + validDigest
+
+	resp, body := get(t, mirror.URL+path)
+	if resp.StatusCode != http.StatusOK || body != manifestBody {
+		t.Fatalf("first digest manifest = %d %q", resp.StatusCode, body)
+	}
+	hitsAfterWarm := upstreamHits.Load()
+
+	resp, body = get(t, mirror.URL+path)
+	if resp.StatusCode != http.StatusOK || body != manifestBody {
+		t.Fatalf("cached digest manifest = %d %q", resp.StatusCode, body)
+	}
+	if upstreamHits.Load() != hitsAfterWarm {
+		t.Fatalf("cached digest manifest hit upstream again: %d -> %d", hitsAfterWarm, upstreamHits.Load())
+	}
+}
+
+func TestOfflineModeServesCachedTagsAndFailsMissesWithoutUpstream(t *testing.T) {
+	var upstreamHits atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		switch r.URL.Path {
+		case "/v2/app/manifests/latest":
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", "sha256:"+sha256Hex([]byte(manifestBody)))
+			_, _ = fmt.Fprint(w, manifestBody)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	server := newLoopbackMirrorServer(t, upstream.URL, t.TempDir())
+	mirror := httptest.NewServer(server)
+	defer mirror.Close()
+
+	resp, body := get(t, mirror.URL+"/v2/app/manifests/latest")
+	if resp.StatusCode != http.StatusOK || body != manifestBody {
+		t.Fatalf("warm cached tag = %d %q", resp.StatusCode, body)
+	}
+	hitsAfterWarm := upstreamHits.Load()
+
+	server.setOfflineMode(true)
+
+	start := time.Now()
+	resp, body = get(t, mirror.URL+"/v2/app/manifests/latest")
+	if resp.StatusCode != http.StatusOK || body != manifestBody {
+		t.Fatalf("offline cached tag = %d %q", resp.StatusCode, body)
+	}
+	if upstreamHits.Load() != hitsAfterWarm {
+		t.Fatalf("offline cached tag hit upstream again: %d -> %d", hitsAfterWarm, upstreamHits.Load())
+	}
+
+	resp, body = get(t, mirror.URL+"/v2/app/manifests/missing")
+	if resp.StatusCode == http.StatusOK {
+		t.Fatalf("offline uncached tag unexpectedly succeeded: %q", body)
+	}
+	if upstreamHits.Load() != hitsAfterWarm {
+		t.Fatalf("offline uncached tag hit upstream: %d -> %d", hitsAfterWarm, upstreamHits.Load())
+	}
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+		t.Fatalf("offline cached+miss path took %s, want fast local response", elapsed)
 	}
 }
 

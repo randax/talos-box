@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/randax/talos-box/internal/manifests"
 )
@@ -42,6 +43,7 @@ type Manager struct {
 	serverFactory      func(upstream, base, cacheDir string) http.Handler
 	resolveUpstreamIPs func(context.Context, string) ([]net.IP, error)
 	hostOwnedIPs       func() ([]net.IP, error)
+	offline            atomic.Bool
 
 	mu                sync.Mutex
 	bound             map[string][]*http.Server // gateway IP -> its servers
@@ -101,7 +103,9 @@ func (m *Manager) Bind(gatewayIP string) error {
 		if m.baseOverride != "" {
 			base = m.baseOverride
 		}
-		server := &http.Server{Handler: NewServer(base, filepath.Join(m.cacheRoot, entry.Upstream))}
+		mirrorServer := NewServer(base, filepath.Join(m.cacheRoot, entry.Upstream))
+		mirrorServer.offline = &m.offline
+		server := &http.Server{Handler: mirrorServer}
 		if m.serverFactory != nil {
 			server.Handler = m.serverFactory(entry.Upstream, base, filepath.Join(m.cacheRoot, entry.Upstream))
 		}
@@ -254,12 +258,14 @@ func (m *Manager) handlerForUpstream(authority upstreamAuthority) http.Handler {
 		base = m.baseOverride
 	}
 	cacheDir := filepath.Join(m.cacheRoot, authority.cacheKey)
-	handler := http.Handler(newServerWithEgress(base, cacheDir, egressDependencies{
+	mirrorServer := newServerWithEgress(base, cacheDir, egressDependencies{
 		resolve:     m.resolveUpstreamIPs,
 		hostIPs:     m.hostOwnedIPs,
 		dialContext: defaultEgressDependencies().dialContext,
 		blocked:     namespaceIPBlocked,
-	}))
+	})
+	mirrorServer.offline = &m.offline
+	handler := http.Handler(mirrorServer)
 	if m.serverFactory != nil {
 		handler = m.serverFactory(authority.canonicalAuthority, base, cacheDir)
 	}
@@ -345,6 +351,14 @@ func dynamicHandlerCloser(handler http.Handler) func() {
 		return value.CloseIdleConnections
 	}
 	return nil
+}
+
+func (m *Manager) SetOffline(enabled bool) {
+	m.offline.Store(enabled)
+}
+
+func (m *Manager) Offline() bool {
+	return m.offline.Load()
 }
 
 func cloneURLWithoutQueryValue(source *url.URL, key string) *url.URL {

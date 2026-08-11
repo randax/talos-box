@@ -146,6 +146,10 @@ type CachePullResult struct {
 	Path         string                  `json:"path"`
 }
 
+type MirrorOfflineStatus struct {
+	Enabled bool `json:"enabled"`
+}
+
 func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	var args createArgs
 	if err := decodeArgs(raw, &args); err != nil {

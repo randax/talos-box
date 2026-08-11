@@ -666,6 +666,69 @@ func TestCatchAllMirrorBoundsDynamicHandlersAndClosesEvictedEntries(t *testing.T
 	}
 }
 
+func TestManagerOfflineToggleAffectsLegacyAndDynamicMirrors(t *testing.T) {
+	f := newFakeRegistry(t, false)
+	legacyPort := freePort(t)
+	catchAllPort := freePort(t)
+
+	m := &Manager{
+		cacheRoot:    t.TempDir(),
+		ports:        []portBinding{{Upstream: "docker.io", Port: legacyPort}},
+		catchAllPort: catchAllPort,
+		resolveUpstreamIPs: func(context.Context, string) ([]net.IP, error) {
+			return []net.IP{net.ParseIP("203.0.113.10")}, nil
+		},
+		hostOwnedIPs: func() ([]net.IP, error) { return nil, nil },
+		bound:        map[string][]*http.Server{},
+		dynamic:      map[string]http.Handler{},
+	}
+	m.serverFactory = func(_ string, _, cacheDir string) http.Handler {
+		server := newLoopbackMirrorServer(t, f.registry.URL, cacheDir)
+		server.offline = &m.offline
+		return server
+	}
+	defer m.Close()
+
+	if err := m.Bind("127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+
+	legacyPath := fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/latest", legacyPort)
+	dynamicPath := fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/latest?ns=docker.io", catchAllPort)
+	for _, path := range []string{legacyPath, dynamicPath} {
+		resp, body := get(t, path)
+		if resp.StatusCode != http.StatusOK || body != manifestBody {
+			t.Fatalf("warm path %s = %d %q", path, resp.StatusCode, body)
+		}
+	}
+	manifestHits := f.manifestHits.Load()
+
+	m.SetOffline(true)
+
+	for _, path := range []string{legacyPath, dynamicPath} {
+		resp, body := get(t, path)
+		if resp.StatusCode != http.StatusOK || body != manifestBody {
+			t.Fatalf("offline cached path %s = %d %q", path, resp.StatusCode, body)
+		}
+	}
+	if f.manifestHits.Load() != manifestHits {
+		t.Fatalf("offline cached requests hit upstream manifest path: %d -> %d", manifestHits, f.manifestHits.Load())
+	}
+
+	for _, path := range []string{
+		fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/missing", legacyPort),
+		fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/missing?ns=docker.io", catchAllPort),
+	} {
+		resp, _ := get(t, path)
+		if resp.StatusCode == http.StatusOK {
+			t.Fatalf("offline uncached path %s unexpectedly succeeded", path)
+		}
+	}
+	if f.manifestHits.Load() != manifestHits {
+		t.Fatalf("offline uncached requests hit upstream manifest path: %d -> %d", manifestHits, f.manifestHits.Load())
+	}
+}
+
 func TestCatchAllMirrorCancellationStopsNamespaceValidation(t *testing.T) {
 	catchAllPort := freePort(t)
 	resolveStarted := make(chan struct{})

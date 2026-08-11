@@ -21,6 +21,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -29,6 +30,7 @@ type Server struct {
 	base     string // upstream base URL, e.g. https://registry-1.docker.io
 	cacheDir string
 	client   *http.Client
+	offline  *atomic.Bool
 
 	mu     sync.Mutex
 	tokens map[string]token // key: auth challenge scope
@@ -176,6 +178,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	isManifest := manifestPathRe.MatchString(r.URL.Path)
+	if isManifest {
+		reference := manifestReference(r.URL.Path)
+		if isDigestReference(reference) && s.serveCachedManifest(w, r) {
+			return
+		}
+		if s.offlineEnabled() {
+			if s.serveCachedManifest(w, r) {
+				return
+			}
+			http.Error(w, "mirror offline: manifest not cached", http.StatusServiceUnavailable)
+			return
+		}
+	}
 
 	resp, err := s.fetch(r)
 	if err != nil {
@@ -230,6 +245,17 @@ func (s *Server) CloseIdleConnections() {
 	if transport, ok := s.client.Transport.(idleCloser); ok {
 		transport.CloseIdleConnections()
 	}
+}
+
+func (s *Server) setOfflineMode(enabled bool) {
+	if s.offline == nil {
+		s.offline = &atomic.Bool{}
+	}
+	s.offline.Store(enabled)
+}
+
+func (s *Server) offlineEnabled() bool {
+	return s.offline != nil && s.offline.Load()
 }
 
 func copyResponseHeaders(w http.ResponseWriter, resp *http.Response) {
@@ -426,6 +452,10 @@ func manifestReference(requestPath string) string {
 		return match[2]
 	}
 	return ""
+}
+
+func isDigestReference(reference string) bool {
+	return strings.HasPrefix(reference, "sha256:")
 }
 
 func responseURL(resp *http.Response, fallback string) string {
