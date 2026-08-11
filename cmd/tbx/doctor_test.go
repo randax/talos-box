@@ -361,6 +361,28 @@ func TestRunDoctorNoClustersSkipsAndEgressWarnIsNonFatal(t *testing.T) {
 	}
 }
 
+func TestRunDoctorIncludesMirrorHealth(t *testing.T) {
+	deps := passingDoctorDependencies()
+	deps.listCache = func() (daemon.CacheListResult, error) {
+		return daemon.CacheListResult{
+			MirrorTotal: daemon.MirrorCacheTotals{
+				BlobCount:     2,
+				BlobBytes:     20,
+				ManifestCount: 1,
+				ManifestBytes: 7,
+			},
+		}, nil
+	}
+
+	var output strings.Builder
+	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
+		t.Fatalf("runDoctorWithDependencies() = %v", err)
+	}
+	if !strings.Contains(output.String(), "PASS mirror-health: daemon serving, cache 27 bytes (2 blob(s), 1 manifest(s))") {
+		t.Fatalf("output missing mirror health line:\n%s", output.String())
+	}
+}
+
 func TestRunDoctorReportsRuntimeDependentChecksAsSkipped(t *testing.T) {
 	deps := passingDoctorDependencies()
 	deps.checkResolver = func() error {
@@ -574,6 +596,7 @@ func passingDoctorDependencies() doctorDependencies {
 		checkForwarding: pass,
 		listClusters:    func() ([]daemon.ClusterSummary, error) { return nil, nil },
 		getStatus:       func() ([]daemon.ClusterStatus, error) { return nil, nil },
+		listCache:       func() (daemon.CacheListResult, error) { return daemon.CacheListResult{}, nil },
 		hostPressure:    func() (hostpressure.Snapshot, error) { return hostpressure.Snapshot{}, nil },
 		command: func(string, ...string) ([]byte, error) {
 			return nil, nil

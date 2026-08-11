@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -18,10 +19,21 @@ type warmListEntry struct {
 }
 
 func (c cli) runCacheWarm(args []string) error {
-	if len(args) == 0 {
-		return errors.New("usage: tbx cache warm <list-file> [<list-file>...]")
+	flags := flag.NewFlagSet("cache warm", flag.ContinueOnError)
+	flags.SetOutput(c.err)
+	checkOnly := flags.Bool("check", false, "verify the warmed cache offline instead of downloading")
+	deep := flags.Bool("deep", false, "rehash cached blobs while checking")
+	positionals, err := parseInterspersed(flags, args)
+	if err != nil {
+		return err
 	}
-	entries, err := parseWarmListEntries(args, c.in)
+	if len(positionals) == 0 {
+		return errors.New("usage: tbx cache warm [--check [--deep]] <list-file> [<list-file>...]")
+	}
+	if *deep && !*checkOnly {
+		return errors.New("cache warm --deep requires --check")
+	}
+	entries, err := parseWarmListEntries(positionals, c.in)
 	if err != nil {
 		return err
 	}
@@ -31,6 +43,33 @@ func (c cli) runCacheWarm(args []string) error {
 	}
 	if len(refs) == 0 {
 		return errors.New("cache warm list is empty")
+	}
+	if *checkOnly {
+		var result daemon.CacheCheckResult
+		if err := c.call("cache.check", daemon.CacheCheckArgs{Refs: refs, Deep: *deep}, &result); err != nil {
+			return err
+		}
+		for _, entry := range result.Entries {
+			switch entry.Status {
+			case daemon.CacheCheckStatusComplete:
+				if _, err := fmt.Fprintf(c.out, "\u2713 %s complete\n", entry.Ref); err != nil {
+					return err
+				}
+			case daemon.CacheCheckStatusFailed:
+				if _, err := fmt.Fprintf(c.out, "\u2717 %s %s\n", entry.Ref, entry.Reason); err != nil {
+					return err
+				}
+			default:
+				return fmt.Errorf("cache check returned unknown status %q for %s", entry.Status, entry.Ref)
+			}
+		}
+		if _, err := fmt.Fprintf(c.out, "summary: %d complete, %d failed\n", result.Complete, result.Failed); err != nil {
+			return err
+		}
+		if result.Failed > 0 {
+			return fmt.Errorf("cache check failed for %d ref(s)", result.Failed)
+		}
+		return nil
 	}
 	var result daemon.CacheWarmResult
 	if err := c.call("cache.warm", daemon.CacheWarmArgs{Refs: refs}, &result); err != nil {
