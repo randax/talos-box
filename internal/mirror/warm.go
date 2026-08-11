@@ -109,7 +109,7 @@ func (m *Manager) warmOne(ctx context.Context, reference, hostArch string) (Warm
 		}
 	}
 
-	if err := warmManifestGraph(ctx, handler, server, parsed.repository, body, hostArch, seenManifests, seenBlobs, &result); err != nil {
+	if err := warmManifestGraph(ctx, handler, server, parsed.repository, body, hostArch, seenManifests, map[string]bool{}, seenBlobs, &result); err != nil {
 		return WarmResult{}, err
 	}
 	if stageListed && staged != nil {
@@ -123,7 +123,7 @@ func (m *Manager) warmOne(ctx context.Context, reference, hostArch string) (Warm
 	return result, nil
 }
 
-func warmManifestGraph(ctx context.Context, handler http.Handler, server *Server, repository string, body []byte, hostArch string, seenManifests, seenBlobs map[string]bool, result *WarmResult) error {
+func warmManifestGraph(ctx context.Context, handler http.Handler, server *Server, repository string, body []byte, hostArch string, seenManifests, warmedHostManifests, seenBlobs map[string]bool, result *WarmResult) error {
 	kind, children, blobs, err := analyzeWarmManifest(body)
 	if err != nil {
 		return err
@@ -147,23 +147,29 @@ func warmManifestGraph(ctx context.Context, handler http.Handler, server *Server
 
 	matchedHost := false
 	for _, child := range children {
-		if seenManifests[child.digest] {
-			if child.architecture == hostArch && (child.os == "" || child.os == "linux") {
-				matchedHost = true
+		hostMatch := child.architecture == hostArch && (child.os == "" || child.os == "linux")
+		if hostMatch {
+			matchedHost = true
+		}
+		var (
+			childBody     []byte
+			cachedBefore  bool
+			needChildBody = !seenManifests[child.digest] || (hostMatch && !warmedHostManifests[child.digest])
+		)
+		if needChildBody {
+			var err error
+			childBody, _, cachedBefore, err = warmManifestRequest(ctx, handler, server, repository, child.digest, child.digest, nil)
+			if err != nil {
+				return err
 			}
-			continue
+			seenManifests[child.digest] = true
 		}
-		childBody, _, cachedBefore, err := warmManifestRequest(ctx, handler, server, repository, child.digest, child.digest, nil)
-		if err != nil {
-			return err
-		}
-		if !cachedBefore {
+		if needChildBody && !cachedBefore {
 			result.AlreadyComplete = false
 		}
-		seenManifests[child.digest] = true
-		if child.architecture == hostArch && (child.os == "" || child.os == "linux") {
-			matchedHost = true
-			if err := warmManifestGraph(ctx, handler, server, repository, childBody, hostArch, seenManifests, seenBlobs, result); err != nil {
+		if hostMatch && !warmedHostManifests[child.digest] {
+			warmedHostManifests[child.digest] = true
+			if err := warmManifestGraph(ctx, handler, server, repository, childBody, hostArch, seenManifests, warmedHostManifests, seenBlobs, result); err != nil {
 				return err
 			}
 		}

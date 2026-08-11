@@ -203,6 +203,41 @@ func TestPruneCacheScopesReportDeletedBytesAndIsolateDiskFromMirror(t *testing.T
 	}
 }
 
+func TestListCacheIncludesMirrorServingStatusFromBindings(t *testing.T) {
+	root := t.TempDir()
+	service := &Server{
+		cache:               imagecache.New(root),
+		hypervisor:          &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
+		boundMirrorGateways: func() []string { return nil },
+	}
+
+	result, err := service.listCache()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.MirrorBoundGatewayIPs) != 0 {
+		t.Fatalf("initial mirror gateway IPs = %v, want empty", result.MirrorBoundGatewayIPs)
+	}
+
+	service.boundMirrorGateways = func() []string { return []string{"172.30.3.1"} }
+	result, err = service.listCache()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.MirrorBoundGatewayIPs) != 1 || result.MirrorBoundGatewayIPs[0] != "172.30.3.1" {
+		t.Fatalf("bound mirror gateway IPs = %v, want [172.30.3.1]", result.MirrorBoundGatewayIPs)
+	}
+
+	service.boundMirrorGateways = func() []string { return nil }
+	result, err = service.listCache()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.MirrorBoundGatewayIPs) != 0 {
+		t.Fatalf("unbound mirror gateway IPs = %v, want empty", result.MirrorBoundGatewayIPs)
+	}
+}
+
 func snapshotTree(t *testing.T, root string) []byte {
 	t.Helper()
 	var buffer bytes.Buffer

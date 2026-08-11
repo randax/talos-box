@@ -96,6 +96,29 @@ func TestUnbindUnknownGatewayIsNoOp(t *testing.T) {
 	m.Unbind("172.30.9.1") // never bound; must not panic
 }
 
+func TestBoundGatewayIPsTracksActualBindAndUnbind(t *testing.T) {
+	m := newManagerWithPorts(t.TempDir(), testPorts(t), freePort(t))
+	defer m.Close()
+	if got := m.BoundGatewayIPs(); len(got) != 0 {
+		t.Fatalf("initial bound gateways = %v, want empty", got)
+	}
+	if err := m.Bind("127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	got := m.BoundGatewayIPs()
+	if len(got) != 1 || got[0] != "127.0.0.1" {
+		t.Fatalf("bound gateways = %v, want [127.0.0.1]", got)
+	}
+	got[0] = "mutated"
+	if gotAgain := m.BoundGatewayIPs(); len(gotAgain) != 1 || gotAgain[0] != "127.0.0.1" {
+		t.Fatalf("bound gateways copy mutated internal state: %v", gotAgain)
+	}
+	m.Unbind("127.0.0.1")
+	if got := m.BoundGatewayIPs(); len(got) != 0 {
+		t.Fatalf("bound gateways after unbind = %v, want empty", got)
+	}
+}
+
 func TestMirrorServesThroughGatewayBinding(t *testing.T) {
 	f := newFakeRegistry(t, false)
 	ports := []portBinding{{Upstream: "test", Port: freePort(t)}}

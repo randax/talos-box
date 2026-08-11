@@ -361,6 +361,231 @@ func TestRunDoctorNoClustersSkipsAndEgressWarnIsNonFatal(t *testing.T) {
 	}
 }
 
+func TestRunDoctorIncludesMirrorHealth(t *testing.T) {
+	deps := passingDoctorDependencies()
+	deps.listClusters = func() ([]daemon.ClusterSummary, error) {
+		return []daemon.ClusterSummary{{Name: "demo", SubnetIndex: 3, Running: true}}, nil
+	}
+	deps.getStatus = func() ([]daemon.ClusterStatus, error) {
+		return []daemon.ClusterStatus{{Name: "demo", Running: true, Nodes: []daemon.NodeStatus{{Name: "demo-cp-1", IP: "172.30.3.2"}}}}, nil
+	}
+	deps.command = func(name string, args ...string) ([]byte, error) {
+		switch name {
+		case "/usr/bin/dscacheutil":
+			return []byte("ip_address: 172.30.3.200\n"), nil
+		case "/sbin/route":
+			return []byte("interface: bridge100\n"), nil
+		default:
+			return nil, nil
+		}
+	}
+	deps.listCache = func() (daemon.CacheListResult, error) {
+		return daemon.CacheListResult{
+			MirrorBoundGatewayIPs: []string{"172.30.3.1"},
+			MirrorTotal: daemon.MirrorCacheTotals{
+				BlobCount:     2,
+				BlobBytes:     20,
+				ManifestCount: 1,
+				ManifestBytes: 7,
+			},
+		}, nil
+	}
+
+	var output strings.Builder
+	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
+		t.Fatalf("runDoctorWithDependencies() = %v", err)
+	}
+	if !strings.Contains(output.String(), "PASS mirror-health: mirror serving on 1 gateway(s) [172.30.3.1], cache 27 bytes (2 blob(s), 1 manifest(s))") {
+		t.Fatalf("output missing mirror health line:\n%s", output.String())
+	}
+}
+
+func TestRunDoctorSkipsMirrorHealthWhenNoClustersAreRunning(t *testing.T) {
+	deps := passingDoctorDependencies()
+	deps.listClusters = func() ([]daemon.ClusterSummary, error) {
+		return []daemon.ClusterSummary{{Name: "demo", SubnetIndex: 3, Running: false}}, nil
+	}
+	deps.command = func(name string, args ...string) ([]byte, error) {
+		if name == "/usr/bin/dscacheutil" {
+			return []byte("ip_address: 172.30.3.200\n"), nil
+		}
+		return nil, nil
+	}
+	deps.listCache = func() (daemon.CacheListResult, error) {
+		return daemon.CacheListResult{
+			MirrorTotal: daemon.MirrorCacheTotals{
+				BlobCount:     2,
+				BlobBytes:     20,
+				ManifestCount: 1,
+				ManifestBytes: 7,
+			},
+		}, nil
+	}
+
+	var output strings.Builder
+	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
+		t.Fatalf("runDoctorWithDependencies() = %v", err)
+	}
+	if !strings.Contains(output.String(), "SKIP mirror-health: no clusters are running; cache 27 bytes (2 blob(s), 1 manifest(s))") {
+		t.Fatalf("output missing mirror idle line:\n%s", output.String())
+	}
+}
+
+func TestRunDoctorFailsMirrorHealthWhenClusterIsRunningButNotBound(t *testing.T) {
+	deps := passingDoctorDependencies()
+	deps.listClusters = func() ([]daemon.ClusterSummary, error) {
+		return []daemon.ClusterSummary{{Name: "demo", SubnetIndex: 3, Running: true}}, nil
+	}
+	deps.getStatus = func() ([]daemon.ClusterStatus, error) {
+		return []daemon.ClusterStatus{{Name: "demo", Running: true, Nodes: []daemon.NodeStatus{{Name: "demo-cp-1", IP: "172.30.3.2"}}}}, nil
+	}
+	deps.command = func(name string, args ...string) ([]byte, error) {
+		switch name {
+		case "/usr/bin/dscacheutil":
+			return []byte("ip_address: 172.30.3.200\n"), nil
+		case "/sbin/route":
+			return []byte("interface: bridge100\n"), nil
+		default:
+			return nil, nil
+		}
+	}
+	deps.listCache = func() (daemon.CacheListResult, error) {
+		return daemon.CacheListResult{
+			MirrorTotal: daemon.MirrorCacheTotals{
+				BlobCount:     2,
+				BlobBytes:     20,
+				ManifestCount: 1,
+				ManifestBytes: 7,
+			},
+		}, nil
+	}
+
+	var output strings.Builder
+	err := (cli{out: &output}).runDoctorWithDependencies(nil, deps)
+	if err == nil {
+		t.Fatal("runDoctorWithDependencies() succeeded despite missing mirror listeners")
+	}
+	if !strings.Contains(output.String(), "FAIL mirror-health: no mirror listeners bound for running cluster(s); expected [172.30.3.1]; cache 27 bytes (2 blob(s), 1 manifest(s))") {
+		t.Fatalf("output missing mirror health line:\n%s", output.String())
+	}
+}
+
+func TestRunDoctorFailsMirrorHealthWhenOnlySomeRunningClustersAreBound(t *testing.T) {
+	deps := passingDoctorDependencies()
+	deps.listClusters = func() ([]daemon.ClusterSummary, error) {
+		return []daemon.ClusterSummary{
+			{Name: "demo-a", SubnetIndex: 3, Running: true},
+			{Name: "demo-b", SubnetIndex: 4, Running: true},
+		}, nil
+	}
+	deps.getStatus = func() ([]daemon.ClusterStatus, error) {
+		return []daemon.ClusterStatus{
+			{Name: "demo-a", Running: true, Nodes: []daemon.NodeStatus{{Name: "demo-a-cp-1", IP: "172.30.3.2"}}},
+			{Name: "demo-b", Running: true, Nodes: []daemon.NodeStatus{{Name: "demo-b-cp-1", IP: "172.30.4.2"}}},
+		}, nil
+	}
+	deps.command = func(name string, args ...string) ([]byte, error) {
+		switch name {
+		case "/usr/bin/dscacheutil":
+			if strings.Contains(args[len(args)-1], ".demo-a.") {
+				return []byte("ip_address: 172.30.3.200\n"), nil
+			}
+			return []byte("ip_address: 172.30.4.200\n"), nil
+		case "/sbin/route":
+			return []byte("interface: bridge100\n"), nil
+		default:
+			return nil, nil
+		}
+	}
+	deps.listCache = func() (daemon.CacheListResult, error) {
+		return daemon.CacheListResult{
+			MirrorBoundGatewayIPs: []string{"172.30.3.1"},
+			MirrorTotal: daemon.MirrorCacheTotals{
+				BlobCount:     2,
+				BlobBytes:     20,
+				ManifestCount: 1,
+				ManifestBytes: 7,
+			},
+		}, nil
+	}
+
+	var output strings.Builder
+	err := (cli{out: &output}).runDoctorWithDependencies(nil, deps)
+	if err == nil {
+		t.Fatal("runDoctorWithDependencies() succeeded despite partial mirror listener coverage")
+	}
+	if !strings.Contains(output.String(), "FAIL mirror-health: mirror listeners bound on [172.30.3.1], expected [172.30.3.1 172.30.4.1]; cache 27 bytes (2 blob(s), 1 manifest(s))") {
+		t.Fatalf("output missing partial mirror health line:\n%s", output.String())
+	}
+}
+
+func TestRunDoctorFailsMirrorHealthWhenBoundGatewayIPIsWrong(t *testing.T) {
+	deps := passingDoctorDependencies()
+	deps.listClusters = func() ([]daemon.ClusterSummary, error) {
+		return []daemon.ClusterSummary{{Name: "demo", SubnetIndex: 3, Running: true}}, nil
+	}
+	deps.getStatus = func() ([]daemon.ClusterStatus, error) {
+		return []daemon.ClusterStatus{{Name: "demo", Running: true, Nodes: []daemon.NodeStatus{{Name: "demo-cp-1", IP: "172.30.3.2"}}}}, nil
+	}
+	deps.command = func(name string, args ...string) ([]byte, error) {
+		switch name {
+		case "/usr/bin/dscacheutil":
+			return []byte("ip_address: 172.30.3.200\n"), nil
+		case "/sbin/route":
+			return []byte("interface: bridge100\n"), nil
+		default:
+			return nil, nil
+		}
+	}
+	deps.listCache = func() (daemon.CacheListResult, error) {
+		return daemon.CacheListResult{
+			MirrorBoundGatewayIPs: []string{"172.30.99.1"},
+			MirrorTotal: daemon.MirrorCacheTotals{
+				BlobCount:     2,
+				BlobBytes:     20,
+				ManifestCount: 1,
+				ManifestBytes: 7,
+			},
+		}, nil
+	}
+
+	var output strings.Builder
+	err := (cli{out: &output}).runDoctorWithDependencies(nil, deps)
+	if err == nil {
+		t.Fatal("runDoctorWithDependencies() succeeded despite wrong mirror binding")
+	}
+	if !strings.Contains(output.String(), "FAIL mirror-health: mirror listeners bound on [172.30.99.1], expected [172.30.3.1]; cache 27 bytes (2 blob(s), 1 manifest(s))") {
+		t.Fatalf("output missing wrong-ip mirror health line:\n%s", output.String())
+	}
+}
+
+func TestRunDoctorSkipsMirrorHealthWhenClusterStateIsUnavailableButGatewaysAreBound(t *testing.T) {
+	deps := passingDoctorDependencies()
+	deps.listClusters = func() ([]daemon.ClusterSummary, error) {
+		return nil, errors.New("cluster state unavailable")
+	}
+	deps.listCache = func() (daemon.CacheListResult, error) {
+		return daemon.CacheListResult{
+			MirrorBoundGatewayIPs: []string{"172.30.3.1"},
+			MirrorTotal: daemon.MirrorCacheTotals{
+				BlobCount:     2,
+				BlobBytes:     20,
+				ManifestCount: 1,
+				ManifestBytes: 7,
+			},
+		}, nil
+	}
+
+	var output strings.Builder
+	err := (cli{out: &output}).runDoctorWithDependencies(nil, deps)
+	if err == nil {
+		t.Fatal("runDoctorWithDependencies() succeeded despite unavailable cluster state")
+	}
+	if !strings.Contains(output.String(), "SKIP mirror-health: cluster state unavailable; cache 27 bytes (2 blob(s), 1 manifest(s))") {
+		t.Fatalf("output missing unavailable-cluster mirror health line:\n%s", output.String())
+	}
+}
+
 func TestRunDoctorReportsRuntimeDependentChecksAsSkipped(t *testing.T) {
 	deps := passingDoctorDependencies()
 	deps.checkResolver = func() error {
@@ -574,6 +799,7 @@ func passingDoctorDependencies() doctorDependencies {
 		checkForwarding: pass,
 		listClusters:    func() ([]daemon.ClusterSummary, error) { return nil, nil },
 		getStatus:       func() ([]daemon.ClusterStatus, error) { return nil, nil },
+		listCache:       func() (daemon.CacheListResult, error) { return daemon.CacheListResult{}, nil },
 		hostPressure:    func() (hostpressure.Snapshot, error) { return hostpressure.Snapshot{}, nil },
 		command: func(string, ...string) ([]byte, error) {
 			return nil, nil
