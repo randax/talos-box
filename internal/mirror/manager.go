@@ -43,6 +43,7 @@ type Manager struct {
 	serverFactory      func(upstream, base, cacheDir string) http.Handler
 	resolveUpstreamIPs func(context.Context, string) ([]net.IP, error)
 	hostOwnedIPs       func() ([]net.IP, error)
+	dialContext        func(context.Context, string, string) (net.Conn, error)
 	offline            atomic.Bool
 
 	mu                sync.Mutex
@@ -74,6 +75,7 @@ func newManagerWithPorts(cacheRoot string, ports []portBinding, catchAllPort int
 			return lookupNamespaceIPs(ctx, host)
 		},
 		hostOwnedIPs: hostOwnedIPs,
+		dialContext:  defaultEgressDependencies().dialContext,
 		bound:        map[string][]*http.Server{},
 		dynamic:      map[string]http.Handler{},
 	}
@@ -257,7 +259,7 @@ func (m *Manager) handlerForUpstream(authority upstreamAuthority) http.Handler {
 	mirrorServer := newServerWithEgress(base, cacheDir, egressDependencies{
 		resolve:     m.resolveUpstreamIPs,
 		hostIPs:     m.hostOwnedIPs,
-		dialContext: defaultEgressDependencies().dialContext,
+		dialContext: m.dialContext,
 		blocked:     namespaceIPBlocked,
 	})
 	mirrorServer.offline = &m.offline

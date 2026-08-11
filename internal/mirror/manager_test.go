@@ -150,12 +150,23 @@ func TestCatchAllMirrorRoutesByNamespaceCachesUnderUpstreamAndMapsDockerIO(t *te
 
 func TestCatchAllMirrorRefusesNonPublicNamespaces(t *testing.T) {
 	catchAllPort := freePort(t)
-	var upstreamHits atomic.Int64
+	var dials atomic.Int64
 
 	m := newManagerWithPorts(t.TempDir(), nil, catchAllPort)
-	m.serverFactory = func(_ string, base, cacheDir string) http.Handler {
-		upstreamHits.Add(1)
-		return NewServer(base, cacheDir)
+	m.resolveUpstreamIPs = func(_ context.Context, host string) ([]net.IP, error) {
+		switch host {
+		case "localhost":
+			return []net.IP{net.ParseIP("127.0.0.1")}, nil
+		case "10.0.0.7", "100.64.0.7", "169.254.1.7":
+			return []net.IP{net.ParseIP(host)}, nil
+		default:
+			return nil, fmt.Errorf("unexpected host %q", host)
+		}
+	}
+	m.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	m.dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		dials.Add(1)
+		return (&net.Dialer{}).DialContext(ctx, network, address)
 	}
 	defer m.Close()
 
@@ -172,8 +183,8 @@ func TestCatchAllMirrorRefusesNonPublicNamespaces(t *testing.T) {
 		})
 	}
 
-	if upstreamHits.Load() != 0 {
-		t.Fatalf("blocked namespaces reached upstream %d times, want 0", upstreamHits.Load())
+	if dials.Load() != 0 {
+		t.Fatalf("blocked namespaces dialed upstream %d times, want 0", dials.Load())
 	}
 }
 
@@ -858,7 +869,7 @@ func TestCatchAllMirrorCancellationStopsNamespaceValidation(t *testing.T) {
 	catchAllPort := freePort(t)
 	resolveStarted := make(chan struct{})
 	resolveReleased := make(chan struct{})
-	var handlerCalls atomic.Int64
+	var dials atomic.Int64
 
 	m := newManagerWithPorts(t.TempDir(), nil, catchAllPort)
 	m.resolveUpstreamIPs = func(ctx context.Context, host string) ([]net.IP, error) {
@@ -871,11 +882,9 @@ func TestCatchAllMirrorCancellationStopsNamespaceValidation(t *testing.T) {
 		return nil, ctx.Err()
 	}
 	m.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
-	m.serverFactory = func(string, string, string) http.Handler {
-		handlerCalls.Add(1)
-		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.WriteHeader(http.StatusOK)
-		})
+	m.dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		dials.Add(1)
+		return (&net.Dialer{}).DialContext(ctx, network, address)
 	}
 	defer m.Close()
 
@@ -902,8 +911,8 @@ func TestCatchAllMirrorCancellationStopsNamespaceValidation(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("catch-all handler did not return promptly after cancellation")
 	}
-	if handlerCalls.Load() != 0 {
-		t.Fatalf("dynamic handler calls = %d, want 0", handlerCalls.Load())
+	if dials.Load() != 0 {
+		t.Fatalf("validation cancellation still dialed upstream %d times, want 0", dials.Load())
 	}
 }
 
