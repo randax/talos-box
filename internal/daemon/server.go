@@ -310,8 +310,10 @@ func (s *Server) handle(request Request) (any, error) {
 		return s.pullCache(request.Args)
 	case "cache.warm":
 		return s.warmMirrorCache(request.Args)
+	case "cache.list":
+		return s.listCache()
 	case "cache.prune":
-		return s.pruneCache()
+		return s.pruneCache(request.Args)
 	case "mirror.offline.get":
 		return s.getMirrorOffline()
 	case "mirror.offline.set":

@@ -52,6 +52,27 @@ type Entry struct {
 	Size         int64
 }
 
+type MirrorUpstreamStats struct {
+	Upstream      string
+	BlobCount     int
+	BlobBytes     int64
+	ManifestCount int
+	ManifestBytes int64
+}
+
+type MirrorTotals struct {
+	BlobCount     int
+	BlobBytes     int64
+	ManifestCount int
+	ManifestBytes int64
+}
+
+type CachePruneResult struct {
+	ImageCount int
+	ImageBytes int64
+	Mirror     MirrorTotals
+}
+
 // New returns a cache rooted at root.
 func New(root string) *Cache {
 	return &Cache{
@@ -210,15 +231,88 @@ func (c *Cache) List() ([]Entry, error) {
 	return entries, nil
 }
 
-// Prune removes every cache entry.
-func (c *Cache) Prune() error {
-	if c.root == "" || filepath.Clean(c.root) == string(filepath.Separator) {
-		return errors.New("refusing to prune an empty or root cache path")
+func (c *Cache) MirrorStats() ([]MirrorUpstreamStats, MirrorTotals, error) {
+	mirrorRoot := filepath.Join(c.root, "mirror")
+	entries, err := os.ReadDir(mirrorRoot)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, MirrorTotals{}, nil
 	}
-	if err := os.RemoveAll(c.root); err != nil {
-		return fmt.Errorf("prune cache: %w", err)
+	if err != nil {
+		return nil, MirrorTotals{}, fmt.Errorf("list mirror cache: %w", err)
 	}
-	return nil
+
+	var stats []MirrorUpstreamStats
+	var totals MirrorTotals
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		stat := MirrorUpstreamStats{Upstream: entry.Name()}
+		if err := walkMirrorObjects(filepath.Join(mirrorRoot, entry.Name(), "blobs"), func(size int64) {
+			stat.BlobCount++
+			stat.BlobBytes += size
+		}); err != nil {
+			return nil, MirrorTotals{}, err
+		}
+		if err := walkMirrorObjects(filepath.Join(mirrorRoot, entry.Name(), "manifests"), func(size int64) {
+			stat.ManifestCount++
+			stat.ManifestBytes += size
+		}, ".meta", ".ct"); err != nil {
+			return nil, MirrorTotals{}, err
+		}
+		totals.BlobCount += stat.BlobCount
+		totals.BlobBytes += stat.BlobBytes
+		totals.ManifestCount += stat.ManifestCount
+		totals.ManifestBytes += stat.ManifestBytes
+		stats = append(stats, stat)
+	}
+
+	sort.Slice(stats, func(i, j int) bool { return stats[i].Upstream < stats[j].Upstream })
+	return stats, totals, nil
+}
+
+func (c *Cache) PruneDisk() (CachePruneResult, error) {
+	if err := validateCacheRoot(c.root); err != nil {
+		return CachePruneResult{}, err
+	}
+	result, err := c.pruneKnownDiskArtifacts()
+	if err != nil {
+		return CachePruneResult{}, fmt.Errorf("prune disk cache: %w", err)
+	}
+	return result, nil
+}
+
+func (c *Cache) PruneMirror() (CachePruneResult, error) {
+	if err := validateCacheRoot(c.root); err != nil {
+		return CachePruneResult{}, err
+	}
+	plan, err := c.planMirrorPrune()
+	if err != nil {
+		return CachePruneResult{}, fmt.Errorf("prune mirror cache: %w", err)
+	}
+	if err := c.executeMirrorPrune(plan); err != nil {
+		return CachePruneResult{}, fmt.Errorf("prune mirror cache: %w", err)
+	}
+	return CachePruneResult{Mirror: plan.totals}, nil
+}
+
+func (c *Cache) PruneAll() (CachePruneResult, error) {
+	if err := validateCacheRoot(c.root); err != nil {
+		return CachePruneResult{}, err
+	}
+	mirrorPlan, err := c.planMirrorPrune()
+	if err != nil {
+		return CachePruneResult{}, fmt.Errorf("prune mirror cache: %w", err)
+	}
+	disk, err := c.PruneDisk()
+	if err != nil {
+		return CachePruneResult{}, err
+	}
+	if err := c.executeMirrorPrune(mirrorPlan); err != nil {
+		return CachePruneResult{}, err
+	}
+	disk.Mirror = mirrorPlan.totals
+	return disk, nil
 }
 
 func (c *Cache) download(sourceURL, destination string) error {
@@ -293,6 +387,298 @@ func decompress(source, destination string) error {
 func fileReady(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.Mode().IsRegular() && info.Size() > 0
+}
+
+func validateCacheRoot(root string) error {
+	if root == "" || filepath.Clean(root) == string(filepath.Separator) {
+		return errors.New("refusing to prune an empty or root cache path")
+	}
+	if info, exists, err := lstatPath(root); err != nil {
+		return err
+	} else if exists {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing to prune symlink %q", root)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("refusing to prune non-directory cache path %q", root)
+		}
+	}
+	return nil
+}
+
+type pruneAction struct {
+	path         string
+	size         int64
+	countAsImage bool
+}
+
+type mirrorPrunePlan struct {
+	root   string
+	totals MirrorTotals
+}
+
+func (c *Cache) pruneKnownDiskArtifacts() (CachePruneResult, error) {
+	rootEntries, err := os.ReadDir(c.root)
+	if errors.Is(err, os.ErrNotExist) {
+		return CachePruneResult{}, nil
+	}
+	if err != nil {
+		return CachePruneResult{}, err
+	}
+
+	var result CachePruneResult
+	var plan []pruneAction
+	var cleanupDirs []string
+	for _, schematic := range rootEntries {
+		if schematic.Name() == "mirror" || !schematic.IsDir() {
+			continue
+		}
+		schematicPath := filepath.Join(c.root, schematic.Name())
+		if err := requireDirectoryPath(schematicPath); err != nil {
+			return CachePruneResult{}, err
+		}
+		versionEntries, err := os.ReadDir(schematicPath)
+		if err != nil {
+			return CachePruneResult{}, err
+		}
+		touchedSchematic := false
+		for _, version := range versionEntries {
+			if !version.IsDir() {
+				continue
+			}
+			versionPath := filepath.Join(schematicPath, version.Name())
+			if err := requireDirectoryPath(versionPath); err != nil {
+				return CachePruneResult{}, err
+			}
+			versionPlan, versionCleanup, touchedVersion, err := planKnownVersionPrune(versionPath)
+			if err != nil {
+				return CachePruneResult{}, err
+			}
+			if !touchedVersion {
+				continue
+			}
+			touchedSchematic = true
+			plan = append(plan, versionPlan...)
+			cleanupDirs = append(cleanupDirs, versionCleanup...)
+			cleanupDirs = append(cleanupDirs, versionPath)
+		}
+		if touchedSchematic {
+			cleanupDirs = append(cleanupDirs, schematicPath)
+		}
+	}
+	for _, action := range plan {
+		if err := os.Remove(action.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return CachePruneResult{}, err
+		}
+		if action.countAsImage {
+			result.ImageCount++
+		}
+		result.ImageBytes += action.size
+	}
+	for _, path := range cleanupDirs {
+		if err := removeIfEmpty(path); err != nil {
+			return CachePruneResult{}, err
+		}
+	}
+	return result, nil
+}
+
+func planKnownVersionPrune(versionPath string) ([]pruneAction, []string, bool, error) {
+	var plan []pruneAction
+	var cleanupDirs []string
+	touched := false
+	for _, architecture := range []Architecture{ArchitectureAMD64, ArchitectureARM64} {
+		archDir := filepath.Join(versionPath, string(architecture))
+		exists, err := pathExists(archDir)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		if exists {
+			touched = true
+			if err := requireDirectoryPath(archDir); err != nil {
+				return nil, nil, false, err
+			}
+			archPlan, err := planKnownFiles(archDir, []knownPruneName{
+				{name: "disk.raw", countAsImage: true},
+				{name: fmt.Sprintf("metal-%s.raw.xz", architecture)},
+			}, []knownPrunePrefix{
+				{prefix: ".disk.raw-"},
+				{prefix: fmt.Sprintf(".metal-%s.raw.xz-", architecture)},
+			})
+			if err != nil {
+				return nil, nil, false, err
+			}
+			plan = append(plan, archPlan...)
+			cleanupDirs = append(cleanupDirs, archDir)
+		}
+	}
+	legacyPlan, err := planKnownFiles(versionPath, []knownPruneName{{name: "disk.raw", countAsImage: true}}, nil)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	plan = append(plan, legacyPlan...)
+	return plan, cleanupDirs, touched || len(plan) > 0, nil
+}
+
+type knownPruneName struct {
+	name         string
+	countAsImage bool
+}
+
+type knownPrunePrefix struct {
+	prefix string
+}
+
+func planKnownFiles(dir string, names []knownPruneName, prefixes []knownPrunePrefix) ([]pruneAction, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	byName := make(map[string]knownPruneName, len(names))
+	for _, candidate := range names {
+		byName[candidate.name] = candidate
+	}
+	var plan []pruneAction
+	for _, entry := range entries {
+		if candidate, ok := byName[entry.Name()]; ok {
+			action, err := planKnownArtifact(filepath.Join(dir, entry.Name()), candidate.countAsImage)
+			if err != nil {
+				return nil, err
+			}
+			plan = append(plan, action)
+			continue
+		}
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(entry.Name(), prefix.prefix) {
+				action, err := planKnownArtifact(filepath.Join(dir, entry.Name()), false)
+				if err != nil {
+					return nil, err
+				}
+				plan = append(plan, action)
+				break
+			}
+		}
+	}
+	return plan, nil
+}
+
+func planKnownArtifact(path string, countAsImage bool) (pruneAction, error) {
+	info, exists, err := lstatPath(path)
+	if err != nil {
+		return pruneAction{}, err
+	}
+	if !exists {
+		return pruneAction{}, nil
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return pruneAction{}, fmt.Errorf("refusing to prune symlink %q", path)
+	}
+	if !info.Mode().IsRegular() {
+		return pruneAction{}, fmt.Errorf("refusing to prune non-regular path %q", path)
+	}
+	return pruneAction{path: path, size: info.Size(), countAsImage: countAsImage}, nil
+}
+
+func (c *Cache) planMirrorPrune() (mirrorPrunePlan, error) {
+	plan := mirrorPrunePlan{root: filepath.Join(c.root, "mirror")}
+	if _, exists, err := lstatPath(plan.root); err != nil {
+		return mirrorPrunePlan{}, err
+	} else if exists {
+		if err := requireDirectoryPath(plan.root); err != nil {
+			return mirrorPrunePlan{}, err
+		}
+	}
+	_, totals, err := c.MirrorStats()
+	if err != nil {
+		return mirrorPrunePlan{}, err
+	}
+	plan.totals = totals
+	return plan, nil
+}
+
+func (c *Cache) executeMirrorPrune(plan mirrorPrunePlan) error {
+	if err := os.RemoveAll(plan.root); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func removeIfEmpty(path string) error {
+	info, exists, err := lstatPath(path)
+	if err != nil || !exists {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing to prune symlink %q", path)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("refusing to prune non-directory path %q", path)
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+	if len(entries) != 0 {
+		return nil
+	}
+	return os.Remove(path)
+}
+
+func requireDirectoryPath(path string) error {
+	info, exists, err := lstatPath(path)
+	if err != nil || !exists {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing to prune symlink %q", path)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("refusing to prune non-directory path %q", path)
+	}
+	return nil
+}
+
+func pathExists(path string) (bool, error) {
+	_, exists, err := lstatPath(path)
+	return exists, err
+}
+
+func lstatPath(path string) (os.FileInfo, bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return info, true, nil
+}
+
+func walkMirrorObjects(root string, visit func(int64), ignoredSuffixes ...string) error {
+	if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			if strings.HasPrefix(info.Name(), ".partial") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasPrefix(info.Name(), ".partial") {
+			return nil
+		}
+		for _, suffix := range ignoredSuffixes {
+			if strings.HasSuffix(info.Name(), suffix) {
+				return nil
+			}
+		}
+		visit(info.Size())
+		return nil
+	})
 }
 
 func migrateLegacyDisk(legacyPath, destination string) (bool, error) {
