@@ -171,7 +171,7 @@ func checkCachedBlob(ctx context.Context, server *Server, digest string, deep bo
 		return fmt.Errorf("blob %s invalid: %w", digest, err)
 	}
 	path := server.blobPath(digest)
-	file, _, err := openCheckedRegularFile(path, nil)
+	file, _, err := openCheckedRegularFile(path)
 	if err != nil {
 		return fmt.Errorf("blob %s not cached", digest)
 	}
@@ -240,7 +240,7 @@ func checkedSupportedDigest(reference string) (string, string, error) {
 }
 
 func checkedCachedManifestBytes(server *Server, requestPath string) ([]byte, error) {
-	return readCheckedRegularFile(server.manifestPath(requestPath), maxManifestBytes, nil)
+	return readCheckedRegularFile(server.manifestPath(requestPath), maxManifestBytes)
 }
 
 func checkedCachedManifestMetadata(server *Server, requestPath string, data []byte) manifestMetadata {
@@ -249,7 +249,7 @@ func checkedCachedManifestMetadata(server *Server, requestPath string, data []by
 		ContentLength:       int64(len(data)),
 		DockerContentDigest: cachedManifestDigest(data, manifestReference(requestPath), ""),
 	}
-	if rawMetadata, err := readCheckedRegularFile(server.manifestMetadataPath(requestPath), maxCachedManifestSidecarBytes, nil); err == nil {
+	if rawMetadata, err := readCheckedRegularFile(server.manifestMetadataPath(requestPath), maxCachedManifestSidecarBytes); err == nil {
 		var stored manifestMetadata
 		if json.Unmarshal(rawMetadata, &stored) == nil {
 			if stored.ContentType != "" {
@@ -259,43 +259,56 @@ func checkedCachedManifestMetadata(server *Server, requestPath string, data []by
 			return metadata
 		}
 	}
-	if ct, err := readCheckedRegularFile(server.manifestPath(requestPath)+".ct", maxCachedManifestSidecarBytes, nil); err == nil && len(ct) > 0 {
+	if ct, err := readCheckedRegularFile(server.manifestPath(requestPath)+".ct", maxCachedManifestSidecarBytes); err == nil && len(ct) > 0 {
 		metadata.ContentType = string(ct)
 	}
 	return metadata
 }
 
-func openCheckedRegularFile(path string, afterOpen func()) (*os.File, os.FileInfo, error) {
+func openCheckedRegularFile(path string) (*os.File, os.FileInfo, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, nil, err
 	}
-	if afterOpen != nil {
-		afterOpen()
-	}
-	info, err := file.Stat()
+	info, err := openRegularFileInfo(file)
 	if err != nil {
 		_ = file.Close()
 		return nil, nil, err
 	}
-	pathInfo, err := os.Lstat(path)
-	if err != nil {
+	if err := validateOpenedRegularFile(path, info); err != nil {
 		_ = file.Close()
 		return nil, nil, err
-	}
-	if pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() || !info.Mode().IsRegular() {
-		_ = file.Close()
-		return nil, nil, fmt.Errorf("cached file is not a regular file")
-	}
-	if !os.SameFile(info, pathInfo) {
-		_ = file.Close()
-		return nil, nil, fmt.Errorf("cached file changed during open")
 	}
 	return file, info, nil
 }
 
-func readCheckedRegularFile(path string, maxBytes int64, afterOpen func()) ([]byte, error) {
-	file, info, err := openCheckedRegularFile(path, afterOpen)
+func openRegularFileInfo(file *os.File) (os.FileInfo, error) {
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("cached file is not a regular file")
+	}
+	return info, nil
+}
+
+func validateOpenedRegularFile(path string, info os.FileInfo) error {
+	pathInfo, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() {
+		return fmt.Errorf("cached file is not a regular file")
+	}
+	if !os.SameFile(info, pathInfo) {
+		return fmt.Errorf("cached file changed during open")
+	}
+	return nil
+}
+
+func readCheckedRegularFile(path string, maxBytes int64) ([]byte, error) {
+	file, info, err := openCheckedRegularFile(path)
 	if err != nil {
 		return nil, err
 	}

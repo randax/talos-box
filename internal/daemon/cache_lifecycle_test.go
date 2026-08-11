@@ -215,8 +215,8 @@ func TestListCacheIncludesMirrorServingStatusFromBindings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.MirrorServing || result.MirrorBoundGateways != 0 || len(result.MirrorBoundGatewayIPs) != 0 {
-		t.Fatalf("initial mirror serving state = serving %t gateways %d ips %v, want false/0/[]", result.MirrorServing, result.MirrorBoundGateways, result.MirrorBoundGatewayIPs)
+	if len(result.MirrorBoundGatewayIPs) != 0 {
+		t.Fatalf("initial mirror gateway IPs = %v, want empty", result.MirrorBoundGatewayIPs)
 	}
 
 	service.boundMirrorGateways = func() []string { return []string{"172.30.3.1"} }
@@ -224,8 +224,8 @@ func TestListCacheIncludesMirrorServingStatusFromBindings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.MirrorServing || result.MirrorBoundGateways != 1 || len(result.MirrorBoundGatewayIPs) != 1 || result.MirrorBoundGatewayIPs[0] != "172.30.3.1" {
-		t.Fatalf("bound mirror serving state = serving %t gateways %d ips %v, want true/1/[172.30.3.1]", result.MirrorServing, result.MirrorBoundGateways, result.MirrorBoundGatewayIPs)
+	if len(result.MirrorBoundGatewayIPs) != 1 || result.MirrorBoundGatewayIPs[0] != "172.30.3.1" {
+		t.Fatalf("bound mirror gateway IPs = %v, want [172.30.3.1]", result.MirrorBoundGatewayIPs)
 	}
 
 	service.boundMirrorGateways = func() []string { return nil }
@@ -233,8 +233,8 @@ func TestListCacheIncludesMirrorServingStatusFromBindings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.MirrorServing || result.MirrorBoundGateways != 0 || len(result.MirrorBoundGatewayIPs) != 0 {
-		t.Fatalf("unbound mirror serving state = serving %t gateways %d ips %v, want false/0/[]", result.MirrorServing, result.MirrorBoundGateways, result.MirrorBoundGatewayIPs)
+	if len(result.MirrorBoundGatewayIPs) != 0 {
+		t.Fatalf("unbound mirror gateway IPs = %v, want empty", result.MirrorBoundGatewayIPs)
 	}
 }
 

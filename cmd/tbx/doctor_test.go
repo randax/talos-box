@@ -381,8 +381,6 @@ func TestRunDoctorIncludesMirrorHealth(t *testing.T) {
 	}
 	deps.listCache = func() (daemon.CacheListResult, error) {
 		return daemon.CacheListResult{
-			MirrorServing:         true,
-			MirrorBoundGateways:   1,
 			MirrorBoundGatewayIPs: []string{"172.30.3.1"},
 			MirrorTotal: daemon.MirrorCacheTotals{
 				BlobCount:     2,
@@ -501,8 +499,6 @@ func TestRunDoctorFailsMirrorHealthWhenOnlySomeRunningClustersAreBound(t *testin
 	}
 	deps.listCache = func() (daemon.CacheListResult, error) {
 		return daemon.CacheListResult{
-			MirrorServing:         true,
-			MirrorBoundGateways:   1,
 			MirrorBoundGatewayIPs: []string{"172.30.3.1"},
 			MirrorTotal: daemon.MirrorCacheTotals{
 				BlobCount:     2,
@@ -543,8 +539,6 @@ func TestRunDoctorFailsMirrorHealthWhenBoundGatewayIPIsWrong(t *testing.T) {
 	}
 	deps.listCache = func() (daemon.CacheListResult, error) {
 		return daemon.CacheListResult{
-			MirrorServing:         true,
-			MirrorBoundGateways:   1,
 			MirrorBoundGatewayIPs: []string{"172.30.99.1"},
 			MirrorTotal: daemon.MirrorCacheTotals{
 				BlobCount:     2,

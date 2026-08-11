@@ -536,16 +536,20 @@ func TestOpenCheckedRegularFileRejectsPathSwapAfterOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, _, err := openCheckedRegularFile(path, func() {
-		if renameErr := os.Rename(path, filepath.Join(root, "manifest.old")); renameErr != nil {
-			t.Fatal(renameErr)
-		}
-		if renameErr := os.Rename(replacement, path); renameErr != nil {
-			t.Fatal(renameErr)
-		}
-	})
+	file, info, err := openCheckedRegularFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = file.Close()
+	if renameErr := os.Rename(path, filepath.Join(root, "manifest.old")); renameErr != nil {
+		t.Fatal(renameErr)
+	}
+	if renameErr := os.Rename(replacement, path); renameErr != nil {
+		t.Fatal(renameErr)
+	}
+	err = validateOpenedRegularFile(path, info)
 	if err == nil || !strings.Contains(err.Error(), "changed during open") {
-		t.Fatalf("openCheckedRegularFile() error = %v, want changed-during-open failure", err)
+		t.Fatalf("validateOpenedRegularFile() error = %v, want changed-during-open failure", err)
 	}
 }
 
