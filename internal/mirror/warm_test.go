@@ -1165,7 +1165,7 @@ func TestWarmManifestGraphSkipsAlreadyCachedBlobs(t *testing.T) {
 	})
 
 	result := &WarmResult{Ref: "registry.example/demo:1.0.0", AlreadyComplete: true}
-	if err := warmManifestGraph(context.Background(), handler, server, "demo", []byte(manifestBody), string(imagecache.ArchitectureAMD64), map[string]bool{}, map[string]bool{}, result); err != nil {
+	if err := warmManifestGraph(context.Background(), handler, server, "demo", []byte(manifestBody), string(imagecache.ArchitectureAMD64), map[string]bool{}, map[string]bool{}, map[string]bool{}, result); err != nil {
 		t.Fatal(err)
 	}
 	if !result.AlreadyComplete {
@@ -1238,6 +1238,70 @@ func TestWarmContinuesAfterFailureAndReportsMixedSummary(t *testing.T) {
 	}
 	if summary.Results[1].Ref != "registry.example/missing@sha256:"+strings.Repeat("b", 64) || summary.Results[1].Error == "" {
 		t.Fatalf("failed result = %+v", summary.Results[1])
+	}
+}
+
+func TestWarmCachesHostBlobsWhenIndexRepeatsChildDigestAcrossPlatforms(t *testing.T) {
+	configBody := []byte("cfg")
+	layerBody := []byte("layer")
+	configDigest := "sha256:" + sha256Hex(configBody)
+	layerDigest := "sha256:" + sha256Hex(layerBody)
+	childManifest := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%d},"layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"%s","size":%d}]}`,
+		configDigest, len(configBody), layerDigest, len(layerBody))
+	childDigest := "sha256:" + sha256Hex([]byte(childManifest))
+	indexBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s","size":%d,"platform":{"architecture":"arm64","os":"linux"}},{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s","size":%d,"platform":{"architecture":"amd64","os":"linux"}}]}`,
+		childDigest, len(childManifest), childDigest, len(childManifest))
+	indexDigest := "sha256:" + sha256Hex([]byte(indexBody))
+
+	var blobHits atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/demo/manifests/" + indexDigest:
+			w.Header().Set("Content-Type", "application/vnd.oci.image.index.v1+json")
+			w.Header().Set("Docker-Content-Digest", indexDigest)
+			_, _ = fmt.Fprint(w, indexBody)
+		case "/v2/demo/manifests/" + childDigest:
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", childDigest)
+			_, _ = fmt.Fprint(w, childManifest)
+		case "/v2/demo/blobs/" + configDigest:
+			blobHits.Add(1)
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = w.Write(configBody)
+		case "/v2/demo/blobs/" + layerDigest:
+			blobHits.Add(1)
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = w.Write(layerBody)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	manager := newManagerWithPorts(t.TempDir(), nil, freePort(t))
+	manager.baseOverride = aliasedURL(t, upstream.URL, "registry.example")
+	egress := egressForRoutes(aliasRoute(t, upstream.URL, "registry.example", "203.0.113.10"))
+	manager.resolveUpstreamIPs = egress.resolve
+	manager.hostOwnedIPs = egress.hostIPs
+	manager.dialContext = egress.dialContext
+	defer manager.Close()
+
+	result, err := manager.Warm(context.Background(), []string{"registry.example/demo@" + indexDigest}, imagecache.ArchitectureAMD64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Warmed != 1 || result.AlreadyComplete != 0 || result.Failed != 0 {
+		t.Fatalf("warm result = %+v", result)
+	}
+	if blobHits.Load() != 2 {
+		t.Fatalf("blob hits = %d, want 2 host blobs fetched", blobHits.Load())
+	}
+
+	server := NewServer("https://registry.example", filepath.Join(manager.cacheRoot, "registry.example"))
+	for _, digest := range []string{configDigest, layerDigest} {
+		if _, err := os.Stat(server.blobPath(digest)); err != nil {
+			t.Fatalf("blob %s missing after warm: %v", digest, err)
+		}
 	}
 }
 
