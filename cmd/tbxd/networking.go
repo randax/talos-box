@@ -53,7 +53,9 @@ func configureHostNetworking() {
 	}
 	// Resolver-file mutation has a single serialized owner so this can never
 	// race the create/destroy paths with a stale domain set.
-	daemon.SyncResolverFiles()
+	if err := daemon.SyncResolverFiles(); err != nil {
+		log.Printf("startup resolver-file sync: %v", err)
+	}
 }
 
 // customClusterDomains lists the explicit domains of live clusters; clusters
