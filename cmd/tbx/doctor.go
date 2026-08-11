@@ -124,6 +124,7 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 	}
 
 	clusters, clusterErr := deps.listClusters()
+	anyRunning := false
 	if isDaemonUnavailable(clusterErr) {
 		detail := fmt.Sprintf("daemon unavailable: %v", clusterErr)
 		if err := writeFindings(
@@ -156,7 +157,6 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 			return err
 		}
 
-		anyRunning := false
 		for _, item := range clusters {
 			if item.Running {
 				anyRunning = true
@@ -199,13 +199,32 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 			mirrorFinding.level, mirrorFinding.detail = "FAIL", err.Error()
 		} else {
 			totalBytes := cacheResult.MirrorTotal.BlobBytes + cacheResult.MirrorTotal.ManifestBytes
-			mirrorFinding.level = "PASS"
-			mirrorFinding.detail = fmt.Sprintf(
-				"mirror serving, cache %d bytes (%d blob(s), %d manifest(s))",
+			cacheDetail := fmt.Sprintf(
+				"cache %d bytes (%d blob(s), %d manifest(s))",
 				totalBytes,
 				cacheResult.MirrorTotal.BlobCount,
 				cacheResult.MirrorTotal.ManifestCount,
 			)
+			switch {
+			case cacheResult.MirrorServing && clusterErr == nil && !anyRunning:
+				mirrorFinding.level = "FAIL"
+				mirrorFinding.detail = fmt.Sprintf("mirror listeners bound while no clusters are running; %s", cacheDetail)
+			case cacheResult.MirrorServing:
+				mirrorFinding.level = "PASS"
+				mirrorFinding.detail = fmt.Sprintf("mirror serving on %d gateway(s), %s", cacheResult.MirrorBoundGateways, cacheDetail)
+			case clusterErr == nil && len(clusters) == 0:
+				mirrorFinding.level = "SKIP"
+				mirrorFinding.detail = fmt.Sprintf("no clusters exist; %s", cacheDetail)
+			case clusterErr == nil && !anyRunning:
+				mirrorFinding.level = "SKIP"
+				mirrorFinding.detail = fmt.Sprintf("no clusters are running; %s", cacheDetail)
+			case clusterErr == nil && anyRunning:
+				mirrorFinding.level = "FAIL"
+				mirrorFinding.detail = fmt.Sprintf("no mirror listeners bound for running cluster(s); %s", cacheDetail)
+			default:
+				mirrorFinding.level = "SKIP"
+				mirrorFinding.detail = fmt.Sprintf("cluster state unavailable; %s", cacheDetail)
+			}
 		}
 	}
 	if err := writeFindings(mirrorFinding); err != nil {

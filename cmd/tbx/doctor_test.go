@@ -363,6 +363,55 @@ func TestRunDoctorNoClustersSkipsAndEgressWarnIsNonFatal(t *testing.T) {
 
 func TestRunDoctorIncludesMirrorHealth(t *testing.T) {
 	deps := passingDoctorDependencies()
+	deps.listClusters = func() ([]daemon.ClusterSummary, error) {
+		return []daemon.ClusterSummary{{Name: "demo", SubnetIndex: 3, Running: true}}, nil
+	}
+	deps.getStatus = func() ([]daemon.ClusterStatus, error) {
+		return []daemon.ClusterStatus{{Name: "demo", Running: true, Nodes: []daemon.NodeStatus{{Name: "demo-cp-1", IP: "172.30.3.2"}}}}, nil
+	}
+	deps.command = func(name string, args ...string) ([]byte, error) {
+		switch name {
+		case "/usr/bin/dscacheutil":
+			return []byte("ip_address: 172.30.3.200\n"), nil
+		case "/sbin/route":
+			return []byte("interface: bridge100\n"), nil
+		default:
+			return nil, nil
+		}
+	}
+	deps.listCache = func() (daemon.CacheListResult, error) {
+		return daemon.CacheListResult{
+			MirrorServing:       true,
+			MirrorBoundGateways: 1,
+			MirrorTotal: daemon.MirrorCacheTotals{
+				BlobCount:     2,
+				BlobBytes:     20,
+				ManifestCount: 1,
+				ManifestBytes: 7,
+			},
+		}, nil
+	}
+
+	var output strings.Builder
+	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
+		t.Fatalf("runDoctorWithDependencies() = %v", err)
+	}
+	if !strings.Contains(output.String(), "PASS mirror-health: mirror serving on 1 gateway(s), cache 27 bytes (2 blob(s), 1 manifest(s))") {
+		t.Fatalf("output missing mirror health line:\n%s", output.String())
+	}
+}
+
+func TestRunDoctorSkipsMirrorHealthWhenNoClustersAreRunning(t *testing.T) {
+	deps := passingDoctorDependencies()
+	deps.listClusters = func() ([]daemon.ClusterSummary, error) {
+		return []daemon.ClusterSummary{{Name: "demo", SubnetIndex: 3, Running: false}}, nil
+	}
+	deps.command = func(name string, args ...string) ([]byte, error) {
+		if name == "/usr/bin/dscacheutil" {
+			return []byte("ip_address: 172.30.3.200\n"), nil
+		}
+		return nil, nil
+	}
 	deps.listCache = func() (daemon.CacheListResult, error) {
 		return daemon.CacheListResult{
 			MirrorTotal: daemon.MirrorCacheTotals{
@@ -378,7 +427,46 @@ func TestRunDoctorIncludesMirrorHealth(t *testing.T) {
 	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
 		t.Fatalf("runDoctorWithDependencies() = %v", err)
 	}
-	if !strings.Contains(output.String(), "PASS mirror-health: mirror serving, cache 27 bytes (2 blob(s), 1 manifest(s))") {
+	if !strings.Contains(output.String(), "SKIP mirror-health: no clusters are running; cache 27 bytes (2 blob(s), 1 manifest(s))") {
+		t.Fatalf("output missing mirror idle line:\n%s", output.String())
+	}
+}
+
+func TestRunDoctorFailsMirrorHealthWhenClusterIsRunningButNotBound(t *testing.T) {
+	deps := passingDoctorDependencies()
+	deps.listClusters = func() ([]daemon.ClusterSummary, error) {
+		return []daemon.ClusterSummary{{Name: "demo", SubnetIndex: 3, Running: true}}, nil
+	}
+	deps.getStatus = func() ([]daemon.ClusterStatus, error) {
+		return []daemon.ClusterStatus{{Name: "demo", Running: true, Nodes: []daemon.NodeStatus{{Name: "demo-cp-1", IP: "172.30.3.2"}}}}, nil
+	}
+	deps.command = func(name string, args ...string) ([]byte, error) {
+		switch name {
+		case "/usr/bin/dscacheutil":
+			return []byte("ip_address: 172.30.3.200\n"), nil
+		case "/sbin/route":
+			return []byte("interface: bridge100\n"), nil
+		default:
+			return nil, nil
+		}
+	}
+	deps.listCache = func() (daemon.CacheListResult, error) {
+		return daemon.CacheListResult{
+			MirrorTotal: daemon.MirrorCacheTotals{
+				BlobCount:     2,
+				BlobBytes:     20,
+				ManifestCount: 1,
+				ManifestBytes: 7,
+			},
+		}, nil
+	}
+
+	var output strings.Builder
+	err := (cli{out: &output}).runDoctorWithDependencies(nil, deps)
+	if err == nil {
+		t.Fatal("runDoctorWithDependencies() succeeded despite missing mirror listeners")
+	}
+	if !strings.Contains(output.String(), "FAIL mirror-health: no mirror listeners bound for running cluster(s); cache 27 bytes (2 blob(s), 1 manifest(s))") {
 		t.Fatalf("output missing mirror health line:\n%s", output.String())
 	}
 }

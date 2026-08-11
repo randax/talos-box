@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -134,7 +135,10 @@ func checkCachedManifest(ctx context.Context, server *Server, requestPath, expec
 	}
 	data, err := checkedCachedManifestBytes(server, requestPath)
 	if err != nil {
-		return nil, "", fmt.Errorf("%s not cached", requestPath)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, "", fmt.Errorf("%s not cached", requestPath)
+		}
+		return nil, "", fmt.Errorf("%s invalid: %w", requestPath, err)
 	}
 	resolvedDigest := server.cachedManifestMetadata(requestPath, data).DockerContentDigest
 	if expectedDigest != "" {
@@ -245,7 +249,23 @@ func checkedCachedManifestBytes(server *Server, requestPath string) ([]byte, err
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("cached manifest is not a regular file")
 	}
-	return os.ReadFile(path)
+	if info.Size() > maxManifestBytes {
+		return nil, fmt.Errorf("cached manifest exceeds %d bytes", maxManifestBytes)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = file.Close() }()
+
+	data, err := io.ReadAll(io.LimitReader(file, maxManifestBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxManifestBytes {
+		return nil, fmt.Errorf("cached manifest exceeds %d bytes", maxManifestBytes)
+	}
+	return data, nil
 }
 
 func manifestRequestPath(repository, reference string) string {

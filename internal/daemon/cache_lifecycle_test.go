@@ -10,6 +10,7 @@ import (
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/hypervisor"
 	"github.com/randax/talos-box/internal/imagecache"
+	"github.com/randax/talos-box/internal/mirror"
 )
 
 func TestListCacheIncludesMirrorSectionForWarmedLayout(t *testing.T) {
@@ -201,6 +202,52 @@ func TestPruneCacheScopesReportDeletedBytesAndIsolateDiskFromMirror(t *testing.T
 			}
 		})
 	}
+}
+
+func TestListCacheIncludesMirrorServingStatusFromBindings(t *testing.T) {
+	root := t.TempDir()
+	manager := mirror.NewManager(mirror.DefaultDir(root))
+	defer manager.Close()
+
+	service := &Server{
+		cache:      imagecache.New(root),
+		hypervisor: &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
+		mirrors:    manager,
+	}
+
+	result, err := service.listCache()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.MirrorServing || result.MirrorBoundGateways != 0 {
+		t.Fatalf("initial mirror serving state = serving %t gateways %d, want false/0", result.MirrorServing, result.MirrorBoundGateways)
+	}
+
+	gateway := bindMirrorGateway(t, manager)
+	result, err = service.listCache()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.MirrorServing || result.MirrorBoundGateways != 1 {
+		t.Fatalf("bound mirror serving state = serving %t gateways %d, want true/1", result.MirrorServing, result.MirrorBoundGateways)
+	}
+
+	manager.Unbind(gateway)
+	result, err = service.listCache()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.MirrorServing || result.MirrorBoundGateways != 0 {
+		t.Fatalf("unbound mirror serving state = serving %t gateways %d, want false/0", result.MirrorServing, result.MirrorBoundGateways)
+	}
+}
+
+func bindMirrorGateway(t *testing.T, manager *mirror.Manager) string {
+	t.Helper()
+	if err := manager.Bind("127.0.0.1"); err != nil {
+		t.Fatalf("bind mirror gateway: %v", err)
+	}
+	return "127.0.0.1"
 }
 
 func snapshotTree(t *testing.T, root string) []byte {
