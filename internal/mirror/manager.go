@@ -175,6 +175,18 @@ func (m *Manager) serveCatchAll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	clone := r.Clone(r.Context())
+	clone.URL = cloneURLWithoutQueryValue(r.URL, "ns")
+	if clone.Method != http.MethodGet && clone.Method != http.MethodHead || clone.URL.Path == "/v2/" {
+		m.cacheProbeServer(authority).ServeHTTP(w, clone)
+		return
+	}
+	if served, cacheErr := m.probeCacheOnly(authority, w, clone); served {
+		return
+	} else if cacheErr != nil {
+		http.Error(w, cacheErr.Error(), cacheErr.status)
+		return
+	}
 	handler, ok := m.dynamicHandler(authority.cacheKey)
 	if !ok {
 		if err := m.validateResolvedAuthority(r.Context(), authority); err != nil {
@@ -188,9 +200,47 @@ func (m *Manager) serveCatchAll(w http.ResponseWriter, r *http.Request) {
 		}
 		handler = m.handlerForUpstream(authority)
 	}
-	clone := r.Clone(r.Context())
-	clone.URL = cloneURLWithoutQueryValue(r.URL, "ns")
 	handler.ServeHTTP(w, clone)
+}
+
+func (m *Manager) probeCacheOnly(authority upstreamAuthority, w http.ResponseWriter, r *http.Request) (bool, *cacheReplayError) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false, nil
+	}
+	if r.URL.Path == "/v2/" {
+		return false, nil
+	}
+	server := m.cacheProbeServer(authority)
+	digest := ""
+	if match := blobPathRe.FindStringSubmatch(r.URL.Path); match != nil {
+		digest = match[1]
+	}
+	isManifest := manifestPathRe.MatchString(r.URL.Path)
+	if served, err := server.serveCacheIfAvailable(w, r, digest, isManifest); served || err != nil {
+		return served, err
+	}
+	if server.offlineEnabled() {
+		return false, &cacheReplayError{
+			status: http.StatusServiceUnavailable,
+			err:    fmt.Errorf("mirror offline: content not cached"),
+		}
+	}
+	return false, nil
+}
+
+func (m *Manager) cacheProbeServer(authority upstreamAuthority) *Server {
+	base := authority.base
+	if m.baseOverride != "" {
+		base = m.baseOverride
+	}
+	server := newServerWithEgress(base, filepath.Join(m.cacheRoot, authority.cacheKey), egressDependencies{
+		resolve:     m.resolveUpstreamIPs,
+		hostIPs:     m.hostOwnedIPs,
+		dialContext: m.dialContext,
+		blocked:     namespaceIPBlocked,
+	})
+	server.offline = &m.offline
+	return server
 }
 
 type upstreamAuthority struct {
