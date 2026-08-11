@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -12,7 +13,7 @@ func TestResolvedRegistrationUsesPerClusterRouteOnlyDomain(t *testing.T) {
 	t.Parallel()
 
 	var calls [][]string
-	registration := applyResolvedRegistration("demo", 7, func(name string, args ...string) error {
+	registration := applyResolvedRegistration("demo.k8s.test", 7, func(name string, args ...string) error {
 		calls = append(calls, append([]string{name}, args...))
 		return nil
 	})
@@ -28,10 +29,28 @@ func TestResolvedRegistrationUsesPerClusterRouteOnlyDomain(t *testing.T) {
 	}
 }
 
+func TestResolvedRegistrationUsesCustomDomain(t *testing.T) {
+	t.Parallel()
+
+	var domains []string
+	registration := applyResolvedRegistration("staging.lab.internal", 9, func(name string, args ...string) error {
+		if len(args) > 0 && args[0] == "domain" {
+			domains = append(domains, args[2])
+		}
+		return nil
+	})
+	if !reflect.DeepEqual(domains, []string{"~staging.lab.internal"}) {
+		t.Fatalf("registered domains = %v, want [~staging.lab.internal]", domains)
+	}
+	if !registration.Registered || registration.Domain != "~staging.lab.internal" {
+		t.Fatalf("registration = %#v", registration)
+	}
+}
+
 func TestResolvedRegistrationFailureIsNonFatalAndActionable(t *testing.T) {
 	t.Parallel()
 
-	registration := applyResolvedRegistration("demo", 7, func(string, ...string) error {
+	registration := applyResolvedRegistration("demo.k8s.test", 7, func(string, ...string) error {
 		return errors.New("resolvectl not found")
 	})
 	if registration.Registered {
@@ -39,6 +58,33 @@ func TestResolvedRegistrationFailureIsNonFatalAndActionable(t *testing.T) {
 	}
 	if registration.Detail == "" || registration.ManualStep == "" {
 		t.Fatalf("registration lacks detail or manual step: %#v", registration)
+	}
+}
+
+func TestDecodeDNSIdentityRefusesHostileDomains(t *testing.T) {
+	t.Parallel()
+
+	// The helper is root and hands the domain to resolvectl; anything but a
+	// canonical validated domain must be refused (a bare "." would register
+	// "~." and hijack all host DNS).
+	for _, raw := range []string{
+		`{"cluster":"a","domain":".","subnetIndex":0}`,
+		`{"cluster":"a","domain":"","subnetIndex":0}`, // empty falls back to the default — allowed
+		`{"cluster":"a","domain":"Lab.Internal","subnetIndex":0}`,
+		`{"cluster":"a","domain":"lab.internal.","subnetIndex":0}`,
+		`{"cluster":"a","domain":"../etc","subnetIndex":0}`,
+		`{"cluster":"a","domain":"a/b.test","subnetIndex":0}`,
+	} {
+		domain, _, err := decodeDNSIdentity([]byte(raw))
+		if strings.Contains(raw, `"domain":""`) {
+			if err != nil || domain != "a.k8s.test" {
+				t.Fatalf("empty domain: got %q, %v; want default a.k8s.test", domain, err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Fatalf("decodeDNSIdentity accepted %s as %q", raw, domain)
+		}
 	}
 }
 
@@ -56,9 +102,9 @@ func TestDispatchDNSListenReturnsOwnedDescriptorAndRegistration(t *testing.T) {
 		}
 		return file, nil
 	}
-	registerDNS = func(cluster string, subnetIndex int) DNSRegistration {
-		if cluster != "demo" || subnetIndex != 7 {
-			t.Fatalf("register = %s/%d, want demo/7", cluster, subnetIndex)
+	registerDNS = func(domain string, subnetIndex int) DNSRegistration {
+		if domain != "demo.k8s.test" || subnetIndex != 7 {
+			t.Fatalf("register = %s/%d, want demo.k8s.test/7", domain, subnetIndex)
 		}
 		return DNSRegistration{Registered: true, Domain: "~demo.k8s.test"}
 	}

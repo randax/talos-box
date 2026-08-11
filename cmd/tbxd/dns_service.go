@@ -6,10 +6,98 @@ import (
 	"log"
 	"net"
 	"sort"
+	"sync"
+	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/helper"
 )
+
+// clusterDomainSource maintains an in-memory snapshot of the cluster domain
+// set for the DNS authority predicate, so answering a query never touches
+// disk. refresh() reads state (retaining the last good set on error — a
+// transient state error must never shrink the set, or queries for live
+// custom domains would be forwarded to the upstream resolver, leaking names
+// or answering from real DNS for unsafe domains). Until the first successful
+// refresh, snapshot() fails closed with the "*" sentinel, which Authority
+// treats as claiming every name.
+type clusterDomainSource struct {
+	list func() ([]cluster.Cluster, error)
+
+	// refreshMu serializes refreshes so overlapping reads cannot publish
+	// out of order; mu guards only the published snapshot, so snapshot()
+	// never waits on state-directory IO.
+	refreshMu sync.Mutex
+	mu        sync.Mutex
+	last      []string
+	everRead  bool
+}
+
+func newClusterDomainSource(list func() ([]cluster.Cluster, error)) *clusterDomainSource {
+	return &clusterDomainSource{list: list}
+}
+
+// snapshot returns the current domain set without any IO or contention with
+// in-flight refreshes.
+func (s *clusterDomainSource) snapshot() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.everRead {
+		return []string{"*"}
+	}
+	return s.last
+}
+
+// refresh re-reads cluster state and publishes it to the snapshot.
+func (s *clusterDomainSource) refresh() {
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+	clusters, err := s.list()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err != nil {
+		if !s.everRead {
+			log.Printf("DNS state has never been readable; answering all queries locally: %v", err)
+			return
+		}
+		log.Printf("DNS state refresh failed; keeping last-known domain set: %v", err)
+		return
+	}
+	domains := make([]string, 0, len(clusters))
+	for _, item := range clusters {
+		domains = append(domains, item.EffectiveDomain())
+	}
+	s.last, s.everRead = domains, true
+}
+
+// refreshEvery keeps the snapshot fresh in the background until the returned
+// stop function is called.
+func (s *clusterDomainSource) refreshEvery(interval time.Duration) func() {
+	ticker := time.NewTicker(interval)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				s.refresh()
+			}
+		}
+	}()
+	return func() {
+		ticker.Stop()
+		close(stop)
+		<-done
+	}
+}
+
+// domainRefreshEvery is the background cadence for the authority snapshot; a
+// created or destroyed cluster's domain is authoritative within this bound.
+const domainRefreshEvery = time.Second
 
 type daemonDNSService interface {
 	Errors() <-chan error
@@ -22,9 +110,9 @@ type dnsServing interface {
 }
 
 type clusterDNSClient interface {
-	ListenDNS(string, int) (net.PacketConn, helper.DNSRegistration, error)
-	RegisterDNS(string, int) (helper.DNSRegistration, error)
-	UnregisterDNS(int) error
+	ListenDNS(clusterName, domain string, subnetIndex int) (net.PacketConn, helper.DNSRegistration, error)
+	RegisterDNS(clusterName, domain string, subnetIndex int) (helper.DNSRegistration, error)
+	UnregisterDNS(subnetIndex int) error
 }
 
 type managedDNSListener struct {
@@ -85,7 +173,7 @@ func (r *dnsReconciler) reconcileWithRegistration(
 			if !reassertRegistration {
 				continue
 			}
-			registration, err := client.RegisterDNS(item.Name, item.SubnetIndex)
+			registration, err := client.RegisterDNS(item.Name, item.EffectiveDomain(), item.SubnetIndex)
 			if err != nil {
 				result = errors.Join(result, fmt.Errorf("register DNS for %s: %w", item.Name, err))
 			} else {
@@ -94,7 +182,7 @@ func (r *dnsReconciler) reconcileWithRegistration(
 			continue
 		}
 
-		connection, registration, err := client.ListenDNS(item.Name, item.SubnetIndex)
+		connection, registration, err := client.ListenDNS(item.Name, item.EffectiveDomain(), item.SubnetIndex)
 		if err != nil {
 			result = errors.Join(result, fmt.Errorf("listen for DNS on %s: %w", cluster.Gateway(item.SubnetIndex), err))
 			continue

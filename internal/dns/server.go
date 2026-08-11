@@ -6,6 +6,8 @@ import (
 	"net"
 	"strings"
 	"time"
+
+	"github.com/randax/talos-box/internal/cluster"
 )
 
 const (
@@ -15,18 +17,20 @@ const (
 
 // Server answers DNS requests over UDP.
 type Server struct {
-	connection net.PacketConn
-	lookup     func(string) net.IP
-	forward    func([]byte) ([]byte, error)
+	connection    net.PacketConn
+	lookup        func(string) net.IP
+	authoritative func(string) bool
+	forward       func([]byte) ([]byte, error)
 }
 
 // NewServer serves DNS over an already-bound packet connection. This is the
 // entry point used when the privileged helper passes tbxd a UDP/53 socket.
-func NewServer(connection net.PacketConn, lookup func(string) net.IP, forward func([]byte) ([]byte, error)) *Server {
-	return &Server{connection: connection, lookup: lookup, forward: forward}
+// authoritative decides which names are answered locally instead of forwarded.
+func NewServer(connection net.PacketConn, lookup func(string) net.IP, authoritative func(string) bool, forward func([]byte) ([]byte, error)) *Server {
+	return &Server{connection: connection, lookup: lookup, authoritative: authoritative, forward: forward}
 }
 
-func Listen(address string, lookup func(string) net.IP) (*Server, error) {
+func Listen(address string, lookup func(string) net.IP, authoritative func(string) bool) (*Server, error) {
 	udpAddress, err := net.ResolveUDPAddr("udp", address)
 	if err != nil {
 		return nil, fmt.Errorf("resolve DNS address: %w", err)
@@ -35,7 +39,31 @@ func Listen(address string, lookup func(string) net.IP) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen for DNS: %w", err)
 	}
-	return NewServer(connection, lookup, SystemForward), nil
+	return NewServer(connection, lookup, authoritative, SystemForward), nil
+}
+
+// Authority builds the authoritative-name predicate from the live set of
+// cluster domains. The default suffix k8s.test is always ours; matches are
+// label-wise (equal, or ending in "."+domain). The sentinel "*" claims every
+// name — a domain source returns it while cluster state has never been
+// readable, so a query is answered NXDOMAIN locally rather than leaked to
+// the upstream resolver.
+func Authority(domains func() []string) func(string) bool {
+	return func(name string) bool {
+		name = strings.ToLower(strings.TrimSuffix(name, "."))
+		if name == cluster.DefaultDomainSuffix || strings.HasSuffix(name, "."+cluster.DefaultDomainSuffix) {
+			return true
+		}
+		if domains == nil {
+			return false
+		}
+		for _, domain := range domains() {
+			if domain == "*" || name == domain || strings.HasSuffix(name, "."+domain) {
+				return true
+			}
+		}
+		return false
+	}
 }
 
 func (s *Server) Serve() error {
@@ -63,7 +91,7 @@ func (s *Server) response(query []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if isAuthoritativeName(q.name) {
+	if s.authoritative(q.name) {
 		return answer(query, s.lookup)
 	}
 	if s.forward == nil {
@@ -74,11 +102,6 @@ func (s *Server) response(query []byte) ([]byte, error) {
 		return errorAnswer(query, 2)
 	}
 	return response, nil
-}
-
-func isAuthoritativeName(name string) bool {
-	name = strings.ToLower(strings.TrimSuffix(name, "."))
-	return name == "k8s.test" || strings.HasSuffix(name, ".k8s.test")
 }
 
 func (s *Server) Close() error {

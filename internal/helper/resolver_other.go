@@ -9,3 +9,6 @@ func installHostResolver(int) error {
 }
 
 func uninstallHostResolver() error { return nil }
+
+// Linux hosts route domains via systemd-resolved, not resolver files.
+func syncDomainResolvers([]string, int) error { return nil }

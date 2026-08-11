@@ -13,10 +13,12 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/randax/talos-box/internal/resolverset"
 )
 
 const (
-	resolverPath                  = "/etc/resolver/k8s.test"
+	resolverPath                  = resolverset.SharedPath
 	shutdownStopMaxAttempts       = 5
 	shutdownStopInitialRetryDelay = 25 * time.Millisecond
 )
@@ -315,6 +317,15 @@ func (s *Server) handle(request Request) (any, int, func(), error) {
 		return nil, -1, nil, installHostResolver(args.Port)
 	case "dns.uninstall":
 		return nil, -1, nil, uninstallHostResolver()
+	case "dns.syncDomains":
+		var args struct {
+			Domains []string `json:"domains"`
+			Port    int      `json:"port"`
+		}
+		if err := decodeArgs(request.Args, &args); err != nil {
+			return nil, -1, nil, err
+		}
+		return nil, -1, nil, syncDomainResolvers(args.Domains, args.Port)
 	case "dns.register":
 		clusterName, subnetIndex, err := decodeDNSIdentity(request.Args)
 		if err != nil {
@@ -478,6 +489,10 @@ func installResolver(path string, port int) error {
 	content, err := resolverContent(port)
 	if err != nil {
 		return err
+	}
+	// Writing follows symlinks; as root that must never happen.
+	if info, err := os.Lstat(path); err == nil && !info.Mode().IsRegular() {
+		return fmt.Errorf("resolver path %s exists but is not a regular file; remove it manually", path)
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create resolver directory: %w", err)

@@ -23,12 +23,12 @@ const (
 
 type helperDNSClient struct{ client *helper.Client }
 
-func (c helperDNSClient) ListenDNS(clusterName string, subnetIndex int) (net.PacketConn, helper.DNSRegistration, error) {
-	return c.client.ListenDNS(clusterName, subnetIndex)
+func (c helperDNSClient) ListenDNS(clusterName, domain string, subnetIndex int) (net.PacketConn, helper.DNSRegistration, error) {
+	return c.client.ListenDNS(clusterName, domain, subnetIndex)
 }
 
-func (c helperDNSClient) RegisterDNS(clusterName string, subnetIndex int) (helper.DNSRegistration, error) {
-	return c.client.RegisterDNS(clusterName, subnetIndex)
+func (c helperDNSClient) RegisterDNS(clusterName, domain string, subnetIndex int) (helper.DNSRegistration, error) {
+	return c.client.RegisterDNS(clusterName, domain, subnetIndex)
 }
 
 func (c helperDNSClient) UnregisterDNS(subnetIndex int) error {
@@ -54,7 +54,7 @@ type linuxDNSService struct {
 	result   error
 }
 
-func startDNSService(lookup func(string) net.IP) (daemonDNSService, error) {
+func startDNSService(lookup func(string) net.IP, authoritative func(string) bool) (daemonDNSService, error) {
 	service := &linuxDNSService{
 		lookup:    lookup,
 		serveDone: make(chan dnsServeResult, 256),
@@ -63,7 +63,7 @@ func startDNSService(lookup func(string) net.IP) (daemonDNSService, error) {
 	}
 	service.reconciler = newDNSReconciler(
 		func(connection net.PacketConn, lookup func(string) net.IP) dnsServing {
-			return tbxdns.NewServer(connection, lookup, tbxdns.SystemForward)
+			return tbxdns.NewServer(connection, lookup, authoritative, tbxdns.SystemForward)
 		},
 		func(subnetIndex int, server dnsServing) {
 			go func() {

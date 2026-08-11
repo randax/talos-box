@@ -46,8 +46,8 @@ func (s *singleDNSService) Close() error {
 	return errors.Join(closeErr, s.result)
 }
 
-func startDNSService(lookup func(string) net.IP) (daemonDNSService, error) {
-	server, err := tbxdns.Listen(tbxdns.Address, lookup)
+func startDNSService(lookup func(string) net.IP, authoritative func(string) bool) (daemonDNSService, error) {
+	server, err := tbxdns.Listen(tbxdns.Address, lookup, authoritative)
 	if err != nil {
 		return nil, err
 	}

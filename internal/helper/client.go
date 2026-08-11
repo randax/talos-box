@@ -112,11 +112,21 @@ func (c *Client) UninstallDNS() error {
 	return err
 }
 
+// SyncDomainResolvers converges the per-domain macOS resolver files to the
+// given set of custom cluster domains.
+func (c *Client) SyncDomainResolvers(domains []string, port int) error {
+	_, _, err := c.call("dns.syncDomains", map[string]any{
+		"domains": domains, "port": port,
+	}, false)
+	return err
+}
+
 // ListenDNS asks the helper to bind a cluster gateway's UDP/53 socket and
-// transfers ownership of the bound descriptor to the caller.
-func (c *Client) ListenDNS(cluster string, subnetIndex int) (*net.UDPConn, DNSRegistration, error) {
+// transfers ownership of the bound descriptor to the caller. domain is the
+// cluster's effective domain; empty means the default, <cluster>.k8s.test.
+func (c *Client) ListenDNS(cluster, domain string, subnetIndex int) (*net.UDPConn, DNSRegistration, error) {
 	response, fd, err := c.call("dns.listen", map[string]any{
-		"cluster": cluster, "subnetIndex": subnetIndex,
+		"cluster": cluster, "domain": domain, "subnetIndex": subnetIndex,
 	}, true)
 	if err != nil {
 		return nil, DNSRegistration{}, err
@@ -146,9 +156,9 @@ func (c *Client) ListenDNS(cluster string, subnetIndex int) (*net.UDPConn, DNSRe
 
 // RegisterDNS re-asserts the systemd-resolved route-only domain for a
 // cluster. Registration failure is represented in the returned status.
-func (c *Client) RegisterDNS(cluster string, subnetIndex int) (DNSRegistration, error) {
+func (c *Client) RegisterDNS(cluster, domain string, subnetIndex int) (DNSRegistration, error) {
 	response, _, err := c.call("dns.register", map[string]any{
-		"cluster": cluster, "subnetIndex": subnetIndex,
+		"cluster": cluster, "domain": domain, "subnetIndex": subnetIndex,
 	}, false)
 	if err != nil {
 		return DNSRegistration{}, err
@@ -314,7 +324,7 @@ func shouldReconnect(op string, err error) bool {
 
 func safeRetryOperation(op string) bool {
 	switch op {
-	case helperInfoOp, "ping", "net.detach", "dns.install", "dns.uninstall", "dns.register", "dns.unregister", "forwarding.enable", "bgp.enable", "bgp.disable":
+	case helperInfoOp, "ping", "net.detach", "dns.install", "dns.uninstall", "dns.syncDomains", "dns.register", "dns.unregister", "forwarding.enable", "bgp.enable", "bgp.disable":
 		return true
 	default:
 		return false

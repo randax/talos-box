@@ -13,3 +13,11 @@ The opt-in fast path that goes beyond the substrate: talosbox generates and appl
 ## Curated CNI
 
 A CNI from talosbox's fixed, tested set (initially `cilium` and `flannel`). Each curated CNI has a known answer to how it reaches the production-style networking model's end state — a working LoadBalancer path and the ingress VIP — whether natively (Cilium) or via a talosbox-shipped companion (flannel + MetalLB). Arbitrary user-supplied CNIs are not a supported concept.
+
+## Cluster domain
+
+The DNS domain a cluster is reachable under on the host, from which its node records and ingress wildcard both derive. Chosen at cluster create and immutable thereafter; every cluster has exactly one, and no two clusters share one. A substrate concept — it exists regardless of provisioning path.
+
+## Safe domain
+
+A cluster domain under a top-level name reserved away from real DNS, so it can never collide with or shadow public names. Anything else is an **unsafe domain**: accepted only by explicit opt-in, because it can silently shadow real DNS for the host.

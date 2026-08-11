@@ -11,6 +11,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/domain"
 )
 
 // Defaults per SPEC §8.
@@ -41,7 +42,12 @@ type ClusterSpec struct {
 	ControlPlanes int
 	Workers       int
 	BGP           bool
-	Node          cluster.NodeDefaults
+	// Domain is the canonical cluster domain; empty means the default,
+	// <name>.k8s.test. AllowUnsafeDomain records the explicit opt-in for
+	// domains that can shadow real DNS.
+	Domain            string
+	AllowUnsafeDomain bool
+	Node              cluster.NodeDefaults
 	// ControlPlane/Worker are set only when the file overrides the role.
 	ControlPlane *cluster.NodeDefaults
 	Worker       *cluster.NodeDefaults
@@ -59,13 +65,15 @@ type rawTalos struct {
 }
 
 type rawCluster struct {
-	Name          string   `yaml:"name"`
-	ControlPlanes *int     `yaml:"controlPlanes"`
-	Workers       *int     `yaml:"workers"`
-	BGP           bool     `yaml:"bgp"`
-	Node          rawNode  `yaml:"node"`
-	ControlPlane  *rawNode `yaml:"controlPlane"`
-	Worker        *rawNode `yaml:"worker"`
+	Name              string   `yaml:"name"`
+	ControlPlanes     *int     `yaml:"controlPlanes"`
+	Workers           *int     `yaml:"workers"`
+	BGP               bool     `yaml:"bgp"`
+	Domain            string   `yaml:"domain"`
+	AllowUnsafeDomain bool     `yaml:"allowUnsafeDomain"`
+	Node              rawNode  `yaml:"node"`
+	ControlPlane      *rawNode `yaml:"controlPlane"`
+	Worker            *rawNode `yaml:"worker"`
 }
 
 type rawNode struct {
@@ -91,6 +99,7 @@ func Parse(data []byte) (Config, error) {
 
 	cfg := Config{Talos: TalosSpec(raw.Talos)}
 	seen := map[string]bool{}
+	seenDomains := map[string]string{}
 	for _, rc := range raw.Clusters {
 		if !nameRe.MatchString(rc.Name) {
 			return Config{}, fmt.Errorf("cluster name %q is invalid (lowercase letters, digits, hyphens)", rc.Name)
@@ -100,7 +109,31 @@ func Parse(data []byte) (Config, error) {
 		}
 		seen[rc.Name] = true
 
-		spec := ClusterSpec{Name: rc.Name, ControlPlanes: defaultControlPlanes, Workers: defaultWorkers, BGP: rc.BGP}
+		spec := ClusterSpec{Name: rc.Name, ControlPlanes: defaultControlPlanes, Workers: defaultWorkers, BGP: rc.BGP, AllowUnsafeDomain: rc.AllowUnsafeDomain}
+		if rc.Domain != "" {
+			canonical, err := domain.Validate(rc.Domain, rc.AllowUnsafeDomain)
+			if err != nil {
+				return Config{}, fmt.Errorf("cluster %q: %w", rc.Name, err)
+			}
+			// The cluster's own default spelled out explicitly is the default.
+			if canonical == rc.Name+"."+cluster.DefaultDomainSuffix {
+				canonical = ""
+			}
+			spec.Domain = canonical
+		}
+		effective := spec.Domain
+		if effective == "" {
+			effective = rc.Name + "." + cluster.DefaultDomainSuffix
+			// The name regexp does not bound length; the default domain the
+			// name produces must already be a canonical DNS name.
+			if canonical, err := domain.Validate(effective, true); err != nil || canonical != effective {
+				return Config{}, fmt.Errorf("cluster %q does not form a valid domain", rc.Name)
+			}
+		}
+		if owner, taken := seenDomains[effective]; taken {
+			return Config{}, fmt.Errorf("cluster %q: domain %q is already used by cluster %q", rc.Name, effective, owner)
+		}
+		seenDomains[effective] = rc.Name
 		if rc.ControlPlanes != nil {
 			spec.ControlPlanes = *rc.ControlPlanes
 		}

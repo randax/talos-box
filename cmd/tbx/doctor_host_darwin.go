@@ -10,9 +10,10 @@ import (
 	"strings"
 
 	tbxdns "github.com/randax/talos-box/internal/dns"
+	"github.com/randax/talos-box/internal/resolverset"
 )
 
-const resolverPath = "/etc/resolver/k8s.test"
+const resolverPath = resolverset.SharedPath
 
 func checkResolver() error {
 	info, err := os.Stat(resolverPath)

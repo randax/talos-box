@@ -9,9 +9,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/dns"
+	"github.com/randax/talos-box/internal/domain"
 	"github.com/randax/talos-box/internal/helper"
 	"github.com/randax/talos-box/internal/hypervisor"
 	"github.com/randax/talos-box/internal/imagecache"
@@ -26,10 +29,15 @@ type createArgs struct {
 	ControlPlane  *cluster.NodeDefaults `json:"controlPlane,omitempty"`
 	Worker        *cluster.NodeDefaults `json:"worker,omitempty"`
 	BGP           bool                  `json:"bgp,omitempty"`
-	Force         bool                  `json:"force"`
-	Schematic     string                `json:"schematic"`
-	Version       string                `json:"version"`
-	TalosVersion  string                `json:"talosVersion"`
+	// Domain is the requested cluster domain; empty means the default,
+	// <name>.k8s.test. AllowUnsafeDomain is the explicit opt-in for domains
+	// that can shadow real DNS.
+	Domain            string `json:"domain,omitempty"`
+	AllowUnsafeDomain bool   `json:"allowUnsafeDomain,omitempty"`
+	Force             bool   `json:"force"`
+	Schematic         string `json:"schematic"`
+	Version           string `json:"version"`
+	TalosVersion      string `json:"talosVersion"`
 }
 
 type nameArgs struct {
@@ -75,8 +83,20 @@ type ClusterSummary struct {
 	TalosVersion  string               `json:"talosVersion"`
 	Schematic     string               `json:"schematic"`
 	BGP           bool                 `json:"bgp"`
-	Running       bool                 `json:"running"`
-	Warning       string               `json:"warning,omitempty"`
+	// Domain is the explicitly chosen cluster domain; empty means the
+	// default, <name>.k8s.test.
+	Domain            string `json:"domain,omitempty"`
+	AllowUnsafeDomain bool   `json:"allowUnsafeDomain,omitempty"`
+	Running           bool   `json:"running"`
+	Warning           string `json:"warning,omitempty"`
+}
+
+// EffectiveDomain returns the domain the cluster is reachable under.
+func (s ClusterSummary) EffectiveDomain() string {
+	if s.Domain != "" {
+		return s.Domain
+	}
+	return s.Name + "." + cluster.DefaultDomainSuffix
 }
 
 // NodeStatus is the observed host-side state of one node.
@@ -92,8 +112,10 @@ type NodeStatus struct {
 
 // ClusterStatus is the status result for one cluster.
 type ClusterStatus struct {
-	Name    string       `json:"name"`
-	Subnet  string       `json:"subnet"`
+	Name   string `json:"name"`
+	Subnet string `json:"subnet"`
+	// Domain is the cluster's effective domain (explicit or defaulted).
+	Domain  string       `json:"domain"`
 	BGP     bool         `json:"bgp"`
 	Running bool         `json:"running"`
 	Nodes   []NodeStatus `json:"nodes"`
@@ -152,6 +174,32 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if err != nil {
 		return ClusterSummary{}, err
 	}
+	canonicalDomain := ""
+	if args.Domain != "" {
+		canonicalDomain, err = domain.Validate(args.Domain, args.AllowUnsafeDomain)
+		if err != nil {
+			return ClusterSummary{}, err
+		}
+		// An explicit domain equal to the cluster's own default is the
+		// default; storing it as such keeps every comparison canonical.
+		if canonicalDomain == args.Name+"."+cluster.DefaultDomainSuffix {
+			canonicalDomain = ""
+		}
+	}
+	effectiveDomain := canonicalDomain
+	if effectiveDomain == "" {
+		effectiveDomain = args.Name + "." + cluster.DefaultDomainSuffix
+		// The default domain derives from the cluster name, which is only
+		// path-checked; a name that does not already form a canonical DNS
+		// name (case included) must fail here, not at helper registration.
+		canonical, err := domain.Validate(effectiveDomain, true)
+		if err != nil || canonical != effectiveDomain {
+			return ClusterSummary{}, fmt.Errorf("cluster name %q does not form a valid domain (lowercase DNS labels required)", args.Name)
+		}
+	}
+	if cluster.DomainInUse(effectiveDomain, clusters) {
+		return ClusterSummary{}, fmt.Errorf("domain %q is already used by another cluster", effectiveDomain)
+	}
 	subnetIndex, subnetWarning, err := cluster.LowestUsableSubnetIndex(clusters, s.hostSubnetSources())
 	if err != nil {
 		return ClusterSummary{}, err
@@ -163,6 +211,8 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	item.ControlPlaneDefaults = args.ControlPlane
 	item.WorkerDefaults = args.Worker
 	item.BGP = args.BGP
+	item.Domain = canonicalDomain
+	item.AllowUnsafeDomain = canonicalDomain != "" && args.AllowUnsafeDomain
 	item.ImageArchitecture = string(s.hypervisor.Architecture())
 	item.Schematic, item.TalosVersion, err = s.resolveImage(args.Schematic, args.Version)
 	if err != nil {
@@ -179,6 +229,11 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if err := cluster.Save(item); err != nil {
 		_ = cluster.Destroy(item.Name)
 		return ClusterSummary{}, err
+	}
+	if item.Domain != "" {
+		if err := SyncResolverFiles(); err != nil {
+			log.Printf("resolver files for %s: %v", item.Name, err)
+		}
 	}
 	startWarning, err := s.start(item)
 	if err != nil {
@@ -435,7 +490,47 @@ func (s *Server) destroyCluster(raw json.RawMessage) (map[string]string, error) 
 	if err := cluster.Destroy(args.Name); err != nil {
 		return nil, err
 	}
+	if err := SyncResolverFiles(); err != nil {
+		log.Printf("resolver files after destroying %s: %v", args.Name, err)
+	}
 	return map[string]string{"name": args.Name}, nil
+}
+
+// resolverSyncMu makes SyncResolverFiles the single owner of resolver-file
+// mutation: every caller re-reads state under the lock, so a concurrent
+// create/destroy and the periodic drift repair can never apply a stale
+// domain set (which would delete a just-created file or resurrect a
+// just-removed one).
+var resolverSyncMu sync.Mutex
+
+// SyncResolverFiles converges the host's per-domain resolver files to the
+// clusters now in state, so a custom domain resolves the moment create
+// returns and its file disappears at destroy rather than on the next drift
+// tick. Best-effort for the create/destroy callers (the tbxd reconciler
+// re-asserts on its own cadence); the error return lets that reconciler
+// report repair failures honestly.
+func SyncResolverFiles() error {
+	resolverSyncMu.Lock()
+	defer resolverSyncMu.Unlock()
+	clusters, err := cluster.List()
+	if err != nil {
+		return fmt.Errorf("skip resolver-file sync: %w", err)
+	}
+	var domains []string
+	for _, item := range clusters {
+		if item.Domain != "" {
+			domains = append(domains, item.Domain)
+		}
+	}
+	client, err := helper.Connect()
+	if err != nil {
+		return fmt.Errorf("skip resolver-file sync: %w", err)
+	}
+	defer func() { _ = client.Close() }()
+	if err := client.SyncDomainResolvers(domains, dns.Port); err != nil {
+		return fmt.Errorf("sync custom-domain resolvers: %w", err)
+	}
+	return nil
 }
 
 func (s *Server) listClusters() ([]ClusterSummary, error) {
@@ -564,7 +659,7 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 
 	result := make([]ClusterStatus, 0, len(items))
 	for _, item := range items {
-		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), BGP: item.BGP, Running: s.clusterRunning(item.Name)}
+		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), BGP: item.BGP, Running: s.clusterRunning(item.Name)}
 		for _, node := range item.Nodes {
 			clusterStatus.Nodes = append(clusterStatus.Nodes, nodeStatus(node, item.SubnetIndex, s.nodeRunning(item.Name, node.Name)))
 		}
@@ -699,16 +794,18 @@ func memoryOr(mib, fallback int) int {
 
 func summary(item cluster.Cluster, running bool) ClusterSummary {
 	return ClusterSummary{
-		Name:          item.Name,
-		Index:         item.Index,
-		SubnetIndex:   item.SubnetIndex,
-		ControlPlanes: item.ControlPlanes,
-		Workers:       item.Workers,
-		NodeDefaults:  item.NodeDefaults,
-		TalosVersion:  item.TalosVersion,
-		Schematic:     item.Schematic,
-		BGP:           item.BGP,
-		Running:       running,
+		Name:              item.Name,
+		Index:             item.Index,
+		SubnetIndex:       item.SubnetIndex,
+		ControlPlanes:     item.ControlPlanes,
+		Workers:           item.Workers,
+		NodeDefaults:      item.NodeDefaults,
+		TalosVersion:      item.TalosVersion,
+		Schematic:         item.Schematic,
+		BGP:               item.BGP,
+		Domain:            item.Domain,
+		AllowUnsafeDomain: item.AllowUnsafeDomain,
+		Running:           running,
 	}
 }
 

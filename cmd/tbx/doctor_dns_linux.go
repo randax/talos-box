@@ -20,7 +20,7 @@ func checkSystemDNS(clusters []daemon.ClusterSummary, command commandOutput) err
 	}
 	var problems []string
 	for _, item := range clusters {
-		name := fmt.Sprintf("doctor-probe.%s.k8s.test", item.Name)
+		name := "doctor-probe." + item.EffectiveDomain()
 		expected := net.ParseIP(fmt.Sprintf("172.30.%d.200", item.SubnetIndex))
 		output, err := command("getent", "ahostsv4", name)
 		if err != nil {

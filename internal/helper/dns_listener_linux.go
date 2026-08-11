@@ -37,8 +37,8 @@ func platformBindDNS(subnetIndex int) (*os.File, error) {
 	return file, nil
 }
 
-func platformRegisterDNS(clusterName string, subnetIndex int) DNSRegistration {
-	registration := applyResolvedRegistration(clusterName, subnetIndex, runResolvedCommand)
+func platformRegisterDNS(clusterDomain string, subnetIndex int) DNSRegistration {
+	registration := applyResolvedRegistration(clusterDomain, subnetIndex, runResolvedCommand)
 	if !registration.Registered {
 		_ = runResolvedCommand("resolvectl", "revert", bridgeNameForSubnet(subnetIndex))
 	}

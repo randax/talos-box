@@ -155,6 +155,8 @@ func (c cli) createCluster(args []string) error {
 	disk := flags.Int("disk-gib", cluster.DefaultDiskGiB, "disk size per node in GiB")
 	talosVersion := flags.String("talos-version", daemon.DefaultTalosVersion, "Talos version")
 	schematic := flags.String("schematic", "", "Image Factory schematic")
+	domainFlag := flags.String("domain", "", "cluster domain (default <name>.k8s.test)")
+	allowUnsafeDomain := flags.Bool("allow-unsafe-domain", false, "allow a domain that can shadow real DNS")
 	force := flags.Bool("force", false, "proceed despite an overcommit or host-pressure warning")
 	positionals, err := parseInterspersed(flags, args)
 	if err != nil {
@@ -168,16 +170,19 @@ func (c cli) createCluster(args []string) error {
 		return err
 	}
 	request := struct {
-		Name          string               `json:"name"`
-		ControlPlanes int                  `json:"controlPlanes"`
-		Workers       int                  `json:"workers"`
-		Node          cluster.NodeDefaults `json:"node"`
-		Force         bool                 `json:"force"`
-		Schematic     string               `json:"schematic"`
-		Version       string               `json:"version"`
+		Name              string               `json:"name"`
+		ControlPlanes     int                  `json:"controlPlanes"`
+		Workers           int                  `json:"workers"`
+		Node              cluster.NodeDefaults `json:"node"`
+		Domain            string               `json:"domain,omitempty"`
+		AllowUnsafeDomain bool                 `json:"allowUnsafeDomain,omitempty"`
+		Force             bool                 `json:"force"`
+		Schematic         string               `json:"schematic"`
+		Version           string               `json:"version"`
 	}{
 		Name: positionals[0], ControlPlanes: *controlPlanes, Workers: *workers,
-		Node:  cluster.NodeDefaults{MemoryMiB: *memory, CPUs: *cpus, DiskGiB: *disk},
+		Node:   cluster.NodeDefaults{MemoryMiB: *memory, CPUs: *cpus, DiskGiB: *disk},
+		Domain: *domainFlag, AllowUnsafeDomain: *allowUnsafeDomain,
 		Force: *force, Schematic: resolvedSchematic, Version: *talosVersion,
 	}
 	var result daemon.ClusterSummary
@@ -195,6 +200,7 @@ func (c cli) createCluster(args []string) error {
 		Talos: config.TalosSpec{Version: result.TalosVersion, Schematic: result.Schematic},
 		Clusters: []config.ClusterSpec{{
 			Name: result.Name, ControlPlanes: result.ControlPlanes, Workers: result.Workers,
+			Domain: result.Domain, AllowUnsafeDomain: result.AllowUnsafeDomain,
 			Node: result.NodeDefaults,
 		}}})
 	_, err = fmt.Fprintf(c.out, "\nequivalent talosbox.yaml:\n%s", stanza)

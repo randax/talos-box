@@ -53,6 +53,13 @@ func run() error {
 		_ = listener.Close()
 		return err
 	}
+	// The authority predicate runs on every DNS query; it answers from an
+	// in-memory snapshot refreshed in the background, so query latency never
+	// depends on state-directory IO.
+	domainSource := newClusterDomainSource(cluster.List)
+	domainSource.refresh()
+	stopDomainRefresh := domainSource.refreshEvery(domainRefreshEvery)
+	defer stopDomainRefresh()
 	dnsService, err := startDNSService(func(name string) net.IP {
 		clusters, err := cluster.List()
 		if err != nil {
@@ -60,7 +67,7 @@ func run() error {
 			return nil
 		}
 		return tbxdns.Resolve(name, clusters, cluster.LookupIP)
-	})
+	}, tbxdns.Authority(domainSource.snapshot))
 	if err != nil {
 		_ = listener.Close()
 		return err

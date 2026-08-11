@@ -42,7 +42,7 @@ func TestClientListenDNSReceivesBoundDatagramSocket(t *testing.T) {
 	}()
 
 	client := &Client{connection: clientConnection}
-	connection, registration, err := client.ListenDNS("demo", 7)
+	connection, registration, err := client.ListenDNS("demo", "demo.k8s.test", 7)
 	if err != nil {
 		t.Fatal(err)
 	}

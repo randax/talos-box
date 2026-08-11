@@ -133,5 +133,9 @@ func (c ClusterStatus) controlPlaneOr(fallback NodeStatus) NodeStatus {
 
 // nodeHost prefers the DNS name talosbox serves for a node.
 func nodeHost(status ClusterStatus, node NodeStatus) string {
-	return fmt.Sprintf("%s.%s.k8s.test", node.Name, status.Name)
+	domain := status.Domain
+	if domain == "" {
+		domain = status.Name + "." + cluster.DefaultDomainSuffix
+	}
+	return node.Name + "." + domain
 }

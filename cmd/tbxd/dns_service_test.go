@@ -1,13 +1,95 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net"
+	"reflect"
 	"testing"
+	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/helper"
 )
+
+func TestDomainSourceSnapshotDoesNoIO(t *testing.T) {
+	t.Parallel()
+
+	listCalls := 0
+	source := newClusterDomainSource(func() ([]cluster.Cluster, error) {
+		listCalls++
+		return []cluster.Cluster{{Name: "demo"}, {Name: "lab", Domain: "lab.internal"}}, nil
+	})
+
+	// Until the first successful refresh the source fails closed.
+	if got := source.snapshot(); !reflect.DeepEqual(got, []string{"*"}) {
+		t.Fatalf("snapshot before refresh = %v, want [*]", got)
+	}
+
+	source.refresh()
+	want := []string{"demo.k8s.test", "lab.internal"}
+	if got := source.snapshot(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("snapshot = %v, want %v", got, want)
+	}
+	if listCalls != 1 {
+		t.Fatalf("list calls = %d, want 1 (snapshot must not read state)", listCalls)
+	}
+	source.snapshot()
+	source.snapshot()
+	if listCalls != 1 {
+		t.Fatalf("list calls = %d after repeated snapshots, want 1", listCalls)
+	}
+}
+
+func TestDomainSourceSnapshotDoesNotBlockOnSlowRefresh(t *testing.T) {
+	t.Parallel()
+
+	release := make(chan struct{})
+	listing := make(chan struct{})
+	source := newClusterDomainSource(func() ([]cluster.Cluster, error) {
+		close(listing)
+		<-release // simulate a stalled state-directory read
+		return nil, nil
+	})
+
+	refreshDone := make(chan struct{})
+	go func() {
+		defer close(refreshDone)
+		source.refresh()
+	}()
+	<-listing // refresh is now inside the (blocked) state read
+
+	snapshotDone := make(chan []string, 1)
+	go func() { snapshotDone <- source.snapshot() }()
+	select {
+	case got := <-snapshotDone:
+		if !reflect.DeepEqual(got, []string{"*"}) {
+			t.Errorf("snapshot during refresh = %v, want [*]", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("snapshot blocked behind an in-flight refresh's state IO")
+	}
+	close(release)
+	<-refreshDone
+}
+
+func TestDomainSourceRetainsLastKnownOnRefreshError(t *testing.T) {
+	t.Parallel()
+
+	fail := false
+	source := newClusterDomainSource(func() ([]cluster.Cluster, error) {
+		if fail {
+			return nil, errors.New("state unreadable")
+		}
+		return []cluster.Cluster{{Name: "demo"}}, nil
+	})
+	source.refresh()
+	fail = true
+	source.refresh()
+	if got := source.snapshot(); !reflect.DeepEqual(got, []string{"demo.k8s.test"}) {
+		t.Fatalf("snapshot after failed refresh = %v, want last-known [demo.k8s.test]", got)
+	}
+}
 
 func TestDNSReconcilerAddsReassertsAndRemovesClusterListeners(t *testing.T) {
 	t.Parallel()
@@ -28,14 +110,14 @@ func TestDNSReconcilerAddsReassertsAndRemovesClusterListeners(t *testing.T) {
 	if err := reconciler.reconcile(client, clusters, lookup); err != nil {
 		t.Fatal(err)
 	}
-	if len(client.listenCalls) != 1 || client.listenCalls[0] != "demo/7" {
+	if len(client.listenCalls) != 1 || client.listenCalls[0] != "demo/demo.k8s.test/7" {
 		t.Fatalf("listen calls = %v", client.listenCalls)
 	}
 
 	if err := reconciler.reconcile(client, clusters, lookup); err != nil {
 		t.Fatal(err)
 	}
-	if len(client.listenCalls) != 1 || len(client.registerCalls) != 1 || client.registerCalls[0] != "demo/7" {
+	if len(client.listenCalls) != 1 || len(client.registerCalls) != 1 || client.registerCalls[0] != "demo/demo.k8s.test/7" {
 		t.Fatalf("listen/register calls = %v / %v", client.listenCalls, client.registerCalls)
 	}
 
@@ -56,13 +138,13 @@ type fakeClusterDNSClient struct {
 	unregisterCalls []int
 }
 
-func (c *fakeClusterDNSClient) ListenDNS(clusterName string, subnetIndex int) (net.PacketConn, helper.DNSRegistration, error) {
-	c.listenCalls = append(c.listenCalls, fmt.Sprintf("%s/%d", clusterName, subnetIndex))
+func (c *fakeClusterDNSClient) ListenDNS(clusterName, domain string, subnetIndex int) (net.PacketConn, helper.DNSRegistration, error) {
+	c.listenCalls = append(c.listenCalls, fmt.Sprintf("%s/%s/%d", clusterName, domain, subnetIndex))
 	return nil, helper.DNSRegistration{Registered: true}, nil
 }
 
-func (c *fakeClusterDNSClient) RegisterDNS(clusterName string, subnetIndex int) (helper.DNSRegistration, error) {
-	c.registerCalls = append(c.registerCalls, fmt.Sprintf("%s/%d", clusterName, subnetIndex))
+func (c *fakeClusterDNSClient) RegisterDNS(clusterName, domain string, subnetIndex int) (helper.DNSRegistration, error) {
+	c.registerCalls = append(c.registerCalls, fmt.Sprintf("%s/%s/%d", clusterName, domain, subnetIndex))
 	return helper.DNSRegistration{Registered: true}, nil
 }
 
