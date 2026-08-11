@@ -28,6 +28,9 @@ var MirrorPorts = []struct {
 	{"registry.k8s.io", 5058},
 }
 
+// CatchAllPort serves the Talos "*" mirror entry.
+const CatchAllPort = 5059
+
 const (
 	// HostASN is the "top of rack" ASN the host's BGP speaker uses (SPEC §5).
 	HostASN = 64512
@@ -175,12 +178,14 @@ spec:
 // RegistryMirrors renders the Talos machine-config patch pointing every
 // upstream registry at the host-side pull-through mirrors.
 func RegistryMirrors(f Facts) string {
-	var b strings.Builder
-	b.WriteString("machine:\n  registries:\n    mirrors:\n")
-	for _, m := range MirrorPorts {
-		fmt.Fprintf(&b, "      %s:\n        endpoints:\n          - http://%s:%d\n", m.Upstream, f.hostIP(1), m.Port)
-	}
-	return b.String()
+	return fmt.Sprintf(`machine:
+  registries:
+    mirrors:
+      "*":
+        endpoints:
+          - http://%s:%d
+        skipFallback: true
+`, f.hostIP(1), CatchAllPort)
 }
 
 // BalloonModule renders the Talos machine-config patch loading virtio_balloon,
