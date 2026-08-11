@@ -745,6 +745,7 @@ func TestCatchAllCachedDigestServesWhenResolverFailsWithoutDial(t *testing.T) {
 	validDigest := "sha256:" + sha256Hex([]byte(manifestBody))
 	var failResolve atomic.Bool
 	var dials atomic.Int64
+	var failDial atomic.Bool
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
 		w.Header().Set("Docker-Content-Digest", validDigest)
@@ -754,23 +755,20 @@ func TestCatchAllCachedDigestServesWhenResolverFailsWithoutDial(t *testing.T) {
 
 	catchAllPort := freePort(t)
 	m := newManagerWithPorts(t.TempDir(), nil, catchAllPort)
-	m.serverFactory = func(_ string, _, cacheDir string) http.Handler {
-		server := newServerWithEgress("http://registry.example", cacheDir, egressDependencies{
-			resolve: func(context.Context, string) ([]net.IP, error) {
-				if failResolve.Load() {
-					return nil, fmt.Errorf("resolver unavailable")
-				}
-				return []net.IP{net.ParseIP("203.0.113.10")}, nil
-			},
-			hostIPs: func() ([]net.IP, error) { return nil, nil },
-			dialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-				dials.Add(1)
-				return (&net.Dialer{}).DialContext(ctx, network, hostPortOfURL(t, upstream.URL))
-			},
-			blocked: func(net.IP, []net.IP) bool { return false },
-		})
-		server.offline = &m.offline
-		return server
+	m.baseOverride = upstream.URL
+	m.resolveUpstreamIPs = func(context.Context, string) ([]net.IP, error) {
+		if failResolve.Load() {
+			return nil, fmt.Errorf("resolver unavailable")
+		}
+		return []net.IP{net.ParseIP("203.0.113.10")}, nil
+	}
+	m.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	m.dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		dials.Add(1)
+		if failDial.Load() {
+			return nil, fmt.Errorf("unexpected dial")
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, hostPortOfURL(t, upstream.URL))
 	}
 	defer m.Close()
 
@@ -785,6 +783,7 @@ func TestCatchAllCachedDigestServesWhenResolverFailsWithoutDial(t *testing.T) {
 	}
 	dialsAfterWarm := dials.Load()
 	failResolve.Store(true)
+	failDial.Store(true)
 
 	resp, body = get(t, path)
 	if resp.StatusCode != http.StatusOK || body != manifestBody {
@@ -798,6 +797,7 @@ func TestCatchAllCachedDigestServesWhenResolverFailsWithoutDial(t *testing.T) {
 func TestCatchAllOfflineCachedTagServesAndMissesDoNotResolveOrDial(t *testing.T) {
 	var failResolve atomic.Bool
 	var dials atomic.Int64
+	var failDial atomic.Bool
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v2/app/manifests/latest":
@@ -812,23 +812,20 @@ func TestCatchAllOfflineCachedTagServesAndMissesDoNotResolveOrDial(t *testing.T)
 
 	catchAllPort := freePort(t)
 	m := newManagerWithPorts(t.TempDir(), nil, catchAllPort)
-	m.serverFactory = func(_ string, _, cacheDir string) http.Handler {
-		server := newServerWithEgress("http://registry.example", cacheDir, egressDependencies{
-			resolve: func(context.Context, string) ([]net.IP, error) {
-				if failResolve.Load() {
-					return nil, fmt.Errorf("resolver unavailable")
-				}
-				return []net.IP{net.ParseIP("203.0.113.10")}, nil
-			},
-			hostIPs: func() ([]net.IP, error) { return nil, nil },
-			dialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-				dials.Add(1)
-				return (&net.Dialer{}).DialContext(ctx, network, hostPortOfURL(t, upstream.URL))
-			},
-			blocked: func(net.IP, []net.IP) bool { return false },
-		})
-		server.offline = &m.offline
-		return server
+	m.baseOverride = upstream.URL
+	m.resolveUpstreamIPs = func(context.Context, string) ([]net.IP, error) {
+		if failResolve.Load() {
+			return nil, fmt.Errorf("resolver unavailable")
+		}
+		return []net.IP{net.ParseIP("203.0.113.10")}, nil
+	}
+	m.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	m.dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		dials.Add(1)
+		if failDial.Load() {
+			return nil, fmt.Errorf("unexpected dial")
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, hostPortOfURL(t, upstream.URL))
 	}
 	defer m.Close()
 
@@ -845,6 +842,7 @@ func TestCatchAllOfflineCachedTagServesAndMissesDoNotResolveOrDial(t *testing.T)
 
 	m.SetOffline(true)
 	failResolve.Store(true)
+	failDial.Store(true)
 
 	resp, body = get(t, cachedTag)
 	if resp.StatusCode != http.StatusOK || body != manifestBody {
@@ -884,7 +882,7 @@ func TestCatchAllMirrorCancellationStopsNamespaceValidation(t *testing.T) {
 	m.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
 	m.dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 		dials.Add(1)
-		return (&net.Dialer{}).DialContext(ctx, network, address)
+		return nil, fmt.Errorf("unexpected dial %s %s", network, address)
 	}
 	defer m.Close()
 
