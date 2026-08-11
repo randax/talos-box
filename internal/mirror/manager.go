@@ -411,6 +411,15 @@ func canonicalizeAuthorityHost(host string) (string, error) {
 	if canonical == "" || strings.Contains(canonical, "..") || strings.Contains(canonical, ":") {
 		return "", fmt.Errorf("invalid host")
 	}
+	if len(canonical) > 253 {
+		return "", fmt.Errorf("invalid host")
+	}
+	labels := strings.Split(canonical, ".")
+	for _, label := range labels {
+		if !validDNSLabel(label) {
+			return "", fmt.Errorf("invalid host")
+		}
+	}
 	return canonical, nil
 }
 
@@ -425,24 +434,43 @@ func canonicalURLHost(host, port string) string {
 }
 
 func safeCacheKey(host, port string) string {
-	var b strings.Builder
-	for _, r := range host {
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.To4() != nil {
+			if port == "" {
+				return "__ipv4_" + host
+			}
+			return "__ipv4_" + host + "__port_" + port
+		}
+		escaped := strings.ReplaceAll(host, ":", "-")
+		if port == "" {
+			return "__ipv6_" + escaped
+		}
+		return "__ipv6_" + escaped + "__port_" + port
+	}
+	if port == "" {
+		return host
+	}
+	return host + "__port_" + port
+}
+
+func validDNSLabel(label string) bool {
+	if len(label) == 0 || len(label) > 63 {
+		return false
+	}
+	for i := 0; i < len(label); i++ {
+		character := label[i]
 		switch {
-		case r >= 'a' && r <= 'z':
-			b.WriteRune(r)
-		case r >= '0' && r <= '9':
-			b.WriteRune(r)
-		case r == '.' || r == '-' || r == '_':
-			b.WriteRune(r)
+		case character >= 'a' && character <= 'z':
+		case character >= '0' && character <= '9':
+		case character == '-':
+			if i == 0 || i == len(label)-1 {
+				return false
+			}
 		default:
-			b.WriteByte('_')
+			return false
 		}
 	}
-	if port != "" {
-		b.WriteByte('_')
-		b.WriteString(port)
-	}
-	return b.String()
+	return true
 }
 
 func lookupNamespaceIPs(host string) ([]net.IP, error) {

@@ -265,13 +265,13 @@ func TestCatchAllMirrorCanonicalizesAuthorities(t *testing.T) {
 			name:          "explicit port is preserved",
 			requestNS:     "docker.io:5443",
 			wantBase:      "https://registry-1.docker.io:5443",
-			wantCacheBase: "docker.io_5443",
+			wantCacheBase: "docker.io__port_5443",
 		},
 		{
 			name:          "ipv6 authority is bracketed and cache-safe",
 			requestNS:     "[2001:DB8::1]:5000",
 			wantBase:      "https://[2001:db8::1]:5000",
-			wantCacheBase: "2001_db8__1_5000",
+			wantCacheBase: "__ipv6_2001-db8--1__port_5000",
 		},
 	}
 
@@ -340,6 +340,12 @@ func TestCatchAllMirrorRejectsMalformedAuthorities(t *testing.T) {
 		"docker.io#fragment",
 		"docker.io:",
 		"[2001:db8::1",
+		"foo_bar.example",
+		"foo+bar.example",
+		"bucher-\u00e4.example",
+		"-edge.example",
+		"edge-.example",
+		"edge..example",
 	} {
 		t.Run(ns, func(t *testing.T) {
 			resp, _ := get(t, fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/latest?ns=%s", catchAllPort, url.QueryEscape(ns)))
@@ -347,6 +353,79 @@ func TestCatchAllMirrorRejectsMalformedAuthorities(t *testing.T) {
 				t.Fatalf("status for malformed ns=%s = %d, want 400", ns, resp.StatusCode)
 			}
 		})
+	}
+}
+
+func TestCatchAllMirrorDistinctAcceptedAuthoritiesDoNotShareHandlersOrCacheDirs(t *testing.T) {
+	catchAllPort := freePort(t)
+	type served struct {
+		authority string
+		cacheBase string
+	}
+	results := map[string]served{}
+
+	m := newManagerWithPorts(t.TempDir(), nil, catchAllPort)
+	m.resolveUpstreamIPs = func(_ context.Context, host string) ([]net.IP, error) {
+		switch canonicalLookupHost(host) {
+		case "docker.io":
+			return []net.IP{net.ParseIP("203.0.113.10")}, nil
+		case "192.0.2.10":
+			return []net.IP{net.ParseIP("192.0.2.10")}, nil
+		case "2001:db8::1":
+			return []net.IP{net.ParseIP("2001:db8::1")}, nil
+		default:
+			return nil, fmt.Errorf("unexpected host %q", host)
+		}
+	}
+	m.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	m.serverFactory = func(authority, _, cacheDir string) http.Handler {
+		cacheBase := filepath.Base(cacheDir)
+		results[authority] = served{authority: authority, cacheBase: cacheBase}
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(authority + "|" + cacheBase))
+		})
+	}
+	defer m.Close()
+
+	if err := m.Bind("127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+
+	requests := []string{"docker.io:5443", "docker.io:5444", "192.0.2.10", "[2001:db8::1]"}
+	bodies := map[string]string{}
+	for _, ns := range requests {
+		resp, body := get(t, fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/latest?ns=%s", catchAllPort, url.QueryEscape(ns)))
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("ns=%s -> %d %q", ns, resp.StatusCode, body)
+		}
+		bodies[ns] = body
+	}
+
+	for _, ns := range requests {
+		resp, body := get(t, fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/latest?ns=%s", catchAllPort, url.QueryEscape(ns)))
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("repeat ns=%s -> %d %q", ns, resp.StatusCode, body)
+		}
+		if body != bodies[ns] {
+			t.Fatalf("repeat body for ns=%s = %q, want %q", ns, body, bodies[ns])
+		}
+	}
+
+	seenBodies := map[string]string{}
+	for _, ns := range requests {
+		if other, ok := seenBodies[bodies[ns]]; ok {
+			t.Fatalf("ns=%s reused body %q already served for %s", ns, bodies[ns], other)
+		}
+		seenBodies[bodies[ns]] = ns
+	}
+
+	seenCacheBases := map[string]string{}
+	for authority, result := range results {
+		if other, ok := seenCacheBases[result.cacheBase]; ok {
+			t.Fatalf("authority %s reused cache base %q already assigned to %s", authority, result.cacheBase, other)
+		}
+		seenCacheBases[result.cacheBase] = authority
 	}
 }
 
