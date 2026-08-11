@@ -49,6 +49,7 @@ type Manager struct {
 	mu                sync.Mutex
 	bound             map[string][]*http.Server // gateway IP -> its servers
 	dynamic           map[string]http.Handler
+	dynamicServers    map[string]*Server
 	dynamicOrder      *list.List
 	dynamicLRUEntries map[string]*list.Element
 	dynamicClosers    map[string]func()
@@ -74,10 +75,11 @@ func newManagerWithPorts(cacheRoot string, ports []portBinding, catchAllPort int
 		resolveUpstreamIPs: func(ctx context.Context, host string) ([]net.IP, error) {
 			return lookupNamespaceIPs(ctx, host)
 		},
-		hostOwnedIPs: hostOwnedIPs,
-		dialContext:  defaultEgressDependencies().dialContext,
-		bound:        map[string][]*http.Server{},
-		dynamic:      map[string]http.Handler{},
+		hostOwnedIPs:   hostOwnedIPs,
+		dialContext:    defaultEgressDependencies().dialContext,
+		bound:          map[string][]*http.Server{},
+		dynamic:        map[string]http.Handler{},
+		dynamicServers: map[string]*Server{},
 	}
 }
 
@@ -332,6 +334,11 @@ func (m *Manager) handlerForUpstream(authority upstreamAuthority) http.Handler {
 	if m.serverFactory != nil {
 		handler = m.serverFactory(authority.canonicalAuthority, base, cacheDir)
 	}
+	if configuredServer, ok := handler.(*Server); ok {
+		m.dynamicServers[authority.cacheKey] = configuredServer
+	} else if m.serverFactory == nil {
+		m.dynamicServers[authority.cacheKey] = mirrorServer
+	}
 	m.dynamic[authority.cacheKey] = handler
 	m.dynamicLRUEntries[authority.cacheKey] = m.dynamicOrder.PushBack(authority.cacheKey)
 	if closer := dynamicHandlerCloser(handler); closer != nil {
@@ -360,6 +367,9 @@ func (m *Manager) dynamicHandler(cacheKey string) (http.Handler, bool) {
 func (m *Manager) ensureDynamicStateLocked() {
 	if m.dynamic == nil {
 		m.dynamic = map[string]http.Handler{}
+	}
+	if m.dynamicServers == nil {
+		m.dynamicServers = map[string]*Server{}
 	}
 	if m.dynamicOrder == nil {
 		m.dynamicOrder = list.New()
@@ -411,6 +421,7 @@ func (m *Manager) drainDynamicLocked() []func() {
 
 func (m *Manager) removeDynamicLocked(key string) func() {
 	delete(m.dynamic, key)
+	delete(m.dynamicServers, key)
 	if element := m.dynamicLRUEntries[key]; element != nil && m.dynamicOrder != nil {
 		m.dynamicOrder.Remove(element)
 	}

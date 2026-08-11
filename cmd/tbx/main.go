@@ -382,7 +382,7 @@ func (c cli) runStatus(args []string) error {
 
 func (c cli) runCache(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tbx cache pull|prune")
+		return errors.New("usage: tbx cache pull|prune|warm")
 	}
 	switch args[0] {
 	case "pull":
@@ -420,6 +420,8 @@ func (c cli) runCache(args []string) error {
 		}
 		_, err := fmt.Fprintf(c.out, "pruned %d cached image(s)\n", result.Removed)
 		return err
+	case "warm":
+		return c.runCacheWarm(args[1:])
 	default:
 		return fmt.Errorf("unknown cache command %q", args[0])
 	}
@@ -439,7 +441,7 @@ Commands:
   console <cluster> <node>
   bgp enable|disable <cluster>
   mirror offline [on|off]
-  cache pull|prune
+  cache pull|prune|warm
   system install|uninstall
   doctor
   version
