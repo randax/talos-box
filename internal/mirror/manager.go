@@ -321,6 +321,34 @@ func (m *Manager) handlerForUpstream(authority upstreamAuthority) http.Handler {
 		base = m.baseOverride
 	}
 	cacheDir := filepath.Join(m.cacheRoot, authority.cacheKey)
+	var (
+		handler        http.Handler
+		retainedServer *Server
+	)
+	if m.serverFactory != nil {
+		handler = m.serverFactory(authority.canonicalAuthority, base, cacheDir)
+	}
+	if configuredServer, ok := handler.(*Server); ok {
+		retainedServer = configuredServer
+	} else {
+		retainedServer = m.newDynamicMirrorServer(base, cacheDir, authority)
+		if handler == nil {
+			handler = retainedServer
+		}
+	}
+	m.dynamicServers[authority.cacheKey] = retainedServer
+	m.dynamic[authority.cacheKey] = handler
+	m.dynamicLRUEntries[authority.cacheKey] = m.dynamicOrder.PushBack(authority.cacheKey)
+	if closer := dynamicResourceCloser(handler, retainedServer); closer != nil {
+		m.dynamicClosers[authority.cacheKey] = closer
+	}
+	for _, closer := range m.evictDynamicLocked() {
+		closer()
+	}
+	return handler
+}
+
+func (m *Manager) newDynamicMirrorServer(base, cacheDir string, authority upstreamAuthority) *Server {
 	mirrorServer := newServerWithEgress(base, cacheDir, egressDependencies{
 		resolve:     m.resolveUpstreamIPs,
 		hostIPs:     m.hostOwnedIPs,
@@ -331,24 +359,7 @@ func (m *Manager) handlerForUpstream(authority upstreamAuthority) http.Handler {
 	mirrorServer.validateUpstream = func(ctx context.Context) error {
 		return m.validateResolvedAuthority(ctx, authority)
 	}
-	handler := http.Handler(mirrorServer)
-	if m.serverFactory != nil {
-		handler = m.serverFactory(authority.canonicalAuthority, base, cacheDir)
-	}
-	if configuredServer, ok := handler.(*Server); ok {
-		m.dynamicServers[authority.cacheKey] = configuredServer
-	} else if m.serverFactory == nil {
-		m.dynamicServers[authority.cacheKey] = mirrorServer
-	}
-	m.dynamic[authority.cacheKey] = handler
-	m.dynamicLRUEntries[authority.cacheKey] = m.dynamicOrder.PushBack(authority.cacheKey)
-	if closer := dynamicHandlerCloser(handler); closer != nil {
-		m.dynamicClosers[authority.cacheKey] = closer
-	}
-	for _, closer := range m.evictDynamicLocked() {
-		closer()
-	}
-	return handler
+	return mirrorServer
 }
 
 func (m *Manager) dynamicHandler(cacheKey string) (http.Handler, bool) {
@@ -440,6 +451,30 @@ func dynamicHandlerCloser(handler http.Handler) func() {
 		return value.CloseIdleConnections
 	}
 	return nil
+}
+
+func dynamicResourceCloser(handler http.Handler, retainedServer *Server) func() {
+	var closers []func()
+	if retainedServer != nil {
+		closers = append(closers, retainedServer.CloseIdleConnections)
+	}
+	if configuredServer, ok := handler.(*Server); !ok || configuredServer != retainedServer {
+		if closer := dynamicHandlerCloser(handler); closer != nil {
+			closers = append(closers, closer)
+		}
+	}
+	switch len(closers) {
+	case 0:
+		return nil
+	case 1:
+		return closers[0]
+	default:
+		return func() {
+			for _, closer := range closers {
+				closer()
+			}
+		}
+	}
 }
 
 func (m *Manager) SetOffline(enabled bool) {

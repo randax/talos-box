@@ -128,22 +128,22 @@ func warmManifestGraph(ctx context.Context, handler http.Handler, server *Server
 	if err != nil {
 		return err
 	}
-		if kind == "manifest" {
-			for _, blob := range blobs {
-				if seenBlobs[blob] {
-					continue
-				}
-				seenBlobs[blob] = true
-				if blobCached(server, blob) {
-					continue
-				}
-				if err := warmBlobRequest(ctx, handler, repository, blob); err != nil {
-					return err
-				}
-				result.AlreadyComplete = false
+	if kind == "manifest" {
+		for _, blob := range blobs {
+			if seenBlobs[blob] {
+				continue
 			}
-			return nil
+			seenBlobs[blob] = true
+			if blobCached(server, blob) {
+				continue
+			}
+			if err := warmBlobRequest(ctx, handler, repository, blob); err != nil {
+				return err
+			}
+			result.AlreadyComplete = false
 		}
+		return nil
+	}
 
 	matchedHost := false
 	for _, child := range children {
@@ -268,6 +268,9 @@ func blobCached(server *Server, digest string) bool {
 
 func parseWarmReference(reference string) (warmReference, error) {
 	name, digest, hasDigest := strings.Cut(reference, "@")
+	if hasDigest && digest == "" {
+		return warmReference{}, fmt.Errorf("invalid pinned digest %q", digest)
+	}
 	lastSlash := strings.LastIndex(name, "/")
 	lastColon := strings.LastIndex(name, ":")
 	tag := ""
@@ -281,6 +284,13 @@ func parseWarmReference(reference string) (warmReference, error) {
 	host, remainder, ok := strings.Cut(nameWithoutTag, "/")
 	if !ok || host == "" || remainder == "" {
 		return warmReference{}, fmt.Errorf("invalid image reference %q", reference)
+	}
+	if digest != "" {
+		canonicalDigest, ok := canonicalSupportedDigest(digest)
+		if !ok {
+			return warmReference{}, fmt.Errorf("invalid or unsupported pinned digest %q", digest)
+		}
+		digest = canonicalDigest
 	}
 
 	listed := digest

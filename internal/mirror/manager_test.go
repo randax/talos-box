@@ -9,8 +9,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"sync"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -678,6 +678,80 @@ func TestCatchAllMirrorBoundsDynamicHandlersAndClosesEvictedEntries(t *testing.T
 	}
 }
 
+func TestDynamicWrappedHandlerCleanupClosesRetainedMirrorServerAndWrapper(t *testing.T) {
+	authorityOne, err := parseUpstreamAuthority("registry-one.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorityTwo, err := parseUpstreamAuthority("registry-two.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wrapperClosed atomic.Int64
+	m := newManagerWithPorts(t.TempDir(), nil, 0)
+	m.dynamicCap = 1
+	m.serverFactory = func(_ string, _, _ string) http.Handler {
+		return &closableWrappedHandler{
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(manifestBody))
+			}),
+			closed: &wrapperClosed,
+		}
+	}
+	defer m.Close()
+
+	_ = m.handlerForUpstream(authorityOne)
+	retainedOne := m.dynamicServers[authorityOne.cacheKey]
+	if retainedOne == nil {
+		t.Fatal("retained mirror server missing for wrapped handler")
+	}
+	retainedTransport := &countingIdleTransport{}
+	retainedOne.client.Transport = retainedTransport
+
+	_ = m.handlerForUpstream(authorityTwo)
+
+	if got := wrapperClosed.Load(); got != 1 {
+		t.Fatalf("wrapped handler close count = %d, want 1 after eviction", got)
+	}
+	if got := retainedTransport.closed.Load(); got != 1 {
+		t.Fatalf("retained mirror transport close count = %d, want 1 after eviction", got)
+	}
+
+	m.Close()
+	if got := wrapperClosed.Load(); got != 2 {
+		t.Fatalf("wrapped handler close count after Manager.Close = %d, want 2", got)
+	}
+}
+
+func TestDynamicServerCleanupDoesNotDoubleCloseSameServer(t *testing.T) {
+	authority, err := parseUpstreamAuthority("registry.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := NewServer("https://registry.example", t.TempDir())
+	transport := &countingIdleTransport{}
+	server.client.Transport = transport
+
+	m := newManagerWithPorts(t.TempDir(), nil, 0)
+	m.serverFactory = func(_ string, _, _ string) http.Handler {
+		return server
+	}
+	defer m.Close()
+
+	_ = m.handlerForUpstream(authority)
+	if retained := m.dynamicServers[authority.cacheKey]; retained != server {
+		t.Fatalf("retained server = %p, want factory server %p", retained, server)
+	}
+	m.Close()
+
+	if got := transport.closed.Load(); got != 1 {
+		t.Fatalf("shared server transport close count = %d, want 1", got)
+	}
+}
+
 func TestCatchAllMirrorInvalidNamespacesDoNotAllocateDynamicHandlers(t *testing.T) {
 	catchAllPort := freePort(t)
 	var created atomic.Int64
@@ -1312,6 +1386,27 @@ func (h *closableHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 
 func (h *closableHandler) CloseIdleConnections() {
 	h.closed.Add(1)
+}
+
+type closableWrappedHandler struct {
+	http.Handler
+	closed *atomic.Int64
+}
+
+func (h *closableWrappedHandler) CloseIdleConnections() {
+	h.closed.Add(1)
+}
+
+type countingIdleTransport struct {
+	closed atomic.Int64
+}
+
+func (t *countingIdleTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, fmt.Errorf("unexpected round trip")
+}
+
+func (t *countingIdleTransport) CloseIdleConnections() {
+	t.closed.Add(1)
 }
 
 func freePort(t *testing.T) int {
