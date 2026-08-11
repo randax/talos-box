@@ -179,7 +179,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		digest = m[1]
 	}
 	isManifest := manifestPathRe.MatchString(r.URL.Path)
-	if s.serveCacheIfAvailable(w, r, digest, isManifest) {
+	if served, err := s.serveCacheIfAvailable(w, r, digest, isManifest); served {
+		return
+	} else if err != nil {
+		http.Error(w, err.Error(), err.status)
 		return
 	}
 	if s.offlineEnabled() {
@@ -197,7 +200,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if s.serveCacheIfAvailable(w, r, digest, isManifest) {
+	if served, err := s.serveCacheIfAvailable(w, r, digest, isManifest); served {
+		return
+	} else if err != nil {
+		http.Error(w, err.Error(), err.status)
 		return
 	}
 	if s.offlineEnabled() {
@@ -208,7 +214,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	resp, err := s.fetch(r)
 	if err != nil {
 		// offline: a manifest we cached earlier still serves the pull
-		if isManifest && s.serveCachedManifest(w, r) {
+		if served, cacheErr := s.serveManifestCacheOnFetchFailure(w, r); served {
+			return
+		} else if cacheErr != nil {
+			http.Error(w, cacheErr.Error(), cacheErr.status)
 			return
 		}
 		http.Error(w, fmt.Sprintf("upstream: %v", err), http.StatusBadGateway)
@@ -251,20 +260,34 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
-func (s *Server) serveCacheIfAvailable(w http.ResponseWriter, r *http.Request, digest string, isManifest bool) bool {
+func (s *Server) serveCacheIfAvailable(w http.ResponseWriter, r *http.Request, digest string, isManifest bool) (bool, *cacheReplayError) {
 	if digest != "" && s.serveCachedBlob(w, r, digest) {
-		return true
+		return true, nil
 	}
 	if isManifest {
 		reference := manifestReference(r.URL.Path)
-		if isDigestReference(reference) && s.serveCachedManifest(w, r) {
-			return true
+		if isDigestReference(reference) {
+			return s.serveCachedDigestManifest(w, r, reference)
 		}
 		if s.offlineEnabled() && s.serveCachedManifest(w, r) {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
+}
+
+func (s *Server) serveManifestCacheOnFetchFailure(w http.ResponseWriter, r *http.Request) (bool, *cacheReplayError) {
+	if !manifestPathRe.MatchString(r.URL.Path) {
+		return false, nil
+	}
+	reference := manifestReference(r.URL.Path)
+	if isDigestReference(reference) {
+		return s.serveCachedDigestManifest(w, r, reference)
+	}
+	if s.serveCachedManifest(w, r) {
+		return true, nil
+	}
+	return false, nil
 }
 
 func (s *Server) CloseIdleConnections() {
@@ -543,6 +566,31 @@ func (s *Server) serveCachedManifest(w http.ResponseWriter, r *http.Request) boo
 		return false
 	}
 	metadata := s.cachedManifestMetadata(r.URL.Path, data)
+	return serveManifestBytes(w, r, data, metadata)
+}
+
+func (s *Server) serveCachedDigestManifest(w http.ResponseWriter, r *http.Request, requestedDigest string) (bool, *cacheReplayError) {
+	path := s.manifestPath(r.URL.Path)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false, nil
+	}
+	canonical, err := verifySupportedDigest(data, requestedDigest)
+	if err != nil {
+		if s.offlineEnabled() {
+			return false, &cacheReplayError{
+				status: http.StatusServiceUnavailable,
+				err:    fmt.Errorf("mirror offline: cached digest corrupted"),
+			}
+		}
+		return false, nil
+	}
+	metadata := s.cachedManifestMetadata(r.URL.Path, data)
+	metadata.DockerContentDigest = canonical
+	return serveManifestBytes(w, r, data, metadata), nil
+}
+
+func serveManifestBytes(w http.ResponseWriter, r *http.Request, data []byte, metadata manifestMetadata) bool {
 	w.Header().Set("Content-Type", metadata.ContentType)
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", metadata.ContentLength))
 	w.Header().Set("Docker-Content-Digest", metadata.DockerContentDigest)
@@ -665,6 +713,14 @@ type upstreamValidationError struct {
 
 func (e *upstreamValidationError) Error() string { return e.err.Error() }
 func (e *upstreamValidationError) Unwrap() error { return e.err }
+
+type cacheReplayError struct {
+	status int
+	err    error
+}
+
+func (e *cacheReplayError) Error() string { return e.err.Error() }
+func (e *cacheReplayError) Unwrap() error { return e.err }
 
 func splitDigestReference(reference string) (string, string, bool) {
 	match := digestRefRe.FindStringSubmatch(reference)

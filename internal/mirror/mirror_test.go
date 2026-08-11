@@ -795,6 +795,78 @@ func TestCachedDigestManifestServesWithoutUpstreamByDefault(t *testing.T) {
 	}
 }
 
+func TestCorruptCachedDigestManifestRefetchesOnline(t *testing.T) {
+	validDigest := "sha256:" + sha256Hex([]byte(manifestBody))
+	var upstreamHits atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		w.Header().Set("Docker-Content-Digest", validDigest)
+		_, _ = fmt.Fprint(w, manifestBody)
+	}))
+	defer upstream.Close()
+
+	server := newLoopbackMirrorServer(t, upstream.URL, t.TempDir())
+	mirror := httptest.NewServer(server)
+	defer mirror.Close()
+	path := "/v2/app/manifests/" + validDigest
+
+	resp, body := get(t, mirror.URL+path)
+	if resp.StatusCode != http.StatusOK || body != manifestBody {
+		t.Fatalf("warm digest manifest = %d %q", resp.StatusCode, body)
+	}
+	hitsAfterWarm := upstreamHits.Load()
+	if err := os.WriteFile(server.manifestPath(path), []byte("corrupt-manifest"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, body = get(t, mirror.URL+path)
+	if resp.StatusCode != http.StatusOK || body != manifestBody {
+		t.Fatalf("online replay after corruption = %d %q", resp.StatusCode, body)
+	}
+	if upstreamHits.Load() != hitsAfterWarm+1 {
+		t.Fatalf("corrupt cached digest did not refetch upstream: %d -> %d", hitsAfterWarm, upstreamHits.Load())
+	}
+}
+
+func TestOfflineCorruptCachedDigestManifestFailsFast(t *testing.T) {
+	validDigest := "sha256:" + sha256Hex([]byte(manifestBody))
+	var upstreamHits atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		w.Header().Set("Docker-Content-Digest", validDigest)
+		_, _ = fmt.Fprint(w, manifestBody)
+	}))
+	defer upstream.Close()
+
+	server := newLoopbackMirrorServer(t, upstream.URL, t.TempDir())
+	mirror := httptest.NewServer(server)
+	defer mirror.Close()
+	path := "/v2/app/manifests/" + validDigest
+
+	resp, body := get(t, mirror.URL+path)
+	if resp.StatusCode != http.StatusOK || body != manifestBody {
+		t.Fatalf("warm digest manifest = %d %q", resp.StatusCode, body)
+	}
+	if err := os.WriteFile(server.manifestPath(path), []byte("corrupt-manifest"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	server.setOfflineMode(true)
+	hitsAfterWarm := upstreamHits.Load()
+
+	resp, body = get(t, mirror.URL+path)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("offline replay after corruption = %d %q, want 503", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "cached digest corrupted") {
+		t.Fatalf("offline corruption error = %q", body)
+	}
+	if upstreamHits.Load() != hitsAfterWarm {
+		t.Fatalf("offline corrupt cached digest hit upstream: %d -> %d", hitsAfterWarm, upstreamHits.Load())
+	}
+}
+
 func TestOfflineModeServesCachedTagsAndFailsMissesWithoutUpstream(t *testing.T) {
 	var upstreamHits atomic.Int64
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
