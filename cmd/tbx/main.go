@@ -396,16 +396,18 @@ func (c cli) runCache(args []string) error {
 			}
 		}
 		if len(result.Mirror) == 0 {
-			_, err := fmt.Fprintln(c.out, "Mirror cache: empty")
-			return err
-		}
-		if _, err := fmt.Fprintln(c.out, "Mirror cache:"); err != nil {
-			return err
-		}
-		for _, entry := range result.Mirror {
-			if _, err := fmt.Fprintf(c.out, "- %s: %d blob(s) %d bytes, %d manifest(s) %d bytes\n",
-				entry.Upstream, entry.BlobCount, entry.BlobBytes, entry.ManifestCount, entry.ManifestBytes); err != nil {
+			if _, err := fmt.Fprintln(c.out, "Mirror cache: empty"); err != nil {
 				return err
+			}
+		} else {
+			if _, err := fmt.Fprintln(c.out, "Mirror cache:"); err != nil {
+				return err
+			}
+			for _, entry := range result.Mirror {
+				if _, err := fmt.Fprintf(c.out, "- %s: %d blob(s) %d bytes, %d manifest(s) %d bytes\n",
+					entry.Upstream, entry.BlobCount, entry.BlobBytes, entry.ManifestCount, entry.ManifestBytes); err != nil {
+					return err
+				}
 			}
 		}
 		_, err := fmt.Fprintf(c.out, "Mirror total: %d blob(s) %d bytes, %d manifest(s) %d bytes\n",

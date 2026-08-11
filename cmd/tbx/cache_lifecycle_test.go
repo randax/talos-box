@@ -135,3 +135,47 @@ func TestRunCacheListPrintsDiskAndMirrorSections(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 }
+
+func TestRunCacheListPrintsZeroMirrorTotalWhenEmpty(t *testing.T) {
+	t.Setenv("HOME", shortTestHome(t))
+	socketPath, err := daemon.SocketPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	done := make(chan struct{})
+	go serveSingleDaemonRequest(t, listener, func(request daemon.Request) daemon.Response {
+		if request.Op != "cache.list" {
+			t.Fatalf("request op = %q, want cache.list", request.Op)
+		}
+		return daemon.Response{OK: true, Data: mustJSON(t, daemon.CacheListResult{
+			MirrorTotal: daemon.MirrorCacheTotals{},
+		})}
+	}, done)
+
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr}
+	if err := command.run([]string{"cache", "list"}); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+
+	want := "" +
+		"Talos disk images: empty\n" +
+		"Mirror cache: empty\n" +
+		"Mirror total: 0 blob(s) 0 bytes, 0 manifest(s) 0 bytes\n"
+	if got := stdout.String(); got != want {
+		t.Fatalf("stdout = %q", got)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
