@@ -216,7 +216,7 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 			actualGateways := append([]string(nil), cacheResult.MirrorBoundGatewayIPs...)
 			sort.Strings(actualGateways)
 			switch {
-			case len(expectedGateways) == 0 && len(actualGateways) > 0:
+			case clusterErr == nil && len(expectedGateways) == 0 && len(actualGateways) > 0:
 				mirrorFinding.level = "FAIL"
 				mirrorFinding.detail = fmt.Sprintf("mirror listeners bound on %v while no clusters are running; %s", actualGateways, cacheDetail)
 			case clusterErr == nil && len(clusters) == 0:
