@@ -280,22 +280,14 @@ func (c *Cache) PruneDisk() (CachePruneResult, error) {
 		return CachePruneResult{}, err
 	}
 	var result CachePruneResult
+	schematics := make(map[string]struct{}, len(images))
 	for _, image := range images {
 		result.ImageCount++
 		result.ImageBytes += image.Size
+		schematics[image.Schematic] = struct{}{}
 	}
-	entries, err := os.ReadDir(c.root)
-	if errors.Is(err, os.ErrNotExist) {
-		return result, nil
-	}
-	if err != nil {
-		return CachePruneResult{}, fmt.Errorf("prune disk cache: %w", err)
-	}
-	for _, entry := range entries {
-		if entry.Name() == "mirror" {
-			continue
-		}
-		if err := os.RemoveAll(filepath.Join(c.root, entry.Name())); err != nil {
+	for schematic := range schematics {
+		if err := os.RemoveAll(filepath.Join(c.root, schematic)); err != nil {
 			return CachePruneResult{}, fmt.Errorf("prune disk cache: %w", err)
 		}
 	}

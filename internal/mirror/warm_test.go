@@ -138,6 +138,76 @@ type syncWarmHits struct {
 	arm64Blob       atomic.Int64
 }
 
+func TestWarmPopulatesMirrorStatsForCacheList(t *testing.T) {
+	cacheRoot := t.TempDir()
+	mirrorRoot := filepath.Join(cacheRoot, "mirror")
+
+	manifestBody := `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":7},"layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":5}]}`
+	manifestDigest := "sha256:" + sha256Hex([]byte(manifestBody))
+	configBody := []byte("config!")
+	layerBody := []byte("layer")
+	configDigest := "sha256:" + sha256Hex(configBody)
+	layerDigest := "sha256:" + sha256Hex(layerBody)
+	manifestBody = fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%d},"layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"%s","size":%d}]}`,
+		configDigest, len(configBody), layerDigest, len(layerBody))
+	manifestDigest = "sha256:" + sha256Hex([]byte(manifestBody))
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/demo/manifests/stable":
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", manifestDigest)
+			_, _ = fmt.Fprint(w, manifestBody)
+		case "/v2/demo/manifests/" + manifestDigest:
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", manifestDigest)
+			_, _ = fmt.Fprint(w, manifestBody)
+		case "/v2/demo/blobs/" + configDigest:
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = w.Write(configBody)
+		case "/v2/demo/blobs/" + layerDigest:
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = w.Write(layerBody)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	manager := newManagerWithPorts(mirrorRoot, nil, freePort(t))
+	manager.baseOverride = aliasedURL(t, upstream.URL, "registry.example")
+	egress := egressForRoutes(aliasRoute(t, upstream.URL, "registry.example", "203.0.113.10"))
+	manager.resolveUpstreamIPs = egress.resolve
+	manager.hostOwnedIPs = egress.hostIPs
+	manager.dialContext = egress.dialContext
+	defer manager.Close()
+
+	result, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Warmed != 1 || result.AlreadyComplete != 0 || result.Failed != 0 {
+		t.Fatalf("warm result = %+v", result)
+	}
+
+	stats, total, err := imagecache.New(cacheRoot).MirrorStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stats) != 1 || stats[0].Upstream != "registry.example" {
+		t.Fatalf("mirror stats = %+v", stats)
+	}
+	if stats[0].BlobCount != 2 || stats[0].ManifestCount != 2 {
+		t.Fatalf("mirror counts = %+v", stats[0])
+	}
+	if total.BlobCount != stats[0].BlobCount || total.ManifestCount != stats[0].ManifestCount {
+		t.Fatalf("mirror total = %+v, stats = %+v", total, stats[0])
+	}
+	if stats[0].BlobBytes <= 0 || stats[0].ManifestBytes <= 0 {
+		t.Fatalf("mirror sizes = %+v", stats[0])
+	}
+}
+
 func TestWarmRerunSkipsBlobDownloadsButRefreshesManifestRequests(t *testing.T) {
 	manifestBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%d},"layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"%s","size":%d}]}`,
 		"sha256:"+sha256Hex([]byte("config")), len("config"), "sha256:"+sha256Hex([]byte("layer")), len("layer"))

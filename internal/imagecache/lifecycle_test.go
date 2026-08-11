@@ -41,6 +41,33 @@ func TestPruneDiskPreservesMirrorCache(t *testing.T) {
 	}
 }
 
+func TestPruneDiskPreservesNonImageRootFiles(t *testing.T) {
+	root := t.TempDir()
+	cache := New(root)
+
+	diskPath := filepath.Join(root, "schematic", "v1.2.3", "amd64", "disk.raw")
+	if err := os.MkdirAll(filepath.Dir(diskPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(diskPath, []byte("disk-bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	notePath := filepath.Join(root, "README.txt")
+	if err := os.WriteFile(notePath, []byte("keep me"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := cache.PruneDisk(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(diskPath); !os.IsNotExist(err) {
+		t.Fatalf("disk path still exists after prune: %v", err)
+	}
+	if _, err := os.Stat(notePath); err != nil {
+		t.Fatalf("non-image root file missing after disk prune: %v", err)
+	}
+}
+
 func TestPruneMirrorAndAllScopes(t *testing.T) {
 	for _, test := range []struct {
 		name            string
