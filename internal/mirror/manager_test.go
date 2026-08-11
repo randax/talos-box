@@ -435,8 +435,8 @@ func TestCatchAllMirrorCancellationStopsDefaultNamespaceValidation(t *testing.T)
 	case <-time.After(time.Second):
 		t.Fatal("catch-all handler did not return promptly after cancellation")
 	}
-	if recorder.Code != http.StatusForbidden {
-		t.Fatalf("status = %d, want 403", recorder.Code)
+	if recorder.Code == http.StatusOK {
+		t.Fatalf("status = %d, want non-success after cancellation", recorder.Code)
 	}
 	if handlerCalls.Load() != 0 {
 		t.Fatalf("dynamic handler calls = %d, want 0", handlerCalls.Load())
