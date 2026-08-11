@@ -173,10 +173,6 @@ func (m *Manager) serveCatchAll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := m.validateResolvedAuthority(r.Context(), authority); err != nil {
-		http.Error(w, err.Error(), http.StatusForbidden)
-		return
-	}
 	handler := m.handlerForUpstream(authority)
 	clone := r.Clone(r.Context())
 	clone.URL = cloneURLWithoutQueryValue(r.URL, "ns")
@@ -228,15 +224,15 @@ func parseUpstreamAuthority(raw string) (upstreamAuthority, error) {
 func (m *Manager) validateResolvedAuthority(ctx context.Context, authority upstreamAuthority) error {
 	ips, err := m.resolveUpstreamIPs(ctx, authority.canonicalHost)
 	if err != nil {
-		return fmt.Errorf("resolve ns %q: %w", authority.canonicalAuthority, err)
+		return &upstreamValidationError{status: http.StatusBadGateway, err: fmt.Errorf("resolve ns %q: %w", authority.canonicalAuthority, err)}
 	}
 	hostIPs, err := m.hostOwnedIPs()
 	if err != nil {
-		return fmt.Errorf("inspect host addresses: %w", err)
+		return &upstreamValidationError{status: http.StatusBadGateway, err: fmt.Errorf("inspect host addresses: %w", err)}
 	}
 	for _, ip := range ips {
 		if namespaceIPBlocked(ip, hostIPs) {
-			return fmt.Errorf("refuse ns %q: address %s is not public", authority.canonicalAuthority, ip.String())
+			return &upstreamValidationError{status: http.StatusForbidden, err: fmt.Errorf("refuse ns %q: address %s is not public", authority.canonicalAuthority, ip.String())}
 		}
 	}
 	return nil
@@ -265,6 +261,9 @@ func (m *Manager) handlerForUpstream(authority upstreamAuthority) http.Handler {
 		blocked:     namespaceIPBlocked,
 	})
 	mirrorServer.offline = &m.offline
+	mirrorServer.validateUpstream = func(ctx context.Context) error {
+		return m.validateResolvedAuthority(ctx, authority)
+	}
 	handler := http.Handler(mirrorServer)
 	if m.serverFactory != nil {
 		handler = m.serverFactory(authority.canonicalAuthority, base, cacheDir)
