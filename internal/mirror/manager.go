@@ -49,10 +49,12 @@ type Manager struct {
 	mu                sync.Mutex
 	bound             map[string][]*http.Server // gateway IP -> its servers
 	dynamic           map[string]http.Handler
+	dynamicServers    map[string]*Server
 	dynamicOrder      *list.List
 	dynamicLRUEntries map[string]*list.Element
 	dynamicClosers    map[string]func()
 	dynamicCap        int
+	warmTagMu         sync.Mutex
 }
 
 const dynamicHandlerCap = 64
@@ -74,10 +76,11 @@ func newManagerWithPorts(cacheRoot string, ports []portBinding, catchAllPort int
 		resolveUpstreamIPs: func(ctx context.Context, host string) ([]net.IP, error) {
 			return lookupNamespaceIPs(ctx, host)
 		},
-		hostOwnedIPs: hostOwnedIPs,
-		dialContext:  defaultEgressDependencies().dialContext,
-		bound:        map[string][]*http.Server{},
-		dynamic:      map[string]http.Handler{},
+		hostOwnedIPs:   hostOwnedIPs,
+		dialContext:    defaultEgressDependencies().dialContext,
+		bound:          map[string][]*http.Server{},
+		dynamic:        map[string]http.Handler{},
+		dynamicServers: map[string]*Server{},
 	}
 }
 
@@ -318,6 +321,34 @@ func (m *Manager) handlerForUpstream(authority upstreamAuthority) http.Handler {
 		base = m.baseOverride
 	}
 	cacheDir := filepath.Join(m.cacheRoot, authority.cacheKey)
+	var (
+		handler        http.Handler
+		retainedServer *Server
+	)
+	if m.serverFactory != nil {
+		handler = m.serverFactory(authority.canonicalAuthority, base, cacheDir)
+	}
+	if configuredServer, ok := handler.(*Server); ok {
+		retainedServer = configuredServer
+	} else {
+		retainedServer = m.newDynamicMirrorServer(base, cacheDir, authority)
+		if handler == nil {
+			handler = retainedServer
+		}
+	}
+	m.dynamicServers[authority.cacheKey] = retainedServer
+	m.dynamic[authority.cacheKey] = handler
+	m.dynamicLRUEntries[authority.cacheKey] = m.dynamicOrder.PushBack(authority.cacheKey)
+	if closer := dynamicResourceCloser(handler, retainedServer); closer != nil {
+		m.dynamicClosers[authority.cacheKey] = closer
+	}
+	for _, closer := range m.evictDynamicLocked() {
+		closer()
+	}
+	return handler
+}
+
+func (m *Manager) newDynamicMirrorServer(base, cacheDir string, authority upstreamAuthority) *Server {
 	mirrorServer := newServerWithEgress(base, cacheDir, egressDependencies{
 		resolve:     m.resolveUpstreamIPs,
 		hostIPs:     m.hostOwnedIPs,
@@ -328,19 +359,7 @@ func (m *Manager) handlerForUpstream(authority upstreamAuthority) http.Handler {
 	mirrorServer.validateUpstream = func(ctx context.Context) error {
 		return m.validateResolvedAuthority(ctx, authority)
 	}
-	handler := http.Handler(mirrorServer)
-	if m.serverFactory != nil {
-		handler = m.serverFactory(authority.canonicalAuthority, base, cacheDir)
-	}
-	m.dynamic[authority.cacheKey] = handler
-	m.dynamicLRUEntries[authority.cacheKey] = m.dynamicOrder.PushBack(authority.cacheKey)
-	if closer := dynamicHandlerCloser(handler); closer != nil {
-		m.dynamicClosers[authority.cacheKey] = closer
-	}
-	for _, closer := range m.evictDynamicLocked() {
-		closer()
-	}
-	return handler
+	return mirrorServer
 }
 
 func (m *Manager) dynamicHandler(cacheKey string) (http.Handler, bool) {
@@ -360,6 +379,9 @@ func (m *Manager) dynamicHandler(cacheKey string) (http.Handler, bool) {
 func (m *Manager) ensureDynamicStateLocked() {
 	if m.dynamic == nil {
 		m.dynamic = map[string]http.Handler{}
+	}
+	if m.dynamicServers == nil {
+		m.dynamicServers = map[string]*Server{}
 	}
 	if m.dynamicOrder == nil {
 		m.dynamicOrder = list.New()
@@ -411,6 +433,7 @@ func (m *Manager) drainDynamicLocked() []func() {
 
 func (m *Manager) removeDynamicLocked(key string) func() {
 	delete(m.dynamic, key)
+	delete(m.dynamicServers, key)
 	if element := m.dynamicLRUEntries[key]; element != nil && m.dynamicOrder != nil {
 		m.dynamicOrder.Remove(element)
 	}
@@ -428,6 +451,30 @@ func dynamicHandlerCloser(handler http.Handler) func() {
 		return value.CloseIdleConnections
 	}
 	return nil
+}
+
+func dynamicResourceCloser(handler http.Handler, retainedServer *Server) func() {
+	var closers []func()
+	if retainedServer != nil {
+		closers = append(closers, retainedServer.CloseIdleConnections)
+	}
+	if configuredServer, ok := handler.(*Server); !ok || configuredServer != retainedServer {
+		if closer := dynamicHandlerCloser(handler); closer != nil {
+			closers = append(closers, closer)
+		}
+	}
+	switch len(closers) {
+	case 0:
+		return nil
+	case 1:
+		return closers[0]
+	default:
+		return func() {
+			for _, closer := range closers {
+				closer()
+			}
+		}
+	}
 }
 
 func (m *Manager) SetOffline(enabled bool) {

@@ -72,6 +72,10 @@ type cachePullArgs struct {
 	TalosVersion string `json:"talosVersion"`
 }
 
+type CacheWarmArgs struct {
+	Refs []string `json:"refs"`
+}
+
 // ClusterSummary is the compact cluster.list result.
 type ClusterSummary struct {
 	Name          string               `json:"name"`
@@ -129,6 +133,29 @@ type CachePullResult struct {
 	Architecture hypervisor.Architecture `json:"architecture"`
 	Path         string                  `json:"path"`
 }
+
+type CacheWarmStatus string
+
+const (
+	CacheWarmStatusWarmed          CacheWarmStatus = "warmed"
+	CacheWarmStatusAlreadyComplete CacheWarmStatus = "already-complete"
+	CacheWarmStatusFailed          CacheWarmStatus = "failed"
+)
+
+type CacheWarmEntry struct {
+	Ref    string          `json:"ref"`
+	Status CacheWarmStatus `json:"status"`
+	Reason string          `json:"reason,omitempty"`
+}
+
+type CacheWarmResult struct {
+	Entries         []CacheWarmEntry `json:"entries"`
+	Warmed          int              `json:"warmed"`
+	AlreadyComplete int              `json:"alreadyComplete"`
+	Failed          int              `json:"failed"`
+}
+
+const cacheWarmTimeout = 2 * time.Hour
 
 type MirrorOfflineStatus struct {
 	Enabled bool `json:"enabled"`
@@ -733,6 +760,27 @@ func (s *Server) pullCache(raw json.RawMessage) (CachePullResult, error) {
 	return CachePullResult{Schematic: schematic, Version: talosVersion, Architecture: architecture, Path: path}, nil
 }
 
+func (s *Server) warmMirrorCache(raw json.RawMessage) (CacheWarmResult, error) {
+	var args CacheWarmArgs
+	if err := decodeArgs(raw, &args); err != nil {
+		return CacheWarmResult{}, err
+	}
+	if len(args.Refs) == 0 {
+		return CacheWarmResult{}, errors.New("at least one image reference is required")
+	}
+	for _, ref := range args.Refs {
+		if err := ValidateWarmRef(ref); err != nil {
+			return CacheWarmResult{}, err
+		}
+	}
+	if s.warmCache == nil {
+		return CacheWarmResult{}, errors.New("cache warm is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), cacheWarmTimeout)
+	defer cancel()
+	return s.warmCache(ctx, args.Refs, s.imageArchitecture())
+}
+
 func (s *Server) pruneCache() (map[string]int, error) {
 	entries, err := s.cache.List()
 	if err != nil {
@@ -742,6 +790,77 @@ func (s *Server) pruneCache() (map[string]int, error) {
 		return nil, err
 	}
 	return map[string]int{"removed": len(entries)}, nil
+}
+
+func ValidateWarmRef(ref string) error {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return errors.New("image reference is required")
+	}
+	if strings.ContainsAny(ref, "?#") || strings.ContainsFunc(ref, func(character rune) bool {
+		return character <= 0x20
+	}) {
+		return fmt.Errorf("image reference %q is malformed", ref)
+	}
+
+	name, digest, hasDigest := strings.Cut(ref, "@")
+	if hasDigest {
+		if digest == "" || !isSupportedWarmDigest(digest) {
+			return fmt.Errorf("image reference %q must use a sha256 or sha512 digest", ref)
+		}
+	}
+
+	host, remainder, ok := strings.Cut(name, "/")
+	if !ok || remainder == "" || (!strings.Contains(host, ".") && !strings.Contains(host, ":") && host != "localhost") {
+		return fmt.Errorf("image reference %q must include a registry host", ref)
+	}
+	if strings.HasSuffix(name, "/") || strings.HasPrefix(remainder, ":") {
+		return fmt.Errorf("image reference %q is malformed", ref)
+	}
+
+	lastSlash := strings.LastIndex(name, "/")
+	lastColon := strings.LastIndex(name, ":")
+	tag := ""
+	if lastColon > lastSlash {
+		tag = name[lastColon+1:]
+	}
+	if hasDigest && lastColon <= lastSlash {
+		return nil
+	}
+	if hasDigest && lastColon > lastSlash && tag == "" {
+		return fmt.Errorf("image reference %q is malformed", ref)
+	}
+	if lastColon <= lastSlash {
+		return fmt.Errorf("image reference %q must include a non-latest tag or digest", ref)
+	}
+	if tag == "latest" {
+		return fmt.Errorf("image reference %q must not use :latest", ref)
+	}
+	return nil
+}
+
+func isSupportedWarmDigest(value string) bool {
+	algorithm, encoded, ok := strings.Cut(value, ":")
+	if !ok || encoded == "" {
+		return false
+	}
+	for _, character := range encoded {
+		if !isHexDigit(character) {
+			return false
+		}
+	}
+	switch algorithm {
+	case "sha256":
+		return len(encoded) == 64
+	case "sha512":
+		return len(encoded) == 128
+	default:
+		return false
+	}
+}
+
+func isHexDigit(character rune) bool {
+	return (character >= 'a' && character <= 'f') || (character >= 'A' && character <= 'F') || (character >= '0' && character <= '9')
 }
 
 func (s *Server) resolveImage(schematic, talosVersion string) (string, string, error) {
