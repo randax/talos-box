@@ -246,6 +246,161 @@ func TestWarmTagAtDigestUsesTagRequestPathAndPinnedDigest(t *testing.T) {
 	}
 }
 
+func TestWarmUppercasePinnedDigestCanonicalizesValidationAndDigestRequestPath(t *testing.T) {
+	configDigest := "sha256:" + sha256Hex([]byte("config"))
+	manifestBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%d},"layers":[]}`,
+		configDigest, len("config"))
+	manifestDigest := "sha256:" + sha256Hex([]byte(manifestBody))
+	uppercaseDigest := "sha256:" + strings.ToUpper(strings.TrimPrefix(manifestDigest, "sha256:"))
+
+	tests := []struct {
+		name          string
+		ref           string
+		wantTagHits   int64
+		wantLowerHits int64
+		wantUpperHits int64
+	}{
+		{
+			name:          "digest-only ref uses canonical digest path once",
+			ref:           "registry.example/demo/app@" + uppercaseDigest,
+			wantLowerHits: 1,
+		},
+		{
+			name:          "tag-at-digest keeps tag listed ref",
+			ref:           "registry.example/demo/app:v1.0.0@" + uppercaseDigest,
+			wantTagHits:   1,
+			wantLowerHits: 1,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var tagHits atomic.Int64
+			var lowerDigestHits atomic.Int64
+			var upperDigestHits atomic.Int64
+
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/v2/demo/app/manifests/v1.0.0":
+					tagHits.Add(1)
+					w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+					w.Header().Set("Docker-Content-Digest", manifestDigest)
+					_, _ = fmt.Fprint(w, manifestBody)
+				case "/v2/demo/app/manifests/" + manifestDigest:
+					lowerDigestHits.Add(1)
+					w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+					w.Header().Set("Docker-Content-Digest", manifestDigest)
+					_, _ = fmt.Fprint(w, manifestBody)
+				case "/v2/demo/app/manifests/" + uppercaseDigest:
+					upperDigestHits.Add(1)
+					w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+					w.Header().Set("Docker-Content-Digest", manifestDigest)
+					_, _ = fmt.Fprint(w, manifestBody)
+				case "/v2/demo/app/blobs/" + configDigest:
+					_, _ = io.WriteString(w, "config")
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer upstream.Close()
+
+			manager := newManagerWithPorts(t.TempDir(), nil, freePort(t))
+			manager.baseOverride = aliasedURL(t, upstream.URL, "registry.example")
+			egress := egressForRoutes(aliasRoute(t, upstream.URL, "registry.example", "203.0.113.10"))
+			manager.resolveUpstreamIPs = egress.resolve
+			manager.hostOwnedIPs = egress.hostIPs
+			manager.dialContext = egress.dialContext
+			defer manager.Close()
+
+			result, err := manager.Warm(context.Background(), []string{test.ref}, imagecache.ArchitectureAMD64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Warmed != 1 || result.Failed != 0 {
+				t.Fatalf("warm result = %+v", result)
+			}
+			if got := tagHits.Load(); got != test.wantTagHits {
+				t.Fatalf("tag hits = %d, want %d", got, test.wantTagHits)
+			}
+			if got := lowerDigestHits.Load(); got != test.wantLowerHits {
+				t.Fatalf("lower digest hits = %d, want %d", got, test.wantLowerHits)
+			}
+			if got := upperDigestHits.Load(); got != test.wantUpperHits {
+				t.Fatalf("upper digest hits = %d, want %d", got, test.wantUpperHits)
+			}
+		})
+	}
+}
+
+func TestParseWarmReferenceRejectsEmptyPinnedDigestSuffixAndPreservesValidRefs(t *testing.T) {
+	validDigest := "sha256:" + strings.Repeat("ab", 32)
+
+	tests := []struct {
+		name    string
+		ref     string
+		want    warmReference
+		wantErr string
+	}{
+		{
+			name:    "digest-only empty suffix rejected",
+			ref:     "registry.example/repo@",
+			wantErr: `invalid pinned digest ""`,
+		},
+		{
+			name:    "tag plus empty suffix rejected",
+			ref:     "registry.example/repo:stable@",
+			wantErr: `invalid pinned digest ""`,
+		},
+		{
+			name: "tag unchanged",
+			ref:  "registry.example/repo:stable",
+			want: warmReference{
+				upstream:   "registry.example",
+				repository: "repo",
+				listedRef:  "stable",
+			},
+		},
+		{
+			name: "digest-only unchanged",
+			ref:  "registry.example/repo@" + validDigest,
+			want: warmReference{
+				upstream:     "registry.example",
+				repository:   "repo",
+				listedRef:    validDigest,
+				pinnedDigest: validDigest,
+			},
+		},
+		{
+			name: "tag-at-digest unchanged",
+			ref:  "registry.example/repo:stable@" + validDigest,
+			want: warmReference{
+				upstream:     "registry.example",
+				repository:   "repo",
+				listedRef:    "stable",
+				pinnedDigest: validDigest,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseWarmReference(test.ref)
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("parseWarmReference(%q) error = %v, want substring %q", test.ref, err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseWarmReference(%q) unexpected error: %v", test.ref, err)
+			}
+			if got != test.want {
+				t.Fatalf("parseWarmReference(%q) = %+v, want %+v", test.ref, got, test.want)
+			}
+		})
+	}
+}
+
 func TestWarmTagAndTagAtDigestWithoutDigestHeaderUseValidatedCanonicalDigest(t *testing.T) {
 	tagManifest := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"%s"},"layers":[]}`, "sha256:"+sha256Hex([]byte("config")))
 	tagDigest := "sha256:" + sha256Hex([]byte(tagManifest))
@@ -412,6 +567,405 @@ func TestWarmDigestAndTagAtDigestRejectBadDigestHeaders(t *testing.T) {
 			t.Fatalf("%s = %d %q", path.ref, resp.StatusCode, body)
 		}
 	}
+}
+
+func TestWarmSucceedsWhenServerFactoryWrapsMirrorServer(t *testing.T) {
+	configDigest := "sha256:" + sha256Hex([]byte("config"))
+	manifestBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%d},"layers":[]}`,
+		configDigest, len("config"))
+	manifestDigest := "sha256:" + sha256Hex([]byte(manifestBody))
+	var wrapperCalls atomic.Int64
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/demo/manifests/stable":
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", manifestDigest)
+			_, _ = fmt.Fprint(w, manifestBody)
+		case "/v2/demo/manifests/" + manifestDigest:
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", manifestDigest)
+			_, _ = fmt.Fprint(w, manifestBody)
+		case "/v2/demo/blobs/" + configDigest:
+			_, _ = io.WriteString(w, "config")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	manager := newManagerWithPorts(t.TempDir(), nil, freePort(t))
+	manager.baseOverride = aliasedURL(t, upstream.URL, "registry.example")
+	egress := egressForRoutes(aliasRoute(t, upstream.URL, "registry.example", "203.0.113.10"))
+	manager.resolveUpstreamIPs = egress.resolve
+	manager.hostOwnedIPs = egress.hostIPs
+	manager.dialContext = egress.dialContext
+	manager.serverFactory = func(_ string, base, cacheDir string) http.Handler {
+		server := newServerWithEgress(base, cacheDir, egressDependencies{
+			resolve:     manager.resolveUpstreamIPs,
+			hostIPs:     manager.hostOwnedIPs,
+			dialContext: manager.dialContext,
+			blocked:     namespaceIPBlocked,
+		})
+		server.offline = &manager.offline
+		server.validateUpstream = func(ctx context.Context) error {
+			authority, err := parseUpstreamAuthority("registry.example")
+			if err != nil {
+				return err
+			}
+			return manager.validateResolvedAuthority(ctx, authority)
+		}
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			wrapperCalls.Add(1)
+			server.ServeHTTP(w, r)
+		})
+	}
+	defer manager.Close()
+
+	summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Warmed != 1 || summary.Failed != 0 || summary.AlreadyComplete != 0 {
+		t.Fatalf("summary = %+v", summary)
+	}
+	if wrapperCalls.Load() == 0 {
+		t.Fatal("delegating wrapper was never invoked")
+	}
+}
+
+func TestWarmCachesAndServesSHA512BlobOffline(t *testing.T) {
+	configBody := []byte("sha256-config")
+	configDigest := "sha256:" + sha256Hex(configBody)
+	layerBody := []byte("sha512-layer")
+	layerDigest := "sha512:" + sha512Hex(layerBody)
+	manifestBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%d},"layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"%s","size":%d}]}`,
+		configDigest, len(configBody), layerDigest, len(layerBody))
+	manifestDigest := "sha256:" + sha256Hex([]byte(manifestBody))
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/demo/manifests/stable":
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", manifestDigest)
+			_, _ = fmt.Fprint(w, manifestBody)
+		case "/v2/demo/manifests/" + manifestDigest:
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", manifestDigest)
+			_, _ = fmt.Fprint(w, manifestBody)
+		case "/v2/demo/blobs/" + configDigest:
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = w.Write(configBody)
+		case "/v2/demo/blobs/" + layerDigest:
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = w.Write(layerBody)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	manager := newManagerWithPorts(t.TempDir(), nil, freePort(t))
+	manager.baseOverride = aliasedURL(t, upstream.URL, "registry.example")
+	egress := egressForRoutes(aliasRoute(t, upstream.URL, "registry.example", "203.0.113.10"))
+	manager.resolveUpstreamIPs = egress.resolve
+	manager.hostOwnedIPs = egress.hostIPs
+	manager.dialContext = egress.dialContext
+	defer manager.Close()
+
+	summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Warmed != 1 || summary.Failed != 0 {
+		t.Fatalf("summary = %+v", summary)
+	}
+
+	manager.offline.Store(true)
+	upstream.Close()
+	mirror := httptest.NewServer(http.HandlerFunc(manager.serveCatchAll))
+	defer mirror.Close()
+
+	resp, body := get(t, mirror.URL+"/v2/demo/blobs/"+configDigest+"?ns=registry.example")
+	if resp.StatusCode != http.StatusOK || body != string(configBody) {
+		t.Fatalf("offline config blob = %d %q", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("Docker-Content-Digest"); got != configDigest {
+		t.Fatalf("config digest header = %q, want %q", got, configDigest)
+	}
+
+	resp, body = get(t, mirror.URL+"/v2/demo/blobs/"+layerDigest+"?ns=registry.example")
+	if resp.StatusCode != http.StatusOK || body != string(layerBody) {
+		t.Fatalf("offline sha512 layer = %d %q", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("Docker-Content-Digest"); got != layerDigest {
+		t.Fatalf("layer digest header = %q, want %q", got, layerDigest)
+	}
+}
+
+func TestWarmRejectsSHA512BlobDigestMismatch(t *testing.T) {
+	configBody := []byte("sha256-config")
+	configDigest := "sha256:" + sha256Hex(configBody)
+	layerDigest := "sha512:" + sha512Hex([]byte("sha512-layer"))
+	manifestBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%d},"layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"%s","size":%d}]}`,
+		configDigest, len(configBody), layerDigest, len("sha512-layer"))
+	manifestDigest := "sha256:" + sha256Hex([]byte(manifestBody))
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/demo/manifests/stable":
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", manifestDigest)
+			_, _ = fmt.Fprint(w, manifestBody)
+		case "/v2/demo/manifests/" + manifestDigest:
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", manifestDigest)
+			_, _ = fmt.Fprint(w, manifestBody)
+		case "/v2/demo/blobs/" + configDigest:
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = w.Write(configBody)
+		case "/v2/demo/blobs/" + layerDigest:
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = io.WriteString(w, "corrupt")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	cacheRoot := t.TempDir()
+	manager := newManagerWithPorts(cacheRoot, nil, freePort(t))
+	manager.baseOverride = aliasedURL(t, upstream.URL, "registry.example")
+	egress := egressForRoutes(aliasRoute(t, upstream.URL, "registry.example", "203.0.113.10"))
+	manager.resolveUpstreamIPs = egress.resolve
+	manager.hostOwnedIPs = egress.hostIPs
+	manager.dialContext = egress.dialContext
+	defer manager.Close()
+
+	summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Warmed != 0 || summary.Failed != 1 {
+		t.Fatalf("summary = %+v", summary)
+	}
+	if len(summary.Results) != 1 || !strings.Contains(summary.Results[0].Error, "sha512") {
+		t.Fatalf("results = %+v, want sha512 mismatch failure", summary.Results)
+	}
+
+	server := NewServer("https://registry.example", filepath.Join(cacheRoot, "registry.example"))
+	if _, err := os.Stat(server.blobPath(layerDigest)); !os.IsNotExist(err) {
+		t.Fatalf("sha512 layer unexpectedly cached after mismatch: %v", err)
+	}
+	if _, err := os.Stat(server.blobPath(configDigest)); err != nil {
+		t.Fatalf("sha256 config should still be cached before sha512 mismatch aborts: %v", err)
+	}
+}
+
+func TestBlobPathCanonicalizesSupportedDigestCase(t *testing.T) {
+	server := NewServer("https://registry.example", t.TempDir())
+
+	for _, test := range []struct {
+		name  string
+		upper string
+		lower string
+	}{
+		{
+			name:  "sha256",
+			upper: "sha256:" + strings.ToUpper(strings.Repeat("ab", 32)),
+			lower: "sha256:" + strings.Repeat("ab", 32),
+		},
+		{
+			name:  "sha512",
+			upper: "sha512:" + strings.ToUpper(strings.Repeat("ab", 64)),
+			lower: "sha512:" + strings.Repeat("ab", 64),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got, want := server.blobPath(test.upper), server.blobPath(test.lower); got != want {
+				t.Fatalf("blobPath(%q) = %q, want same as %q", test.upper, got, want)
+			}
+		})
+	}
+}
+
+func TestWarmCachesAndServesUppercaseManifestDigestsOffline(t *testing.T) {
+	tests := []struct {
+		name string
+		sum  func([]byte) string
+	}{
+		{
+			name: "sha256",
+			sum: func(data []byte) string {
+				return "sha256:" + sha256Hex(data)
+			},
+		},
+		{
+			name: "sha512",
+			sum: func(data []byte) string {
+				return "sha512:" + sha512Hex(data)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			configBody := []byte("manifest-config")
+			configDigest := "sha256:" + sha256Hex(configBody)
+			manifestBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%d},"layers":[]}`,
+				configDigest, len(configBody))
+			manifestDigest := test.sum([]byte(manifestBody))
+			offlineRequest := manifestDigest[:len(test.name)+1] + strings.ToUpper(manifestDigest[len(test.name)+1:])
+
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/v2/demo/manifests/stable":
+					w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+					w.Header().Set("Docker-Content-Digest", manifestDigest)
+					_, _ = fmt.Fprint(w, manifestBody)
+				case "/v2/demo/manifests/" + manifestDigest:
+					w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+					w.Header().Set("Docker-Content-Digest", manifestDigest)
+					_, _ = fmt.Fprint(w, manifestBody)
+				case "/v2/demo/blobs/" + configDigest:
+					w.Header().Set("Content-Type", "application/octet-stream")
+					_, _ = w.Write(configBody)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer upstream.Close()
+
+			manager := newManagerWithPorts(t.TempDir(), nil, freePort(t))
+			manager.baseOverride = aliasedURL(t, upstream.URL, "registry.example")
+			egress := egressForRoutes(aliasRoute(t, upstream.URL, "registry.example", "203.0.113.10"))
+			manager.resolveUpstreamIPs = egress.resolve
+			manager.hostOwnedIPs = egress.hostIPs
+			manager.dialContext = egress.dialContext
+			defer manager.Close()
+
+			summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if summary.Warmed != 1 || summary.Failed != 0 {
+				t.Fatalf("summary = %+v", summary)
+			}
+
+			manager.offline.Store(true)
+			upstream.Close()
+			mirror := httptest.NewServer(http.HandlerFunc(manager.serveCatchAll))
+			defer mirror.Close()
+
+			resp, body := get(t, mirror.URL+"/v2/demo/manifests/"+offlineRequest+"?ns=registry.example")
+			if resp.StatusCode != http.StatusOK || body != manifestBody {
+				t.Fatalf("offline uppercase manifest = %d %q", resp.StatusCode, body)
+			}
+			if got := resp.Header.Get("Docker-Content-Digest"); got != manifestDigest {
+				t.Fatalf("digest header = %q, want %q", got, manifestDigest)
+			}
+		})
+	}
+}
+
+func TestWarmCachesAndServesUppercaseBlobDigestsOffline(t *testing.T) {
+	tests := []struct {
+		name           string
+		configBody     []byte
+		configDigest   string
+		layerBody      []byte
+		layerDigest    string
+		offlineRequest string
+		offlineDigest  string
+		offlineBody    string
+	}{
+		{
+			name:           "uppercase sha256 config digest",
+			configBody:     []byte("sha256-config"),
+			configDigest:   "sha256:" + strings.ToUpper(sha256Hex([]byte("sha256-config"))),
+			layerBody:      nil,
+			layerDigest:    "",
+			offlineRequest: "sha256:" + strings.ToUpper(sha256Hex([]byte("sha256-config"))),
+			offlineDigest:  "sha256:" + sha256Hex([]byte("sha256-config")),
+			offlineBody:    "sha256-config",
+		},
+		{
+			name:           "uppercase sha512 layer digest",
+			configBody:     []byte("sha256-config"),
+			configDigest:   "sha256:" + sha256Hex([]byte("sha256-config")),
+			layerBody:      []byte("sha512-layer"),
+			layerDigest:    "sha512:" + strings.ToUpper(sha512Hex([]byte("sha512-layer"))),
+			offlineRequest: "sha512:" + strings.ToUpper(sha512Hex([]byte("sha512-layer"))),
+			offlineDigest:  "sha512:" + sha512Hex([]byte("sha512-layer")),
+			offlineBody:    "sha512-layer",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manifestBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%d},"layers":%s}`,
+				test.configDigest, len(test.configBody), uppercaseLayerListJSON(test.layerDigest, len(test.layerBody)))
+			manifestDigest := "sha256:" + sha256Hex([]byte(manifestBody))
+
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/v2/demo/manifests/stable":
+					w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+					w.Header().Set("Docker-Content-Digest", manifestDigest)
+					_, _ = fmt.Fprint(w, manifestBody)
+				case "/v2/demo/manifests/" + manifestDigest:
+					w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+					w.Header().Set("Docker-Content-Digest", manifestDigest)
+					_, _ = fmt.Fprint(w, manifestBody)
+				case "/v2/demo/blobs/" + test.configDigest:
+					w.Header().Set("Content-Type", "application/octet-stream")
+					_, _ = w.Write(test.configBody)
+				case "/v2/demo/blobs/" + test.layerDigest:
+					w.Header().Set("Content-Type", "application/octet-stream")
+					_, _ = w.Write(test.layerBody)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer upstream.Close()
+
+			manager := newManagerWithPorts(t.TempDir(), nil, freePort(t))
+			manager.baseOverride = aliasedURL(t, upstream.URL, "registry.example")
+			egress := egressForRoutes(aliasRoute(t, upstream.URL, "registry.example", "203.0.113.10"))
+			manager.resolveUpstreamIPs = egress.resolve
+			manager.hostOwnedIPs = egress.hostIPs
+			manager.dialContext = egress.dialContext
+			defer manager.Close()
+
+			summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if summary.Warmed != 1 || summary.Failed != 0 {
+				t.Fatalf("summary = %+v", summary)
+			}
+
+			manager.offline.Store(true)
+			upstream.Close()
+			mirror := httptest.NewServer(http.HandlerFunc(manager.serveCatchAll))
+			defer mirror.Close()
+
+			resp, body := get(t, mirror.URL+"/v2/demo/blobs/"+test.offlineRequest+"?ns=registry.example")
+			if resp.StatusCode != http.StatusOK || body != test.offlineBody {
+				t.Fatalf("offline uppercase blob = %d %q", resp.StatusCode, body)
+			}
+			if got := resp.Header.Get("Docker-Content-Digest"); got != test.offlineDigest {
+				t.Fatalf("digest header = %q, want %q", got, test.offlineDigest)
+			}
+		})
+	}
+}
+
+func uppercaseLayerListJSON(digest string, size int) string {
+	if digest == "" {
+		return "[]"
+	}
+	return fmt.Sprintf(`[{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"%s","size":%d}]`, digest, size)
 }
 
 func TestWarmBlobRequestDiscardsResponseBody(t *testing.T) {

@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -740,6 +741,51 @@ func TestManifestServedWhenCacheWriteFails(t *testing.T) {
 	resp, body := get(t, ts.URL+"/v2/app/manifests/latest")
 	if resp.StatusCode != http.StatusOK || body != manifestBody {
 		t.Fatalf("manifest with failing cache = %d %q, want 200 with manifest", resp.StatusCode, body)
+	}
+}
+
+func TestManifestPathCanonicalizesSupportedDigestCase(t *testing.T) {
+	server := NewServer("https://registry.example", t.TempDir())
+
+	for _, test := range []struct {
+		name  string
+		upper string
+		lower string
+	}{
+		{
+			name:  "sha256",
+			upper: "sha256:" + strings.ToUpper(strings.Repeat("ab", 32)),
+			lower: "sha256:" + strings.Repeat("ab", 32),
+		},
+		{
+			name:  "sha512",
+			upper: "sha512:" + strings.ToUpper(strings.Repeat("ab", 64)),
+			lower: "sha512:" + strings.Repeat("ab", 64),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			upperPath := "/v2/app/manifests/" + test.upper
+			lowerPath := "/v2/app/manifests/" + test.lower
+			if got, want := server.manifestPath(upperPath), server.manifestPath(lowerPath); got != want {
+				t.Fatalf("manifestPath(%q) = %q, want same as %q", upperPath, got, lowerPath)
+			}
+		})
+	}
+}
+
+func TestManifestPathLeavesTagAndUnsupportedDigestLikeRefsUnchanged(t *testing.T) {
+	cacheDir := t.TempDir()
+	server := NewServer("https://registry.example", cacheDir)
+
+	for _, path := range []string{
+		"/v2/app/manifests/latest",
+		"/v2/app/manifests/md5:" + strings.ToUpper(strings.Repeat("ab", 16)),
+		"/v2/app/manifests/sha256:ABCD",
+	} {
+		want := filepath.Join(cacheDir, "manifests", strings.ReplaceAll(strings.TrimPrefix(path, "/v2/"), "/", "_"))
+		if got := server.manifestPath(path); got != want {
+			t.Fatalf("manifestPath(%q) = %q, want %q", path, got, want)
+		}
 	}
 }
 
