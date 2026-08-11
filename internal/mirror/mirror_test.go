@@ -3,7 +3,9 @@ package mirror
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -28,6 +30,7 @@ type fakeRegistry struct {
 	token    *httptest.Server
 
 	requireToken bool
+	manifestHits atomic.Int64
 	blobHits     atomic.Int64
 	tokenHits    atomic.Int64
 }
@@ -64,6 +67,7 @@ func newFakeRegistry(t *testing.T, requireToken bool) *fakeRegistry {
 		case r.URL.Path == "/v2/":
 			w.WriteHeader(http.StatusOK)
 		case r.URL.Path == "/v2/app/manifests/latest":
+			f.manifestHits.Add(1)
 			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
 			w.Header().Set("Docker-Content-Digest", "sha256:"+sha256Hex([]byte(manifestBody)))
 			_, _ = fmt.Fprint(w, manifestBody)
@@ -760,6 +764,547 @@ func TestManifestOfflineFallback(t *testing.T) {
 	}
 }
 
+func TestCachedDigestManifestServesWithoutUpstreamByDefault(t *testing.T) {
+	validDigest := "sha256:" + sha256Hex([]byte(manifestBody))
+	var upstreamHits atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		w.Header().Set("Docker-Content-Digest", validDigest)
+		_, _ = fmt.Fprint(w, manifestBody)
+	}))
+	defer upstream.Close()
+
+	server := newLoopbackMirrorServer(t, upstream.URL, t.TempDir())
+	mirror := httptest.NewServer(server)
+	defer mirror.Close()
+	path := "/v2/app/manifests/" + validDigest
+
+	resp, body := get(t, mirror.URL+path)
+	if resp.StatusCode != http.StatusOK || body != manifestBody {
+		t.Fatalf("first digest manifest = %d %q", resp.StatusCode, body)
+	}
+	hitsAfterWarm := upstreamHits.Load()
+
+	resp, body = get(t, mirror.URL+path)
+	if resp.StatusCode != http.StatusOK || body != manifestBody {
+		t.Fatalf("cached digest manifest = %d %q", resp.StatusCode, body)
+	}
+	if upstreamHits.Load() != hitsAfterWarm {
+		t.Fatalf("cached digest manifest hit upstream again: %d -> %d", hitsAfterWarm, upstreamHits.Load())
+	}
+}
+
+func TestCorruptCachedDigestManifestRefetchesOnline(t *testing.T) {
+	validDigest := "sha256:" + sha256Hex([]byte(manifestBody))
+	var upstreamHits atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		w.Header().Set("Docker-Content-Digest", validDigest)
+		_, _ = fmt.Fprint(w, manifestBody)
+	}))
+	defer upstream.Close()
+
+	server := newLoopbackMirrorServer(t, upstream.URL, t.TempDir())
+	mirror := httptest.NewServer(server)
+	defer mirror.Close()
+	path := "/v2/app/manifests/" + validDigest
+
+	resp, body := get(t, mirror.URL+path)
+	if resp.StatusCode != http.StatusOK || body != manifestBody {
+		t.Fatalf("warm digest manifest = %d %q", resp.StatusCode, body)
+	}
+	hitsAfterWarm := upstreamHits.Load()
+	if err := os.WriteFile(server.manifestPath(path), []byte("corrupt-manifest"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, body = get(t, mirror.URL+path)
+	if resp.StatusCode != http.StatusOK || body != manifestBody {
+		t.Fatalf("online replay after corruption = %d %q", resp.StatusCode, body)
+	}
+	if upstreamHits.Load() != hitsAfterWarm+1 {
+		t.Fatalf("corrupt cached digest did not refetch upstream: %d -> %d", hitsAfterWarm, upstreamHits.Load())
+	}
+}
+
+func TestOfflineCorruptCachedDigestManifestFailsFast(t *testing.T) {
+	validDigest := "sha256:" + sha256Hex([]byte(manifestBody))
+	var upstreamHits atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		w.Header().Set("Docker-Content-Digest", validDigest)
+		_, _ = fmt.Fprint(w, manifestBody)
+	}))
+	defer upstream.Close()
+
+	server := newLoopbackMirrorServer(t, upstream.URL, t.TempDir())
+	mirror := httptest.NewServer(server)
+	defer mirror.Close()
+	path := "/v2/app/manifests/" + validDigest
+
+	resp, body := get(t, mirror.URL+path)
+	if resp.StatusCode != http.StatusOK || body != manifestBody {
+		t.Fatalf("warm digest manifest = %d %q", resp.StatusCode, body)
+	}
+	if err := os.WriteFile(server.manifestPath(path), []byte("corrupt-manifest"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	server.setOfflineMode(true)
+	hitsAfterWarm := upstreamHits.Load()
+
+	resp, body = get(t, mirror.URL+path)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("offline replay after corruption = %d %q, want 503", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "cached digest corrupted") {
+		t.Fatalf("offline corruption error = %q", body)
+	}
+	if upstreamHits.Load() != hitsAfterWarm {
+		t.Fatalf("offline corrupt cached digest hit upstream: %d -> %d", hitsAfterWarm, upstreamHits.Load())
+	}
+}
+
+func TestOfflineModeServesCachedTagsAndFailsMissesWithoutUpstream(t *testing.T) {
+	var upstreamHits atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		switch r.URL.Path {
+		case "/v2/app/manifests/latest":
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", "sha256:"+sha256Hex([]byte(manifestBody)))
+			_, _ = fmt.Fprint(w, manifestBody)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	server := newLoopbackMirrorServer(t, upstream.URL, t.TempDir())
+	mirror := httptest.NewServer(server)
+	defer mirror.Close()
+
+	resp, body := get(t, mirror.URL+"/v2/app/manifests/latest")
+	if resp.StatusCode != http.StatusOK || body != manifestBody {
+		t.Fatalf("warm cached tag = %d %q", resp.StatusCode, body)
+	}
+	hitsAfterWarm := upstreamHits.Load()
+
+	server.setOfflineMode(true)
+
+	start := time.Now()
+	resp, body = get(t, mirror.URL+"/v2/app/manifests/latest")
+	if resp.StatusCode != http.StatusOK || body != manifestBody {
+		t.Fatalf("offline cached tag = %d %q", resp.StatusCode, body)
+	}
+	if upstreamHits.Load() != hitsAfterWarm {
+		t.Fatalf("offline cached tag hit upstream again: %d -> %d", hitsAfterWarm, upstreamHits.Load())
+	}
+
+	resp, body = get(t, mirror.URL+"/v2/app/manifests/missing")
+	if resp.StatusCode == http.StatusOK {
+		t.Fatalf("offline uncached tag unexpectedly succeeded: %q", body)
+	}
+	if upstreamHits.Load() != hitsAfterWarm {
+		t.Fatalf("offline uncached tag hit upstream: %d -> %d", hitsAfterWarm, upstreamHits.Load())
+	}
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+		t.Fatalf("offline cached+miss path took %s, want fast local response", elapsed)
+	}
+}
+
+func TestOfflineModePreventsAllUncachedUpstreamWork(t *testing.T) {
+	var upstreamHits atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		switch {
+		case r.URL.Path == "/v2/app/manifests/latest":
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", "sha256:"+sha256Hex([]byte(manifestBody)))
+			_, _ = fmt.Fprint(w, manifestBody)
+		case strings.HasPrefix(r.URL.Path, "/v2/app/blobs/sha256:"):
+			_, _ = fmt.Fprint(w, "blob-bytes")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	server := newLoopbackMirrorServer(t, upstream.URL, t.TempDir())
+	mirror := httptest.NewServer(server)
+	defer mirror.Close()
+
+	// Warm one cached manifest and one cached blob before going offline.
+	_, _ = get(t, mirror.URL+"/v2/app/manifests/latest")
+	cachedBlobDigest := "sha256:" + sha256Hex([]byte("blob-bytes"))
+	_, _ = get(t, mirror.URL+"/v2/app/blobs/"+cachedBlobDigest)
+	hitsAfterWarm := upstreamHits.Load()
+
+	server.setOfflineMode(true)
+
+	resp, body := get(t, mirror.URL+"/v2/app/manifests/latest")
+	if resp.StatusCode != http.StatusOK || body != manifestBody {
+		t.Fatalf("offline cached manifest = %d %q", resp.StatusCode, body)
+	}
+	resp, body = get(t, mirror.URL+"/v2/app/blobs/"+cachedBlobDigest)
+	if resp.StatusCode != http.StatusOK || body != "blob-bytes" {
+		t.Fatalf("offline cached blob = %d %q", resp.StatusCode, body)
+	}
+
+	for _, path := range []string{
+		mirror.URL + "/v2/app/manifests/missing",
+		mirror.URL + "/v2/app/blobs/sha256:" + strings.Repeat("1", 64),
+		mirror.URL + "/v2/app/other",
+	} {
+		resp, _ := get(t, path)
+		if resp.StatusCode == http.StatusOK {
+			t.Fatalf("offline miss %s unexpectedly succeeded", path)
+		}
+	}
+	if upstreamHits.Load() != hitsAfterWarm {
+		t.Fatalf("offline uncached paths hit upstream: %d -> %d", hitsAfterWarm, upstreamHits.Load())
+	}
+}
+
+func TestOfflineToggleDuringValidationPreventsUpstreamFetch(t *testing.T) {
+	var upstreamHits atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		w.Header().Set("Docker-Content-Digest", "sha256:"+sha256Hex([]byte(manifestBody)))
+		_, _ = fmt.Fprint(w, manifestBody)
+	}))
+	defer upstream.Close()
+
+	validationStarted := make(chan struct{})
+	releaseValidation := make(chan struct{})
+	server := newLoopbackMirrorServer(t, upstream.URL, t.TempDir())
+	server.validateUpstream = func(context.Context) error {
+		close(validationStarted)
+		<-releaseValidation
+		return nil
+	}
+	mirror := httptest.NewServer(server)
+	defer mirror.Close()
+
+	requestDone := make(chan struct{})
+	var responseStatus int
+	var responseBody string
+	go func() {
+		resp, body := get(t, mirror.URL+"/v2/app/manifests/latest")
+		responseStatus = resp.StatusCode
+		responseBody = body
+		close(requestDone)
+	}()
+
+	<-validationStarted
+	server.setOfflineMode(true)
+	close(releaseValidation)
+
+	select {
+	case <-requestDone:
+	case <-time.After(time.Second):
+		t.Fatal("request did not finish after validation release")
+	}
+	if responseStatus == http.StatusOK {
+		t.Fatalf("request unexpectedly succeeded while offline toggled during validation: %q", responseBody)
+	}
+	if upstreamHits.Load() != 0 {
+		t.Fatalf("offline toggle during validation still hit upstream: %d", upstreamHits.Load())
+	}
+}
+
+func TestCachedManifestResponsesIncludeProtocolHeaders(t *testing.T) {
+	validDigest := "sha256:" + sha256Hex([]byte(manifestBody))
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		w.Header().Set("Docker-Content-Digest", validDigest)
+		_, _ = fmt.Fprint(w, manifestBody)
+	}))
+	defer upstream.Close()
+
+	server := newLoopbackMirrorServer(t, upstream.URL, t.TempDir())
+	mirror := httptest.NewServer(server)
+	defer mirror.Close()
+
+	// Warm cached digest and tag entries, then force the tag path to serve from cache.
+	_, _ = get(t, mirror.URL+"/v2/app/manifests/"+validDigest)
+	_, _ = get(t, mirror.URL+"/v2/app/manifests/latest")
+	server.setOfflineMode(true)
+
+	for _, test := range []struct {
+		name       string
+		method     string
+		path       string
+		wantStatus int
+		wantBody   string
+		wantDigest string
+		wantType   string
+		wantLength string
+	}{
+		{
+			name:       "digest get",
+			method:     http.MethodGet,
+			path:       "/v2/app/manifests/" + validDigest,
+			wantStatus: http.StatusOK,
+			wantBody:   manifestBody,
+			wantDigest: validDigest,
+			wantType:   "application/vnd.oci.image.manifest.v1+json",
+			wantLength: fmt.Sprintf("%d", len(manifestBody)),
+		},
+		{
+			name:       "digest head",
+			method:     http.MethodHead,
+			path:       "/v2/app/manifests/" + validDigest,
+			wantStatus: http.StatusOK,
+			wantDigest: validDigest,
+			wantType:   "application/vnd.oci.image.manifest.v1+json",
+			wantLength: fmt.Sprintf("%d", len(manifestBody)),
+		},
+		{
+			name:       "tag get",
+			method:     http.MethodGet,
+			path:       "/v2/app/manifests/latest",
+			wantStatus: http.StatusOK,
+			wantBody:   manifestBody,
+			wantDigest: validDigest,
+			wantType:   "application/vnd.oci.image.manifest.v1+json",
+			wantLength: fmt.Sprintf("%d", len(manifestBody)),
+		},
+		{
+			name:       "tag head",
+			method:     http.MethodHead,
+			path:       "/v2/app/manifests/latest",
+			wantStatus: http.StatusOK,
+			wantDigest: validDigest,
+			wantType:   "application/vnd.oci.image.manifest.v1+json",
+			wantLength: fmt.Sprintf("%d", len(manifestBody)),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request, err := http.NewRequest(test.method, mirror.URL+test.path, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := http.DefaultClient.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bodyBytes, err := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.StatusCode != test.wantStatus {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, test.wantStatus)
+			}
+			if got := resp.Header.Get("Content-Type"); got != test.wantType {
+				t.Fatalf("Content-Type = %q, want %q", got, test.wantType)
+			}
+			if got := resp.Header.Get("Content-Length"); got != test.wantLength {
+				t.Fatalf("Content-Length = %q, want %q", got, test.wantLength)
+			}
+			if got := resp.Header.Get("Docker-Content-Digest"); got != test.wantDigest {
+				t.Fatalf("Docker-Content-Digest = %q, want %q", got, test.wantDigest)
+			}
+			if string(bodyBytes) != test.wantBody {
+				t.Fatalf("body = %q, want %q", string(bodyBytes), test.wantBody)
+			}
+		})
+	}
+}
+
+func TestCachedManifestMetadataFallbackRevalidatesCurrentBytes(t *testing.T) {
+	sha512Digest := "sha512:" + sha512Hex([]byte(manifestBody))
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/app/manifests/latest":
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", "sha256:"+sha256Hex([]byte(manifestBody)))
+			_, _ = fmt.Fprint(w, manifestBody)
+		case "/v2/app/manifests/" + sha512Digest:
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", sha512Digest)
+			_, _ = fmt.Fprint(w, manifestBody)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	server := newLoopbackMirrorServer(t, upstream.URL, t.TempDir())
+	mirror := httptest.NewServer(server)
+	defer mirror.Close()
+
+	// Warm sha512 digest and tag entries.
+	_, _ = get(t, mirror.URL+"/v2/app/manifests/"+sha512Digest)
+	_, _ = get(t, mirror.URL+"/v2/app/manifests/latest")
+	server.setOfflineMode(true)
+
+	sha512Path := "/v2/app/manifests/" + sha512Digest
+	legacyTagPath := "/v2/app/manifests/latest"
+
+	tests := []struct {
+		name              string
+		path              string
+		breakMeta         func(t *testing.T)
+		wantDigest        string
+		wantContentType   string
+		wantContentLength string
+	}{
+		{
+			name: "missing meta sha512 replays requested digest",
+			path: sha512Path,
+			breakMeta: func(t *testing.T) {
+				t.Helper()
+				if err := os.Remove(server.manifestMetadataPath(sha512Path)); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantDigest:        sha512Digest,
+			wantContentType:   "application/vnd.oci.image.manifest.v1+json",
+			wantContentLength: fmt.Sprintf("%d", len(manifestBody)),
+		},
+		{
+			name: "corrupt meta falls back to ct sidecar for tag",
+			path: legacyTagPath,
+			breakMeta: func(t *testing.T) {
+				t.Helper()
+				if err := os.WriteFile(server.manifestMetadataPath(legacyTagPath), []byte("{not-json"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(server.manifestPath(legacyTagPath)+".ct", []byte("application/vnd.oci.image.manifest.v1+json"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantDigest:        "sha256:" + sha256Hex([]byte(manifestBody)),
+			wantContentType:   "application/vnd.oci.image.manifest.v1+json",
+			wantContentLength: fmt.Sprintf("%d", len(manifestBody)),
+		},
+		{
+			name: "stale meta length and digest are recomputed",
+			path: legacyTagPath,
+			breakMeta: func(t *testing.T) {
+				t.Helper()
+				stale := manifestMetadata{
+					ContentType:         "application/vnd.oci.image.manifest.v1+json",
+					ContentLength:       1,
+					DockerContentDigest: "sha256:" + strings.Repeat("1", 64),
+				}
+				raw, err := json.Marshal(stale)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(server.manifestMetadataPath(legacyTagPath), raw, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantDigest:        "sha256:" + sha256Hex([]byte(manifestBody)),
+			wantContentType:   "application/vnd.oci.image.manifest.v1+json",
+			wantContentLength: fmt.Sprintf("%d", len(manifestBody)),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			test.breakMeta(t)
+			request, err := http.NewRequest(http.MethodHead, mirror.URL+test.path, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := http.DefaultClient.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bodyBytes, err := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(bodyBytes) != 0 {
+				t.Fatalf("HEAD body = %q, want empty", string(bodyBytes))
+			}
+			if got := resp.Header.Get("Docker-Content-Digest"); got != test.wantDigest {
+				t.Fatalf("Docker-Content-Digest = %q, want %q", got, test.wantDigest)
+			}
+			if got := resp.Header.Get("Content-Type"); got != test.wantContentType {
+				t.Fatalf("Content-Type = %q, want %q", got, test.wantContentType)
+			}
+			if got := resp.Header.Get("Content-Length"); got != test.wantContentLength {
+				t.Fatalf("Content-Length = %q, want %q", got, test.wantContentLength)
+			}
+		})
+	}
+}
+
+func TestManifestDigestSupportIncludesSha512AndRejectsUnsupportedAlgorithms(t *testing.T) {
+	sha512Digest := "sha512:" + sha512Hex([]byte(manifestBody))
+	tests := []struct {
+		name       string
+		requestRef string
+		header     string
+		wantStatus int
+		wantCached bool
+		wantError  string
+	}{
+		{
+			name:       "sha512 digest fetches and caches",
+			requestRef: sha512Digest,
+			header:     sha512Digest,
+			wantStatus: http.StatusOK,
+			wantCached: true,
+		},
+		{
+			name:       "unsupported digest algorithm is rejected",
+			requestRef: "md5:" + strings.Repeat("a", 32),
+			header:     "md5:" + strings.Repeat("a", 32),
+			wantStatus: http.StatusBadGateway,
+			wantError:  "unsupported digest algorithm",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var upstreamHits atomic.Int64
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				upstreamHits.Add(1)
+				w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+				w.Header().Set("Docker-Content-Digest", test.header)
+				_, _ = fmt.Fprint(w, manifestBody)
+			}))
+
+			dir := t.TempDir()
+			server := newLoopbackMirrorServer(t, upstream.URL, dir)
+			mirror := httptest.NewServer(server)
+			defer mirror.Close()
+			path := "/v2/app/manifests/" + test.requestRef
+
+			resp, body := get(t, mirror.URL+path)
+			if resp.StatusCode != test.wantStatus {
+				t.Fatalf("status = %d, want %d; body = %q", resp.StatusCode, test.wantStatus, body)
+			}
+			if test.wantError != "" && !strings.Contains(body, test.wantError) {
+				t.Fatalf("error body %q does not contain %q", body, test.wantError)
+			}
+
+			upstream.Close()
+			resp, cachedBody := get(t, mirror.URL+path)
+			if test.wantCached {
+				if resp.StatusCode != http.StatusOK || cachedBody != manifestBody {
+					t.Fatalf("cached sha512 response = %d %q", resp.StatusCode, cachedBody)
+				}
+				if upstreamHits.Load() != 1 {
+					t.Fatalf("sha512 cache-first follow-up hit upstream again: %d", upstreamHits.Load())
+				}
+			} else if resp.StatusCode == http.StatusOK {
+				t.Fatalf("unsupported digest was cached unexpectedly: %q", cachedBody)
+			}
+		})
+	}
+}
+
 func TestNonGetRejected(t *testing.T) {
 	f := newFakeRegistry(t, false)
 	mirror := startMirror(t, f)
@@ -775,6 +1320,11 @@ func TestNonGetRejected(t *testing.T) {
 
 func sha256Hex(data []byte) string {
 	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func sha512Hex(data []byte) string {
+	sum := sha512.Sum512(data)
 	return hex.EncodeToString(sum[:])
 }
 

@@ -48,6 +48,8 @@ func (c cli) run(args []string) error {
 		return c.runManifests(args[1:])
 	case "bgp":
 		return c.runBGP(args[1:])
+	case "mirror":
+		return c.runMirror(args[1:])
 	case "snapshot":
 		return c.runSnapshot(args[1:])
 	case "console":
@@ -366,6 +368,7 @@ Commands:
   manifests <cluster> [section]
   console <cluster> <node>
   bgp enable|disable <cluster>
+  mirror offline [on|off]
   cache pull|prune
   system install|uninstall
   doctor

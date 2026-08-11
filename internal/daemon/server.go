@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -30,6 +31,7 @@ type Server struct {
 	opMu             sync.Mutex
 	vms              map[string]map[string]hypervisor.Machine
 	mirrors          *mirror.Manager
+	mirrorOffline    atomic.Bool
 	defaultSchematic string
 	subnetSources    cluster.SubnetSources
 	hostPressure     func(string) (hostpressure.Snapshot, error)
@@ -280,6 +282,10 @@ func (s *Server) handle(request Request) (any, error) {
 		return s.pullCache(request.Args)
 	case "cache.prune":
 		return s.pruneCache()
+	case "mirror.offline.get":
+		return s.getMirrorOffline()
+	case "mirror.offline.set":
+		return s.setMirrorOffline(request.Args)
 	default:
 		return nil, fmt.Errorf("unknown operation %q", request.Op)
 	}
