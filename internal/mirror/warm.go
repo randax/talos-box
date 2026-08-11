@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -230,6 +229,7 @@ func warmManifestRequest(ctx context.Context, handler http.Handler, server *Serv
 	if staged != nil {
 		requestContext = withStagedManifest(requestContext, staged)
 	}
+	requestContext = withManifestValidationReference(requestContext, validateReference)
 	request := httptest.NewRequest(http.MethodGet, path, nil).WithContext(requestContext)
 	request.Header.Set("Accept", strings.Join([]string{
 		"application/vnd.oci.image.index.v1+json",
@@ -242,18 +242,7 @@ func warmManifestRequest(ctx context.Context, handler http.Handler, server *Serv
 	if recorder.Code != http.StatusOK {
 		return nil, "", cachedBefore, fmt.Errorf("%s returned %d: %s", path, recorder.Code, strings.TrimSpace(recorder.Body.String()))
 	}
-	response := &http.Response{
-		Header: recorder.Result().Header.Clone(),
-		Body:   io.NopCloser(strings.NewReader(recorder.Body.String())),
-	}
-	if isDigestReference(validateReference) {
-		response.Header.Del("Docker-Content-Digest")
-	}
-	_, metadata, err := validateManifest(response, validateReference)
-	if err != nil {
-		return nil, "", cachedBefore, err
-	}
-	return recorder.Body.Bytes(), metadata.DockerContentDigest, cachedBefore, nil
+	return recorder.Body.Bytes(), recorder.Header().Get("Docker-Content-Digest"), cachedBefore, nil
 }
 
 func warmBlobRequest(ctx context.Context, handler http.Handler, repository, digest string) error {
