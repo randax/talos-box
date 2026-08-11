@@ -456,6 +456,35 @@ func TestCheckUsesNoNetworkWhenCacheIsComplete(t *testing.T) {
 	}
 }
 
+func TestCheckRejectsOversizedCachedManifest(t *testing.T) {
+	cacheRoot := t.TempDir()
+	mirrorRoot := filepath.Join(cacheRoot, "mirror")
+	manager := newManagerWithPorts(mirrorRoot, nil, freePort(t))
+	defer manager.Close()
+
+	server := NewServer("https://registry.example", filepath.Join(mirrorRoot, "registry.example"))
+	oversizedBody := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","padding":"` + strings.Repeat("a", maxManifestBytes) + `"}`)
+	manifestDigest := "sha256:" + sha256Hex(oversizedBody)
+	requestPath := "/v2/demo/manifests/" + manifestDigest
+	if err := os.MkdirAll(filepath.Dir(server.manifestPath(requestPath)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(server.manifestPath(requestPath), oversizedBody, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := manager.Check(context.Background(), []string{"registry.example/demo@" + manifestDigest}, imagecache.ArchitectureAMD64, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Complete != 0 || summary.Failed != 1 {
+		t.Fatalf("check summary = %+v", summary)
+	}
+	if len(summary.Results) != 1 || !strings.Contains(summary.Results[0].Error, "exceeds") {
+		t.Fatalf("check result = %+v, want oversized manifest failure", summary.Results)
+	}
+}
+
 func TestCheckRejectsSymlinkedManifestInPlainMode(t *testing.T) {
 	fixture := newCheckManifestFixture(t)
 	defer fixture.manager.Close()

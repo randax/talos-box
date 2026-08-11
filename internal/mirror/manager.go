@@ -167,6 +167,13 @@ func (m *Manager) Close() {
 	}
 }
 
+// BoundGatewayCount reports how many gateway IPs currently have mirror listeners bound.
+func (m *Manager) BoundGatewayCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.bound)
+}
+
 // DefaultDir is the mirror cache root under the talosbox cache.
 func DefaultDir(cacheRoot string) string {
 	return filepath.Join(cacheRoot, "mirror")
