@@ -24,16 +24,21 @@ import (
 type clusterDomainSource struct {
 	list func() ([]cluster.Cluster, error)
 
-	mu       sync.Mutex
-	last     []string
-	everRead bool
+	// refreshMu serializes refreshes so overlapping reads cannot publish
+	// out of order; mu guards only the published snapshot, so snapshot()
+	// never waits on state-directory IO.
+	refreshMu sync.Mutex
+	mu        sync.Mutex
+	last      []string
+	everRead  bool
 }
 
 func newClusterDomainSource(list func() ([]cluster.Cluster, error)) *clusterDomainSource {
 	return &clusterDomainSource{list: list}
 }
 
-// snapshot returns the current domain set without any IO.
+// snapshot returns the current domain set without any IO or contention with
+// in-flight refreshes.
 func (s *clusterDomainSource) snapshot() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -43,13 +48,14 @@ func (s *clusterDomainSource) snapshot() []string {
 	return s.last
 }
 
-// refresh re-reads cluster state into the snapshot. The read happens under
-// the lock so two overlapping refreshes cannot store out of order and
-// regress the set to an older read.
+// refresh re-reads cluster state and publishes it to the snapshot.
 func (s *clusterDomainSource) refresh() {
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+	clusters, err := s.list()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	clusters, err := s.list()
 	if err != nil {
 		if !s.everRead {
 			log.Printf("DNS state has never been readable; answering all queries locally: %v", err)

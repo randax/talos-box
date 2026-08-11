@@ -6,6 +6,7 @@ import (
 	"net"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/helper"
@@ -38,6 +39,38 @@ func TestDomainSourceSnapshotDoesNoIO(t *testing.T) {
 	if listCalls != 1 {
 		t.Fatalf("list calls = %d after repeated snapshots, want 1", listCalls)
 	}
+}
+
+func TestDomainSourceSnapshotDoesNotBlockOnSlowRefresh(t *testing.T) {
+	t.Parallel()
+
+	release := make(chan struct{})
+	listing := make(chan struct{})
+	source := newClusterDomainSource(func() ([]cluster.Cluster, error) {
+		close(listing)
+		<-release // simulate a stalled state-directory read
+		return nil, nil
+	})
+
+	refreshDone := make(chan struct{})
+	go func() {
+		defer close(refreshDone)
+		source.refresh()
+	}()
+	<-listing // refresh is now inside the (blocked) state read
+
+	snapshotDone := make(chan []string, 1)
+	go func() { snapshotDone <- source.snapshot() }()
+	select {
+	case got := <-snapshotDone:
+		if !reflect.DeepEqual(got, []string{"*"}) {
+			t.Errorf("snapshot during refresh = %v, want [*]", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("snapshot blocked behind an in-flight refresh's state IO")
+	}
+	close(release)
+	<-refreshDone
 }
 
 func TestDomainSourceRetainsLastKnownOnRefreshError(t *testing.T) {
