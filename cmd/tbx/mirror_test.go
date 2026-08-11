@@ -3,12 +3,10 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/randax/talos-box/internal/daemon"
 )
@@ -130,8 +128,12 @@ func mustJSON(t *testing.T, value any) json.RawMessage {
 
 func shortTestHome(t *testing.T) string {
 	t.Helper()
-	path := filepath.Join("/private/tmp", fmt.Sprintf("tbx132-%d", time.Now().UnixNano()))
-	if err := os.MkdirAll(path, 0o700); err != nil {
+	parent := os.TempDir()
+	if info, err := os.Stat("/tmp"); err == nil && info.IsDir() {
+		parent = "/tmp"
+	}
+	path, err := os.MkdirTemp(parent, "tbx132-")
+	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(path) })
