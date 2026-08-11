@@ -169,7 +169,7 @@ func (m *Manager) serveCatchAll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := m.validateResolvedAuthority(authority); err != nil {
+	if err := m.validateResolvedAuthority(r.Context(), authority); err != nil {
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
@@ -221,8 +221,8 @@ func parseUpstreamAuthority(raw string) (upstreamAuthority, error) {
 	}, nil
 }
 
-func (m *Manager) validateResolvedAuthority(authority upstreamAuthority) error {
-	ips, err := m.resolveUpstreamIPs(context.Background(), authority.canonicalHost)
+func (m *Manager) validateResolvedAuthority(ctx context.Context, authority upstreamAuthority) error {
+	ips, err := m.resolveUpstreamIPs(ctx, authority.canonicalHost)
 	if err != nil {
 		return fmt.Errorf("resolve ns %q: %w", authority.canonicalAuthority, err)
 	}

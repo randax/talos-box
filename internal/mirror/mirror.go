@@ -231,7 +231,7 @@ func copyResponseHeaders(w http.ResponseWriter, resp *http.Response) {
 // on a 401 challenge and following redirects (the http.Client default).
 func (s *Server) fetch(r *http.Request) (*http.Response, error) {
 	url := s.base + r.URL.RequestURI()
-	request, err := http.NewRequest(r.Method, url, nil)
+	request, err := http.NewRequestWithContext(r.Context(), r.Method, url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -252,7 +252,7 @@ func (s *Server) fetch(r *http.Request) (*http.Response, error) {
 	}
 	challenge := resp.Header.Get("WWW-Authenticate")
 	_ = resp.Body.Close()
-	bearer, err := s.negotiateToken(challenge)
+	bearer, err := s.negotiateToken(r.Context(), challenge)
 	if err != nil {
 		return nil, err
 	}
@@ -449,7 +449,7 @@ func (s *Server) blobPath(digest string) string {
 
 var challengeRe = regexp.MustCompile(`(\w+)="([^"]*)"`)
 
-func (s *Server) negotiateToken(challenge string) (string, error) {
+func (s *Server) negotiateToken(ctx context.Context, challenge string) (string, error) {
 	if !strings.HasPrefix(challenge, "Bearer ") {
 		return "", fmt.Errorf("unsupported auth challenge %q", challenge)
 	}
@@ -462,7 +462,11 @@ func (s *Server) negotiateToken(challenge string) (string, error) {
 		return "", fmt.Errorf("auth challenge without realm: %q", challenge)
 	}
 	url := fmt.Sprintf("%s?service=%s&scope=%s", realm, params["service"], params["scope"])
-	resp, err := s.client.Get(url)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := s.client.Do(request)
 	if err != nil {
 		return "", err
 	}

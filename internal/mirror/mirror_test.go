@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 const blobDigest = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
@@ -392,6 +393,123 @@ func TestSafeEgressBlocksLoopbackTokenRealms(t *testing.T) {
 	}
 	if blockedHits.Load() != 0 {
 		t.Fatalf("blocked token hits = %d, want 0", blockedHits.Load())
+	}
+}
+
+func TestGuestCancellationStopsOutboundFetchPromptly(t *testing.T) {
+	fetchStarted := make(chan struct{})
+	fetchReleased := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(fetchStarted)
+		<-r.Context().Done()
+		close(fetchReleased)
+	}))
+	defer upstream.Close()
+
+	requestContext, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	request := httptest.NewRequest(http.MethodGet, "/v2/app/manifests/latest", nil).WithContext(requestContext)
+	recorder := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		newLoopbackMirrorServer(t, upstream.URL, t.TempDir()).ServeHTTP(recorder, request)
+		close(done)
+	}()
+
+	<-fetchStarted
+	cancel()
+
+	select {
+	case <-fetchReleased:
+	case <-time.After(time.Second):
+		t.Fatal("upstream fetch did not observe guest cancellation")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("mirror request did not return promptly after fetch cancellation")
+	}
+}
+
+func TestGuestCancellationStopsRedirectFollowPromptly(t *testing.T) {
+	redirectStarted := make(chan struct{})
+	redirectReleased := make(chan struct{})
+	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(redirectStarted)
+		<-r.Context().Done()
+		close(redirectReleased)
+	}))
+	defer cdn.Close()
+
+	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, cdn.URL+"/blob", http.StatusFound)
+	}))
+	defer registry.Close()
+
+	requestContext, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	request := httptest.NewRequest(http.MethodGet, "/v2/app/blobs/sha256:"+sha256Hex([]byte("blob-bytes")), nil).WithContext(requestContext)
+	recorder := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		newLoopbackMirrorServer(t, registry.URL, t.TempDir()).ServeHTTP(recorder, request)
+		close(done)
+	}()
+
+	<-redirectStarted
+	cancel()
+
+	select {
+	case <-redirectReleased:
+	case <-time.After(time.Second):
+		t.Fatal("redirect target did not observe guest cancellation")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("mirror request did not return promptly after redirect cancellation")
+	}
+}
+
+func TestGuestCancellationStopsTokenRealmFetchPromptly(t *testing.T) {
+	tokenStarted := make(chan struct{})
+	tokenReleased := make(chan struct{})
+	token := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(tokenStarted)
+		<-r.Context().Done()
+		close(tokenReleased)
+	}))
+	defer token.Close()
+
+	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("WWW-Authenticate",
+			fmt.Sprintf(`Bearer realm=%q,service="fake-service",scope="repository:app:pull"`, token.URL))
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer registry.Close()
+
+	requestContext, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	request := httptest.NewRequest(http.MethodGet, "/v2/app/manifests/latest", nil).WithContext(requestContext)
+	recorder := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		newLoopbackMirrorServer(t, registry.URL, t.TempDir()).ServeHTTP(recorder, request)
+		close(done)
+	}()
+
+	<-tokenStarted
+	cancel()
+
+	select {
+	case <-tokenReleased:
+	case <-time.After(time.Second):
+		t.Fatal("token realm request did not observe guest cancellation")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("mirror request did not return promptly after token cancellation")
 	}
 }
 

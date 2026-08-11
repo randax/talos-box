@@ -529,6 +529,59 @@ func TestCatchAllMirrorBoundsDynamicHandlersAndClosesEvictedEntries(t *testing.T
 	}
 }
 
+func TestCatchAllMirrorCancellationStopsNamespaceValidation(t *testing.T) {
+	catchAllPort := freePort(t)
+	resolveStarted := make(chan struct{})
+	resolveReleased := make(chan struct{})
+	var handlerCalls atomic.Int64
+
+	m := newManagerWithPorts(t.TempDir(), nil, catchAllPort)
+	m.resolveUpstreamIPs = func(ctx context.Context, host string) ([]net.IP, error) {
+		if host != "docker.io" {
+			t.Fatalf("resolve host = %q, want docker.io", host)
+		}
+		close(resolveStarted)
+		<-ctx.Done()
+		close(resolveReleased)
+		return nil, ctx.Err()
+	}
+	m.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	m.serverFactory = func(string, string, string) http.Handler {
+		handlerCalls.Add(1)
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		})
+	}
+	defer m.Close()
+
+	requestContext, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	request := httptest.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/latest?ns=docker.io", catchAllPort), nil).WithContext(requestContext)
+	recorder := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		m.serveCatchAll(recorder, request)
+		close(done)
+	}()
+
+	<-resolveStarted
+	cancel()
+
+	select {
+	case <-resolveReleased:
+	case <-time.After(time.Second):
+		t.Fatal("namespace validation did not observe request cancellation")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("catch-all handler did not return promptly after cancellation")
+	}
+	if handlerCalls.Load() != 0 {
+		t.Fatalf("dynamic handler calls = %d, want 0", handlerCalls.Load())
+	}
+}
+
 type rewriteTransport struct {
 	target  *url.URL
 	wrapped http.RoundTripper
