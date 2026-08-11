@@ -168,13 +168,6 @@ func (m *Manager) Close() {
 	}
 }
 
-// BoundGatewayCount reports how many gateway IPs currently have mirror listeners bound.
-func (m *Manager) BoundGatewayCount() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return len(m.bound)
-}
-
 // BoundGatewayIPs reports the currently bound gateway IPs as a sorted copy.
 func (m *Manager) BoundGatewayIPs() []string {
 	m.mu.Lock()

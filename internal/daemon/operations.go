@@ -218,8 +218,6 @@ type CacheListResult struct {
 	Images                []CacheImageEntry  `json:"images"`
 	Mirror                []MirrorCacheEntry `json:"mirror"`
 	MirrorTotal           MirrorCacheTotals  `json:"mirrorTotal"`
-	MirrorServing         bool               `json:"mirrorServing"`
-	MirrorBoundGateways   int                `json:"mirrorBoundGateways"`
 	MirrorBoundGatewayIPs []string           `json:"mirrorBoundGatewayIps"`
 }
 
@@ -891,8 +889,6 @@ func (s *Server) listCache() (CacheListResult, error) {
 	}
 	if s.boundMirrorGateways != nil {
 		result.MirrorBoundGatewayIPs = s.boundMirrorGateways()
-		result.MirrorBoundGateways = len(result.MirrorBoundGatewayIPs)
-		result.MirrorServing = result.MirrorBoundGateways > 0
 	}
 	for _, entry := range entries {
 		result.Images = append(result.Images, CacheImageEntry{
