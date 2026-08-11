@@ -3,11 +3,13 @@ package mirror
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/randax/talos-box/internal/imagecache"
@@ -91,6 +93,42 @@ func TestCheckFailsWhenHostBlobIsMissing(t *testing.T) {
 	}
 }
 
+func TestCheckFailsWhenHostBlobIsSymlinked(t *testing.T) {
+	fixture := newCheckManifestFixture(t)
+	defer fixture.manager.Close()
+
+	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Warmed != 1 || summary.Failed != 0 {
+		t.Fatalf("warm summary = %+v", summary)
+	}
+
+	target := filepath.Join(t.TempDir(), "foreign-blob")
+	if err := os.WriteFile(target, []byte("layer"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(fixture.server.blobPath(fixture.layerDigest)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, fixture.server.blobPath(fixture.layerDigest)); err != nil {
+		t.Fatal(err)
+	}
+	fixture.upstream.Close()
+
+	checkSummary, err := fixture.manager.Check(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checkSummary.Complete != 0 || checkSummary.Failed != 1 {
+		t.Fatalf("check summary = %+v", checkSummary)
+	}
+	if len(checkSummary.Results) != 1 || !strings.Contains(checkSummary.Results[0].Error, fixture.layerDigest) {
+		t.Fatalf("check result = %+v, want symlinked blob digest", checkSummary.Results)
+	}
+}
+
 func TestCheckDeepCatchesCorruptBlobButPlainCheckDoesNot(t *testing.T) {
 	fixture := newCheckManifestFixture(t)
 	defer fixture.manager.Close()
@@ -158,6 +196,36 @@ func TestCheckRejectsMalformedBlobDigestWithoutPathEscape(t *testing.T) {
 	}
 	if len(summary.Results) != 1 || !strings.Contains(summary.Results[0].Error, "../sentinel") {
 		t.Fatalf("check result = %+v, want malformed digest failure", summary.Results)
+	}
+}
+
+func TestCheckRejectsMalformedChildManifestDigest(t *testing.T) {
+	cacheRoot := t.TempDir()
+	mirrorRoot := filepath.Join(cacheRoot, "mirror")
+	manager := newManagerWithPorts(mirrorRoot, nil, freePort(t))
+	defer manager.Close()
+
+	server := NewServer("https://registry.example", filepath.Join(mirrorRoot, "registry.example"))
+	indexBody := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"../child","size":8,"platform":{"architecture":"amd64","os":"linux"}}]}`)
+	indexDigest := "sha256:" + sha256Hex(indexBody)
+	requestPath := "/v2/demo/manifests/" + indexDigest
+	if err := server.storeManifest(requestPath, manifestMetadata{
+		ContentType:         "application/vnd.oci.image.index.v1+json",
+		ContentLength:       int64(len(indexBody)),
+		DockerContentDigest: indexDigest,
+	}, indexBody); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := manager.Check(context.Background(), []string{"registry.example/demo@" + indexDigest}, imagecache.ArchitectureAMD64, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Complete != 0 || summary.Failed != 1 {
+		t.Fatalf("check summary = %+v", summary)
+	}
+	if len(summary.Results) != 1 || !strings.Contains(summary.Results[0].Error, "../child") {
+		t.Fatalf("check result = %+v, want malformed child digest failure", summary.Results)
 	}
 }
 
@@ -256,6 +324,134 @@ func TestCheckAttemptsEveryRefAndReportsEachResult(t *testing.T) {
 	}
 }
 
+func TestCheckAllowsEmptyBlobInPlainMode(t *testing.T) {
+	cacheRoot := t.TempDir()
+	mirrorRoot := filepath.Join(cacheRoot, "mirror")
+	configBody := []byte{}
+	configDigest := "sha256:" + sha256Hex(configBody)
+	manifestBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":0},"layers":[]}`,
+		configDigest)
+	manifestDigest := "sha256:" + sha256Hex([]byte(manifestBody))
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/demo/manifests/stable", "/v2/demo/manifests/" + manifestDigest:
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", manifestDigest)
+			_, _ = fmt.Fprint(w, manifestBody)
+		case "/v2/demo/blobs/" + configDigest:
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = w.Write(configBody)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	manager := newManagerWithPorts(mirrorRoot, nil, freePort(t))
+	manager.baseOverride = aliasedURL(t, upstream.URL, "registry.example")
+	egress := egressForRoutes(aliasRoute(t, upstream.URL, "registry.example", "203.0.113.10"))
+	manager.resolveUpstreamIPs = egress.resolve
+	manager.hostOwnedIPs = egress.hostIPs
+	manager.dialContext = egress.dialContext
+	defer manager.Close()
+
+	summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Warmed != 1 || summary.Failed != 0 {
+		t.Fatalf("warm summary = %+v", summary)
+	}
+	upstream.Close()
+
+	checkSummary, err := manager.Check(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checkSummary.Complete != 1 || checkSummary.Failed != 0 {
+		t.Fatalf("check summary = %+v", checkSummary)
+	}
+}
+
+func TestCheckUsesNoNetworkWhenCacheIsComplete(t *testing.T) {
+	fixture := newCheckManifestFixture(t)
+	defer fixture.manager.Close()
+
+	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Warmed != 1 || summary.Failed != 0 {
+		t.Fatalf("warm summary = %+v", summary)
+	}
+	fixture.upstream.Close()
+
+	var resolves atomic.Int64
+	var dials atomic.Int64
+	fixture.manager.resolveUpstreamIPs = func(context.Context, string) ([]net.IP, error) {
+		resolves.Add(1)
+		return nil, fmt.Errorf("unexpected resolve")
+	}
+	fixture.manager.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	fixture.manager.dialContext = func(context.Context, string, string) (net.Conn, error) {
+		dials.Add(1)
+		return nil, fmt.Errorf("unexpected dial")
+	}
+
+	checkSummary, err := fixture.manager.Check(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checkSummary.Complete != 1 || checkSummary.Failed != 0 {
+		t.Fatalf("check summary = %+v", checkSummary)
+	}
+	if resolves.Load() != 0 || dials.Load() != 0 {
+		t.Fatalf("offline check touched network: resolves=%d dials=%d", resolves.Load(), dials.Load())
+	}
+}
+
+func TestCheckRejectsSymlinkedManifestInPlainMode(t *testing.T) {
+	fixture := newCheckManifestFixture(t)
+	defer fixture.manager.Close()
+
+	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Warmed != 1 || summary.Failed != 0 {
+		t.Fatalf("warm summary = %+v", summary)
+	}
+
+	digestPath := fixture.server.manifestPath("/v2/demo/manifests/" + fixture.manifestDigest)
+	manifestData, err := os.ReadFile(digestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "manifest.json")
+	if err := os.WriteFile(target, manifestData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(digestPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, digestPath); err != nil {
+		t.Fatal(err)
+	}
+	fixture.upstream.Close()
+
+	checkSummary, err := fixture.manager.Check(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checkSummary.Complete != 0 || checkSummary.Failed != 1 {
+		t.Fatalf("check summary = %+v", checkSummary)
+	}
+	if len(checkSummary.Results) != 1 || !strings.Contains(checkSummary.Results[0].Error, fixture.manifestDigest) {
+		t.Fatalf("check result = %+v, want symlinked manifest failure", checkSummary.Results)
+	}
+}
+
 type cacheCheckBlobFixture struct {
 	digest string
 	body   []byte
@@ -273,11 +469,12 @@ func cacheCheckManifestFixture(t *testing.T, payload string) ([]byte, string, ca
 }
 
 type checkManifestFixture struct {
-	ref         string
-	layerDigest string
-	manager     *Manager
-	server      *Server
-	upstream    *httptest.Server
+	ref            string
+	manifestDigest string
+	layerDigest    string
+	manager        *Manager
+	server         *Server
+	upstream       *httptest.Server
 }
 
 func newCheckManifestFixture(t *testing.T) checkManifestFixture {
@@ -318,11 +515,12 @@ func newCheckManifestFixture(t *testing.T) checkManifestFixture {
 	manager.dialContext = egress.dialContext
 
 	return checkManifestFixture{
-		ref:         "registry.example/demo:stable",
-		layerDigest: layerDigest,
-		manager:     manager,
-		server:      NewServer("https://registry.example", filepath.Join(mirrorRoot, "registry.example")),
-		upstream:    upstream,
+		ref:            "registry.example/demo:stable",
+		manifestDigest: manifestDigest,
+		layerDigest:    layerDigest,
+		manager:        manager,
+		server:         NewServer("https://registry.example", filepath.Join(mirrorRoot, "registry.example")),
+		upstream:       upstream,
 	}
 }
 
