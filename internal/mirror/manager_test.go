@@ -918,6 +918,311 @@ func TestCatchAllOfflineCachedTagServesAndMissesDoNotResolveOrDial(t *testing.T)
 	}
 }
 
+func TestFreshManagerCachedDigestServesWithoutResolverOrDial(t *testing.T) {
+	validDigest := "sha256:" + sha256Hex([]byte(manifestBody))
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		w.Header().Set("Docker-Content-Digest", validDigest)
+		_, _ = fmt.Fprint(w, manifestBody)
+	}))
+	defer upstream.Close()
+
+	cacheRoot := t.TempDir()
+	warm := newManagerWithPorts(cacheRoot, nil, freePort(t))
+	warm.baseOverride = upstream.URL
+	warm.resolveUpstreamIPs = func(context.Context, string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("203.0.113.10")}, nil
+	}
+	warm.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	warm.dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, hostPortOfURL(t, upstream.URL))
+	}
+	if err := warm.Bind("127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	path := fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/%s?ns=docker.io", warm.catchAllPort, url.QueryEscape(validDigest))
+	resp, body := get(t, path)
+	if resp.StatusCode != http.StatusOK || body != manifestBody {
+		t.Fatalf("warm digest = %d %q", resp.StatusCode, body)
+	}
+	warm.Close()
+
+	var resolves atomic.Int64
+	var dials atomic.Int64
+	restarted := newManagerWithPorts(cacheRoot, nil, freePort(t))
+	restarted.baseOverride = upstream.URL
+	restarted.resolveUpstreamIPs = func(context.Context, string) ([]net.IP, error) {
+		resolves.Add(1)
+		return nil, fmt.Errorf("resolver unavailable")
+	}
+	restarted.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	restarted.dialContext = func(context.Context, string, string) (net.Conn, error) {
+		dials.Add(1)
+		return nil, fmt.Errorf("unexpected dial")
+	}
+	if err := restarted.Bind("127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+
+	path = fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/%s?ns=docker.io", restarted.catchAllPort, url.QueryEscape(validDigest))
+	resp, body = get(t, path)
+	if resp.StatusCode != http.StatusOK || body != manifestBody {
+		t.Fatalf("restarted cached digest = %d %q", resp.StatusCode, body)
+	}
+	if resolves.Load() != 0 || dials.Load() != 0 {
+		t.Fatalf("cached replay touched network: resolves=%d dials=%d", resolves.Load(), dials.Load())
+	}
+	if got := len(restarted.dynamic); got != 0 {
+		t.Fatalf("dynamic handlers after cold cached digest = %d, want 0", got)
+	}
+}
+
+func TestFreshManagerOfflineCachedTagServesAndColdMissDoesNotResolveOrDial(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/app/manifests/latest":
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", "sha256:"+sha256Hex([]byte(manifestBody)))
+			_, _ = fmt.Fprint(w, manifestBody)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	cacheRoot := t.TempDir()
+	warm := newManagerWithPorts(cacheRoot, nil, freePort(t))
+	warm.baseOverride = upstream.URL
+	warm.resolveUpstreamIPs = func(context.Context, string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("203.0.113.10")}, nil
+	}
+	warm.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	warm.dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, hostPortOfURL(t, upstream.URL))
+	}
+	if err := warm.Bind("127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	resp, body := get(t, fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/latest?ns=docker.io", warm.catchAllPort))
+	if resp.StatusCode != http.StatusOK || body != manifestBody {
+		t.Fatalf("warm tag = %d %q", resp.StatusCode, body)
+	}
+	warm.Close()
+
+	var resolves atomic.Int64
+	var dials atomic.Int64
+	restarted := newManagerWithPorts(cacheRoot, nil, freePort(t))
+	restarted.baseOverride = upstream.URL
+	restarted.SetOffline(true)
+	restarted.resolveUpstreamIPs = func(context.Context, string) ([]net.IP, error) {
+		resolves.Add(1)
+		return nil, fmt.Errorf("resolver unavailable")
+	}
+	restarted.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	restarted.dialContext = func(context.Context, string, string) (net.Conn, error) {
+		dials.Add(1)
+		return nil, fmt.Errorf("unexpected dial")
+	}
+	if err := restarted.Bind("127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+
+	resp, body = get(t, fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/latest?ns=docker.io", restarted.catchAllPort))
+	if resp.StatusCode != http.StatusOK || body != manifestBody {
+		t.Fatalf("offline restarted cached tag = %d %q", resp.StatusCode, body)
+	}
+	resp, body = get(t, fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/missing?ns=docker.io", restarted.catchAllPort))
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("offline restarted miss = %d %q, want 503", resp.StatusCode, body)
+	}
+	if resolves.Load() != 0 || dials.Load() != 0 {
+		t.Fatalf("offline cold paths touched network: resolves=%d dials=%d", resolves.Load(), dials.Load())
+	}
+	if got := len(restarted.dynamic); got != 0 {
+		t.Fatalf("dynamic handlers after offline cold paths = %d, want 0", got)
+	}
+}
+
+func TestFreshManagerCacheProbeDoesNotBypassMethodGuard(t *testing.T) {
+	validDigest := "sha256:" + sha256Hex([]byte(manifestBody))
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		w.Header().Set("Docker-Content-Digest", validDigest)
+		_, _ = fmt.Fprint(w, manifestBody)
+	}))
+	defer upstream.Close()
+
+	cacheRoot := t.TempDir()
+	warm := newManagerWithPorts(cacheRoot, nil, freePort(t))
+	warm.baseOverride = upstream.URL
+	warm.resolveUpstreamIPs = func(context.Context, string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("203.0.113.10")}, nil
+	}
+	warm.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	warm.dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, hostPortOfURL(t, upstream.URL))
+	}
+	if err := warm.Bind("127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	path := fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/%s?ns=docker.io", warm.catchAllPort, url.QueryEscape(validDigest))
+	_, _ = get(t, path)
+	warm.Close()
+
+	var resolves atomic.Int64
+	restarted := newManagerWithPorts(cacheRoot, nil, freePort(t))
+	restarted.baseOverride = upstream.URL
+	restarted.resolveUpstreamIPs = func(context.Context, string) ([]net.IP, error) {
+		resolves.Add(1)
+		return nil, fmt.Errorf("resolver unavailable")
+	}
+	restarted.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	restarted.dialContext = func(context.Context, string, string) (net.Conn, error) {
+		t.Fatal("unexpected dial")
+		return nil, nil
+	}
+	if err := restarted.Bind("127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+
+	request, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/%s?ns=docker.io", restarted.catchAllPort, url.QueryEscape(validDigest)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("POST cached digest = %d, want 405", resp.StatusCode)
+	}
+	if resolves.Load() != 0 {
+		t.Fatalf("POST method guard touched resolver %d times", resolves.Load())
+	}
+}
+
+func TestFreshManagerVersionPingStillAnswersLocallyWithoutDNS(t *testing.T) {
+	var resolves atomic.Int64
+	restarted := newManagerWithPorts(t.TempDir(), nil, freePort(t))
+	restarted.SetOffline(true)
+	restarted.resolveUpstreamIPs = func(context.Context, string) ([]net.IP, error) {
+		resolves.Add(1)
+		return nil, fmt.Errorf("resolver unavailable")
+	}
+	restarted.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	restarted.dialContext = func(context.Context, string, string) (net.Conn, error) {
+		t.Fatal("unexpected dial")
+		return nil, nil
+	}
+	if err := restarted.Bind("127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+
+	resp, body := get(t, fmt.Sprintf("http://127.0.0.1:%d/v2/?ns=docker.io", restarted.catchAllPort))
+	if resp.StatusCode != http.StatusOK || body != "" {
+		t.Fatalf("version ping = %d %q, want 200 empty", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("Docker-Distribution-API-Version"); got != "registry/2.0" {
+		t.Fatalf("version ping header = %q, want registry/2.0", got)
+	}
+	if resolves.Load() != 0 {
+		t.Fatalf("version ping touched resolver %d times", resolves.Load())
+	}
+}
+
+func TestFreshManagerOfflineCorruptCachedDigestFailsWithoutNetworkAndOnlineRefetches(t *testing.T) {
+	validDigest := "sha256:" + sha256Hex([]byte(manifestBody))
+	var upstreamHits atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		w.Header().Set("Docker-Content-Digest", validDigest)
+		_, _ = fmt.Fprint(w, manifestBody)
+	}))
+	defer upstream.Close()
+
+	cacheRoot := t.TempDir()
+	warm := newManagerWithPorts(cacheRoot, nil, freePort(t))
+	warm.baseOverride = upstream.URL
+	warm.resolveUpstreamIPs = func(context.Context, string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("203.0.113.10")}, nil
+	}
+	warm.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	warm.dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, hostPortOfURL(t, upstream.URL))
+	}
+	if err := warm.Bind("127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	path := fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/%s?ns=docker.io", warm.catchAllPort, url.QueryEscape(validDigest))
+	resp, body := get(t, path)
+	if resp.StatusCode != http.StatusOK || body != manifestBody {
+		t.Fatalf("warm digest = %d %q", resp.StatusCode, body)
+	}
+	warm.Close()
+
+	corruptPath := filepath.Join(cacheRoot, "docker.io", "manifests", "app_manifests_"+validDigest)
+	if err := os.WriteFile(corruptPath, []byte("corrupt-manifest"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var resolves atomic.Int64
+	var dials atomic.Int64
+	offline := newManagerWithPorts(cacheRoot, nil, freePort(t))
+	offline.baseOverride = upstream.URL
+	offline.SetOffline(true)
+	offline.resolveUpstreamIPs = func(context.Context, string) ([]net.IP, error) {
+		resolves.Add(1)
+		return nil, fmt.Errorf("resolver unavailable")
+	}
+	offline.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	offline.dialContext = func(context.Context, string, string) (net.Conn, error) {
+		dials.Add(1)
+		return nil, fmt.Errorf("unexpected dial")
+	}
+	if err := offline.Bind("127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	resp, body = get(t, fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/%s?ns=docker.io", offline.catchAllPort, url.QueryEscape(validDigest)))
+	if resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(body, "cached digest corrupted") {
+		t.Fatalf("offline corrupt replay = %d %q", resp.StatusCode, body)
+	}
+	if resolves.Load() != 0 || dials.Load() != 0 {
+		t.Fatalf("offline corrupt replay touched network: resolves=%d dials=%d", resolves.Load(), dials.Load())
+	}
+	if got := len(offline.dynamic); got != 0 {
+		t.Fatalf("dynamic handlers after offline corrupt replay = %d, want 0", got)
+	}
+	offline.Close()
+
+	online := newManagerWithPorts(cacheRoot, nil, freePort(t))
+	online.baseOverride = upstream.URL
+	online.resolveUpstreamIPs = func(context.Context, string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("203.0.113.10")}, nil
+	}
+	online.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	online.dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, hostPortOfURL(t, upstream.URL))
+	}
+	if err := online.Bind("127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	defer online.Close()
+	hitsBefore := upstreamHits.Load()
+	resp, body = get(t, fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/%s?ns=docker.io", online.catchAllPort, url.QueryEscape(validDigest)))
+	if resp.StatusCode != http.StatusOK || body != manifestBody {
+		t.Fatalf("online refetch after corruption = %d %q", resp.StatusCode, body)
+	}
+	if upstreamHits.Load() != hitsBefore+1 {
+		t.Fatalf("online refetch did not hit upstream: %d -> %d", hitsBefore, upstreamHits.Load())
+	}
+}
+
 func TestCatchAllMirrorCancellationStopsNamespaceValidation(t *testing.T) {
 	catchAllPort := freePort(t)
 	resolveStarted := make(chan struct{})
