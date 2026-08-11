@@ -51,3 +51,23 @@ func TestMirrorOfflineDefaultsOffAndCanToggle(t *testing.T) {
 		t.Fatal("mirror offline inspection did not report enabled state")
 	}
 }
+
+func TestMirrorOfflineSetRejectsMissingNullAndUnknownPayloads(t *testing.T) {
+	t.Parallel()
+
+	service := &Server{mirrors: mirror.NewManager(t.TempDir())}
+	for _, payload := range []string{
+		`{}`,
+		`{"enabled":null}`,
+		`{"enabled":true,"extra":1}`,
+		`{"extra":1}`,
+		`true`,
+	} {
+		t.Run(payload, func(t *testing.T) {
+			_, err := service.handle(Request{Op: "mirror.offline.set", Args: json.RawMessage(payload)})
+			if err == nil {
+				t.Fatalf("mirror.offline.set accepted invalid payload %s", payload)
+			}
+		})
+	}
+}
