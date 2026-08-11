@@ -98,6 +98,9 @@ func checkManifestGraph(ctx context.Context, server *Server, repository string, 
 
 	matchedHost := false
 	for _, child := range children {
+		if _, _, err := checkedSupportedDigest(child.digest); err != nil {
+			return fmt.Errorf("child manifest %s invalid: %w", child.digest, err)
+		}
 		if child.architecture == hostArch && (child.os == "" || child.os == "linux") {
 			matchedHost = true
 		}
@@ -126,7 +129,7 @@ func checkCachedManifest(ctx context.Context, server *Server, requestPath, expec
 	if err := ctx.Err(); err != nil {
 		return nil, "", err
 	}
-	data, err := server.cachedManifestBytes(requestPath)
+	data, err := checkedCachedManifestBytes(server, requestPath)
 	if err != nil {
 		return nil, "", fmt.Errorf("%s not cached", requestPath)
 	}
@@ -154,12 +157,15 @@ func checkCachedBlob(ctx context.Context, server *Server, digest string, deep bo
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if _, _, err := checkedSupportedDigest(digest); err != nil {
+		return fmt.Errorf("blob %s invalid: %w", digest, err)
+	}
 	path := server.blobPath(digest)
-	info, err := os.Stat(path)
+	info, err := os.Lstat(path)
 	if err != nil {
 		return fmt.Errorf("blob %s not cached", digest)
 	}
-	if !info.Mode().IsRegular() || info.Size() == 0 {
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return fmt.Errorf("blob %s incomplete", digest)
 	}
 	if !deep {
@@ -172,9 +178,9 @@ func checkCachedBlob(ctx context.Context, server *Server, digest string, deep bo
 }
 
 func verifyBlobFile(path, digest string) error {
-	algorithm, encoded, ok := splitDigestReference(digest)
-	if !ok {
-		return fmt.Errorf("invalid digest reference")
+	algorithm, encoded, err := checkedSupportedDigest(digest)
+	if err != nil {
+		return err
 	}
 	file, err := os.Open(path)
 	if err != nil {
@@ -205,6 +211,38 @@ func verifyBlobFile(path, digest string) error {
 		return fmt.Errorf("unsupported digest algorithm %q", algorithm)
 	}
 	return nil
+}
+
+func checkedSupportedDigest(reference string) (string, string, error) {
+	algorithm, encoded, ok := splitDigestReference(reference)
+	if !ok {
+		return "", "", fmt.Errorf("invalid digest reference")
+	}
+	switch algorithm {
+	case "sha256":
+		if len(encoded) != 64 {
+			return "", "", fmt.Errorf("invalid digest reference")
+		}
+	case "sha512":
+		if len(encoded) != 128 {
+			return "", "", fmt.Errorf("invalid digest reference")
+		}
+	default:
+		return "", "", fmt.Errorf("unsupported digest algorithm %q", algorithm)
+	}
+	return algorithm, encoded, nil
+}
+
+func checkedCachedManifestBytes(server *Server, requestPath string) ([]byte, error) {
+	path := server.manifestPath(requestPath)
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("cached manifest is not a regular file")
+	}
+	return os.ReadFile(path)
 }
 
 func manifestRequestPath(repository, reference string) string {
