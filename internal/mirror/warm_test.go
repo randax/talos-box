@@ -4,8 +4,11 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -243,6 +246,82 @@ func TestWarmTagAtDigestUsesTagRequestPathAndPinnedDigest(t *testing.T) {
 	}
 }
 
+func TestWarmTagAndTagAtDigestWithoutDigestHeaderUseValidatedCanonicalDigest(t *testing.T) {
+	tagManifest := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"%s"},"layers":[]}`, "sha256:"+sha256Hex([]byte("config")))
+	tagDigest := "sha256:" + sha256Hex([]byte(tagManifest))
+	pinnedManifest := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"%s"},"layers":[]}`, "sha512:"+sha512Hex([]byte("config")))
+	pinnedDigest := "sha512:" + sha512Hex([]byte(pinnedManifest))
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/demo/manifests/stable":
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			_, _ = fmt.Fprint(w, tagManifest)
+		case "/v2/demo/manifests/v2.0.0":
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			_, _ = fmt.Fprint(w, pinnedManifest)
+		case "/v2/demo/manifests/" + tagDigest:
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			_, _ = fmt.Fprint(w, tagManifest)
+		case "/v2/demo/manifests/" + pinnedDigest:
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			_, _ = fmt.Fprint(w, pinnedManifest)
+		case "/v2/demo/blobs/sha256:" + sha256Hex([]byte("config")):
+			_, _ = io.WriteString(w, "config")
+		case "/v2/demo/blobs/sha512:" + sha512Hex([]byte("config")):
+			_, _ = io.WriteString(w, "config")
+		case "/v2/demo/manifests/":
+			t.Fatal("warm requested empty manifest path")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	manager := newManagerWithPorts(t.TempDir(), nil, freePort(t))
+	manager.baseOverride = aliasedURL(t, upstream.URL, "registry.example")
+	egress := egressForRoutes(aliasRoute(t, upstream.URL, "registry.example", "203.0.113.10"))
+	manager.resolveUpstreamIPs = egress.resolve
+	manager.hostOwnedIPs = egress.hostIPs
+	manager.dialContext = egress.dialContext
+	defer manager.Close()
+
+	summary, err := manager.Warm(context.Background(), []string{
+		"registry.example/demo:stable",
+		"registry.example/demo:v2.0.0@" + pinnedDigest,
+	}, imagecache.ArchitectureAMD64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Warmed != 2 || summary.Failed != 0 {
+		t.Fatalf("summary = %+v", summary)
+	}
+
+	manager.offline.Store(true)
+	upstream.Close()
+	mirror := httptest.NewServer(http.HandlerFunc(manager.serveCatchAll))
+	defer mirror.Close()
+
+	for _, path := range []struct {
+		ref        string
+		wantDigest string
+		wantBody   string
+	}{
+		{"/v2/demo/manifests/stable", tagDigest, tagManifest},
+		{"/v2/demo/manifests/" + tagDigest, tagDigest, tagManifest},
+		{"/v2/demo/manifests/v2.0.0", pinnedDigest, pinnedManifest},
+		{"/v2/demo/manifests/" + pinnedDigest, pinnedDigest, pinnedManifest},
+	} {
+		resp, body := get(t, mirror.URL+path.ref+"?ns=registry.example")
+		if resp.StatusCode != http.StatusOK || body != path.wantBody {
+			t.Fatalf("%s = %d %q", path.ref, resp.StatusCode, body)
+		}
+		if got := resp.Header.Get("Docker-Content-Digest"); got != path.wantDigest {
+			t.Fatalf("%s digest header = %q, want %q", path.ref, got, path.wantDigest)
+		}
+	}
+}
+
 func TestWarmBlobRequestDiscardsResponseBody(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := w.(*httptest.ResponseRecorder); ok {
@@ -256,6 +335,22 @@ func TestWarmBlobRequestDiscardsResponseBody(t *testing.T) {
 
 	if err := warmBlobRequest(context.Background(), handler, "demo", "sha256:"+strings.Repeat("1", 64)); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDiscardWarmResponseWriteReturnsOriginalLengthAndCapsBuffer(t *testing.T) {
+	response := newDiscardWarmResponse()
+	response.WriteHeader(http.StatusBadGateway)
+	payload := []byte(strings.Repeat("x", maxWarmErrorBodyBytes*2))
+	written, err := response.Write(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if written != len(payload) {
+		t.Fatalf("written = %d, want %d", written, len(payload))
+	}
+	if response.errorBody.Len() != maxWarmErrorBodyBytes {
+		t.Fatalf("buffered error length = %d, want %d", response.errorBody.Len(), maxWarmErrorBodyBytes)
 	}
 }
 
@@ -363,6 +458,67 @@ func TestWarmFailurePreservesPreviouslyCachedManifest(t *testing.T) {
 	resp, body := get(t, mirror.URL+"/v2/demo/manifests/"+goodDigest+"?ns=registry.example")
 	if resp.StatusCode != http.StatusOK || body != goodManifest {
 		t.Fatalf("cached manifest after failed rerun = %d %q", resp.StatusCode, body)
+	}
+}
+
+func TestWarmPinnedTagMismatchPreservesPreviouslyCachedTag(t *testing.T) {
+	oldConfigDigest := "sha256:" + sha256Hex([]byte("old-config"))
+	oldManifest := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"%s"},"layers":[]}`, oldConfigDigest)
+	oldDigest := "sha256:" + sha256Hex([]byte(oldManifest))
+	newManifest := `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:` + strings.Repeat("d", 64) + `"},"layers":[]}`
+
+	var mismatch atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/demo/manifests/stable":
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			if mismatch.Load() {
+				_, _ = fmt.Fprint(w, newManifest)
+				return
+			}
+			w.Header().Set("Docker-Content-Digest", oldDigest)
+			_, _ = fmt.Fprint(w, oldManifest)
+		case "/v2/demo/manifests/" + oldDigest:
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", oldDigest)
+			_, _ = fmt.Fprint(w, oldManifest)
+		case "/v2/demo/blobs/" + oldConfigDigest:
+			_, _ = io.WriteString(w, "old-config")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	manager := newManagerWithPorts(t.TempDir(), nil, freePort(t))
+	manager.baseOverride = aliasedURL(t, upstream.URL, "registry.example")
+	egress := egressForRoutes(aliasRoute(t, upstream.URL, "registry.example", "203.0.113.10"))
+	manager.resolveUpstreamIPs = egress.resolve
+	manager.hostOwnedIPs = egress.hostIPs
+	manager.dialContext = egress.dialContext
+	defer manager.Close()
+
+	ref := "registry.example/demo:stable@" + oldDigest
+	if summary, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64); err != nil || summary.Warmed != 1 {
+		t.Fatalf("initial warm = %+v, %v", summary, err)
+	}
+
+	mismatch.Store(true)
+	summary, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Failed != 1 {
+		t.Fatalf("mismatch rerun summary = %+v", summary)
+	}
+
+	upstream.Close()
+	manager.offline.Store(true)
+	mirror := httptest.NewServer(http.HandlerFunc(manager.serveCatchAll))
+	defer mirror.Close()
+	resp, body := get(t, mirror.URL+"/v2/demo/manifests/stable?ns=registry.example")
+	if resp.StatusCode != http.StatusOK || body != oldManifest {
+		t.Fatalf("cached tag after pinned mismatch = %d %q", resp.StatusCode, body)
 	}
 }
 
@@ -550,6 +706,88 @@ func TestWarmTagReferenceCachesListedTagAndResolvedDigest(t *testing.T) {
 		resp, body := get(t, mirror.URL+path+"?ns=registry.example")
 		if resp.StatusCode != http.StatusOK || body != manifestBody {
 			t.Fatalf("%s = %d %q", path, resp.StatusCode, body)
+		}
+	}
+}
+
+func TestWarmOneBatchSupportsMultipleRegistriesWithIsolatedOfflineServing(t *testing.T) {
+	configOne := "cfg-one"
+	configOneDigest := "sha256:" + sha256Hex([]byte(configOne))
+	manifestOne := `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"` + configOneDigest + `"},"layers":[]}`
+	digestOne := "sha256:" + sha256Hex([]byte(manifestOne))
+	configTwo := "cfg-two"
+	configTwoDigest := "sha256:" + sha256Hex([]byte(configTwo))
+	manifestTwo := `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"` + configTwoDigest + `"},"layers":[]}`
+	digestTwo := "sha256:" + sha256Hex([]byte(manifestTwo))
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/one/manifests/" + digestOne:
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", digestOne)
+			_, _ = fmt.Fprint(w, manifestOne)
+		case "/v2/two/manifests/" + digestTwo:
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", digestTwo)
+			_, _ = fmt.Fprint(w, manifestTwo)
+		case "/v2/one/blobs/" + configOneDigest:
+			_, _ = io.WriteString(w, configOne)
+		case "/v2/two/blobs/" + configTwoDigest:
+			_, _ = io.WriteString(w, configTwo)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	cacheRoot := t.TempDir()
+	manager := newManagerWithPorts(cacheRoot, nil, freePort(t))
+	manager.baseOverride = aliasedURL(t, upstream.URL, "registry.example")
+	manager.resolveUpstreamIPs = func(_ context.Context, host string) ([]net.IP, error) {
+		switch host {
+		case "registry.one", "registry.two", "registry.example":
+			return []net.IP{net.ParseIP("203.0.113.10")}, nil
+		default:
+			return nil, fmt.Errorf("unexpected host %q", host)
+		}
+	}
+	manager.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	manager.dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, hostPortOfURL(t, upstream.URL))
+	}
+	defer manager.Close()
+
+	summary, err := manager.Warm(context.Background(), []string{
+		"registry.one/one@" + digestOne,
+		"registry.two/two@" + digestTwo,
+	}, imagecache.ArchitectureAMD64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Warmed != 2 || summary.Failed != 0 {
+		t.Fatalf("summary = %+v", summary)
+	}
+	for _, directory := range []string{"registry.one", "registry.two"} {
+		if _, err := os.Stat(filepath.Join(cacheRoot, directory)); err != nil {
+			t.Fatalf("cache directory %s missing: %v", directory, err)
+		}
+	}
+
+	manager.offline.Store(true)
+	upstream.Close()
+	mirror := httptest.NewServer(http.HandlerFunc(manager.serveCatchAll))
+	defer mirror.Close()
+	for _, test := range []struct {
+		ns       string
+		path     string
+		wantBody string
+	}{
+		{"registry.one", "/v2/one/manifests/" + digestOne, manifestOne},
+		{"registry.two", "/v2/two/manifests/" + digestTwo, manifestTwo},
+	} {
+		resp, body := get(t, mirror.URL+test.path+"?ns="+test.ns)
+		if resp.StatusCode != http.StatusOK || body != test.wantBody {
+			t.Fatalf("%s%s = %d %q", test.ns, test.path, resp.StatusCode, body)
 		}
 	}
 }
