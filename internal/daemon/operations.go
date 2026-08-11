@@ -76,6 +76,11 @@ type CacheWarmArgs struct {
 	Refs []string `json:"refs"`
 }
 
+type CacheCheckArgs struct {
+	Refs []string `json:"refs"`
+	Deep bool     `json:"deep,omitempty"`
+}
+
 type CachePruneScope string
 
 const (
@@ -169,6 +174,24 @@ type CacheWarmResult struct {
 
 const cacheWarmTimeout = 2 * time.Hour
 
+type CacheCheckStatus string
+
+const (
+	CacheCheckStatusComplete CacheCheckStatus = "complete"
+	CacheCheckStatusFailed   CacheCheckStatus = "failed"
+)
+
+type CacheCheckEntry struct {
+	Ref    string           `json:"ref"`
+	Status CacheCheckStatus `json:"status"`
+	Reason string           `json:"reason,omitempty"`
+}
+
+type CacheCheckResult struct {
+	Entries  []CacheCheckEntry `json:"entries"`
+	Complete int               `json:"complete"`
+	Failed   int               `json:"failed"`
+}
 type CacheImageEntry struct {
 	Schematic    string `json:"schematic"`
 	Version      string `json:"version"`
@@ -826,6 +849,27 @@ func (s *Server) warmMirrorCache(raw json.RawMessage) (CacheWarmResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), cacheWarmTimeout)
 	defer cancel()
 	return s.warmCache(ctx, args.Refs, s.imageArchitecture())
+}
+
+func (s *Server) checkMirrorCache(raw json.RawMessage) (CacheCheckResult, error) {
+	var args CacheCheckArgs
+	if err := decodeArgs(raw, &args); err != nil {
+		return CacheCheckResult{}, err
+	}
+	if len(args.Refs) == 0 {
+		return CacheCheckResult{}, errors.New("at least one image reference is required")
+	}
+	for _, ref := range args.Refs {
+		if err := ValidateWarmRef(ref); err != nil {
+			return CacheCheckResult{}, err
+		}
+	}
+	if s.checkCache == nil {
+		return CacheCheckResult{}, errors.New("cache check is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), cacheWarmTimeout)
+	defer cancel()
+	return s.checkCache(ctx, args.Refs, s.imageArchitecture(), args.Deep)
 }
 
 func (s *Server) listCache() (CacheListResult, error) {

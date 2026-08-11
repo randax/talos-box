@@ -28,6 +28,7 @@ type Server struct {
 	cache      *imagecache.Cache
 	hypervisor hypervisor.Hypervisor
 	warmCache  func(context.Context, []string, imagecache.Architecture) (CacheWarmResult, error)
+	checkCache func(context.Context, []string, imagecache.Architecture, bool) (CacheCheckResult, error)
 
 	opMu             sync.Mutex
 	vms              map[string]map[string]hypervisor.Machine
@@ -101,6 +102,29 @@ func NewServer(ctx context.Context) (*Server, error) {
 				status = CacheWarmStatusAlreadyComplete
 			}
 			result.Entries = append(result.Entries, CacheWarmEntry{
+				Ref:    entry.Ref,
+				Status: status,
+				Reason: entry.Error,
+			})
+		}
+		return result, nil
+	}
+	server.checkCache = func(ctx context.Context, refs []string, architecture imagecache.Architecture, deep bool) (CacheCheckResult, error) {
+		summary, err := server.mirrors.Check(ctx, refs, architecture, deep)
+		if err != nil {
+			return CacheCheckResult{}, err
+		}
+		result := CacheCheckResult{
+			Complete: summary.Complete,
+			Failed:   summary.Failed,
+			Entries:  make([]CacheCheckEntry, 0, len(summary.Results)),
+		}
+		for _, entry := range summary.Results {
+			status := CacheCheckStatusComplete
+			if entry.Error != "" {
+				status = CacheCheckStatusFailed
+			}
+			result.Entries = append(result.Entries, CacheCheckEntry{
 				Ref:    entry.Ref,
 				Status: status,
 				Reason: entry.Error,
@@ -310,6 +334,8 @@ func (s *Server) handle(request Request) (any, error) {
 		return s.pullCache(request.Args)
 	case "cache.warm":
 		return s.warmMirrorCache(request.Args)
+	case "cache.check":
+		return s.checkMirrorCache(request.Args)
 	case "cache.list":
 		return s.listCache()
 	case "cache.prune":

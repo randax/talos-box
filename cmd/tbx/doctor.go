@@ -24,6 +24,7 @@ type doctorDependencies struct {
 	listClusters    func() ([]daemon.ClusterSummary, error)
 	listConfig      func() ([]cluster.Cluster, error)
 	getStatus       func() ([]daemon.ClusterStatus, error)
+	listCache       func() (daemon.CacheListResult, error)
 	hostPressure    func() (hostpressure.Snapshot, error)
 	command         commandOutput
 	readFile        func(string) ([]byte, error)
@@ -187,6 +188,30 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		}
 	}
 
+	mirrorFinding := doctorFinding{check: "mirror-health"}
+	if deps.listCache == nil {
+		mirrorFinding.level, mirrorFinding.detail = "SKIP", "probe unavailable"
+	} else {
+		cacheResult, err := deps.listCache()
+		if isDaemonUnavailable(err) {
+			mirrorFinding.level, mirrorFinding.detail = "SKIP", fmt.Sprintf("daemon unavailable: %v", err)
+		} else if err != nil {
+			mirrorFinding.level, mirrorFinding.detail = "FAIL", err.Error()
+		} else {
+			totalBytes := cacheResult.MirrorTotal.BlobBytes + cacheResult.MirrorTotal.ManifestBytes
+			mirrorFinding.level = "PASS"
+			mirrorFinding.detail = fmt.Sprintf(
+				"daemon serving, cache %d bytes (%d blob(s), %d manifest(s))",
+				totalBytes,
+				cacheResult.MirrorTotal.BlobCount,
+				cacheResult.MirrorTotal.ManifestCount,
+			)
+		}
+	}
+	if err := writeFindings(mirrorFinding); err != nil {
+		return err
+	}
+
 	if err := writeFindings(egressFinding(probeFactoryEgress(deps.doHTTP))); err != nil {
 		return err
 	}
@@ -224,6 +249,11 @@ func (c cli) doctorDependencies() doctorDependencies {
 		getStatus: func() ([]daemon.ClusterStatus, error) {
 			var result []daemon.ClusterStatus
 			err := c.doctorCall("status", map[string]string{"cluster": ""}, &result)
+			return result, err
+		},
+		listCache: func() (daemon.CacheListResult, error) {
+			var result daemon.CacheListResult
+			err := c.doctorCall("cache.list", struct{}{}, &result)
 			return result, err
 		},
 		hostPressure: func() (hostpressure.Snapshot, error) {
