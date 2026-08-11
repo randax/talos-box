@@ -42,7 +42,12 @@ type token struct {
 // NewServer mirrors the upstream at base (scheme included), caching blobs
 // under cacheDir.
 func NewServer(base, cacheDir string) *Server {
-	return newServerWithEgress(base, cacheDir, defaultEgressDependencies())
+	return &Server{
+		base:     strings.TrimSuffix(base, "/"),
+		cacheDir: cacheDir,
+		client:   &http.Client{Timeout: 5 * time.Minute},
+		tokens:   make(map[string]token),
+	}
 }
 
 func newServerWithEgress(base, cacheDir string, egress egressDependencies) *Server {
@@ -203,6 +208,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	copyResponseHeaders(w, resp)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+func (s *Server) CloseIdleConnections() {
+	type idleCloser interface {
+		CloseIdleConnections()
+	}
+	if transport, ok := s.client.Transport.(idleCloser); ok {
+		transport.CloseIdleConnections()
+	}
 }
 
 func copyResponseHeaders(w http.ResponseWriter, resp *http.Response) {

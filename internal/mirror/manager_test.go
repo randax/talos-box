@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -200,6 +201,51 @@ func TestLegacyMirrorPortStillServesWhenCatchAllIsBound(t *testing.T) {
 	}
 }
 
+func TestLegacyMirrorPortHonorsDefaultProxyTransport(t *testing.T) {
+	var proxyHits atomic.Int64
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyHits.Add(1)
+		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		w.Header().Set("Docker-Content-Digest", "sha256:"+sha256Hex([]byte(manifestBody)))
+		_, _ = w.Write([]byte(manifestBody))
+	}))
+	defer proxy.Close()
+	parsedProxy := mustURL(t, proxy.URL)
+	originalTransport := http.DefaultTransport
+	clonedTransport := http.DefaultTransport.(*http.Transport).Clone()
+	clonedTransport.Proxy = func(*http.Request) (*url.URL, error) {
+		return parsedProxy, nil
+	}
+	http.DefaultTransport = clonedTransport
+	defer func() {
+		http.DefaultTransport = originalTransport
+		clonedTransport.CloseIdleConnections()
+	}()
+
+	legacyPort := freePort(t)
+	m := &Manager{
+		cacheRoot:    t.TempDir(),
+		ports:        []portBinding{{Upstream: "docker.io", Port: legacyPort}},
+		catchAllPort: freePort(t),
+		bound:        map[string][]*http.Server{},
+		dynamic:      map[string]http.Handler{},
+		baseOverride: "http://registry.example",
+	}
+	defer m.Close()
+
+	if err := m.Bind("127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, body := get(t, fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/latest", legacyPort))
+	if resp.StatusCode != http.StatusOK || body != manifestBody {
+		t.Fatalf("legacy mirror via default proxy transport = %d %q", resp.StatusCode, body)
+	}
+	if proxyHits.Load() == 0 {
+		t.Fatal("legacy fixed mirror did not use the default transport proxy")
+	}
+}
+
 func TestCatchAllMirrorCanonicalizesAuthorities(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -332,6 +378,78 @@ func TestCatchAllMirrorRejectsBlockedHostPortAuthorities(t *testing.T) {
 	}
 }
 
+func TestCatchAllMirrorRejectsNonGlobalAuthorities(t *testing.T) {
+	catchAllPort := freePort(t)
+	m := newManagerWithPorts(t.TempDir(), nil, catchAllPort)
+	m.resolveUpstreamIPs = func(_ context.Context, host string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP(canonicalLookupHost(host))}, nil
+	}
+	m.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	defer m.Close()
+
+	if err := m.Bind("127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, ns := range []string{"0.0.0.0", "::", "255.255.255.255"} {
+		t.Run(ns, func(t *testing.T) {
+			resp, _ := get(t, fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/latest?ns=%s", catchAllPort, url.QueryEscape(ns)))
+			if resp.StatusCode != http.StatusForbidden {
+				t.Fatalf("status for non-global ns=%s = %d, want 403", ns, resp.StatusCode)
+			}
+		})
+	}
+}
+
+func TestCatchAllMirrorBoundsDynamicHandlersAndClosesEvictedEntries(t *testing.T) {
+	catchAllPort := freePort(t)
+	var created atomic.Int64
+	var closed atomic.Int64
+
+	m := newManagerWithPorts(t.TempDir(), nil, catchAllPort)
+	m.dynamicCap = 4
+	m.resolveUpstreamIPs = func(context.Context, string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("203.0.113.10")}, nil
+	}
+	m.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	m.serverFactory = func(_ string, _, _ string) http.Handler {
+		created.Add(1)
+		return &closableHandler{closed: &closed}
+	}
+	defer m.Close()
+
+	if err := m.Bind("127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+
+	totalAuthorities := int(m.dynamicCap) + 3
+	for i := 0; i < totalAuthorities; i++ {
+		ns := fmt.Sprintf("registry-%d.example", i)
+		resp, body := get(t, fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/latest?ns=%s", catchAllPort, url.QueryEscape(ns)))
+		if resp.StatusCode != http.StatusOK || body != manifestBody {
+			t.Fatalf("ns=%s -> %d %q", ns, resp.StatusCode, body)
+		}
+	}
+
+	if got := len(m.dynamic); got != int(m.dynamicCap) {
+		t.Fatalf("retained dynamic handlers = %d, want %d", got, m.dynamicCap)
+	}
+	if created.Load() != int64(totalAuthorities) {
+		t.Fatalf("created handlers = %d, want %d", created.Load(), totalAuthorities)
+	}
+	if closed.Load() != int64(totalAuthorities-int(m.dynamicCap)) {
+		t.Fatalf("closed handlers after eviction = %d, want %d", closed.Load(), totalAuthorities-int(m.dynamicCap))
+	}
+
+	m.Close()
+	if got := len(m.dynamic); got != 0 {
+		t.Fatalf("dynamic handlers after Close = %d, want 0", got)
+	}
+	if closed.Load() != int64(totalAuthorities) {
+		t.Fatalf("closed handlers after Close = %d, want %d", closed.Load(), totalAuthorities)
+	}
+}
+
 type rewriteTransport struct {
 	target  *url.URL
 	wrapped http.RoundTripper
@@ -357,6 +475,19 @@ func mustURL(t *testing.T, raw string) *url.URL {
 		t.Fatal(err)
 	}
 	return parsed
+}
+
+type closableHandler struct {
+	closed *atomic.Int64
+}
+
+func (h *closableHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(manifestBody))
+}
+
+func (h *closableHandler) CloseIdleConnections() {
+	h.closed.Add(1)
 }
 
 func freePort(t *testing.T) int {

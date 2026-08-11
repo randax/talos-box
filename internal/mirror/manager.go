@@ -1,6 +1,7 @@
 package mirror
 
 import (
+	"container/list"
 	"context"
 	"errors"
 	"fmt"
@@ -42,10 +43,16 @@ type Manager struct {
 	resolveUpstreamIPs func(context.Context, string) ([]net.IP, error)
 	hostOwnedIPs       func() ([]net.IP, error)
 
-	mu      sync.Mutex
-	bound   map[string][]*http.Server // gateway IP -> its servers
-	dynamic map[string]http.Handler
+	mu                sync.Mutex
+	bound             map[string][]*http.Server // gateway IP -> its servers
+	dynamic           map[string]http.Handler
+	dynamicOrder      *list.List
+	dynamicLRUEntries map[string]*list.Element
+	dynamicClosers    map[string]func()
+	dynamicCap        int
 }
+
+const dynamicHandlerCap = 64
 
 // NewManager mirrors manifests.MirrorPorts, caching under cacheRoot.
 func NewManager(cacheRoot string) *Manager {
@@ -139,11 +146,15 @@ func (m *Manager) Close() {
 	m.mu.Lock()
 	all := m.bound
 	m.bound = map[string][]*http.Server{}
+	closers := m.drainDynamicLocked()
 	m.mu.Unlock()
 	for _, servers := range all {
 		for _, s := range servers {
 			_ = s.Close()
 		}
+	}
+	for _, closer := range closers {
+		closer()
 	}
 }
 
@@ -230,7 +241,11 @@ func (m *Manager) validateResolvedAuthority(authority upstreamAuthority) error {
 func (m *Manager) handlerForUpstream(authority upstreamAuthority) http.Handler {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.ensureDynamicStateLocked()
 	if handler, ok := m.dynamic[authority.cacheKey]; ok {
+		if element := m.dynamicLRUEntries[authority.cacheKey]; element != nil {
+			m.dynamicOrder.MoveToBack(element)
+		}
 		return handler
 	}
 
@@ -239,12 +254,97 @@ func (m *Manager) handlerForUpstream(authority upstreamAuthority) http.Handler {
 		base = m.baseOverride
 	}
 	cacheDir := filepath.Join(m.cacheRoot, authority.cacheKey)
-	handler := http.Handler(NewServer(base, cacheDir))
+	handler := http.Handler(newServerWithEgress(base, cacheDir, egressDependencies{
+		resolve:     m.resolveUpstreamIPs,
+		hostIPs:     m.hostOwnedIPs,
+		dialContext: defaultEgressDependencies().dialContext,
+		blocked:     namespaceIPBlocked,
+	}))
 	if m.serverFactory != nil {
 		handler = m.serverFactory(authority.canonicalAuthority, base, cacheDir)
 	}
 	m.dynamic[authority.cacheKey] = handler
+	m.dynamicLRUEntries[authority.cacheKey] = m.dynamicOrder.PushBack(authority.cacheKey)
+	if closer := dynamicHandlerCloser(handler); closer != nil {
+		m.dynamicClosers[authority.cacheKey] = closer
+	}
+	for _, closer := range m.evictDynamicLocked() {
+		closer()
+	}
 	return handler
+}
+
+func (m *Manager) ensureDynamicStateLocked() {
+	if m.dynamic == nil {
+		m.dynamic = map[string]http.Handler{}
+	}
+	if m.dynamicOrder == nil {
+		m.dynamicOrder = list.New()
+	}
+	if m.dynamicLRUEntries == nil {
+		m.dynamicLRUEntries = map[string]*list.Element{}
+	}
+	if m.dynamicClosers == nil {
+		m.dynamicClosers = map[string]func(){}
+	}
+}
+
+func (m *Manager) effectiveDynamicCap() int {
+	if m.dynamicCap > 0 {
+		return m.dynamicCap
+	}
+	return dynamicHandlerCap
+}
+
+func (m *Manager) evictDynamicLocked() []func() {
+	var closers []func()
+	for len(m.dynamic) > m.effectiveDynamicCap() {
+		front := m.dynamicOrder.Front()
+		if front == nil {
+			return closers
+		}
+		key := front.Value.(string)
+		if closer := m.removeDynamicLocked(key); closer != nil {
+			closers = append(closers, closer)
+		}
+	}
+	return closers
+}
+
+func (m *Manager) drainDynamicLocked() []func() {
+	m.ensureDynamicStateLocked()
+	keys := make([]string, 0, len(m.dynamic))
+	for key := range m.dynamic {
+		keys = append(keys, key)
+	}
+	var closers []func()
+	for _, key := range keys {
+		if closer := m.removeDynamicLocked(key); closer != nil {
+			closers = append(closers, closer)
+		}
+	}
+	return closers
+}
+
+func (m *Manager) removeDynamicLocked(key string) func() {
+	delete(m.dynamic, key)
+	if element := m.dynamicLRUEntries[key]; element != nil && m.dynamicOrder != nil {
+		m.dynamicOrder.Remove(element)
+	}
+	delete(m.dynamicLRUEntries, key)
+	closer := m.dynamicClosers[key]
+	delete(m.dynamicClosers, key)
+	return closer
+}
+
+func dynamicHandlerCloser(handler http.Handler) func() {
+	type idleCloser interface {
+		CloseIdleConnections()
+	}
+	if value, ok := handler.(idleCloser); ok {
+		return value.CloseIdleConnections
+	}
+	return nil
 }
 
 func cloneURLWithoutQueryValue(source *url.URL, key string) *url.URL {
@@ -370,7 +470,7 @@ func hostOwnedIPs() ([]net.IP, error) {
 }
 
 func namespaceIPBlocked(ip net.IP, hostIPs []net.IP) bool {
-	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || inCGNATRange(ip) {
+	if !ip.IsGlobalUnicast() || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || inCGNATRange(ip) {
 		return true
 	}
 	for _, hostIP := range hostIPs {
