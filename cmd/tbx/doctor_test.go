@@ -559,6 +559,33 @@ func TestRunDoctorFailsMirrorHealthWhenBoundGatewayIPIsWrong(t *testing.T) {
 	}
 }
 
+func TestRunDoctorSkipsMirrorHealthWhenClusterStateIsUnavailableButGatewaysAreBound(t *testing.T) {
+	deps := passingDoctorDependencies()
+	deps.listClusters = func() ([]daemon.ClusterSummary, error) {
+		return nil, errors.New("cluster state unavailable")
+	}
+	deps.listCache = func() (daemon.CacheListResult, error) {
+		return daemon.CacheListResult{
+			MirrorBoundGatewayIPs: []string{"172.30.3.1"},
+			MirrorTotal: daemon.MirrorCacheTotals{
+				BlobCount:     2,
+				BlobBytes:     20,
+				ManifestCount: 1,
+				ManifestBytes: 7,
+			},
+		}, nil
+	}
+
+	var output strings.Builder
+	err := (cli{out: &output}).runDoctorWithDependencies(nil, deps)
+	if err == nil {
+		t.Fatal("runDoctorWithDependencies() succeeded despite unavailable cluster state")
+	}
+	if !strings.Contains(output.String(), "SKIP mirror-health: cluster state unavailable; cache 27 bytes (2 blob(s), 1 manifest(s))") {
+		t.Fatalf("output missing unavailable-cluster mirror health line:\n%s", output.String())
+	}
+}
+
 func TestRunDoctorReportsRuntimeDependentChecksAsSkipped(t *testing.T) {
 	deps := passingDoctorDependencies()
 	deps.checkResolver = func() error {
