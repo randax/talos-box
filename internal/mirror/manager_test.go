@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -339,6 +340,8 @@ func TestCatchAllMirrorRejectsMalformedAuthorities(t *testing.T) {
 		"docker.io?query=yes",
 		"docker.io#fragment",
 		"docker.io:",
+		"docker.io:+443",
+		"docker.io:４４３",
 		"[2001:db8::1",
 		"foo_bar.example",
 		"foo+bar.example",
@@ -353,6 +356,140 @@ func TestCatchAllMirrorRejectsMalformedAuthorities(t *testing.T) {
 				t.Fatalf("status for malformed ns=%s = %d, want 400", ns, resp.StatusCode)
 			}
 		})
+	}
+}
+
+func TestCatchAllMirrorCancellationStopsDefaultNamespaceValidation(t *testing.T) {
+	catchAllPort := freePort(t)
+	var handlerCalls atomic.Int64
+
+	originalResolver := net.DefaultResolver
+	resolveStarted := make(chan struct{})
+	resolveReleased := make(chan struct{})
+	releaseResolver := make(chan struct{})
+	var signalStart sync.Once
+	var signalRelease sync.Once
+	net.DefaultResolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			signalStart.Do(func() { close(resolveStarted) })
+			select {
+			case <-ctx.Done():
+				signalRelease.Do(func() { close(resolveReleased) })
+				return nil, ctx.Err()
+			case <-releaseResolver:
+				return nil, context.Canceled
+			}
+		},
+	}
+	defer func() {
+		close(releaseResolver)
+		net.DefaultResolver = originalResolver
+	}()
+
+	m := newManagerWithPorts(t.TempDir(), nil, catchAllPort)
+	m.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	m.serverFactory = func(string, string, string) http.Handler {
+		handlerCalls.Add(1)
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		})
+	}
+	defer m.Close()
+
+	requestContext, cancel := context.WithCancel(context.Background())
+	request := httptest.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/latest?ns=docker.io", catchAllPort), nil).WithContext(requestContext)
+	recorder := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		m.serveCatchAll(recorder, request)
+		close(done)
+	}()
+
+	select {
+	case <-resolveStarted:
+	case <-time.After(time.Second):
+		t.Fatal("default resolver Dial did not start")
+	}
+	cancel()
+
+	select {
+	case <-resolveReleased:
+	case <-time.After(time.Second):
+		t.Fatal("namespace validation did not observe request cancellation")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("catch-all handler did not return promptly after cancellation")
+	}
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", recorder.Code)
+	}
+	if handlerCalls.Load() != 0 {
+		t.Fatalf("dynamic handler calls = %d, want 0", handlerCalls.Load())
+	}
+}
+
+func TestCatchAllMirrorHandlerCreationDoesNotPanicWhenDefaultTransportIsCustomRoundTripper(t *testing.T) {
+	originalTransport := http.DefaultTransport
+	http.DefaultTransport = rewriteTransport{
+		target:  mustURL(t, "http://example.invalid"),
+		wrapped: originalTransport,
+	}
+	defer func() { http.DefaultTransport = originalTransport }()
+
+	m := newManagerWithPorts(t.TempDir(), nil, freePort(t))
+	defer m.Close()
+	authority, err := parseUpstreamAuthority("docker.io")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	handler := m.handlerForUpstream(authority)
+	server, ok := handler.(*Server)
+	if !ok {
+		t.Fatalf("handler type = %T, want *Server", handler)
+	}
+	transport, ok := server.client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", server.client.Transport)
+	}
+	if transport.Proxy != nil {
+		t.Fatal("safe transport proxy is not disabled")
+	}
+	if transport.DialContext == nil {
+		t.Fatal("safe transport DialContext is nil")
+	}
+}
+
+func TestCatchAllMirrorHandlerCreationDoesNotPanicWhenDefaultTransportIsTypedNilTransport(t *testing.T) {
+	originalTransport := http.DefaultTransport
+	var typedNil *http.Transport
+	http.DefaultTransport = typedNil
+	defer func() { http.DefaultTransport = originalTransport }()
+
+	m := newManagerWithPorts(t.TempDir(), nil, freePort(t))
+	defer m.Close()
+	authority, err := parseUpstreamAuthority("docker.io")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	handler := m.handlerForUpstream(authority)
+	server, ok := handler.(*Server)
+	if !ok {
+		t.Fatalf("handler type = %T, want *Server", handler)
+	}
+	transport, ok := server.client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", server.client.Transport)
+	}
+	if transport.Proxy != nil {
+		t.Fatal("safe transport proxy is not disabled")
+	}
+	if transport.DialContext == nil {
+		t.Fatal("safe transport DialContext is nil")
 	}
 }
 

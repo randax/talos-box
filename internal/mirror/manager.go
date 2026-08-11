@@ -68,8 +68,8 @@ func newManagerWithPorts(cacheRoot string, ports []portBinding, catchAllPort int
 		cacheRoot:    cacheRoot,
 		ports:        ports,
 		catchAllPort: catchAllPort,
-		resolveUpstreamIPs: func(_ context.Context, host string) ([]net.IP, error) {
-			return lookupNamespaceIPs(host)
+		resolveUpstreamIPs: func(ctx context.Context, host string) ([]net.IP, error) {
+			return lookupNamespaceIPs(ctx, host)
 		},
 		hostOwnedIPs: hostOwnedIPs,
 		bound:        map[string][]*http.Server{},
@@ -393,6 +393,11 @@ func validatePort(port string) error {
 	if port == "" {
 		return fmt.Errorf("missing port")
 	}
+	for i := 0; i < len(port); i++ {
+		if port[i] < '0' || port[i] > '9' {
+			return fmt.Errorf("invalid port")
+		}
+	}
 	value, err := strconv.Atoi(port)
 	if err != nil || value < 1 || value > 65535 {
 		return fmt.Errorf("invalid port")
@@ -473,11 +478,11 @@ func validDNSLabel(label string) bool {
 	return true
 }
 
-func lookupNamespaceIPs(host string) ([]net.IP, error) {
+func lookupNamespaceIPs(ctx context.Context, host string) ([]net.IP, error) {
 	if ip := net.ParseIP(host); ip != nil {
 		return []net.IP{ip}, nil
 	}
-	return net.DefaultResolver.LookupIP(context.Background(), "ip", host)
+	return net.DefaultResolver.LookupIP(ctx, "ip", host)
 }
 
 func hostOwnedIPs() ([]net.IP, error) {

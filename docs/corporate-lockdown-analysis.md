@@ -12,8 +12,10 @@ Mechanism inventory (from code):
   (`internal/imagecache/cache.go:17`, default Go client, system roots, no explicit proxy
   config, no timeout) and registry upstreams + their token/CDN endpoints
   (`internal/mirror/mirror.go:45`, 5-min timeout, system roots).
-- Guests reach registries only via plain-HTTP host mirrors on `172.30.<n>.1:5055-5058`
-  (`internal/mirror/manager.go:69`).
+- Guests reach registries only via the plain-HTTP host mirror entry
+  `http://172.30.<n>.1:5059` rendered under Talos `machine.registries.mirrors."*"`
+  with `skipFallback: true`; legacy fixed listeners on `5055-5058` remain for older
+  clusters (`internal/mirror/manager.go:69`, `internal/manifests/manifests.go:178-189`).
 - Embedded authoritative DNS on `127.0.0.1:5399`, wired via `/etc/resolver/k8s.test`
   (`internal/dns/server.go:10-13`, `internal/helper/server.go:19`).
 - vmnet **shared/NAT mode** with hardcoded `172.30.<n>.0/24` subnets, no collision
@@ -215,7 +217,8 @@ Related robustness gaps in the same category: the embedded DNS is **UDP-only**
   can inspect every flow; worst observed effect is throughput collapse. No mitigation
   beyond documenting.
 - **Cleartext-HTTP policy**: content filters that flag "web on nonstandard port" can
-  reset guest→mirror traffic (plain HTTP on 5055–5058) even though it never leaves the
+  reset guest→mirror traffic (plain HTTP on the catch-all port `5059`, with `5055–5058`
+  retained only for legacy fixed-listener compatibility) even though it never leaves the
   host. Escape hatch would be an opt-in HTTPS mirror mode with a generated CA delivered
   via machine-config trust patch.
 - **DLP / antimalware scanning of large artifacts**: on-access scanners chewing through

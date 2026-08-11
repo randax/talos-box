@@ -145,13 +145,15 @@ so BGP remains the fast-failover path there.
 [the installer-stall ticket](https://github.com/randax/talos-box/issues/12): corporate agents
 such as GlobalProtect RST guest-originated TLS, so direct in-VM registry access must be treated
 as unreliable on attendee machines): `tbxd` runs pull-through mirrors for `docker.io`,
-`ghcr.io`, `quay.io`, `registry.k8s.io` (one listener per upstream, ports `5055+` — port 5000
-is macOS AirPlay Receiver, which answers 403 and poisons smoke tests; gate G4), bound on
-each **cluster gateway IP** (`172.30.<n>.1`) — not `0.0.0.0` — with the bind set added when a
+`ghcr.io`, `quay.io`, `registry.k8s.io`, plus a catch-all listener on port `5059` (port 5000
+is macOS AirPlay Receiver, which answers 403 and poisons smoke tests; gate G4), bound on each
+**cluster gateway IP** (`172.30.<n>.1`) — not `0.0.0.0` — with the bind set added when a
 cluster starts and removed when it stops (#39), so the ports never surface on the host's
-physical/VPN interfaces and distinct gateways share the fixed ports without conflict. Printed
-machine configs set `registryMirrors` accordingly. Mirror storage lives in the cache and
-doubles as the offline-venue answer.
+physical/VPN interfaces and distinct gateways share the fixed ports without conflict. New
+printed machine configs set Talos `machine.registries.mirrors."*"` to a single endpoint
+`http://172.30.<n>.1:5059` with `skipFallback: true`; legacy fixed listeners on `5055–5058`
+remain only so older clusters keep working until they are recreated. Mirror storage lives in
+the cache and doubles as the offline-venue answer.
 
 **Reachability guarantees** (the tested surface): host ↔ node IPs; host ↔ LB VIPs (L2 or BGP);
 **cluster ↔ cluster** (nodes and VIPs) through the host as inter-subnet router — first-class,

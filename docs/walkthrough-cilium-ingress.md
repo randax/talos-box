@@ -30,22 +30,18 @@ registry TLS is unreliable behind corporate agents like GlobalProtect) and the
 machine:
   registries:
     mirrors:
-      docker.io:
+      "*":
         endpoints:
-          - http://172.30.0.1:5055
-      ghcr.io:
-        endpoints:
-          - http://172.30.0.1:5056
-      quay.io:
-        endpoints:
-          - http://172.30.0.1:5057
-      registry.k8s.io:
-        endpoints:
-          - http://172.30.0.1:5058
+          - http://172.30.0.1:5059
+        skipFallback: true
   kernel:
     modules:
       - name: virtio_balloon
 ```
+
+The single `*` entry is the new-cluster shape rendered by `tbx manifests demo`.
+Legacy fixed listeners on `5055–5058` remain only so older clusters keep working until
+they are recreated with the catch-all mirror patch.
 
 Cilium replaces both the default CNI and kube-proxy, so add `patch-cilium.yaml`:
 

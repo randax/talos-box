@@ -84,7 +84,20 @@ func defaultEgressDependencies() egressDependencies {
 }
 
 func newSafeTransport(egress egressDependencies) *http.Transport {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	var transport *http.Transport
+	if base, ok := http.DefaultTransport.(*http.Transport); ok && base != nil {
+		transport = base.Clone()
+	} else {
+		transport = &http.Transport{
+			Proxy:                 nil,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   http.DefaultMaxIdleConnsPerHost,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
+	}
 	transport.Proxy = nil
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 		return dialValidatedIP(ctx, network, address, egress)
