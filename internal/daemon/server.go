@@ -26,10 +26,11 @@ import (
 
 // Server owns all VMs started by one daemon process.
 type Server struct {
-	cache      *imagecache.Cache
-	hypervisor hypervisor.Hypervisor
-	warmCache  func(context.Context, []string, imagecache.Architecture) (CacheWarmResult, error)
-	checkCache func(context.Context, []string, imagecache.Architecture, bool) (CacheCheckResult, error)
+	cache               *imagecache.Cache
+	hypervisor          hypervisor.Hypervisor
+	warmCache           func(context.Context, []string, imagecache.Architecture) (CacheWarmResult, error)
+	checkCache          func(context.Context, []string, imagecache.Architecture, bool) (CacheCheckResult, error)
+	boundMirrorGateways func() []string
 
 	opMu                  sync.Mutex
 	vms                   map[string]map[string]hypervisor.Machine
@@ -126,6 +127,9 @@ func NewServer(ctx context.Context) (*Server, error) {
 		destroyVolumeCount:    countDestroyStorageVolumes,
 		storageEngineDelete:   deleteConfiguredStorageEngine,
 		storageEngineValidate: validateConfiguredStorageEngine,
+	}
+	server.boundMirrorGateways = func() []string {
+		return server.mirrors.BoundGatewayIPs()
 	}
 	server.warmCache = func(ctx context.Context, refs []string, architecture imagecache.Architecture) (CacheWarmResult, error) {
 		summary, err := server.mirrors.Warm(ctx, refs, architecture)

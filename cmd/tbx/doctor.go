@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -205,36 +206,39 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 				cacheResult.MirrorTotal.BlobCount,
 				cacheResult.MirrorTotal.ManifestCount,
 			)
-			runningClusters := 0
+			var expectedGateways []string
 			for _, item := range clusters {
 				if item.Running {
-					runningClusters++
+					expectedGateways = append(expectedGateways, cluster.Gateway(item.SubnetIndex))
 				}
 			}
+			sort.Strings(expectedGateways)
+			actualGateways := append([]string(nil), cacheResult.MirrorBoundGatewayIPs...)
+			sort.Strings(actualGateways)
 			switch {
-			case cacheResult.MirrorServing && clusterErr == nil && !anyRunning:
+			case len(expectedGateways) == 0 && len(actualGateways) > 0:
 				mirrorFinding.level = "FAIL"
-				mirrorFinding.detail = fmt.Sprintf("mirror listeners bound while no clusters are running; %s", cacheDetail)
-			case cacheResult.MirrorServing && clusterErr == nil && cacheResult.MirrorBoundGateways == runningClusters:
-				mirrorFinding.level = "PASS"
-				mirrorFinding.detail = fmt.Sprintf("mirror serving on %d gateway(s), %s", cacheResult.MirrorBoundGateways, cacheDetail)
-			case clusterErr == nil && anyRunning && cacheResult.MirrorBoundGateways > 0:
-				mirrorFinding.level = "FAIL"
-				mirrorFinding.detail = fmt.Sprintf(
-					"mirror listeners bound for %d of %d running cluster(s); %s",
-					cacheResult.MirrorBoundGateways,
-					runningClusters,
-					cacheDetail,
-				)
+				mirrorFinding.detail = fmt.Sprintf("mirror listeners bound on %v while no clusters are running; %s", actualGateways, cacheDetail)
 			case clusterErr == nil && len(clusters) == 0:
 				mirrorFinding.level = "SKIP"
 				mirrorFinding.detail = fmt.Sprintf("no clusters exist; %s", cacheDetail)
-			case clusterErr == nil && !anyRunning:
+			case clusterErr == nil && len(expectedGateways) == 0:
 				mirrorFinding.level = "SKIP"
 				mirrorFinding.detail = fmt.Sprintf("no clusters are running; %s", cacheDetail)
-			case clusterErr == nil && anyRunning:
+			case clusterErr == nil && stringSlicesEqual(actualGateways, expectedGateways):
+				mirrorFinding.level = "PASS"
+				mirrorFinding.detail = fmt.Sprintf("mirror serving on %d gateway(s) %v, %s", len(actualGateways), actualGateways, cacheDetail)
+			case clusterErr == nil && len(actualGateways) == 0:
 				mirrorFinding.level = "FAIL"
-				mirrorFinding.detail = fmt.Sprintf("no mirror listeners bound for running cluster(s); %s", cacheDetail)
+				mirrorFinding.detail = fmt.Sprintf("no mirror listeners bound for running cluster(s); expected %v; %s", expectedGateways, cacheDetail)
+			case clusterErr == nil:
+				mirrorFinding.level = "FAIL"
+				mirrorFinding.detail = fmt.Sprintf(
+					"mirror listeners bound on %v, expected %v; %s",
+					actualGateways,
+					expectedGateways,
+					cacheDetail,
+				)
 			default:
 				mirrorFinding.level = "SKIP"
 				mirrorFinding.detail = fmt.Sprintf("cluster state unavailable; %s", cacheDetail)
@@ -256,6 +260,18 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		return errors.New("one or more doctor checks failed")
 	}
 	return nil
+}
+
+func stringSlicesEqual(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func isDaemonUnavailable(err error) bool {

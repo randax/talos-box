@@ -485,6 +485,70 @@ func TestCheckRejectsOversizedCachedManifest(t *testing.T) {
 	}
 }
 
+func TestCheckIgnoresOversizedMetadataSidecar(t *testing.T) {
+	cacheRoot := t.TempDir()
+	mirrorRoot := filepath.Join(cacheRoot, "mirror")
+	manager := newManagerWithPorts(mirrorRoot, nil, freePort(t))
+	defer manager.Close()
+
+	server := NewServer("https://registry.example", filepath.Join(mirrorRoot, "registry.example"))
+	configBody := []byte("cfg")
+	configDigest := "sha256:" + sha256Hex(configBody)
+	manifestBody := []byte(fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%d},"layers":[]}`,
+		configDigest, len(configBody)))
+	manifestDigest := "sha256:" + sha256Hex(manifestBody)
+	requestPath := "/v2/demo/manifests/" + manifestDigest
+	if err := server.storeManifest(requestPath, manifestMetadata{
+		ContentType:         "application/vnd.oci.image.manifest.v1+json",
+		ContentLength:       int64(len(manifestBody)),
+		DockerContentDigest: manifestDigest,
+	}, manifestBody); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(server.blobPath(configDigest)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(server.blobPath(configDigest), configBody, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(server.manifestMetadataPath(requestPath), []byte(`{"dockerContentDigest":"sha512:`+strings.Repeat("a", 128)+`","padding":"`+strings.Repeat("b", maxCachedManifestSidecarBytes)+`"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := manager.Check(context.Background(), []string{"registry.example/demo@" + manifestDigest}, imagecache.ArchitectureAMD64, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Complete != 1 || summary.Failed != 0 {
+		t.Fatalf("check summary = %+v", summary)
+	}
+}
+
+func TestOpenCheckedRegularFileRejectsPathSwapAfterOpen(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "manifest.json")
+	original := []byte("one")
+	replacement := filepath.Join(root, "replacement.json")
+	if err := os.WriteFile(path, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(replacement, []byte("two"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := openCheckedRegularFile(path, func() {
+		if renameErr := os.Rename(path, filepath.Join(root, "manifest.old")); renameErr != nil {
+			t.Fatal(renameErr)
+		}
+		if renameErr := os.Rename(replacement, path); renameErr != nil {
+			t.Fatal(renameErr)
+		}
+	})
+	if err == nil || !strings.Contains(err.Error(), "changed during open") {
+		t.Fatalf("openCheckedRegularFile() error = %v, want changed-during-open failure", err)
+	}
+}
+
 func TestCheckRejectsSymlinkedManifestInPlainMode(t *testing.T) {
 	fixture := newCheckManifestFixture(t)
 	defer fixture.manager.Close()
