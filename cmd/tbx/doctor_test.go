@@ -378,7 +378,7 @@ func TestRunDoctorIncludesMirrorHealth(t *testing.T) {
 	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
 		t.Fatalf("runDoctorWithDependencies() = %v", err)
 	}
-	if !strings.Contains(output.String(), "PASS mirror-health: daemon serving, cache 27 bytes (2 blob(s), 1 manifest(s))") {
+	if !strings.Contains(output.String(), "PASS mirror-health: mirror serving, cache 27 bytes (2 blob(s), 1 manifest(s))") {
 		t.Fatalf("output missing mirror health line:\n%s", output.String())
 	}
 }

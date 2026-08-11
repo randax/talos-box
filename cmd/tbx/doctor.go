@@ -201,7 +201,7 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 			totalBytes := cacheResult.MirrorTotal.BlobBytes + cacheResult.MirrorTotal.ManifestBytes
 			mirrorFinding.level = "PASS"
 			mirrorFinding.detail = fmt.Sprintf(
-				"daemon serving, cache %d bytes (%d blob(s), %d manifest(s))",
+				"mirror serving, cache %d bytes (%d blob(s), %d manifest(s))",
 				totalBytes,
 				cacheResult.MirrorTotal.BlobCount,
 				cacheResult.MirrorTotal.ManifestCount,
