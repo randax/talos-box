@@ -208,6 +208,99 @@ func TestWarmPopulatesMirrorStatsForCacheList(t *testing.T) {
 	}
 }
 
+func TestWarmUpdatesMirrorStatsPerUpstreamFromZero(t *testing.T) {
+	manifestOne := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%d}}`,
+		"sha256:"+sha256Hex([]byte("config-one")), len("config-one"))
+	digestOne := "sha256:" + sha256Hex([]byte(manifestOne))
+	configOne := "config-one"
+	configOneDigest := "sha256:" + sha256Hex([]byte(configOne))
+
+	manifestTwo := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%d}}`,
+		"sha256:"+sha256Hex([]byte("config-two")), len("config-two"))
+	digestTwo := "sha256:" + sha256Hex([]byte(manifestTwo))
+	configTwo := "config-two"
+	configTwoDigest := "sha256:" + sha256Hex([]byte(configTwo))
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/one/manifests/" + digestOne:
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", digestOne)
+			_, _ = fmt.Fprint(w, manifestOne)
+		case "/v2/two/manifests/" + digestTwo:
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", digestTwo)
+			_, _ = fmt.Fprint(w, manifestTwo)
+		case "/v2/one/blobs/" + configOneDigest:
+			_, _ = io.WriteString(w, configOne)
+		case "/v2/two/blobs/" + configTwoDigest:
+			_, _ = io.WriteString(w, configTwo)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	cacheRoot := t.TempDir()
+	mirrorRoot := filepath.Join(cacheRoot, "mirror")
+	stats, total, err := imagecache.New(cacheRoot).MirrorStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stats) != 0 || total != (imagecache.MirrorTotals{}) {
+		t.Fatalf("initial mirror stats = %+v total=%+v, want zero", stats, total)
+	}
+
+	manager := newManagerWithPorts(mirrorRoot, nil, freePort(t))
+	manager.baseOverride = aliasedURL(t, upstream.URL, "registry.example")
+	manager.resolveUpstreamIPs = func(_ context.Context, host string) ([]net.IP, error) {
+		switch host {
+		case "registry.one", "registry.two", "registry.example":
+			return []net.IP{net.ParseIP("203.0.113.10")}, nil
+		default:
+			return nil, fmt.Errorf("unexpected host %q", host)
+		}
+	}
+	manager.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	manager.dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, hostPortOfURL(t, upstream.URL))
+	}
+	defer manager.Close()
+
+	summary, err := manager.Warm(context.Background(), []string{
+		"registry.one/one@" + digestOne,
+		"registry.two/two@" + digestTwo,
+	}, imagecache.ArchitectureAMD64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Warmed != 2 || summary.Failed != 0 || summary.AlreadyComplete != 0 {
+		t.Fatalf("warm summary = %+v", summary)
+	}
+
+	stats, total, err = imagecache.New(cacheRoot).MirrorStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stats) != 2 {
+		t.Fatalf("stats len = %d, want 2", len(stats))
+	}
+	for _, stat := range stats {
+		if stat.BlobCount != 1 || stat.ManifestCount != 1 {
+			t.Fatalf("per-upstream stats = %+v, want 1 blob and 1 manifest", stat)
+		}
+		if stat.BlobBytes <= 0 || stat.ManifestBytes <= 0 {
+			t.Fatalf("per-upstream bytes = %+v, want non-zero", stat)
+		}
+	}
+	if total.BlobCount != 2 || total.ManifestCount != 2 {
+		t.Fatalf("mirror total = %+v, want 2 blobs and 2 manifests", total)
+	}
+	if total.BlobBytes != stats[0].BlobBytes+stats[1].BlobBytes || total.ManifestBytes != stats[0].ManifestBytes+stats[1].ManifestBytes {
+		t.Fatalf("mirror total bytes = %+v, stats = %+v", total, stats)
+	}
+}
+
 func TestWarmRerunSkipsBlobDownloadsButRefreshesManifestRequests(t *testing.T) {
 	manifestBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%d},"layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"%s","size":%d}]}`,
 		"sha256:"+sha256Hex([]byte("config")), len("config"), "sha256:"+sha256Hex([]byte("layer")), len("layer"))
