@@ -312,7 +312,7 @@ func (c cli) runStatus(args []string) error {
 
 func (c cli) runCache(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tbx cache pull|prune|warm")
+		return errors.New("usage: tbx cache pull|prune|warm|list")
 	}
 	switch args[0] {
 	case "pull":
@@ -339,16 +339,77 @@ func (c cli) runCache(args []string) error {
 		_, err = fmt.Fprintf(c.out, "cached Talos %s %s schematic %s at %s\n", result.Version, result.Architecture, result.Schematic, result.Path)
 		return err
 	case "prune":
-		if len(args) != 1 {
-			return errors.New("usage: tbx cache prune")
-		}
-		var result struct {
-			Removed int `json:"removed"`
-		}
-		if err := c.call("cache.prune", struct{}{}, &result); err != nil {
+		flags := flag.NewFlagSet("cache prune", flag.ContinueOnError)
+		flags.SetOutput(c.err)
+		pruneMirror := flags.Bool("mirror", false, "remove only mirror cache")
+		pruneAll := flags.Bool("all", false, "remove disk and mirror cache")
+		positionals, err := parseInterspersed(flags, args[1:])
+		if err != nil {
 			return err
 		}
-		_, err := fmt.Fprintf(c.out, "pruned %d cached image(s)\n", result.Removed)
+		if len(positionals) != 0 || (*pruneMirror && *pruneAll) {
+			return errors.New("usage: tbx cache prune [--mirror|--all]")
+		}
+		scope := daemon.CachePruneScopeImages
+		if *pruneMirror {
+			scope = daemon.CachePruneScopeMirror
+		} else if *pruneAll {
+			scope = daemon.CachePruneScopeAll
+		}
+		var result daemon.CachePruneResult
+		if err := c.call("cache.prune", daemon.CachePruneArgs{Scope: scope}, &result); err != nil {
+			return err
+		}
+		switch result.Scope {
+		case daemon.CachePruneScopeImages:
+			_, err = fmt.Fprintf(c.out, "pruned disk cache: %d image(s), %d bytes; mirror cache untouched\n", result.ImageCount, result.ImageBytes)
+		case daemon.CachePruneScopeMirror:
+			_, err = fmt.Fprintf(c.out, "pruned mirror cache: %d blob(s) %d bytes, %d manifest(s) %d bytes; disk cache untouched\n",
+				result.Mirror.BlobCount, result.Mirror.BlobBytes, result.Mirror.ManifestCount, result.Mirror.ManifestBytes)
+		case daemon.CachePruneScopeAll:
+			_, err = fmt.Fprintf(c.out, "pruned all cache: %d image(s), %d bytes; %d blob(s) %d bytes, %d manifest(s) %d bytes\n",
+				result.ImageCount, result.ImageBytes, result.Mirror.BlobCount, result.Mirror.BlobBytes, result.Mirror.ManifestCount, result.Mirror.ManifestBytes)
+		default:
+			return fmt.Errorf("cache prune returned unknown scope %q", result.Scope)
+		}
+		return err
+	case "list":
+		if len(args) != 1 {
+			return errors.New("usage: tbx cache list")
+		}
+		var result daemon.CacheListResult
+		if err := c.call("cache.list", struct{}{}, &result); err != nil {
+			return err
+		}
+		if len(result.Images) == 0 {
+			if _, err := fmt.Fprintln(c.out, "Talos disk images: empty"); err != nil {
+				return err
+			}
+		} else {
+			if _, err := fmt.Fprintln(c.out, "Talos disk images:"); err != nil {
+				return err
+			}
+			for _, entry := range result.Images {
+				if _, err := fmt.Fprintf(c.out, "- %s %s %s %d bytes\n", entry.Schematic, entry.Version, entry.Architecture, entry.Size); err != nil {
+					return err
+				}
+			}
+		}
+		if len(result.Mirror) == 0 {
+			_, err := fmt.Fprintln(c.out, "Mirror cache: empty")
+			return err
+		}
+		if _, err := fmt.Fprintln(c.out, "Mirror cache:"); err != nil {
+			return err
+		}
+		for _, entry := range result.Mirror {
+			if _, err := fmt.Fprintf(c.out, "- %s: %d blob(s) %d bytes, %d manifest(s) %d bytes\n",
+				entry.Upstream, entry.BlobCount, entry.BlobBytes, entry.ManifestCount, entry.ManifestBytes); err != nil {
+				return err
+			}
+		}
+		_, err := fmt.Fprintf(c.out, "Mirror total: %d blob(s) %d bytes, %d manifest(s) %d bytes\n",
+			result.MirrorTotal.BlobCount, result.MirrorTotal.BlobBytes, result.MirrorTotal.ManifestCount, result.MirrorTotal.ManifestBytes)
 		return err
 	case "warm":
 		return c.runCacheWarm(args[1:])
@@ -371,7 +432,7 @@ Commands:
   console <cluster> <node>
   bgp enable|disable <cluster>
   mirror offline [on|off]
-  cache pull|prune|warm
+  cache pull|prune|warm|list
   system install|uninstall
   doctor
   version
