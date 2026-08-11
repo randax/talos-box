@@ -184,6 +184,7 @@ type CacheWarmResult struct {
 }
 
 const cacheWarmTimeout = 2 * time.Hour
+
 type CacheImageEntry struct {
 	Schematic    string `json:"schematic"`
 	Version      string `json:"version"`

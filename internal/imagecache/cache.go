@@ -286,37 +286,32 @@ func (c *Cache) PruneMirror() (CachePruneResult, error) {
 	if err := validateCacheRoot(c.root); err != nil {
 		return CachePruneResult{}, err
 	}
-	_, mirrorTotals, err := c.MirrorStats()
+	plan, err := c.planMirrorPrune()
 	if err != nil {
-		return CachePruneResult{}, err
-	}
-	mirrorRoot := filepath.Join(c.root, "mirror")
-	if _, exists, err := lstatPath(mirrorRoot); err != nil {
-		return CachePruneResult{}, fmt.Errorf("prune mirror cache: %w", err)
-	} else if exists {
-		if err := requireDirectoryPath(mirrorRoot); err != nil {
-			return CachePruneResult{}, fmt.Errorf("prune mirror cache: %w", err)
-		}
-	}
-	if err := os.RemoveAll(mirrorRoot); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return CachePruneResult{}, fmt.Errorf("prune mirror cache: %w", err)
 	}
-	return CachePruneResult{Mirror: mirrorTotals}, nil
+	if err := c.executeMirrorPrune(plan); err != nil {
+		return CachePruneResult{}, fmt.Errorf("prune mirror cache: %w", err)
+	}
+	return CachePruneResult{Mirror: plan.totals}, nil
 }
 
 func (c *Cache) PruneAll() (CachePruneResult, error) {
 	if err := validateCacheRoot(c.root); err != nil {
 		return CachePruneResult{}, err
 	}
+	mirrorPlan, err := c.planMirrorPrune()
+	if err != nil {
+		return CachePruneResult{}, fmt.Errorf("prune mirror cache: %w", err)
+	}
 	disk, err := c.PruneDisk()
 	if err != nil {
 		return CachePruneResult{}, err
 	}
-	mirror, err := c.PruneMirror()
-	if err != nil {
+	if err := c.executeMirrorPrune(mirrorPlan); err != nil {
 		return CachePruneResult{}, err
 	}
-	disk.Mirror = mirror.Mirror
+	disk.Mirror = mirrorPlan.totals
 	return disk, nil
 }
 
@@ -415,6 +410,11 @@ type pruneAction struct {
 	path         string
 	size         int64
 	countAsImage bool
+}
+
+type mirrorPrunePlan struct {
+	root   string
+	totals MirrorTotals
 }
 
 func (c *Cache) pruneKnownDiskArtifacts() (CachePruneResult, error) {
@@ -577,6 +577,30 @@ func planKnownArtifact(path string, countAsImage bool) (pruneAction, error) {
 		return pruneAction{}, fmt.Errorf("refusing to prune non-regular path %q", path)
 	}
 	return pruneAction{path: path, size: info.Size(), countAsImage: countAsImage}, nil
+}
+
+func (c *Cache) planMirrorPrune() (mirrorPrunePlan, error) {
+	plan := mirrorPrunePlan{root: filepath.Join(c.root, "mirror")}
+	if _, exists, err := lstatPath(plan.root); err != nil {
+		return mirrorPrunePlan{}, err
+	} else if exists {
+		if err := requireDirectoryPath(plan.root); err != nil {
+			return mirrorPrunePlan{}, err
+		}
+	}
+	_, totals, err := c.MirrorStats()
+	if err != nil {
+		return mirrorPrunePlan{}, err
+	}
+	plan.totals = totals
+	return plan, nil
+}
+
+func (c *Cache) executeMirrorPrune(plan mirrorPrunePlan) error {
+	if err := os.RemoveAll(plan.root); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 func removeIfEmpty(path string) error {

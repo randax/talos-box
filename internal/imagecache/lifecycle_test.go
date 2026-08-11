@@ -422,3 +422,59 @@ func TestPruneMirrorRejectsSymlinkRoot(t *testing.T) {
 		t.Fatalf("mirror symlink missing after failed prune: %v", err)
 	}
 }
+
+func TestPruneAllRejectsInvalidMirrorRootWithoutDeletingDisk(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		setupMirror func(t *testing.T, root string)
+	}{
+		{
+			name: "symlink",
+			setupMirror: func(t *testing.T, root string) {
+				t.Helper()
+				target := filepath.Join(root, "real-mirror")
+				if err := os.MkdirAll(target, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, filepath.Join(root, "mirror")); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "non-directory",
+			setupMirror: func(t *testing.T, root string) {
+				t.Helper()
+				if err := os.WriteFile(filepath.Join(root, "mirror"), []byte("not-a-directory"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			cache := New(root)
+
+			diskPath := filepath.Join(root, "schematic", "v1.2.3", "amd64", "disk.raw")
+			if err := os.MkdirAll(filepath.Dir(diskPath), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			before := []byte("disk-bytes")
+			if err := os.WriteFile(diskPath, before, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			test.setupMirror(t, root)
+
+			if _, err := cache.PruneAll(); err == nil {
+				t.Fatal("PruneAll accepted invalid mirror root")
+			}
+			after, err := os.ReadFile(diskPath)
+			if err != nil {
+				t.Fatalf("disk removed after failed prune-all: %v", err)
+			}
+			if string(after) != string(before) {
+				t.Fatalf("disk bytes changed after failed prune-all: got %q want %q", string(after), string(before))
+			}
+		})
+	}
+}
