@@ -542,19 +542,7 @@ func (s *Server) serveCachedManifest(w http.ResponseWriter, r *http.Request) boo
 	if err != nil {
 		return false
 	}
-	metadata := manifestMetadata{
-		ContentType:         "application/vnd.oci.image.manifest.v1+json",
-		ContentLength:       int64(len(data)),
-		DockerContentDigest: "sha256:" + manifestSHA256(data),
-	}
-	if rawMetadata, err := os.ReadFile(s.manifestMetadataPath(r.URL.Path)); err == nil {
-		var stored manifestMetadata
-		if json.Unmarshal(rawMetadata, &stored) == nil {
-			metadata = stored
-		}
-	} else if ct, err := os.ReadFile(path + ".ct"); err == nil && len(ct) > 0 {
-		metadata.ContentType = string(ct)
-	}
+	metadata := s.cachedManifestMetadata(r.URL.Path, data)
 	w.Header().Set("Content-Type", metadata.ContentType)
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", metadata.ContentLength))
 	w.Header().Set("Docker-Content-Digest", metadata.DockerContentDigest)
@@ -563,6 +551,28 @@ func (s *Server) serveCachedManifest(w http.ResponseWriter, r *http.Request) boo
 		_, _ = w.Write(data)
 	}
 	return true
+}
+
+func (s *Server) cachedManifestMetadata(requestPath string, data []byte) manifestMetadata {
+	metadata := manifestMetadata{
+		ContentType:         "application/vnd.oci.image.manifest.v1+json",
+		ContentLength:       int64(len(data)),
+		DockerContentDigest: cachedManifestDigest(data, manifestReference(requestPath), ""),
+	}
+	if rawMetadata, err := os.ReadFile(s.manifestMetadataPath(requestPath)); err == nil {
+		var stored manifestMetadata
+		if json.Unmarshal(rawMetadata, &stored) == nil {
+			if stored.ContentType != "" {
+				metadata.ContentType = stored.ContentType
+			}
+			metadata.DockerContentDigest = cachedManifestDigest(data, manifestReference(requestPath), stored.DockerContentDigest)
+		} else if ct, err := os.ReadFile(s.manifestPath(requestPath) + ".ct"); err == nil && len(ct) > 0 {
+			metadata.ContentType = string(ct)
+		}
+	} else if ct, err := os.ReadFile(s.manifestPath(requestPath) + ".ct"); err == nil && len(ct) > 0 {
+		metadata.ContentType = string(ct)
+	}
+	return metadata
 }
 
 func (s *Server) blobPath(digest string) string {
@@ -684,4 +694,18 @@ func verifySupportedDigest(data []byte, reference string) (string, error) {
 		return "", fmt.Errorf("unsupported digest algorithm %q", algorithm)
 	}
 	return algorithm + ":" + encoded, nil
+}
+
+func cachedManifestDigest(data []byte, requestedReference, storedDigest string) string {
+	if isDigestReference(requestedReference) {
+		if canonical, err := verifySupportedDigest(data, requestedReference); err == nil {
+			return canonical
+		}
+	}
+	if storedDigest != "" {
+		if canonical, err := verifySupportedDigest(data, storedDigest); err == nil {
+			return canonical
+		}
+	}
+	return "sha256:" + manifestSHA256(data)
 }

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -1038,6 +1039,129 @@ func TestCachedManifestResponsesIncludeProtocolHeaders(t *testing.T) {
 			}
 			if string(bodyBytes) != test.wantBody {
 				t.Fatalf("body = %q, want %q", string(bodyBytes), test.wantBody)
+			}
+		})
+	}
+}
+
+func TestCachedManifestMetadataFallbackRevalidatesCurrentBytes(t *testing.T) {
+	sha512Digest := "sha512:" + sha512Hex([]byte(manifestBody))
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/app/manifests/latest":
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", "sha256:"+sha256Hex([]byte(manifestBody)))
+			_, _ = fmt.Fprint(w, manifestBody)
+		case "/v2/app/manifests/" + sha512Digest:
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", sha512Digest)
+			_, _ = fmt.Fprint(w, manifestBody)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	server := newLoopbackMirrorServer(t, upstream.URL, t.TempDir())
+	mirror := httptest.NewServer(server)
+	defer mirror.Close()
+
+	// Warm sha512 digest and tag entries.
+	_, _ = get(t, mirror.URL+"/v2/app/manifests/"+sha512Digest)
+	_, _ = get(t, mirror.URL+"/v2/app/manifests/latest")
+	server.setOfflineMode(true)
+
+	sha512Path := "/v2/app/manifests/" + sha512Digest
+	legacyTagPath := "/v2/app/manifests/latest"
+
+	tests := []struct {
+		name              string
+		path              string
+		breakMeta         func(t *testing.T)
+		wantDigest        string
+		wantContentType   string
+		wantContentLength string
+	}{
+		{
+			name: "missing meta sha512 replays requested digest",
+			path: sha512Path,
+			breakMeta: func(t *testing.T) {
+				t.Helper()
+				if err := os.Remove(server.manifestMetadataPath(sha512Path)); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantDigest:        sha512Digest,
+			wantContentType:   "application/vnd.oci.image.manifest.v1+json",
+			wantContentLength: fmt.Sprintf("%d", len(manifestBody)),
+		},
+		{
+			name: "corrupt meta falls back to ct sidecar for tag",
+			path: legacyTagPath,
+			breakMeta: func(t *testing.T) {
+				t.Helper()
+				if err := os.WriteFile(server.manifestMetadataPath(legacyTagPath), []byte("{not-json"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(server.manifestPath(legacyTagPath)+".ct", []byte("application/vnd.oci.image.manifest.v1+json"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantDigest:        "sha256:" + sha256Hex([]byte(manifestBody)),
+			wantContentType:   "application/vnd.oci.image.manifest.v1+json",
+			wantContentLength: fmt.Sprintf("%d", len(manifestBody)),
+		},
+		{
+			name: "stale meta length and digest are recomputed",
+			path: legacyTagPath,
+			breakMeta: func(t *testing.T) {
+				t.Helper()
+				stale := manifestMetadata{
+					ContentType:         "application/vnd.oci.image.manifest.v1+json",
+					ContentLength:       1,
+					DockerContentDigest: "sha256:" + strings.Repeat("1", 64),
+				}
+				raw, err := json.Marshal(stale)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(server.manifestMetadataPath(legacyTagPath), raw, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantDigest:        "sha256:" + sha256Hex([]byte(manifestBody)),
+			wantContentType:   "application/vnd.oci.image.manifest.v1+json",
+			wantContentLength: fmt.Sprintf("%d", len(manifestBody)),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			test.breakMeta(t)
+			request, err := http.NewRequest(http.MethodHead, mirror.URL+test.path, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := http.DefaultClient.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bodyBytes, err := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(bodyBytes) != 0 {
+				t.Fatalf("HEAD body = %q, want empty", string(bodyBytes))
+			}
+			if got := resp.Header.Get("Docker-Content-Digest"); got != test.wantDigest {
+				t.Fatalf("Docker-Content-Digest = %q, want %q", got, test.wantDigest)
+			}
+			if got := resp.Header.Get("Content-Type"); got != test.wantContentType {
+				t.Fatalf("Content-Type = %q, want %q", got, test.wantContentType)
+			}
+			if got := resp.Header.Get("Content-Length"); got != test.wantContentLength {
+				t.Fatalf("Content-Length = %q, want %q", got, test.wantContentLength)
 			}
 		})
 	}

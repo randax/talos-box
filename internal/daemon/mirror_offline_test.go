@@ -60,6 +60,8 @@ func TestMirrorOfflineSetRejectsMissingNullAndUnknownPayloads(t *testing.T) {
 		`{}`,
 		`{"enabled":null}`,
 		`{"enabled":true,"extra":1}`,
+		`{"enabled":true}{"enabled":false}`,
+		`{"enabled":true,"enabled":false}`,
 		`{"extra":1}`,
 		`true`,
 	} {
