@@ -175,6 +175,39 @@ func TestCiliumValuesSizeClientRateLimitForL2Announcements(t *testing.T) {
 	}
 }
 
+func TestRegistryMirrorsUsesSingleCatchAllMirrorWithSkipFallback(t *testing.T) {
+	out := RegistryMirrors(facts())
+
+	var rendered struct {
+		Machine struct {
+			Registries struct {
+				Mirrors map[string]struct {
+					Endpoints    []string `yaml:"endpoints"`
+					SkipFallback bool     `yaml:"skipFallback"`
+				} `yaml:"mirrors"`
+			} `yaml:"registries"`
+		} `yaml:"machine"`
+	}
+	if err := yaml.Unmarshal([]byte(out), &rendered); err != nil {
+		t.Fatal(err)
+	}
+
+	mirrors := rendered.Machine.Registries.Mirrors
+	if len(mirrors) != 1 {
+		t.Fatalf("mirror count = %d, want 1", len(mirrors))
+	}
+	catchAll, ok := mirrors["*"]
+	if !ok {
+		t.Fatalf("mirrors = %v, want only *", mapKeys(mirrors))
+	}
+	if len(catchAll.Endpoints) != 1 || catchAll.Endpoints[0] != "http://172.30.0.1:5059" {
+		t.Fatalf("catch-all endpoints = %v, want [http://172.30.0.1:5059]", catchAll.Endpoints)
+	}
+	if !catchAll.SkipFallback {
+		t.Fatal("catch-all mirror skipFallback = false, want true")
+	}
+}
+
 func decodeYAMLDocuments(t *testing.T, rendered string) []map[string]any {
 	t.Helper()
 	decoder := yaml.NewDecoder(strings.NewReader(rendered))
@@ -295,7 +328,7 @@ func TestSubnetValuesFlowThrough(t *testing.T) {
 		{LBPool, []string{"172.30.3.200", "172.30.3.239", "edge"}},
 		{BGPPolicy, []string{"64603", "64512", "172.30.3.1"}},
 		{CiliumValues, []string{"172.30.3.200", "qps: 10", "burst: 20"}},
-		{RegistryMirrors, []string{"http://172.30.3.1:5055", "http://172.30.3.1:5058", "registry.k8s.io"}},
+		{RegistryMirrors, []string{"http://172.30.3.1:5059", "skipFallback: true", "\"*\""}},
 		{BalloonModule, []string{"virtio_balloon"}},
 	} {
 		out := tt.render(f)

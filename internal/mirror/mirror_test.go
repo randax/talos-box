@@ -1,16 +1,20 @@
 package mirror
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 const blobDigest = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
@@ -75,10 +79,28 @@ func newFakeRegistry(t *testing.T, requireToken bool) *fakeRegistry {
 
 func startMirror(t *testing.T, f *fakeRegistry) *httptest.Server {
 	t.Helper()
-	server := NewServer(f.registry.URL, t.TempDir())
+	server := newLoopbackMirrorServer(t, f.registry.URL, t.TempDir())
 	ts := httptest.NewServer(server)
 	t.Cleanup(ts.Close)
 	return ts
+}
+
+func newLoopbackMirrorServer(t *testing.T, base, cacheDir string) *Server {
+	t.Helper()
+	dialer := &net.Dialer{}
+	return newServerWithEgress(base, cacheDir, egressDependencies{
+		resolve: func(ctx context.Context, host string) ([]net.IP, error) {
+			if ip := net.ParseIP(host); ip != nil {
+				return []net.IP{ip}, nil
+			}
+			return net.DefaultResolver.LookupIP(ctx, "ip", host)
+		},
+		hostIPs: func() ([]net.IP, error) { return nil, nil },
+		dialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return dialer.DialContext(ctx, network, address)
+		},
+		blocked: func(net.IP, []net.IP) bool { return false },
+	})
 }
 
 func get(t *testing.T, url string) (*http.Response, string) {
@@ -127,7 +149,7 @@ func TestBlobCacheSurvivesRestart(t *testing.T) {
 	f := newFakeRegistry(t, false)
 	realDigest := "sha256:" + sha256Hex([]byte("blob-bytes"))
 	dir := t.TempDir()
-	ts := httptest.NewServer(NewServer(f.registry.URL, dir))
+	ts := httptest.NewServer(newLoopbackMirrorServer(t, f.registry.URL, dir))
 	defer ts.Close()
 
 	_, body := get(t, ts.URL+"/v2/app/blobs/"+realDigest)
@@ -137,7 +159,7 @@ func TestBlobCacheSurvivesRestart(t *testing.T) {
 	hits := f.blobHits.Load()
 
 	// a NEW server over the same directory (daemon restart) must serve from disk
-	restarted := httptest.NewServer(NewServer(f.registry.URL, dir))
+	restarted := httptest.NewServer(newLoopbackMirrorServer(t, f.registry.URL, dir))
 	defer restarted.Close()
 	_, body = get(t, restarted.URL+"/v2/app/blobs/"+realDigest)
 	if body != "blob-bytes" {
@@ -163,6 +185,331 @@ func TestAnonymousTokenFlow(t *testing.T) {
 	_, _ = get(t, mirror.URL+"/v2/app/manifests/latest")
 	if f.tokenHits.Load() > 1 {
 		t.Errorf("token fetched %d times, want cached reuse", f.tokenHits.Load())
+	}
+}
+
+func TestOutboundRequestsDialValidatedIPsAndIgnoreEnvironmentProxy(t *testing.T) {
+	var upstreamHits atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		w.Header().Set("Docker-Content-Digest", "sha256:"+sha256Hex([]byte(manifestBody)))
+		_, _ = fmt.Fprint(w, manifestBody)
+	}))
+	defer upstream.Close()
+
+	var proxyHits atomic.Int64
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyHits.Add(1)
+		http.Error(w, "proxy should be ignored", http.StatusBadGateway)
+	}))
+	defer proxy.Close()
+	t.Setenv("HTTP_PROXY", proxy.URL)
+	t.Setenv("http_proxy", proxy.URL)
+
+	var resolveCalls atomic.Int64
+	var dialed atomic.Value
+	server := newServerWithEgress(
+		aliasedURL(t, upstream.URL, "registry.example"),
+		t.TempDir(),
+		egressDependencies{
+			resolve: func(context.Context, string) ([]net.IP, error) {
+				resolveCalls.Add(1)
+				return []net.IP{net.ParseIP("203.0.113.10")}, nil
+			},
+			hostIPs: func() ([]net.IP, error) { return nil, nil },
+			dialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+				dialed.Store(address)
+				return (&net.Dialer{}).DialContext(ctx, network, hostPortOfURL(t, upstream.URL))
+			},
+		},
+	)
+	mirror := httptest.NewServer(server)
+	defer mirror.Close()
+
+	resp, body := get(t, mirror.URL+"/v2/app/manifests/latest")
+	if resp.StatusCode != http.StatusOK || body != manifestBody {
+		t.Fatalf("manifest = %d %q", resp.StatusCode, body)
+	}
+	if resolveCalls.Load() != 1 {
+		t.Fatalf("resolver calls = %d, want 1", resolveCalls.Load())
+	}
+	if got := dialed.Load(); got != "203.0.113.10:"+portOfURL(t, upstream.URL) {
+		t.Fatalf("dialed address = %v, want resolved IP with upstream port", got)
+	}
+	if proxyHits.Load() != 0 {
+		t.Fatalf("proxy hits = %d, want 0", proxyHits.Load())
+	}
+	if upstreamHits.Load() != 1 {
+		t.Fatalf("upstream hits = %d, want 1", upstreamHits.Load())
+	}
+}
+
+func TestSafeEgressAllowsPublicRedirects(t *testing.T) {
+	var cdnHits atomic.Int64
+	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cdnHits.Add(1)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write([]byte("blob-bytes"))
+	}))
+	defer cdn.Close()
+
+	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v2/":
+			w.WriteHeader(http.StatusOK)
+		case strings.HasPrefix(r.URL.Path, "/v2/app/blobs/sha256:"):
+			http.Redirect(w, r, aliasedURL(t, cdn.URL, "cdn.example")+"/blob", http.StatusFound)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer registry.Close()
+
+	server := newServerWithEgress(
+		aliasedURL(t, registry.URL, "registry.example"),
+		t.TempDir(),
+		egressForRoutes(
+			aliasRoute(t, registry.URL, "registry.example", "203.0.113.10"),
+			aliasRoute(t, cdn.URL, "cdn.example", "203.0.113.20"),
+		),
+	)
+	mirror := httptest.NewServer(server)
+	defer mirror.Close()
+
+	resp, body := get(t, mirror.URL+"/v2/app/blobs/sha256:"+sha256Hex([]byte("blob-bytes")))
+	if resp.StatusCode != http.StatusOK || body != "blob-bytes" {
+		t.Fatalf("blob through public redirect = %d %q", resp.StatusCode, body)
+	}
+	if cdnHits.Load() != 1 {
+		t.Fatalf("cdn hits = %d, want 1", cdnHits.Load())
+	}
+}
+
+func TestSafeEgressBlocksLoopbackRedirects(t *testing.T) {
+	var blockedHits atomic.Int64
+	blocked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		blockedHits.Add(1)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write([]byte("blocked"))
+	}))
+	defer blocked.Close()
+
+	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, blocked.URL+"/blob", http.StatusFound)
+	}))
+	defer registry.Close()
+
+	server := newServerWithEgress(
+		aliasedURL(t, registry.URL, "registry.example"),
+		t.TempDir(),
+		egressForRoutes(
+			aliasRoute(t, registry.URL, "registry.example", "203.0.113.10"),
+			aliasRoute(t, blocked.URL, "127.0.0.1", "127.0.0.1"),
+		),
+	)
+	mirror := httptest.NewServer(server)
+	defer mirror.Close()
+
+	resp, body := get(t, mirror.URL+"/v2/app/blobs/sha256:"+sha256Hex([]byte("blob-bytes")))
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("blob through blocked redirect = %d %q, want 502", resp.StatusCode, body)
+	}
+	if blockedHits.Load() != 0 {
+		t.Fatalf("blocked redirect hits = %d, want 0", blockedHits.Load())
+	}
+}
+
+func TestSafeEgressAllowsPublicTokenRealms(t *testing.T) {
+	var tokenHits atomic.Int64
+	token := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenHits.Add(1)
+		_, _ = fmt.Fprint(w, `{"token":"secret-token"}`)
+	}))
+	defer token.Close()
+
+	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer secret-token" {
+			w.Header().Set("WWW-Authenticate",
+				fmt.Sprintf(`Bearer realm=%q,service="fake-service",scope="repository:app:pull"`, aliasedURL(t, token.URL, "token.example")))
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		w.Header().Set("Docker-Content-Digest", "sha256:"+sha256Hex([]byte(manifestBody)))
+		_, _ = fmt.Fprint(w, manifestBody)
+	}))
+	defer registry.Close()
+
+	server := newServerWithEgress(
+		aliasedURL(t, registry.URL, "registry.example"),
+		t.TempDir(),
+		egressForRoutes(
+			aliasRoute(t, registry.URL, "registry.example", "203.0.113.10"),
+			aliasRoute(t, token.URL, "token.example", "203.0.113.30"),
+		),
+	)
+	mirror := httptest.NewServer(server)
+	defer mirror.Close()
+
+	resp, body := get(t, mirror.URL+"/v2/app/manifests/latest")
+	if resp.StatusCode != http.StatusOK || body != manifestBody {
+		t.Fatalf("manifest through public token realm = %d %q", resp.StatusCode, body)
+	}
+	if tokenHits.Load() != 1 {
+		t.Fatalf("token hits = %d, want 1", tokenHits.Load())
+	}
+}
+
+func TestSafeEgressBlocksLoopbackTokenRealms(t *testing.T) {
+	var blockedHits atomic.Int64
+	blocked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		blockedHits.Add(1)
+		_, _ = fmt.Fprint(w, `{"token":"blocked-token"}`)
+	}))
+	defer blocked.Close()
+
+	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("WWW-Authenticate",
+			fmt.Sprintf(`Bearer realm=%q,service="fake-service",scope="repository:app:pull"`, blocked.URL))
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer registry.Close()
+
+	server := newServerWithEgress(
+		aliasedURL(t, registry.URL, "registry.example"),
+		t.TempDir(),
+		egressForRoutes(
+			aliasRoute(t, registry.URL, "registry.example", "203.0.113.10"),
+			aliasRoute(t, blocked.URL, "127.0.0.1", "127.0.0.1"),
+		),
+	)
+	mirror := httptest.NewServer(server)
+	defer mirror.Close()
+
+	resp, body := get(t, mirror.URL+"/v2/app/manifests/latest")
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("manifest through blocked token realm = %d %q, want 502", resp.StatusCode, body)
+	}
+	if blockedHits.Load() != 0 {
+		t.Fatalf("blocked token hits = %d, want 0", blockedHits.Load())
+	}
+}
+
+func TestGuestCancellationStopsOutboundFetchPromptly(t *testing.T) {
+	fetchStarted := make(chan struct{})
+	fetchReleased := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(fetchStarted)
+		<-r.Context().Done()
+		close(fetchReleased)
+	}))
+	defer upstream.Close()
+
+	requestContext, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	request := httptest.NewRequest(http.MethodGet, "/v2/app/manifests/latest", nil).WithContext(requestContext)
+	recorder := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		newLoopbackMirrorServer(t, upstream.URL, t.TempDir()).ServeHTTP(recorder, request)
+		close(done)
+	}()
+
+	<-fetchStarted
+	cancel()
+
+	select {
+	case <-fetchReleased:
+	case <-time.After(time.Second):
+		t.Fatal("upstream fetch did not observe guest cancellation")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("mirror request did not return promptly after fetch cancellation")
+	}
+}
+
+func TestGuestCancellationStopsRedirectFollowPromptly(t *testing.T) {
+	redirectStarted := make(chan struct{})
+	redirectReleased := make(chan struct{})
+	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(redirectStarted)
+		<-r.Context().Done()
+		close(redirectReleased)
+	}))
+	defer cdn.Close()
+
+	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, cdn.URL+"/blob", http.StatusFound)
+	}))
+	defer registry.Close()
+
+	requestContext, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	request := httptest.NewRequest(http.MethodGet, "/v2/app/blobs/sha256:"+sha256Hex([]byte("blob-bytes")), nil).WithContext(requestContext)
+	recorder := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		newLoopbackMirrorServer(t, registry.URL, t.TempDir()).ServeHTTP(recorder, request)
+		close(done)
+	}()
+
+	<-redirectStarted
+	cancel()
+
+	select {
+	case <-redirectReleased:
+	case <-time.After(time.Second):
+		t.Fatal("redirect target did not observe guest cancellation")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("mirror request did not return promptly after redirect cancellation")
+	}
+}
+
+func TestGuestCancellationStopsTokenRealmFetchPromptly(t *testing.T) {
+	tokenStarted := make(chan struct{})
+	tokenReleased := make(chan struct{})
+	token := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(tokenStarted)
+		<-r.Context().Done()
+		close(tokenReleased)
+	}))
+	defer token.Close()
+
+	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("WWW-Authenticate",
+			fmt.Sprintf(`Bearer realm=%q,service="fake-service",scope="repository:app:pull"`, token.URL))
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer registry.Close()
+
+	requestContext, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	request := httptest.NewRequest(http.MethodGet, "/v2/app/manifests/latest", nil).WithContext(requestContext)
+	recorder := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		newLoopbackMirrorServer(t, registry.URL, t.TempDir()).ServeHTTP(recorder, request)
+		close(done)
+	}()
+
+	<-tokenStarted
+	cancel()
+
+	select {
+	case <-tokenReleased:
+	case <-time.After(time.Second):
+		t.Fatal("token realm request did not observe guest cancellation")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("mirror request did not return promptly after token cancellation")
 	}
 }
 
@@ -208,7 +555,7 @@ func TestBlobIntegrityBeforeServing(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			f := newFakeRegistry(t, false)
 			dir := t.TempDir()
-			server := NewServer(f.registry.URL, dir)
+			server := newLoopbackMirrorServer(t, f.registry.URL, dir)
 			ts := httptest.NewServer(server)
 			defer ts.Close()
 
@@ -339,7 +686,7 @@ func TestManifestIntegrityBeforeCachingOrServing(t *testing.T) {
 			}))
 
 			dir := t.TempDir()
-			server := NewServer(upstream.URL, dir)
+			server := newLoopbackMirrorServer(t, upstream.URL, dir)
 			mirror := httptest.NewServer(server)
 			defer mirror.Close()
 			path := "/v2/app/manifests/" + test.requestRef
@@ -383,7 +730,7 @@ func TestManifestServedWhenCacheWriteFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
-	ts := httptest.NewServer(NewServer(f.registry.URL, dir))
+	ts := httptest.NewServer(newLoopbackMirrorServer(t, f.registry.URL, dir))
 	defer ts.Close()
 
 	resp, body := get(t, ts.URL+"/v2/app/manifests/latest")
@@ -395,7 +742,7 @@ func TestManifestServedWhenCacheWriteFails(t *testing.T) {
 func TestManifestOfflineFallback(t *testing.T) {
 	f := newFakeRegistry(t, false)
 	dir := t.TempDir()
-	ts := httptest.NewServer(NewServer(f.registry.URL, dir))
+	ts := httptest.NewServer(newLoopbackMirrorServer(t, f.registry.URL, dir))
 	defer ts.Close()
 
 	_, body := get(t, ts.URL+"/v2/app/manifests/latest")
@@ -429,4 +776,85 @@ func TestNonGetRejected(t *testing.T) {
 func sha256Hex(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
+}
+
+func aliasedURL(t *testing.T, raw, host string) string {
+	t.Helper()
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed.Host = net.JoinHostPort(host, portOfURL(t, raw))
+	return parsed.String()
+}
+
+func hostPortOfURL(t *testing.T, raw string) string {
+	t.Helper()
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parsed.Host
+}
+
+func portOfURL(t *testing.T, raw string) string {
+	t.Helper()
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parsed.Port()
+}
+
+type testRoute struct {
+	host      string
+	resolved  net.IP
+	actual    string
+	aliasBase string
+}
+
+func aliasRoute(t *testing.T, raw, host, ip string) testRoute {
+	t.Helper()
+	return testRoute{
+		host:      canonicalLookupHost(host),
+		resolved:  net.ParseIP(ip),
+		actual:    hostPortOfURL(t, raw),
+		aliasBase: aliasedURL(t, raw, host),
+	}
+}
+
+func egressForRoutes(routes ...testRoute) egressDependencies {
+	byHost := make(map[string][]net.IP, len(routes))
+	byAddress := make(map[string]string, len(routes))
+	for _, route := range routes {
+		byHost[route.host] = []net.IP{route.resolved}
+		byAddress[net.JoinHostPort(route.resolved.String(), portOfHostPort(route.actual))] = route.actual
+	}
+	dialer := &net.Dialer{}
+	return egressDependencies{
+		resolve: func(_ context.Context, host string) ([]net.IP, error) {
+			ips, ok := byHost[canonicalLookupHost(host)]
+			if !ok {
+				return nil, fmt.Errorf("unexpected host %q", host)
+			}
+			return ips, nil
+		},
+		hostIPs: func() ([]net.IP, error) { return nil, nil },
+		dialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			target, ok := byAddress[address]
+			if !ok {
+				return nil, fmt.Errorf("unexpected dial %q", address)
+			}
+			return dialer.DialContext(ctx, network, target)
+		},
+		blocked: namespaceIPBlocked,
+	}
+}
+
+func portOfHostPort(hostPort string) string {
+	_, port, err := net.SplitHostPort(hostPort)
+	if err != nil {
+		panic(err)
+	}
+	return port
 }

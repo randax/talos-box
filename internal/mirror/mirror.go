@@ -6,6 +6,7 @@ package mirror
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -13,6 +14,7 @@ import (
 	"io"
 	"log"
 	"mime"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -46,6 +48,106 @@ func NewServer(base, cacheDir string) *Server {
 		client:   &http.Client{Timeout: 5 * time.Minute},
 		tokens:   make(map[string]token),
 	}
+}
+
+func newServerWithEgress(base, cacheDir string, egress egressDependencies) *Server {
+	return &Server{
+		base:     strings.TrimSuffix(base, "/"),
+		cacheDir: cacheDir,
+		client:   &http.Client{Timeout: 5 * time.Minute, Transport: newSafeTransport(egress)},
+		tokens:   make(map[string]token),
+	}
+}
+
+type egressDependencies struct {
+	resolve     func(context.Context, string) ([]net.IP, error)
+	hostIPs     func() ([]net.IP, error)
+	dialContext func(context.Context, string, string) (net.Conn, error)
+	blocked     func(net.IP, []net.IP) bool
+}
+
+func defaultEgressDependencies() egressDependencies {
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+	return egressDependencies{
+		resolve: func(ctx context.Context, host string) ([]net.IP, error) {
+			if ip := net.ParseIP(host); ip != nil {
+				return []net.IP{ip}, nil
+			}
+			return net.DefaultResolver.LookupIP(ctx, "ip", host)
+		},
+		hostIPs: hostOwnedIPs,
+		dialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return dialer.DialContext(ctx, network, address)
+		},
+		blocked: namespaceIPBlocked,
+	}
+}
+
+func newSafeTransport(egress egressDependencies) *http.Transport {
+	var transport *http.Transport
+	if base, ok := http.DefaultTransport.(*http.Transport); ok && base != nil {
+		transport = base.Clone()
+	} else {
+		transport = &http.Transport{
+			Proxy:                 nil,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   http.DefaultMaxIdleConnsPerHost,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
+	}
+	transport.Proxy = nil
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		return dialValidatedIP(ctx, network, address, egress)
+	}
+	return transport
+}
+
+func dialValidatedIP(ctx context.Context, network, address string, egress egressDependencies) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	ips, err := egress.resolve(ctx, canonicalLookupHost(host))
+	if err != nil {
+		return nil, err
+	}
+	hostIPs, err := egress.hostIPs()
+	if err != nil {
+		return nil, err
+	}
+	var allowed []net.IP
+	blocked := egress.blocked
+	if blocked == nil {
+		blocked = namespaceIPBlocked
+	}
+	for _, ip := range ips {
+		if blocked(ip, hostIPs) {
+			continue
+		}
+		allowed = append(allowed, ip)
+	}
+	if len(allowed) == 0 {
+		return nil, fmt.Errorf("refuse upstream host %q: no public address", host)
+	}
+	var dialErr error
+	for _, ip := range allowed {
+		conn, err := egress.dialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		dialErr = err
+	}
+	return nil, dialErr
+}
+
+func canonicalLookupHost(host string) string {
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.String()
+	}
+	return strings.TrimSuffix(strings.ToLower(host), ".")
 }
 
 var (
@@ -121,6 +223,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
+func (s *Server) CloseIdleConnections() {
+	type idleCloser interface {
+		CloseIdleConnections()
+	}
+	if transport, ok := s.client.Transport.(idleCloser); ok {
+		transport.CloseIdleConnections()
+	}
+}
+
 func copyResponseHeaders(w http.ResponseWriter, resp *http.Response) {
 	for _, header := range []string{"Content-Type", "Content-Length", "Docker-Content-Digest", "Etag"} {
 		if value := resp.Header.Get(header); value != "" {
@@ -133,7 +244,7 @@ func copyResponseHeaders(w http.ResponseWriter, resp *http.Response) {
 // on a 401 challenge and following redirects (the http.Client default).
 func (s *Server) fetch(r *http.Request) (*http.Response, error) {
 	url := s.base + r.URL.RequestURI()
-	request, err := http.NewRequest(r.Method, url, nil)
+	request, err := http.NewRequestWithContext(r.Context(), r.Method, url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -154,7 +265,7 @@ func (s *Server) fetch(r *http.Request) (*http.Response, error) {
 	}
 	challenge := resp.Header.Get("WWW-Authenticate")
 	_ = resp.Body.Close()
-	bearer, err := s.negotiateToken(challenge)
+	bearer, err := s.negotiateToken(r.Context(), challenge)
 	if err != nil {
 		return nil, err
 	}
@@ -351,7 +462,7 @@ func (s *Server) blobPath(digest string) string {
 
 var challengeRe = regexp.MustCompile(`(\w+)="([^"]*)"`)
 
-func (s *Server) negotiateToken(challenge string) (string, error) {
+func (s *Server) negotiateToken(ctx context.Context, challenge string) (string, error) {
 	if !strings.HasPrefix(challenge, "Bearer ") {
 		return "", fmt.Errorf("unsupported auth challenge %q", challenge)
 	}
@@ -364,7 +475,11 @@ func (s *Server) negotiateToken(challenge string) (string, error) {
 		return "", fmt.Errorf("auth challenge without realm: %q", challenge)
 	}
 	url := fmt.Sprintf("%s?service=%s&scope=%s", realm, params["service"], params["scope"])
-	resp, err := s.client.Get(url)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := s.client.Do(request)
 	if err != nil {
 		return "", err
 	}
