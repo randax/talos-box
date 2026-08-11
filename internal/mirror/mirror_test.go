@@ -895,6 +895,54 @@ func TestOfflineModePreventsAllUncachedUpstreamWork(t *testing.T) {
 	}
 }
 
+func TestOfflineToggleDuringValidationPreventsUpstreamFetch(t *testing.T) {
+	var upstreamHits atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		w.Header().Set("Docker-Content-Digest", "sha256:"+sha256Hex([]byte(manifestBody)))
+		_, _ = fmt.Fprint(w, manifestBody)
+	}))
+	defer upstream.Close()
+
+	validationStarted := make(chan struct{})
+	releaseValidation := make(chan struct{})
+	server := newLoopbackMirrorServer(t, upstream.URL, t.TempDir())
+	server.validateUpstream = func(context.Context) error {
+		close(validationStarted)
+		<-releaseValidation
+		return nil
+	}
+	mirror := httptest.NewServer(server)
+	defer mirror.Close()
+
+	requestDone := make(chan struct{})
+	var responseStatus int
+	var responseBody string
+	go func() {
+		resp, body := get(t, mirror.URL+"/v2/app/manifests/latest")
+		responseStatus = resp.StatusCode
+		responseBody = body
+		close(requestDone)
+	}()
+
+	<-validationStarted
+	server.setOfflineMode(true)
+	close(releaseValidation)
+
+	select {
+	case <-requestDone:
+	case <-time.After(time.Second):
+		t.Fatal("request did not finish after validation release")
+	}
+	if responseStatus == http.StatusOK {
+		t.Fatalf("request unexpectedly succeeded while offline toggled during validation: %q", responseBody)
+	}
+	if upstreamHits.Load() != 0 {
+		t.Fatalf("offline toggle during validation still hit upstream: %d", upstreamHits.Load())
+	}
+}
+
 func TestCachedManifestResponsesIncludeProtocolHeaders(t *testing.T) {
 	validDigest := "sha256:" + sha256Hex([]byte(manifestBody))
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

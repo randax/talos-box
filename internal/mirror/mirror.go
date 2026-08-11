@@ -177,21 +177,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var digest string
 	if m := blobPathRe.FindStringSubmatch(r.URL.Path); m != nil {
 		digest = m[1]
-		if s.serveCachedBlob(w, r, digest) {
-			return
-		}
 	}
 	isManifest := manifestPathRe.MatchString(r.URL.Path)
-	if isManifest {
-		reference := manifestReference(r.URL.Path)
-		if isDigestReference(reference) && s.serveCachedManifest(w, r) {
-			return
-		}
+	if s.serveCacheIfAvailable(w, r, digest, isManifest) {
+		return
 	}
 	if s.offlineEnabled() {
-		if isManifest && s.serveCachedManifest(w, r) {
-			return
-		}
 		http.Error(w, "mirror offline: content not cached", http.StatusServiceUnavailable)
 		return
 	}
@@ -206,16 +197,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if isManifest {
-		reference := manifestReference(r.URL.Path)
-		if isDigestReference(reference) && s.serveCachedManifest(w, r) {
-			return
-		}
-		if s.offlineEnabled() {
-			if s.serveCachedManifest(w, r) {
-				return
-			}
-		}
+	if s.serveCacheIfAvailable(w, r, digest, isManifest) {
+		return
+	}
+	if s.offlineEnabled() {
+		http.Error(w, "mirror offline: content not cached", http.StatusServiceUnavailable)
+		return
 	}
 
 	resp, err := s.fetch(r)
@@ -262,6 +249,22 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	copyResponseHeaders(w, resp)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+func (s *Server) serveCacheIfAvailable(w http.ResponseWriter, r *http.Request, digest string, isManifest bool) bool {
+	if digest != "" && s.serveCachedBlob(w, r, digest) {
+		return true
+	}
+	if isManifest {
+		reference := manifestReference(r.URL.Path)
+		if isDigestReference(reference) && s.serveCachedManifest(w, r) {
+			return true
+		}
+		if s.offlineEnabled() && s.serveCachedManifest(w, r) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) CloseIdleConnections() {
