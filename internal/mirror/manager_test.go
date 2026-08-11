@@ -1,6 +1,7 @@
 package mirror
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -184,6 +185,9 @@ func TestLegacyMirrorPortStillServesWhenCatchAllIsBound(t *testing.T) {
 		dynamic:      map[string]http.Handler{},
 		baseOverride: f.registry.URL,
 	}
+	m.serverFactory = func(_ string, base, cacheDir string) http.Handler {
+		return newLoopbackMirrorServer(t, base, cacheDir)
+	}
 	defer m.Close()
 
 	if err := m.Bind("127.0.0.1"); err != nil {
@@ -193,6 +197,138 @@ func TestLegacyMirrorPortStillServesWhenCatchAllIsBound(t *testing.T) {
 	resp, body := get(t, fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/latest", legacyPort))
 	if resp.StatusCode != http.StatusOK || body != manifestBody {
 		t.Fatalf("legacy mirror manifest = %d %q", resp.StatusCode, body)
+	}
+}
+
+func TestCatchAllMirrorCanonicalizesAuthorities(t *testing.T) {
+	tests := []struct {
+		name          string
+		requestNS     string
+		repeatNS      string
+		wantBase      string
+		wantCacheBase string
+	}{
+		{
+			name:          "docker.io equivalent forms share canonical mapping",
+			requestNS:     "DOCKER.IO.",
+			repeatNS:      "docker.io",
+			wantBase:      "https://registry-1.docker.io",
+			wantCacheBase: "docker.io",
+		},
+		{
+			name:          "explicit port is preserved",
+			requestNS:     "docker.io:5443",
+			wantBase:      "https://registry-1.docker.io:5443",
+			wantCacheBase: "docker.io_5443",
+		},
+		{
+			name:          "ipv6 authority is bracketed and cache-safe",
+			requestNS:     "[2001:DB8::1]:5000",
+			wantBase:      "https://[2001:db8::1]:5000",
+			wantCacheBase: "2001_db8__1_5000",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			catchAllPort := freePort(t)
+			var bases []string
+			var cacheBases []string
+
+			m := newManagerWithPorts(t.TempDir(), nil, catchAllPort)
+			m.resolveUpstreamIPs = func(context.Context, string) ([]net.IP, error) {
+				return []net.IP{net.ParseIP("203.0.113.10")}, nil
+			}
+			m.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+			m.serverFactory = func(_ string, base, cacheDir string) http.Handler {
+				bases = append(bases, base)
+				cacheBases = append(cacheBases, filepath.Base(cacheDir))
+				return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(manifestBody))
+				})
+			}
+			defer m.Close()
+
+			if err := m.Bind("127.0.0.1"); err != nil {
+				t.Fatal(err)
+			}
+
+			for _, ns := range []string{test.requestNS, test.repeatNS} {
+				if ns == "" {
+					continue
+				}
+				resp, body := get(t, fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/latest?ns=%s", catchAllPort, url.QueryEscape(ns)))
+				if resp.StatusCode != http.StatusOK || body != manifestBody {
+					t.Fatalf("ns=%s -> %d %q", ns, resp.StatusCode, body)
+				}
+			}
+
+			if len(bases) != 1 {
+				t.Fatalf("serverFactory calls = %d, want 1", len(bases))
+			}
+			if bases[0] != test.wantBase {
+				t.Fatalf("base = %q, want %q", bases[0], test.wantBase)
+			}
+			if cacheBases[0] != test.wantCacheBase {
+				t.Fatalf("cache base = %q, want %q", cacheBases[0], test.wantCacheBase)
+			}
+		})
+	}
+}
+
+func TestCatchAllMirrorRejectsMalformedAuthorities(t *testing.T) {
+	catchAllPort := freePort(t)
+	m := newManagerWithPorts(t.TempDir(), nil, catchAllPort)
+	defer m.Close()
+
+	if err := m.Bind("127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, ns := range []string{
+		"http://docker.io",
+		"user@docker.io",
+		"docker.io/path",
+		"docker.io?query=yes",
+		"docker.io#fragment",
+		"docker.io:",
+		"[2001:db8::1",
+	} {
+		t.Run(ns, func(t *testing.T) {
+			resp, _ := get(t, fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/latest?ns=%s", catchAllPort, url.QueryEscape(ns)))
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status for malformed ns=%s = %d, want 400", ns, resp.StatusCode)
+			}
+		})
+	}
+}
+
+func TestCatchAllMirrorRejectsBlockedHostPortAuthorities(t *testing.T) {
+	catchAllPort := freePort(t)
+	m := newManagerWithPorts(t.TempDir(), nil, catchAllPort)
+	m.resolveUpstreamIPs = func(_ context.Context, host string) ([]net.IP, error) {
+		switch canonicalLookupHost(host) {
+		case "localhost":
+			return []net.IP{net.ParseIP("127.0.0.1")}, nil
+		default:
+			return []net.IP{net.ParseIP(canonicalLookupHost(host))}, nil
+		}
+	}
+	m.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	defer m.Close()
+
+	if err := m.Bind("127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, ns := range []string{"127.0.0.1:5000", "10.0.0.7:5000", "localhost:5000", "[::1]:5000"} {
+		t.Run(ns, func(t *testing.T) {
+			resp, _ := get(t, fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/latest?ns=%s", catchAllPort, url.QueryEscape(ns)))
+			if resp.StatusCode != http.StatusForbidden {
+				t.Fatalf("status for blocked ns=%s = %d, want 403", ns, resp.StatusCode)
+			}
+		})
 	}
 }
 

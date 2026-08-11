@@ -6,6 +6,7 @@ package mirror
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -13,6 +14,7 @@ import (
 	"io"
 	"log"
 	"mime"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -40,12 +42,94 @@ type token struct {
 // NewServer mirrors the upstream at base (scheme included), caching blobs
 // under cacheDir.
 func NewServer(base, cacheDir string) *Server {
+	return newServerWithEgress(base, cacheDir, defaultEgressDependencies())
+}
+
+func newServerWithEgress(base, cacheDir string, egress egressDependencies) *Server {
 	return &Server{
 		base:     strings.TrimSuffix(base, "/"),
 		cacheDir: cacheDir,
-		client:   &http.Client{Timeout: 5 * time.Minute},
+		client:   &http.Client{Timeout: 5 * time.Minute, Transport: newSafeTransport(egress)},
 		tokens:   make(map[string]token),
 	}
+}
+
+type egressDependencies struct {
+	resolve     func(context.Context, string) ([]net.IP, error)
+	hostIPs     func() ([]net.IP, error)
+	dialContext func(context.Context, string, string) (net.Conn, error)
+	blocked     func(net.IP, []net.IP) bool
+}
+
+func defaultEgressDependencies() egressDependencies {
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+	return egressDependencies{
+		resolve: func(ctx context.Context, host string) ([]net.IP, error) {
+			if ip := net.ParseIP(host); ip != nil {
+				return []net.IP{ip}, nil
+			}
+			return net.DefaultResolver.LookupIP(ctx, "ip", host)
+		},
+		hostIPs: hostOwnedIPs,
+		dialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return dialer.DialContext(ctx, network, address)
+		},
+		blocked: namespaceIPBlocked,
+	}
+}
+
+func newSafeTransport(egress egressDependencies) *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		return dialValidatedIP(ctx, network, address, egress)
+	}
+	return transport
+}
+
+func dialValidatedIP(ctx context.Context, network, address string, egress egressDependencies) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	ips, err := egress.resolve(ctx, canonicalLookupHost(host))
+	if err != nil {
+		return nil, err
+	}
+	hostIPs, err := egress.hostIPs()
+	if err != nil {
+		return nil, err
+	}
+	var allowed []net.IP
+	blocked := egress.blocked
+	if blocked == nil {
+		blocked = namespaceIPBlocked
+	}
+	for _, ip := range ips {
+		if blocked(ip, hostIPs) {
+			continue
+		}
+		allowed = append(allowed, ip)
+	}
+	if len(allowed) == 0 {
+		return nil, fmt.Errorf("refuse upstream host %q: no public address", host)
+	}
+	var dialErr error
+	for _, ip := range allowed {
+		conn, err := egress.dialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		dialErr = err
+	}
+	return nil, dialErr
+}
+
+func canonicalLookupHost(host string) string {
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.String()
+	}
+	return strings.TrimSuffix(strings.ToLower(host), ".")
 }
 
 var (

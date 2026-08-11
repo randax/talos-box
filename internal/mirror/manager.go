@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -33,11 +34,13 @@ func baseFor(upstream string) string {
 // ports are reachable from guests but never exposed on the host's other
 // interfaces (SPEC §5). One listener per (gateway, upstream port).
 type Manager struct {
-	cacheRoot     string
-	ports         []portBinding
-	catchAllPort  int
-	baseOverride  string // tests only: point every upstream at one fake registry
-	serverFactory func(upstream, base, cacheDir string) http.Handler
+	cacheRoot          string
+	ports              []portBinding
+	catchAllPort       int
+	baseOverride       string // tests only: point every upstream at one fake registry
+	serverFactory      func(upstream, base, cacheDir string) http.Handler
+	resolveUpstreamIPs func(context.Context, string) ([]net.IP, error)
+	hostOwnedIPs       func() ([]net.IP, error)
 
 	mu      sync.Mutex
 	bound   map[string][]*http.Server // gateway IP -> its servers
@@ -58,6 +61,10 @@ func newManagerWithPorts(cacheRoot string, ports []portBinding, catchAllPort int
 		cacheRoot:    cacheRoot,
 		ports:        ports,
 		catchAllPort: catchAllPort,
+		resolveUpstreamIPs: func(_ context.Context, host string) ([]net.IP, error) {
+			return lookupNamespaceIPs(host)
+		},
+		hostOwnedIPs: hostOwnedIPs,
 		bound:        map[string][]*http.Server{},
 		dynamic:      map[string]http.Handler{},
 	}
@@ -146,39 +153,97 @@ func DefaultDir(cacheRoot string) string {
 }
 
 func (m *Manager) serveCatchAll(w http.ResponseWriter, r *http.Request) {
-	upstream := strings.TrimSpace(r.URL.Query().Get("ns"))
-	if upstream == "" {
-		http.Error(w, "missing ns query parameter", http.StatusBadRequest)
+	authority, err := parseUpstreamAuthority(strings.TrimSpace(r.URL.Query().Get("ns")))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := validateUpstreamNamespace(upstream); err != nil {
+	if err := m.validateResolvedAuthority(authority); err != nil {
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
-
-	handler := m.handlerForUpstream(upstream)
+	handler := m.handlerForUpstream(authority)
 	clone := r.Clone(r.Context())
 	clone.URL = cloneURLWithoutQueryValue(r.URL, "ns")
 	handler.ServeHTTP(w, clone)
 }
 
-func (m *Manager) handlerForUpstream(upstream string) http.Handler {
+type upstreamAuthority struct {
+	cacheKey           string
+	canonicalHost      string
+	canonicalAuthority string
+	base               string
+}
+
+func parseUpstreamAuthority(raw string) (upstreamAuthority, error) {
+	if raw == "" {
+		return upstreamAuthority{}, fmt.Errorf("missing ns query parameter")
+	}
+	if strings.Contains(raw, "://") || strings.ContainsAny(raw, "/?#@") {
+		return upstreamAuthority{}, fmt.Errorf("malformed ns authority %q", raw)
+	}
+	host, port, err := splitAuthorityHostPort(raw)
+	if err != nil {
+		return upstreamAuthority{}, fmt.Errorf("malformed ns authority %q", raw)
+	}
+	canonicalHost, err := canonicalizeAuthorityHost(host)
+	if err != nil {
+		return upstreamAuthority{}, fmt.Errorf("malformed ns authority %q", raw)
+	}
+	baseHost := canonicalHost
+	if canonicalHost == "docker.io" {
+		baseHost = "registry-1.docker.io"
+	}
+	urlHost := canonicalURLHost(baseHost, port)
+	canonicalAuthority := canonicalHost
+	if port != "" {
+		canonicalAuthority = net.JoinHostPort(canonicalHost, port)
+		if strings.Contains(canonicalHost, ":") {
+			canonicalAuthority = "[" + canonicalHost + "]:" + port
+		}
+	}
+	return upstreamAuthority{
+		cacheKey:           safeCacheKey(canonicalHost, port),
+		canonicalHost:      canonicalHost,
+		canonicalAuthority: canonicalAuthority,
+		base:               "https://" + urlHost,
+	}, nil
+}
+
+func (m *Manager) validateResolvedAuthority(authority upstreamAuthority) error {
+	ips, err := m.resolveUpstreamIPs(context.Background(), authority.canonicalHost)
+	if err != nil {
+		return fmt.Errorf("resolve ns %q: %w", authority.canonicalAuthority, err)
+	}
+	hostIPs, err := m.hostOwnedIPs()
+	if err != nil {
+		return fmt.Errorf("inspect host addresses: %w", err)
+	}
+	for _, ip := range ips {
+		if namespaceIPBlocked(ip, hostIPs) {
+			return fmt.Errorf("refuse ns %q: address %s is not public", authority.canonicalAuthority, ip.String())
+		}
+	}
+	return nil
+}
+
+func (m *Manager) handlerForUpstream(authority upstreamAuthority) http.Handler {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if handler, ok := m.dynamic[upstream]; ok {
+	if handler, ok := m.dynamic[authority.cacheKey]; ok {
 		return handler
 	}
 
-	base := baseFor(upstream)
+	base := authority.base
 	if m.baseOverride != "" {
 		base = m.baseOverride
 	}
-	cacheDir := filepath.Join(m.cacheRoot, upstream)
+	cacheDir := filepath.Join(m.cacheRoot, authority.cacheKey)
 	handler := http.Handler(NewServer(base, cacheDir))
 	if m.serverFactory != nil {
-		handler = m.serverFactory(upstream, base, cacheDir)
+		handler = m.serverFactory(authority.canonicalAuthority, base, cacheDir)
 	}
-	m.dynamic[upstream] = handler
+	m.dynamic[authority.cacheKey] = handler
 	return handler
 }
 
@@ -190,21 +255,94 @@ func cloneURLWithoutQueryValue(source *url.URL, key string) *url.URL {
 	return &clone
 }
 
-func validateUpstreamNamespace(upstream string) error {
-	ips, err := lookupNamespaceIPs(upstream)
-	if err != nil {
-		return fmt.Errorf("resolve ns %q: %w", upstream, err)
-	}
-	hostIPs, err := hostOwnedIPs()
-	if err != nil {
-		return fmt.Errorf("inspect host addresses: %w", err)
-	}
-	for _, ip := range ips {
-		if namespaceIPBlocked(ip, hostIPs) {
-			return fmt.Errorf("refuse ns %q: address %s is not public", upstream, ip.String())
+func splitAuthorityHostPort(raw string) (string, string, error) {
+	if strings.HasPrefix(raw, "[") {
+		end := strings.Index(raw, "]")
+		if end == -1 {
+			return "", "", fmt.Errorf("missing ]")
 		}
+		host := raw[1:end]
+		if end == len(raw)-1 {
+			return host, "", nil
+		}
+		if raw[end+1] != ':' {
+			return "", "", fmt.Errorf("unexpected suffix")
+		}
+		port := raw[end+2:]
+		if err := validatePort(port); err != nil {
+			return "", "", err
+		}
+		return host, port, nil
+	}
+	if addr := net.ParseIP(raw); addr != nil {
+		return addr.String(), "", nil
+	}
+	if host, port, err := net.SplitHostPort(raw); err == nil {
+		if err := validatePort(port); err != nil {
+			return "", "", err
+		}
+		return host, port, nil
+	}
+	if strings.HasSuffix(raw, ":") {
+		return "", "", fmt.Errorf("missing port")
+	}
+	return raw, "", nil
+}
+
+func validatePort(port string) error {
+	if port == "" {
+		return fmt.Errorf("missing port")
+	}
+	value, err := strconv.Atoi(port)
+	if err != nil || value < 1 || value > 65535 {
+		return fmt.Errorf("invalid port")
 	}
 	return nil
+}
+
+func canonicalizeAuthorityHost(host string) (string, error) {
+	if host == "" || strings.ContainsAny(host, " \t\r\n") {
+		return "", fmt.Errorf("invalid host")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.String(), nil
+	}
+	canonical := strings.TrimSuffix(strings.ToLower(host), ".")
+	if canonical == "" || strings.Contains(canonical, "..") || strings.Contains(canonical, ":") {
+		return "", fmt.Errorf("invalid host")
+	}
+	return canonical, nil
+}
+
+func canonicalURLHost(host, port string) string {
+	if port != "" {
+		return net.JoinHostPort(host, port)
+	}
+	if strings.Contains(host, ":") {
+		return "[" + host + "]"
+	}
+	return host
+}
+
+func safeCacheKey(host, port string) string {
+	var b strings.Builder
+	for _, r := range host {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '.' || r == '-' || r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	if port != "" {
+		b.WriteByte('_')
+		b.WriteString(port)
+	}
+	return b.String()
 }
 
 func lookupNamespaceIPs(host string) ([]net.IP, error) {
