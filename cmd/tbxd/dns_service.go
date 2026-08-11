@@ -7,52 +7,91 @@ import (
 	"net"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/helper"
 )
 
-// clusterDomainSource serves the live cluster domain set for the DNS
-// authority predicate, retaining the last good read: a transient state error
-// must never shrink the set, or queries for live custom domains would be
-// forwarded to the upstream resolver (leaking names, or answering from real
-// DNS for unsafe domains). Until the first successful read it fails closed
-// with the "*" sentinel, which Authority treats as claiming every name.
+// clusterDomainSource maintains an in-memory snapshot of the cluster domain
+// set for the DNS authority predicate, so answering a query never touches
+// disk. refresh() reads state (retaining the last good set on error — a
+// transient state error must never shrink the set, or queries for live
+// custom domains would be forwarded to the upstream resolver, leaking names
+// or answering from real DNS for unsafe domains). Until the first successful
+// refresh, snapshot() fails closed with the "*" sentinel, which Authority
+// treats as claiming every name.
 type clusterDomainSource struct {
+	list func() ([]cluster.Cluster, error)
+
 	mu       sync.Mutex
 	last     []string
 	everRead bool
 }
 
-// newPrimedDomainSource loads the initial domain set before DNS starts, so
-// the cache is normally populated for the first queries after startup.
-func newPrimedDomainSource() *clusterDomainSource {
-	source := &clusterDomainSource{}
-	source.domains()
-	return source
+func newClusterDomainSource(list func() ([]cluster.Cluster, error)) *clusterDomainSource {
+	return &clusterDomainSource{list: list}
 }
 
-func (s *clusterDomainSource) domains() []string {
-	// The state read happens under the lock so two overlapping refreshes
-	// cannot store out of order and regress the set to an older read.
+// snapshot returns the current domain set without any IO.
+func (s *clusterDomainSource) snapshot() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	clusters, err := cluster.List()
+	if !s.everRead {
+		return []string{"*"}
+	}
+	return s.last
+}
+
+// refresh re-reads cluster state into the snapshot. The read happens under
+// the lock so two overlapping refreshes cannot store out of order and
+// regress the set to an older read.
+func (s *clusterDomainSource) refresh() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	clusters, err := s.list()
 	if err != nil {
 		if !s.everRead {
 			log.Printf("DNS state has never been readable; answering all queries locally: %v", err)
-			return []string{"*"}
+			return
 		}
 		log.Printf("DNS state refresh failed; keeping last-known domain set: %v", err)
-		return s.last
+		return
 	}
 	domains := make([]string, 0, len(clusters))
 	for _, item := range clusters {
 		domains = append(domains, item.EffectiveDomain())
 	}
 	s.last, s.everRead = domains, true
-	return domains
 }
+
+// refreshEvery keeps the snapshot fresh in the background until the returned
+// stop function is called.
+func (s *clusterDomainSource) refreshEvery(interval time.Duration) func() {
+	ticker := time.NewTicker(interval)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				s.refresh()
+			}
+		}
+	}()
+	return func() {
+		ticker.Stop()
+		close(stop)
+		<-done
+	}
+}
+
+// domainRefreshEvery is the background cadence for the authority snapshot; a
+// created or destroyed cluster's domain is authoritative within this bound.
+const domainRefreshEvery = time.Second
 
 type daemonDNSService interface {
 	Errors() <-chan error

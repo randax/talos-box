@@ -1,13 +1,62 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net"
+	"reflect"
 	"testing"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/helper"
 )
+
+func TestDomainSourceSnapshotDoesNoIO(t *testing.T) {
+	t.Parallel()
+
+	listCalls := 0
+	source := newClusterDomainSource(func() ([]cluster.Cluster, error) {
+		listCalls++
+		return []cluster.Cluster{{Name: "demo"}, {Name: "lab", Domain: "lab.internal"}}, nil
+	})
+
+	// Until the first successful refresh the source fails closed.
+	if got := source.snapshot(); !reflect.DeepEqual(got, []string{"*"}) {
+		t.Fatalf("snapshot before refresh = %v, want [*]", got)
+	}
+
+	source.refresh()
+	want := []string{"demo.k8s.test", "lab.internal"}
+	if got := source.snapshot(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("snapshot = %v, want %v", got, want)
+	}
+	if listCalls != 1 {
+		t.Fatalf("list calls = %d, want 1 (snapshot must not read state)", listCalls)
+	}
+	source.snapshot()
+	source.snapshot()
+	if listCalls != 1 {
+		t.Fatalf("list calls = %d after repeated snapshots, want 1", listCalls)
+	}
+}
+
+func TestDomainSourceRetainsLastKnownOnRefreshError(t *testing.T) {
+	t.Parallel()
+
+	fail := false
+	source := newClusterDomainSource(func() ([]cluster.Cluster, error) {
+		if fail {
+			return nil, errors.New("state unreadable")
+		}
+		return []cluster.Cluster{{Name: "demo"}}, nil
+	})
+	source.refresh()
+	fail = true
+	source.refresh()
+	if got := source.snapshot(); !reflect.DeepEqual(got, []string{"demo.k8s.test"}) {
+		t.Fatalf("snapshot after failed refresh = %v, want last-known [demo.k8s.test]", got)
+	}
+}
 
 func TestDNSReconcilerAddsReassertsAndRemovesClusterListeners(t *testing.T) {
 	t.Parallel()
