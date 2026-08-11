@@ -311,7 +311,7 @@ func (s *Server) serveCacheIfAvailable(w http.ResponseWriter, r *http.Request, d
 	}
 	if isManifest {
 		if shouldRefreshManifest(r.Context()) {
-			return false
+			return false, nil
 		}
 		reference := manifestReference(r.URL.Path)
 		if isDigestReference(reference) {
