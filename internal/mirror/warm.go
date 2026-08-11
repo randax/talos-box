@@ -128,22 +128,22 @@ func warmManifestGraph(ctx context.Context, handler http.Handler, server *Server
 	if err != nil {
 		return err
 	}
-	if kind == "manifest" {
-		for _, blob := range blobs {
-			if seenBlobs[blob] {
-				continue
-			}
-			seenBlobs[blob] = true
-			cachedBefore := blobCached(server, blob)
-			if err := warmBlobRequest(ctx, handler, repository, blob); err != nil {
-				return err
-			}
-			if !cachedBefore {
+		if kind == "manifest" {
+			for _, blob := range blobs {
+				if seenBlobs[blob] {
+					continue
+				}
+				seenBlobs[blob] = true
+				if blobCached(server, blob) {
+					continue
+				}
+				if err := warmBlobRequest(ctx, handler, repository, blob); err != nil {
+					return err
+				}
 				result.AlreadyComplete = false
 			}
+			return nil
 		}
-		return nil
-	}
 
 	matchedHost := false
 	for _, child := range children {
@@ -247,7 +247,7 @@ func warmManifestRequest(ctx context.Context, handler http.Handler, server *Serv
 
 func warmBlobRequest(ctx context.Context, handler http.Handler, repository, digest string) error {
 	path := "/v2/" + repository + "/blobs/" + digest
-	request := httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx)
+	request := httptest.NewRequest(http.MethodGet, path, nil).WithContext(withWarmBlob(ctx))
 	recorder := newDiscardWarmResponse()
 	handler.ServeHTTP(recorder, request)
 	if recorder.status != http.StatusOK {

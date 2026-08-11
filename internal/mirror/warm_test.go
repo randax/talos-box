@@ -430,6 +430,35 @@ func TestWarmBlobRequestDiscardsResponseBody(t *testing.T) {
 	}
 }
 
+func TestWarmManifestGraphSkipsAlreadyCachedBlobs(t *testing.T) {
+	configDigest := "sha256:" + sha256Hex([]byte("config"))
+	manifestBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"%s"},"layers":[]}`, configDigest)
+	server := NewServer("https://registry.example", t.TempDir())
+	if err := os.MkdirAll(filepath.Dir(server.blobPath(configDigest)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(server.blobPath(configDigest), []byte("cached"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	handlerCalls := 0
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handlerCalls++
+		t.Fatalf("warm should not hit handler for cached blob path %s", r.URL.Path)
+	})
+
+	result := &WarmResult{Ref: "registry.example/demo:1.0.0", AlreadyComplete: true}
+	if err := warmManifestGraph(context.Background(), handler, server, "demo", []byte(manifestBody), string(imagecache.ArchitectureAMD64), map[string]bool{}, map[string]bool{}, result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.AlreadyComplete {
+		t.Fatal("cached blob should keep warm result already-complete")
+	}
+	if handlerCalls != 0 {
+		t.Fatalf("handler calls = %d, want 0", handlerCalls)
+	}
+}
+
 func TestDiscardWarmResponseWriteReturnsOriginalLengthAndCapsBuffer(t *testing.T) {
 	response := newDiscardWarmResponse()
 	response.WriteHeader(http.StatusBadGateway)

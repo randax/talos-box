@@ -164,6 +164,7 @@ var (
 type manifestRefreshKey struct{}
 type manifestValidationReferenceKey struct{}
 type stagedManifestKey struct{}
+type warmBlobKey struct{}
 
 func withManifestRefresh(ctx context.Context) context.Context {
 	return context.WithValue(ctx, manifestRefreshKey{}, true)
@@ -198,6 +199,15 @@ func withStagedManifest(ctx context.Context, staged *stagedManifest) context.Con
 func stagedManifestFromContext(ctx context.Context) *stagedManifest {
 	staged, _ := ctx.Value(stagedManifestKey{}).(*stagedManifest)
 	return staged
+}
+
+func withWarmBlob(ctx context.Context) context.Context {
+	return context.WithValue(ctx, warmBlobKey{}, true)
+}
+
+func shouldSkipWarmBlobReplay(ctx context.Context) bool {
+	value, _ := ctx.Value(warmBlobKey{}).(bool)
+	return value
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -265,15 +275,20 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method == http.MethodGet && resp.StatusCode == http.StatusOK {
 		switch {
-		case digest != "":
-			if err := s.cacheBlob(resp.Body, digest); err != nil {
-				http.Error(w, fmt.Sprintf("upstream blob %s: %v", responseURL(resp, s.base+r.URL.RequestURI()), err), http.StatusBadGateway)
-				return
-			}
-			copyResponseHeaders(w, resp)
-			if !s.serveCachedBlob(w, r, digest) {
-				http.Error(w, "serve verified blob: cached file unavailable", http.StatusInternalServerError)
-			}
+			case digest != "":
+				if err := s.cacheBlob(resp.Body, digest); err != nil {
+					http.Error(w, fmt.Sprintf("upstream blob %s: %v", responseURL(resp, s.base+r.URL.RequestURI()), err), http.StatusBadGateway)
+					return
+				}
+				if shouldSkipWarmBlobReplay(r.Context()) {
+					w.Header().Set("Docker-Content-Digest", digest)
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				copyResponseHeaders(w, resp)
+				if !s.serveCachedBlob(w, r, digest) {
+					http.Error(w, "serve verified blob: cached file unavailable", http.StatusInternalServerError)
+				}
 			return
 		case isManifest:
 			data, metadata, err := validateManifest(resp, manifestValidationReference(r.Context(), manifestReference(r.URL.Path)))

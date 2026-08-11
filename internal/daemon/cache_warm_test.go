@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/randax/talos-box/internal/hypervisor"
 	"github.com/randax/talos-box/internal/imagecache"
 )
 
@@ -36,6 +38,35 @@ func TestCacheWarmRejectsUnpinnedRefsBeforeStartingWarm(t *testing.T) {
 				t.Fatalf("cache.warm accepted invalid refs %v", refs)
 			}
 		})
+	}
+}
+
+func TestCacheWarmUsesBoundedContext(t *testing.T) {
+	t.Parallel()
+
+	service := &Server{
+		hypervisor: &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
+		warmCache: func(ctx context.Context, refs []string, architecture imagecache.Architecture) (CacheWarmResult, error) {
+			deadline, ok := ctx.Deadline()
+			if !ok {
+				t.Fatal("warmCache context has no deadline")
+			}
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				t.Fatalf("warmCache deadline already expired: %s", remaining)
+			}
+			if remaining > cacheWarmTimeout {
+				t.Fatalf("warmCache deadline too far out: %s > %s", remaining, cacheWarmTimeout)
+			}
+			return CacheWarmResult{}, nil
+		},
+	}
+
+	if _, err := service.handle(Request{
+		Op:   "cache.warm",
+		Args: mustWarmArgs(t, CacheWarmArgs{Refs: []string{"docker.io/library/nginx:1.27.0"}}),
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 
