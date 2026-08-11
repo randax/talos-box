@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -172,6 +173,18 @@ func (m *Manager) BoundGatewayCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.bound)
+}
+
+// BoundGatewayIPs reports the currently bound gateway IPs as a sorted copy.
+func (m *Manager) BoundGatewayIPs() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	gateways := make([]string, 0, len(m.bound))
+	for gateway := range m.bound {
+		gateways = append(gateways, gateway)
+	}
+	sort.Strings(gateways)
+	return gateways
 }
 
 // DefaultDir is the mirror cache root under the talosbox cache.

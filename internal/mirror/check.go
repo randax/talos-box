@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +15,8 @@ import (
 
 	"github.com/randax/talos-box/internal/imagecache"
 )
+
+const maxCachedManifestSidecarBytes = 1 << 20
 
 type CheckSummary struct {
 	Results  []CheckResult
@@ -140,7 +143,7 @@ func checkCachedManifest(ctx context.Context, server *Server, requestPath, expec
 		}
 		return nil, "", fmt.Errorf("%s invalid: %w", requestPath, err)
 	}
-	resolvedDigest := server.cachedManifestMetadata(requestPath, data).DockerContentDigest
+	resolvedDigest := checkedCachedManifestMetadata(server, requestPath, data).DockerContentDigest
 	if expectedDigest != "" {
 		canonical, err := verifySupportedDigest(data, expectedDigest)
 		if err != nil {
@@ -168,32 +171,28 @@ func checkCachedBlob(ctx context.Context, server *Server, digest string, deep bo
 		return fmt.Errorf("blob %s invalid: %w", digest, err)
 	}
 	path := server.blobPath(digest)
-	info, err := os.Lstat(path)
+	file, _, err := openCheckedRegularFile(path, nil)
 	if err != nil {
 		return fmt.Errorf("blob %s not cached", digest)
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return fmt.Errorf("blob %s incomplete", digest)
-	}
+	defer func() { _ = file.Close() }()
 	if !deep {
 		return nil
 	}
-	if err := verifyBlobFile(path, digest); err != nil {
+	if err := verifyBlobFile(file, digest); err != nil {
 		return fmt.Errorf("blob %s corrupted: %w", digest, err)
 	}
 	return nil
 }
 
-func verifyBlobFile(path, digest string) error {
+func verifyBlobFile(file *os.File, digest string) error {
 	algorithm, encoded, err := checkedSupportedDigest(digest)
 	if err != nil {
 		return err
 	}
-	file, err := os.Open(path)
-	if err != nil {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	defer func() { _ = file.Close() }()
 
 	switch algorithm {
 	case "sha256":
@@ -241,29 +240,75 @@ func checkedSupportedDigest(reference string) (string, string, error) {
 }
 
 func checkedCachedManifestBytes(server *Server, requestPath string) ([]byte, error) {
-	path := server.manifestPath(requestPath)
-	info, err := os.Lstat(path)
-	if err != nil {
-		return nil, err
+	return readCheckedRegularFile(server.manifestPath(requestPath), maxManifestBytes, nil)
+}
+
+func checkedCachedManifestMetadata(server *Server, requestPath string, data []byte) manifestMetadata {
+	metadata := manifestMetadata{
+		ContentType:         "application/vnd.oci.image.manifest.v1+json",
+		ContentLength:       int64(len(data)),
+		DockerContentDigest: cachedManifestDigest(data, manifestReference(requestPath), ""),
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("cached manifest is not a regular file")
+	if rawMetadata, err := readCheckedRegularFile(server.manifestMetadataPath(requestPath), maxCachedManifestSidecarBytes, nil); err == nil {
+		var stored manifestMetadata
+		if json.Unmarshal(rawMetadata, &stored) == nil {
+			if stored.ContentType != "" {
+				metadata.ContentType = stored.ContentType
+			}
+			metadata.DockerContentDigest = cachedManifestDigest(data, manifestReference(requestPath), stored.DockerContentDigest)
+			return metadata
+		}
 	}
-	if info.Size() > maxManifestBytes {
-		return nil, fmt.Errorf("cached manifest exceeds %d bytes", maxManifestBytes)
+	if ct, err := readCheckedRegularFile(server.manifestPath(requestPath)+".ct", maxCachedManifestSidecarBytes, nil); err == nil && len(ct) > 0 {
+		metadata.ContentType = string(ct)
 	}
+	return metadata
+}
+
+func openCheckedRegularFile(path string, afterOpen func()) (*os.File, os.FileInfo, error) {
 	file, err := os.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	if afterOpen != nil {
+		afterOpen()
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, nil, err
+	}
+	pathInfo, err := os.Lstat(path)
+	if err != nil {
+		_ = file.Close()
+		return nil, nil, err
+	}
+	if pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() || !info.Mode().IsRegular() {
+		_ = file.Close()
+		return nil, nil, fmt.Errorf("cached file is not a regular file")
+	}
+	if !os.SameFile(info, pathInfo) {
+		_ = file.Close()
+		return nil, nil, fmt.Errorf("cached file changed during open")
+	}
+	return file, info, nil
+}
+
+func readCheckedRegularFile(path string, maxBytes int64, afterOpen func()) ([]byte, error) {
+	file, info, err := openCheckedRegularFile(path, afterOpen)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = file.Close() }()
-
-	data, err := io.ReadAll(io.LimitReader(file, maxManifestBytes+1))
+	if info.Size() > maxBytes {
+		return nil, fmt.Errorf("cached manifest exceeds %d bytes", maxBytes)
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
 	if err != nil {
 		return nil, err
 	}
-	if len(data) > maxManifestBytes {
-		return nil, fmt.Errorf("cached manifest exceeds %d bytes", maxManifestBytes)
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("cached manifest exceeds %d bytes", maxBytes)
 	}
 	return data, nil
 }

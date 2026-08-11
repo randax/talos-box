@@ -381,8 +381,9 @@ func TestRunDoctorIncludesMirrorHealth(t *testing.T) {
 	}
 	deps.listCache = func() (daemon.CacheListResult, error) {
 		return daemon.CacheListResult{
-			MirrorServing:       true,
-			MirrorBoundGateways: 1,
+			MirrorServing:         true,
+			MirrorBoundGateways:   1,
+			MirrorBoundGatewayIPs: []string{"172.30.3.1"},
 			MirrorTotal: daemon.MirrorCacheTotals{
 				BlobCount:     2,
 				BlobBytes:     20,
@@ -396,7 +397,7 @@ func TestRunDoctorIncludesMirrorHealth(t *testing.T) {
 	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
 		t.Fatalf("runDoctorWithDependencies() = %v", err)
 	}
-	if !strings.Contains(output.String(), "PASS mirror-health: mirror serving on 1 gateway(s), cache 27 bytes (2 blob(s), 1 manifest(s))") {
+	if !strings.Contains(output.String(), "PASS mirror-health: mirror serving on 1 gateway(s) [172.30.3.1], cache 27 bytes (2 blob(s), 1 manifest(s))") {
 		t.Fatalf("output missing mirror health line:\n%s", output.String())
 	}
 }
@@ -466,7 +467,7 @@ func TestRunDoctorFailsMirrorHealthWhenClusterIsRunningButNotBound(t *testing.T)
 	if err == nil {
 		t.Fatal("runDoctorWithDependencies() succeeded despite missing mirror listeners")
 	}
-	if !strings.Contains(output.String(), "FAIL mirror-health: no mirror listeners bound for running cluster(s); cache 27 bytes (2 blob(s), 1 manifest(s))") {
+	if !strings.Contains(output.String(), "FAIL mirror-health: no mirror listeners bound for running cluster(s); expected [172.30.3.1]; cache 27 bytes (2 blob(s), 1 manifest(s))") {
 		t.Fatalf("output missing mirror health line:\n%s", output.String())
 	}
 }
@@ -500,8 +501,9 @@ func TestRunDoctorFailsMirrorHealthWhenOnlySomeRunningClustersAreBound(t *testin
 	}
 	deps.listCache = func() (daemon.CacheListResult, error) {
 		return daemon.CacheListResult{
-			MirrorServing:       true,
-			MirrorBoundGateways: 1,
+			MirrorServing:         true,
+			MirrorBoundGateways:   1,
+			MirrorBoundGatewayIPs: []string{"172.30.3.1"},
 			MirrorTotal: daemon.MirrorCacheTotals{
 				BlobCount:     2,
 				BlobBytes:     20,
@@ -516,8 +518,50 @@ func TestRunDoctorFailsMirrorHealthWhenOnlySomeRunningClustersAreBound(t *testin
 	if err == nil {
 		t.Fatal("runDoctorWithDependencies() succeeded despite partial mirror listener coverage")
 	}
-	if !strings.Contains(output.String(), "FAIL mirror-health: mirror listeners bound for 1 of 2 running cluster(s); cache 27 bytes (2 blob(s), 1 manifest(s))") {
+	if !strings.Contains(output.String(), "FAIL mirror-health: mirror listeners bound on [172.30.3.1], expected [172.30.3.1 172.30.4.1]; cache 27 bytes (2 blob(s), 1 manifest(s))") {
 		t.Fatalf("output missing partial mirror health line:\n%s", output.String())
+	}
+}
+
+func TestRunDoctorFailsMirrorHealthWhenBoundGatewayIPIsWrong(t *testing.T) {
+	deps := passingDoctorDependencies()
+	deps.listClusters = func() ([]daemon.ClusterSummary, error) {
+		return []daemon.ClusterSummary{{Name: "demo", SubnetIndex: 3, Running: true}}, nil
+	}
+	deps.getStatus = func() ([]daemon.ClusterStatus, error) {
+		return []daemon.ClusterStatus{{Name: "demo", Running: true, Nodes: []daemon.NodeStatus{{Name: "demo-cp-1", IP: "172.30.3.2"}}}}, nil
+	}
+	deps.command = func(name string, args ...string) ([]byte, error) {
+		switch name {
+		case "/usr/bin/dscacheutil":
+			return []byte("ip_address: 172.30.3.200\n"), nil
+		case "/sbin/route":
+			return []byte("interface: bridge100\n"), nil
+		default:
+			return nil, nil
+		}
+	}
+	deps.listCache = func() (daemon.CacheListResult, error) {
+		return daemon.CacheListResult{
+			MirrorServing:         true,
+			MirrorBoundGateways:   1,
+			MirrorBoundGatewayIPs: []string{"172.30.99.1"},
+			MirrorTotal: daemon.MirrorCacheTotals{
+				BlobCount:     2,
+				BlobBytes:     20,
+				ManifestCount: 1,
+				ManifestBytes: 7,
+			},
+		}, nil
+	}
+
+	var output strings.Builder
+	err := (cli{out: &output}).runDoctorWithDependencies(nil, deps)
+	if err == nil {
+		t.Fatal("runDoctorWithDependencies() succeeded despite wrong mirror binding")
+	}
+	if !strings.Contains(output.String(), "FAIL mirror-health: mirror listeners bound on [172.30.99.1], expected [172.30.3.1]; cache 27 bytes (2 blob(s), 1 manifest(s))") {
+		t.Fatalf("output missing wrong-ip mirror health line:\n%s", output.String())
 	}
 }
 
