@@ -322,6 +322,98 @@ func TestWarmTagAndTagAtDigestWithoutDigestHeaderUseValidatedCanonicalDigest(t *
 	}
 }
 
+func TestWarmDigestAndTagAtDigestRejectBadDigestHeaders(t *testing.T) {
+	tagManifest := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"%s"},"layers":[]}`, "sha256:"+sha256Hex([]byte("config")))
+	tagDigest := "sha256:" + sha256Hex([]byte(tagManifest))
+	pinnedManifest := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"%s"},"layers":[]}`, "sha512:"+sha512Hex([]byte("config")))
+	pinnedDigest := "sha512:" + sha512Hex([]byte(pinnedManifest))
+
+	var corrupt atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/demo/manifests/stable":
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			if corrupt.Load() {
+				w.Header().Set("Docker-Content-Digest", "sha256:"+strings.Repeat("1", 64))
+			} else {
+				w.Header().Set("Docker-Content-Digest", tagDigest)
+			}
+			_, _ = fmt.Fprint(w, tagManifest)
+		case "/v2/demo/manifests/v2.0.0":
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			if corrupt.Load() {
+				w.Header().Set("Docker-Content-Digest", "sha512:not-hex")
+			}
+			_, _ = fmt.Fprint(w, pinnedManifest)
+		case "/v2/demo/manifests/" + tagDigest:
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", tagDigest)
+			_, _ = fmt.Fprint(w, tagManifest)
+		case "/v2/demo/manifests/" + pinnedDigest:
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			if corrupt.Load() {
+				w.Header().Set("Docker-Content-Digest", "sha512:not-hex")
+			} else {
+				w.Header().Set("Docker-Content-Digest", pinnedDigest)
+			}
+			_, _ = fmt.Fprint(w, pinnedManifest)
+		case "/v2/demo/blobs/sha256:" + sha256Hex([]byte("config")):
+			_, _ = io.WriteString(w, "config")
+		case "/v2/demo/blobs/sha512:" + sha512Hex([]byte("config")):
+			_, _ = io.WriteString(w, "config")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	manager := newManagerWithPorts(t.TempDir(), nil, freePort(t))
+	manager.baseOverride = aliasedURL(t, upstream.URL, "registry.example")
+	egress := egressForRoutes(aliasRoute(t, upstream.URL, "registry.example", "203.0.113.10"))
+	manager.resolveUpstreamIPs = egress.resolve
+	manager.hostOwnedIPs = egress.hostIPs
+	manager.dialContext = egress.dialContext
+	defer manager.Close()
+
+	if summary, err := manager.Warm(context.Background(), []string{
+		"registry.example/demo:stable",
+		"registry.example/demo:v2.0.0@" + pinnedDigest,
+	}, imagecache.ArchitectureAMD64); err != nil || summary.Warmed != 2 {
+		t.Fatalf("initial warm = %+v, %v", summary, err)
+	}
+
+	corrupt.Store(true)
+	summary, err := manager.Warm(context.Background(), []string{
+		"registry.example/demo:stable",
+		"registry.example/demo:v2.0.0@" + pinnedDigest,
+	}, imagecache.ArchitectureAMD64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Failed != 2 {
+		t.Fatalf("bad header rerun summary = %+v", summary)
+	}
+
+	manager.offline.Store(true)
+	upstream.Close()
+	mirror := httptest.NewServer(http.HandlerFunc(manager.serveCatchAll))
+	defer mirror.Close()
+	for _, path := range []struct {
+		ref      string
+		wantBody string
+	}{
+		{"/v2/demo/manifests/stable", tagManifest},
+		{"/v2/demo/manifests/v2.0.0", pinnedManifest},
+		{"/v2/demo/manifests/" + tagDigest, tagManifest},
+		{"/v2/demo/manifests/" + pinnedDigest, pinnedManifest},
+	} {
+		resp, body := get(t, mirror.URL+path.ref+"?ns=registry.example")
+		if resp.StatusCode != http.StatusOK || body != path.wantBody {
+			t.Fatalf("%s = %d %q", path.ref, resp.StatusCode, body)
+		}
+	}
+}
+
 func TestWarmBlobRequestDiscardsResponseBody(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := w.(*httptest.ResponseRecorder); ok {

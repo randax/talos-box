@@ -162,6 +162,7 @@ var (
 )
 
 type manifestRefreshKey struct{}
+type manifestValidationReferenceKey struct{}
 type stagedManifestKey struct{}
 
 func withManifestRefresh(ctx context.Context) context.Context {
@@ -171,6 +172,17 @@ func withManifestRefresh(ctx context.Context) context.Context {
 func shouldRefreshManifest(ctx context.Context) bool {
 	value, _ := ctx.Value(manifestRefreshKey{}).(bool)
 	return value
+}
+
+func withManifestValidationReference(ctx context.Context, reference string) context.Context {
+	return context.WithValue(ctx, manifestValidationReferenceKey{}, reference)
+}
+
+func manifestValidationReference(ctx context.Context, fallback string) string {
+	if value, ok := ctx.Value(manifestValidationReferenceKey{}).(string); ok && value != "" {
+		return value
+	}
+	return fallback
 }
 
 type stagedManifest struct {
@@ -264,7 +276,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		case isManifest:
-			data, metadata, err := validateManifest(resp, manifestReference(r.URL.Path))
+			data, metadata, err := validateManifest(resp, manifestValidationReference(r.Context(), manifestReference(r.URL.Path)))
 			if err != nil {
 				http.Error(w, fmt.Sprintf("upstream manifest: %v", err), http.StatusBadGateway)
 				return
