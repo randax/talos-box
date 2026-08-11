@@ -76,6 +76,18 @@ type CacheWarmArgs struct {
 	Refs []string `json:"refs"`
 }
 
+type CachePruneScope string
+
+const (
+	CachePruneScopeImages CachePruneScope = "images"
+	CachePruneScopeMirror CachePruneScope = "mirror"
+	CachePruneScopeAll    CachePruneScope = "all"
+)
+
+type CachePruneArgs struct {
+	Scope CachePruneScope `json:"scope"`
+}
+
 // ClusterSummary is the compact cluster.list result.
 type ClusterSummary struct {
 	Name          string               `json:"name"`
@@ -172,6 +184,40 @@ type CacheWarmResult struct {
 }
 
 const cacheWarmTimeout = 2 * time.Hour
+type CacheImageEntry struct {
+	Schematic    string `json:"schematic"`
+	Version      string `json:"version"`
+	Architecture string `json:"architecture"`
+	Size         int64  `json:"size"`
+}
+
+type MirrorCacheEntry struct {
+	Upstream      string `json:"upstream"`
+	BlobCount     int    `json:"blobCount"`
+	BlobBytes     int64  `json:"blobBytes"`
+	ManifestCount int    `json:"manifestCount"`
+	ManifestBytes int64  `json:"manifestBytes"`
+}
+
+type MirrorCacheTotals struct {
+	BlobCount     int   `json:"blobCount"`
+	BlobBytes     int64 `json:"blobBytes"`
+	ManifestCount int   `json:"manifestCount"`
+	ManifestBytes int64 `json:"manifestBytes"`
+}
+
+type CacheListResult struct {
+	Images      []CacheImageEntry  `json:"images"`
+	Mirror      []MirrorCacheEntry `json:"mirror"`
+	MirrorTotal MirrorCacheTotals  `json:"mirrorTotal"`
+}
+
+type CachePruneResult struct {
+	Scope      CachePruneScope   `json:"scope"`
+	ImageCount int               `json:"imageCount"`
+	ImageBytes int64             `json:"imageBytes"`
+	Mirror     MirrorCacheTotals `json:"mirror"`
+}
 
 type MirrorOfflineStatus struct {
 	Enabled bool `json:"enabled"`
@@ -895,15 +941,70 @@ func (s *Server) warmMirrorCache(raw json.RawMessage) (CacheWarmResult, error) {
 	return s.warmCache(ctx, args.Refs, s.imageArchitecture())
 }
 
-func (s *Server) pruneCache() (map[string]int, error) {
+func (s *Server) listCache() (CacheListResult, error) {
 	entries, err := s.cache.List()
 	if err != nil {
-		return nil, err
+		return CacheListResult{}, err
 	}
-	if err := s.cache.Prune(); err != nil {
-		return nil, err
+	mirrorStats, mirrorTotals, err := s.cache.MirrorStats()
+	if err != nil {
+		return CacheListResult{}, err
 	}
-	return map[string]int{"removed": len(entries)}, nil
+	result := CacheListResult{
+		Images:      make([]CacheImageEntry, 0, len(entries)),
+		Mirror:      make([]MirrorCacheEntry, 0, len(mirrorStats)),
+		MirrorTotal: MirrorCacheTotals(mirrorTotals),
+	}
+	for _, entry := range entries {
+		result.Images = append(result.Images, CacheImageEntry{
+			Schematic:    entry.Schematic,
+			Version:      entry.Version,
+			Architecture: string(entry.Architecture),
+			Size:         entry.Size,
+		})
+	}
+	for _, stat := range mirrorStats {
+		result.Mirror = append(result.Mirror, MirrorCacheEntry{
+			Upstream:      stat.Upstream,
+			BlobCount:     stat.BlobCount,
+			BlobBytes:     stat.BlobBytes,
+			ManifestCount: stat.ManifestCount,
+			ManifestBytes: stat.ManifestBytes,
+		})
+	}
+	return result, nil
+}
+
+func (s *Server) pruneCache(raw json.RawMessage) (CachePruneResult, error) {
+	var args CachePruneArgs
+	if err := decodeArgs(raw, &args); err != nil {
+		return CachePruneResult{}, err
+	}
+	if args.Scope == "" {
+		args.Scope = CachePruneScopeImages
+	}
+	switch args.Scope {
+	case CachePruneScopeImages:
+		result, err := s.cache.PruneDisk()
+		if err != nil {
+			return CachePruneResult{}, err
+		}
+		return CachePruneResult{Scope: args.Scope, ImageCount: result.ImageCount, ImageBytes: result.ImageBytes, Mirror: MirrorCacheTotals(result.Mirror)}, nil
+	case CachePruneScopeMirror:
+		result, err := s.cache.PruneMirror()
+		if err != nil {
+			return CachePruneResult{}, err
+		}
+		return CachePruneResult{Scope: args.Scope, ImageCount: result.ImageCount, ImageBytes: result.ImageBytes, Mirror: MirrorCacheTotals(result.Mirror)}, nil
+	case CachePruneScopeAll:
+		result, err := s.cache.PruneAll()
+		if err != nil {
+			return CachePruneResult{}, err
+		}
+		return CachePruneResult{Scope: args.Scope, ImageCount: result.ImageCount, ImageBytes: result.ImageBytes, Mirror: MirrorCacheTotals(result.Mirror)}, nil
+	default:
+		return CachePruneResult{}, fmt.Errorf("unknown cache prune scope %q", args.Scope)
+	}
 }
 
 func ValidateWarmRef(ref string) error {

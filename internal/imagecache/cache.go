@@ -52,6 +52,27 @@ type Entry struct {
 	Size         int64
 }
 
+type MirrorUpstreamStats struct {
+	Upstream      string
+	BlobCount     int
+	BlobBytes     int64
+	ManifestCount int
+	ManifestBytes int64
+}
+
+type MirrorTotals struct {
+	BlobCount     int
+	BlobBytes     int64
+	ManifestCount int
+	ManifestBytes int64
+}
+
+type CachePruneResult struct {
+	ImageCount int
+	ImageBytes int64
+	Mirror     MirrorTotals
+}
+
 // New returns a cache rooted at root.
 func New(root string) *Cache {
 	return &Cache{
@@ -210,15 +231,106 @@ func (c *Cache) List() ([]Entry, error) {
 	return entries, nil
 }
 
-// Prune removes every cache entry.
-func (c *Cache) Prune() error {
-	if c.root == "" || filepath.Clean(c.root) == string(filepath.Separator) {
-		return errors.New("refusing to prune an empty or root cache path")
+func (c *Cache) MirrorStats() ([]MirrorUpstreamStats, MirrorTotals, error) {
+	mirrorRoot := filepath.Join(c.root, "mirror")
+	entries, err := os.ReadDir(mirrorRoot)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, MirrorTotals{}, nil
 	}
-	if err := os.RemoveAll(c.root); err != nil {
-		return fmt.Errorf("prune cache: %w", err)
+	if err != nil {
+		return nil, MirrorTotals{}, fmt.Errorf("list mirror cache: %w", err)
 	}
-	return nil
+
+	var stats []MirrorUpstreamStats
+	var totals MirrorTotals
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		stat := MirrorUpstreamStats{Upstream: entry.Name()}
+		if err := walkMirrorObjects(filepath.Join(mirrorRoot, entry.Name(), "blobs"), func(size int64) {
+			stat.BlobCount++
+			stat.BlobBytes += size
+		}); err != nil {
+			return nil, MirrorTotals{}, err
+		}
+		if err := walkMirrorObjects(filepath.Join(mirrorRoot, entry.Name(), "manifests"), func(size int64) {
+			stat.ManifestCount++
+			stat.ManifestBytes += size
+		}, ".meta", ".ct"); err != nil {
+			return nil, MirrorTotals{}, err
+		}
+		totals.BlobCount += stat.BlobCount
+		totals.BlobBytes += stat.BlobBytes
+		totals.ManifestCount += stat.ManifestCount
+		totals.ManifestBytes += stat.ManifestBytes
+		stats = append(stats, stat)
+	}
+
+	sort.Slice(stats, func(i, j int) bool { return stats[i].Upstream < stats[j].Upstream })
+	return stats, totals, nil
+}
+
+func (c *Cache) PruneDisk() (CachePruneResult, error) {
+	if err := validateCacheRoot(c.root); err != nil {
+		return CachePruneResult{}, err
+	}
+	images, err := c.List()
+	if err != nil {
+		return CachePruneResult{}, err
+	}
+	var result CachePruneResult
+	for _, image := range images {
+		result.ImageCount++
+		result.ImageBytes += image.Size
+	}
+	entries, err := os.ReadDir(c.root)
+	if errors.Is(err, os.ErrNotExist) {
+		return result, nil
+	}
+	if err != nil {
+		return CachePruneResult{}, fmt.Errorf("prune disk cache: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.Name() == "mirror" {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(c.root, entry.Name())); err != nil {
+			return CachePruneResult{}, fmt.Errorf("prune disk cache: %w", err)
+		}
+	}
+	return result, nil
+}
+
+func (c *Cache) PruneMirror() (CachePruneResult, error) {
+	if err := validateCacheRoot(c.root); err != nil {
+		return CachePruneResult{}, err
+	}
+	_, mirrorTotals, err := c.MirrorStats()
+	if err != nil {
+		return CachePruneResult{}, err
+	}
+	mirrorRoot := filepath.Join(c.root, "mirror")
+	if err := os.RemoveAll(mirrorRoot); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return CachePruneResult{}, fmt.Errorf("prune mirror cache: %w", err)
+	}
+	return CachePruneResult{Mirror: mirrorTotals}, nil
+}
+
+func (c *Cache) PruneAll() (CachePruneResult, error) {
+	if err := validateCacheRoot(c.root); err != nil {
+		return CachePruneResult{}, err
+	}
+	disk, err := c.PruneDisk()
+	if err != nil {
+		return CachePruneResult{}, err
+	}
+	mirror, err := c.PruneMirror()
+	if err != nil {
+		return CachePruneResult{}, err
+	}
+	disk.Mirror = mirror.Mirror
+	return disk, nil
 }
 
 func (c *Cache) download(sourceURL, destination string) error {
@@ -293,6 +405,40 @@ func decompress(source, destination string) error {
 func fileReady(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.Mode().IsRegular() && info.Size() > 0
+}
+
+func validateCacheRoot(root string) error {
+	if root == "" || filepath.Clean(root) == string(filepath.Separator) {
+		return errors.New("refusing to prune an empty or root cache path")
+	}
+	return nil
+}
+
+func walkMirrorObjects(root string, visit func(int64), ignoredSuffixes ...string) error {
+	if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			if strings.HasPrefix(info.Name(), ".partial") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasPrefix(info.Name(), ".partial") {
+			return nil
+		}
+		for _, suffix := range ignoredSuffixes {
+			if strings.HasSuffix(info.Name(), suffix) {
+				return nil
+			}
+		}
+		visit(info.Size())
+		return nil
+	})
 }
 
 func migrateLegacyDisk(legacyPath, destination string) (bool, error) {
