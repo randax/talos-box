@@ -678,6 +678,61 @@ func TestCatchAllMirrorBoundsDynamicHandlersAndClosesEvictedEntries(t *testing.T
 	}
 }
 
+func TestCatchAllMirrorInvalidNamespacesDoNotAllocateDynamicHandlers(t *testing.T) {
+	catchAllPort := freePort(t)
+	var created atomic.Int64
+
+	m := newManagerWithPorts(t.TempDir(), nil, catchAllPort)
+	m.resolveUpstreamIPs = func(_ context.Context, host string) ([]net.IP, error) {
+		switch canonicalLookupHost(host) {
+		case "registry-ok.example":
+			return []net.IP{net.ParseIP("203.0.113.10")}, nil
+		case "127.0.0.1":
+			return []net.IP{net.ParseIP("127.0.0.1")}, nil
+		default:
+			return nil, fmt.Errorf("unexpected host %q", host)
+		}
+	}
+	m.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	m.serverFactory = func(authority, _, _ string) http.Handler {
+		created.Add(1)
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(authority))
+		})
+	}
+	defer m.Close()
+
+	if err := m.Bind("127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, body := get(t, fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/latest?ns=%s", catchAllPort, url.QueryEscape("registry-ok.example")))
+	if resp.StatusCode != http.StatusOK || body != "registry-ok.example" {
+		t.Fatalf("valid ns = %d %q", resp.StatusCode, body)
+	}
+	if created.Load() != 1 {
+		t.Fatalf("created handlers after valid request = %d, want 1", created.Load())
+	}
+	if got := len(m.dynamic); got != 1 {
+		t.Fatalf("dynamic handlers after valid request = %d, want 1", got)
+	}
+
+	for i := 0; i < 3; i++ {
+		resp, _ := get(t, fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/latest?ns=%s", catchAllPort, url.QueryEscape("127.0.0.1")))
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("invalid ns request %d = %d, want 403", i, resp.StatusCode)
+		}
+	}
+
+	if created.Load() != 1 {
+		t.Fatalf("created handlers after invalid requests = %d, want 1", created.Load())
+	}
+	if got := len(m.dynamic); got != 1 {
+		t.Fatalf("dynamic handlers after invalid requests = %d, want 1", got)
+	}
+}
+
 func TestManagerOfflineToggleAffectsLegacyAndDynamicMirrors(t *testing.T) {
 	f := newFakeRegistry(t, false)
 	legacyPort := freePort(t)

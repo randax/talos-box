@@ -175,7 +175,19 @@ func (m *Manager) serveCatchAll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	handler := m.handlerForUpstream(authority)
+	handler, ok := m.dynamicHandler(authority.cacheKey)
+	if !ok {
+		if err := m.validateResolvedAuthority(r.Context(), authority); err != nil {
+			var validationErr *upstreamValidationError
+			if errors.As(err, &validationErr) {
+				http.Error(w, validationErr.Error(), validationErr.status)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		handler = m.handlerForUpstream(authority)
+	}
 	clone := r.Clone(r.Context())
 	clone.URL = cloneURLWithoutQueryValue(r.URL, "ns")
 	handler.ServeHTTP(w, clone)
@@ -279,6 +291,20 @@ func (m *Manager) handlerForUpstream(authority upstreamAuthority) http.Handler {
 		closer()
 	}
 	return handler
+}
+
+func (m *Manager) dynamicHandler(cacheKey string) (http.Handler, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ensureDynamicStateLocked()
+	handler, ok := m.dynamic[cacheKey]
+	if !ok {
+		return nil, false
+	}
+	if element := m.dynamicLRUEntries[cacheKey]; element != nil {
+		m.dynamicOrder.MoveToBack(element)
+	}
+	return handler, true
 }
 
 func (m *Manager) ensureDynamicStateLocked() {
