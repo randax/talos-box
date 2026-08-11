@@ -25,9 +25,11 @@ func Content(port int) string {
 	return fmt.Sprintf("%s\nnameserver 127.0.0.1\nport %d\n", Marker, port)
 }
 
-// Managed reports whether an observed file carries the ownership marker.
+// Managed reports whether an observed file carries the ownership marker as
+// its exact first line — a user file that merely starts with the marker text
+// (e.g. "# managed by talosbox backup") is not ours.
 func Managed(content []byte) bool {
-	return strings.HasPrefix(string(content), Marker)
+	return strings.HasPrefix(string(content), Marker+"\n")
 }
 
 // Plan compares the wanted custom domains against the observed files

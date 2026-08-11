@@ -63,4 +63,7 @@ func TestContentCarriesOwnershipMarker(t *testing.T) {
 	if Managed([]byte("nameserver 127.0.0.1\nport 5399\n")) {
 		t.Fatal("unmarked content recognized as managed")
 	}
+	if Managed([]byte(Marker + " backup of my old resolver\nnameserver 10.0.0.1\n")) {
+		t.Fatal("marker-prefixed user file recognized as managed")
+	}
 }

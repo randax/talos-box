@@ -174,14 +174,16 @@ func maintainHostNetworking(
 		case <-stop:
 			return
 		case <-ticks:
-			domains, err := customDomains()
-			if err != nil {
-				// Fail closed: without trustworthy state, reconciling would
-				// treat live custom domains as orphans and delete their files.
-				log.Printf("skip host networking check: %v", err)
-				continue
-			}
+			domains, domainsErr := customDomains()
 			drift := checkHostNetworking(tbxdns.Port, domains, readFile, listResolvers, run)
+			if domainsErr != nil {
+				// Fail closed on the domain set only: without trustworthy
+				// state, reconciling would treat live custom domains as
+				// orphans and delete their files. Shared-resolver and
+				// forwarding repair are state-independent and continue.
+				log.Printf("skip custom-domain resolver check: %v", domainsErr)
+				drift.domains = false
+			}
 			if !drift.any() {
 				continue
 			}

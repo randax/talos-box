@@ -324,7 +324,7 @@ func shouldReconnect(op string, err error) bool {
 
 func safeRetryOperation(op string) bool {
 	switch op {
-	case helperInfoOp, "ping", "net.detach", "dns.install", "dns.uninstall", "dns.register", "dns.unregister", "forwarding.enable", "bgp.enable", "bgp.disable":
+	case helperInfoOp, "ping", "net.detach", "dns.install", "dns.uninstall", "dns.syncDomains", "dns.register", "dns.unregister", "forwarding.enable", "bgp.enable", "bgp.disable":
 		return true
 	default:
 		return false
