@@ -113,8 +113,8 @@ func TestRunCacheWarmRejectsInvalidRefsBeforeDaemonCall(t *testing.T) {
 	if !strings.Contains(err.Error(), filepath.Base(listPath)+":3") || !strings.Contains(err.Error(), ":latest") {
 		t.Fatalf("error = %q, want latest-tag source line rejection", err)
 	}
-	if !strings.Contains(err.Error(), filepath.Base(listPath)+":4") || !strings.Contains(err.Error(), "invalid digest") {
-		t.Fatalf("error = %q, want invalid digest source line rejection", err)
+	if !strings.Contains(err.Error(), filepath.Base(listPath)+":4") || !strings.Contains(err.Error(), "must use a sha256 or sha512 digest") {
+		t.Fatalf("error = %q, want digest source line rejection", err)
 	}
 	if stdout.Len() != 0 {
 		t.Fatalf("stdout = %q, want empty", stdout.String())

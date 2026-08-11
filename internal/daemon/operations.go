@@ -767,7 +767,7 @@ func (s *Server) warmMirrorCache(raw json.RawMessage) (CacheWarmResult, error) {
 		return CacheWarmResult{}, errors.New("at least one image reference is required")
 	}
 	for _, ref := range args.Refs {
-		if err := validateWarmRef(ref); err != nil {
+		if err := ValidateWarmRef(ref); err != nil {
 			return CacheWarmResult{}, err
 		}
 	}
@@ -788,7 +788,7 @@ func (s *Server) pruneCache() (map[string]int, error) {
 	return map[string]int{"removed": len(entries)}, nil
 }
 
-func validateWarmRef(ref string) error {
+func ValidateWarmRef(ref string) error {
 	ref = strings.TrimSpace(ref)
 	if ref == "" {
 		return errors.New("image reference is required")

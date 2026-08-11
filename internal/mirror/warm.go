@@ -56,6 +56,10 @@ func (m *Manager) warmOne(ctx context.Context, reference, hostArch string) (Warm
 	if err != nil {
 		return WarmResult{}, err
 	}
+	if !isDigestReference(parsed.listedRef) {
+		m.warmTagMu.Lock()
+		defer m.warmTagMu.Unlock()
+	}
 	authority, err := parseUpstreamAuthority(parsed.upstream)
 	if err != nil {
 		return WarmResult{}, err
@@ -71,8 +75,13 @@ func (m *Manager) warmOne(ctx context.Context, reference, hostArch string) (Warm
 	result := WarmResult{Ref: reference, AlreadyComplete: true}
 	seenManifests := map[string]bool{}
 	seenBlobs := map[string]bool{}
+	var staged *stagedManifest
+	stageListed := !isDigestReference(parsed.listedRef)
+	if stageListed {
+		staged = &stagedManifest{}
+	}
 
-	body, digest, cachedBefore, err := warmManifestRequest(ctx, handler, server, parsed.repository, parsed.listedRef)
+	body, digest, cachedBefore, err := warmManifestRequest(ctx, handler, server, parsed.repository, parsed.listedRef, staged)
 	if err != nil {
 		return WarmResult{}, err
 	}
@@ -84,7 +93,7 @@ func (m *Manager) warmOne(ctx context.Context, reference, hostArch string) (Warm
 	}
 	seenManifests[digest] = true
 	if parsed.listedRef != digest {
-		_, _, digestCachedBefore, err := warmManifestRequest(ctx, handler, server, parsed.repository, digest)
+		_, _, digestCachedBefore, err := warmManifestRequest(ctx, handler, server, parsed.repository, digest, nil)
 		if err != nil {
 			return WarmResult{}, err
 		}
@@ -95,6 +104,14 @@ func (m *Manager) warmOne(ctx context.Context, reference, hostArch string) (Warm
 
 	if err := warmManifestGraph(ctx, handler, server, parsed.repository, body, hostArch, seenManifests, seenBlobs, &result); err != nil {
 		return WarmResult{}, err
+	}
+	if stageListed && staged != nil {
+		if staged.requestPath == "" || len(staged.data) == 0 {
+			return WarmResult{}, fmt.Errorf("listed ref %q did not produce a staged manifest", reference)
+		}
+		if err := server.storeManifest(staged.requestPath, staged.metadata, staged.data); err != nil {
+			return WarmResult{}, fmt.Errorf("publish listed manifest: %w", err)
+		}
 	}
 	return result, nil
 }
@@ -129,7 +146,7 @@ func warmManifestGraph(ctx context.Context, handler http.Handler, server *Server
 			}
 			continue
 		}
-		childBody, _, cachedBefore, err := warmManifestRequest(ctx, handler, server, repository, child.digest)
+		childBody, _, cachedBefore, err := warmManifestRequest(ctx, handler, server, repository, child.digest, nil)
 		if err != nil {
 			return err
 		}
@@ -198,10 +215,14 @@ func analyzeWarmManifest(body []byte) (string, []warmChildManifest, []string, er
 	return "manifest", nil, blobs, nil
 }
 
-func warmManifestRequest(ctx context.Context, handler http.Handler, server *Server, repository, reference string) ([]byte, string, bool, error) {
+func warmManifestRequest(ctx context.Context, handler http.Handler, server *Server, repository, reference string, staged *stagedManifest) ([]byte, string, bool, error) {
 	path := "/v2/" + repository + "/manifests/" + reference
 	cachedBefore := manifestCached(server, path)
-	request := httptest.NewRequest(http.MethodGet, path, nil).WithContext(withManifestRefresh(ctx))
+	requestContext := withManifestRefresh(ctx)
+	if staged != nil {
+		requestContext = withStagedManifest(requestContext, staged)
+	}
+	request := httptest.NewRequest(http.MethodGet, path, nil).WithContext(requestContext)
 	request.Header.Set("Accept", strings.Join([]string{
 		"application/vnd.oci.image.index.v1+json",
 		"application/vnd.docker.distribution.manifest.list.v2+json",
@@ -279,6 +300,8 @@ type discardWarmResponse struct {
 	errorBody strings.Builder
 }
 
+const maxWarmErrorBodyBytes = 64 << 10
+
 func newDiscardWarmResponse() *discardWarmResponse {
 	return &discardWarmResponse{headers: make(http.Header), status: http.StatusOK}
 }
@@ -291,7 +314,13 @@ func (d *discardWarmResponse) WriteHeader(status int) {
 
 func (d *discardWarmResponse) Write(data []byte) (int, error) {
 	if d.status >= http.StatusBadRequest {
-		_, _ = d.errorBody.Write(data)
+		remaining := maxWarmErrorBodyBytes - d.errorBody.Len()
+		if remaining > 0 {
+			if len(data) > remaining {
+				data = data[:remaining]
+			}
+			_, _ = d.errorBody.Write(data)
+		}
 	}
 	return len(data), nil
 }

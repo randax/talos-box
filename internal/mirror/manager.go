@@ -54,6 +54,7 @@ type Manager struct {
 	dynamicLRUEntries map[string]*list.Element
 	dynamicClosers    map[string]func()
 	dynamicCap        int
+	warmTagMu         sync.Mutex
 }
 
 const dynamicHandlerCap = 64
