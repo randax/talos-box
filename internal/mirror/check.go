@@ -72,10 +72,10 @@ func (m *Manager) checkOne(ctx context.Context, reference, hostArch string, deep
 			return fmt.Errorf("resolved manifest %s: %w", resolvedDigest, err)
 		}
 	}
-	return checkManifestGraph(ctx, server, parsed.repository, body, hostArch, deep, seenManifests, seenBlobs)
+	return checkManifestGraph(ctx, server, parsed.repository, body, hostArch, deep, seenManifests, map[string]bool{}, seenBlobs)
 }
 
-func checkManifestGraph(ctx context.Context, server *Server, repository string, body []byte, hostArch string, deep bool, seenManifests, seenBlobs map[string]bool) error {
+func checkManifestGraph(ctx context.Context, server *Server, repository string, body []byte, hostArch string, deep bool, seenManifests, checkedHostManifests, seenBlobs map[string]bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -101,20 +101,23 @@ func checkManifestGraph(ctx context.Context, server *Server, repository string, 
 		if _, _, err := checkedSupportedDigest(child.digest); err != nil {
 			return fmt.Errorf("child manifest %s invalid: %w", child.digest, err)
 		}
-		if child.architecture == hostArch && (child.os == "" || child.os == "linux") {
+		hostMatch := child.architecture == hostArch && (child.os == "" || child.os == "linux")
+		if hostMatch {
 			matchedHost = true
 		}
-		if seenManifests[child.digest] {
-			continue
-		}
 		childPath := manifestRequestPath(repository, child.digest)
-		childBody, _, err := checkCachedManifest(ctx, server, childPath, child.digest)
-		if err != nil {
-			return fmt.Errorf("child manifest %s: %w", child.digest, err)
+		var childBody []byte
+		if !seenManifests[child.digest] || (hostMatch && !checkedHostManifests[child.digest]) {
+			var err error
+			childBody, _, err = checkCachedManifest(ctx, server, childPath, child.digest)
+			if err != nil {
+				return fmt.Errorf("child manifest %s: %w", child.digest, err)
+			}
+			seenManifests[child.digest] = true
 		}
-		seenManifests[child.digest] = true
-		if child.architecture == hostArch && (child.os == "" || child.os == "linux") {
-			if err := checkManifestGraph(ctx, server, repository, childBody, hostArch, deep, seenManifests, seenBlobs); err != nil {
+		if hostMatch && !checkedHostManifests[child.digest] {
+			checkedHostManifests[child.digest] = true
+			if err := checkManifestGraph(ctx, server, repository, childBody, hostArch, deep, seenManifests, checkedHostManifests, seenBlobs); err != nil {
 				return err
 			}
 		}

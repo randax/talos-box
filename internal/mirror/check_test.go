@@ -65,6 +65,51 @@ func TestCheckFailsWhenChildManifestIsMissing(t *testing.T) {
 	}
 }
 
+func TestCheckVerifiesHostBlobsWhenIndexRepeatsChildDigestAcrossPlatforms(t *testing.T) {
+	cacheRoot := t.TempDir()
+	mirrorRoot := filepath.Join(cacheRoot, "mirror")
+	manager := newManagerWithPorts(mirrorRoot, nil, freePort(t))
+	defer manager.Close()
+
+	server := NewServer("https://registry.example", filepath.Join(mirrorRoot, "registry.example"))
+	configBody := []byte("cfg")
+	layerBody := []byte("layer")
+	configDigest := "sha256:" + sha256Hex(configBody)
+	layerDigest := "sha256:" + sha256Hex(layerBody)
+	childManifest := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%d},"layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"%s","size":%d}]}`,
+		configDigest, len(configBody), layerDigest, len(layerBody))
+	childDigest := "sha256:" + sha256Hex([]byte(childManifest))
+	indexBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s","size":%d,"platform":{"architecture":"arm64","os":"linux"}},{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s","size":%d,"platform":{"architecture":"amd64","os":"linux"}}]}`,
+		childDigest, len(childManifest), childDigest, len(childManifest))
+	indexDigest := "sha256:" + sha256Hex([]byte(indexBody))
+	requestPath := "/v2/demo/manifests/" + indexDigest
+	if err := server.storeManifest(requestPath, manifestMetadata{
+		ContentType:         "application/vnd.oci.image.index.v1+json",
+		ContentLength:       int64(len(indexBody)),
+		DockerContentDigest: indexDigest,
+	}, []byte(indexBody)); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.storeManifest("/v2/demo/manifests/"+childDigest, manifestMetadata{
+		ContentType:         "application/vnd.oci.image.manifest.v1+json",
+		ContentLength:       int64(len(childManifest)),
+		DockerContentDigest: childDigest,
+	}, []byte(childManifest)); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := manager.Check(context.Background(), []string{"registry.example/demo@" + indexDigest}, imagecache.ArchitectureAMD64, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Complete != 0 || summary.Failed != 1 {
+		t.Fatalf("check summary = %+v", summary)
+	}
+	if len(summary.Results) != 1 || !strings.Contains(summary.Results[0].Error, configDigest) {
+		t.Fatalf("check result = %+v, want missing host config blob digest", summary.Results)
+	}
+}
+
 func TestCheckFailsWhenHostBlobIsMissing(t *testing.T) {
 	fixture := newCheckManifestFixture(t)
 	defer fixture.manager.Close()
