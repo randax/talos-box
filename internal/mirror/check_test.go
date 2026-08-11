@@ -63,6 +63,34 @@ func TestCheckFailsWhenChildManifestIsMissing(t *testing.T) {
 	}
 }
 
+func TestCheckFailsWhenHostBlobIsMissing(t *testing.T) {
+	fixture := newCheckManifestFixture(t)
+	defer fixture.manager.Close()
+
+	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Warmed != 1 || summary.Failed != 0 {
+		t.Fatalf("warm summary = %+v", summary)
+	}
+	if err := os.Remove(fixture.server.blobPath(fixture.layerDigest)); err != nil {
+		t.Fatal(err)
+	}
+	fixture.upstream.Close()
+
+	checkSummary, err := fixture.manager.Check(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checkSummary.Complete != 0 || checkSummary.Failed != 1 {
+		t.Fatalf("check summary = %+v", checkSummary)
+	}
+	if len(checkSummary.Results) != 1 || !strings.Contains(checkSummary.Results[0].Error, fixture.layerDigest) {
+		t.Fatalf("check result = %+v, want missing blob digest", checkSummary.Results)
+	}
+}
+
 func TestCheckDeepCatchesCorruptBlobButPlainCheckDoesNot(t *testing.T) {
 	fixture := newCheckManifestFixture(t)
 	defer fixture.manager.Close()
@@ -97,6 +125,151 @@ func TestCheckDeepCatchesCorruptBlobButPlainCheckDoesNot(t *testing.T) {
 	if len(deepSummary.Results) != 1 || !strings.Contains(deepSummary.Results[0].Error, fixture.layerDigest) {
 		t.Fatalf("deep check result = %+v, want corrupt blob digest", deepSummary.Results)
 	}
+}
+
+func TestCheckRejectsMalformedBlobDigestWithoutPathEscape(t *testing.T) {
+	cacheRoot := t.TempDir()
+	mirrorRoot := filepath.Join(cacheRoot, "mirror")
+	manager := newManagerWithPorts(mirrorRoot, nil, freePort(t))
+	defer manager.Close()
+
+	server := NewServer("https://registry.example", filepath.Join(mirrorRoot, "registry.example"))
+	manifestBody := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"../sentinel","size":8},"layers":[]}`)
+	manifestDigest := "sha256:" + sha256Hex(manifestBody)
+	requestPath := "/v2/demo/manifests/" + manifestDigest
+	if err := server.storeManifest(requestPath, manifestMetadata{
+		ContentType:         "application/vnd.oci.image.manifest.v1+json",
+		ContentLength:       int64(len(manifestBody)),
+		DockerContentDigest: manifestDigest,
+	}, manifestBody); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(server.cacheDir, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("escaped"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := manager.Check(context.Background(), []string{"registry.example/demo@" + manifestDigest}, imagecache.ArchitectureAMD64, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Complete != 0 || summary.Failed != 1 {
+		t.Fatalf("check summary = %+v", summary)
+	}
+	if len(summary.Results) != 1 || !strings.Contains(summary.Results[0].Error, "../sentinel") {
+		t.Fatalf("check result = %+v, want malformed digest failure", summary.Results)
+	}
+}
+
+func TestCheckRejectsSymlinkedBlobInPlainMode(t *testing.T) {
+	fixture := newCheckManifestFixture(t)
+	defer fixture.manager.Close()
+
+	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Warmed != 1 || summary.Failed != 0 {
+		t.Fatalf("warm summary = %+v", summary)
+	}
+
+	realBlob := fixture.server.blobPath(fixture.layerDigest)
+	blobData, err := os.ReadFile(realBlob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "layer")
+	if err := os.WriteFile(target, blobData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(realBlob); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, realBlob); err != nil {
+		t.Fatal(err)
+	}
+	fixture.upstream.Close()
+
+	checkSummary, err := fixture.manager.Check(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checkSummary.Complete != 0 || checkSummary.Failed != 1 {
+		t.Fatalf("check summary = %+v", checkSummary)
+	}
+	if len(checkSummary.Results) != 1 || !strings.Contains(checkSummary.Results[0].Error, fixture.layerDigest) {
+		t.Fatalf("check result = %+v, want symlinked blob failure", checkSummary.Results)
+	}
+}
+
+func TestCheckAttemptsEveryRefAndReportsEachResult(t *testing.T) {
+	cacheRoot := t.TempDir()
+	mirrorRoot := filepath.Join(cacheRoot, "mirror")
+	manager := newManagerWithPorts(mirrorRoot, nil, freePort(t))
+	defer manager.Close()
+
+	server := NewServer("https://registry.example", filepath.Join(mirrorRoot, "registry.example"))
+	goodManifest, goodDigest, goodBlob := cacheCheckManifestFixture(t, "good")
+	badManifest, badDigest, _ := cacheCheckManifestFixture(t, "bad")
+	for _, manifest := range []struct {
+		repo   string
+		digest string
+		body   []byte
+	}{
+		{repo: "good", digest: goodDigest, body: goodManifest},
+		{repo: "bad", digest: badDigest, body: badManifest},
+	} {
+		path := "/v2/" + manifest.repo + "/manifests/" + manifest.digest
+		if err := server.storeManifest(path, manifestMetadata{
+			ContentType:         "application/vnd.oci.image.manifest.v1+json",
+			ContentLength:       int64(len(manifest.body)),
+			DockerContentDigest: manifest.digest,
+		}, manifest.body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(server.blobPath(goodBlob.digest)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(server.blobPath(goodBlob.digest), goodBlob.body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := manager.Check(context.Background(), []string{
+		"registry.example/bad@" + badDigest,
+		"registry.example/good@" + goodDigest,
+	}, imagecache.ArchitectureAMD64, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Complete != 1 || summary.Failed != 1 {
+		t.Fatalf("check summary = %+v", summary)
+	}
+	if len(summary.Results) != 2 {
+		t.Fatalf("results len = %d, want 2", len(summary.Results))
+	}
+	if summary.Results[0].Ref != "registry.example/bad@"+badDigest || summary.Results[0].Error == "" {
+		t.Fatalf("first result = %+v, want failed bad ref", summary.Results[0])
+	}
+	if summary.Results[1].Ref != "registry.example/good@"+goodDigest || summary.Results[1].Error != "" {
+		t.Fatalf("second result = %+v, want complete good ref", summary.Results[1])
+	}
+}
+
+type cacheCheckBlobFixture struct {
+	digest string
+	body   []byte
+}
+
+func cacheCheckManifestFixture(t *testing.T, payload string) ([]byte, string, cacheCheckBlobFixture) {
+	t.Helper()
+	blob := cacheCheckBlobFixture{
+		body:   []byte(payload),
+		digest: "sha256:" + sha256Hex([]byte(payload)),
+	}
+	manifestBody := []byte(fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%d},"layers":[]}`,
+		blob.digest, len(blob.body)))
+	return manifestBody, "sha256:" + sha256Hex(manifestBody), blob
 }
 
 type checkManifestFixture struct {
