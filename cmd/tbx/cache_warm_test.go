@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -100,6 +101,11 @@ func TestRunCacheWarmRejectsInvalidRefsBeforeDaemonCall(t *testing.T) {
 		"docker.io/library/nginx:1.27.0",
 		"docker.io/library/nginx:latest",
 		"docker.io/library/nginx@sha256:not-hex",
+		"docker.io/library/repo:@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+		"docker.io/:tag",
+		"docker.io/library/nginx:1.2.3?query",
+		"docker.io/library/nginx:1.2.3#fragment",
+		"docker.io/library/ bad:1.2.3",
 	}, "\n")), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -115,6 +121,11 @@ func TestRunCacheWarmRejectsInvalidRefsBeforeDaemonCall(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), filepath.Base(listPath)+":4") || !strings.Contains(err.Error(), "must use a sha256 or sha512 digest") {
 		t.Fatalf("error = %q, want digest source line rejection", err)
+	}
+	for _, line := range []int{5, 6, 7, 8, 9} {
+		if !strings.Contains(err.Error(), filepath.Base(listPath)+":"+fmt.Sprint(line)) {
+			t.Fatalf("error = %q, want malformed ref line %d", err, line)
+		}
 	}
 	if stdout.Len() != 0 {
 		t.Fatalf("stdout = %q, want empty", stdout.String())

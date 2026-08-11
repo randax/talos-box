@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -81,7 +82,11 @@ func (m *Manager) warmOne(ctx context.Context, reference, hostArch string) (Warm
 		staged = &stagedManifest{}
 	}
 
-	body, digest, cachedBefore, err := warmManifestRequest(ctx, handler, server, parsed.repository, parsed.listedRef, staged)
+	validateReference := parsed.listedRef
+	if parsed.pinnedDigest != "" {
+		validateReference = parsed.pinnedDigest
+	}
+	body, digest, cachedBefore, err := warmManifestRequest(ctx, handler, server, parsed.repository, parsed.listedRef, validateReference, staged)
 	if err != nil {
 		return WarmResult{}, err
 	}
@@ -91,9 +96,12 @@ func (m *Manager) warmOne(ctx context.Context, reference, hostArch string) (Warm
 	if parsed.pinnedDigest != "" && digest != parsed.pinnedDigest {
 		return WarmResult{}, fmt.Errorf("listed ref %q resolved to %s, want %s", reference, digest, parsed.pinnedDigest)
 	}
+	if stageListed && staged != nil {
+		staged.metadata.DockerContentDigest = digest
+	}
 	seenManifests[digest] = true
 	if parsed.listedRef != digest {
-		_, _, digestCachedBefore, err := warmManifestRequest(ctx, handler, server, parsed.repository, digest, nil)
+		_, _, digestCachedBefore, err := warmManifestRequest(ctx, handler, server, parsed.repository, digest, digest, nil)
 		if err != nil {
 			return WarmResult{}, err
 		}
@@ -146,7 +154,7 @@ func warmManifestGraph(ctx context.Context, handler http.Handler, server *Server
 			}
 			continue
 		}
-		childBody, _, cachedBefore, err := warmManifestRequest(ctx, handler, server, repository, child.digest, nil)
+		childBody, _, cachedBefore, err := warmManifestRequest(ctx, handler, server, repository, child.digest, child.digest, nil)
 		if err != nil {
 			return err
 		}
@@ -215,7 +223,7 @@ func analyzeWarmManifest(body []byte) (string, []warmChildManifest, []string, er
 	return "manifest", nil, blobs, nil
 }
 
-func warmManifestRequest(ctx context.Context, handler http.Handler, server *Server, repository, reference string, staged *stagedManifest) ([]byte, string, bool, error) {
+func warmManifestRequest(ctx context.Context, handler http.Handler, server *Server, repository, reference, validateReference string, staged *stagedManifest) ([]byte, string, bool, error) {
 	path := "/v2/" + repository + "/manifests/" + reference
 	cachedBefore := manifestCached(server, path)
 	requestContext := withManifestRefresh(ctx)
@@ -234,7 +242,18 @@ func warmManifestRequest(ctx context.Context, handler http.Handler, server *Serv
 	if recorder.Code != http.StatusOK {
 		return nil, "", cachedBefore, fmt.Errorf("%s returned %d: %s", path, recorder.Code, strings.TrimSpace(recorder.Body.String()))
 	}
-	return recorder.Body.Bytes(), recorder.Header().Get("Docker-Content-Digest"), cachedBefore, nil
+	response := &http.Response{
+		Header: recorder.Result().Header.Clone(),
+		Body:   io.NopCloser(strings.NewReader(recorder.Body.String())),
+	}
+	if isDigestReference(validateReference) {
+		response.Header.Del("Docker-Content-Digest")
+	}
+	_, metadata, err := validateManifest(response, validateReference)
+	if err != nil {
+		return nil, "", cachedBefore, err
+	}
+	return recorder.Body.Bytes(), metadata.DockerContentDigest, cachedBefore, nil
 }
 
 func warmBlobRequest(ctx context.Context, handler http.Handler, repository, digest string) error {
@@ -313,6 +332,7 @@ func (d *discardWarmResponse) WriteHeader(status int) {
 }
 
 func (d *discardWarmResponse) Write(data []byte) (int, error) {
+	originalLength := len(data)
 	if d.status >= http.StatusBadRequest {
 		remaining := maxWarmErrorBodyBytes - d.errorBody.Len()
 		if remaining > 0 {
@@ -322,5 +342,5 @@ func (d *discardWarmResponse) Write(data []byte) (int, error) {
 			_, _ = d.errorBody.Write(data)
 		}
 	}
-	return len(data), nil
+	return originalLength, nil
 }

@@ -907,6 +907,11 @@ func ValidateWarmRef(ref string) error {
 	if ref == "" {
 		return errors.New("image reference is required")
 	}
+	if strings.ContainsAny(ref, "?#") || strings.ContainsFunc(ref, func(character rune) bool {
+		return character <= 0x20
+	}) {
+		return fmt.Errorf("image reference %q is malformed", ref)
+	}
 
 	name, digest, hasDigest := strings.Cut(ref, "@")
 	if hasDigest {
@@ -919,16 +924,26 @@ func ValidateWarmRef(ref string) error {
 	if !ok || remainder == "" || (!strings.Contains(host, ".") && !strings.Contains(host, ":") && host != "localhost") {
 		return fmt.Errorf("image reference %q must include a registry host", ref)
 	}
+	if strings.HasSuffix(name, "/") || strings.HasPrefix(remainder, ":") {
+		return fmt.Errorf("image reference %q is malformed", ref)
+	}
 
 	lastSlash := strings.LastIndex(name, "/")
 	lastColon := strings.LastIndex(name, ":")
+	tag := ""
+	if lastColon > lastSlash {
+		tag = name[lastColon+1:]
+	}
 	if hasDigest && lastColon <= lastSlash {
 		return nil
+	}
+	if hasDigest && lastColon > lastSlash && tag == "" {
+		return fmt.Errorf("image reference %q is malformed", ref)
 	}
 	if lastColon <= lastSlash {
 		return fmt.Errorf("image reference %q must include a non-latest tag or digest", ref)
 	}
-	if name[lastColon+1:] == "latest" {
+	if tag == "latest" {
 		return fmt.Errorf("image reference %q must not use :latest", ref)
 	}
 	return nil

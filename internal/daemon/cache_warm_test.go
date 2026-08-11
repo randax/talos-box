@@ -24,6 +24,11 @@ func TestCacheWarmRejectsUnpinnedRefsBeforeStartingWarm(t *testing.T) {
 		{"library/nginx:1.2.3"},
 		{"docker.io/library/nginx@sha256:not-hex"},
 		{"docker.io/library/nginx@sha512:abcd"},
+		{"docker.io/library/repo:@sha256:1111111111111111111111111111111111111111111111111111111111111111"},
+		{"docker.io/:tag"},
+		{"docker.io/library/nginx:1.2.3?query"},
+		{"docker.io/library/nginx:1.2.3#fragment"},
+		{"docker.io/library/ bad:1.2.3"},
 	} {
 		t.Run(strings.Join(refs, ","), func(t *testing.T) {
 			_, err := service.handle(Request{Op: "cache.warm", Args: mustWarmArgs(t, CacheWarmArgs{Refs: refs})})
