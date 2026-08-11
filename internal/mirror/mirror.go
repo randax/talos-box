@@ -161,6 +161,17 @@ var (
 	digestRefRe    = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9]*(?:[+._-][A-Za-z][A-Za-z0-9]*)*):([A-Fa-f0-9]+)$`)
 )
 
+type manifestRefreshKey struct{}
+
+func withManifestRefresh(ctx context.Context) context.Context {
+	return context.WithValue(ctx, manifestRefreshKey{}, true)
+}
+
+func shouldRefreshManifest(ctx context.Context) bool {
+	value, _ := ctx.Value(manifestRefreshKey{}).(bool)
+	return value
+}
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "mirror is pull-only", http.StatusMethodNotAllowed)
@@ -265,6 +276,9 @@ func (s *Server) serveCacheIfAvailable(w http.ResponseWriter, r *http.Request, d
 		return true, nil
 	}
 	if isManifest {
+		if shouldRefreshManifest(r.Context()) {
+			return false
+		}
 		reference := manifestReference(r.URL.Path)
 		if isDigestReference(reference) {
 			return s.serveCachedDigestManifest(w, r, reference)
@@ -560,8 +574,7 @@ func manifestSHA512(data []byte) string {
 }
 
 func (s *Server) serveCachedManifest(w http.ResponseWriter, r *http.Request) bool {
-	path := s.manifestPath(r.URL.Path)
-	data, err := os.ReadFile(path)
+	data, err := s.cachedManifestBytes(r.URL.Path)
 	if err != nil {
 		return false
 	}
@@ -599,6 +612,10 @@ func serveManifestBytes(w http.ResponseWriter, r *http.Request, data []byte, met
 		_, _ = w.Write(data)
 	}
 	return true
+}
+
+func (s *Server) cachedManifestBytes(requestPath string) ([]byte, error) {
+	return os.ReadFile(s.manifestPath(requestPath))
 }
 
 func (s *Server) cachedManifestMetadata(requestPath string, data []byte) manifestMetadata {
