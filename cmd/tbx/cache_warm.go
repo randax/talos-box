@@ -102,7 +102,7 @@ func parseWarmListSource(source string, reader io.Reader) ([]warmListEntry, []st
 		if text == "" || strings.HasPrefix(text, "#") {
 			continue
 		}
-		if err := validateWarmRef(text); err != nil {
+		if err := daemon.ValidateWarmRef(text); err != nil {
 			problems = append(problems, fmt.Sprintf("%s:%d: %v", source, lineNumber, err))
 			continue
 		}
@@ -112,62 +112,4 @@ func parseWarmListSource(source string, reader io.Reader) ([]warmListEntry, []st
 		problems = append(problems, fmt.Sprintf("%s: %v", source, err))
 	}
 	return entries, problems
-}
-
-func validateWarmRef(reference string) error {
-	name, digest, hasDigest := strings.Cut(reference, "@")
-	if hasDigest {
-		if digest == "" || !isLikelyDigest(digest) {
-			return fmt.Errorf("invalid digest reference %q", reference)
-		}
-	}
-
-	host, remainder, ok := strings.Cut(name, "/")
-	if !ok || !looksLikeRegistryHost(host) || remainder == "" {
-		return fmt.Errorf("missing registry host in %q", reference)
-	}
-	lastSlash := strings.LastIndex(name, "/")
-	lastColon := strings.LastIndex(name, ":")
-	tag := ""
-	if lastColon > lastSlash {
-		tag = name[lastColon+1:]
-	}
-	if !hasDigest && tag == "" {
-		return fmt.Errorf("tagless ref %q is not allowed", reference)
-	}
-	if tag == "latest" {
-		return fmt.Errorf(":latest is not allowed in %q", reference)
-	}
-	return nil
-}
-
-func looksLikeRegistryHost(host string) bool {
-	return strings.Contains(host, ".") || strings.Contains(host, ":") || host == "localhost"
-}
-
-func isLikelyDigest(value string) bool {
-	algorithm, encoded, ok := strings.Cut(value, ":")
-	if !ok || algorithm == "" || encoded == "" {
-		return false
-	}
-	for _, character := range algorithm {
-		if !isDigestAlgorithmRune(character) {
-			return false
-		}
-	}
-	for _, character := range encoded {
-		if !isHexDigit(character) {
-			return false
-		}
-	}
-	return true
-}
-
-func isDigestAlgorithmRune(character rune) bool {
-	return (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
-		(character >= '0' && character <= '9') || character == '+' || character == '.' || character == '_' || character == '-'
-}
-
-func isHexDigit(character rune) bool {
-	return (character >= 'a' && character <= 'f') || (character >= 'A' && character <= 'F') || (character >= '0' && character <= '9')
 }

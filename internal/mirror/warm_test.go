@@ -366,6 +366,142 @@ func TestWarmFailurePreservesPreviouslyCachedManifest(t *testing.T) {
 	}
 }
 
+func TestWarmTagRefreshFailurePreservesPreviouslyCachedTag(t *testing.T) {
+	oldConfigDigest := "sha256:" + sha256Hex([]byte("old-config"))
+	oldManifest := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"%s"},"layers":[]}`, oldConfigDigest)
+	oldDigest := "sha256:" + sha256Hex([]byte(oldManifest))
+	newConfigDigest := "sha256:" + strings.Repeat("c", 64)
+	newManifest := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"%s"},"layers":[]}`, newConfigDigest)
+	newDigest := "sha256:" + sha256Hex([]byte(newManifest))
+
+	var refreshBroken atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/demo/manifests/stable":
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			if refreshBroken.Load() {
+				w.Header().Set("Docker-Content-Digest", newDigest)
+				_, _ = fmt.Fprint(w, newManifest)
+				return
+			}
+			w.Header().Set("Docker-Content-Digest", oldDigest)
+			_, _ = fmt.Fprint(w, oldManifest)
+		case "/v2/demo/manifests/" + oldDigest:
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", oldDigest)
+			_, _ = fmt.Fprint(w, oldManifest)
+		case "/v2/demo/manifests/" + newDigest:
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", newDigest)
+			_, _ = fmt.Fprint(w, newManifest)
+		case "/v2/demo/blobs/" + oldConfigDigest:
+			_, _ = io.WriteString(w, "old-config")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	manager := newManagerWithPorts(t.TempDir(), nil, freePort(t))
+	manager.baseOverride = aliasedURL(t, upstream.URL, "registry.example")
+	egress := egressForRoutes(aliasRoute(t, upstream.URL, "registry.example", "203.0.113.10"))
+	manager.resolveUpstreamIPs = egress.resolve
+	manager.hostOwnedIPs = egress.hostIPs
+	manager.dialContext = egress.dialContext
+	defer manager.Close()
+
+	if summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64); err != nil || summary.Warmed != 1 {
+		t.Fatalf("initial warm = %+v, %v", summary, err)
+	}
+
+	refreshBroken.Store(true)
+	summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Failed != 1 || summary.Warmed != 0 {
+		t.Fatalf("refresh failure summary = %+v", summary)
+	}
+
+	upstream.Close()
+	manager.offline.Store(true)
+	mirror := httptest.NewServer(http.HandlerFunc(manager.serveCatchAll))
+	defer mirror.Close()
+
+	resp, body := get(t, mirror.URL+"/v2/demo/manifests/stable?ns=registry.example")
+	if resp.StatusCode != http.StatusOK || body != oldManifest {
+		t.Fatalf("cached tag after failed refresh = %d %q", resp.StatusCode, body)
+	}
+}
+
+func TestWarmRefreshNetworkFailureDoesNotFallbackToCachedManifest(t *testing.T) {
+	configDigest := "sha256:" + sha256Hex([]byte("config"))
+	manifestBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"%s"},"layers":[]}`, configDigest)
+	manifestDigest := "sha256:" + sha256Hex([]byte(manifestBody))
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/demo/manifests/stable":
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", manifestDigest)
+			_, _ = fmt.Fprint(w, manifestBody)
+		case "/v2/demo/manifests/" + manifestDigest:
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", manifestDigest)
+			_, _ = fmt.Fprint(w, manifestBody)
+		case "/v2/demo/blobs/" + configDigest:
+			_, _ = io.WriteString(w, "config")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	manager := newManagerWithPorts(t.TempDir(), nil, freePort(t))
+	manager.baseOverride = aliasedURL(t, upstream.URL, "registry.example")
+	egress := egressForRoutes(aliasRoute(t, upstream.URL, "registry.example", "203.0.113.10"))
+	manager.resolveUpstreamIPs = egress.resolve
+	manager.hostOwnedIPs = egress.hostIPs
+	manager.dialContext = egress.dialContext
+	defer manager.Close()
+
+	if summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64); err != nil || summary.Warmed != 1 {
+		t.Fatalf("initial warm = %+v, %v", summary, err)
+	}
+
+	upstream.Close()
+	summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Failed != 1 || summary.Results[0].Error == "" {
+		t.Fatalf("network failure summary = %+v", summary)
+	}
+
+	manager.offline.Store(true)
+	mirror := httptest.NewServer(http.HandlerFunc(manager.serveCatchAll))
+	defer mirror.Close()
+	resp, body := get(t, mirror.URL+"/v2/demo/manifests/stable?ns=registry.example")
+	if resp.StatusCode != http.StatusOK || body != manifestBody {
+		t.Fatalf("offline replay after refresh failure = %d %q", resp.StatusCode, body)
+	}
+}
+
+func TestDiscardWarmResponseBoundsErrorCapture(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.WriteString(w, strings.Repeat("x", maxWarmErrorBodyBytes*2))
+	})
+
+	err := warmBlobRequest(context.Background(), handler, "demo", "sha256:"+strings.Repeat("1", 64))
+	if err == nil {
+		t.Fatal("warmBlobRequest succeeded, want error")
+	}
+	if len(err.Error()) > maxWarmErrorBodyBytes+128 {
+		t.Fatalf("error length = %d, want bounded capture", len(err.Error()))
+	}
+}
+
 func TestWarmTagReferenceCachesListedTagAndResolvedDigest(t *testing.T) {
 	configDigest := "sha256:" + sha256Hex([]byte("config"))
 	manifestBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"%s"},"layers":[]}`, configDigest)

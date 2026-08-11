@@ -162,6 +162,7 @@ var (
 )
 
 type manifestRefreshKey struct{}
+type stagedManifestKey struct{}
 
 func withManifestRefresh(ctx context.Context) context.Context {
 	return context.WithValue(ctx, manifestRefreshKey{}, true)
@@ -170,6 +171,21 @@ func withManifestRefresh(ctx context.Context) context.Context {
 func shouldRefreshManifest(ctx context.Context) bool {
 	value, _ := ctx.Value(manifestRefreshKey{}).(bool)
 	return value
+}
+
+type stagedManifest struct {
+	requestPath string
+	data        []byte
+	metadata    manifestMetadata
+}
+
+func withStagedManifest(ctx context.Context, staged *stagedManifest) context.Context {
+	return context.WithValue(ctx, stagedManifestKey{}, staged)
+}
+
+func stagedManifestFromContext(ctx context.Context) *stagedManifest {
+	staged, _ := ctx.Value(stagedManifestKey{}).(*stagedManifest)
+	return staged
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -224,7 +240,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.fetch(r)
 	if err != nil {
-		// offline: a manifest we cached earlier still serves the pull
 		if served, cacheErr := s.serveManifestCacheOnFetchFailure(w, r); served {
 			return
 		} else if cacheErr != nil {
@@ -254,12 +269,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, fmt.Sprintf("upstream manifest: %v", err), http.StatusBadGateway)
 				return
 			}
-			// the validated manifest is already in memory; a cache write
-			// failure only costs offline replay, not this pull
-			if err := s.storeManifest(r.URL.Path, metadata, data); err != nil {
-				log.Printf("mirror: cache manifest %s: %v", r.URL.Path, err)
+			if staged := stagedManifestFromContext(r.Context()); staged != nil {
+				staged.requestPath = r.URL.Path
+				staged.data = append([]byte(nil), data...)
+				staged.metadata = metadata
+			} else {
+				// the validated manifest is already in memory; a cache write
+				// failure only costs offline replay, not this pull
+				if err := s.storeManifest(r.URL.Path, metadata, data); err != nil {
+					log.Printf("mirror: cache manifest %s: %v", r.URL.Path, err)
+				}
 			}
 			copyResponseHeaders(w, resp)
+			applyManifestMetadataHeaders(w, metadata)
 			w.WriteHeader(resp.StatusCode)
 			_, _ = w.Write(data)
 			return
@@ -329,6 +351,18 @@ func copyResponseHeaders(w http.ResponseWriter, resp *http.Response) {
 		if value := resp.Header.Get(header); value != "" {
 			w.Header().Set(header, value)
 		}
+	}
+}
+
+func applyManifestMetadataHeaders(w http.ResponseWriter, metadata manifestMetadata) {
+	if metadata.ContentType != "" {
+		w.Header().Set("Content-Type", metadata.ContentType)
+	}
+	if metadata.ContentLength > 0 {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", metadata.ContentLength))
+	}
+	if metadata.DockerContentDigest != "" {
+		w.Header().Set("Docker-Content-Digest", metadata.DockerContentDigest)
 	}
 }
 
