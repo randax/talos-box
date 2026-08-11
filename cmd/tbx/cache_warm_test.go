@@ -82,7 +82,7 @@ func TestRunCacheWarmReadsFilesAndStdinThenPrintsSummary(t *testing.T) {
 
 	wantStdout := "" +
 		"\u2713 docker.io/library/pause:3.10 warmed\n" +
-		"= public.ecr.aws/eks-distro/kubernetes/pause:3.10 already complete\n" +
+		"\u2713 public.ecr.aws/eks-distro/kubernetes/pause:3.10 already complete\n" +
 		"\u2713 ghcr.io/example/app@sha256:1111111111111111111111111111111111111111111111111111111111111111 warmed\n" +
 		"summary: 2 warmed, 1 already complete, 0 failed\n"
 	if got := stdout.String(); got != wantStdout {

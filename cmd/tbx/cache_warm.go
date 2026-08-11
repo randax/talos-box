@@ -43,7 +43,7 @@ func (c cli) runCacheWarm(args []string) error {
 				return err
 			}
 		case daemon.CacheWarmStatusAlreadyComplete:
-			if _, err := fmt.Fprintf(c.out, "= %s already complete\n", entry.Ref); err != nil {
+			if _, err := fmt.Fprintf(c.out, "\u2713 %s already complete\n", entry.Ref); err != nil {
 				return err
 			}
 		case daemon.CacheWarmStatusFailed:
