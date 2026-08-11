@@ -171,6 +171,8 @@ type CacheWarmResult struct {
 	Failed          int              `json:"failed"`
 }
 
+const cacheWarmTimeout = 2 * time.Hour
+
 type MirrorOfflineStatus struct {
 	Enabled bool `json:"enabled"`
 }
@@ -888,7 +890,9 @@ func (s *Server) warmMirrorCache(raw json.RawMessage) (CacheWarmResult, error) {
 	if s.warmCache == nil {
 		return CacheWarmResult{}, errors.New("cache warm is not configured")
 	}
-	return s.warmCache(context.Background(), args.Refs, s.imageArchitecture())
+	ctx, cancel := context.WithTimeout(context.Background(), cacheWarmTimeout)
+	defer cancel()
+	return s.warmCache(ctx, args.Refs, s.imageArchitecture())
 }
 
 func (s *Server) pruneCache() (map[string]int, error) {
