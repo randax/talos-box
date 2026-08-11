@@ -205,13 +205,27 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 				cacheResult.MirrorTotal.BlobCount,
 				cacheResult.MirrorTotal.ManifestCount,
 			)
+			runningClusters := 0
+			for _, item := range clusters {
+				if item.Running {
+					runningClusters++
+				}
+			}
 			switch {
 			case cacheResult.MirrorServing && clusterErr == nil && !anyRunning:
 				mirrorFinding.level = "FAIL"
 				mirrorFinding.detail = fmt.Sprintf("mirror listeners bound while no clusters are running; %s", cacheDetail)
-			case cacheResult.MirrorServing:
+			case cacheResult.MirrorServing && clusterErr == nil && cacheResult.MirrorBoundGateways == runningClusters:
 				mirrorFinding.level = "PASS"
 				mirrorFinding.detail = fmt.Sprintf("mirror serving on %d gateway(s), %s", cacheResult.MirrorBoundGateways, cacheDetail)
+			case clusterErr == nil && anyRunning && cacheResult.MirrorBoundGateways > 0:
+				mirrorFinding.level = "FAIL"
+				mirrorFinding.detail = fmt.Sprintf(
+					"mirror listeners bound for %d of %d running cluster(s); %s",
+					cacheResult.MirrorBoundGateways,
+					runningClusters,
+					cacheDetail,
+				)
 			case clusterErr == nil && len(clusters) == 0:
 				mirrorFinding.level = "SKIP"
 				mirrorFinding.detail = fmt.Sprintf("no clusters exist; %s", cacheDetail)

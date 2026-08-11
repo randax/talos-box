@@ -471,6 +471,56 @@ func TestRunDoctorFailsMirrorHealthWhenClusterIsRunningButNotBound(t *testing.T)
 	}
 }
 
+func TestRunDoctorFailsMirrorHealthWhenOnlySomeRunningClustersAreBound(t *testing.T) {
+	deps := passingDoctorDependencies()
+	deps.listClusters = func() ([]daemon.ClusterSummary, error) {
+		return []daemon.ClusterSummary{
+			{Name: "demo-a", SubnetIndex: 3, Running: true},
+			{Name: "demo-b", SubnetIndex: 4, Running: true},
+		}, nil
+	}
+	deps.getStatus = func() ([]daemon.ClusterStatus, error) {
+		return []daemon.ClusterStatus{
+			{Name: "demo-a", Running: true, Nodes: []daemon.NodeStatus{{Name: "demo-a-cp-1", IP: "172.30.3.2"}}},
+			{Name: "demo-b", Running: true, Nodes: []daemon.NodeStatus{{Name: "demo-b-cp-1", IP: "172.30.4.2"}}},
+		}, nil
+	}
+	deps.command = func(name string, args ...string) ([]byte, error) {
+		switch name {
+		case "/usr/bin/dscacheutil":
+			if strings.Contains(args[len(args)-1], ".demo-a.") {
+				return []byte("ip_address: 172.30.3.200\n"), nil
+			}
+			return []byte("ip_address: 172.30.4.200\n"), nil
+		case "/sbin/route":
+			return []byte("interface: bridge100\n"), nil
+		default:
+			return nil, nil
+		}
+	}
+	deps.listCache = func() (daemon.CacheListResult, error) {
+		return daemon.CacheListResult{
+			MirrorServing:       true,
+			MirrorBoundGateways: 1,
+			MirrorTotal: daemon.MirrorCacheTotals{
+				BlobCount:     2,
+				BlobBytes:     20,
+				ManifestCount: 1,
+				ManifestBytes: 7,
+			},
+		}, nil
+	}
+
+	var output strings.Builder
+	err := (cli{out: &output}).runDoctorWithDependencies(nil, deps)
+	if err == nil {
+		t.Fatal("runDoctorWithDependencies() succeeded despite partial mirror listener coverage")
+	}
+	if !strings.Contains(output.String(), "FAIL mirror-health: mirror listeners bound for 1 of 2 running cluster(s); cache 27 bytes (2 blob(s), 1 manifest(s))") {
+		t.Fatalf("output missing partial mirror health line:\n%s", output.String())
+	}
+}
+
 func TestRunDoctorReportsRuntimeDependentChecksAsSkipped(t *testing.T) {
 	deps := passingDoctorDependencies()
 	deps.checkResolver = func() error {
