@@ -235,7 +235,7 @@ func renderMetalLB(item cluster.Cluster) ([]unstructured.Unstructured, error) {
 }
 
 func manifestFacts(item cluster.Cluster) manifests.Facts {
-	return manifests.Facts{Cluster: item.Name, SubnetIndex: item.SubnetIndex, CNI: string(item.CNI), LB: item.LB, BGP: item.BGP}
+	return manifests.Facts{Cluster: item.Name, SubnetIndex: item.SubnetIndex, CNI: string(item.CNI), LB: item.LB, BGP: item.BGP, Hubble: item.Hubble}
 }
 
 func metalLBProbe(item cluster.Cluster) string {

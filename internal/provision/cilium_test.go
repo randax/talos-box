@@ -10,7 +10,14 @@ import (
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/manifests"
 	appsv1 "k8s.io/api/apps/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/dynamic/fake"
 	kubernetesfake "k8s.io/client-go/kubernetes/fake"
 )
 
@@ -35,6 +42,15 @@ func TestWaitForCiliumRequiresOperatorAgentAndEnvoy(t *testing.T) {
 func (r recordingReconciler) Reconcile(context.Context, cluster.Cluster, []byte) (LoadBalancerResult, error) {
 	*r.order = append(*r.order, "cilium")
 	return LoadBalancerResult{}, nil
+}
+
+type recordingBGPReconciler struct {
+	order *[]string
+}
+
+func (r recordingBGPReconciler) ReconcileBGP(context.Context, cluster.Cluster) error {
+	*r.order = append(*r.order, "bgp")
+	return nil
 }
 
 func TestCiliumReconcileInstallsCNIBeforeWaitingForNodesReady(t *testing.T) {
@@ -84,6 +100,35 @@ func TestCiliumReconcileInstallsCNIBeforeWaitingForNodesReady(t *testing.T) {
 	}
 	if result.KubeconfigPath == "" {
 		t.Fatal("Cilium reconciliation did not write kubeconfig")
+	}
+}
+
+func TestCiliumReconcileReassertsHostBGPAfterApplyingCilium(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.TalosVersion = "v1.13.6"
+	item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true, BGP: true}
+	order := []string{}
+	client := &fakeClient{kubeData: []byte("kubeconfig")}
+	client.readyHook = func() { order = append(order, "ready") }
+	_, err = Reconcile(context.Background(), Request{
+		Cluster:      item,
+		Client:       client,
+		PollInterval: 0,
+		LoadBalancer: recordingReconciler{order: &order},
+		BGP:          recordingBGPReconciler{order: &order},
+		Observe: func(context.Context) ([]Node, error) {
+			return []Node{{Name: item.Nodes[0].Name, Role: cluster.RoleControlPlane, IP: item.Nodes[0].IP, Phase: PhaseConfigured}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(order, ","), "bgp,cilium,ready"; got != want {
+		t.Fatalf("Cilium/BGP reconcile order = %s, want %s", got, want)
 	}
 }
 
@@ -177,4 +222,229 @@ func TestRenderCiliumWithoutLoadBalancerOmitsExtrasAndProbe(t *testing.T) {
 	if len(extras) != 0 || len(probe) != 0 {
 		t.Fatalf("lb:false extras = %s, probe = %s", objectKinds(extras), objectKinds(probe))
 	}
+}
+
+func TestRenderCiliumMakesHubbleRelayAndUIFollowIntent(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		hubble bool
+		want   []string
+	}{
+		{name: "disabled"},
+		{name: "enabled", hubble: true, want: []string{"hubble-peer", "hubble-relay", "hubble-ui"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			item := cluster.Cluster{ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, Hubble: tt.hubble}}
+			objects, err := renderCilium(item)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{"hubble-peer", "hubble-relay", "hubble-ui"} {
+				found := false
+				for _, object := range objects {
+					if object.GetName() == name {
+						found = true
+						break
+					}
+				}
+				want := false
+				for _, expected := range tt.want {
+					want = want || expected == name
+				}
+				if found != want {
+					t.Errorf("rendered %q = %t, want %t", name, found, want)
+				}
+			}
+			if tt.hubble {
+				candidates, err := ciliumHubbleObjects(item)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, candidate := range candidates {
+					for _, object := range objects {
+						if objectID(object) == objectID(candidate) && object.GetAnnotations()[hubbleOwnershipAnnotation] != fieldManager {
+							t.Errorf("Hubble object %s/%s lacks tbx ownership annotation", object.GetKind(), object.GetName())
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestRenderCiliumBGPUsesNoL2AnnouncementObject(t *testing.T) {
+	item := cluster.Cluster{ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true, BGP: true}}
+	objects, err := renderCilium(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, extras, _ := partitionCiliumObjects(objects)
+	if got, want := objectKinds(extras), "CiliumLoadBalancerIPPool,CiliumBGPClusterConfig,CiliumBGPPeerConfig,CiliumBGPAdvertisement"; got != want {
+		t.Fatalf("BGP extras = %s, want %s", got, want)
+	}
+}
+
+func TestWaitForHubbleRequiresRelayAndUI(t *testing.T) {
+	relay := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "hubble-relay", Namespace: ciliumNamespace, Generation: 1}, Status: appsv1.DeploymentStatus{ObservedGeneration: 1, ReadyReplicas: 1, AvailableReplicas: 1}}
+	ui := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "hubble-ui", Namespace: ciliumNamespace, Generation: 1}, Status: appsv1.DeploymentStatus{ObservedGeneration: 1, ReadyReplicas: 1, AvailableReplicas: 1}}
+	if err := waitForHubble(context.Background(), kubernetesfake.NewClientset(relay, ui), time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+	if err := waitForHubble(ctx, kubernetesfake.NewClientset(relay), time.Millisecond); err == nil {
+		t.Fatal("Hubble passed without its UI")
+	}
+}
+
+func TestDeleteHubbleObjectsRemovesOnlyTalosboxOwnedCandidates(t *testing.T) {
+	item := cluster.Cluster{ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium}}
+	candidates, err := ciliumHubbleObjects(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) < 2 {
+		t.Fatalf("Hubble deletion candidates = %d, want at least two", len(candidates))
+	}
+	client := fake.NewSimpleDynamicClient(runtime.NewScheme())
+	mapper := ciliumTestMapper(candidates)
+	owned := candidates[0].DeepCopy()
+	owned.SetAnnotations(map[string]string{hubbleOwnershipAnnotation: fieldManager})
+	unmanaged := candidates[1].DeepCopy()
+	for _, object := range []*unstructured.Unstructured{owned, unmanaged} {
+		resource := ciliumTestResource(t, client, mapper, object)
+		if _, err := resource.Create(context.Background(), object, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := deleteHubbleObjects(context.Background(), client, mapper, candidates); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ciliumTestResource(t, client, mapper, owned).Get(context.Background(), owned.GetName(), metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("owned Hubble object get error = %v, want NotFound", err)
+	}
+	if _, err := ciliumTestResource(t, client, mapper, unmanaged).Get(context.Background(), unmanaged.GetName(), metav1.GetOptions{}); err != nil {
+		t.Fatalf("unmanaged Hubble object was deleted: %v", err)
+	}
+}
+
+func TestValidateHubbleOwnershipRejectsUnmanagedNameCollision(t *testing.T) {
+	item := cluster.Cluster{ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium}}
+	candidates, err := ciliumHubbleObjects(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := fake.NewSimpleDynamicClient(runtime.NewScheme())
+	mapper := ciliumTestMapper(candidates)
+	unmanaged := candidates[0].DeepCopy()
+	if _, err := ciliumTestResource(t, client, mapper, unmanaged).Create(context.Background(), unmanaged, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateHubbleOwnership(context.Background(), client, mapper, candidates); err == nil || !strings.Contains(err.Error(), "unmanaged Hubble") {
+		t.Fatalf("Hubble ownership validation error = %v", err)
+	}
+}
+
+func TestDeleteStaleCiliumAnnouncementsRemovesOnlyOwnedAlternative(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		item cluster.Cluster
+		want string
+	}{
+		{name: "BGP becomes L2", item: cluster.Cluster{ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true}}, want: "CiliumBGPClusterConfig,CiliumBGPPeerConfig,CiliumBGPAdvertisement"},
+		{name: "L2 becomes BGP", item: cluster.Cluster{ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true, BGP: true}}, want: "CiliumL2AnnouncementPolicy"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			candidates, err := staleCiliumAnnouncementObjects(tt.item)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := objectKinds(candidates); got != tt.want {
+				t.Fatalf("stale announcement objects = %s, want %s", got, tt.want)
+			}
+			client := fake.NewSimpleDynamicClient(runtime.NewScheme())
+			mapper := ciliumTestMapper(candidates)
+			for i := range candidates {
+				object := candidates[i].DeepCopy()
+				object.SetAnnotations(map[string]string{announcementOwnershipAnnotation: fieldManager})
+				if _, err := ciliumTestResource(t, client, mapper, object).Create(context.Background(), object, metav1.CreateOptions{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if err := deleteStaleCiliumAnnouncements(context.Background(), client, mapper, tt.item); err != nil {
+				t.Fatal(err)
+			}
+			for i := range candidates {
+				if _, err := ciliumTestResource(t, client, mapper, &candidates[i]).Get(context.Background(), candidates[i].GetName(), metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+					t.Fatalf("stale %s %q get error = %v, want NotFound", candidates[i].GetKind(), candidates[i].GetName(), err)
+				}
+			}
+		})
+	}
+}
+
+func TestDeleteStaleCiliumAnnouncementsRejectsUnmanagedWithoutDeletingOwned(t *testing.T) {
+	item := cluster.Cluster{ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true}}
+	candidates, err := staleCiliumAnnouncementObjects(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) < 2 {
+		t.Fatal("stale announcement candidates < 2, want at least two")
+	}
+	client := fake.NewSimpleDynamicClient(runtime.NewScheme())
+	mapper := ciliumTestMapper(candidates)
+	owned := candidates[0].DeepCopy()
+	owned.SetAnnotations(map[string]string{announcementOwnershipAnnotation: fieldManager})
+	if _, err := ciliumTestResource(t, client, mapper, owned).Create(context.Background(), owned, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	unmanaged := candidates[len(candidates)-1].DeepCopy()
+	unmanaged.SetAnnotations(nil)
+	unmanaged.SetManagedFields(nil)
+	if _, err := ciliumTestResource(t, client, mapper, unmanaged).Create(context.Background(), unmanaged, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	err = deleteStaleCiliumAnnouncements(context.Background(), client, mapper, item)
+	if err == nil || !strings.Contains(err.Error(), "unmanaged Cilium") {
+		t.Fatalf("delete stale announcements error = %v, want unmanaged Cilium", err)
+	}
+	if _, err := ciliumTestResource(t, client, mapper, owned).Get(context.Background(), owned.GetName(), metav1.GetOptions{}); err != nil {
+		t.Fatalf("owned stale object was deleted before validation completed: %v", err)
+	}
+}
+
+func ciliumTestMapper(objects []unstructured.Unstructured) meta.RESTMapper {
+	versions := make(map[schema.GroupVersion]struct{})
+	for _, object := range objects {
+		versions[object.GroupVersionKind().GroupVersion()] = struct{}{}
+	}
+	groups := make([]schema.GroupVersion, 0, len(versions))
+	for version := range versions {
+		groups = append(groups, version)
+	}
+	mapper := meta.NewDefaultRESTMapper(groups)
+	for _, object := range objects {
+		scope := meta.RESTScopeRoot
+		if object.GetNamespace() != "" {
+			scope = meta.RESTScopeNamespace
+		}
+		mapper.Add(object.GroupVersionKind(), scope)
+	}
+	return mapper
+}
+
+func ciliumTestResource(t *testing.T, client *fake.FakeDynamicClient, mapper meta.RESTMapper, object *unstructured.Unstructured) dynamic.ResourceInterface {
+	t.Helper()
+	mapping, err := mapper.RESTMapping(object.GroupVersionKind().GroupKind(), object.GroupVersionKind().Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
+		return client.Resource(mapping.Resource).Namespace(object.GetNamespace())
+	}
+	return client.Resource(mapping.Resource)
 }
