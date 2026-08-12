@@ -390,7 +390,7 @@ func TestSubnetValuesFlowThrough(t *testing.T) {
 	}{
 		{LBPool, []string{"172.30.3.200", "172.30.3.239", "edge"}},
 		{BGPPolicy, []string{"64603", "64512", "172.30.3.1"}},
-		{CiliumValues, []string{"172.30.3.200", "qps: 10", "burst: 20"}},
+		{CiliumValues, []string{"hostLegacyRouting: true", "qps: 10", "burst: 20"}},
 		{RegistryMirrors, []string{"http://172.30.3.1:5059", "skipFallback: true", "\"*\""}},
 		{BalloonModule, []string{"virtio_balloon"}},
 	} {

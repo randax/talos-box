@@ -23,25 +23,58 @@ import (
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/siderolabs/talos/pkg/machinery/config/configloader"
+	"github.com/siderolabs/talos/pkg/machinery/config/types/cri"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
 type fakeClient struct {
 	applied   []string
+	configs   [][]byte
 	bootstrap int
 	kube      int
 	kubeData  []byte
 	bootErr   error
 	readyErrs []error
 	expected  [][]string
+	readyHook func()
+}
+
+func TestCiliumMachineConfigRoutesRuntimeImagesThroughCatchAllMirror(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("demo", 3, 1, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.TalosVersion = "v1.13.6"
+	item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNICilium}
+	generated, err := generateMachineConfigs(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider, err := configloader.NewFromBytes(generated.configs[cluster.RoleControlPlane])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mirror *cri.RegistryMirrorConfigV1Alpha1
+	for _, document := range provider.Documents() {
+		candidate, ok := document.(*cri.RegistryMirrorConfigV1Alpha1)
+		if ok && candidate.MetaName == "*" {
+			mirror = candidate
+		}
+	}
+	if mirror == nil || !mirror.SkipFallback() || len(mirror.RegistryEndpoints) != 1 || mirror.RegistryEndpoints[0].Endpoint() != "http://172.30.3.1:5059" {
+		t.Fatalf("catch-all mirror = %#v", mirror)
+	}
 }
 
 func (f *fakeClient) Apply(_ context.Context, node string, config []byte) error {
-	if !strings.Contains(string(config), "name: flannel") {
-		return errors.New("machine config did not select Talos-managed flannel")
+	if !strings.Contains(string(config), "name: flannel") && !strings.Contains(string(config), "name: none") {
+		return fmt.Errorf("machine config did not select a curated CNI:\n%s", config)
 	}
 	f.applied = append(f.applied, node)
+	f.configs = append(f.configs, append([]byte(nil), config...))
 	return nil
 }
 
@@ -79,6 +112,9 @@ func (f *fakeClient) Kubeconfig(context.Context, string) ([]byte, error) {
 }
 
 func (f *fakeClient) KubernetesReady(_ context.Context, _ []byte, expectedNodes []string) error {
+	if f.readyHook != nil {
+		f.readyHook()
+	}
 	f.expected = append(f.expected, append([]string(nil), expectedNodes...))
 	if len(f.readyErrs) == 0 {
 		return nil

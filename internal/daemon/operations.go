@@ -125,7 +125,6 @@ type ClusterStatus struct {
 	VIPLive         bool         `json:"vipLive"`
 	Nodes           []NodeStatus `json:"nodes"`
 	Hints           []string     `json:"hints,omitempty"`
-	subnetIndex     int
 }
 
 // CachePullResult describes the image made ready by cache.pull.
@@ -252,6 +251,11 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	}
 	result := summary(item, true)
 	result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, subnetWarning, startWarning)
+	if narration, err := s.provisionCNI(item); err != nil {
+		return result, fmt.Errorf("provision %s: %w", item.Name, err)
+	} else {
+		result.Narration = narration
+	}
 	return result, nil
 }
 
@@ -286,6 +290,11 @@ func (s *Server) startCluster(raw json.RawMessage) (ClusterSummary, error) {
 	}
 	result := summary(item, true)
 	result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, subnetWarning)
+	if narration, err := s.provisionCNI(item); err != nil {
+		return result, fmt.Errorf("provision %s: %w", item.Name, err)
+	} else {
+		result.Narration = narration
+	}
 	return result, nil
 }
 
@@ -406,7 +415,6 @@ func (s *Server) stopCluster(raw json.RawMessage) (ClusterSummary, error) {
 }
 
 func (s *Server) stop(name string) error {
-	s.cancelProvisionLocked(name)
 	if item, err := cluster.Load(name); err == nil {
 		s.unbindMirrors(item.SubnetIndex)
 	} else {
@@ -483,7 +491,6 @@ func (s *Server) destroyCluster(raw json.RawMessage) (map[string]string, error) 
 	if !args.Force {
 		return nil, errors.New("cluster.destroy requires force=true")
 	}
-	s.cancelProvisionLocked(args.Name)
 	dir, err := cluster.Dir(args.Name)
 	if err != nil {
 		return nil, err
@@ -670,10 +677,9 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 
 	result := make([]ClusterStatus, 0, len(items))
 	for _, item := range items {
-		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: s.clusterRunning(item.Name), subnetIndex: item.SubnetIndex}
+		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: s.clusterRunning(item.Name)}
 		for _, node := range item.Nodes {
-			running := s.nodeRunning(item.Name, node.Name)
-			clusterStatus.Nodes = append(clusterStatus.Nodes, NodeStatus{Name: node.Name, Role: node.Role, MAC: node.MAC, Phase: ClassifyPhase(running, ProbeResult{})})
+			clusterStatus.Nodes = append(clusterStatus.Nodes, nodeStatus(node, item.SubnetIndex, s.nodeRunning(item.Name, node.Name)))
 		}
 		clusterStatus.Hints = Hints(clusterStatus)
 		result = append(result, clusterStatus)
@@ -681,28 +687,10 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 	return result, nil
 }
 
-func (s *Server) refreshNodeStatuses(statuses []ClusterStatus) {
-	lookupIP := s.nodeIPLookup
-	if lookupIP == nil {
-		lookupIP = cluster.LookupIP
-	}
-	probe := s.nodeProbe
-	if probe == nil {
-		probe = probeAPID
-	}
-	for i := range statuses {
-		for j, snapshot := range statuses[i].Nodes {
-			node := cluster.Node{Name: snapshot.Name, Role: snapshot.Role, MAC: snapshot.MAC}
-			statuses[i].Nodes[j] = nodeStatusWith(node, statuses[i].subnetIndex, snapshot.Phase != PhaseStopped, lookupIP, probe)
-		}
-		statuses[i].Hints = Hints(statuses[i])
-	}
-}
-
 func refreshKubernetesReadiness(statuses []ClusterStatus) {
 	for index := range statuses {
 		status := &statuses[index]
-		if status.CNI != cluster.CNIFlannel {
+		if status.CNI != cluster.CNIFlannel && status.CNI != cluster.CNICilium {
 			continue
 		}
 		if !status.Running {
