@@ -213,11 +213,11 @@ func (s *Server) observeProvisionNodes(item cluster.Cluster) []provision.Node {
 	}
 	s.opMu.Unlock()
 
-	lookupIP := s.provisionIPLookup
+	lookupIP := s.nodeIPLookup
 	if lookupIP == nil {
 		lookupIP = cluster.LookupIP
 	}
-	probe := s.provisionNodeProbe
+	probe := s.nodeProbe
 	if probe == nil {
 		probe = probeAPID
 	}
