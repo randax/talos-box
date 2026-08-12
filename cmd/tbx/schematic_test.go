@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/randax/talos-box/internal/daemon"
 )
@@ -65,18 +66,24 @@ func runWithDaemonResponse(t *testing.T, data json.RawMessage, run func(cli) err
 	}
 	t.Cleanup(func() { _ = listener.Close() })
 
-	requests := make(chan daemon.Request, 1)
+	type requestResult struct {
+		request daemon.Request
+		err     error
+	}
+	results := make(chan requestResult, 1)
 	go func() {
 		connection, err := listener.Accept()
 		if err != nil {
+			results <- requestResult{err: err}
 			return
 		}
 		defer func() { _ = connection.Close() }()
 		var request daemon.Request
 		if err := json.NewDecoder(connection).Decode(&request); err != nil {
+			results <- requestResult{err: err}
 			return
 		}
-		requests <- request
+		results <- requestResult{request: request}
 		_ = json.NewEncoder(connection).Encode(daemon.Response{OK: true, Data: data})
 	}()
 
@@ -84,5 +91,14 @@ func runWithDaemonResponse(t *testing.T, data json.RawMessage, run func(cli) err
 	if err := run(cli{out: &stdout, err: &stderr}); err != nil {
 		t.Fatal(err)
 	}
-	return <-requests
+	select {
+	case result := <-results:
+		if result.err != nil {
+			t.Fatalf("receive daemon request: %v", result.err)
+		}
+		return result.request
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for daemon request")
+		return daemon.Request{}
+	}
 }
