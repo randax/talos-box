@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/config"
 	"github.com/randax/talos-box/internal/hypervisor"
 	"github.com/randax/talos-box/internal/provision"
 )
@@ -163,6 +164,65 @@ func TestStatusDoesNotHoldOperationLockWhileProbing(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("status did not finish after probe release")
+	}
+}
+
+func TestUpMaintenanceGateDoesNotHoldOperationLockWhileProbing(t *testing.T) {
+	service, item, task, _ := blockedProvision(t)
+	service.opMu.Lock()
+	service.cancelProvisionLocked(task.item.Name)
+	service.opMu.Unlock()
+	item.ProvisioningIntent = cluster.ProvisioningIntent{}
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	service.vms[item.Name] = map[string]hypervisor.Machine{
+		item.Nodes[0].Name: &fakeMachine{active: true},
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	service.nodeIPLookup = func(string, int) string { return "172.30.0.2" }
+	service.nodeProbe = func(string) ProbeResult {
+		close(started)
+		<-release
+		return ProbeResult{Dialed: true, TLS: true, MaintenanceCert: true}
+	}
+	service.provisionReconcile = func(context.Context, provision.Request) (provision.Result, error) {
+		return provision.Result{}, nil
+	}
+	args, err := json.Marshal(upArgs{Clusters: []config.ClusterSpec{{
+		Name:               item.Name,
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan Response, 1)
+	go func() {
+		done <- service.dispatchProvisioning(Request{Op: "up", Args: args})
+	}()
+	waitForProvisionStart(t, started)
+
+	lockAcquired := make(chan struct{})
+	go func() {
+		service.opMu.Lock()
+		close(lockAcquired)
+		service.opMu.Unlock()
+	}()
+	select {
+	case <-lockAcquired:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("up maintenance probe held the daemon operation lock")
+	}
+	close(release)
+	select {
+	case response := <-done:
+		if !response.OK {
+			t.Fatalf("up failed: %s", response.Error)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("up did not finish after maintenance probe release")
 	}
 }
 

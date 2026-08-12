@@ -262,8 +262,27 @@ func (s *Server) dispatch(request Request) Response {
 }
 
 func (s *Server) dispatchProvisioning(request Request) Response {
+	var allMaintenance func(cluster.Cluster) bool
+	if request.Op == "up" {
+		observations, err := s.observeUpMaintenance(request.Args)
+		if err != nil {
+			return failure(err)
+		}
+		allMaintenance = func(item cluster.Cluster) bool {
+			observation, ok := observations[item.Name]
+			if !ok || !observation.allMaintenance {
+				return false
+			}
+			for _, node := range item.Nodes {
+				if observation.running[node.Name] != s.nodeRunning(item.Name, node.Name) {
+					return false
+				}
+			}
+			return true
+		}
+	}
 	s.opMu.Lock()
-	data, tasks, err := s.handleProvisioningLocked(request)
+	data, tasks, err := s.handleProvisioningLocked(request, allMaintenance)
 	s.opMu.Unlock()
 	if err != nil {
 		return failure(err)

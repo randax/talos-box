@@ -31,7 +31,7 @@ type provisionTask struct {
 	action     int
 }
 
-func (s *Server) handleProvisioningLocked(request Request) (any, []provisionTask, error) {
+func (s *Server) handleProvisioningLocked(request Request, allMaintenance func(cluster.Cluster) bool) (any, []provisionTask, error) {
 	switch request.Op {
 	case "cluster.create":
 		result, err := s.createCluster(request.Args)
@@ -54,7 +54,7 @@ func (s *Server) handleProvisioningLocked(request Request) (any, []provisionTask
 		}
 		return &result, s.beginProvisionTasksLocked([]cluster.Cluster{item}), nil
 	case "up":
-		actions, err := s.up(request.Args)
+		actions, err := s.upWithMaintenance(request.Args, allMaintenance)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -212,7 +212,10 @@ func (s *Server) observeProvisionNodes(item cluster.Cluster) []provision.Node {
 		running[node.Name] = s.nodeRunning(item.Name, node.Name)
 	}
 	s.opMu.Unlock()
+	return s.observeProvisionNodesWithRunning(item, running)
+}
 
+func (s *Server) observeProvisionNodesWithRunning(item cluster.Cluster, running map[string]bool) []provision.Node {
 	lookupIP := s.nodeIPLookup
 	if lookupIP == nil {
 		lookupIP = cluster.LookupIP

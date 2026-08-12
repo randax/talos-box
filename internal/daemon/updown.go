@@ -6,6 +6,7 @@ import (
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/config"
+	"github.com/randax/talos-box/internal/provision"
 )
 
 type upArgs struct {
@@ -17,6 +18,10 @@ type upArgs struct {
 // up reconciles the daemon's world toward the desired clusters: create the
 // missing, start the stopped, leave the running alone.
 func (s *Server) up(raw json.RawMessage) ([]Action, error) {
+	return s.upWithMaintenance(raw, s.allNodesInMaintenance)
+}
+
+func (s *Server) upWithMaintenance(raw json.RawMessage, allMaintenance func(cluster.Cluster) bool) ([]Action, error) {
 	var args upArgs
 	if err := decodeArgs(raw, &args); err != nil {
 		return nil, err
@@ -26,7 +31,7 @@ func (s *Server) up(raw json.RawMessage) ([]Action, error) {
 		return nil, err
 	}
 	actions := PlanUp(args.Clusters, existing)
-	updates, err := s.preflightUp(args.Clusters, existing, s.allNodesInMaintenance)
+	updates, err := s.preflightUp(args.Clusters, existing, allMaintenance)
 	if err != nil {
 		return nil, err
 	}
@@ -55,6 +60,55 @@ func (s *Server) up(raw json.RawMessage) ([]Action, error) {
 		}
 	}
 	return actions, nil
+}
+
+type maintenanceObservation struct {
+	running        map[string]bool
+	allMaintenance bool
+}
+
+func (s *Server) observeUpMaintenance(raw json.RawMessage) (map[string]maintenanceObservation, error) {
+	var args upArgs
+	if err := decodeArgs(raw, &args); err != nil {
+		return nil, err
+	}
+	type candidate struct {
+		item    cluster.Cluster
+		running map[string]bool
+	}
+	candidates := make([]candidate, 0, len(args.Clusters))
+	s.opMu.Lock()
+	for _, spec := range args.Clusters {
+		if spec.CNI == "" {
+			continue
+		}
+		item, err := cluster.Load(spec.Name)
+		if err != nil {
+			continue
+		}
+		if item.CNI != "" {
+			continue
+		}
+		running := make(map[string]bool, len(item.Nodes))
+		for _, node := range item.Nodes {
+			running[node.Name] = s.nodeRunning(item.Name, node.Name)
+		}
+		candidates = append(candidates, candidate{item: item, running: running})
+	}
+	s.opMu.Unlock()
+
+	observations := make(map[string]maintenanceObservation, len(candidates))
+	for _, candidate := range candidates {
+		allMaintenance := len(candidate.item.Nodes) > 0
+		for _, node := range s.observeProvisionNodesWithRunning(candidate.item, candidate.running) {
+			if node.Phase != provision.PhaseMaintenance {
+				allMaintenance = false
+				break
+			}
+		}
+		observations[candidate.item.Name] = maintenanceObservation{running: candidate.running, allMaintenance: allMaintenance}
+	}
+	return observations, nil
 }
 
 func actionAfterProvision(action ActionKind, narration []string) ActionKind {
