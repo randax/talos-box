@@ -62,10 +62,11 @@ type MetalLBReconciler struct {
 	HTTPClient   *http.Client
 }
 
-// LiveVIP returns the probe VIP only after both Kubernetes has assigned it and
-// the host can receive a successful response through the L2 path.
+// LiveVIP returns the durable tbx probe VIP only after both Kubernetes has
+// assigned it and the host can receive a successful response through the
+// selected CNI's announcement path.
 func LiveVIP(ctx context.Context, item cluster.Cluster, kubeconfig []byte) (string, bool) {
-	if item.CNI != cluster.CNIFlannel || !item.LB {
+	if (item.CNI != cluster.CNIFlannel && item.CNI != cluster.CNICilium) || !item.LB {
 		return "", false
 	}
 	config, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
@@ -234,7 +235,7 @@ func renderMetalLB(item cluster.Cluster) ([]unstructured.Unstructured, error) {
 }
 
 func manifestFacts(item cluster.Cluster) manifests.Facts {
-	return manifests.Facts{Cluster: item.Name, SubnetIndex: item.SubnetIndex, BGP: item.BGP}
+	return manifests.Facts{Cluster: item.Name, SubnetIndex: item.SubnetIndex, CNI: string(item.CNI), LB: item.LB, BGP: item.BGP}
 }
 
 func metalLBProbe(item cluster.Cluster) string {
