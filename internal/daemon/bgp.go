@@ -12,7 +12,21 @@ import (
 type bgpHelperClient interface {
 	EnableBGP(cluster string, subnetIndex int, localASN, peerASN uint32) error
 	DisableBGP(cluster string) error
+	HasBGP(cluster string) (bool, error)
 	Close() error
+}
+
+func hostBGPActive(clusterName string) (bool, error) {
+	client, err := connectBGPHelper()
+	if err != nil {
+		return false, helperInstallError(err)
+	}
+	defer func() { _ = client.Close() }()
+	active, err := client.HasBGP(clusterName)
+	if err != nil {
+		return false, fmt.Errorf("read BGP speaker for %s: %w", clusterName, err)
+	}
+	return active, nil
 }
 
 var connectBGPHelper = func() (bgpHelperClient, error) { return helper.Connect() }

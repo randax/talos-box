@@ -2,7 +2,12 @@ package provision
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -50,6 +55,11 @@ type recordingBGPReconciler struct {
 
 func (r recordingBGPReconciler) ReconcileBGP(context.Context, cluster.Cluster) error {
 	*r.order = append(*r.order, "bgp")
+	return nil
+}
+
+func (r recordingBGPReconciler) DisableBGP(context.Context, cluster.Cluster) error {
+	*r.order = append(*r.order, "disable-bgp")
 	return nil
 }
 
@@ -131,6 +141,259 @@ func TestCiliumReconcileReassertsHostBGPAfterApplyingCilium(t *testing.T) {
 		t.Fatalf("Cilium/BGP reconcile order = %s, want %s", got, want)
 	}
 }
+
+func TestCiliumL2ReconcileDisablesHostBGPEveryRunAfterApplyingL2(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.TalosVersion = "v1.13.6"
+	item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true}
+	order := []string{}
+	client := &fakeClient{kubeData: []byte("kubeconfig")}
+	client.readyHook = func() { order = append(order, "ready") }
+	_, err = Reconcile(context.Background(), Request{
+		Cluster:      item,
+		Client:       client,
+		PollInterval: 0,
+		LoadBalancer: recordingReconciler{order: &order},
+		BGP:          recordingBGPReconciler{order: &order},
+		Observe: func(context.Context) ([]Node, error) {
+			return []Node{{Name: item.Nodes[0].Name, Role: cluster.RoleControlPlane, IP: item.Nodes[0].IP, Phase: PhaseConfigured}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(order, ","), "cilium,disable-bgp,ready"; got != want {
+		t.Fatalf("Cilium/L2 reconcile order = %s, want %s", got, want)
+	}
+}
+
+func TestCiliumWithoutLoadBalancerDoesNotTouchHostBGP(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.TalosVersion = "v1.13.6"
+	item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNICilium}
+	order := []string{}
+	client := &fakeClient{kubeData: []byte("kubeconfig")}
+	client.readyHook = func() { order = append(order, "ready") }
+	_, err = Reconcile(context.Background(), Request{
+		Cluster:      item,
+		Client:       client,
+		PollInterval: 0,
+		LoadBalancer: recordingReconciler{order: &order},
+		BGP:          recordingBGPReconciler{order: &order},
+		Observe: func(context.Context) ([]Node, error) {
+			return []Node{{Name: item.Nodes[0].Name, Role: cluster.RoleControlPlane, IP: item.Nodes[0].IP, Phase: PhaseConfigured}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(order, ","), "cilium,ready"; got != want {
+		t.Fatalf("Cilium non-LB reconcile order = %s, want %s", got, want)
+	}
+}
+
+func TestCiliumConvergedRejectsStaleBGPResourcesOnL2Path(t *testing.T) {
+	item := cluster.Cluster{Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true}}
+	server, kubeconfig := ciliumConvergedServer(t, item, true)
+	defer server.Close()
+	if err := CiliumConverged(context.Background(), kubeconfig, item); err == nil || !strings.Contains(strings.ToLower(err.Error()), "stale cilium object") {
+		t.Fatalf("CiliumConverged() error = %v, want stale BGP object", err)
+	}
+}
+
+func TestCiliumConvergedAcceptsExactL2DesiredSet(t *testing.T) {
+	item := cluster.Cluster{Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true}}
+	server, kubeconfig := ciliumConvergedServer(t, item, false)
+	defer server.Close()
+	if err := CiliumConverged(context.Background(), kubeconfig, item); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCiliumConvergedAcceptsExactBGPDesiredSet(t *testing.T) {
+	item := cluster.Cluster{Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true, BGP: true}}
+	server, kubeconfig := ciliumConvergedServer(t, item, false)
+	defer server.Close()
+	if err := CiliumConverged(context.Background(), kubeconfig, item); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCiliumConvergedAcceptsNoLoadBalancerDesiredSet(t *testing.T) {
+	item := cluster.Cluster{Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium}}
+	server, kubeconfig := ciliumConvergedServer(t, item, false)
+	defer server.Close()
+	if err := CiliumConverged(context.Background(), kubeconfig, item); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCiliumConvergedAcceptsFullHubbleDesiredSet(t *testing.T) {
+	item := cluster.Cluster{Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, Hubble: true}}
+	server, kubeconfig := ciliumConvergedServer(t, item, false)
+	defer server.Close()
+	if err := CiliumConverged(context.Background(), kubeconfig, item); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCiliumConvergedRejectsPartialHubbleDeletion(t *testing.T) {
+	item := cluster.Cluster{Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium}}
+	server, kubeconfig := ciliumConvergedServerWithOptions(t, item, ciliumConvergedOptions{staleHubble: true})
+	defer server.Close()
+	if err := CiliumConverged(context.Background(), kubeconfig, item); err == nil || !strings.Contains(strings.ToLower(err.Error()), "stale cilium object") {
+		t.Fatalf("CiliumConverged() error = %v, want stale Hubble object", err)
+	}
+}
+
+func TestCiliumConvergedRejectsUnmanagedProbe(t *testing.T) {
+	item := cluster.Cluster{Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true}}
+	server, kubeconfig := ciliumConvergedServerWithOptions(t, item, ciliumConvergedOptions{unmanagedProbe: true})
+	defer server.Close()
+	if err := CiliumConverged(context.Background(), kubeconfig, item); err == nil || !strings.Contains(strings.ToLower(err.Error()), "not owned") {
+		t.Fatalf("CiliumConverged() error = %v, want unmanaged probe error", err)
+	}
+}
+
+func TestCiliumConvergedRejectsUnmanagedAnnouncement(t *testing.T) {
+	item := cluster.Cluster{Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true}}
+	server, kubeconfig := ciliumConvergedServerWithOptions(t, item, ciliumConvergedOptions{unmanagedAnnouncement: true})
+	defer server.Close()
+	if err := CiliumConverged(context.Background(), kubeconfig, item); err == nil || !strings.Contains(strings.ToLower(err.Error()), "not owned") {
+		t.Fatalf("CiliumConverged() error = %v, want unmanaged announcement error", err)
+	}
+}
+
+func ciliumConvergedServer(t *testing.T, item cluster.Cluster, staleBGP bool) (*httptest.Server, []byte) {
+	return ciliumConvergedServerWithOptions(t, item, ciliumConvergedOptions{staleBGP: staleBGP})
+}
+
+type ciliumConvergedOptions struct {
+	staleBGP              bool
+	staleHubble           bool
+	unmanagedProbe        bool
+	unmanagedAnnouncement bool
+}
+
+func ciliumConvergedServerWithOptions(t *testing.T, item cluster.Cluster, options ciliumConvergedOptions) (*httptest.Server, []byte) {
+	t.Helper()
+	hubbleCandidates, err := ciliumHubbleObjects(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hubblePaths := make(map[string]string, len(hubbleCandidates))
+	for _, candidate := range hubbleCandidates {
+		path, err := ciliumObjectPath(candidate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hubblePaths[path] = candidate.GetKind()
+	}
+	certificate, certificatePEM, keyPEM := testCertificate(t)
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(certificatePEM) {
+		t.Fatal("parse test CA")
+	}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		path := request.URL.Path
+		if kind, hubble := hubblePaths[path]; hubble {
+			if !item.Hubble && !options.staleHubble {
+				writer.WriteHeader(http.StatusNotFound)
+				return
+			}
+			if kind == "Deployment" {
+				_, _ = writer.Write([]byte(ciliumOwnedDeploymentJSON))
+				return
+			}
+			_, _ = writer.Write([]byte(ciliumHubbleOwnedObjectJSON))
+			return
+		}
+		switch path {
+		case "/apis/apps/v1/namespaces/kube-system/deployments/cilium-operator":
+			_, _ = writer.Write([]byte(`{"metadata":{"generation":1},"status":{"observedGeneration":1,"readyReplicas":1,"availableReplicas":1}}`))
+		case "/apis/apps/v1/namespaces/kube-system/daemonsets/cilium", "/apis/apps/v1/namespaces/kube-system/daemonsets/cilium-envoy":
+			_, _ = writer.Write([]byte(`{"metadata":{"generation":1},"status":{"observedGeneration":1,"desiredNumberScheduled":1,"numberReady":1}}`))
+		case ciliumProbeDeploymentPath():
+			if !item.LB {
+				writer.WriteHeader(http.StatusNotFound)
+				return
+			}
+			if options.unmanagedProbe {
+				_, _ = writer.Write([]byte(ciliumUnmanagedDeploymentJSON))
+				return
+			}
+			_, _ = writer.Write([]byte(ciliumProbeDeploymentJSON))
+		case ciliumProbeServicePath():
+			if !item.LB {
+				writer.WriteHeader(http.StatusNotFound)
+				return
+			}
+			if options.unmanagedProbe {
+				_, _ = writer.Write([]byte(`{}`))
+				return
+			}
+			_, _ = writer.Write([]byte(ciliumProbeObjectJSON))
+		case "/apis/cilium.io/v2/ciliumloadbalancerippools/demo-pool":
+			if !item.LB {
+				writer.WriteHeader(http.StatusNotFound)
+				return
+			}
+			_, _ = writer.Write([]byte(ciliumOwnedObjectJSON))
+		case "/apis/cilium.io/v2alpha1/ciliuml2announcementpolicies/demo-l2":
+			if !item.LB || item.BGP {
+				writer.WriteHeader(http.StatusNotFound)
+				return
+			}
+			if options.unmanagedAnnouncement {
+				_, _ = writer.Write([]byte(`{}`))
+				return
+			}
+			_, _ = writer.Write([]byte(ciliumOwnedObjectJSON))
+		default:
+			if (item.LB && item.BGP || options.staleBGP) && strings.Contains(path, "/ciliumbgp") {
+				_, _ = writer.Write([]byte(ciliumOwnedObjectJSON))
+				return
+			}
+			writer.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	server.TLS = &tls.Config{Certificates: []tls.Certificate{certificate}, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool, MinVersion: tls.VersionTLS12}
+	server.StartTLS()
+	kubeconfig := fmt.Sprintf(`apiVersion: v1
+clusters:
+- name: test
+  cluster:
+    server: %s
+    certificate-authority-data: %s
+contexts:
+- name: test
+  context:
+    cluster: test
+    user: admin
+current-context: test
+users:
+- name: admin
+  user:
+    client-certificate-data: %s
+    client-key-data: %s
+`, server.URL, base64.StdEncoding.EncodeToString(certificatePEM), base64.StdEncoding.EncodeToString(certificatePEM), base64.StdEncoding.EncodeToString(keyPEM))
+	return server, []byte(kubeconfig)
+}
+
+const ciliumOwnedObjectJSON = `{"metadata":{"annotations":{"talosbox.dev/announcement-owned":"talosbox"}}}`
+const ciliumHubbleOwnedObjectJSON = `{"metadata":{"annotations":{"talosbox.dev/hubble-owned":"talosbox"}}}`
+const ciliumOwnedDeploymentJSON = `{"metadata":{"generation":1,"annotations":{"talosbox.dev/hubble-owned":"talosbox"}},"status":{"observedGeneration":1,"readyReplicas":1,"availableReplicas":1}}`
+const ciliumProbeDeploymentJSON = `{"metadata":{"generation":1,"labels":{"talosbox.dev/managed":"true"}},"status":{"observedGeneration":1,"readyReplicas":1,"availableReplicas":1}}`
+const ciliumProbeObjectJSON = `{"metadata":{"labels":{"talosbox.dev/managed":"true"}}}`
+const ciliumUnmanagedDeploymentJSON = `{"metadata":{"generation":1},"status":{"observedGeneration":1,"readyReplicas":1,"availableReplicas":1}}`
 
 func TestRenderCiliumUsesPinnedTalosValuesAndNativeLoadBalancer(t *testing.T) {
 	item, err := cluster.New("demo", 3, 1, 0, cluster.NodeDefaults{})

@@ -17,6 +17,7 @@ type legacyBGPClient struct {
 
 func (c *legacyBGPClient) EnableBGP(string, int, uint32, uint32) error { c.enabled = true; return nil }
 func (*legacyBGPClient) DisableBGP(string) error                       { return nil }
+func (*legacyBGPClient) HasBGP(string) (bool, error)                   { return true, nil }
 func (*legacyBGPClient) Close() error                                  { return nil }
 
 func TestSetBGPRepairsMigratedLegacyState(t *testing.T) {
@@ -94,6 +95,7 @@ func TestSetBGPRejectsIntentThatCannotUseBGP(t *testing.T) {
 type fakeBGPClient struct {
 	disabled []string
 	err      error
+	active   bool
 }
 
 func (c *fakeBGPClient) EnableBGP(string, int, uint32, uint32) error { return nil }
@@ -101,7 +103,8 @@ func (c *fakeBGPClient) DisableBGP(cluster string) error {
 	c.disabled = append(c.disabled, cluster)
 	return c.err
 }
-func (c *fakeBGPClient) Close() error { return nil }
+func (c *fakeBGPClient) HasBGP(string) (bool, error) { return c.active, nil }
+func (c *fakeBGPClient) Close() error                { return nil }
 
 func TestDestroyDisablesHostBGPBeforeRemovingState(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())

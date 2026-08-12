@@ -57,6 +57,8 @@ func LBPool(f Facts) string {
 kind: CiliumLoadBalancerIPPool
 metadata:
   name: %s-pool
+  annotations:
+    talosbox.dev/announcement-owned: "talosbox"
 spec:
   blocks:
     - start: %s

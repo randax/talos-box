@@ -40,6 +40,30 @@ func TestPlanUpStartsPartiallyRunningCluster(t *testing.T) {
 	}
 }
 
+func TestObservedUpActionDoesNotCallIncompleteProvisioningUpToDate(t *testing.T) {
+	tests := []struct {
+		name        string
+		action      ActionKind
+		provisioned bool
+		complete    bool
+		want        ActionKind
+	}{
+		{name: "running substrate-only cluster stays no-op", action: ActionNone, want: ActionNone},
+		{name: "running provisioned cluster waits for Kubernetes", action: ActionNone, provisioned: true, want: ActionReconcile},
+		{name: "Ready provisioned cluster is up to date", action: ActionNone, provisioned: true, complete: true, want: ActionNone},
+		{name: "observed BGP host peer permits up to date", action: ActionNone, provisioned: true, complete: true, want: ActionNone},
+		{name: "missing BGP host peer reconciles", action: ActionNone, provisioned: true, want: ActionReconcile},
+		{name: "stopped provisioned cluster starts before reconciliation", action: ActionStart, provisioned: true, want: ActionStart},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := observedUpAction(test.action, test.provisioned, test.complete); got != test.want {
+				t.Fatalf("observedUpAction(%q, %t, %t) = %q, want %q", test.action, test.provisioned, test.complete, got, test.want)
+			}
+		})
+	}
+}
+
 func TestClusterReadyRequiresEveryPersistedNode(t *testing.T) {
 	item := cluster.Cluster{Nodes: []cluster.Node{{Name: "cp-1"}, {Name: "worker-1"}}}
 	active := map[string]bool{"cp-1": true, "worker-1": false}

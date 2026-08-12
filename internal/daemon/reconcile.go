@@ -15,8 +15,12 @@ type ActionKind string
 const (
 	ActionCreate ActionKind = "create"
 	ActionStart  ActionKind = "start"
-	ActionStop   ActionKind = "stop"
-	ActionNone   ActionKind = "none"
+	// ActionReconcile marks a running provisioned cluster whose Talos/Kubernetes
+	// end state is still incomplete. It is intentionally distinct from a VM
+	// no-op so the CLI never calls a half-provisioned cluster "up to date".
+	ActionReconcile ActionKind = "reconcile"
+	ActionStop      ActionKind = "stop"
+	ActionNone      ActionKind = "none"
 	// ActionMissing marks a cluster the file describes but the host lacks.
 	ActionMissing ActionKind = "missing"
 )
