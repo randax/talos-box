@@ -176,3 +176,19 @@ func TestProvisioningNarrationUsesExactInspectionSections(t *testing.T) {
 		}
 	}
 }
+
+func TestProvisioningNarrationQuotesClusterName(t *testing.T) {
+	item := cluster.Cluster{Name: "demo; echo owned", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true}}
+	for stage, narration := range map[string][]string{
+		"Cilium":  ciliumNarration(item, true),
+		"MetalLB": metalLBNarration(item),
+	} {
+		joined := strings.Join(narration, "\n")
+		for _, section := range []string{"objects", "extras"} {
+			want := "tbx manifests 'demo; echo owned' " + section + " | kubectl apply --server-side -f -"
+			if !strings.Contains(joined, want) {
+				t.Fatalf("%s narration missing quoted command %q:\n%s", stage, want, joined)
+			}
+		}
+	}
+}

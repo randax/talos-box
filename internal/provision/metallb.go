@@ -14,6 +14,7 @@ import (
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/manifests"
+	"github.com/randax/talos-box/internal/shellquote"
 	"helm.sh/helm/v3/pkg/chart/loader"
 	"helm.sh/helm/v3/pkg/chartutil"
 	"helm.sh/helm/v3/pkg/engine"
@@ -161,9 +162,10 @@ func (r MetalLBReconciler) reconcile(ctx context.Context, item cluster.Cluster, 
 }
 
 func metalLBNarration(item cluster.Cluster) []string {
+	name := shellquote.Quote(item.Name)
 	return []string{
-		"MetalLB chart: ≈ tbx manifests " + item.Name + " objects | kubectl apply --server-side -f -",
-		"MetalLB LoadBalancer extras: ≈ tbx manifests " + item.Name + " extras | kubectl apply --server-side -f -",
+		"MetalLB chart: ≈ tbx manifests " + name + " objects | kubectl apply --server-side -f -",
+		"MetalLB LoadBalancer extras: ≈ tbx manifests " + name + " extras | kubectl apply --server-side -f -",
 	}
 }
 

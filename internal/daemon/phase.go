@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/shellquote"
 )
 
 // Phase is a node's observed lifecycle state, derived without Talos credentials:
@@ -146,6 +147,7 @@ func Hints(status ClusterStatus) []string {
 }
 
 func credentialExports(name string) string {
+	name = shellquote.Quote(name)
 	return fmt.Sprintf(" export TALOSCONFIG=~/.talosbox/clusters/%s/talosconfig; export KUBECONFIG=~/.talosbox/clusters/%s/kubeconfig", name, name)
 }
 

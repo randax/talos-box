@@ -206,3 +206,15 @@ func TestHintsDescribeProvisioningInProgressAndExports(t *testing.T) {
 		}
 	}
 }
+
+func TestCredentialExportsQuoteClusterName(t *testing.T) {
+	got := credentialExports("demo; echo owned")
+	for _, want := range []string{
+		"TALOSCONFIG=~/.talosbox/clusters/'demo; echo owned'/talosconfig",
+		"KUBECONFIG=~/.talosbox/clusters/'demo; echo owned'/kubeconfig",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("credentialExports() missing %q: %s", want, got)
+		}
+	}
+}
