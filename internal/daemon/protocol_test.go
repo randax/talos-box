@@ -80,3 +80,38 @@ func TestServeConnectionRoundTrip(t *testing.T) {
 	}
 	<-done
 }
+
+func TestServeConnectionReportsProtocolVersion(t *testing.T) {
+	t.Parallel()
+
+	client, server := net.Pipe()
+	done := make(chan struct{})
+	service := &Server{}
+	go func() {
+		service.serveConnection(server)
+		close(done)
+	}()
+
+	request := Request{Op: "daemon.info", Args: json.RawMessage(`{}`)}
+	if err := json.NewEncoder(client).Encode(request); err != nil {
+		t.Fatal(err)
+	}
+	var response Response
+	if err := json.NewDecoder(client).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if !response.OK {
+		t.Fatalf("response = %#v, want success", response)
+	}
+	var info Info
+	if err := json.Unmarshal(response.Data, &info); err != nil {
+		t.Fatal(err)
+	}
+	if info.ProtocolVersion != ProtocolVersion {
+		t.Fatalf("protocol version = %d, want %d", info.ProtocolVersion, ProtocolVersion)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+}

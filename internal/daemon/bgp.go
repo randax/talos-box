@@ -2,11 +2,20 @@ package daemon
 
 import (
 	"encoding/json"
+	"fmt"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/helper"
 	"github.com/randax/talos-box/internal/manifests"
 )
+
+type bgpHelperClient interface {
+	EnableBGP(cluster string, subnetIndex int, localASN, peerASN uint32) error
+	DisableBGP(cluster string) error
+	Close() error
+}
+
+var connectBGPHelper = func() (bgpHelperClient, error) { return helper.Connect() }
 
 // setBGP enables or disables host-side BGP for a cluster: it starts/stops the
 // speaker in the helper and persists the mode. The attendee still applies the
@@ -20,8 +29,17 @@ func (s *Server) setBGP(raw json.RawMessage, enable bool) (ClusterSummary, error
 	if err != nil {
 		return ClusterSummary{}, err
 	}
+	if enable {
+		if item.CNI == "" {
+			return ClusterSummary{}, fmt.Errorf("cluster %q cannot enable BGP: bgp requires cni: cilium", item.Name)
+		}
+		enabled := true
+		if _, err := cluster.ParseProvisioningIntent(string(item.CNI), &item.LB, &enabled, &item.Hubble); err != nil {
+			return ClusterSummary{}, fmt.Errorf("cluster %q cannot enable BGP: %w", item.Name, err)
+		}
+	}
 
-	client, err := helper.Connect()
+	client, err := connectBGPHelper()
 	if err != nil {
 		return ClusterSummary{}, helperInstallError(err)
 	}

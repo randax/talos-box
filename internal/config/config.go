@@ -41,7 +41,7 @@ type ClusterSpec struct {
 	Name          string
 	ControlPlanes int
 	Workers       int
-	BGP           bool
+	cluster.ProvisioningIntent
 	// Domain is the canonical cluster domain; empty means the default,
 	// <name>.k8s.test. AllowUnsafeDomain records the explicit opt-in for
 	// domains that can shadow real DNS.
@@ -65,15 +65,15 @@ type rawTalos struct {
 }
 
 type rawCluster struct {
-	Name              string   `yaml:"name"`
-	ControlPlanes     *int     `yaml:"controlPlanes"`
-	Workers           *int     `yaml:"workers"`
-	BGP               bool     `yaml:"bgp"`
-	Domain            string   `yaml:"domain"`
-	AllowUnsafeDomain bool     `yaml:"allowUnsafeDomain"`
-	Node              rawNode  `yaml:"node"`
-	ControlPlane      *rawNode `yaml:"controlPlane"`
-	Worker            *rawNode `yaml:"worker"`
+	Name                            string `yaml:"name"`
+	ControlPlanes                   *int   `yaml:"controlPlanes"`
+	Workers                         *int   `yaml:"workers"`
+	cluster.ProvisioningIntentInput `yaml:",inline"`
+	Domain                          string   `yaml:"domain"`
+	AllowUnsafeDomain               bool     `yaml:"allowUnsafeDomain"`
+	Node                            rawNode  `yaml:"node"`
+	ControlPlane                    *rawNode `yaml:"controlPlane"`
+	Worker                          *rawNode `yaml:"worker"`
 }
 
 type rawNode struct {
@@ -109,7 +109,15 @@ func Parse(data []byte) (Config, error) {
 		}
 		seen[rc.Name] = true
 
-		spec := ClusterSpec{Name: rc.Name, ControlPlanes: defaultControlPlanes, Workers: defaultWorkers, BGP: rc.BGP, AllowUnsafeDomain: rc.AllowUnsafeDomain}
+		intent, err := rc.Intent()
+		if err != nil {
+			return Config{}, fmt.Errorf("cluster %q: %w", rc.Name, err)
+		}
+		spec := ClusterSpec{
+			Name: rc.Name, ControlPlanes: defaultControlPlanes, Workers: defaultWorkers,
+			ProvisioningIntent: intent,
+			AllowUnsafeDomain:  rc.AllowUnsafeDomain,
+		}
 		if rc.Domain != "" {
 			canonical, err := domain.Validate(rc.Domain, rc.AllowUnsafeDomain)
 			if err != nil {

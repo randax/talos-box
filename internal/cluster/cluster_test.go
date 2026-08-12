@@ -1,7 +1,10 @@
 package cluster
 
 import (
+	"encoding/json"
 	"net"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -38,6 +41,53 @@ func TestDeterministicMAC(t *testing.T) {
 	}
 }
 
+func TestLoadMigratesLegacyBGPStateToCiliumIntent(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := New("legacy-bgp", 3, 1, 0, NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.BGP = true
+	if err := Save(item); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := Dir(item.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, stateFile)
+	legacy, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(legacy, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if fields["bgp"] == nil || fields["cni"] != nil {
+		t.Fatalf("legacy fixture = %s, want bgp without cni", legacy)
+	}
+
+	loaded, err := Load(item.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := ProvisioningIntent{CNI: CNICilium, LB: true, BGP: true}
+	if loaded.ProvisioningIntent != want {
+		t.Fatalf("migrated intent = %+v, want %+v", loaded.ProvisioningIntent, want)
+	}
+	persisted, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(persisted, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if string(fields["cni"]) != `"cilium"` || string(fields["lb"]) != "true" || string(fields["bgp"]) != "true" {
+		t.Fatalf("persisted migrated state = %s", persisted)
+	}
+}
+
 func TestStateRoundTrip(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
@@ -70,6 +120,25 @@ func TestStateRoundTrip(t *testing.T) {
 				t.Fatalf("Load(%q) = %#v, want %#v", want.Name, got, want)
 			}
 		})
+	}
+}
+
+func TestStateRoundTripPreservesProvisioningIntent(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := New("provisioned", 3, 1, 2, NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.ProvisioningIntent = ProvisioningIntent{CNI: CNICilium, LB: true, BGP: true, Hubble: true}
+	if err := Save(item); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(item.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.ProvisioningIntent != item.ProvisioningIntent {
+		t.Fatalf("provisioning intent = %+v, want %+v", loaded.ProvisioningIntent, item.ProvisioningIntent)
 	}
 }
 

@@ -133,23 +133,27 @@ func clusterReady(item cluster.Cluster, nodeActive func(string) bool) bool {
 
 // createFromSpec provisions and starts one cluster from a config spec.
 func (s *Server) createFromSpec(spec config.ClusterSpec, talos config.TalosSpec, force bool) (ClusterSummary, error) {
-	args := createArgs{
-		Name:              spec.Name,
-		ControlPlanes:     &spec.ControlPlanes,
-		Workers:           &spec.Workers,
-		Node:              spec.Node,
-		ControlPlane:      spec.ControlPlane,
-		Worker:            spec.Worker,
-		BGP:               spec.BGP,
-		Domain:            spec.Domain,
-		AllowUnsafeDomain: spec.AllowUnsafeDomain,
-		Force:             force,
-		Schematic:         talos.Schematic,
-		Version:           talos.Version,
-	}
+	args := createArgsFromSpec(spec, talos, force)
 	encoded, err := json.Marshal(args)
 	if err != nil {
 		return ClusterSummary{}, err
 	}
 	return s.createCluster(encoded)
+}
+
+func createArgsFromSpec(spec config.ClusterSpec, talos config.TalosSpec, force bool) createArgs {
+	return createArgs{
+		Name:                    spec.Name,
+		ControlPlanes:           &spec.ControlPlanes,
+		Workers:                 &spec.Workers,
+		Node:                    spec.Node,
+		ControlPlane:            spec.ControlPlane,
+		Worker:                  spec.Worker,
+		ProvisioningIntentInput: spec.Input(),
+		Domain:                  spec.Domain,
+		AllowUnsafeDomain:       spec.AllowUnsafeDomain,
+		Force:                   force,
+		Schematic:               talos.Schematic,
+		Version:                 talos.Version,
+	}
 }

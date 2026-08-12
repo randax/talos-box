@@ -49,11 +49,11 @@ type Cluster struct {
 	// Per-role overrides; nil means "use NodeDefaults".
 	ControlPlaneDefaults *NodeDefaults `json:"controlPlaneDefaults,omitempty"`
 	WorkerDefaults       *NodeDefaults `json:"workerDefaults,omitempty"`
-	BGP                  bool          `json:"bgp,omitempty"`
-	Nodes                []Node        `json:"nodes"`
-	Schematic            string        `json:"schematic,omitempty"`
-	TalosVersion         string        `json:"talosVersion,omitempty"`
-	ImageArchitecture    string        `json:"imageArchitecture,omitempty"`
+	ProvisioningIntent
+	Nodes             []Node `json:"nodes"`
+	Schematic         string `json:"schematic,omitempty"`
+	TalosVersion      string `json:"talosVersion,omitempty"`
+	ImageArchitecture string `json:"imageArchitecture,omitempty"`
 	// Domain is the canonical cluster domain when explicitly chosen at
 	// create; empty means the default, <name>.k8s.test. AllowUnsafeDomain
 	// records the opt-in the user passed for it, so emitted config

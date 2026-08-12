@@ -30,6 +30,29 @@ func TestCreateClusterChecksHostPressureBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestCreateClusterRejectsInvalidProvisioningIntentBeforeMutation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	service := &Server{}
+	falseValue := false
+	trueValue := true
+	raw, err := json.Marshal(createArgs{
+		Name: "invalid-intent",
+		ProvisioningIntentInput: cluster.ProvisioningIntentInput{
+			CNI: string(cluster.CNIFlannel), LB: &falseValue, BGP: &trueValue,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.createCluster(raw)
+	if err == nil || !strings.Contains(err.Error(), "bgp requires lb: true") {
+		t.Fatalf("createCluster() error = %v, want pre-mutation provisioning validation", err)
+	}
+	if _, loadErr := cluster.Load("invalid-intent"); loadErr == nil {
+		t.Fatal("createCluster() persisted state despite invalid provisioning intent")
+	}
+}
+
 func TestAddNodeChecksHostPressureBeforeMutation(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	item, err := cluster.New("unsafe-add", 0, 0, 0, cluster.NodeDefaults{MemoryMiB: 1})
