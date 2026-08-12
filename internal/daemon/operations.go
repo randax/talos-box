@@ -125,6 +125,7 @@ type ClusterStatus struct {
 	VIPLive         bool         `json:"vipLive"`
 	Nodes           []NodeStatus `json:"nodes"`
 	Hints           []string     `json:"hints,omitempty"`
+	subnetIndex     int
 }
 
 // CachePullResult describes the image made ready by cache.pull.
@@ -669,14 +670,33 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 
 	result := make([]ClusterStatus, 0, len(items))
 	for _, item := range items {
-		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: s.clusterRunning(item.Name)}
+		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: s.clusterRunning(item.Name), subnetIndex: item.SubnetIndex}
 		for _, node := range item.Nodes {
-			clusterStatus.Nodes = append(clusterStatus.Nodes, nodeStatus(node, item.SubnetIndex, s.nodeRunning(item.Name, node.Name)))
+			running := s.nodeRunning(item.Name, node.Name)
+			clusterStatus.Nodes = append(clusterStatus.Nodes, NodeStatus{Name: node.Name, Role: node.Role, MAC: node.MAC, Phase: ClassifyPhase(running, ProbeResult{})})
 		}
 		clusterStatus.Hints = Hints(clusterStatus)
 		result = append(result, clusterStatus)
 	}
 	return result, nil
+}
+
+func (s *Server) refreshNodeStatuses(statuses []ClusterStatus) {
+	lookupIP := s.nodeIPLookup
+	if lookupIP == nil {
+		lookupIP = cluster.LookupIP
+	}
+	probe := s.nodeProbe
+	if probe == nil {
+		probe = probeAPID
+	}
+	for i := range statuses {
+		for j, snapshot := range statuses[i].Nodes {
+			node := cluster.Node{Name: snapshot.Name, Role: snapshot.Role, MAC: snapshot.MAC}
+			statuses[i].Nodes[j] = nodeStatusWith(node, statuses[i].subnetIndex, snapshot.Phase != PhaseStopped, lookupIP, probe)
+		}
+		statuses[i].Hints = Hints(statuses[i])
+	}
 }
 
 func refreshKubernetesReadiness(statuses []ClusterStatus) {

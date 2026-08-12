@@ -91,8 +91,8 @@ func TestProvisionObserverDoesNotHoldOperationLockWhileProbing(t *testing.T) {
 	}
 	started := make(chan struct{})
 	release := make(chan struct{})
-	service.provisionIPLookup = func(string, int) string { return "172.30.0.2" }
-	service.provisionNodeProbe = func(string) ProbeResult {
+	service.nodeIPLookup = func(string, int) string { return "172.30.0.2" }
+	service.nodeProbe = func(string) ProbeResult {
 		close(started)
 		<-release
 		return ProbeResult{Dialed: true, TLS: true}
@@ -121,6 +121,48 @@ func TestProvisionObserverDoesNotHoldOperationLockWhileProbing(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("node observation did not finish after probe release")
+	}
+}
+
+func TestStatusDoesNotHoldOperationLockWhileProbing(t *testing.T) {
+	service, item, _, _ := blockedProvision(t)
+	service.vms[item.Name] = map[string]hypervisor.Machine{
+		item.Nodes[0].Name: &fakeMachine{active: true},
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	service.nodeIPLookup = func(string, int) string { return "172.30.0.2" }
+	service.nodeProbe = func(string) ProbeResult {
+		close(started)
+		<-release
+		return ProbeResult{Dialed: true, TLS: true}
+	}
+	done := make(chan Response, 1)
+	go func() {
+		done <- service.dispatchStatus(Request{Op: "status", Args: json.RawMessage(`{"cluster":"demo"}`)})
+	}()
+	waitForProvisionStart(t, started)
+
+	lockAcquired := make(chan struct{})
+	go func() {
+		service.opMu.Lock()
+		close(lockAcquired)
+		service.opMu.Unlock()
+	}()
+	select {
+	case <-lockAcquired:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("status node probe held the daemon operation lock")
+	}
+	close(release)
+	select {
+	case response := <-done:
+		if !response.OK {
+			t.Fatalf("status failed: %s", response.Error)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("status did not finish after probe release")
 	}
 }
 
