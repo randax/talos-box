@@ -200,7 +200,7 @@ func TestHintsDescribeProvisioningInProgressAndExports(t *testing.T) {
 		Nodes: []NodeStatus{{Name: "demo-cp-1", Role: cluster.RoleControlPlane, Phase: PhaseConfigured}},
 	}
 	joined := strings.Join(Hints(status), "\n")
-	for _, want := range []string{"provisioning is in progress", "TALOSCONFIG=~/.talosbox/clusters/demo/talosconfig", "KUBECONFIG=~/.talosbox/clusters/demo/kubeconfig"} {
+	for _, want := range []string{"provisioning is in progress", "tbx up; export TALOSCONFIG=~/.talosbox/clusters/demo/talosconfig", "KUBECONFIG=~/.talosbox/clusters/demo/kubeconfig"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("provisioning hint missing %q:\n%s", want, joined)
 		}

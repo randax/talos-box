@@ -97,7 +97,7 @@ func Hints(status ClusterStatus) []string {
 		return []string{fmt.Sprintf("cluster is stopped — start it with: tbx cluster start %s", status.Name)}
 	}
 	if status.CNI != "" && !status.KubernetesReady {
-		return []string{fmt.Sprintf("%s provisioning is in progress; tbx will apply machine config, bootstrap, and reconcile the CNI. Rerun: tbx up%s", status.CNI, credentialExports(status.Name))}
+		return []string{fmt.Sprintf("%s provisioning is in progress; tbx will apply machine config, bootstrap, and reconcile the CNI. Rerun: tbx up;%s", status.CNI, credentialExports(status.Name))}
 	}
 	if len(maintenance) > 0 {
 		first := maintenance[0]
