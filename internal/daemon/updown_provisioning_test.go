@@ -216,7 +216,7 @@ func TestPersistIntentUpdatesDefersHostBGPDisableUntilL2Reconciliation(t *testin
 	}
 	next := item
 	next.BGP = false
-	if err := persistIntentUpdates([]intentUpdate{{previous: item, next: next}}); err != nil {
+	if err := persistIntentUpdates([]intentUpdate{{next: next}}); err != nil {
 		t.Fatal(err)
 	}
 	updated, err := cluster.Load(item.Name)

@@ -42,6 +42,23 @@ type fakeClient struct {
 	readyHook func()
 }
 
+type fakeLoadBalancer struct {
+	calls int
+	errs  []error
+}
+
+func (f *fakeLoadBalancer) Reconcile(context.Context, cluster.Cluster, []byte) (LoadBalancerResult, error) {
+	f.calls++
+	if len(f.errs) > 0 {
+		err := f.errs[0]
+		f.errs = f.errs[1:]
+		if err != nil {
+			return LoadBalancerResult{}, err
+		}
+	}
+	return LoadBalancerResult{VIP: "172.30.0.200"}, nil
+}
+
 func TestCiliumMachineConfigRoutesRuntimeImagesThroughCatchAllMirror(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	item, err := cluster.New("demo", 3, 1, 0, cluster.NodeDefaults{})
@@ -261,6 +278,108 @@ func TestFlannelReconcileRemintsDerivedCredentialsWithoutReapply(t *testing.T) {
 	}
 	if contents, err := os.ReadFile(result.KubeconfigPath); err != nil || string(contents) != "reminted" {
 		t.Fatalf("reminted kubeconfig = %q, %v", contents, err)
+	}
+}
+
+func TestFlannelReconcileRecoversFromEveryDocumentedInterruptionStage(t *testing.T) {
+	interrupted := errors.New("simulated process interruption")
+	tests := []struct {
+		name         string
+		loadBalancer bool
+		firstPass    func(cluster.Cluster, *fakeClient, *fakeLoadBalancer) Request
+		verify       func(*testing.T, *fakeClient, *fakeLoadBalancer)
+	}{
+		{
+			name: "post-apply",
+			firstPass: func(item cluster.Cluster, client *fakeClient, _ *fakeLoadBalancer) Request {
+				observations := 0
+				return Request{Cluster: item, Client: client, PollInterval: time.Nanosecond, Observe: func(context.Context) ([]Node, error) {
+					observations++
+					if observations == 1 {
+						return []Node{{Name: item.Nodes[0].Name, Role: cluster.RoleControlPlane, IP: item.Nodes[0].IP, Phase: PhaseMaintenance}}, nil
+					}
+					return nil, interrupted
+				}}
+			},
+			verify: func(t *testing.T, client *fakeClient, _ *fakeLoadBalancer) {
+				if len(client.applied) != 1 {
+					t.Fatalf("machine config apply calls = %d, want one before interruption and no reapply", len(client.applied))
+				}
+			},
+		},
+		{
+			name: "pre-bootstrap",
+			firstPass: func(item cluster.Cluster, client *fakeClient, _ *fakeLoadBalancer) Request {
+				client.bootErr = interrupted
+				return configuredRequest(item, client, nil)
+			},
+			verify: func(t *testing.T, client *fakeClient, _ *fakeLoadBalancer) {
+				if client.bootstrap != 2 {
+					t.Fatalf("bootstrap calls = %d, want interrupted attempt plus successful retry", client.bootstrap)
+				}
+			},
+		},
+		{
+			name: "post-bootstrap",
+			firstPass: func(item cluster.Cluster, client *fakeClient, _ *fakeLoadBalancer) Request {
+				client.kubeErrs = []error{interrupted}
+				return configuredRequest(item, client, nil)
+			},
+			verify: func(t *testing.T, client *fakeClient, _ *fakeLoadBalancer) {
+				if client.kube != 2 {
+					t.Fatalf("kubeconfig calls = %d, want interrupted attempt plus successful retry", client.kube)
+				}
+			},
+		},
+		{
+			name:         "pre-SSA",
+			loadBalancer: true,
+			firstPass: func(item cluster.Cluster, client *fakeClient, loadBalancer *fakeLoadBalancer) Request {
+				loadBalancer.errs = []error{interrupted}
+				return configuredRequest(item, client, loadBalancer)
+			},
+			verify: func(t *testing.T, _ *fakeClient, loadBalancer *fakeLoadBalancer) {
+				if loadBalancer.calls != 2 {
+					t.Fatalf("SSA reconcile calls = %d, want interrupted attempt plus idempotent retry", loadBalancer.calls)
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			item.TalosVersion = "v1.13.6"
+			item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, LB: test.loadBalancer}
+			client := &fakeClient{kubeData: []byte("kubeconfig")}
+			loadBalancer := &fakeLoadBalancer{}
+
+			if _, err := Reconcile(context.Background(), test.firstPass(item, client, loadBalancer)); !errors.Is(err, interrupted) {
+				t.Fatalf("first Reconcile() error = %v, want simulated interruption", err)
+			}
+			client.bootErr = nil
+			result, err := Reconcile(context.Background(), configuredRequest(item, client, loadBalancer))
+			if err != nil {
+				t.Fatalf("retry Reconcile() failed: %v", err)
+			}
+			if result.KubeconfigPath == "" {
+				t.Fatal("retry did not converge to derived credentials")
+			}
+			test.verify(t, client, loadBalancer)
+		})
+	}
+}
+
+func configuredRequest(item cluster.Cluster, client *fakeClient, loadBalancer LoadBalancerReconciler) Request {
+	return Request{
+		Cluster: item, Client: client, LoadBalancer: loadBalancer, PollInterval: time.Nanosecond,
+		Observe: func(context.Context) ([]Node, error) {
+			return []Node{{Name: item.Nodes[0].Name, Role: cluster.RoleControlPlane, IP: item.Nodes[0].IP, Phase: PhaseConfigured}}, nil
+		},
 	}
 }
 

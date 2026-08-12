@@ -87,8 +87,7 @@ func observedUpAction(action ActionKind, provisioned, complete bool) ActionKind 
 }
 
 type intentUpdate struct {
-	previous cluster.Cluster
-	next     cluster.Cluster
+	next cluster.Cluster
 }
 
 func persistIntentUpdates(updates []intentUpdate) error {
@@ -130,9 +129,8 @@ func (s *Server) preflightUp(
 			return nil, err
 		}
 		if changed {
-			previous := item
 			item.ProvisioningIntent = intent
-			updates = append(updates, intentUpdate{previous: previous, next: item})
+			updates = append(updates, intentUpdate{next: item})
 		}
 	}
 	return updates, nil
