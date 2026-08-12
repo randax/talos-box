@@ -266,22 +266,12 @@ func objectID(object unstructured.Unstructured) string {
 
 func deleteHubbleObjects(ctx context.Context, client dynamic.Interface, mapper meta.RESTMapper, candidates []unstructured.Unstructured) error {
 	for _, candidate := range candidates {
-		mapping, err := mapper.RESTMapping(candidate.GroupVersionKind().GroupKind(), candidate.GroupVersionKind().Version)
-		if err != nil {
-			return fmt.Errorf("map Hubble %s %q: %w", candidate.GetKind(), candidate.GetName(), err)
-		}
-		var resource dynamic.ResourceInterface
-		if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
-			resource = client.Resource(mapping.Resource).Namespace(candidate.GetNamespace())
-		} else {
-			resource = client.Resource(mapping.Resource)
-		}
-		live, err := resource.Get(ctx, candidate.GetName(), metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			continue
-		}
+		resource, live, found, err := getDynamicObject(ctx, client, mapper, candidate)
 		if err != nil {
 			return fmt.Errorf("get Hubble %s %q: %w", candidate.GetKind(), candidate.GetName(), err)
+		}
+		if !found {
+			continue
 		}
 		if live.GetAnnotations()[hubbleOwnershipAnnotation] != fieldManager {
 			continue
@@ -295,22 +285,12 @@ func deleteHubbleObjects(ctx context.Context, client dynamic.Interface, mapper m
 
 func validateHubbleOwnership(ctx context.Context, client dynamic.Interface, mapper meta.RESTMapper, candidates []unstructured.Unstructured) error {
 	for _, candidate := range candidates {
-		mapping, err := mapper.RESTMapping(candidate.GroupVersionKind().GroupKind(), candidate.GroupVersionKind().Version)
-		if err != nil {
-			return fmt.Errorf("map Hubble %s %q: %w", candidate.GetKind(), candidate.GetName(), err)
-		}
-		var resource dynamic.ResourceInterface
-		if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
-			resource = client.Resource(mapping.Resource).Namespace(candidate.GetNamespace())
-		} else {
-			resource = client.Resource(mapping.Resource)
-		}
-		live, err := resource.Get(ctx, candidate.GetName(), metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			continue
-		}
+		_, live, found, err := getDynamicObject(ctx, client, mapper, candidate)
 		if err != nil {
 			return fmt.Errorf("get Hubble %s %q: %w", candidate.GetKind(), candidate.GetName(), err)
+		}
+		if !found {
+			continue
 		}
 		if live.GetAnnotations()[hubbleOwnershipAnnotation] != fieldManager {
 			return fmt.Errorf("refuse to adopt unmanaged Hubble %s %q", candidate.GetKind(), candidate.GetName())
@@ -334,23 +314,13 @@ func deleteStaleCiliumAnnouncements(ctx context.Context, client dynamic.Interfac
 	}
 	resources := make([]dynamic.ResourceInterface, 0, len(candidates))
 	for _, candidate := range candidates {
-		mapping, err := mapper.RESTMapping(candidate.GroupVersionKind().GroupKind(), candidate.GroupVersionKind().Version)
-		if err != nil {
-			return fmt.Errorf("map stale Cilium %s %q: %w", candidate.GetKind(), candidate.GetName(), err)
-		}
-		var resource dynamic.ResourceInterface
-		if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
-			resource = client.Resource(mapping.Resource).Namespace(candidate.GetNamespace())
-		} else {
-			resource = client.Resource(mapping.Resource)
-		}
-		live, err := resource.Get(ctx, candidate.GetName(), metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			resources = append(resources, nil)
-			continue
-		}
+		resource, live, found, err := getDynamicObject(ctx, client, mapper, candidate)
 		if err != nil {
 			return fmt.Errorf("get stale Cilium %s %q: %w", candidate.GetKind(), candidate.GetName(), err)
+		}
+		if !found {
+			resources = append(resources, nil)
+			continue
 		}
 		if !announcementOwnedByTalosbox(live) {
 			return fmt.Errorf("refuse to remove unmanaged Cilium %s %q", candidate.GetKind(), candidate.GetName())
@@ -366,6 +336,32 @@ func deleteStaleCiliumAnnouncements(ctx context.Context, client dynamic.Interfac
 		}
 	}
 	return nil
+}
+
+func getDynamicObject(
+	ctx context.Context,
+	client dynamic.Interface,
+	mapper meta.RESTMapper,
+	candidate unstructured.Unstructured,
+) (dynamic.ResourceInterface, *unstructured.Unstructured, bool, error) {
+	mapping, err := mapper.RESTMapping(candidate.GroupVersionKind().GroupKind(), candidate.GroupVersionKind().Version)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("map %s %q: %w", candidate.GetKind(), candidate.GetName(), err)
+	}
+	var resource dynamic.ResourceInterface
+	if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
+		resource = client.Resource(mapping.Resource).Namespace(candidate.GetNamespace())
+	} else {
+		resource = client.Resource(mapping.Resource)
+	}
+	live, err := resource.Get(ctx, candidate.GetName(), metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return resource, nil, false, nil
+	}
+	if err != nil {
+		return resource, nil, false, err
+	}
+	return resource, live, true, nil
 }
 
 func announcementOwnedByTalosbox(object *unstructured.Unstructured) bool {
