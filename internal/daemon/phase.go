@@ -108,6 +108,18 @@ func Hints(status ClusterStatus) []string {
 	}
 	if len(configured) == len(status.Nodes) && len(status.Nodes) > 0 {
 		cp := status.controlPlaneOr(status.Nodes[0])
+		if status.CNI == cluster.CNIFlannel && status.LB && status.KubernetesReady {
+			if status.VIPLive {
+				return []string{fmt.Sprintf("Kubernetes is Ready; MetalLB L2 VIP is live at http://%s/. Flannel does not enforce NetworkPolicies; use cilium to exercise policies.", status.VIP)}
+			}
+			return []string{"Kubernetes is Ready; waiting for the MetalLB L2 LoadBalancer VIP probe to respond. Flannel does not enforce NetworkPolicies; use cilium to exercise policies."}
+		}
+		if status.CNI == cluster.CNIFlannel && !status.LB && status.KubernetesReady {
+			hints = append(hints,
+				fmt.Sprintf("Kubernetes is Ready with Talos-managed flannel; LoadBalancer support is disabled by lb: false, so no VIP is provisioned. export TALOSCONFIG=~/.talosbox/clusters/%s/talosconfig; export KUBECONFIG=~/.talosbox/clusters/%s/kubeconfig", status.Name, status.Name),
+			)
+			return hints
+		}
 		hints = append(hints,
 			fmt.Sprintf("all nodes configured. If etcd is not yet bootstrapped: talosctl --nodes %s bootstrap, then talosctl kubeconfig .", cp.IP),
 			fmt.Sprintf("node TUI (the Talos dashboard): talosctl dashboard --nodes %s", cp.IP),

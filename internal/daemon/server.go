@@ -27,18 +27,30 @@ type Server struct {
 	cache      *imagecache.Cache
 	hypervisor hypervisor.Hypervisor
 
-	opMu             sync.Mutex
-	vms              map[string]map[string]hypervisor.Machine
-	mirrors          *mirror.Manager
-	defaultSchematic string
-	subnetSources    cluster.SubnetSources
-	hostPressure     func(string) (hostpressure.Snapshot, error)
+	opMu               sync.Mutex
+	vms                map[string]map[string]hypervisor.Machine
+	provisions         map[string]activeProvision
+	provisionSequence  uint64
+	provisionReconcile provisionReconcileFunc
+	nodeIPLookup       func(string, int) string
+	nodeProbe          func(string) ProbeResult
+	lifecycleContext   context.Context
+	lifecycleCancel    context.CancelFunc
+	mirrors            *mirror.Manager
+	defaultSchematic   string
+	subnetSources      cluster.SubnetSources
+	hostPressure       func(string) (hostpressure.Snapshot, error)
 
 	listenerMu   sync.Mutex
 	listener     net.Listener
 	closing      bool
 	connections  map[net.Conn]struct{}
 	connectionWG sync.WaitGroup
+}
+
+type activeProvision struct {
+	generation uint64
+	cancel     context.CancelFunc
 }
 
 type lockedListener struct {
@@ -71,13 +83,17 @@ func NewServer(ctx context.Context) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	lifecycleContext, lifecycleCancel := context.WithCancel(ctx)
 	return &Server{
-		cache:         cache,
-		hypervisor:    backend,
-		vms:           make(map[string]map[string]hypervisor.Machine),
-		mirrors:       mirror.NewManager(mirror.DefaultDir(root)),
-		subnetSources: cluster.SystemSubnetSources(),
-		hostPressure:  hostpressure.SystemSnapshot,
+		cache:            cache,
+		hypervisor:       backend,
+		vms:              make(map[string]map[string]hypervisor.Machine),
+		provisions:       make(map[string]activeProvision),
+		lifecycleContext: lifecycleContext,
+		lifecycleCancel:  lifecycleCancel,
+		mirrors:          mirror.NewManager(mirror.DefaultDir(root)),
+		subnetSources:    cluster.SystemSubnetSources(),
+		hostPressure:     hostpressure.SystemSnapshot,
 	}, nil
 }
 
@@ -186,6 +202,9 @@ func (s *Server) Shutdown() error {
 	for _, connection := range connections {
 		_ = connection.Close()
 	}
+	s.opMu.Lock()
+	s.cancelAllProvisionsLocked()
+	s.opMu.Unlock()
 	s.connectionWG.Wait()
 
 	s.opMu.Lock()
@@ -226,6 +245,12 @@ func (s *Server) serveConnection(connection net.Conn) {
 }
 
 func (s *Server) dispatch(request Request) Response {
+	if request.Op == "status" {
+		return s.dispatchStatus(request)
+	}
+	if request.Op == "cluster.create" || request.Op == "cluster.start" || request.Op == "up" {
+		return s.dispatchProvisioning(request)
+	}
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 
@@ -234,6 +259,38 @@ func (s *Server) dispatch(request Request) Response {
 		return failure(err)
 	}
 	return success(data)
+}
+
+func (s *Server) dispatchProvisioning(request Request) Response {
+	s.opMu.Lock()
+	data, tasks, err := s.handleProvisioningLocked(request)
+	s.opMu.Unlock()
+	if err != nil {
+		return failure(err)
+	}
+	if err := s.runProvisionTasks(data, tasks); err != nil {
+		return failure(err)
+	}
+	return success(data)
+}
+
+// dispatchStatus keeps the existing VM-state snapshot serialized, then probes
+// Kubernetes after releasing opMu so a slow API server cannot block lifecycle
+// operations.
+func (s *Server) dispatchStatus(request Request) Response {
+	s.opMu.Lock()
+	data, err := s.handle(request)
+	s.opMu.Unlock()
+	if err != nil {
+		return failure(err)
+	}
+	statuses, ok := data.([]ClusterStatus)
+	if !ok {
+		return failure(errors.New("status returned an unexpected response"))
+	}
+	s.refreshNodeStatuses(statuses)
+	refreshKubernetesReadiness(statuses)
+	return success(statuses)
 }
 
 func (s *Server) handle(request Request) (any, error) {

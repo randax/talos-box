@@ -136,6 +136,73 @@ func TestCreateClusterSendsProvisioningIntentAndPrintsIt(t *testing.T) {
 	}
 }
 
+func TestCreateClusterDefaultsFlannelLoadBalancerOn(t *testing.T) {
+	home, err := os.MkdirTemp("/tmp", "tbx-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	t.Setenv("HOME", home)
+	socket := filepath.Join(home, ".talosbox", "tbxd.sock")
+	if err := os.MkdirAll(filepath.Dir(socket), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	requests := make(chan daemon.Request, 2)
+	go func() {
+		acceptAndRespond := func(response daemon.Response) bool {
+			connection, err := listener.Accept()
+			if err != nil {
+				return false
+			}
+			defer func() { _ = connection.Close() }()
+			var request daemon.Request
+			if err := json.NewDecoder(connection).Decode(&request); err != nil {
+				return false
+			}
+			requests <- request
+			return json.NewEncoder(connection).Encode(response) == nil
+		}
+		if !acceptAndRespond(daemon.Response{OK: true, Data: json.RawMessage(fmt.Sprintf(`{"protocolVersion":%d}`, daemon.ProtocolVersion))}) {
+			return
+		}
+		_ = acceptAndRespond(daemon.Response{OK: true, Data: json.RawMessage(`{"name":"demo","controlPlanes":1,"workers":2,"nodeDefaults":{"memoryMiB":2048,"cpus":2,"diskGiB":20},"cni":"flannel","lb":true}`)})
+	}()
+
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr}
+	if err := command.createCluster([]string{"demo", "--cni=flannel"}); err != nil {
+		t.Fatal(err)
+	}
+	if request := <-requests; request.Op != "daemon.info" {
+		t.Fatalf("first operation = %q, want daemon.info", request.Op)
+	}
+	request := <-requests
+	if request.Op != "cluster.create" {
+		t.Fatalf("second operation = %q, want cluster.create", request.Op)
+	}
+	var args struct {
+		CNI cluster.CNI `json:"cni"`
+		LB  *bool       `json:"lb"`
+	}
+	if err := json.Unmarshal(request.Args, &args); err != nil {
+		t.Fatal(err)
+	}
+	if args.CNI != cluster.CNIFlannel || args.LB == nil || !*args.LB {
+		t.Fatalf("create arguments = %+v, want flannel with lb defaulted on", args)
+	}
+	for _, line := range []string{"cni: flannel", "lb: true"} {
+		if !strings.Contains(stdout.String(), line) {
+			t.Fatalf("output missing %q:\n%s", line, stdout.String())
+		}
+	}
+}
+
 func TestCreateClusterRejectsOldDaemonBeforeMutation(t *testing.T) {
 	home, err := os.MkdirTemp("/tmp", "tbx-")
 	if err != nil {

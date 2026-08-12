@@ -115,3 +115,41 @@ func TestHints(t *testing.T) {
 		}
 	}
 }
+
+func TestHintsDescribeFlannelReadyWithoutLoadBalancer(t *testing.T) {
+	status := ClusterStatus{
+		Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel}, KubernetesReady: true,
+		Nodes: []NodeStatus{{Name: "demo-cp-1", Role: cluster.RoleControlPlane, Phase: PhaseConfigured, IP: "172.30.0.2"}},
+	}
+	hints := Hints(status)
+	joined := strings.Join(hints, "\n")
+	for _, wanted := range []string{"Ready", "lb: false", "disabled", "TALOSCONFIG=~/.talosbox/clusters/demo/talosconfig", "KUBECONFIG=~/.talosbox/clusters/demo/kubeconfig"} {
+		if !strings.Contains(joined, wanted) {
+			t.Fatalf("hints missing %q:\n%s", wanted, joined)
+		}
+	}
+}
+
+func TestHintsDescribeLiveFlannelMetalLBVIPAndPolicyLimit(t *testing.T) {
+	status := ClusterStatus{
+		Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, LB: true}, KubernetesReady: true,
+		VIP: "172.30.4.200", VIPLive: true,
+		Nodes: []NodeStatus{{Role: cluster.RoleControlPlane, Phase: PhaseConfigured}},
+	}
+	hints := Hints(status)
+	if len(hints) != 1 || !strings.Contains(hints[0], "http://172.30.4.200/") || !strings.Contains(hints[0], "does not enforce NetworkPolicies") {
+		t.Fatalf("hints = %v", hints)
+	}
+}
+
+func TestHintsDoNotInferFlannelKubernetesReadiness(t *testing.T) {
+	status := ClusterStatus{
+		Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel},
+		Nodes: []NodeStatus{{Name: "demo-cp-1", Role: cluster.RoleControlPlane, Phase: PhaseConfigured, IP: "172.30.0.2"}},
+	}
+	for _, hint := range Hints(status) {
+		if strings.Contains(hint, "Kubernetes is Ready") {
+			t.Fatalf("Hints() inferred Kubernetes readiness from Talos state: %q", hint)
+		}
+	}
+}

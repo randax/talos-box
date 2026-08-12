@@ -40,6 +40,7 @@ func (s *Server) up(raw json.RawMessage) ([]Action, error) {
 				return actions[:i], fmt.Errorf("create %s: %w", spec.Name, err)
 			}
 			actions[i].Warning = result.Warning
+			actions[i].Narration = result.Narration
 		case ActionStart:
 			encoded, err := json.Marshal(startArgs{Name: spec.Name, Force: args.Force})
 			if err != nil {

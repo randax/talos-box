@@ -90,7 +90,6 @@ func TestCreateClusterRejectsInvalidCSIIntentBeforeMutation(t *testing.T) {
 		})
 	}
 }
-
 func TestAddNodeChecksHostPressureBeforeMutation(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	item, err := cluster.New("unsafe-add", 0, 0, 0, cluster.NodeDefaults{MemoryMiB: 1})
