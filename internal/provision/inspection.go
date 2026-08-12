@@ -132,6 +132,14 @@ type inspection struct {
 	values  string
 	objects string
 	extras  string
+	chart   inspectionChartMetadata
+}
+
+type inspectionChartMetadata struct {
+	name      string
+	version   string
+	release   string
+	namespace string
 }
 
 func inspectProvisioning(item cluster.Cluster) (inspection, error) {
@@ -141,6 +149,12 @@ func inspectProvisioning(item cluster.Cluster) (inspection, error) {
 		objects, err := renderCilium(item)
 		if err != nil {
 			return inspection{}, err
+		}
+		result.chart = inspectionChartMetadata{
+			name:      "cilium/cilium",
+			version:   ciliumChartVersion,
+			release:   "cilium",
+			namespace: ciliumNamespace,
 		}
 		namespaces, chart, extras, probe := partitionCiliumObjects(objects)
 		result.values = manifests.CiliumValues(manifestFacts(item))
@@ -159,6 +173,12 @@ func inspectProvisioning(item cluster.Cluster) (inspection, error) {
 		objects, err := renderMetalLB(item)
 		if err != nil {
 			return inspection{}, err
+		}
+		result.chart = inspectionChartMetadata{
+			name:      "metallb/metallb",
+			version:   metalLBChartVersion,
+			release:   "metallb",
+			namespace: metalLBNamespace,
 		}
 		namespaces, chart, crds, extras, probe := partitionMetalLBObjects(objects)
 		result.values = manifests.MetalLBValues(manifestFacts(item))
@@ -202,41 +222,13 @@ func (i inspection) all(clusterName string) string {
 	var sections []string
 	sections = append(sections, fmt.Sprintf("# Machine-config prerequisite patch (apply before bootstrap):\n#   tbx manifests %s machine\n%s", clusterName, i.machine))
 	if i.values != "" {
-		sections = append(sections, fmt.Sprintf("# Pinned Helm values used by tbx (release %s in namespace %s):\n#   tbx manifests %s values > values.yaml\n%s", inspectionRelease(i), inspectionNamespace(i), clusterName, i.values))
+		sections = append(sections, fmt.Sprintf("# Pinned Helm values used by tbx (release %s in namespace %s):\n#   tbx manifests %s values > values.yaml\n%s", i.chart.release, i.chart.namespace, clusterName, i.values))
 	}
 	if i.objects != "" {
-		sections = append(sections, fmt.Sprintf("# Exact rendered chart objects tbx applies server-side (%s %s, release %s, namespace %s):\n#   tbx manifests %s objects | kubectl apply --server-side -f -\n%s", inspectionChart(i), inspectionChartVersion(i), inspectionRelease(i), inspectionNamespace(i), clusterName, i.objects))
+		sections = append(sections, fmt.Sprintf("# Exact rendered chart objects tbx applies server-side (%s %s, release %s, namespace %s):\n#   tbx manifests %s objects | kubectl apply --server-side -f -\n%s", i.chart.name, i.chart.version, i.chart.release, i.chart.namespace, clusterName, i.objects))
 	}
 	if i.extras != "" {
 		sections = append(sections, fmt.Sprintf("# Exact LoadBalancer/BGP extras and probe tbx applies:\n#   tbx manifests %s extras | kubectl apply --server-side -f -\n%s", clusterName, i.extras))
 	}
 	return strings.Join(sections, "---\n")
-}
-
-func inspectionChart(i inspection) string {
-	if strings.Contains(i.values, "kubeProxyReplacement") {
-		return "cilium/cilium"
-	}
-	return "metallb/metallb"
-}
-
-func inspectionChartVersion(i inspection) string {
-	if inspectionChart(i) == "cilium/cilium" {
-		return ciliumChartVersion
-	}
-	return metalLBChartVersion
-}
-
-func inspectionRelease(i inspection) string {
-	if inspectionChart(i) == "cilium/cilium" {
-		return "cilium"
-	}
-	return "metallb"
-}
-
-func inspectionNamespace(i inspection) string {
-	if inspectionChart(i) == "cilium/cilium" {
-		return ciliumNamespace
-	}
-	return metalLBNamespace
 }

@@ -101,6 +101,64 @@ clusters:
 	}
 }
 
+func TestRunUpQuietSuppressesNarrationButDefaultOutputShowsManualEquivalents(t *testing.T) {
+	t.Run("default output includes stage narration", func(t *testing.T) {
+		home, requests := startUpTestDaemon(t,
+			daemon.Response{OK: true, Data: json.RawMessage(fmt.Sprintf(`{"protocolVersion":%d}`, daemon.ProtocolVersion))},
+			daemon.Response{OK: true, Data: json.RawMessage(`[{"cluster":"demo","action":"reconcile","narration":["machine config: ≈ talosctl apply-config --insecure --nodes 172.30.0.2 --file controlplane.yaml","Cilium chart: ≈ helm template cilium cilium/cilium --version 1.19.6 -n kube-system | kubectl apply --server-side -f -"]}]`)},
+		)
+		path := filepath.Join(home, "talosbox.yaml")
+		if err := os.WriteFile(path, []byte("version: 1\nclusters:\n  - name: demo\n    cni: cilium\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		var stdout, stderr bytes.Buffer
+		if err := (cli{out: &stdout, err: &stderr}).runUp([]string{"-f", path}); err != nil {
+			t.Fatal(err)
+		}
+		if request := <-requests; request.Op != "daemon.info" {
+			t.Fatalf("first operation = %q, want daemon.info", request.Op)
+		}
+		if request := <-requests; request.Op != "up" {
+			t.Fatalf("second operation = %q, want up", request.Op)
+		}
+		for _, want := range []string{
+			"reconciled demo\n",
+			"machine config: ≈ talosctl apply-config --insecure --nodes 172.30.0.2 --file controlplane.yaml",
+			"Cilium chart: ≈ helm template cilium cilium/cilium --version 1.19.6 -n kube-system | kubectl apply --server-side -f -",
+		} {
+			if !strings.Contains(stdout.String(), want) {
+				t.Fatalf("default runUp output missing %q:\n%s", want, stdout.String())
+			}
+		}
+	})
+
+	t.Run("quiet suppresses stage narration", func(t *testing.T) {
+		home, requests := startUpTestDaemon(t,
+			daemon.Response{OK: true, Data: json.RawMessage(fmt.Sprintf(`{"protocolVersion":%d}`, daemon.ProtocolVersion))},
+			daemon.Response{OK: true, Data: json.RawMessage(`[{"cluster":"demo","action":"reconcile","narration":["machine config: ≈ talosctl apply-config --insecure --nodes 172.30.0.2 --file controlplane.yaml","Cilium chart: ≈ helm template cilium cilium/cilium --version 1.19.6 -n kube-system | kubectl apply --server-side -f -"]}]`)},
+		)
+		path := filepath.Join(home, "talosbox.yaml")
+		if err := os.WriteFile(path, []byte("version: 1\nclusters:\n  - name: demo\n    cni: cilium\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		var stdout, stderr bytes.Buffer
+		if err := (cli{out: &stdout, err: &stderr}).runUp([]string{"-f", path, "--quiet"}); err != nil {
+			t.Fatal(err)
+		}
+		if request := <-requests; request.Op != "daemon.info" {
+			t.Fatalf("first operation = %q, want daemon.info", request.Op)
+		}
+		if request := <-requests; request.Op != "up" {
+			t.Fatalf("second operation = %q, want up", request.Op)
+		}
+		if got := stdout.String(); got != "reconciled demo\n" {
+			t.Fatalf("quiet runUp output = %q, want final action only", got)
+		}
+	})
+}
+
 func startUpTestDaemon(t *testing.T, responses ...daemon.Response) (string, <-chan daemon.Request) {
 	t.Helper()
 	home, err := os.MkdirTemp("/tmp", "tbx-")
