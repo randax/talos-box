@@ -264,20 +264,21 @@ func (s *Server) dispatch(request Request) Response {
 func (s *Server) dispatchProvisioning(request Request) Response {
 	var allMaintenance func(cluster.Cluster) bool
 	if request.Op == "up" {
-		observations, err := s.observeUpMaintenance(request.Args)
+		discovered, err := s.observeUpMaintenance(request.Args)
 		if err != nil {
 			return failure(err)
 		}
 		// Confirm the externally-owned Talos phase immediately before the
 		// serialized commit. A node may leave maintenance without its VM power
 		// state changing, so the first observation is discovery, not authority.
-		observations, err = s.observeUpMaintenance(request.Args)
+		confirmed, err := s.observeUpMaintenance(request.Args)
 		if err != nil {
 			return failure(err)
 		}
 		allMaintenance = func(item cluster.Cluster) bool {
-			observation, ok := observations[item.Name]
-			return ok && observation.matches(item, func(nodeName string) bool {
+			first, firstOK := discovered[item.Name]
+			observation, confirmedOK := confirmed[item.Name]
+			return firstOK && confirmedOK && first.sameSnapshot(observation) && observation.matches(item, func(nodeName string) bool {
 				return s.nodeRunning(item.Name, nodeName)
 			})
 		}

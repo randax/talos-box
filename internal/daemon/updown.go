@@ -67,6 +67,18 @@ type maintenanceObservation struct {
 	allMaintenance bool
 }
 
+func (observation maintenanceObservation) sameSnapshot(other maintenanceObservation) bool {
+	if observation.allMaintenance != other.allMaintenance || len(observation.running) != len(other.running) {
+		return false
+	}
+	for name, running := range observation.running {
+		if otherRunning, ok := other.running[name]; !ok || running != otherRunning {
+			return false
+		}
+	}
+	return true
+}
+
 func (observation maintenanceObservation) matches(item cluster.Cluster, nodeRunning func(string) bool) bool {
 	if !observation.allMaintenance || len(observation.running) != len(item.Nodes) {
 		return false
