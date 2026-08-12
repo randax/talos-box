@@ -20,6 +20,7 @@ const (
 var (
 	kubernetesReadyProbe   = provision.KubernetesReady
 	ciliumConvergenceProbe = provision.CiliumConverged
+	loadBalancerVIPProbe   = loadBalancerVIP
 )
 
 type provisionReconcileFunc func(context.Context, provision.Request) (provision.Result, error)
@@ -255,7 +256,7 @@ func (s *Server) provisioningComplete(item cluster.Cluster) bool {
 	}
 	vipLive := false
 	if item.LB {
-		_, vipLive = loadBalancerVIP(item)
+		_, vipLive = loadBalancerVIPProbe(item)
 	}
 	if item.CNI == cluster.CNICilium {
 		dir, err := cluster.Dir(item.Name)
@@ -272,6 +273,9 @@ func (s *Server) provisioningComplete(item cluster.Cluster) bool {
 			return false
 		}
 		if item.LB {
+			if !vipLive {
+				return false
+			}
 			active, err := hostBGPActive(item.Name)
 			if err != nil {
 				return false
