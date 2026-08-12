@@ -384,7 +384,7 @@ func ciliumNarration(item cluster.Cluster, loadBalancer bool) []string {
 		narration = append(narration, "≈ kubectl apply --server-side -f - # Cilium LB-IPAM/L2 pool and VIP probe")
 	}
 	if item.Hubble {
-		narration = append(narration, "≈ kubectl port-forward -n kube-system service/hubble-ui 12000:80 # Hubble UI at http://localhost:12000")
+		narration = append(narration, "≈ kubectl port-forward -n "+ciliumNamespace+" service/hubble-ui 12000:80 # Hubble UI at http://localhost:12000")
 	}
 	return narration
 }
