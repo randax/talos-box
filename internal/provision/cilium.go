@@ -378,10 +378,10 @@ func announcementOwnedByTalosbox(object *unstructured.Unstructured) bool {
 
 func ciliumNarration(item cluster.Cluster, loadBalancer bool) []string {
 	narration := []string{
-		"Cilium chart: ≈ helm template cilium cilium/cilium --version " + ciliumChartVersion + " -n " + ciliumNamespace + " | kubectl apply --server-side -f -",
+		"Cilium chart: ≈ tbx manifests " + item.Name + " objects | kubectl apply --server-side -f -",
 	}
 	if loadBalancer {
-		narration = append(narration, "Cilium LoadBalancer extras: ≈ kubectl apply --server-side -f - # LB-IPAM/L2 or BGP pool and VIP probe")
+		narration = append(narration, "Cilium LoadBalancer extras: ≈ tbx manifests "+item.Name+" extras | kubectl apply --server-side -f -")
 	}
 	if item.Hubble {
 		narration = append(narration, "Hubble UI: ≈ kubectl port-forward -n "+ciliumNamespace+" service/hubble-ui 12000:80 # http://localhost:12000")

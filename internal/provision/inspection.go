@@ -219,7 +219,9 @@ func encodeInspectionObjects(objects []unstructured.Unstructured) (string, error
 }
 
 func (i inspection) all(clusterName string) string {
-	var sections []string
+	sections := []string{
+		"# Inspection bundle only: this stream mixes a Talos patch, Helm values, and Kubernetes objects.\n# Do not pipe it wholesale to talosctl, helm, or kubectl; run the command above each section instead.\n",
+	}
 	sections = append(sections, fmt.Sprintf("# Machine-config prerequisite patch (apply before bootstrap):\n#   tbx manifests %s machine\n%s", clusterName, i.machine))
 	if i.values != "" {
 		sections = append(sections, fmt.Sprintf("# Pinned Helm values used by tbx (release %s in namespace %s):\n#   tbx manifests %s values > values.yaml\n%s", i.chart.release, i.chart.namespace, clusterName, i.values))

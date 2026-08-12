@@ -157,10 +157,14 @@ func (r MetalLBReconciler) reconcile(ctx context.Context, item cluster.Cluster, 
 	if err != nil {
 		return LoadBalancerResult{}, err
 	}
-	return LoadBalancerResult{VIP: vip, Narration: []string{
-		"MetalLB chart: ≈ helm template metallb metallb/metallb --version " + metalLBChartVersion + " -n " + metalLBNamespace + " | kubectl apply --server-side -f -",
-		"MetalLB LoadBalancer extras: ≈ kubectl apply --server-side -f - # L2 pool and VIP probe",
-	}}, nil
+	return LoadBalancerResult{VIP: vip, Narration: metalLBNarration(item)}, nil
+}
+
+func metalLBNarration(item cluster.Cluster) []string {
+	return []string{
+		"MetalLB chart: ≈ tbx manifests " + item.Name + " objects | kubectl apply --server-side -f -",
+		"MetalLB LoadBalancer extras: ≈ tbx manifests " + item.Name + " extras | kubectl apply --server-side -f -",
+	}
 }
 
 func renderMetalLB(item cluster.Cluster) ([]unstructured.Unstructured, error) {

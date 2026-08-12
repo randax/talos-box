@@ -142,3 +142,37 @@ func TestRenderInspectionIndependentSections(t *testing.T) {
 		t.Fatalf("values section unexpectedly contains rendered objects:\n%s", values)
 	}
 }
+
+func TestInspectionAllWarnsThatMixedOutputIsNotDirectlyApplicable(t *testing.T) {
+	item := cluster.Cluster{Name: "demo", SubnetIndex: 2, ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true}}
+	all, err := RenderInspection(item, "all")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Inspection bundle only", "Do not pipe it wholesale", "run the command above each section"} {
+		if !strings.Contains(all, want) {
+			t.Fatalf("all inspection missing safety guidance %q:\n%s", want, all)
+		}
+	}
+}
+
+func TestProvisioningNarrationUsesExactInspectionSections(t *testing.T) {
+	item := cluster.Cluster{Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true}}
+	for stage, narration := range map[string][]string{
+		"Cilium":  ciliumNarration(item, true),
+		"MetalLB": metalLBNarration(item),
+	} {
+		joined := strings.Join(narration, "\n")
+		for _, want := range []string{
+			"tbx manifests demo objects | kubectl apply --server-side -f -",
+			"tbx manifests demo extras | kubectl apply --server-side -f -",
+		} {
+			if !strings.Contains(joined, want) {
+				t.Fatalf("%s narration missing exact manual equivalent %q:\n%s", stage, want, joined)
+			}
+		}
+		if strings.Contains(joined, "helm template") {
+			t.Fatalf("%s narration bypasses curated values:\n%s", stage, joined)
+		}
+	}
+}
