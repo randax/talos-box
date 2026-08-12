@@ -169,7 +169,7 @@ func (s *Server) provisionCNI(parent context.Context, item cluster.Cluster, forc
 	// Once every desired outcome is observed healthy, a rerun is a genuine fast
 	// no-op. Cilium additionally probes its optional Hubble deployments: a live
 	// VIP and Ready Nodes alone cannot establish that that desired set converged.
-	if !force && s.fastNoopProvisioned(item) {
+	if !force && s.tryFastNoopReconcile(item) {
 		return nil, nil
 	}
 	dir, err := cluster.Dir(item.Name)
@@ -195,15 +195,7 @@ func (s *Server) provisionCNI(parent context.Context, item cluster.Cluster, forc
 		LoadBalancer: loadBalancer,
 		BGP:          hostBGPReconciler{},
 		Observe: func(context.Context) ([]provision.Node, error) {
-			s.opMu.Lock()
-			states := make([]provision.Node, 0, len(item.Nodes))
-			for _, node := range item.Nodes {
-				status := nodeStatus(node, item.SubnetIndex, s.nodeRunning(item.Name, node.Name))
-				phase := provision.Phase(status.Phase)
-				states = append(states, provision.Node{Name: node.Name, Role: node.Role, IP: status.IP, Phase: phase})
-			}
-			s.opMu.Unlock()
-			return states, nil
+			return s.observeProvisionNodes(item), nil
 		},
 		PollInterval: time.Second,
 	})
@@ -213,7 +205,31 @@ func (s *Server) provisionCNI(parent context.Context, item cluster.Cluster, forc
 	return result.Narration, nil
 }
 
-func (s *Server) fastNoopProvisioned(item cluster.Cluster) bool {
+func (s *Server) observeProvisionNodes(item cluster.Cluster) []provision.Node {
+	running := make(map[string]bool, len(item.Nodes))
+	s.opMu.Lock()
+	for _, node := range item.Nodes {
+		running[node.Name] = s.nodeRunning(item.Name, node.Name)
+	}
+	s.opMu.Unlock()
+
+	lookupIP := s.provisionIPLookup
+	if lookupIP == nil {
+		lookupIP = cluster.LookupIP
+	}
+	probe := s.provisionNodeProbe
+	if probe == nil {
+		probe = probeAPID
+	}
+	states := make([]provision.Node, 0, len(item.Nodes))
+	for _, node := range item.Nodes {
+		status := nodeStatusWith(node, item.SubnetIndex, running[node.Name], lookupIP, probe)
+		states = append(states, provision.Node{Name: node.Name, Role: node.Role, IP: status.IP, Phase: provision.Phase(status.Phase)})
+	}
+	return states
+}
+
+func (s *Server) tryFastNoopReconcile(item cluster.Cluster) bool {
 	if !s.provisioningComplete(item) {
 		return false
 	}

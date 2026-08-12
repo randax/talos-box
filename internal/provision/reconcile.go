@@ -2,6 +2,7 @@
 // path. It deliberately persists only credentials and receives observed node
 // state from the daemon; provisioning progress is never written to cluster
 // state.
+// Package provision reconciles curated Kubernetes networking stacks.
 package provision
 
 import (

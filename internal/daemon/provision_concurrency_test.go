@@ -84,6 +84,46 @@ func TestShutdownCancelsActiveProvisioning(t *testing.T) {
 	}
 }
 
+func TestProvisionObserverDoesNotHoldOperationLockWhileProbing(t *testing.T) {
+	service, item, _, _ := blockedProvision(t)
+	service.vms[item.Name] = map[string]hypervisor.Machine{
+		item.Nodes[0].Name: &fakeMachine{active: true},
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	service.provisionIPLookup = func(string, int) string { return "172.30.0.2" }
+	service.provisionNodeProbe = func(string) ProbeResult {
+		close(started)
+		<-release
+		return ProbeResult{Dialed: true, TLS: true}
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		service.observeProvisionNodes(item)
+	}()
+	waitForProvisionStart(t, started)
+
+	lockAcquired := make(chan struct{})
+	go func() {
+		service.opMu.Lock()
+		service.opMu.Unlock()
+		close(lockAcquired)
+	}()
+	select {
+	case <-lockAcquired:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("node probe held the daemon operation lock")
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("node observation did not finish after probe release")
+	}
+}
+
 func blockedProvision(t *testing.T) (*Server, cluster.Cluster, provisionTask, <-chan struct{}) {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
