@@ -32,6 +32,8 @@ type Server struct {
 	provisions         map[string]activeProvision
 	provisionSequence  uint64
 	provisionReconcile provisionReconcileFunc
+	provisionIPLookup  func(string, int) string
+	provisionNodeProbe func(string) ProbeResult
 	lifecycleContext   context.Context
 	lifecycleCancel    context.CancelFunc
 	mirrors            *mirror.Manager

@@ -173,15 +173,7 @@ func (s *Server) provisionFlannel(parent context.Context, item cluster.Cluster) 
 			PollInterval: time.Second,
 		},
 		Observe: func(context.Context) ([]provision.Node, error) {
-			s.opMu.Lock()
-			defer s.opMu.Unlock()
-			states := make([]provision.Node, 0, len(item.Nodes))
-			for _, node := range item.Nodes {
-				status := nodeStatus(node, item.SubnetIndex, s.nodeRunning(item.Name, node.Name))
-				phase := provision.Phase(status.Phase)
-				states = append(states, provision.Node{Name: node.Name, Role: node.Role, IP: status.IP, Phase: phase})
-			}
-			return states, nil
+			return s.observeProvisionNodes(item), nil
 		},
 		PollInterval: time.Second,
 	})
@@ -189,6 +181,30 @@ func (s *Server) provisionFlannel(parent context.Context, item cluster.Cluster) 
 		return nil, err
 	}
 	return result.Narration, nil
+}
+
+func (s *Server) observeProvisionNodes(item cluster.Cluster) []provision.Node {
+	running := make(map[string]bool, len(item.Nodes))
+	s.opMu.Lock()
+	for _, node := range item.Nodes {
+		running[node.Name] = s.nodeRunning(item.Name, node.Name)
+	}
+	s.opMu.Unlock()
+
+	lookupIP := s.provisionIPLookup
+	if lookupIP == nil {
+		lookupIP = cluster.LookupIP
+	}
+	probe := s.provisionNodeProbe
+	if probe == nil {
+		probe = probeAPID
+	}
+	states := make([]provision.Node, 0, len(item.Nodes))
+	for _, node := range item.Nodes {
+		status := nodeStatusWith(node, item.SubnetIndex, running[node.Name], lookupIP, probe)
+		states = append(states, provision.Node{Name: node.Name, Role: node.Role, IP: status.IP, Phase: provision.Phase(status.Phase)})
+	}
+	return states
 }
 
 func kubernetesReady(name string, expectedNodes []string) bool {
