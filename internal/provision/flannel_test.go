@@ -244,11 +244,19 @@ func TestFlannelReconcileStopsAtContextDeadline(t *testing.T) {
 	}
 }
 
-func TestFlannelLoadBalancerIsExplicitlyDeferred(t *testing.T) {
-	item := cluster.Cluster{ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, LB: true}}
-	_, err := Reconcile(context.Background(), Request{Cluster: item})
-	if !errors.Is(err, ErrFlannelLoadBalancerUnsupported) {
-		t.Fatalf("Reconcile() error = %v, want deferred flannel LB error", err)
+func TestFlannelLoadBalancerRequiresKubernetesReconciler(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.TalosVersion = "v1.13.6"
+	item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, LB: true}
+	_, err = Reconcile(context.Background(), Request{Cluster: item, Client: &fakeClient{kubeData: []byte("kubeconfig")}, Observe: func(context.Context) ([]Node, error) {
+		return []Node{{Name: item.Nodes[0].Name, Role: cluster.RoleControlPlane, IP: item.Nodes[0].IP, Phase: PhaseConfigured}}, nil
+	}})
+	if err == nil || !strings.Contains(err.Error(), "LoadBalancer provisioning requires a Kubernetes reconciler") {
+		t.Fatalf("Reconcile() error = %v, want missing LoadBalancer reconciler", err)
 	}
 }
 

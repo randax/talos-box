@@ -32,8 +32,6 @@ import (
 	"google.golang.org/grpc/codes"
 )
 
-var ErrFlannelLoadBalancerUnsupported = errors.New("flannel LoadBalancer provisioning is not yet implemented")
-
 const defaultPollInterval = time.Second
 
 // Phase is the observed Talos API state relevant to config application.
@@ -62,11 +60,18 @@ type TalosClient interface {
 	KubernetesReady(context.Context, []byte, []string) error
 }
 
+// LoadBalancerReconciler installs and verifies the flannel LoadBalancer
+// implementation after Talos has produced a ready Kubernetes API.
+type LoadBalancerReconciler interface {
+	Reconcile(context.Context, cluster.Cluster, []byte) (LoadBalancerResult, error)
+}
+
 // Request supplies all transient state required for one reconciliation.
 type Request struct {
 	Cluster      cluster.Cluster
 	Observe      func(context.Context) ([]Node, error)
 	Client       TalosClient
+	LoadBalancer LoadBalancerReconciler
 	PollInterval time.Duration
 }
 
@@ -75,6 +80,7 @@ type Result struct {
 	TalosconfigPath string
 	KubeconfigPath  string
 	Narration       []string
+	VIP             string
 }
 
 type generated struct {
@@ -97,9 +103,6 @@ type credentialPaths struct {
 func Reconcile(ctx context.Context, request Request) (Result, error) {
 	if request.Cluster.CNI != cluster.CNIFlannel {
 		return Result{}, nil
-	}
-	if request.Cluster.LB {
-		return Result{}, ErrFlannelLoadBalancerUnsupported
 	}
 	if request.Client == nil || request.Observe == nil {
 		return Result{}, errors.New("flannel provisioning requires a Talos client and node observer")
@@ -186,6 +189,17 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 			fmt.Sprintf("export TALOSCONFIG=%s", generated.paths.talosconfig),
 			fmt.Sprintf("export KUBECONFIG=%s", generated.paths.kubeconfig),
 		)
+		if request.Cluster.LB {
+			if request.LoadBalancer == nil {
+				return Result{}, errors.New("flannel LoadBalancer provisioning requires a Kubernetes reconciler")
+			}
+			loadBalancer, err := request.LoadBalancer.Reconcile(ctx, request.Cluster, kubeconfig)
+			if err != nil {
+				return Result{}, fmt.Errorf("reconcile flannel LoadBalancer: %w", err)
+			}
+			result.VIP = loadBalancer.VIP
+			result.Narration = append(result.Narration, loadBalancer.Narration...)
+		}
 		return result, nil
 	}
 }

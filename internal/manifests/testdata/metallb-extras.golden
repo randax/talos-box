@@ -1,0 +1,21 @@
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: demo-pool
+  namespace: metallb-system
+  labels:
+    talosbox.dev/managed: "true"
+spec:
+  addresses:
+    - 172.30.0.200-172.30.0.239
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: demo-l2
+  namespace: metallb-system
+  labels:
+    talosbox.dev/managed: "true"
+spec:
+  ipAddressPools:
+    - demo-pool
