@@ -25,9 +25,10 @@ func (c cli) runUp(args []string) error {
 		return err
 	}
 	return c.printActions(actions, map[daemon.ActionKind]string{
-		daemon.ActionCreate: "created %s",
-		daemon.ActionStart:  "started %s",
-		daemon.ActionNone:   "%s is up to date",
+		daemon.ActionCreate:    "created %s",
+		daemon.ActionStart:     "started %s",
+		daemon.ActionReconcile: "reconciled %s",
+		daemon.ActionNone:      "%s is up to date",
 	})
 }
 

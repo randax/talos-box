@@ -74,6 +74,13 @@ type BGPReconciler interface {
 	ReconcileBGP(context.Context, cluster.Cluster) error
 }
 
+// BGPDisabler is optional because only the daemon owns a host speaker. It is
+// intentionally separate from BGPReconciler so isolated render/reconcile
+// callers need not manufacture host-network state.
+type BGPDisabler interface {
+	DisableBGP(context.Context, cluster.Cluster) error
+}
+
 // Request supplies all transient state required for one reconciliation.
 type Request struct {
 	Cluster      cluster.Cluster
@@ -178,7 +185,7 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 		result.Narration = append(result.Narration,
 			fmt.Sprintf("≈ talosctl --nodes %s bootstrap", controlPlane.IP),
 		)
-		kubeconfig, err := request.Client.Kubeconfig(ctx, controlPlane.IP)
+		kubeconfig, err := kubeconfigWithRetry(ctx, request.Client, controlPlane.IP, request.PollInterval)
 		if err != nil {
 			return Result{}, fmt.Errorf("retrieve kubeconfig: %w", err)
 		}
@@ -205,6 +212,15 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 			loadBalancer, err := request.LoadBalancer.Reconcile(ctx, request.Cluster, kubeconfig)
 			if err != nil {
 				return Result{}, fmt.Errorf("reconcile Cilium: %w", err)
+			}
+			if request.Cluster.LB && !request.Cluster.BGP {
+				if disabler, ok := request.BGP.(BGPDisabler); ok {
+					// Cilium's reconciler has already applied L2 and removed its
+					// owned BGP objects. Only now may the host withdraw the peer.
+					if err := disabler.DisableBGP(ctx, request.Cluster); err != nil {
+						return Result{}, fmt.Errorf("disable host BGP: %w", err)
+					}
+				}
 			}
 			result.VIP = loadBalancer.VIP
 			result.Narration = append(result.Narration, loadBalancer.Narration...)
@@ -453,6 +469,27 @@ func alreadyBootstrapped(err error) bool {
 	return talosclient.StatusCode(err) == codes.AlreadyExists || strings.Contains(strings.ToLower(err.Error()), "already bootstrapped")
 }
 
+// kubeconfigWithRetry covers the short interval after bootstrap where Talos
+// has accepted the request but apid is still restarting or its Kubernetes
+// credentials are not yet available. Permanent failures remain immediate;
+// an interrupted run is still always safely recoverable by rerunning tbx up.
+func kubeconfigWithRetry(ctx context.Context, client TalosClient, node string, interval time.Duration) ([]byte, error) {
+	for {
+		kubeconfig, err := client.Kubeconfig(ctx, node)
+		if err == nil {
+			return kubeconfig, nil
+		}
+		switch talosclient.StatusCode(err) {
+		case codes.Unavailable, codes.DeadlineExceeded, codes.Canceled:
+			if err := wait(ctx, interval); err != nil {
+				return nil, err
+			}
+		default:
+			return nil, err
+		}
+	}
+}
+
 func wait(ctx context.Context, interval time.Duration) error {
 	if interval <= 0 {
 		return nil
@@ -556,6 +593,58 @@ func KubernetesReady(ctx context.Context, kubeconfig []byte, expectedNodes []str
 	for name := range expected {
 		if !ready[name] {
 			return fmt.Errorf("kubernetes expected node %q was not found", name)
+		}
+	}
+	return nil
+}
+
+// HubbleConverged verifies the optional Cilium Hubble deployments match the
+// desired toggle. It is intentionally a small observed-state check for the
+// fast path: a live VIP and Ready Nodes alone cannot prove that relay and UI
+// converged after their setting changed.
+func HubbleConverged(ctx context.Context, kubeconfig []byte, enabled bool) error {
+	transport, server, err := kubeTransport(kubeconfig)
+	if err != nil {
+		return err
+	}
+	defer transport.CloseIdleConnections()
+	for _, name := range []string{"hubble-relay", "hubble-ui"} {
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, server+"/apis/apps/v1/namespaces/kube-system/deployments/"+name, nil)
+		if err != nil {
+			return err
+		}
+		response, err := (&http.Client{Transport: transport}).Do(request)
+		if err != nil {
+			return err
+		}
+		if !enabled {
+			_ = response.Body.Close()
+			if response.StatusCode != http.StatusNotFound {
+				return fmt.Errorf("hubble is disabled but deployment %q still exists (%s)", name, response.Status)
+			}
+			continue
+		}
+		if response.StatusCode != http.StatusOK {
+			_ = response.Body.Close()
+			return fmt.Errorf("hubble deployment %q: %s", name, response.Status)
+		}
+		var deployment struct {
+			Metadata struct {
+				Generation int64 `json:"generation"`
+			} `json:"metadata"`
+			Status struct {
+				ObservedGeneration int64 `json:"observedGeneration"`
+				ReadyReplicas      int32 `json:"readyReplicas"`
+				AvailableReplicas  int32 `json:"availableReplicas"`
+			} `json:"status"`
+		}
+		decodeErr := json.NewDecoder(response.Body).Decode(&deployment)
+		_ = response.Body.Close()
+		if decodeErr != nil {
+			return fmt.Errorf("decode Hubble deployment %q: %w", name, decodeErr)
+		}
+		if deployment.Status.ObservedGeneration < deployment.Metadata.Generation || deployment.Status.ReadyReplicas < 1 || deployment.Status.AvailableReplicas < 1 {
+			return fmt.Errorf("hubble deployment %q is not Ready", name)
 		}
 	}
 	return nil
