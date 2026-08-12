@@ -34,16 +34,6 @@ func (s *Server) up(raw json.RawMessage) ([]Action, error) {
 		return nil, err
 	}
 	for i, action := range actions {
-		if action.Kind != ActionNone {
-			continue
-		}
-		item, err := cluster.Load(args.Clusters[i].Name)
-		if err != nil {
-			return nil, fmt.Errorf("load %s: %w", args.Clusters[i].Name, err)
-		}
-		actions[i].Kind = observedUpAction(action.Kind, item.CNI != "", s.provisioningComplete(item))
-	}
-	for i, action := range actions {
 		spec := args.Clusters[i]
 		switch action.Kind {
 		case ActionCreate:
@@ -64,7 +54,7 @@ func (s *Server) up(raw json.RawMessage) ([]Action, error) {
 			}
 			actions[i].Warning = result.Warning
 			actions[i].Narration = result.Narration
-		case ActionReconcile, ActionNone:
+		case ActionNone:
 			item, err := cluster.Load(spec.Name)
 			if err != nil {
 				return actions[:i], fmt.Errorf("load %s: %w", spec.Name, err)
@@ -74,13 +64,14 @@ func (s *Server) up(raw json.RawMessage) ([]Action, error) {
 				return actions[:i], fmt.Errorf("provision %s: %w", spec.Name, err)
 			}
 			actions[i].Narration = narration
+			actions[i].Kind = actionAfterProvision(action.Kind, narration)
 		}
 	}
 	return actions, nil
 }
 
-func observedUpAction(action ActionKind, provisioned, complete bool) ActionKind {
-	if action == ActionNone && provisioned && !complete {
+func actionAfterProvision(action ActionKind, narration []string) ActionKind {
+	if action == ActionNone && len(narration) > 0 {
 		return ActionReconcile
 	}
 	return action

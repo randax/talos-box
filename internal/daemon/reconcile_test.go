@@ -40,25 +40,22 @@ func TestPlanUpStartsPartiallyRunningCluster(t *testing.T) {
 	}
 }
 
-func TestObservedUpActionDoesNotCallIncompleteProvisioningUpToDate(t *testing.T) {
+func TestActionAfterProvisionDoesNotCallReconciledClusterUpToDate(t *testing.T) {
 	tests := []struct {
-		name        string
-		action      ActionKind
-		provisioned bool
-		complete    bool
-		want        ActionKind
+		name      string
+		action    ActionKind
+		narration []string
+		want      ActionKind
 	}{
 		{name: "running substrate-only cluster stays no-op", action: ActionNone, want: ActionNone},
-		{name: "running provisioned cluster waits for Kubernetes", action: ActionNone, provisioned: true, want: ActionReconcile},
-		{name: "Ready provisioned cluster is up to date", action: ActionNone, provisioned: true, complete: true, want: ActionNone},
-		{name: "observed BGP host peer permits up to date", action: ActionNone, provisioned: true, complete: true, want: ActionNone},
-		{name: "missing BGP host peer reconciles", action: ActionNone, provisioned: true, want: ActionReconcile},
-		{name: "stopped provisioned cluster starts before reconciliation", action: ActionStart, provisioned: true, want: ActionStart},
+		{name: "fast no-op provisioned cluster is up to date", action: ActionNone, want: ActionNone},
+		{name: "provisioning work is reported as reconciled", action: ActionNone, narration: []string{"≈ kubectl apply --server-side -f -"}, want: ActionReconcile},
+		{name: "stopped provisioned cluster starts before reconciliation", action: ActionStart, narration: []string{"≈ kubectl apply --server-side -f -"}, want: ActionStart},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := observedUpAction(test.action, test.provisioned, test.complete); got != test.want {
-				t.Fatalf("observedUpAction(%q, %t, %t) = %q, want %q", test.action, test.provisioned, test.complete, got, test.want)
+			if got := actionAfterProvision(test.action, test.narration); got != test.want {
+				t.Fatalf("actionAfterProvision(%q, %q) = %q, want %q", test.action, test.narration, got, test.want)
 			}
 		})
 	}
