@@ -10,7 +10,10 @@ import (
 	"strings"
 )
 
-var requiredKernelArgs = []string{"console=tty0", "console=hvc0"}
+var (
+	requiredKernelArgs = []string{"console=tty0", "console=hvc0"}
+	requiredExtensions = []string{"siderolabs/iscsi-tools", "siderolabs/util-linux-tools"}
+)
 
 // Schematic creates the content-addressed Image Factory schematic used by talosbox.
 func (c *Cache) Schematic(extraArgs ...string) (string, error) {
@@ -51,13 +54,17 @@ func (c *Cache) Schematic(extraArgs ...string) (string, error) {
 
 type schematicRequest struct {
 	Customization struct {
-		ExtraKernelArgs []string `json:"extraKernelArgs"`
+		ExtraKernelArgs  []string `json:"extraKernelArgs"`
+		SystemExtensions struct {
+			OfficialExtensions []string `json:"officialExtensions"`
+		} `json:"systemExtensions"`
 	} `json:"customization"`
 }
 
 func schematicRequestBody(extraArgs []string) ([]byte, error) {
 	request := schematicRequest{}
 	request.Customization.ExtraKernelArgs = append(append([]string(nil), requiredKernelArgs...), extraArgs...)
+	request.Customization.SystemExtensions.OfficialExtensions = append([]string(nil), requiredExtensions...)
 
 	body, err := json.Marshal(request)
 	if err != nil {
