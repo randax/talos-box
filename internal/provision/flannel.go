@@ -161,7 +161,7 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 				return Result{}, fmt.Errorf("apply machine config to %s: %w", node.Name, err)
 			}
 			result.Narration = append(result.Narration,
-				fmt.Sprintf("≈ talosctl apply-config --insecure --nodes %s --file %s.yaml", node.IP, roleConfigName(node.Role)),
+				fmt.Sprintf("machine config: ≈ talosctl apply-config --insecure --nodes %s --file %s.yaml", node.IP, roleConfigName(node.Role)),
 			)
 			applied = true
 		}
@@ -183,7 +183,7 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 			return Result{}, fmt.Errorf("bootstrap Kubernetes: %w", err)
 		}
 		result.Narration = append(result.Narration,
-			fmt.Sprintf("≈ talosctl --nodes %s bootstrap", controlPlane.IP),
+			fmt.Sprintf("bootstrap: ≈ talosctl --nodes %s bootstrap", controlPlane.IP),
 		)
 		kubeconfig, err := kubeconfigWithRetry(ctx, request.Client, controlPlane.IP, request.PollInterval)
 		if err != nil {
@@ -206,6 +206,9 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 				if err := request.BGP.ReconcileBGP(ctx, request.Cluster); err != nil {
 					return Result{}, fmt.Errorf("reconcile host BGP: %w", err)
 				}
+				result.Narration = append(result.Narration,
+					fmt.Sprintf("host BGP: ≈ tbx bgp enable %s", request.Cluster.Name),
+				)
 			}
 			// Cilium is the CNI: cni.name none means Nodes cannot report Ready
 			// until its chart is applied. Reconcile it before the Ready wait.
@@ -220,6 +223,9 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 					if err := disabler.DisableBGP(ctx, request.Cluster); err != nil {
 						return Result{}, fmt.Errorf("disable host BGP: %w", err)
 					}
+					result.Narration = append(result.Narration,
+						fmt.Sprintf("host BGP: ≈ tbx bgp disable %s", request.Cluster.Name),
+					)
 				}
 			}
 			result.VIP = loadBalancer.VIP
@@ -234,7 +240,7 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 			}
 		}
 		result.Narration = append(result.Narration,
-			fmt.Sprintf("≈ talosctl --nodes %s kubeconfig %s", controlPlane.IP, generated.paths.kubeconfig),
+			fmt.Sprintf("credentials: ≈ talosctl --nodes %s kubeconfig %s", controlPlane.IP, generated.paths.kubeconfig),
 			fmt.Sprintf("export TALOSCONFIG=%s", generated.paths.talosconfig),
 			fmt.Sprintf("export KUBECONFIG=%s", generated.paths.kubeconfig),
 		)
@@ -280,10 +286,7 @@ func generateMachineConfigs(item cluster.Cluster) (generated, error) {
 	if controlPlane.IP == "" {
 		return generated{}, errors.New("cluster has no control plane")
 	}
-	cniName := string(item.CNI)
-	if item.CNI == cluster.CNICilium {
-		cniName = "none"
-	}
+	cniName := machineCNIName(item)
 	input, err := generate.NewInput(
 		item.Name,
 		"https://"+controlPlane.IP+":6443",
@@ -307,7 +310,7 @@ func generateMachineConfigs(item cluster.Cluster) (generated, error) {
 		if err != nil {
 			return generated{}, fmt.Errorf("encode %s config: %w", role, err)
 		}
-		if item.CNI == cluster.CNICilium {
+		if ciliumDisablesKubeProxy(item) {
 			bytes, err = disableKubeProxy(bytes)
 			if err != nil {
 				return generated{}, fmt.Errorf("disable kube-proxy in %s config: %w", role, err)
@@ -337,14 +340,29 @@ func disableKubeProxy(config []byte) ([]byte, error) {
 }
 
 func addCatchAllMirror(config []byte, subnetIndex int) []byte {
-	return append(config, []byte(fmt.Sprintf(`---
+	return append(config, []byte(catchAllMirrorDocument(subnetIndex))...)
+}
+
+func machineCNIName(item cluster.Cluster) string {
+	if item.CNI == cluster.CNICilium {
+		return "none"
+	}
+	return string(item.CNI)
+}
+
+func ciliumDisablesKubeProxy(item cluster.Cluster) bool {
+	return item.CNI == cluster.CNICilium
+}
+
+func catchAllMirrorDocument(subnetIndex int) string {
+	return fmt.Sprintf(`---
 apiVersion: v1alpha1
 kind: RegistryMirrorConfig
 name: "*"
 endpoints:
   - url: http://172.30.%d.1:%d
 skipFallback: true
-`, subnetIndex, manifests.CatchAllPort))...)
+`, subnetIndex, manifests.CatchAllPort)
 }
 
 func loadOrCreateSecrets(path string, contract *machineryconfig.VersionContract) (*secrets.Bundle, error) {

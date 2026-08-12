@@ -13,15 +13,17 @@ the `prototype/talos-vz-boot` and `prototype/vmnet-arp` branches.
 
 ## 1. Goals and non-goals
 
-The tool guarantees the **substrate** — VMs, networking, DNS, image delivery — and deliberately
-does not touch what workshops teach. Generating and applying Talos machine config, installing
-Cilium and ingress controllers, and bootstrapping clusters is the **attendees' work**; the tool
-prints ready-to-paste configs and manifests but never applies them.
+The tool always guarantees the **substrate** — VMs, networking, DNS, and image delivery.
+Without `cni`, it deliberately stops there so workshops can teach Talos bootstrap and CNI
+installation themselves. Declaring `cni: cilium|flannel` opts into the curated path: `tbx`
+generates and applies Talos machine config, bootstraps Kubernetes, and reconciles the pinned CNI
+and optional LoadBalancer resources from the host. Ingress controllers and attendee workloads
+remain **attendee work**; Cilium's built-in ingress controller is disabled.
 
 Out of scope ([map](https://github.com/randax/talos-box/issues/1)): workshop curriculum,
 instructor-side orchestration, Intel Macs, Linux/Windows hosts, machines under 16 GB RAM, and
-installing in-cluster software. No convenience bootstrap helpers in v1 — the guided hints
-(§10) are the only hand-holding.
+arbitrary application or ingress installation. The curated CNI/LoadBalancer path is an explicit
+opt-in; substrate-only clusters retain the original manual workflow and guided hints (§10).
 
 ## 2. Supported platform
 
@@ -249,7 +251,7 @@ clusters:
 
 `tbx status` is **state-aware**: alongside nodes/IPs/DNS names/LB pool/BGP state it appends
 copy-pasteable next-step hints keyed to observed state (maintenance node → the
-`talosctl --insecure` probe; configured-but-no-CNI → `tbx manifests demo k8s | kubectl apply -f -`).
+`talosctl --insecure` probe; provisioned clusters report convergence progress and a safe `tbx up` rerun; substrate-only clusters retain manual guidance).
 Hints **never execute anything**. `--quiet` suppresses them; all list/status commands support
 `-o json`.
 
@@ -257,11 +259,11 @@ Hints **never execute anything**. `--quiet` suppresses them; all list/status com
 through the `tbxd`-owned socket — Talos renders its console dashboard and logs there, and
 maintenance-mode debugging works before any config exists. Detach with **`Ctrl-]`**; the
 session banner states the detach key. Attaching never blocks the VM; multiple attach/detach
-cycles are supported. `tbx manifests` prints the cluster's curated Cilium Helm values,
-matching `CiliumLoadBalancerIPPool`,
-`CiliumBGPClusterConfig`/`CiliumBGPPeerConfig`/`CiliumBGPAdvertisement` resources, the
-`registryMirrors` machine-config patch, and the
-`virtio_balloon` module patch.
+cycles are supported. `tbx manifests` is the exact inspection/fork surface for the declared
+curated path: its `machine`, `values`, `objects`, and `extras` sections match the patch,
+pinned Helm release, rendered objects, and LB/BGP/MetalLB probe resources tbx applies. The
+output can be applied manually on a substrate-only cluster; it does not turn substrate-only
+clusters into a curated path by itself.
 
 ## 11. Distribution
 
