@@ -31,7 +31,7 @@ type provisionTask struct {
 	action     int
 }
 
-func (s *Server) handleProvisioningLocked(request Request, allMaintenance func(cluster.Cluster) bool) (any, []provisionTask, error) {
+func (s *Server) handleProvisioningLocked(request Request, maintenance map[string]maintenanceObservation) (any, []provisionTask, error) {
 	switch request.Op {
 	case "cluster.create":
 		result, err := s.createCluster(request.Args)
@@ -54,7 +54,7 @@ func (s *Server) handleProvisioningLocked(request Request, allMaintenance func(c
 		}
 		return &result, s.beginProvisionTasksLocked([]cluster.Cluster{item}), nil
 	case "up":
-		actions, err := s.upWithMaintenance(request.Args, allMaintenance)
+		actions, err := s.upWithMaintenance(request.Args, maintenance)
 		if err != nil {
 			return nil, nil, err
 		}

@@ -235,6 +235,56 @@ func TestUpMaintenanceGateDoesNotHoldOperationLockWhileProbing(t *testing.T) {
 	}
 }
 
+func TestUpMaintenanceObservationDoesNotHoldOperationLockWhileLoadingCluster(t *testing.T) {
+	service, item, task, _ := blockedProvision(t)
+	service.opMu.Lock()
+	service.cancelProvisionLocked(task.item.Name)
+	service.opMu.Unlock()
+	item.ProvisioningIntent = cluster.ProvisioningIntent{}
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	service.maintenanceLoad = func(name string) (cluster.Cluster, error) {
+		close(started)
+		<-release
+		return cluster.Load(name)
+	}
+	args, err := json.Marshal(upArgs{Clusters: []config.ClusterSpec{{
+		Name:               item.Name,
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := service.observeUpMaintenance(args)
+		done <- err
+	}()
+	waitForProvisionStart(t, started)
+
+	lockAcquired := make(chan struct{})
+	go func() {
+		service.opMu.Lock()
+		close(lockAcquired)
+		service.opMu.Unlock()
+	}()
+	select {
+	case <-lockAcquired:
+	case <-time.After(time.Second):
+		close(release)
+		<-done
+		t.Fatal("cluster.Load held the daemon operation lock")
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestUpRejectsMaintenanceEvidenceThatChangesBeforeCommit(t *testing.T) {
 	service, item, task, _ := blockedProvision(t)
 	service.opMu.Lock()
@@ -273,14 +323,93 @@ func TestUpRejectsMaintenanceEvidenceThatChangesBeforeCommit(t *testing.T) {
 	}
 }
 
+func TestUpRejectsVMStateThatChangesAfterMaintenanceConfirmation(t *testing.T) {
+	service, item, task, _ := blockedProvision(t)
+	service.opMu.Lock()
+	service.cancelProvisionLocked(task.item.Name)
+	service.opMu.Unlock()
+	item.ProvisioningIntent = cluster.ProvisioningIntent{}
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	service.vms[item.Name] = map[string]hypervisor.Machine{
+		item.Nodes[0].Name: &fakeMachine{active: true},
+	}
+	service.nodeIPLookup = func(string, int) string { return "172.30.0.2" }
+	confirmed := make(chan struct{})
+	release := make(chan struct{})
+	probes := 0
+	service.nodeProbe = func(string) ProbeResult {
+		probes++
+		if probes == 2 {
+			close(confirmed)
+			<-release
+		}
+		return ProbeResult{Dialed: true, TLS: true, MaintenanceCert: true}
+	}
+	args, err := json.Marshal(upArgs{Clusters: []config.ClusterSpec{{
+		Name:               item.Name,
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan Response, 1)
+	go func() {
+		done <- service.dispatchProvisioning(Request{Op: "up", Args: args})
+	}()
+	waitForProvisionStart(t, confirmed)
+
+	service.opMu.Lock()
+	service.vms[item.Name][item.Nodes[0].Name] = &fakeMachine{active: false}
+	service.opMu.Unlock()
+	close(release)
+	response := <-done
+	if response.OK || !strings.Contains(response.Error, "all nodes are in maintenance") {
+		t.Fatalf("up response = %+v, want changed-VM-state rejection", response)
+	}
+	stored, err := cluster.Load(item.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.CNI != "" {
+		t.Fatalf("stored CNI = %q after changed VM state, want empty", stored.CNI)
+	}
+}
+
 func TestMaintenanceObservationRejectsNodeSetChanges(t *testing.T) {
-	observation := maintenanceObservation{running: map[string]bool{"demo-cp-1": true}, allMaintenance: true}
+	observation := maintenanceObservation{
+		running: map[string]bool{"demo-cp-1": true},
+		phases:  map[string]provision.Phase{"demo-cp-1": provision.PhaseMaintenance},
+	}
 	item := cluster.Cluster{Nodes: []cluster.Node{
 		{Name: "demo-cp-1"},
 		{Name: "demo-worker-1"},
 	}}
-	if observation.matches(item, func(string) bool { return true }) {
+	if observation.allNodesMaintenance(item, func(string) bool { return true }) {
 		t.Fatal("maintenance observation accepted a node that was never probed")
+	}
+}
+
+func TestMaintenanceObservationRequiresFreshMaintenancePhase(t *testing.T) {
+	item := cluster.Cluster{Nodes: []cluster.Node{{Name: "demo-cp-1"}}}
+	observation := maintenanceObservation{
+		running: map[string]bool{"demo-cp-1": true},
+		phases:  map[string]provision.Phase{"demo-cp-1": provision.PhaseConfigured},
+	}
+	if observation.allNodesMaintenance(item, func(string) bool { return true }) {
+		t.Fatal("maintenance decision accepted a freshly observed configured node")
+	}
+}
+
+func TestMaintenanceObservationRequiresMatchingVMState(t *testing.T) {
+	item := cluster.Cluster{Nodes: []cluster.Node{{Name: "demo-cp-1"}}}
+	observation := maintenanceObservation{
+		running: map[string]bool{"demo-cp-1": true},
+		phases:  map[string]provision.Phase{"demo-cp-1": provision.PhaseMaintenance},
+	}
+	if observation.allNodesMaintenance(item, func(string) bool { return false }) {
+		t.Fatal("maintenance decision accepted VM state changed after confirmation")
 	}
 }
 

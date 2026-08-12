@@ -18,10 +18,10 @@ type upArgs struct {
 // up reconciles the daemon's world toward the desired clusters: create the
 // missing, start the stopped, leave the running alone.
 func (s *Server) up(raw json.RawMessage) ([]Action, error) {
-	return s.upWithMaintenance(raw, s.allNodesInMaintenance)
+	return s.upWithMaintenance(raw, nil)
 }
 
-func (s *Server) upWithMaintenance(raw json.RawMessage, allMaintenance func(cluster.Cluster) bool) ([]Action, error) {
+func (s *Server) upWithMaintenance(raw json.RawMessage, maintenance map[string]maintenanceObservation) ([]Action, error) {
 	var args upArgs
 	if err := decodeArgs(raw, &args); err != nil {
 		return nil, err
@@ -31,7 +31,7 @@ func (s *Server) upWithMaintenance(raw json.RawMessage, allMaintenance func(clus
 		return nil, err
 	}
 	actions := PlanUp(args.Clusters, existing)
-	updates, err := s.preflightUp(args.Clusters, existing, allMaintenance)
+	updates, err := s.preflightUp(args.Clusters, existing, maintenance)
 	if err != nil {
 		return nil, err
 	}
@@ -63,12 +63,12 @@ func (s *Server) upWithMaintenance(raw json.RawMessage, allMaintenance func(clus
 }
 
 type maintenanceObservation struct {
-	running        map[string]bool
-	allMaintenance bool
+	running map[string]bool
+	phases  map[string]provision.Phase
 }
 
 func (observation maintenanceObservation) sameSnapshot(other maintenanceObservation) bool {
-	if observation.allMaintenance != other.allMaintenance || len(observation.running) != len(other.running) {
+	if len(observation.running) != len(other.running) || len(observation.phases) != len(other.phases) {
 		return false
 	}
 	for name, running := range observation.running {
@@ -76,16 +76,21 @@ func (observation maintenanceObservation) sameSnapshot(other maintenanceObservat
 			return false
 		}
 	}
+	for name, phase := range observation.phases {
+		if otherPhase, ok := other.phases[name]; !ok || phase != otherPhase {
+			return false
+		}
+	}
 	return true
 }
 
-func (observation maintenanceObservation) matches(item cluster.Cluster, nodeRunning func(string) bool) bool {
-	if !observation.allMaintenance || len(observation.running) != len(item.Nodes) {
+func (observation maintenanceObservation) allNodesMaintenance(item cluster.Cluster, nodeRunning func(string) bool) bool {
+	if len(item.Nodes) == 0 || len(observation.running) != len(item.Nodes) || len(observation.phases) != len(item.Nodes) {
 		return false
 	}
 	for _, node := range item.Nodes {
 		wasRunning, ok := observation.running[node.Name]
-		if !ok || wasRunning != nodeRunning(node.Name) {
+		if !ok || observation.phases[node.Name] != provision.PhaseMaintenance || wasRunning != nodeRunning(node.Name) {
 			return false
 		}
 	}
@@ -102,36 +107,39 @@ func (s *Server) observeUpMaintenance(raw json.RawMessage) (map[string]maintenan
 		running map[string]bool
 	}
 	candidates := make([]candidate, 0, len(args.Clusters))
-	s.opMu.Lock()
+	load := s.maintenanceLoad
+	if load == nil {
+		load = cluster.Load
+	}
 	for _, spec := range args.Clusters {
 		if spec.CNI == "" {
 			continue
 		}
-		item, err := cluster.Load(spec.Name)
+		item, err := load(spec.Name)
 		if err != nil {
 			continue
 		}
 		if item.CNI != "" {
 			continue
 		}
-		running := make(map[string]bool, len(item.Nodes))
-		for _, node := range item.Nodes {
-			running[node.Name] = s.nodeRunning(item.Name, node.Name)
+		candidates = append(candidates, candidate{item: item})
+	}
+	s.opMu.Lock()
+	for i := range candidates {
+		candidates[i].running = make(map[string]bool, len(candidates[i].item.Nodes))
+		for _, node := range candidates[i].item.Nodes {
+			candidates[i].running[node.Name] = s.nodeRunning(candidates[i].item.Name, node.Name)
 		}
-		candidates = append(candidates, candidate{item: item, running: running})
 	}
 	s.opMu.Unlock()
 
 	observations := make(map[string]maintenanceObservation, len(candidates))
 	for _, candidate := range candidates {
-		allMaintenance := len(candidate.item.Nodes) > 0
+		phases := make(map[string]provision.Phase, len(candidate.item.Nodes))
 		for _, node := range s.observeProvisionNodesWithRunning(candidate.item, candidate.running) {
-			if node.Phase != provision.PhaseMaintenance {
-				allMaintenance = false
-				break
-			}
+			phases[node.Name] = node.Phase
 		}
-		observations[candidate.item.Name] = maintenanceObservation{running: candidate.running, allMaintenance: allMaintenance}
+		observations[candidate.item.Name] = maintenanceObservation{running: candidate.running, phases: phases}
 	}
 	return observations, nil
 }
@@ -163,7 +171,7 @@ func persistIntentUpdates(updates []intentUpdate) error {
 func (s *Server) preflightUp(
 	specs []config.ClusterSpec,
 	existing map[string]ClusterState,
-	allMaintenance func(cluster.Cluster) bool,
+	maintenance map[string]maintenanceObservation,
 ) ([]intentUpdate, error) {
 	updates := make([]intentUpdate, 0, len(specs))
 	for _, spec := range specs {
@@ -179,7 +187,10 @@ func (s *Server) preflightUp(
 		}
 		allNodesMaintenance := false
 		if item.CNI == "" && spec.CNI != "" {
-			allNodesMaintenance = allMaintenance(item)
+			observation, ok := maintenance[item.Name]
+			allNodesMaintenance = ok && observation.allNodesMaintenance(item, func(nodeName string) bool {
+				return s.nodeRunning(item.Name, nodeName)
+			})
 		}
 		intent, changed, err := reconcileProvisioningIntent(item, spec, allNodesMaintenance)
 		if err != nil {
@@ -272,22 +283,6 @@ func checkDomainUnchanged(item cluster.Cluster, spec config.ClusterSpec) error {
 		)
 	}
 	return nil
-}
-
-// allNodesInMaintenance is an observed-state guard for adopting a pre-existing
-// substrate-only cluster. Once any node has left maintenance, its machine
-// config belongs to the attendee and tbx may not retrofit a curated CNI.
-func (s *Server) allNodesInMaintenance(item cluster.Cluster) bool {
-	if len(item.Nodes) == 0 {
-		return false
-	}
-	for _, node := range item.Nodes {
-		status := nodeStatus(node, item.SubnetIndex, s.nodeRunning(item.Name, node.Name))
-		if status.Phase != PhaseMaintenance {
-			return false
-		}
-	}
-	return true
 }
 
 func specEffectiveDomain(spec config.ClusterSpec) string {

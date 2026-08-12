@@ -34,6 +34,7 @@ type Server struct {
 	provisionReconcile provisionReconcileFunc
 	nodeIPLookup       func(string, int) string
 	nodeProbe          func(string) ProbeResult
+	maintenanceLoad    func(string) (cluster.Cluster, error)
 	lifecycleContext   context.Context
 	lifecycleCancel    context.CancelFunc
 	mirrors            *mirror.Manager
@@ -262,29 +263,28 @@ func (s *Server) dispatch(request Request) Response {
 }
 
 func (s *Server) dispatchProvisioning(request Request) Response {
-	var allMaintenance func(cluster.Cluster) bool
+	var maintenance map[string]maintenanceObservation
 	if request.Op == "up" {
 		discovered, err := s.observeUpMaintenance(request.Args)
 		if err != nil {
 			return failure(err)
 		}
-		// Confirm the externally-owned Talos phase immediately before the
-		// serialized commit. A node may leave maintenance without its VM power
-		// state changing, so the first observation is discovery, not authority.
+		// Confirm the externally-owned Talos phase once more before serialized
+		// preflight. The locked decision also revalidates daemon-owned VM state;
+		// the first observation is discovery, not authority.
 		confirmed, err := s.observeUpMaintenance(request.Args)
 		if err != nil {
 			return failure(err)
 		}
-		allMaintenance = func(item cluster.Cluster) bool {
-			first, firstOK := discovered[item.Name]
-			observation, confirmedOK := confirmed[item.Name]
-			return firstOK && confirmedOK && first.sameSnapshot(observation) && observation.matches(item, func(nodeName string) bool {
-				return s.nodeRunning(item.Name, nodeName)
-			})
+		maintenance = make(map[string]maintenanceObservation, len(confirmed))
+		for name, observation := range confirmed {
+			if first, ok := discovered[name]; ok && first.sameSnapshot(observation) {
+				maintenance[name] = observation
+			}
 		}
 	}
 	s.opMu.Lock()
-	data, tasks, err := s.handleProvisioningLocked(request, allMaintenance)
+	data, tasks, err := s.handleProvisioningLocked(request, maintenance)
 	s.opMu.Unlock()
 	if err != nil {
 		return failure(err)

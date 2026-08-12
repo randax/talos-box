@@ -9,6 +9,7 @@ import (
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/config"
+	"github.com/randax/talos-box/internal/provision"
 )
 
 func TestCreateFromSpecWithoutCNIUsesLegacyProvisioningFields(t *testing.T) {
@@ -166,7 +167,12 @@ func TestPreflightUpRejectsEveryInvalidClusterBeforeAnyIntentIsPersisted(t *test
 	_, err = service.preflightUp([]config.ClusterSpec{
 		{Name: first.Name, ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, LB: true}},
 		{Name: second.Name, ProvisioningIntent: cluster.ProvisioningIntent{}},
-	}, map[string]ClusterState{first.Name: {Exists: true}, second.Name: {Exists: true}}, func(cluster.Cluster) bool { return true })
+	}, map[string]ClusterState{first.Name: {Exists: true}, second.Name: {Exists: true}}, map[string]maintenanceObservation{
+		first.Name: {
+			running: map[string]bool{first.Nodes[0].Name: false},
+			phases:  map[string]provision.Phase{first.Nodes[0].Name: provision.PhaseMaintenance},
+		},
+	})
 	if err == nil || !strings.Contains(err.Error(), "tbx cluster destroy second && tbx up") {
 		t.Fatalf("preflightUp() error = %v, want immutable-CNI error", err)
 	}
