@@ -10,24 +10,29 @@ import (
 	"github.com/randax/talos-box/internal/provision"
 )
 
-const flannelProvisionTimeout = 10 * time.Minute
+const cniProvisionTimeout = 10 * time.Minute
 
-func (s *Server) provisionFlannel(item cluster.Cluster) ([]string, error) {
-	if item.CNI != cluster.CNIFlannel {
+func (s *Server) provisionCNI(item cluster.Cluster) ([]string, error) {
+	if item.CNI != cluster.CNIFlannel && item.CNI != cluster.CNICilium {
 		return nil, nil
 	}
 	dir, err := cluster.Dir(item.Name)
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), flannelProvisionTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), cniProvisionTimeout)
 	defer cancel()
+	var loadBalancer provision.LoadBalancerReconciler
+	switch item.CNI {
+	case cluster.CNIFlannel:
+		loadBalancer = provision.MetalLBReconciler{PollInterval: time.Second}
+	case cluster.CNICilium:
+		loadBalancer = provision.CiliumReconciler{PollInterval: time.Second}
+	}
 	result, err := provision.Reconcile(ctx, provision.Request{
-		Cluster: item,
-		Client:  provision.MachineryClient{TalosconfigPath: filepath.Join(dir, "talosconfig")},
-		LoadBalancer: provision.MetalLBReconciler{
-			PollInterval: time.Second,
-		},
+		Cluster:      item,
+		Client:       provision.MachineryClient{TalosconfigPath: filepath.Join(dir, "talosconfig")},
+		LoadBalancer: loadBalancer,
 		Observe: func(context.Context) ([]provision.Node, error) {
 			states := make([]provision.Node, 0, len(item.Nodes))
 			for _, node := range item.Nodes {

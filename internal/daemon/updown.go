@@ -57,7 +57,7 @@ func (s *Server) up(raw json.RawMessage) ([]Action, error) {
 			if err != nil {
 				return actions[:i], fmt.Errorf("load %s: %w", spec.Name, err)
 			}
-			narration, err := s.provisionFlannel(item)
+			narration, err := s.provisionCNI(item)
 			if err != nil {
 				return actions[:i], fmt.Errorf("provision %s: %w", spec.Name, err)
 			}

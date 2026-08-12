@@ -251,7 +251,7 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	}
 	result := summary(item, true)
 	result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, subnetWarning, startWarning)
-	if narration, err := s.provisionFlannel(item); err != nil {
+	if narration, err := s.provisionCNI(item); err != nil {
 		return result, fmt.Errorf("provision %s: %w", item.Name, err)
 	} else {
 		result.Narration = narration
@@ -290,7 +290,7 @@ func (s *Server) startCluster(raw json.RawMessage) (ClusterSummary, error) {
 	}
 	result := summary(item, true)
 	result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, subnetWarning)
-	if narration, err := s.provisionFlannel(item); err != nil {
+	if narration, err := s.provisionCNI(item); err != nil {
 		return result, fmt.Errorf("provision %s: %w", item.Name, err)
 	} else {
 		result.Narration = narration
@@ -690,7 +690,7 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 func refreshKubernetesReadiness(statuses []ClusterStatus) {
 	for index := range statuses {
 		status := &statuses[index]
-		if status.CNI != cluster.CNIFlannel {
+		if status.CNI != cluster.CNIFlannel && status.CNI != cluster.CNICilium {
 			continue
 		}
 		if !status.Running {

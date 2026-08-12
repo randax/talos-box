@@ -142,6 +142,46 @@ func TestHintsDescribeLiveFlannelMetalLBVIPAndPolicyLimit(t *testing.T) {
 	}
 }
 
+func TestHintsDescribeCiliumReadyWithAndWithoutLoadBalancer(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		intent cluster.ProvisioningIntent
+		vip    string
+		live   bool
+		wants  []string
+	}{
+		{
+			name:   "live VIP",
+			intent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true},
+			vip:    "172.30.4.200",
+			live:   true,
+			wants:  []string{"Cilium LB-IPAM", "http://172.30.4.200/"},
+		},
+		{
+			name:   "load balancer disabled",
+			intent: cluster.ProvisioningIntent{CNI: cluster.CNICilium},
+			wants:  []string{"Ready", "lb: false", "no VIP"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			status := ClusterStatus{
+				Name:               "demo",
+				ProvisioningIntent: test.intent,
+				KubernetesReady:    true,
+				VIP:                test.vip,
+				VIPLive:            test.live,
+				Nodes:              []NodeStatus{{Role: cluster.RoleControlPlane, Phase: PhaseConfigured}},
+			}
+			joined := strings.Join(Hints(status), "\n")
+			for _, wanted := range test.wants {
+				if !strings.Contains(joined, wanted) {
+					t.Fatalf("hints missing %q:\n%s", wanted, joined)
+				}
+			}
+		})
+	}
+}
+
 func TestHintsDoNotInferFlannelKubernetesReadiness(t *testing.T) {
 	status := ClusterStatus{
 		Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel},

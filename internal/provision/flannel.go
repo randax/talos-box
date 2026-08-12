@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/manifests"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
 	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
@@ -60,8 +61,8 @@ type TalosClient interface {
 	KubernetesReady(context.Context, []byte, []string) error
 }
 
-// LoadBalancerReconciler installs and verifies the flannel LoadBalancer
-// implementation after Talos has produced a ready Kubernetes API.
+// LoadBalancerReconciler installs and verifies a curated CNI's host-side
+// LoadBalancer implementation through the Kubernetes API.
 type LoadBalancerReconciler interface {
 	Reconcile(context.Context, cluster.Cluster, []byte) (LoadBalancerResult, error)
 }
@@ -96,22 +97,22 @@ type credentialPaths struct {
 	kubeconfig  string
 }
 
-// Reconcile brings exactly the Talos-managed flannel/no-LB path to a usable
-// Kubernetes API. It follows observations rather than recording progress:
-// only nodes currently in maintenance are given a machine config, then the
-// configured control plane is bootstrapped idempotently and yields kubeconfig.
+// Reconcile brings a curated CNI path to a usable Kubernetes API. It follows
+// observations rather than recording progress: only nodes currently in
+// maintenance are given a machine config, then the configured control plane is
+// bootstrapped idempotently and yields kubeconfig.
 func Reconcile(ctx context.Context, request Request) (Result, error) {
-	if request.Cluster.CNI != cluster.CNIFlannel {
+	if request.Cluster.CNI != cluster.CNIFlannel && request.Cluster.CNI != cluster.CNICilium {
 		return Result{}, nil
 	}
 	if request.Client == nil || request.Observe == nil {
-		return Result{}, errors.New("flannel provisioning requires a Talos client and node observer")
+		return Result{}, errors.New("CNI provisioning requires a Talos client and node observer")
 	}
 	if request.PollInterval <= 0 {
 		request.PollInterval = defaultPollInterval
 	}
 
-	generated, err := generateFlannel(request.Cluster)
+	generated, err := generateMachineConfigs(request.Cluster)
 	if err != nil {
 		return Result{}, err
 	}
@@ -176,6 +177,19 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 		if err := writeSecure(generated.paths.kubeconfig, kubeconfig); err != nil {
 			return Result{}, fmt.Errorf("write kubeconfig: %w", err)
 		}
+		if request.Cluster.CNI == cluster.CNICilium {
+			if request.LoadBalancer == nil {
+				return Result{}, errors.New("cilium provisioning requires a Kubernetes reconciler")
+			}
+			// Cilium is the CNI: cni.name none means Nodes cannot report Ready
+			// until its chart is applied. Reconcile it before the Ready wait.
+			loadBalancer, err := request.LoadBalancer.Reconcile(ctx, request.Cluster, kubeconfig)
+			if err != nil {
+				return Result{}, fmt.Errorf("reconcile Cilium: %w", err)
+			}
+			result.VIP = loadBalancer.VIP
+			result.Narration = append(result.Narration, loadBalancer.Narration...)
+		}
 		for {
 			if err := request.Client.KubernetesReady(ctx, kubeconfig, nodeNames(nodes)); err == nil {
 				break
@@ -189,7 +203,7 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 			fmt.Sprintf("export TALOSCONFIG=%s", generated.paths.talosconfig),
 			fmt.Sprintf("export KUBECONFIG=%s", generated.paths.kubeconfig),
 		)
-		if request.Cluster.LB {
+		if request.Cluster.CNI == cluster.CNIFlannel && request.Cluster.LB {
 			if request.LoadBalancer == nil {
 				return Result{}, errors.New("flannel LoadBalancer provisioning requires a Kubernetes reconciler")
 			}
@@ -204,7 +218,7 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 	}
 }
 
-func generateFlannel(item cluster.Cluster) (generated, error) {
+func generateMachineConfigs(item cluster.Cluster) (generated, error) {
 	paths, err := credentials(item.Name)
 	if err != nil {
 		return generated{}, err
@@ -231,6 +245,10 @@ func generateFlannel(item cluster.Cluster) (generated, error) {
 	if controlPlane.IP == "" {
 		return generated{}, errors.New("cluster has no control plane")
 	}
+	cniName := string(item.CNI)
+	if item.CNI == cluster.CNICilium {
+		cniName = "none"
+	}
 	input, err := generate.NewInput(
 		item.Name,
 		"https://"+controlPlane.IP+":6443",
@@ -239,7 +257,7 @@ func generateFlannel(item cluster.Cluster) (generated, error) {
 		generate.WithSecretsBundle(bundle),
 		generate.WithEndpointList(controlPlaneEndpoints),
 		generate.WithInstallDisk("/dev/vda"),
-		generate.WithClusterCNIConfig(&v1alpha1.CNIConfig{CNIName: string(cluster.CNIFlannel)}),
+		generate.WithClusterCNIConfig(&v1alpha1.CNIConfig{CNIName: cniName}),
 	)
 	if err != nil {
 		return generated{}, fmt.Errorf("generate Talos config input: %w", err)
@@ -254,6 +272,13 @@ func generateFlannel(item cluster.Cluster) (generated, error) {
 		if err != nil {
 			return generated{}, fmt.Errorf("encode %s config: %w", role, err)
 		}
+		if item.CNI == cluster.CNICilium {
+			bytes, err = disableKubeProxy(bytes)
+			if err != nil {
+				return generated{}, fmt.Errorf("disable kube-proxy in %s config: %w", role, err)
+			}
+		}
+		bytes = addCatchAllMirror(bytes, item.SubnetIndex)
 		configs[role] = bytes
 	}
 	talosconfig, err := input.Talosconfig()
@@ -261,6 +286,30 @@ func generateFlannel(item cluster.Cluster) (generated, error) {
 		return generated{}, fmt.Errorf("generate talosconfig: %w", err)
 	}
 	return generated{talosconfig: talosconfig, configs: configs, paths: paths}, nil
+}
+
+func disableKubeProxy(config []byte) ([]byte, error) {
+	var document map[string]any
+	if err := yaml.Unmarshal(config, &document); err != nil {
+		return nil, err
+	}
+	clusterConfig, ok := document["cluster"].(map[string]any)
+	if !ok {
+		return nil, errors.New("generated config lacks cluster section")
+	}
+	clusterConfig["proxy"] = map[string]any{"disabled": true}
+	return yaml.Marshal(document)
+}
+
+func addCatchAllMirror(config []byte, subnetIndex int) []byte {
+	return append(config, []byte(fmt.Sprintf(`---
+apiVersion: v1alpha1
+kind: RegistryMirrorConfig
+name: "*"
+endpoints:
+  - url: http://172.30.%d.1:%d
+skipFallback: true
+`, subnetIndex, manifests.CatchAllPort))...)
 }
 
 func loadOrCreateSecrets(path string, contract *machineryconfig.VersionContract) (*secrets.Bundle, error) {
