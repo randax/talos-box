@@ -32,8 +32,6 @@ type Server struct {
 	provisions         map[string]activeProvision
 	provisionSequence  uint64
 	provisionReconcile provisionReconcileFunc
-	nodeIPLookup       func(string, int) string
-	nodeProbe          func(string) ProbeResult
 	lifecycleContext   context.Context
 	lifecycleCancel    context.CancelFunc
 	mirrors            *mirror.Manager
@@ -288,7 +286,6 @@ func (s *Server) dispatchStatus(request Request) Response {
 	if !ok {
 		return failure(errors.New("status returned an unexpected response"))
 	}
-	s.refreshNodeStatuses(statuses)
 	refreshKubernetesReadiness(statuses)
 	return success(statuses)
 }

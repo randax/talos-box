@@ -42,7 +42,6 @@ func (s *Server) up(raw json.RawMessage) ([]Action, error) {
 				return actions[:i], fmt.Errorf("create %s: %w", spec.Name, err)
 			}
 			actions[i].Warning = result.Warning
-			actions[i].Narration = result.Narration
 		case ActionStart:
 			encoded, err := json.Marshal(startArgs{Name: spec.Name, Force: args.Force})
 			if err != nil {
@@ -53,18 +52,6 @@ func (s *Server) up(raw json.RawMessage) ([]Action, error) {
 				return actions[:i], fmt.Errorf("start %s: %w", spec.Name, err)
 			}
 			actions[i].Warning = result.Warning
-			actions[i].Narration = result.Narration
-		case ActionNone:
-			item, err := cluster.Load(spec.Name)
-			if err != nil {
-				return actions[:i], fmt.Errorf("load %s: %w", spec.Name, err)
-			}
-			narration, err := s.provisionCNI(item, false)
-			if err != nil {
-				return actions[:i], fmt.Errorf("provision %s: %w", spec.Name, err)
-			}
-			actions[i].Narration = narration
-			actions[i].Kind = actionAfterProvision(action.Kind, narration)
 		}
 	}
 	return actions, nil
