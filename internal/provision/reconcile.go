@@ -1,8 +1,7 @@
-// Package provision drives Talos's API for the opt-in cluster provisioning
-// path. It deliberately persists only credentials and receives observed node
-// state from the daemon; provisioning progress is never written to cluster
-// state.
-// Package provision reconciles curated Kubernetes networking stacks.
+// Package provision drives Talos's API for opt-in cluster provisioning and
+// reconciles curated Kubernetes networking stacks. It persists only
+// credentials and receives observed node state from the daemon; provisioning
+// progress is never written to cluster state.
 package provision
 
 import (
