@@ -221,8 +221,8 @@ func TestCiliumValuesMakeHubbleRelayAndUIFollowIntent(t *testing.T) {
 		hubble bool
 		want   string
 	}{
-		{name: "disabled", want: "hubble:\n  enabled: false\n  relay:\n    enabled: false\n  ui:\n    enabled: false"},
-		{name: "enabled", hubble: true, want: "hubble:\n  enabled: true\n  relay:\n    enabled: true\n  ui:\n    enabled: true"},
+		{name: "disabled", want: "hubble:\n  enabled: false\n  tls:\n    auto:\n      method: cronJob\n  relay:\n    enabled: false\n  ui:\n    enabled: false"},
+		{name: "enabled", hubble: true, want: "hubble:\n  enabled: true\n  tls:\n    auto:\n      method: cronJob\n  relay:\n    enabled: true\n  ui:\n    enabled: true"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			values := CiliumValues(Facts{Cluster: "demo", CNI: "cilium", LB: true, Hubble: tt.hubble})

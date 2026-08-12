@@ -158,8 +158,8 @@ func (r MetalLBReconciler) reconcile(ctx context.Context, item cluster.Cluster, 
 		return LoadBalancerResult{}, err
 	}
 	return LoadBalancerResult{VIP: vip, Narration: []string{
-		"≈ helm template metallb metallb/metallb --version " + metalLBChartVersion + " -n " + metalLBNamespace + " | kubectl apply --server-side -f -",
-		"≈ kubectl apply --server-side -f - # MetalLB L2 pool and VIP probe",
+		"MetalLB chart: ≈ helm template metallb metallb/metallb --version " + metalLBChartVersion + " -n " + metalLBNamespace + " | kubectl apply --server-side -f -",
+		"MetalLB LoadBalancer extras: ≈ kubectl apply --server-side -f - # L2 pool and VIP probe",
 	}}, nil
 }
 
