@@ -410,9 +410,9 @@ func CiliumConverged(ctx context.Context, kubeconfig []byte, item cluster.Cluste
 		path string
 		kind string
 	}{
-		{"/apis/apps/v1/namespaces/kube-system/deployments/cilium-operator", "deployment"},
-		{"/apis/apps/v1/namespaces/kube-system/daemonsets/cilium", "daemonset"},
-		{"/apis/apps/v1/namespaces/kube-system/daemonsets/cilium-envoy", "daemonset"},
+		{"/apis/apps/v1/namespaces/" + ciliumNamespace + "/deployments/cilium-operator", "deployment"},
+		{"/apis/apps/v1/namespaces/" + ciliumNamespace + "/daemonsets/cilium", "daemonset"},
+		{"/apis/apps/v1/namespaces/" + ciliumNamespace + "/daemonsets/cilium-envoy", "daemonset"},
 	} {
 		if err := ciliumWorkloadReady(ctx, transport, server, workload.path, workload.kind); err != nil {
 			return err
@@ -552,7 +552,7 @@ func ciliumAnnouncementState(ctx context.Context, transport http.RoundTripper, s
 	if err := json.NewDecoder(response.Body).Decode(&object); err != nil {
 		return fmt.Errorf("decode Cilium announcement %s: %w", path, err)
 	}
-	if object.Metadata.Annotations["talosbox.dev/announcement-owned"] != "talosbox" {
+	if object.Metadata.Annotations[announcementOwnershipAnnotation] != fieldManager {
 		return fmt.Errorf("cilium desired announcement %s is not owned by talosbox", path)
 	}
 	return nil
