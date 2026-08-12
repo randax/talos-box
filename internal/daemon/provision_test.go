@@ -97,6 +97,68 @@ func TestProvisioningCompleteUsesMultiSecondProbeBudgets(t *testing.T) {
 	}
 }
 
+func TestProvisioningCompleteCiliumRequiresLiveVIPAndMatchingBGP(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir, err := cluster.Dir("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"secrets.yaml", "talosconfig", "kubeconfig"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("not a kubeconfig"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	originalReady := kubernetesReadyProbe
+	originalCilium := ciliumConvergenceProbe
+	originalVIP := loadBalancerVIPProbe
+	originalHelper := connectBGPHelper
+	t.Cleanup(func() {
+		kubernetesReadyProbe = originalReady
+		ciliumConvergenceProbe = originalCilium
+		loadBalancerVIPProbe = originalVIP
+		connectBGPHelper = originalHelper
+	})
+	kubernetesReadyProbe = func(context.Context, []byte, []string) error { return nil }
+	ciliumConvergenceProbe = func(context.Context, []byte, cluster.Cluster) error { return nil }
+
+	tests := []struct {
+		name      string
+		vipLive   bool
+		wantBGP   bool
+		activeBGP bool
+		want      bool
+	}{
+		{name: "VIP not live", want: false},
+		{name: "VIP live and BGP disabled", vipLive: true, want: true},
+		{name: "VIP live but stale BGP active", vipLive: true, activeBGP: true, want: false},
+		{name: "VIP live but BGP inactive", vipLive: true, wantBGP: true, want: false},
+		{name: "VIP live and BGP matches", vipLive: true, wantBGP: true, activeBGP: true, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			loadBalancerVIPProbe = func(cluster.Cluster) (string, bool) { return "172.30.0.200", tt.vipLive }
+			connectBGPHelper = func() (bgpHelperClient, error) {
+				return &fakeBGPClient{active: tt.activeBGP}, nil
+			}
+			item := cluster.Cluster{
+				Name: "demo",
+				ProvisioningIntent: cluster.ProvisioningIntent{
+					CNI: cluster.CNICilium,
+					LB:  true,
+					BGP: tt.wantBGP,
+				},
+			}
+			if got := (&Server{}).provisioningComplete(item); got != tt.want {
+				t.Fatalf("provisioningComplete() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestProvisioningCompleteEligibleRequiresObservedEndState(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
