@@ -18,7 +18,6 @@ import (
 	"github.com/randax/talos-box/internal/helper"
 	"github.com/randax/talos-box/internal/hypervisor"
 	"github.com/randax/talos-box/internal/imagecache"
-	"github.com/randax/talos-box/internal/provision"
 )
 
 type createArgs struct {
@@ -122,6 +121,8 @@ type ClusterStatus struct {
 	BGP             bool         `json:"bgp"`
 	Running         bool         `json:"running"`
 	KubernetesReady bool         `json:"kubernetesReady"`
+	VIP             string       `json:"vip,omitempty"`
+	VIPLive         bool         `json:"vipLive"`
 	Nodes           []NodeStatus `json:"nodes"`
 	Hints           []string     `json:"hints,omitempty"`
 }
@@ -156,10 +157,6 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if err != nil {
 		return ClusterSummary{}, err
 	}
-	if intent.CNI == cluster.CNIFlannel && intent.LB {
-		return ClusterSummary{}, provision.ErrFlannelLoadBalancerUnsupported
-	}
-
 	dir, err := cluster.Dir(args.Name)
 	if err != nil {
 		return ClusterSummary{}, err
@@ -693,7 +690,14 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 func refreshKubernetesReadiness(statuses []ClusterStatus) {
 	for index := range statuses {
 		status := &statuses[index]
-		if status.CNI != cluster.CNIFlannel || status.LB {
+		if status.CNI != cluster.CNIFlannel {
+			continue
+		}
+		if !status.Running {
+			status.KubernetesReady = false
+			status.VIP = ""
+			status.VIPLive = false
+			status.Hints = Hints(*status)
 			continue
 		}
 		nodeNames := make([]string, 0, len(status.Nodes))
@@ -701,6 +705,12 @@ func refreshKubernetesReadiness(statuses []ClusterStatus) {
 			nodeNames = append(nodeNames, node.Name)
 		}
 		status.KubernetesReady = kubernetesReady(status.Name, nodeNames)
+		if status.KubernetesReady && status.LB {
+			item, err := cluster.Load(status.Name)
+			if err == nil {
+				status.VIP, status.VIPLive = loadBalancerVIP(item)
+			}
+		}
 		status.Hints = Hints(*status)
 	}
 }
