@@ -1,7 +1,5 @@
-// Package manifests renders the Cilium Helm values, ready-to-apply Cilium
-// resources, and Talos machine-config patches that match a cluster's
-// networking (SPEC §5, §10). talosbox prints these; applying them is the
-// attendees' work.
+// Package manifests renders curated CNI values, ready-to-apply resources, and
+// Talos machine-config patches that match a cluster's networking.
 package manifests
 
 import (
@@ -188,6 +186,46 @@ func RegistryMirrors(f Facts) string {
 `, f.hostIP(1), CatchAllPort)
 }
 
+// MetalLBValues disables every BGP backend. The flannel path is deliberately
+// L2-only: speakers still use the existing catch-all Talos registry mirror for
+// their quay.io images, while the chart itself is rendered by tbx on the host.
+func MetalLBValues(Facts) string {
+	return `speaker:
+  frr:
+    enabled: false
+frrk8s:
+  enabled: false
+`
+}
+
+// MetalLBExtras renders the L2-only address pool for a flannel cluster. The
+// explicit selector prevents a future attendee-created pool from being
+// accidentally announced by talosbox's L2Advertisement.
+func MetalLBExtras(f Facts) string {
+	return fmt.Sprintf(`apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: %s-pool
+  namespace: metallb-system
+  labels:
+    talosbox.dev/managed: "true"
+spec:
+  addresses:
+    - %s-%s
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: %s-l2
+  namespace: metallb-system
+  labels:
+    talosbox.dev/managed: "true"
+spec:
+  ipAddressPools:
+    - %s-pool
+`, f.Cluster, f.hostIP(200), f.hostIP(239), f.Cluster, f.Cluster)
+}
+
 // BalloonModule renders the Talos machine-config patch loading virtio_balloon,
 // required for tbxd's memory ballooning (SPEC §8).
 func BalloonModule(Facts) string {
@@ -216,15 +254,17 @@ func All(f Facts) string {
 // sections is the single registry driving Render, its error text, and the CLI
 // usage string. Grouped sections keep output consumable by one tool.
 var sections = map[string]func(Facts) string{
-	"all":           All,
-	"lb-pool":       LBPool,
-	"bgp":           BGPPolicy,
-	"l2":            L2Policy,
-	"cilium-values": CiliumValues,
-	"mirrors":       RegistryMirrors,
-	"balloon":       BalloonModule,
-	"k8s":           k8sSection,
-	"talos":         func(f Facts) string { return join(RegistryMirrors(f), BalloonModule(f)) },
+	"all":            All,
+	"lb-pool":        LBPool,
+	"bgp":            BGPPolicy,
+	"l2":             L2Policy,
+	"cilium-values":  CiliumValues,
+	"mirrors":        RegistryMirrors,
+	"metallb-values": MetalLBValues,
+	"metallb-extras": MetalLBExtras,
+	"balloon":        BalloonModule,
+	"k8s":            k8sSection,
+	"talos":          func(f Facts) string { return join(RegistryMirrors(f), BalloonModule(f)) },
 }
 
 // k8sSection renders the LB pool plus exactly ONE announcement mechanism —
@@ -244,7 +284,7 @@ func k8sSection(f Facts) string {
 
 // Sections lists the valid section names in stable display order.
 func Sections() []string {
-	return []string{"lb-pool", "bgp", "l2", "cilium-values", "mirrors", "balloon", "k8s", "talos", "all"}
+	return []string{"lb-pool", "bgp", "l2", "cilium-values", "mirrors", "balloon", "metallb-values", "metallb-extras", "k8s", "talos", "all"}
 }
 
 func join(docs ...string) string {

@@ -27,6 +27,8 @@ func TestGolden(t *testing.T) {
 		{"bgp", BGPPolicy},
 		{"cilium-values", CiliumValues},
 		{"mirrors", RegistryMirrors},
+		{"metallb-values", MetalLBValues},
+		{"metallb-extras", MetalLBExtras},
 		{"balloon", BalloonModule},
 		{"all", All},
 	}
@@ -52,7 +54,7 @@ func TestGolden(t *testing.T) {
 
 // Every rendered section must be parseable YAML in all its documents.
 func TestRenderedYAMLParses(t *testing.T) {
-	for _, section := range []string{"lb-pool", "bgp", "cilium-values", "mirrors", "balloon", "k8s", "talos", "all"} {
+	for _, section := range []string{"lb-pool", "bgp", "cilium-values", "mirrors", "balloon", "metallb-values", "metallb-extras", "k8s", "talos", "all"} {
 		t.Run(section, func(t *testing.T) {
 			out, err := Render(facts(), section)
 			if err != nil {
@@ -75,6 +77,44 @@ func TestRenderedYAMLParses(t *testing.T) {
 				t.Fatal("no documents rendered")
 			}
 		})
+	}
+}
+
+func TestMetalLBAssetsUseL2AndExistingMirrors(t *testing.T) {
+	values := MetalLBValues(facts())
+	for _, wanted := range []string{"frr:", "enabled: false", "frrk8s:"} {
+		if !strings.Contains(values, wanted) {
+			t.Errorf("MetalLB values missing %q:\n%s", wanted, values)
+		}
+	}
+	if strings.Contains(values, "frr-k8s:") {
+		t.Fatalf("MetalLB values enable the frr-k8s chart:\n%s", values)
+	}
+
+	docs := decodeYAMLDocuments(t, MetalLBExtras(facts()))
+	if len(docs) != 2 {
+		t.Fatalf("MetalLB extras = %d documents, want 2", len(docs))
+	}
+	byKind := map[string]map[string]any{}
+	for _, doc := range docs {
+		byKind[doc["kind"].(string)] = doc
+	}
+	pool := byKind["IPAddressPool"]
+	advertisement := byKind["L2Advertisement"]
+	if pool == nil || advertisement == nil {
+		t.Fatalf("MetalLB kinds = %v, want IPAddressPool and L2Advertisement", mapKeys(byKind))
+	}
+	if got := pool["apiVersion"]; got != "metallb.io/v1beta1" {
+		t.Errorf("IPAddressPool apiVersion = %v", got)
+	}
+	if got := nestedString(t, pool, "metadata", "namespace"); got != "metallb-system" {
+		t.Errorf("pool namespace = %q, want metallb-system", got)
+	}
+	if got := nestedString(t, pool, "spec", "addresses", "0"); got != "172.30.0.200-172.30.0.239" {
+		t.Errorf("pool addresses = %q", got)
+	}
+	if got := nestedString(t, advertisement, "spec", "ipAddressPools", "0"); got != "demo-pool" {
+		t.Errorf("advertisement pool = %q", got)
 	}
 }
 
@@ -237,6 +277,29 @@ func decodeKnownFields[T any](t *testing.T, value any) T {
 		t.Fatalf("manifest does not match the Cilium 1.19 schema: %v", err)
 	}
 	return decoded
+}
+
+func nestedString(t *testing.T, value map[string]any, path ...string) string {
+	t.Helper()
+	var current any = value
+	for _, key := range path {
+		switch typed := current.(type) {
+		case map[string]any:
+			current = typed[key]
+		case []any:
+			if key != "0" || len(typed) == 0 {
+				t.Fatalf("cannot read %q from %T", key, current)
+			}
+			current = typed[0]
+		default:
+			t.Fatalf("cannot read %q from %T", key, current)
+		}
+	}
+	result, ok := current.(string)
+	if !ok {
+		t.Fatalf("nested value = %T, want string", current)
+	}
+	return result
 }
 
 func mapKeys[V any](values map[string]V) []string {

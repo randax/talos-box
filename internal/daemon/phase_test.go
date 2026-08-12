@@ -123,10 +123,22 @@ func TestHintsDescribeFlannelReadyWithoutLoadBalancer(t *testing.T) {
 	}
 	hints := Hints(status)
 	joined := strings.Join(hints, "\n")
-	for _, wanted := range []string{"Ready", "lb: false", "TALOSCONFIG=~/.talosbox/clusters/demo/talosconfig", "KUBECONFIG=~/.talosbox/clusters/demo/kubeconfig"} {
+	for _, wanted := range []string{"Ready", "lb: false", "disabled", "TALOSCONFIG=~/.talosbox/clusters/demo/talosconfig", "KUBECONFIG=~/.talosbox/clusters/demo/kubeconfig"} {
 		if !strings.Contains(joined, wanted) {
 			t.Fatalf("hints missing %q:\n%s", wanted, joined)
 		}
+	}
+}
+
+func TestHintsDescribeLiveFlannelMetalLBVIPAndPolicyLimit(t *testing.T) {
+	status := ClusterStatus{
+		Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, LB: true}, KubernetesReady: true,
+		VIP: "172.30.4.200", VIPLive: true,
+		Nodes: []NodeStatus{{Role: cluster.RoleControlPlane, Phase: PhaseConfigured}},
+	}
+	hints := Hints(status)
+	if len(hints) != 1 || !strings.Contains(hints[0], "http://172.30.4.200/") || !strings.Contains(hints[0], "does not enforce NetworkPolicies") {
+		t.Fatalf("hints = %v", hints)
 	}
 }
 

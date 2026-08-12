@@ -53,27 +53,6 @@ func TestCreateClusterRejectsInvalidProvisioningIntentBeforeMutation(t *testing.
 	}
 }
 
-func TestCreateClusterDefersFlannelLoadBalancerBeforeMutation(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	trueValue := true
-	raw, err := json.Marshal(createArgs{
-		Name: "flannel-lb",
-		ProvisioningIntentInput: cluster.ProvisioningIntentInput{
-			CNI: string(cluster.CNIFlannel), LB: &trueValue,
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = (&Server{}).createCluster(raw)
-	if err == nil || !strings.Contains(err.Error(), "flannel LoadBalancer provisioning is not yet implemented") {
-		t.Fatalf("createCluster() error = %v, want deferred flannel LoadBalancer error", err)
-	}
-	if _, loadErr := cluster.Load("flannel-lb"); loadErr == nil {
-		t.Fatal("createCluster() persisted state despite deferred flannel LoadBalancer")
-	}
-}
-
 func TestAddNodeChecksHostPressureBeforeMutation(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	item, err := cluster.New("unsafe-add", 0, 0, 0, cluster.NodeDefaults{MemoryMiB: 1})
