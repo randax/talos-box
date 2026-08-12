@@ -251,11 +251,6 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	}
 	result := summary(item, true)
 	result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, subnetWarning, startWarning)
-	if narration, err := s.provisionFlannel(item); err != nil {
-		return result, fmt.Errorf("provision %s: %w", item.Name, err)
-	} else {
-		result.Narration = narration
-	}
 	return result, nil
 }
 
@@ -290,11 +285,6 @@ func (s *Server) startCluster(raw json.RawMessage) (ClusterSummary, error) {
 	}
 	result := summary(item, true)
 	result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, subnetWarning)
-	if narration, err := s.provisionFlannel(item); err != nil {
-		return result, fmt.Errorf("provision %s: %w", item.Name, err)
-	} else {
-		result.Narration = narration
-	}
 	return result, nil
 }
 
@@ -415,6 +405,7 @@ func (s *Server) stopCluster(raw json.RawMessage) (ClusterSummary, error) {
 }
 
 func (s *Server) stop(name string) error {
+	s.cancelProvisionLocked(name)
 	if item, err := cluster.Load(name); err == nil {
 		s.unbindMirrors(item.SubnetIndex)
 	} else {
@@ -491,6 +482,7 @@ func (s *Server) destroyCluster(raw json.RawMessage) (map[string]string, error) 
 	if !args.Force {
 		return nil, errors.New("cluster.destroy requires force=true")
 	}
+	s.cancelProvisionLocked(args.Name)
 	dir, err := cluster.Dir(args.Name)
 	if err != nil {
 		return nil, err
