@@ -92,7 +92,15 @@ func (c cli) runCluster(args []string) error {
 		if _, err := fmt.Fprintf(c.out, "started cluster %s\n", result.Name); err != nil {
 			return err
 		}
-		return printWarning(c.err, result.Warning)
+		if err := printWarning(c.err, result.Warning); err != nil {
+			return err
+		}
+		for _, line := range result.Narration {
+			if _, err := fmt.Fprintln(c.out, line); err != nil {
+				return err
+			}
+		}
+		return nil
 	case "stop", "suspend", "resume":
 		if len(args) != 2 {
 			return fmt.Errorf("usage: tbx cluster %s <name>", args[0])
@@ -220,6 +228,11 @@ func (c cli) createCluster(args []string) error {
 	}
 	if err := printWarning(c.err, result.Warning); err != nil {
 		return err
+	}
+	for _, line := range result.Narration {
+		if _, err := fmt.Fprintln(c.out, line); err != nil {
+			return err
+		}
 	}
 	stanza := config.Marshal(config.Config{
 		Talos: config.TalosSpec{Version: result.TalosVersion, Schematic: result.Schematic},

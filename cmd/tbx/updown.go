@@ -59,6 +59,11 @@ func (c cli) printActions(actions []daemon.Action, wording map[daemon.ActionKind
 		if err := printWarning(c.err, action.Warning); err != nil {
 			return err
 		}
+		for _, line := range action.Narration {
+			if _, err := fmt.Fprintln(c.out, line); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }

@@ -108,6 +108,12 @@ func Hints(status ClusterStatus) []string {
 	}
 	if len(configured) == len(status.Nodes) && len(status.Nodes) > 0 {
 		cp := status.controlPlaneOr(status.Nodes[0])
+		if status.CNI == cluster.CNIFlannel && !status.LB && status.KubernetesReady {
+			hints = append(hints,
+				fmt.Sprintf("Kubernetes is Ready with Talos-managed flannel and no LoadBalancer support (lb: false). LoadBalancer provisioning is not implemented yet. export TALOSCONFIG=~/.talosbox/clusters/%s/talosconfig; export KUBECONFIG=~/.talosbox/clusters/%s/kubeconfig", status.Name, status.Name),
+			)
+			return hints
+		}
 		hints = append(hints,
 			fmt.Sprintf("all nodes configured. If etcd is not yet bootstrapped: talosctl --nodes %s bootstrap, then talosctl kubeconfig .", cp.IP),
 			fmt.Sprintf("node TUI (the Talos dashboard): talosctl dashboard --nodes %s", cp.IP),
