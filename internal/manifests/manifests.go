@@ -14,6 +14,7 @@ type Facts struct {
 	CNI         string
 	LB          bool
 	BGP         bool // cluster is in BGP mode: configure BGP, not L2 announcements
+	Hubble      bool
 }
 
 // MirrorPorts fixes the upstream registry → host mirror port mapping.
@@ -70,6 +71,8 @@ func L2Policy(f Facts) string {
 kind: CiliumL2AnnouncementPolicy
 metadata:
   name: %s-l2
+  annotations:
+    talosbox.dev/announcement-owned: "talosbox"
 spec:
   loadBalancerIPs: true
   nodeSelector: {}
@@ -122,12 +125,12 @@ k8sClientRateLimit:
 ingressController:
   enabled: false
 hubble:
-  enabled: false
+  enabled: %t
   relay:
-    enabled: false
+    enabled: %t
   ui:
-    enabled: false
-`, l2Enabled, f.BGP, ciliumClientQPS, ciliumClientBurst)
+    enabled: %t
+`, l2Enabled, f.BGP, ciliumClientQPS, ciliumClientBurst, f.Hubble, f.Hubble, f.Hubble)
 }
 
 // BGPPolicy renders Cilium's BGP v2 resources for "host as ToR": every node
@@ -137,6 +140,8 @@ func BGPPolicy(f Facts) string {
 kind: CiliumBGPClusterConfig
 metadata:
   name: %s-bgp
+  annotations:
+    talosbox.dev/announcement-owned: "talosbox"
 spec:
   nodeSelector: {}
   bgpInstances:
@@ -153,6 +158,8 @@ apiVersion: cilium.io/v2
 kind: CiliumBGPPeerConfig
 metadata:
   name: %s-bgp-peer
+  annotations:
+    talosbox.dev/announcement-owned: "talosbox"
 spec:
   families:
     - afi: ipv4
@@ -165,6 +172,8 @@ apiVersion: cilium.io/v2
 kind: CiliumBGPAdvertisement
 metadata:
   name: %s-bgp-advertisement
+  annotations:
+    talosbox.dev/announcement-owned: "talosbox"
   labels:
     talosbox.dev/advertisement: service-load-balancer
 spec:

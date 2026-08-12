@@ -67,12 +67,20 @@ type LoadBalancerReconciler interface {
 	Reconcile(context.Context, cluster.Cluster, []byte) (LoadBalancerResult, error)
 }
 
+// BGPReconciler reasserts the host-side BGP speaker after Cilium has applied
+// the in-cluster peer resources. The host process keeps no durable speaker
+// state, so this belongs in every observed-state provisioning pass.
+type BGPReconciler interface {
+	ReconcileBGP(context.Context, cluster.Cluster) error
+}
+
 // Request supplies all transient state required for one reconciliation.
 type Request struct {
 	Cluster      cluster.Cluster
 	Observe      func(context.Context) ([]Node, error)
 	Client       TalosClient
 	LoadBalancer LoadBalancerReconciler
+	BGP          BGPReconciler
 	PollInterval time.Duration
 }
 
@@ -180,6 +188,17 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 		if request.Cluster.CNI == cluster.CNICilium {
 			if request.LoadBalancer == nil {
 				return Result{}, errors.New("cilium provisioning requires a Kubernetes reconciler")
+			}
+			if request.Cluster.BGP {
+				if request.BGP == nil {
+					return Result{}, errors.New("BGP provisioning requires a host BGP reconciler")
+				}
+				// The Cilium reconcile verifies the VIP from the host. Start the
+				// host peer first so BGP advertisements can install that route
+				// before the reachability probe runs.
+				if err := request.BGP.ReconcileBGP(ctx, request.Cluster); err != nil {
+					return Result{}, fmt.Errorf("reconcile host BGP: %w", err)
+				}
 			}
 			// Cilium is the CNI: cni.name none means Nodes cannot report Ready
 			// until its chart is applied. Reconcile it before the Ready wait.

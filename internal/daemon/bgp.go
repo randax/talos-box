@@ -39,19 +39,11 @@ func (s *Server) setBGP(raw json.RawMessage, enable bool) (ClusterSummary, error
 		}
 	}
 
-	client, err := connectBGPHelper()
-	if err != nil {
-		return ClusterSummary{}, helperInstallError(err)
-	}
-	defer func() { _ = client.Close() }()
-
 	if enable {
-		localASN := uint32(manifests.HostASN)
-		peerASN := uint32(manifests.ClusterASN(item.SubnetIndex))
-		if err := client.EnableBGP(item.Name, item.SubnetIndex, localASN, peerASN); err != nil {
+		if err := enableHostBGP(item); err != nil {
 			return ClusterSummary{}, err
 		}
-	} else if err := client.DisableBGP(item.Name); err != nil {
+	} else if err := disableHostBGP(item.Name); err != nil {
 		return ClusterSummary{}, err
 	}
 
@@ -60,4 +52,28 @@ func (s *Server) setBGP(raw json.RawMessage, enable bool) (ClusterSummary, error
 		return ClusterSummary{}, err
 	}
 	return summary(item, s.clusterRunning(item.Name)), nil
+}
+
+func enableHostBGP(item cluster.Cluster) error {
+	client, err := connectBGPHelper()
+	if err != nil {
+		return helperInstallError(err)
+	}
+	defer func() { _ = client.Close() }()
+	if err := client.EnableBGP(item.Name, item.SubnetIndex, uint32(manifests.HostASN), uint32(manifests.ClusterASN(item.SubnetIndex))); err != nil {
+		return fmt.Errorf("enable BGP speaker for %s: %w", item.Name, err)
+	}
+	return nil
+}
+
+func disableHostBGP(clusterName string) error {
+	client, err := connectBGPHelper()
+	if err != nil {
+		return helperInstallError(err)
+	}
+	defer func() { _ = client.Close() }()
+	if err := client.DisableBGP(clusterName); err != nil {
+		return fmt.Errorf("disable BGP speaker for %s: %w", clusterName, err)
+	}
+	return nil
 }

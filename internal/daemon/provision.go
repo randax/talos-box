@@ -33,6 +33,7 @@ func (s *Server) provisionCNI(item cluster.Cluster) ([]string, error) {
 		Cluster:      item,
 		Client:       provision.MachineryClient{TalosconfigPath: filepath.Join(dir, "talosconfig")},
 		LoadBalancer: loadBalancer,
+		BGP:          hostBGPReconciler{},
 		Observe: func(context.Context) ([]provision.Node, error) {
 			states := make([]provision.Node, 0, len(item.Nodes))
 			for _, node := range item.Nodes {
@@ -48,6 +49,12 @@ func (s *Server) provisionCNI(item cluster.Cluster) ([]string, error) {
 		return nil, err
 	}
 	return result.Narration, nil
+}
+
+type hostBGPReconciler struct{}
+
+func (hostBGPReconciler) ReconcileBGP(_ context.Context, item cluster.Cluster) error {
+	return enableHostBGP(item)
 }
 
 func kubernetesReady(name string, expectedNodes []string) bool {

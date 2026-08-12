@@ -40,6 +40,22 @@ func TestBGPRejectsInvalidArguments(t *testing.T) {
 	}
 }
 
+type shutdownSpeaker struct{ stops int }
+
+func (s *shutdownSpeaker) Stop() { s.stops++ }
+
+func TestShutdownStopsEveryBGPSpeaker(t *testing.T) {
+	server := NewServer(nil)
+	first, second := &shutdownSpeaker{}, &shutdownSpeaker{}
+	server.speakers = map[string]bgpSpeaker{"first": first, "second": second}
+	if err := server.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
+	if first.stops != 1 || second.stops != 1 || len(server.speakers) != 0 {
+		t.Fatalf("BGP shutdown = first:%d second:%d remaining:%d", first.stops, second.stops, len(server.speakers))
+	}
+}
+
 func TestListenUnixSocketPreservesNonCollisionBindError(t *testing.T) {
 	t.Parallel()
 

@@ -188,7 +188,12 @@ func (s *Server) Shutdown() error {
 
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
-	result := s.dhcp.Close()
+	var result error
+	for cluster, speaker := range s.speakers {
+		speaker.Stop()
+		delete(s.speakers, cluster)
+	}
+	result = s.dhcp.Close()
 	for attempt := 1; ; attempt++ {
 		var retainedResult error
 		stop := func(attachment *platformAttachment) bool {
