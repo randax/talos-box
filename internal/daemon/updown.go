@@ -67,6 +67,19 @@ type maintenanceObservation struct {
 	allMaintenance bool
 }
 
+func (observation maintenanceObservation) matches(item cluster.Cluster, nodeRunning func(string) bool) bool {
+	if !observation.allMaintenance || len(observation.running) != len(item.Nodes) {
+		return false
+	}
+	for _, node := range item.Nodes {
+		wasRunning, ok := observation.running[node.Name]
+		if !ok || wasRunning != nodeRunning(node.Name) {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Server) observeUpMaintenance(raw json.RawMessage) (map[string]maintenanceObservation, error) {
 	var args upArgs
 	if err := decodeArgs(raw, &args); err != nil {

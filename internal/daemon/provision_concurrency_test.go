@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -181,10 +183,17 @@ func TestUpMaintenanceGateDoesNotHoldOperationLockWhileProbing(t *testing.T) {
 	}
 	started := make(chan struct{})
 	release := make(chan struct{})
+	var firstProbe sync.Once
 	service.nodeIPLookup = func(string, int) string { return "172.30.0.2" }
 	service.nodeProbe = func(string) ProbeResult {
-		close(started)
-		<-release
+		wait := false
+		firstProbe.Do(func() {
+			wait = true
+			close(started)
+		})
+		if wait {
+			<-release
+		}
 		return ProbeResult{Dialed: true, TLS: true, MaintenanceCert: true}
 	}
 	service.provisionReconcile = func(context.Context, provision.Request) (provision.Result, error) {
@@ -223,6 +232,55 @@ func TestUpMaintenanceGateDoesNotHoldOperationLockWhileProbing(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("up did not finish after maintenance probe release")
+	}
+}
+
+func TestUpRejectsMaintenanceEvidenceThatChangesBeforeCommit(t *testing.T) {
+	service, item, task, _ := blockedProvision(t)
+	service.opMu.Lock()
+	service.cancelProvisionLocked(task.item.Name)
+	service.opMu.Unlock()
+	item.ProvisioningIntent = cluster.ProvisioningIntent{}
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	service.vms[item.Name] = map[string]hypervisor.Machine{
+		item.Nodes[0].Name: &fakeMachine{active: true},
+	}
+	service.nodeIPLookup = func(string, int) string { return "172.30.0.2" }
+	probes := 0
+	service.nodeProbe = func(string) ProbeResult {
+		probes++
+		return ProbeResult{Dialed: true, TLS: true, MaintenanceCert: probes == 1}
+	}
+	args, err := json.Marshal(upArgs{Clusters: []config.ClusterSpec{{
+		Name:               item.Name,
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := service.dispatchProvisioning(Request{Op: "up", Args: args})
+	if response.OK || !strings.Contains(response.Error, "all nodes are in maintenance") {
+		t.Fatalf("up response = %+v, want stale-maintenance rejection", response)
+	}
+	stored, err := cluster.Load(item.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.CNI != "" {
+		t.Fatalf("stored CNI = %q after rejected adoption, want empty", stored.CNI)
+	}
+}
+
+func TestMaintenanceObservationRejectsNodeSetChanges(t *testing.T) {
+	observation := maintenanceObservation{running: map[string]bool{"demo-cp-1": true}, allMaintenance: true}
+	item := cluster.Cluster{Nodes: []cluster.Node{
+		{Name: "demo-cp-1"},
+		{Name: "demo-worker-1"},
+	}}
+	if observation.matches(item, func(string) bool { return true }) {
+		t.Fatal("maintenance observation accepted a node that was never probed")
 	}
 }
 
