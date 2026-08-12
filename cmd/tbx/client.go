@@ -13,12 +13,37 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/daemon"
 )
 
 type dialError struct{ err error }
 
 func (e dialError) Error() string { return e.err.Error() }
+
+func requiresProvisioningIntentHandshake(input cluster.ProvisioningIntentInput) bool {
+	return input.CNI != "" || input.LB != nil || input.BGP != nil || input.Hubble != nil
+}
+
+func (c cli) ensureProvisioningIntentSupport(input cluster.ProvisioningIntentInput) error {
+	if !requiresProvisioningIntentHandshake(input) {
+		return nil
+	}
+	var info daemon.Info
+	if err := c.call("daemon.info", struct{}{}, &info); err != nil {
+		if strings.Contains(err.Error(), "unknown operation") {
+			return errors.New("tbxd is too old; restart or upgrade tbxd to use --cni/--hubble/--lb/--bgp")
+		}
+		return err
+	}
+	if info.ProtocolVersion != daemon.ProtocolVersion {
+		if info.ProtocolVersion < daemon.ProtocolVersion {
+			return fmt.Errorf("tbxd protocol %d is too old; restart or upgrade tbxd to use --cni/--hubble/--lb/--bgp", info.ProtocolVersion)
+		}
+		return fmt.Errorf("tbx is too old: protocol %d does not support tbxd protocol %d; upgrade tbx before using --cni/--hubble/--lb/--bgp", daemon.ProtocolVersion, info.ProtocolVersion)
+	}
+	return nil
+}
 
 func (c cli) call(op string, args, destination any) error {
 	socketPath, err := daemon.SocketPath()

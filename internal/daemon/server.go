@@ -240,6 +240,8 @@ func (s *Server) handle(request Request) (any, error) {
 	switch request.Op {
 	case "daemon.ping":
 		return map[string]bool{"pong": true}, nil
+	case "daemon.info":
+		return Info{ProtocolVersion: ProtocolVersion}, nil
 	case "up":
 		return s.up(request.Args)
 	case "down":

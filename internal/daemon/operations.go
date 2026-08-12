@@ -28,7 +28,7 @@ type createArgs struct {
 	NodeDefaults  cluster.NodeDefaults  `json:"nodeDefaults"`
 	ControlPlane  *cluster.NodeDefaults `json:"controlPlane,omitempty"`
 	Worker        *cluster.NodeDefaults `json:"worker,omitempty"`
-	BGP           bool                  `json:"bgp,omitempty"`
+	cluster.ProvisioningIntentInput
 	// Domain is the requested cluster domain; empty means the default,
 	// <name>.k8s.test. AllowUnsafeDomain is the explicit opt-in for domains
 	// that can shadow real DNS.
@@ -82,7 +82,7 @@ type ClusterSummary struct {
 	NodeDefaults  cluster.NodeDefaults `json:"nodeDefaults"`
 	TalosVersion  string               `json:"talosVersion"`
 	Schematic     string               `json:"schematic"`
-	BGP           bool                 `json:"bgp"`
+	cluster.ProvisioningIntent
 	// Domain is the explicitly chosen cluster domain; empty means the
 	// default, <name>.k8s.test.
 	Domain            string `json:"domain,omitempty"`
@@ -148,6 +148,10 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if args.Version == "" {
 		args.Version = args.TalosVersion
 	}
+	intent, err := args.Intent()
+	if err != nil {
+		return ClusterSummary{}, err
+	}
 
 	dir, err := cluster.Dir(args.Name)
 	if err != nil {
@@ -210,7 +214,7 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	}
 	item.ControlPlaneDefaults = args.ControlPlane
 	item.WorkerDefaults = args.Worker
-	item.BGP = args.BGP
+	item.ProvisioningIntent = intent
 	item.Domain = canonicalDomain
 	item.AllowUnsafeDomain = canonicalDomain != "" && args.AllowUnsafeDomain
 	item.ImageArchitecture = string(s.hypervisor.Architecture())
@@ -794,18 +798,18 @@ func memoryOr(mib, fallback int) int {
 
 func summary(item cluster.Cluster, running bool) ClusterSummary {
 	return ClusterSummary{
-		Name:              item.Name,
-		Index:             item.Index,
-		SubnetIndex:       item.SubnetIndex,
-		ControlPlanes:     item.ControlPlanes,
-		Workers:           item.Workers,
-		NodeDefaults:      item.NodeDefaults,
-		TalosVersion:      item.TalosVersion,
-		Schematic:         item.Schematic,
-		BGP:               item.BGP,
-		Domain:            item.Domain,
-		AllowUnsafeDomain: item.AllowUnsafeDomain,
-		Running:           running,
+		Name:               item.Name,
+		Index:              item.Index,
+		SubnetIndex:        item.SubnetIndex,
+		ControlPlanes:      item.ControlPlanes,
+		Workers:            item.Workers,
+		NodeDefaults:       item.NodeDefaults,
+		TalosVersion:       item.TalosVersion,
+		Schematic:          item.Schematic,
+		ProvisioningIntent: item.ProvisioningIntent,
+		Domain:             item.Domain,
+		AllowUnsafeDomain:  item.AllowUnsafeDomain,
+		Running:            running,
 	}
 }
 

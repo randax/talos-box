@@ -26,8 +26,15 @@ func Marshal(cfg Config) string {
 		fmt.Fprintf(&b, "  - name: %s\n", c.Name)
 		fmt.Fprintf(&b, "    controlPlanes: %d\n", c.ControlPlanes)
 		fmt.Fprintf(&b, "    workers: %d\n", c.Workers)
-		if c.BGP {
-			b.WriteString("    bgp: true\n")
+		if c.CNI != "" {
+			fmt.Fprintf(&b, "    cni: %s\n", c.CNI)
+			fmt.Fprintf(&b, "    lb: %t\n", c.LB)
+			if c.BGP {
+				b.WriteString("    bgp: true\n")
+			}
+			if c.Hubble {
+				b.WriteString("    hubble: true\n")
+			}
 		}
 		if c.Domain != "" {
 			fmt.Fprintf(&b, "    domain: %s\n", c.Domain)

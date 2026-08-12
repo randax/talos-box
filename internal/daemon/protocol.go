@@ -11,6 +11,10 @@ import (
 
 const DefaultTalosVersion = "v1.13.6"
 
+// ProtocolVersion is the daemon wire version understood by this CLI/server
+// pair. New request fields must negotiate support before relying on them.
+const ProtocolVersion = 1
+
 // Request is one newline-delimited daemon request.
 type Request struct {
 	Op   string          `json:"op"`
@@ -22,6 +26,11 @@ type Response struct {
 	OK    bool            `json:"ok"`
 	Data  json.RawMessage `json:"data,omitempty"`
 	Error string          `json:"error,omitempty"`
+}
+
+// Info reports daemon wire compatibility details.
+type Info struct {
+	ProtocolVersion int `json:"protocolVersion"`
 }
 
 // SocketPath returns the per-user daemon socket path.

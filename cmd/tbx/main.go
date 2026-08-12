@@ -157,6 +157,10 @@ func (c cli) createCluster(args []string) error {
 	schematic := flags.String("schematic", "", "Image Factory schematic")
 	domainFlag := flags.String("domain", "", "cluster domain (default <name>.k8s.test)")
 	allowUnsafeDomain := flags.Bool("allow-unsafe-domain", false, "allow a domain that can shadow real DNS")
+	cni := flags.String("cni", "", "CNI to provision: cilium|flannel")
+	lb := flags.Bool("lb", true, "install LoadBalancer support with the CNI")
+	bgp := flags.Bool("bgp", false, "enable Cilium BGP LoadBalancer announcements")
+	hubble := flags.Bool("hubble", false, "enable Cilium Hubble Relay and UI")
 	force := flags.Bool("force", false, "proceed despite an overcommit or host-pressure warning")
 	positionals, err := parseInterspersed(flags, args)
 	if err != nil {
@@ -164,6 +168,25 @@ func (c cli) createCluster(args []string) error {
 	}
 	if len(positionals) != 1 {
 		return errors.New("usage: tbx cluster create <name> [--cp N --workers N]")
+	}
+	provided := map[string]bool{}
+	flags.Visit(func(item *flag.Flag) { provided[item.Name] = true })
+	var lbArg, bgpArg, hubbleArg *bool
+	if *cni != "" || provided["lb"] {
+		lbArg = lb
+	}
+	if *cni != "" || provided["bgp"] {
+		bgpArg = bgp
+	}
+	if *cni != "" || provided["hubble"] {
+		hubbleArg = hubble
+	}
+	intentInput := cluster.ProvisioningIntentInput{CNI: *cni, LB: lbArg, BGP: bgpArg, Hubble: hubbleArg}
+	if _, err := intentInput.Intent(); err != nil {
+		return err
+	}
+	if err := c.ensureProvisioningIntentSupport(intentInput); err != nil {
+		return err
 	}
 	resolvedSchematic, err := resolveSchematic(*schematic)
 	if err != nil {
@@ -176,14 +199,16 @@ func (c cli) createCluster(args []string) error {
 		Node              cluster.NodeDefaults `json:"node"`
 		Domain            string               `json:"domain,omitempty"`
 		AllowUnsafeDomain bool                 `json:"allowUnsafeDomain,omitempty"`
-		Force             bool                 `json:"force"`
-		Schematic         string               `json:"schematic"`
-		Version           string               `json:"version"`
+		cluster.ProvisioningIntentInput
+		Force     bool   `json:"force"`
+		Schematic string `json:"schematic"`
+		Version   string `json:"version"`
 	}{
 		Name: positionals[0], ControlPlanes: *controlPlanes, Workers: *workers,
 		Node:   cluster.NodeDefaults{MemoryMiB: *memory, CPUs: *cpus, DiskGiB: *disk},
 		Domain: *domainFlag, AllowUnsafeDomain: *allowUnsafeDomain,
-		Force: *force, Schematic: resolvedSchematic, Version: *talosVersion,
+		ProvisioningIntentInput: intentInput,
+		Force:                   *force, Schematic: resolvedSchematic, Version: *talosVersion,
 	}
 	var result daemon.ClusterSummary
 	if err := c.call("cluster.create", request, &result); err != nil {
@@ -200,7 +225,8 @@ func (c cli) createCluster(args []string) error {
 		Talos: config.TalosSpec{Version: result.TalosVersion, Schematic: result.Schematic},
 		Clusters: []config.ClusterSpec{{
 			Name: result.Name, ControlPlanes: result.ControlPlanes, Workers: result.Workers,
-			Domain: result.Domain, AllowUnsafeDomain: result.AllowUnsafeDomain,
+			ProvisioningIntent: result.ProvisioningIntent,
+			Domain:             result.Domain, AllowUnsafeDomain: result.AllowUnsafeDomain,
 			Node: result.NodeDefaults,
 		}}})
 	_, err = fmt.Fprintf(c.out, "\nequivalent talosbox.yaml:\n%s", stanza)

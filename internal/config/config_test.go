@@ -114,6 +114,52 @@ func TestParseTalosDefaults(t *testing.T) {
 	}
 }
 
+func TestParseProvisioningIntent(t *testing.T) {
+	cfg, err := Parse([]byte(`version: 1
+clusters:
+  - name: cilium
+    cni: cilium
+    bgp: true
+    hubble: true
+  - name: flannel
+    cni: flannel
+    lb: false
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Clusters[0]; got.CNI != cluster.CNICilium || !got.LB || !got.BGP || !got.Hubble {
+		t.Fatalf("cilium provisioning intent = %+v", got)
+	}
+	if got := cfg.Clusters[1]; got.CNI != cluster.CNIFlannel || got.LB || got.BGP || got.Hubble {
+		t.Fatalf("flannel provisioning intent = %+v", got)
+	}
+}
+
+func TestParseRejectsInvalidProvisioningIntent(t *testing.T) {
+	tests := []struct {
+		name    string
+		yaml    string
+		wantErr string
+	}{
+		{"unknown cni", "cni: calico", "cni must be one of"},
+		{"lb without cni", "lb: false", "lb requires cni"},
+		{"bgp without cni", "bgp: false", "bgp requires cni"},
+		{"hubble without cni", "hubble: false", "hubble requires cni"},
+		{"bgp without load balancer", "cni: cilium\n    lb: false\n    bgp: true", "bgp requires lb: true"},
+		{"flannel bgp", "cni: flannel\n    bgp: true", "bgp requires cni: cilium"},
+		{"flannel hubble", "cni: flannel\n    hubble: true", "hubble requires cni: cilium"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse([]byte("version: 1\nclusters:\n  - name: demo\n    " + tt.yaml + "\n"))
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Parse() error = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestParseErrors(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -258,5 +304,26 @@ clusters:
 	}
 	if back.Clusters[0] != spec {
 		t.Errorf("round trip = %+v, want %+v", back.Clusters[0], spec)
+	}
+}
+
+func TestMarshalProvisioningIntentRoundTrip(t *testing.T) {
+	spec := ClusterSpec{
+		Name: "demo", ControlPlanes: 1, Workers: 2,
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true, BGP: true, Hubble: true},
+		Node:               cluster.NodeDefaults{MemoryMiB: 2048, CPUs: 2, DiskGiB: 20},
+	}
+	got := Marshal(Config{Clusters: []ClusterSpec{spec}})
+	for _, line := range []string{"cni: cilium", "lb: true", "bgp: true", "hubble: true"} {
+		if !strings.Contains(got, line) {
+			t.Fatalf("Marshal() missing %q:\n%s", line, got)
+		}
+	}
+	back, err := Parse([]byte(got))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back.Clusters[0] != spec {
+		t.Fatalf("round trip = %+v, want %+v", back.Clusters[0], spec)
 	}
 }

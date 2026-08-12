@@ -77,16 +77,31 @@ func Load(name string) (Cluster, error) {
 		c.ImageArchitecture = LegacyImageArchitecture
 	}
 	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(data, &fields); err == nil && fields["subnetIndex"] == nil {
-		c.SubnetIndex = c.Index
+	migrated := false
+	if err := json.Unmarshal(data, &fields); err == nil {
+		if fields["subnetIndex"] == nil {
+			c.SubnetIndex = c.Index
+		}
+		// Before provisioning intent existed, bgp=true meant the manual Cilium
+		// LoadBalancer/BGP path. Preserve that historical meaning so upgrading
+		// does not turn a valid cluster into an intent that BGP repair rejects.
+		if fields["bgp"] != nil && fields["cni"] == nil && c.BGP {
+			c.ProvisioningIntent = ProvisioningIntent{
+				CNI: CNICilium,
+				LB:  true,
+				BGP: true,
+			}
+			migrated = true
+		}
 	}
-	migrated, err := ensureNodeReservations(&c)
+	reservationsMigrated, err := ensureNodeReservations(&c)
 	if err != nil {
 		return Cluster{}, fmt.Errorf("load cluster reservations: %w", err)
 	}
+	migrated = migrated || reservationsMigrated
 	if migrated {
 		if err := Save(c); err != nil {
-			return Cluster{}, fmt.Errorf("persist cluster reservation migration: %w", err)
+			return Cluster{}, fmt.Errorf("persist cluster state migration: %w", err)
 		}
 	}
 	return c, nil
