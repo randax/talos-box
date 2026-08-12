@@ -498,6 +498,9 @@ func (s *Server) destroyCluster(raw json.RawMessage) (map[string]string, error) 
 	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("cluster %q does not exist", args.Name)
 	}
+	if err := disableHostBGP(args.Name); err != nil {
+		log.Printf("disable host BGP for %s during force destroy: %v", args.Name, err)
+	}
 	// stop what we can, but a partially-destroyed cluster (state dir present,
 	// cluster.json gone) must still be removable
 	if _, loadErr := cluster.Load(args.Name); loadErr == nil {

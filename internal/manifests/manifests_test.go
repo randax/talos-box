@@ -141,7 +141,7 @@ func TestBGPPolicyMatchesCilium119Schema(t *testing.T) {
 	}
 
 	clusterConfig := decodeKnownFields[ciliumBGPClusterConfig](t, cluster)
-	if clusterConfig.Metadata.Name != "demo-bgp" || len(clusterConfig.Spec.BGPInstances) != 1 {
+	if clusterConfig.Metadata.Name != "demo-bgp" || clusterConfig.Metadata.Annotations["talosbox.dev/announcement-owned"] != "talosbox" || len(clusterConfig.Spec.BGPInstances) != 1 {
 		t.Fatalf("cluster config = %+v", clusterConfig)
 	}
 	instance := clusterConfig.Spec.BGPInstances[0]
@@ -154,7 +154,7 @@ func TestBGPPolicyMatchesCilium119Schema(t *testing.T) {
 	}
 
 	peerConfig := decodeKnownFields[ciliumBGPPeerConfig](t, peer)
-	if peerConfig.Metadata.Name != "demo-bgp-peer" || len(peerConfig.Spec.Families) != 1 {
+	if peerConfig.Metadata.Name != "demo-bgp-peer" || peerConfig.Metadata.Annotations["talosbox.dev/announcement-owned"] != "talosbox" || len(peerConfig.Spec.Families) != 1 {
 		t.Fatalf("peer config = %+v", peerConfig)
 	}
 	family := peerConfig.Spec.Families[0]
@@ -163,7 +163,7 @@ func TestBGPPolicyMatchesCilium119Schema(t *testing.T) {
 	}
 
 	advertisementConfig := decodeKnownFields[ciliumBGPAdvertisement](t, advertisement)
-	if advertisementConfig.Metadata.Labels[advertisementLabel] != "service-load-balancer" || len(advertisementConfig.Spec.Advertisements) != 1 {
+	if advertisementConfig.Metadata.Labels[advertisementLabel] != "service-load-balancer" || advertisementConfig.Metadata.Annotations["talosbox.dev/announcement-owned"] != "talosbox" || len(advertisementConfig.Spec.Advertisements) != 1 {
 		t.Fatalf("advertisement config = %+v", advertisementConfig)
 	}
 	serviceAdvertisement := advertisementConfig.Spec.Advertisements[0]
@@ -210,6 +210,24 @@ func TestCiliumValuesSizeClientRateLimitForL2Announcements(t *testing.T) {
 			}
 			if tt.wantLimit && (values.ClientRateLimit.QPS != 10 || values.ClientRateLimit.Burst != 20) {
 				t.Errorf("client rate limit = %d QPS/%d burst, want 10 QPS/20 burst", values.ClientRateLimit.QPS, values.ClientRateLimit.Burst)
+			}
+		})
+	}
+}
+
+func TestCiliumValuesMakeHubbleRelayAndUIFollowIntent(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		hubble bool
+		want   string
+	}{
+		{name: "disabled", want: "hubble:\n  enabled: false\n  relay:\n    enabled: false\n  ui:\n    enabled: false"},
+		{name: "enabled", hubble: true, want: "hubble:\n  enabled: true\n  relay:\n    enabled: true\n  ui:\n    enabled: true"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			values := CiliumValues(Facts{Cluster: "demo", CNI: "cilium", LB: true, Hubble: tt.hubble})
+			if !strings.Contains(values, tt.want) {
+				t.Fatalf("Cilium Hubble values =\n%s\nwant %s", values, tt.want)
 			}
 		})
 	}
@@ -321,8 +339,9 @@ type ciliumTypeMeta struct {
 }
 
 type ciliumObjectMeta struct {
-	Name   string            `yaml:"name"`
-	Labels map[string]string `yaml:"labels,omitempty"`
+	Name        string            `yaml:"name"`
+	Annotations map[string]string `yaml:"annotations,omitempty"`
+	Labels      map[string]string `yaml:"labels,omitempty"`
 }
 
 type ciliumLabelSelector struct {

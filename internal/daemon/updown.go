@@ -32,6 +32,9 @@ func (s *Server) up(raw json.RawMessage) ([]Action, error) {
 			if err := checkDomainUnchanged(spec); err != nil {
 				return actions[:i], err
 			}
+			if err := synchronizeHubbleIntent(spec); err != nil {
+				return actions[:i], err
+			}
 		}
 		switch action.Kind {
 		case ActionCreate:
@@ -65,6 +68,25 @@ func (s *Server) up(raw json.RawMessage) ([]Action, error) {
 		}
 	}
 	return actions, nil
+}
+
+// synchronizeHubbleIntent persists the one symmetric Cilium knob before an
+// observed-state pass. Other provisioning mutations deliberately remain in
+// the broader mutation-rule reconciler; this narrow update cannot change the
+// CNI, LoadBalancer, or BGP contract of an existing cluster.
+func synchronizeHubbleIntent(spec config.ClusterSpec) error {
+	if spec.CNI != cluster.CNICilium {
+		return nil
+	}
+	item, err := cluster.Load(spec.Name)
+	if err != nil {
+		return err
+	}
+	if item.CNI != cluster.CNICilium || item.Hubble == spec.Hubble {
+		return nil
+	}
+	item.Hubble = spec.Hubble
+	return cluster.Save(item)
 }
 
 // down stops every cluster the file describes; it never destroys.
