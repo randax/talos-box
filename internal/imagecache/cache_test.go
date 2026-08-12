@@ -3,6 +3,7 @@ package imagecache
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +15,8 @@ import (
 	"time"
 )
 
+const defaultSchematicRequestJSON = `{"customization":{"extraKernelArgs":["console=tty0","console=hvc0"],"systemExtensions":{"officialExtensions":["siderolabs/iscsi-tools","siderolabs/util-linux-tools"]}}}`
+
 func TestSchematicRequestBody(t *testing.T) {
 	t.Parallel()
 
@@ -24,12 +27,12 @@ func TestSchematicRequestBody(t *testing.T) {
 	}{
 		{
 			name: "required arguments",
-			want: `{"customization":{"extraKernelArgs":["console=tty0","console=hvc0"]}}`,
+			want: defaultSchematicRequestJSON,
 		},
 		{
 			name:  "user arguments follow required arguments",
 			extra: []string{"talos.platform=metal", "panic=10"},
-			want:  `{"customization":{"extraKernelArgs":["console=tty0","console=hvc0","talos.platform=metal","panic=10"]}}`,
+			want:  `{"customization":{"extraKernelArgs":["console=tty0","console=hvc0","talos.platform=metal","panic=10"],"systemExtensions":{"officialExtensions":["siderolabs/iscsi-tools","siderolabs/util-linux-tools"]}}}`,
 		},
 	}
 
@@ -46,6 +49,82 @@ func TestSchematicRequestBody(t *testing.T) {
 				t.Fatalf("request body = %s, want %s", body, test.want)
 			}
 		})
+	}
+}
+
+func TestDefaultSchematicCachesCuratedCSIImagesByArchitecture(t *testing.T) {
+	requireXZ(t)
+
+	const schematicID = "curated-csi-default"
+	archives := map[string][]byte{
+		"/image/" + schematicID + "/v1.2.3/metal-amd64.raw.xz": compressXZ(t, "amd64 disk"),
+		"/image/" + schematicID + "/v1.2.3/metal-arm64.raw.xz": compressXZ(t, "arm64 disk"),
+	}
+	var gotSchematicBody string
+	var gotDownloads []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/schematics":
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read request body: %v", err)
+			}
+			gotSchematicBody = string(body)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"id":%q}`, schematicID)
+		case r.Method == http.MethodGet:
+			archive, ok := archives[r.URL.EscapedPath()]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			gotDownloads = append(gotDownloads, r.URL.EscapedPath())
+			w.Header().Set("Content-Type", "application/x-xz")
+			_, _ = w.Write(archive)
+		default:
+			t.Errorf("unexpected request = %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+		}
+	}))
+	defer upstream.Close()
+
+	cache := New(t.TempDir())
+	cache.factoryURL = upstream.URL
+	cache.schematicClient = upstream.Client()
+	cache.downloadClient = upstream.Client()
+	id, err := cache.Schematic()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != schematicID {
+		t.Fatalf("Schematic() = %q, want %q", id, schematicID)
+	}
+	if gotSchematicBody != defaultSchematicRequestJSON {
+		t.Fatalf("schematic request = %s, want %s", gotSchematicBody, defaultSchematicRequestJSON)
+	}
+	for _, architecture := range []Architecture{ArchitectureAMD64, ArchitectureARM64} {
+		path, err := cache.Ensure(id, "v1.2.3", architecture)
+		if err != nil {
+			t.Fatalf("Ensure(%q) error = %v", architecture, err)
+		}
+		wantPath := filepath.Join(cache.root, schematicID, "v1.2.3", string(architecture), "disk.raw")
+		if path != wantPath {
+			t.Errorf("Ensure(%q) path = %q, want %q", architecture, path, wantPath)
+		}
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(contents) != string(architecture)+" disk" {
+			t.Errorf("Ensure(%q) contents = %q", architecture, contents)
+		}
+	}
+	wantDownloads := []string{
+		"/image/" + schematicID + "/v1.2.3/metal-amd64.raw.xz",
+		"/image/" + schematicID + "/v1.2.3/metal-arm64.raw.xz",
+	}
+	if !reflect.DeepEqual(gotDownloads, wantDownloads) {
+		t.Fatalf("download requests = %v, want %v", gotDownloads, wantDownloads)
 	}
 }
 
