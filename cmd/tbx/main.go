@@ -158,6 +158,7 @@ func (c cli) createCluster(args []string) error {
 	domainFlag := flags.String("domain", "", "cluster domain (default <name>.k8s.test)")
 	allowUnsafeDomain := flags.Bool("allow-unsafe-domain", false, "allow a domain that can shadow real DNS")
 	cni := flags.String("cni", "", "CNI to provision: cilium|flannel")
+	csi := flags.String("csi", "", "CSI to provision: longhorn|local-path")
 	lb := flags.Bool("lb", true, "install LoadBalancer support with the CNI")
 	bgp := flags.Bool("bgp", false, "enable Cilium BGP LoadBalancer announcements")
 	hubble := flags.Bool("hubble", false, "enable Cilium Hubble Relay and UI")
@@ -181,7 +182,7 @@ func (c cli) createCluster(args []string) error {
 	if *cni != "" || provided["hubble"] {
 		hubbleArg = hubble
 	}
-	intentInput := cluster.ProvisioningIntentInput{CNI: *cni, LB: lbArg, BGP: bgpArg, Hubble: hubbleArg}
+	intentInput := cluster.ProvisioningIntentInput{CNI: *cni, CSI: *csi, LB: lbArg, BGP: bgpArg, Hubble: hubbleArg}
 	if _, err := intentInput.Intent(); err != nil {
 		return err
 	}

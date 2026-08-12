@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/config"
 	"github.com/randax/talos-box/internal/daemon"
 )
@@ -15,6 +16,11 @@ func (c cli) runUp(args []string) error {
 	cfg, force, err := loadUpConfigFile(args)
 	if err != nil {
 		return err
+	}
+	if input, ok := strongestProvisioningIntent(cfg); ok {
+		if err := c.ensureProvisioningIntentSupport(input); err != nil {
+			return err
+		}
 	}
 	var actions []daemon.Action
 	request := struct {
@@ -29,6 +35,22 @@ func (c cli) runUp(args []string) error {
 		daemon.ActionStart:  "started %s",
 		daemon.ActionNone:   "%s is up to date",
 	})
+}
+
+func strongestProvisioningIntent(cfg config.Config) (cluster.ProvisioningIntentInput, bool) {
+	var strongest cluster.ProvisioningIntentInput
+	found := false
+	for _, spec := range cfg.Clusters {
+		input := spec.Input()
+		if !requiresProvisioningIntentHandshake(input) {
+			continue
+		}
+		if !found || minimumProvisioningIntentProtocol(input) > minimumProvisioningIntentProtocol(strongest) {
+			strongest = input
+			found = true
+		}
+	}
+	return strongest, found
 }
 
 func (c cli) runDown(args []string) error {

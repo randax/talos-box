@@ -28,6 +28,9 @@ func Marshal(cfg Config) string {
 		fmt.Fprintf(&b, "    workers: %d\n", c.Workers)
 		if c.CNI != "" {
 			fmt.Fprintf(&b, "    cni: %s\n", c.CNI)
+			if c.CSI != "" {
+				fmt.Fprintf(&b, "    csi: %s\n", c.CSI)
+			}
 			fmt.Fprintf(&b, "    lb: %t\n", c.LB)
 			if c.BGP {
 				b.WriteString("    bgp: true\n")

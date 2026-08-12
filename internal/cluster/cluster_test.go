@@ -129,7 +129,7 @@ func TestStateRoundTripPreservesProvisioningIntent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	item.ProvisioningIntent = ProvisioningIntent{CNI: CNICilium, LB: true, BGP: true, Hubble: true}
+	item.ProvisioningIntent = ProvisioningIntent{CNI: CNICilium, CSI: CSILonghorn, LB: true, BGP: true, Hubble: true}
 	if err := Save(item); err != nil {
 		t.Fatal(err)
 	}
