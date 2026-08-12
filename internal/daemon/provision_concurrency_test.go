@@ -107,8 +107,8 @@ func TestProvisionObserverDoesNotHoldOperationLockWhileProbing(t *testing.T) {
 	lockAcquired := make(chan struct{})
 	go func() {
 		service.opMu.Lock()
-		service.opMu.Unlock()
 		close(lockAcquired)
+		service.opMu.Unlock()
 	}()
 	select {
 	case <-lockAcquired:
