@@ -18,6 +18,7 @@ import (
 	"github.com/randax/talos-box/internal/helper"
 	"github.com/randax/talos-box/internal/hypervisor"
 	"github.com/randax/talos-box/internal/imagecache"
+	"github.com/randax/talos-box/internal/provision"
 )
 
 type createArgs struct {
@@ -85,10 +86,11 @@ type ClusterSummary struct {
 	cluster.ProvisioningIntent
 	// Domain is the explicitly chosen cluster domain; empty means the
 	// default, <name>.k8s.test.
-	Domain            string `json:"domain,omitempty"`
-	AllowUnsafeDomain bool   `json:"allowUnsafeDomain,omitempty"`
-	Running           bool   `json:"running"`
-	Warning           string `json:"warning,omitempty"`
+	Domain            string   `json:"domain,omitempty"`
+	AllowUnsafeDomain bool     `json:"allowUnsafeDomain,omitempty"`
+	Running           bool     `json:"running"`
+	Warning           string   `json:"warning,omitempty"`
+	Narration         []string `json:"narration,omitempty"`
 }
 
 // EffectiveDomain returns the domain the cluster is reachable under.
@@ -115,11 +117,13 @@ type ClusterStatus struct {
 	Name   string `json:"name"`
 	Subnet string `json:"subnet"`
 	// Domain is the cluster's effective domain (explicit or defaulted).
-	Domain  string       `json:"domain"`
-	BGP     bool         `json:"bgp"`
-	Running bool         `json:"running"`
-	Nodes   []NodeStatus `json:"nodes"`
-	Hints   []string     `json:"hints,omitempty"`
+	Domain string `json:"domain"`
+	cluster.ProvisioningIntent
+	BGP             bool         `json:"bgp"`
+	Running         bool         `json:"running"`
+	KubernetesReady bool         `json:"kubernetesReady"`
+	Nodes           []NodeStatus `json:"nodes"`
+	Hints           []string     `json:"hints,omitempty"`
 }
 
 // CachePullResult describes the image made ready by cache.pull.
@@ -151,6 +155,9 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	intent, err := args.Intent()
 	if err != nil {
 		return ClusterSummary{}, err
+	}
+	if intent.CNI == cluster.CNIFlannel && intent.LB {
+		return ClusterSummary{}, provision.ErrFlannelLoadBalancerUnsupported
 	}
 
 	dir, err := cluster.Dir(args.Name)
@@ -247,6 +254,11 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	}
 	result := summary(item, true)
 	result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, subnetWarning, startWarning)
+	if narration, err := s.provisionFlannel(item); err != nil {
+		return result, fmt.Errorf("provision %s: %w", item.Name, err)
+	} else {
+		result.Narration = narration
+	}
 	return result, nil
 }
 
@@ -281,6 +293,11 @@ func (s *Server) startCluster(raw json.RawMessage) (ClusterSummary, error) {
 	}
 	result := summary(item, true)
 	result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, subnetWarning)
+	if narration, err := s.provisionFlannel(item); err != nil {
+		return result, fmt.Errorf("provision %s: %w", item.Name, err)
+	} else {
+		result.Narration = narration
+	}
 	return result, nil
 }
 
@@ -663,7 +680,7 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 
 	result := make([]ClusterStatus, 0, len(items))
 	for _, item := range items {
-		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), BGP: item.BGP, Running: s.clusterRunning(item.Name)}
+		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: s.clusterRunning(item.Name)}
 		for _, node := range item.Nodes {
 			clusterStatus.Nodes = append(clusterStatus.Nodes, nodeStatus(node, item.SubnetIndex, s.nodeRunning(item.Name, node.Name)))
 		}
@@ -671,6 +688,21 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 		result = append(result, clusterStatus)
 	}
 	return result, nil
+}
+
+func refreshKubernetesReadiness(statuses []ClusterStatus) {
+	for index := range statuses {
+		status := &statuses[index]
+		if status.CNI != cluster.CNIFlannel || status.LB {
+			continue
+		}
+		nodeNames := make([]string, 0, len(status.Nodes))
+		for _, node := range status.Nodes {
+			nodeNames = append(nodeNames, node.Name)
+		}
+		status.KubernetesReady = kubernetesReady(status.Name, nodeNames)
+		status.Hints = Hints(*status)
+	}
 }
 
 func (s *Server) nodeRunning(clusterName, nodeName string) bool {
