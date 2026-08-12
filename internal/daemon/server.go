@@ -226,6 +226,9 @@ func (s *Server) serveConnection(connection net.Conn) {
 }
 
 func (s *Server) dispatch(request Request) Response {
+	if request.Op == "status" {
+		return s.dispatchStatus(request)
+	}
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 
@@ -234,6 +237,24 @@ func (s *Server) dispatch(request Request) Response {
 		return failure(err)
 	}
 	return success(data)
+}
+
+// dispatchStatus keeps the existing VM-state snapshot serialized, then probes
+// Kubernetes after releasing opMu so a slow API server cannot block lifecycle
+// operations.
+func (s *Server) dispatchStatus(request Request) Response {
+	s.opMu.Lock()
+	data, err := s.handle(request)
+	s.opMu.Unlock()
+	if err != nil {
+		return failure(err)
+	}
+	statuses, ok := data.([]ClusterStatus)
+	if !ok {
+		return failure(errors.New("status returned an unexpected response"))
+	}
+	refreshKubernetesReadiness(statuses)
+	return success(statuses)
 }
 
 func (s *Server) handle(request Request) (any, error) {

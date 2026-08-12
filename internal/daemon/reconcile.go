@@ -23,9 +23,10 @@ const (
 
 // Action pairs a cluster with the reconciliation decision for it.
 type Action struct {
-	Cluster string     `json:"cluster"`
-	Kind    ActionKind `json:"action"`
-	Warning string     `json:"warning,omitempty"`
+	Cluster   string     `json:"cluster"`
+	Kind      ActionKind `json:"action"`
+	Warning   string     `json:"warning,omitempty"`
+	Narration []string   `json:"narration,omitempty"`
 }
 
 // PlanUp decides, per desired cluster: create it, start it, or leave it.
