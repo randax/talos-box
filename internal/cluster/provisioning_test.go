@@ -11,11 +11,12 @@ func TestParseProvisioningIntent(t *testing.T) {
 	tests := []struct {
 		name    string
 		cni     string
+		csi     string
 		lb      *bool
 		bgp     *bool
 		hubble  *bool
 		want    ProvisioningIntent
-		wantErr string
+		wantErr []string
 	}{
 		{
 			name: "cilium defaults load balancer on",
@@ -38,50 +39,82 @@ func TestParseProvisioningIntent(t *testing.T) {
 		{
 			name:    "unknown cni",
 			cni:     "calico",
-			wantErr: "cni must be one of cilium or flannel",
+			wantErr: []string{"cni must be one of cilium or flannel"},
+		},
+		{
+			name: "longhorn storage intent",
+			cni:  "cilium",
+			csi:  "longhorn",
+			want: ProvisioningIntent{CNI: CNICilium, CSI: CSILonghorn, LB: true},
+		},
+		{
+			name: "local path storage intent",
+			cni:  "flannel",
+			csi:  "local-path",
+			want: ProvisioningIntent{CNI: CNIFlannel, CSI: CSILocalPath, LB: true},
+		},
+		{
+			name:    "unknown csi lists curated engines",
+			cni:     "cilium",
+			csi:     "rook",
+			wantErr: []string{"csi must be one of longhorn | local-path", `got "rook"`},
+		},
+		{
+			name: "csi without cni names both remedies",
+			csi:  "longhorn",
+			wantErr: []string{
+				"csi requires cni",
+				"add cni:",
+				"install storage yourself from the printed manifests",
+			},
 		},
 		{
 			name:    "load balancer without cni even when false",
 			lb:      boolPtr(false),
-			wantErr: "lb requires cni",
+			wantErr: []string{"lb requires cni"},
 		},
 		{
 			name:    "bgp without cni",
 			bgp:     boolPtr(true),
-			wantErr: "bgp requires cni",
+			wantErr: []string{"bgp requires cni"},
 		},
 		{
 			name:    "hubble without cni",
 			hubble:  boolPtr(false),
-			wantErr: "hubble requires cni",
+			wantErr: []string{"hubble requires cni"},
 		},
 		{
 			name:    "bgp requires load balancer",
 			cni:     "cilium",
 			lb:      boolPtr(false),
 			bgp:     boolPtr(true),
-			wantErr: "bgp requires lb: true",
+			wantErr: []string{"bgp requires lb: true"},
 		},
 		{
 			name:    "bgp requires cilium",
 			cni:     "flannel",
 			bgp:     boolPtr(true),
-			wantErr: "bgp requires cni: cilium",
+			wantErr: []string{"bgp requires cni: cilium"},
 		},
 		{
 			name:    "hubble requires cilium",
 			cni:     "flannel",
 			hubble:  boolPtr(true),
-			wantErr: "hubble requires cni: cilium",
+			wantErr: []string{"hubble requires cni: cilium"},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := ParseProvisioningIntent(tt.cni, tt.lb, tt.bgp, tt.hubble)
-			if tt.wantErr != "" {
-				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
-					t.Fatalf("ParseProvisioningIntent() error = %v, want %q", err, tt.wantErr)
+			got, err := ParseProvisioningIntent(tt.cni, tt.csi, tt.lb, tt.bgp, tt.hubble)
+			if len(tt.wantErr) > 0 {
+				if err == nil {
+					t.Fatalf("ParseProvisioningIntent() error = nil, want containing %q", tt.wantErr)
+				}
+				for _, part := range tt.wantErr {
+					if !strings.Contains(err.Error(), part) {
+						t.Fatalf("ParseProvisioningIntent() error = %v, want containing %q", err, part)
+					}
 				}
 				return
 			}

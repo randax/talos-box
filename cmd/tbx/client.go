@@ -21,8 +21,17 @@ type dialError struct{ err error }
 
 func (e dialError) Error() string { return e.err.Error() }
 
+const legacyProvisioningIntentProtocolVersion = 1
+
 func requiresProvisioningIntentHandshake(input cluster.ProvisioningIntentInput) bool {
-	return input.CNI != "" || input.LB != nil || input.BGP != nil || input.Hubble != nil
+	return input.CNI != "" || input.CSI != "" || input.LB != nil || input.BGP != nil || input.Hubble != nil
+}
+
+func minimumProvisioningIntentProtocol(input cluster.ProvisioningIntentInput) int {
+	if input.CSI != "" {
+		return daemon.ProtocolVersion
+	}
+	return legacyProvisioningIntentProtocolVersion
 }
 
 func (c cli) ensureProvisioningIntentSupport(input cluster.ProvisioningIntentInput) error {
@@ -32,15 +41,16 @@ func (c cli) ensureProvisioningIntentSupport(input cluster.ProvisioningIntentInp
 	var info daemon.Info
 	if err := c.call("daemon.info", struct{}{}, &info); err != nil {
 		if strings.Contains(err.Error(), "unknown operation") {
-			return errors.New("tbxd is too old; restart or upgrade tbxd to use --cni/--hubble/--lb/--bgp")
+			return errors.New("tbxd is too old; restart or upgrade tbxd to use --cni/--csi/--hubble/--lb/--bgp")
 		}
 		return err
 	}
-	if info.ProtocolVersion != daemon.ProtocolVersion {
-		if info.ProtocolVersion < daemon.ProtocolVersion {
-			return fmt.Errorf("tbxd protocol %d is too old; restart or upgrade tbxd to use --cni/--hubble/--lb/--bgp", info.ProtocolVersion)
-		}
-		return fmt.Errorf("tbx is too old: protocol %d does not support tbxd protocol %d; upgrade tbx before using --cni/--hubble/--lb/--bgp", daemon.ProtocolVersion, info.ProtocolVersion)
+	minimumProtocol := minimumProvisioningIntentProtocol(input)
+	if info.ProtocolVersion < minimumProtocol {
+		return fmt.Errorf("tbxd protocol %d is too old; restart or upgrade tbxd to use --cni/--csi/--hubble/--lb/--bgp", info.ProtocolVersion)
+	}
+	if info.ProtocolVersion > daemon.ProtocolVersion {
+		return fmt.Errorf("tbx is too old: protocol %d does not support tbxd protocol %d; upgrade tbx before using --cni/--csi/--hubble/--lb/--bgp", daemon.ProtocolVersion, info.ProtocolVersion)
 	}
 	return nil
 }

@@ -24,6 +24,38 @@ func TestCreateClusterRejectsInvalidProvisioningFlagsBeforeDaemonCall(t *testing
 	}
 }
 
+func TestMinimumProvisioningIntentProtocolPreservesLegacyCNICompatibility(t *testing.T) {
+	if got := minimumProvisioningIntentProtocol(cluster.ProvisioningIntentInput{CNI: "cilium"}); got != 1 {
+		t.Fatalf("CNI-only minimum protocol = %d, want 1", got)
+	}
+	if got := minimumProvisioningIntentProtocol(cluster.ProvisioningIntentInput{CNI: "cilium", CSI: "longhorn"}); got != daemon.ProtocolVersion {
+		t.Fatalf("CSI minimum protocol = %d, want %d", got, daemon.ProtocolVersion)
+	}
+}
+
+func TestCreateClusterRejectsCSIWithoutCNIBeforeDaemonCall(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr}
+	err := command.createCluster([]string{"demo", "--csi=longhorn"})
+	if err == nil {
+		t.Fatal("createCluster() error = nil, want CSI validation error")
+	}
+	for _, part := range []string{"csi requires cni", "add cni:", "install storage yourself from the printed manifests"} {
+		if !strings.Contains(err.Error(), part) {
+			t.Fatalf("createCluster() error = %v, want containing %q", err, part)
+		}
+	}
+}
+
+func TestCreateClusterRejectsUnknownCSIBeforeDaemonCall(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr}
+	err := command.createCluster([]string{"demo", "--cni=cilium", "--csi=rook"})
+	if err == nil || !strings.Contains(err.Error(), "csi must be one of longhorn | local-path") {
+		t.Fatalf("createCluster() error = %v, want curated CSI validation error", err)
+	}
+}
+
 func TestCreateClusterRejectsFlannelBGPBeforeDaemonCall(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	command := cli{out: &stdout, err: &stderr}
@@ -68,12 +100,12 @@ func TestCreateClusterSendsProvisioningIntentAndPrintsIt(t *testing.T) {
 		if !acceptAndRespond(daemon.Response{OK: true, Data: json.RawMessage(fmt.Sprintf(`{"protocolVersion":%d}`, daemon.ProtocolVersion))}) {
 			return
 		}
-		_ = acceptAndRespond(daemon.Response{OK: true, Data: json.RawMessage(`{"name":"demo","controlPlanes":1,"workers":2,"nodeDefaults":{"memoryMiB":2048,"cpus":2,"diskGiB":20},"cni":"cilium","lb":true,"bgp":true,"hubble":true}`)})
+		_ = acceptAndRespond(daemon.Response{OK: true, Data: json.RawMessage(`{"name":"demo","controlPlanes":1,"workers":2,"nodeDefaults":{"memoryMiB":2048,"cpus":2,"diskGiB":20},"cni":"cilium","csi":"longhorn","lb":true,"bgp":true,"hubble":true}`)})
 	}()
 
 	var stdout, stderr bytes.Buffer
 	command := cli{out: &stdout, err: &stderr}
-	if err := command.createCluster([]string{"demo", "--cni=cilium", "--bgp", "--hubble"}); err != nil {
+	if err := command.createCluster([]string{"demo", "--cni=cilium", "--csi=longhorn", "--bgp", "--hubble"}); err != nil {
 		t.Fatal(err)
 	}
 	infoRequest := <-requests
@@ -86,6 +118,7 @@ func TestCreateClusterSendsProvisioningIntentAndPrintsIt(t *testing.T) {
 	}
 	var args struct {
 		CNI    cluster.CNI `json:"cni"`
+		CSI    cluster.CSI `json:"csi"`
 		LB     *bool       `json:"lb"`
 		BGP    *bool       `json:"bgp"`
 		Hubble *bool       `json:"hubble"`
@@ -93,10 +126,10 @@ func TestCreateClusterSendsProvisioningIntentAndPrintsIt(t *testing.T) {
 	if err := json.Unmarshal(request.Args, &args); err != nil {
 		t.Fatal(err)
 	}
-	if args.CNI != cluster.CNICilium || args.LB == nil || !*args.LB || args.BGP == nil || !*args.BGP || args.Hubble == nil || !*args.Hubble {
+	if args.CNI != cluster.CNICilium || args.CSI != cluster.CSILonghorn || args.LB == nil || !*args.LB || args.BGP == nil || !*args.BGP || args.Hubble == nil || !*args.Hubble {
 		t.Fatalf("create arguments = %+v, want cilium defaults and requested features", args)
 	}
-	for _, line := range []string{"cni: cilium", "lb: true", "bgp: true", "hubble: true"} {
+	for _, line := range []string{"cni: cilium", "csi: longhorn", "lb: true", "bgp: true", "hubble: true"} {
 		if !strings.Contains(stdout.String(), line) {
 			t.Fatalf("output missing %q:\n%s", line, stdout.String())
 		}
@@ -151,6 +184,50 @@ func TestCreateClusterRejectsOldDaemonBeforeMutation(t *testing.T) {
 		t.Fatalf("operation = %q, want daemon.info", request.Op)
 	}
 	<-serverDone
+}
+
+func TestCreateClusterWithCSIRejectsOldDaemonBeforeMutation(t *testing.T) {
+	home, err := os.MkdirTemp("/tmp", "tbx-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	t.Setenv("HOME", home)
+	socket := filepath.Join(home, ".talosbox", "tbxd.sock")
+	if err := os.MkdirAll(filepath.Dir(socket), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	requests := make(chan daemon.Request, 1)
+	go func() {
+		connection, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = connection.Close() }()
+		var request daemon.Request
+		if err := json.NewDecoder(connection).Decode(&request); err != nil {
+			return
+		}
+		requests <- request
+		response := fmt.Sprintf(`{"protocolVersion":%d}`, daemon.ProtocolVersion-1)
+		_ = json.NewEncoder(connection).Encode(daemon.Response{OK: true, Data: json.RawMessage(response)})
+	}()
+
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr}
+	err = command.createCluster([]string{"demo", "--cni=cilium", "--csi=longhorn"})
+	if err == nil || !strings.Contains(err.Error(), "tbxd protocol 1 is too old") || !strings.Contains(err.Error(), "--csi") {
+		t.Fatalf("createCluster() error = %v, want CSI protocol upgrade refusal", err)
+	}
+	if request := <-requests; request.Op != "daemon.info" {
+		t.Fatalf("operation = %q, want daemon.info", request.Op)
+	}
 }
 
 func TestCreateClusterRejectsNewDaemonBeforeMutation(t *testing.T) {
@@ -247,7 +324,7 @@ func TestCreateClusterWithoutCNIUsesLegacyProtocolAndOutput(t *testing.T) {
 	if err := json.Unmarshal(request.Args, &args); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"cni", "lb", "bgp", "hubble"} {
+	for _, key := range []string{"cni", "csi", "lb", "bgp", "hubble"} {
 		if _, found := args[key]; found {
 			t.Fatalf("legacy create request unexpectedly includes %q: %s", key, request.Args)
 		}

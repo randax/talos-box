@@ -53,6 +53,44 @@ func TestCreateClusterRejectsInvalidProvisioningIntentBeforeMutation(t *testing.
 	}
 }
 
+func TestCreateClusterRejectsInvalidCSIIntentBeforeMutation(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   cluster.ProvisioningIntentInput
+		wantErr string
+	}{
+		{
+			name:    "csi without cni",
+			input:   cluster.ProvisioningIntentInput{CSI: string(cluster.CSILonghorn)},
+			wantErr: "csi requires cni",
+		},
+		{
+			name: "unknown csi",
+			input: cluster.ProvisioningIntentInput{
+				CNI: string(cluster.CNICilium), CSI: "rook",
+			},
+			wantErr: "csi must be one of longhorn | local-path",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			service := &Server{}
+			raw, err := json.Marshal(createArgs{Name: "invalid-csi", ProvisioningIntentInput: tt.input})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = service.createCluster(raw)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("createCluster() error = %v, want containing %q", err, tt.wantErr)
+			}
+			if _, loadErr := cluster.Load("invalid-csi"); loadErr == nil {
+				t.Fatal("createCluster() persisted state despite invalid CSI intent")
+			}
+		})
+	}
+}
+
 func TestAddNodeChecksHostPressureBeforeMutation(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	item, err := cluster.New("unsafe-add", 0, 0, 0, cluster.NodeDefaults{MemoryMiB: 1})

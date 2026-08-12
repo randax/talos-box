@@ -119,6 +119,7 @@ func TestParseProvisioningIntent(t *testing.T) {
 clusters:
   - name: cilium
     cni: cilium
+    csi: longhorn
     bgp: true
     hubble: true
   - name: flannel
@@ -128,7 +129,7 @@ clusters:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := cfg.Clusters[0]; got.CNI != cluster.CNICilium || !got.LB || !got.BGP || !got.Hubble {
+	if got := cfg.Clusters[0]; got.CNI != cluster.CNICilium || got.CSI != cluster.CSILonghorn || !got.LB || !got.BGP || !got.Hubble {
 		t.Fatalf("cilium provisioning intent = %+v", got)
 	}
 	if got := cfg.Clusters[1]; got.CNI != cluster.CNIFlannel || got.LB || got.BGP || got.Hubble {
@@ -143,6 +144,8 @@ func TestParseRejectsInvalidProvisioningIntent(t *testing.T) {
 		wantErr string
 	}{
 		{"unknown cni", "cni: calico", "cni must be one of"},
+		{"unknown csi", "cni: cilium\n    csi: rook", "csi must be one of longhorn | local-path"},
+		{"csi without cni", "csi: longhorn", "add cni:"},
 		{"lb without cni", "lb: false", "lb requires cni"},
 		{"bgp without cni", "bgp: false", "bgp requires cni"},
 		{"hubble without cni", "hubble: false", "hubble requires cni"},
@@ -310,11 +313,11 @@ clusters:
 func TestMarshalProvisioningIntentRoundTrip(t *testing.T) {
 	spec := ClusterSpec{
 		Name: "demo", ControlPlanes: 1, Workers: 2,
-		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true, BGP: true, Hubble: true},
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, CSI: cluster.CSILocalPath, LB: true, BGP: true, Hubble: true},
 		Node:               cluster.NodeDefaults{MemoryMiB: 2048, CPUs: 2, DiskGiB: 20},
 	}
 	got := Marshal(Config{Clusters: []ClusterSpec{spec}})
-	for _, line := range []string{"cni: cilium", "lb: true", "bgp: true", "hubble: true"} {
+	for _, line := range []string{"cni: cilium", "csi: local-path", "lb: true", "bgp: true", "hubble: true"} {
 		if !strings.Contains(got, line) {
 			t.Fatalf("Marshal() missing %q:\n%s", line, got)
 		}

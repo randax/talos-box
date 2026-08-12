@@ -34,7 +34,7 @@ func (s *Server) setBGP(raw json.RawMessage, enable bool) (ClusterSummary, error
 			return ClusterSummary{}, fmt.Errorf("cluster %q cannot enable BGP: bgp requires cni: cilium", item.Name)
 		}
 		enabled := true
-		if _, err := cluster.ParseProvisioningIntent(string(item.CNI), &item.LB, &enabled, &item.Hubble); err != nil {
+		if _, err := cluster.ParseProvisioningIntent(string(item.CNI), string(item.CSI), &item.LB, &enabled, &item.Hubble); err != nil {
 			return ClusterSummary{}, fmt.Errorf("cluster %q cannot enable BGP: %w", item.Name, err)
 		}
 	}

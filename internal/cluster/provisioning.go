@@ -11,11 +11,21 @@ const (
 	CNIFlannel CNI = "flannel"
 )
 
-// ProvisioningIntent is the durable, user-requested networking configuration.
+// CSI identifies the curated cluster storage implementation requested during
+// provisioning. An empty value leaves storage to the user.
+type CSI string
+
+const (
+	CSILonghorn  CSI = "longhorn"
+	CSILocalPath CSI = "local-path"
+)
+
+// ProvisioningIntent is the durable, user-requested networking and storage configuration.
 // It deliberately contains no progress markers: reconciliation derives those
 // from the cluster itself.
 type ProvisioningIntent struct {
 	CNI    CNI  `json:"cni,omitempty"`
+	CSI    CSI  `json:"csi,omitempty"`
 	LB     bool `json:"lb,omitempty"`
 	BGP    bool `json:"bgp,omitempty"`
 	Hubble bool `json:"hubble,omitempty"`
@@ -26,6 +36,7 @@ type ProvisioningIntent struct {
 // validation can reject any knob supplied without cni.
 type ProvisioningIntentInput struct {
 	CNI    string `json:"cni,omitempty" yaml:"cni"`
+	CSI    string `json:"csi,omitempty" yaml:"csi"`
 	LB     *bool  `json:"lb,omitempty" yaml:"lb"`
 	BGP    *bool  `json:"bgp,omitempty" yaml:"bgp"`
 	Hubble *bool  `json:"hubble,omitempty" yaml:"hubble"`
@@ -33,7 +44,7 @@ type ProvisioningIntentInput struct {
 
 // Intent returns the defaulted, validated durable intent.
 func (input ProvisioningIntentInput) Intent() (ProvisioningIntent, error) {
-	return ParseProvisioningIntent(input.CNI, input.LB, input.BGP, input.Hubble)
+	return ParseProvisioningIntent(input.CNI, input.CSI, input.LB, input.BGP, input.Hubble)
 }
 
 // Input returns the protocol form of a validated intent. Substrate-only
@@ -43,7 +54,7 @@ func (intent ProvisioningIntent) Input() ProvisioningIntentInput {
 		return ProvisioningIntentInput{}
 	}
 	return ProvisioningIntentInput{
-		CNI: string(intent.CNI), LB: boolPointer(intent.LB),
+		CNI: string(intent.CNI), CSI: string(intent.CSI), LB: boolPointer(intent.LB),
 		BGP: boolPointer(intent.BGP), Hubble: boolPointer(intent.Hubble),
 	}
 }
@@ -51,9 +62,11 @@ func (intent ProvisioningIntent) Input() ProvisioningIntentInput {
 // ParseProvisioningIntent validates the user-facing CNI knobs and applies
 // their defaults. Pointer values preserve whether a knob was supplied, which
 // lets callers reject even an explicit false value without cni.
-func ParseProvisioningIntent(cni string, lb, bgp, hubble *bool) (ProvisioningIntent, error) {
+func ParseProvisioningIntent(cni, csi string, lb, bgp, hubble *bool) (ProvisioningIntent, error) {
 	if cni == "" {
 		switch {
+		case csi != "":
+			return ProvisioningIntent{}, fmt.Errorf("csi requires cni: add cni: cilium or flannel, or install storage yourself from the printed manifests")
 		case lb != nil:
 			return ProvisioningIntent{}, fmt.Errorf("lb requires cni: cilium or flannel")
 		case bgp != nil:
@@ -65,11 +78,16 @@ func ParseProvisioningIntent(cni string, lb, bgp, hubble *bool) (ProvisioningInt
 		}
 	}
 
-	intent := ProvisioningIntent{CNI: CNI(cni), LB: true}
+	intent := ProvisioningIntent{CNI: CNI(cni), CSI: CSI(csi), LB: true}
 	switch intent.CNI {
 	case CNICilium, CNIFlannel:
 	default:
 		return ProvisioningIntent{}, fmt.Errorf("cni must be one of cilium or flannel, got %q", cni)
+	}
+	switch intent.CSI {
+	case "", CSILonghorn, CSILocalPath:
+	default:
+		return ProvisioningIntent{}, fmt.Errorf("csi must be one of longhorn | local-path, got %q", csi)
 	}
 	if lb != nil {
 		intent.LB = *lb
