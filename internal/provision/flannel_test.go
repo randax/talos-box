@@ -35,6 +35,7 @@ type fakeClient struct {
 	bootstrap int
 	kube      int
 	kubeData  []byte
+	kubeErrs  []error
 	bootErr   error
 	readyErrs []error
 	expected  [][]string
@@ -108,7 +109,37 @@ func TestFlannelReconcileTreatsAlreadyBootstrappedAsSuccess(t *testing.T) {
 
 func (f *fakeClient) Kubeconfig(context.Context, string) ([]byte, error) {
 	f.kube++
+	if len(f.kubeErrs) > 0 {
+		err := f.kubeErrs[0]
+		f.kubeErrs = f.kubeErrs[1:]
+		return nil, err
+	}
 	return f.kubeData, nil
+}
+
+func TestKubeconfigWithRetryHandlesTransientTalosRestart(t *testing.T) {
+	client := &fakeClient{
+		kubeData: []byte("kubeconfig"),
+		kubeErrs: []error{status.Error(codes.Unavailable, "apid restarting")},
+	}
+	got, err := kubeconfigWithRetry(context.Background(), client, "172.30.0.2", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "kubeconfig" || client.kube != 2 {
+		t.Fatalf("kubeconfig retry = %q after %d calls, want successful second call", got, client.kube)
+	}
+}
+
+func TestKubeconfigWithRetryDoesNotHidePermanentErrors(t *testing.T) {
+	client := &fakeClient{kubeErrs: []error{status.Error(codes.PermissionDenied, "bad credential")}}
+	_, err := kubeconfigWithRetry(context.Background(), client, "172.30.0.2", 0)
+	if err == nil || !strings.Contains(err.Error(), "bad credential") {
+		t.Fatalf("kubeconfigWithRetry() error = %v, want permanent error", err)
+	}
+	if client.kube != 1 {
+		t.Fatalf("kubeconfig calls = %d, want 1", client.kube)
+	}
 }
 
 func (f *fakeClient) KubernetesReady(_ context.Context, _ []byte, expectedNodes []string) error {
@@ -349,6 +380,80 @@ users:
 	if err := KubernetesReady(context.Background(), invalidCredentials, []string{"cp"}); err == nil || !strings.Contains(err.Error(), "decode kubeconfig CA") {
 		t.Fatalf("KubernetesReady() error = %v, want invalid credential error", err)
 	}
+}
+
+func TestHubbleConvergedRequiresTheDesiredDeployments(t *testing.T) {
+	tests := []struct {
+		name    string
+		desired bool
+		present bool
+		ready   bool
+		wantErr string
+	}{
+		{name: "enabled and ready", desired: true, present: true, ready: true},
+		{name: "enabled but not ready", desired: true, present: true, wantErr: "not Ready"},
+		{name: "enabled but missing", desired: true, wantErr: "404"},
+		{name: "disabled and absent", desired: false},
+		{name: "disabled but still present", desired: false, present: true, ready: true, wantErr: "disabled"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server, kubeconfig := hubbleServer(t, test.present, test.ready)
+			defer server.Close()
+			err := HubbleConverged(context.Background(), kubeconfig, test.desired)
+			if test.wantErr == "" && err != nil {
+				t.Fatal(err)
+			}
+			if test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)) {
+				t.Fatalf("HubbleConverged() error = %v, want %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func hubbleServer(t *testing.T, present, ready bool) (*httptest.Server, []byte) {
+	t.Helper()
+	certificate, certificatePEM, keyPEM := testCertificate(t)
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(certificatePEM) {
+		t.Fatal("parse test CA")
+	}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/apis/apps/v1/namespaces/kube-system/deployments/hubble-relay" && request.URL.Path != "/apis/apps/v1/namespaces/kube-system/deployments/hubble-ui" {
+			writer.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if !present {
+			writer.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if ready {
+			_, _ = writer.Write([]byte(`{"metadata":{"generation":2},"status":{"observedGeneration":2,"readyReplicas":1,"availableReplicas":1}}`))
+			return
+		}
+		_, _ = writer.Write([]byte(`{"metadata":{"generation":2},"status":{"observedGeneration":1}}`))
+	}))
+	server.TLS = &tls.Config{Certificates: []tls.Certificate{certificate}, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool, MinVersion: tls.VersionTLS12}
+	server.StartTLS()
+	kubeconfig := fmt.Sprintf(`apiVersion: v1
+clusters:
+- name: test
+  cluster:
+    server: %s
+    certificate-authority-data: %s
+contexts:
+- name: test
+  context:
+    cluster: test
+    user: admin
+current-context: test
+users:
+- name: admin
+  user:
+    client-certificate-data: %s
+    client-key-data: %s
+`, server.URL, base64.StdEncoding.EncodeToString(certificatePEM), base64.StdEncoding.EncodeToString(certificatePEM), base64.StdEncoding.EncodeToString(keyPEM))
+	return server, []byte(kubeconfig)
 }
 
 func readyServer(t *testing.T, status int, body string) (*httptest.Server, []byte) {

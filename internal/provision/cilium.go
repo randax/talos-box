@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -397,6 +398,280 @@ func ciliumExtras(f manifests.Facts) string {
 		return manifests.LBPool(f) + "---\n" + manifests.BGPPolicy(f)
 	}
 	return manifests.LBPool(f) + "---\n" + manifests.L2Policy(f)
+}
+
+// CiliumConverged observes the Cilium workload and the exact announcement
+// desired set. It lets a fully converged L2 cluster skip a costly full-chart
+// SSA pass, while stale resources from an interrupted BGP -> L2 change force
+// the normal reconciler to clean them up on the next `tbx up`.
+func CiliumConverged(ctx context.Context, kubeconfig []byte, item cluster.Cluster) error {
+	transport, server, err := kubeTransport(kubeconfig)
+	if err != nil {
+		return err
+	}
+	defer transport.CloseIdleConnections()
+	for _, workload := range []struct {
+		path string
+		kind string
+	}{
+		{"/apis/apps/v1/namespaces/kube-system/deployments/cilium-operator", "deployment"},
+		{"/apis/apps/v1/namespaces/kube-system/daemonsets/cilium", "daemonset"},
+		{"/apis/apps/v1/namespaces/kube-system/daemonsets/cilium-envoy", "daemonset"},
+	} {
+		if err := ciliumWorkloadReady(ctx, transport, server, workload.path, workload.kind); err != nil {
+			return err
+		}
+	}
+	if item.LB {
+		if err := ciliumOwnedObjectState(ctx, transport, server, "/apis/cilium.io/v2/ciliumloadbalancerippools/"+item.Name+"-pool", announcementOwnershipAnnotation, fieldManager); err != nil {
+			return err
+		}
+		if item.BGP {
+			for _, path := range ciliumBGPPaths(item.Name) {
+				if err := ciliumAnnouncementState(ctx, transport, server, path); err != nil {
+					return err
+				}
+			}
+			if err := ciliumObjectState(ctx, transport, server, ciliumL2Path(item.Name), false); err != nil {
+				return err
+			}
+		} else {
+			if err := ciliumAnnouncementState(ctx, transport, server, ciliumL2Path(item.Name)); err != nil {
+				return err
+			}
+			for _, path := range ciliumBGPPaths(item.Name) {
+				if err := ciliumObjectState(ctx, transport, server, path, false); err != nil {
+					return err
+				}
+			}
+		}
+		if err := ciliumOwnedWorkloadReady(ctx, transport, server, ciliumProbeDeploymentPath(), "deployment", "talosbox.dev/managed", "true"); err != nil {
+			return err
+		}
+		if err := ciliumOwnedObjectState(ctx, transport, server, ciliumProbeServicePath(), "talosbox.dev/managed", "true"); err != nil {
+			return err
+		}
+	} else {
+		if err := ciliumObjectState(ctx, transport, server, "/apis/cilium.io/v2/ciliumloadbalancerippools/"+item.Name+"-pool", false); err != nil {
+			return err
+		}
+		if err := ciliumObjectState(ctx, transport, server, ciliumL2Path(item.Name), false); err != nil {
+			return err
+		}
+		for _, path := range ciliumBGPPaths(item.Name) {
+			if err := ciliumObjectState(ctx, transport, server, path, false); err != nil {
+				return err
+			}
+		}
+		if err := ciliumObjectState(ctx, transport, server, ciliumProbeDeploymentPath(), false); err != nil {
+			return err
+		}
+		if err := ciliumObjectState(ctx, transport, server, ciliumProbeServicePath(), false); err != nil {
+			return err
+		}
+	}
+	return ciliumHubbleConverged(ctx, transport, server, item)
+}
+
+func ciliumL2Path(name string) string {
+	return "/apis/cilium.io/v2alpha1/ciliuml2announcementpolicies/" + name + "-l2"
+}
+
+func ciliumBGPPaths(name string) []string {
+	return []string{
+		"/apis/cilium.io/v2/ciliumbgpclusterconfigs/" + name + "-bgp",
+		"/apis/cilium.io/v2/ciliumbgppeerconfigs/" + name + "-bgp-peer",
+		"/apis/cilium.io/v2/ciliumbgpadvertisements/" + name + "-bgp-advertisement",
+	}
+}
+
+func ciliumProbeDeploymentPath() string {
+	return "/apis/apps/v1/namespaces/" + probeNamespace + "/deployments/lb-probe"
+}
+
+func ciliumProbeServicePath() string {
+	return "/api/v1/namespaces/" + probeNamespace + "/services/lb-probe"
+}
+
+func ciliumObjectState(ctx context.Context, transport http.RoundTripper, server, path string, present bool) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, server+path, nil)
+	if err != nil {
+		return err
+	}
+	response, err := (&http.Client{Transport: transport}).Do(request)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if present && response.StatusCode != http.StatusOK {
+		return fmt.Errorf("cilium desired object %s: %s", path, response.Status)
+	}
+	if !present && response.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("stale Cilium object %s: %s", path, response.Status)
+	}
+	return nil
+}
+
+func ciliumOwnedObjectState(ctx context.Context, transport http.RoundTripper, server, path, key, value string) error {
+	response, err := ciliumGet(ctx, transport, server, path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("cilium desired object %s: %s", path, response.Status)
+	}
+	var object struct {
+		Metadata struct {
+			Annotations map[string]string `json:"annotations"`
+			Labels      map[string]string `json:"labels"`
+		} `json:"metadata"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&object); err != nil {
+		return fmt.Errorf("decode Cilium object %s: %w", path, err)
+	}
+	if object.Metadata.Annotations[key] != value && object.Metadata.Labels[key] != value {
+		return fmt.Errorf("cilium desired object %s is not owned by talosbox", path)
+	}
+	return nil
+}
+
+// ciliumAnnouncementState additionally checks the ownership annotation. The
+// resource names are stable, but ownership prevents a coincidental attendee
+// resource from being treated as talosbox's declarative announcement set.
+func ciliumAnnouncementState(ctx context.Context, transport http.RoundTripper, server, path string) error {
+	response, err := ciliumGet(ctx, transport, server, path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("cilium desired announcement %s: %s", path, response.Status)
+	}
+	var object struct {
+		Metadata struct {
+			Annotations map[string]string `json:"annotations"`
+		} `json:"metadata"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&object); err != nil {
+		return fmt.Errorf("decode Cilium announcement %s: %w", path, err)
+	}
+	if object.Metadata.Annotations["talosbox.dev/announcement-owned"] != "talosbox" {
+		return fmt.Errorf("cilium desired announcement %s is not owned by talosbox", path)
+	}
+	return nil
+}
+
+func ciliumGet(ctx context.Context, transport http.RoundTripper, server, path string) (*http.Response, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, server+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	return (&http.Client{Transport: transport}).Do(request)
+}
+
+func ciliumOwnedWorkloadReady(ctx context.Context, transport http.RoundTripper, server, path, kind, key, value string) error {
+	if err := ciliumWorkloadReady(ctx, transport, server, path, kind); err != nil {
+		return err
+	}
+	return ciliumOwnedObjectState(ctx, transport, server, path, key, value)
+}
+
+func ciliumHubbleConverged(ctx context.Context, transport http.RoundTripper, server string, item cluster.Cluster) error {
+	candidates, err := ciliumHubbleObjects(item)
+	if err != nil {
+		return err
+	}
+	for _, candidate := range candidates {
+		path, err := ciliumObjectPath(candidate)
+		if err != nil {
+			return err
+		}
+		if !item.Hubble {
+			if err := ciliumObjectState(ctx, transport, server, path, false); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := ciliumOwnedObjectState(ctx, transport, server, path, hubbleOwnershipAnnotation, fieldManager); err != nil {
+			return err
+		}
+		if candidate.GetKind() == "Deployment" {
+			if err := ciliumWorkloadReady(ctx, transport, server, path, "deployment"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func ciliumObjectPath(object unstructured.Unstructured) (string, error) {
+	version := object.GroupVersionKind().Version
+	if version == "" || object.GetKind() == "" || object.GetName() == "" {
+		return "", fmt.Errorf("invalid Cilium object identity %q", objectID(object))
+	}
+	group := object.GroupVersionKind().Group
+	prefix := "/api/" + version
+	if group != "" {
+		prefix = "/apis/" + group + "/" + version
+	}
+	if object.GetNamespace() != "" {
+		prefix += "/namespaces/" + object.GetNamespace()
+	}
+	return prefix + "/" + ciliumResourceName(object.GetKind()) + "/" + object.GetName(), nil
+}
+
+func ciliumResourceName(kind string) string {
+	lower := strings.ToLower(kind)
+	if strings.HasSuffix(lower, "s") {
+		return lower + "es"
+	}
+	if strings.HasSuffix(lower, "y") {
+		return strings.TrimSuffix(lower, "y") + "ies"
+	}
+	return lower + "s"
+}
+
+func ciliumWorkloadReady(ctx context.Context, transport http.RoundTripper, server, path, kind string) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, server+path, nil)
+	if err != nil {
+		return err
+	}
+	response, err := (&http.Client{Transport: transport}).Do(request)
+	if err != nil {
+		return err
+	}
+	if response.StatusCode != http.StatusOK {
+		_ = response.Body.Close()
+		return fmt.Errorf("cilium %s %s: %s", kind, path, response.Status)
+	}
+	var workload struct {
+		Metadata struct {
+			Generation int64 `json:"generation"`
+		} `json:"metadata"`
+		Status struct {
+			ObservedGeneration     int64 `json:"observedGeneration"`
+			ReadyReplicas          int32 `json:"readyReplicas"`
+			AvailableReplicas      int32 `json:"availableReplicas"`
+			DesiredNumberScheduled int32 `json:"desiredNumberScheduled"`
+			NumberReady            int32 `json:"numberReady"`
+		} `json:"status"`
+	}
+	err = json.NewDecoder(response.Body).Decode(&workload)
+	_ = response.Body.Close()
+	if err != nil {
+		return fmt.Errorf("decode Cilium %s %s: %w", kind, path, err)
+	}
+	if workload.Status.ObservedGeneration < workload.Metadata.Generation {
+		return fmt.Errorf("cilium %s %s has not observed its generation", kind, path)
+	}
+	if kind == "deployment" && (workload.Status.ReadyReplicas < 1 || workload.Status.AvailableReplicas < 1) {
+		return fmt.Errorf("cilium deployment %s is not Ready", path)
+	}
+	if kind == "daemonset" && (workload.Status.DesiredNumberScheduled < 1 || workload.Status.NumberReady < workload.Status.DesiredNumberScheduled) {
+		return fmt.Errorf("cilium daemonset %s is not Ready", path)
+	}
+	return nil
 }
 
 func ciliumProbe(item cluster.Cluster) string {
