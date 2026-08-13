@@ -961,7 +961,7 @@ func (s *Server) warmMirrorCache(raw json.RawMessage) (CacheWarmResult, error) {
 	if s.warmCache == nil {
 		return CacheWarmResult{}, errors.New("cache warm is not configured")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), cacheWarmTimeout)
+	ctx, cancel := s.lifecycleTimeoutContext(cacheWarmTimeout)
 	defer cancel()
 	return s.warmCache(ctx, args.Refs, s.imageArchitecture())
 }
@@ -982,7 +982,7 @@ func (s *Server) checkMirrorCache(raw json.RawMessage) (CacheCheckResult, error)
 	if s.checkCache == nil {
 		return CacheCheckResult{}, errors.New("cache check is not configured")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), cacheWarmTimeout)
+	ctx, cancel := s.lifecycleTimeoutContext(cacheWarmTimeout)
 	defer cancel()
 	return s.checkCache(ctx, args.Refs, s.imageArchitecture(), args.Deep)
 }

@@ -350,6 +350,14 @@ func (s *Server) dispatch(request Request) Response {
 	return success(data)
 }
 
+func (s *Server) lifecycleTimeoutContext(timeout time.Duration) (context.Context, context.CancelFunc) {
+	parent := s.lifecycleContext
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
 func (s *Server) dispatchProvisioning(request Request) Response {
 	var maintenance map[string]maintenanceObservation
 	if request.Op == "up" {

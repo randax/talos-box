@@ -70,6 +70,54 @@ func TestCacheWarmUsesBoundedContext(t *testing.T) {
 	}
 }
 
+func TestCacheWarmObservesLifecycleCancellation(t *testing.T) {
+	t.Parallel()
+
+	lifecycle, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	service := &Server{
+		hypervisor:       &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
+		lifecycleContext: lifecycle,
+		lifecycleCancel:  cancel,
+		warmCache: func(ctx context.Context, refs []string, architecture imagecache.Architecture) (CacheWarmResult, error) {
+			if got, want := architecture, imagecache.ArchitectureAMD64; got != want {
+				t.Fatalf("architecture = %q, want %q", got, want)
+			}
+			close(started)
+			<-ctx.Done()
+			return CacheWarmResult{}, ctx.Err()
+		},
+	}
+
+	response := make(chan Response, 1)
+	go func() {
+		response <- service.dispatch(Request{
+			Op:   "cache.warm",
+			Args: mustWarmArgs(t, CacheWarmArgs{Refs: []string{"docker.io/library/nginx:1.27.0"}}),
+		})
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("cache.warm did not start")
+	}
+
+	service.lifecycleCancel()
+
+	select {
+	case got := <-response:
+		if got.OK {
+			t.Fatal("cache.warm succeeded, want cancellation failure")
+		}
+		if !strings.Contains(got.Error, context.Canceled.Error()) {
+			t.Fatalf("cache.warm error = %q, want %q", got.Error, context.Canceled)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cache.warm did not return after lifecycle cancellation")
+	}
+}
+
 func mustWarmArgs(t *testing.T, value any) json.RawMessage {
 	t.Helper()
 	data, err := json.Marshal(value)

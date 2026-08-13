@@ -76,6 +76,54 @@ func TestCacheCheckUsesBoundedContextAndOptions(t *testing.T) {
 	}
 }
 
+func TestCacheCheckObservesLifecycleCancellation(t *testing.T) {
+	t.Parallel()
+
+	lifecycle, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	service := &Server{
+		hypervisor:       &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
+		lifecycleContext: lifecycle,
+		lifecycleCancel:  cancel,
+		checkCache: func(ctx context.Context, refs []string, architecture imagecache.Architecture, deep bool) (CacheCheckResult, error) {
+			if !deep {
+				t.Fatal("checkCache deep = false, want true")
+			}
+			close(started)
+			<-ctx.Done()
+			return CacheCheckResult{}, ctx.Err()
+		},
+	}
+
+	response := make(chan Response, 1)
+	go func() {
+		response <- service.dispatch(Request{
+			Op:   "cache.check",
+			Args: mustCheckArgs(t, CacheCheckArgs{Refs: []string{"docker.io/library/nginx:1.27.0"}, Deep: true}),
+		})
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("cache.check did not start")
+	}
+
+	service.lifecycleCancel()
+
+	select {
+	case got := <-response:
+		if got.OK {
+			t.Fatal("cache.check succeeded, want cancellation failure")
+		}
+		if !strings.Contains(got.Error, context.Canceled.Error()) {
+			t.Fatalf("cache.check error = %q, want %q", got.Error, context.Canceled)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cache.check did not return after lifecycle cancellation")
+	}
+}
+
 func mustCheckArgs(t *testing.T, value any) json.RawMessage {
 	t.Helper()
 	data, err := json.Marshal(value)
