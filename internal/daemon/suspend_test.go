@@ -56,6 +56,29 @@ func TestPrepareSavedMachineRetainsResourcesAfterStopping(t *testing.T) {
 	}
 }
 
+func TestSuspendInvalidatesStorageLiveObservation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	machine := &suspendMachineFake{}
+	service := &Server{
+		hypervisor:    &fakeHypervisor{capabilities: hypervisor.Capabilities{Suspend: hypervisor.FeatureStatus{Supported: true}}},
+		vms:           map[string]map[string]hypervisor.Machine{item.Name: {item.Nodes[0].Name: machine}},
+		storagePhases: map[string]StoragePhase{item.Name: StoragePhaseLive},
+	}
+	if _, err := service.suspendCluster([]byte(`{"name":"demo"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := service.storagePhases[item.Name]; ok {
+		t.Fatal("suspend retained stale storage-live observation")
+	}
+}
+
 func TestPrepareSavedMachineClosesAfterSaveFailure(t *testing.T) {
 	machine := &suspendMachineFake{suspendErr: errors.New("save failed")}
 

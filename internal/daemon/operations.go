@@ -416,6 +416,7 @@ func (s *Server) stopCluster(raw json.RawMessage) (ClusterSummary, error) {
 
 func (s *Server) stop(name string) error {
 	s.cancelProvisionLocked(name)
+	delete(s.storagePhases, name)
 	if item, err := cluster.Load(name); err == nil {
 		s.unbindMirrors(item.SubnetIndex)
 	} else {

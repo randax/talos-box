@@ -27,6 +27,7 @@ func (s *Server) suspendCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if !s.clusterRunning(item.Name) {
 		return ClusterSummary{}, fmt.Errorf("cluster %q is not running", item.Name)
 	}
+	delete(s.storagePhases, item.Name)
 	capability := s.hypervisor.Capabilities().Suspend
 	if !capability.Supported {
 		return ClusterSummary{}, fmt.Errorf("%w: %s", hypervisor.ErrUnsupported, capability.Reason)

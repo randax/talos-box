@@ -43,6 +43,7 @@ func TestStatusRemainsResponsiveDuringProvisioning(t *testing.T) {
 
 func TestStopCancelsActiveProvisioning(t *testing.T) {
 	service, item, task, started := blockedProvision(t)
+	service.storagePhases = map[string]StoragePhase{item.Name: StoragePhaseLive}
 	done := make(chan error, 1)
 	go func() {
 		done <- service.runProvisionTasks(&ClusterSummary{Name: item.Name}, []provisionTask{task})
@@ -60,6 +61,9 @@ func TestStopCancelsActiveProvisioning(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("stop did not cancel active provisioning")
+	}
+	if _, ok := service.storagePhases[item.Name]; ok {
+		t.Fatal("stop retained stale storage-live observation")
 	}
 }
 
