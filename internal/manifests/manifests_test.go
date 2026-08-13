@@ -248,6 +248,44 @@ func TestRegistryMirrorsUsesSingleCatchAllMirrorWithSkipFallback(t *testing.T) {
 	}
 }
 
+func TestTalosSectionIncludesStorageKubeletMounts(t *testing.T) {
+	out, err := Render(facts(), "talos")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	docs := decodeYAMLDocuments(t, out)
+	var kubeletPatch talosKubeletExtraMountsPatch
+	found := false
+	for _, doc := range docs {
+		machine, ok := doc["machine"].(map[string]any)
+		if !ok {
+			continue
+		}
+		kubelet, ok := machine["kubelet"].(map[string]any)
+		if !ok || kubelet["extraMounts"] == nil {
+			continue
+		}
+		decoded := decodeKnownFields[talosKubeletExtraMountsPatch](t, doc)
+		if len(decoded.Machine.Kubelet.ExtraMounts) == 0 {
+			continue
+		}
+		kubeletPatch = decoded
+		found = true
+		break
+	}
+	if !found {
+		t.Fatalf("talos section did not render a kubelet extraMounts patch:\n%s", out)
+	}
+
+	if got, want := kubeletPatch.Machine.Kubelet.ExtraMounts, []talosExtraMount{
+		{Destination: "/var/local-path-provisioner", Type: "bind", Source: "/var/local-path-provisioner", Options: []string{"bind", "rshared", "rw"}},
+		{Destination: "/var/lib/longhorn", Type: "bind", Source: "/var/lib/longhorn", Options: []string{"bind", "rshared", "rw"}},
+	}; !equalTalosExtraMounts(got, want) {
+		t.Fatalf("kubelet extraMounts = %#v, want %#v", got, want)
+	}
+}
+
 func decodeYAMLDocuments(t *testing.T, rendered string) []map[string]any {
 	t.Helper()
 	decoder := yaml.NewDecoder(strings.NewReader(rendered))
@@ -380,6 +418,33 @@ type ciliumBGPAdvertisement struct {
 			Selector ciliumLabelSelector `yaml:"selector"`
 		} `yaml:"advertisements"`
 	} `yaml:"spec"`
+}
+
+type talosExtraMount struct {
+	Destination string   `yaml:"destination"`
+	Type        string   `yaml:"type"`
+	Source      string   `yaml:"source"`
+	Options     []string `yaml:"options"`
+}
+
+type talosKubeletExtraMountsPatch struct {
+	Machine struct {
+		Kubelet struct {
+			ExtraMounts []talosExtraMount `yaml:"extraMounts"`
+		} `yaml:"kubelet"`
+	} `yaml:"machine"`
+}
+
+func equalTalosExtraMounts(got, want []talosExtraMount) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for index := range got {
+		if got[index].Destination != want[index].Destination || got[index].Type != want[index].Type || got[index].Source != want[index].Source || strings.Join(got[index].Options, ",") != strings.Join(want[index].Options, ",") {
+			return false
+		}
+	}
+	return true
 }
 
 func TestSubnetValuesFlowThrough(t *testing.T) {

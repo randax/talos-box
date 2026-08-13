@@ -96,6 +96,9 @@ func Hints(status ClusterStatus) []string {
 	if len(status.Nodes) > 0 && len(stopped) == len(status.Nodes) {
 		return []string{fmt.Sprintf("cluster is stopped — start it with: tbx cluster start %s", status.Name)}
 	}
+	if hint := storageHint(status); hint != "" {
+		hints = append(hints, hint)
+	}
 	if len(maintenance) > 0 {
 		first := maintenance[0]
 		endpoint := status.controlPlaneOr(first)
@@ -110,20 +113,26 @@ func Hints(status ClusterStatus) []string {
 		cp := status.controlPlaneOr(status.Nodes[0])
 		if status.CNI == cluster.CNIFlannel && status.LB && status.KubernetesReady {
 			if status.VIPLive {
-				return []string{fmt.Sprintf("Kubernetes is Ready; MetalLB L2 VIP is live at http://%s/. Flannel does not enforce NetworkPolicies; use cilium to exercise policies.", status.VIP)}
+				hints = append(hints,
+					fmt.Sprintf("Kubernetes is Ready; MetalLB L2 VIP is live at http://%s/. Flannel does not enforce NetworkPolicies; use cilium to exercise policies.", status.VIP),
+				)
+			} else {
+				hints = append(hints,
+					"Kubernetes is Ready; waiting for the MetalLB L2 LoadBalancer VIP probe to respond. Flannel does not enforce NetworkPolicies; use cilium to exercise policies.",
+				)
 			}
-			return []string{"Kubernetes is Ready; waiting for the MetalLB L2 LoadBalancer VIP probe to respond. Flannel does not enforce NetworkPolicies; use cilium to exercise policies."}
 		}
 		if status.CNI == cluster.CNIFlannel && !status.LB && status.KubernetesReady {
 			hints = append(hints,
 				fmt.Sprintf("Kubernetes is Ready with Talos-managed flannel; LoadBalancer support is disabled by lb: false, so no VIP is provisioned. export TALOSCONFIG=~/.talosbox/clusters/%s/talosconfig; export KUBECONFIG=~/.talosbox/clusters/%s/kubeconfig", status.Name, status.Name),
 			)
-			return hints
 		}
-		hints = append(hints,
-			fmt.Sprintf("all nodes configured. If etcd is not yet bootstrapped: talosctl --nodes %s bootstrap, then talosctl kubeconfig .", cp.IP),
-			fmt.Sprintf("node TUI (the Talos dashboard): talosctl dashboard --nodes %s", cp.IP),
-		)
+		if !status.KubernetesReady {
+			hints = append(hints,
+				fmt.Sprintf("all nodes configured. If etcd is not yet bootstrapped: talosctl --nodes %s bootstrap, then talosctl kubeconfig .", cp.IP),
+				fmt.Sprintf("node TUI (the Talos dashboard): talosctl dashboard --nodes %s", cp.IP),
+			)
+		}
 	}
 	if len(unreachable) > 0 {
 		hints = append(hints,
@@ -131,6 +140,23 @@ func Hints(status ClusterStatus) []string {
 		)
 	}
 	return hints
+}
+
+func storageHint(status ClusterStatus) string {
+	if status.CSI == "" {
+		return ""
+	}
+	switch status.StoragePhase {
+	case StoragePhaseProvisioning:
+		if status.StorageError != "" {
+			return fmt.Sprintf("storage provisioning: CSI readiness probe failed: %s; retrying after backoff.", status.StorageError)
+		}
+		return "storage provisioning: waiting for the CSI readiness probe to pass."
+	case StoragePhaseLive:
+		return "storage live: the CSI readiness probe passed."
+	default:
+		return ""
+	}
 }
 
 // controlPlaneOr returns the cluster's first control-plane node, or fallback.

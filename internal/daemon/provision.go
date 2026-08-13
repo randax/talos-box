@@ -13,6 +13,8 @@ import (
 
 const flannelProvisionTimeout = 10 * time.Minute
 
+const storageProbeRetryBackoff = time.Minute
+
 type provisionReconcileFunc func(context.Context, provision.Request) (provision.Result, error)
 
 type provisionTask struct {
@@ -88,6 +90,13 @@ func (s *Server) beginProvisionTasksLocked(items []cluster.Cluster) []provisionT
 		if s.provisions == nil {
 			s.provisions = make(map[string]activeProvision)
 		}
+		if item.CSI == cluster.CSILocalPath {
+			if s.storagePhases == nil {
+				s.storagePhases = make(map[string]StoragePhase)
+			}
+			s.storagePhases[item.Name] = StoragePhaseProvisioning
+			delete(s.storageProbeFailures, item.Name)
+		}
 		if active, ok := s.provisions[item.Name]; ok {
 			active.cancel()
 		}
@@ -130,7 +139,12 @@ func (s *Server) cancelAllProvisionsLocked() {
 
 func (s *Server) runProvisionTasks(data any, tasks []provisionTask) error {
 	for i, task := range tasks {
-		narration, err := s.provisionFlannel(task.ctx, task.item)
+		narration, phase, err := s.provisionFlannel(task.ctx, task.item)
+		if task.item.CSI != "" {
+			s.opMu.Lock()
+			s.recordStoragePhaseLocked(task.item.Name, phase)
+			s.opMu.Unlock()
+		}
 		s.finishProvision(task)
 		if err != nil {
 			s.opMu.Lock()
@@ -152,13 +166,13 @@ func (s *Server) runProvisionTasks(data any, tasks []provisionTask) error {
 	return nil
 }
 
-func (s *Server) provisionFlannel(parent context.Context, item cluster.Cluster) ([]string, error) {
+func (s *Server) provisionFlannel(parent context.Context, item cluster.Cluster) ([]string, StoragePhase, error) {
 	if item.CNI != cluster.CNIFlannel {
-		return nil, nil
+		return nil, "", nil
 	}
 	dir, err := cluster.Dir(item.Name)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	ctx, cancel := context.WithTimeout(parent, flannelProvisionTimeout)
 	defer cancel()
@@ -166,7 +180,7 @@ func (s *Server) provisionFlannel(parent context.Context, item cluster.Cluster) 
 	if reconcile == nil {
 		reconcile = provision.Reconcile
 	}
-	result, err := reconcile(ctx, provision.Request{
+	request := provision.Request{
 		Cluster: item,
 		Client:  provision.MachineryClient{TalosconfigPath: filepath.Join(dir, "talosconfig")},
 		LoadBalancer: provision.MetalLBReconciler{
@@ -176,11 +190,15 @@ func (s *Server) provisionFlannel(parent context.Context, item cluster.Cluster) 
 			return s.observeProvisionNodes(item), nil
 		},
 		PollInterval: time.Second,
-	})
-	if err != nil {
-		return nil, err
 	}
-	return result.Narration, nil
+	if item.CSI == cluster.CSILocalPath {
+		request.Storage = provision.LocalPathReconciler{PollInterval: time.Second}
+	}
+	result, err := reconcile(ctx, request)
+	if err != nil {
+		return nil, "", err
+	}
+	return result.Narration, storagePhaseFromProvisionResult(result), nil
 }
 
 func (s *Server) observeProvisionNodes(item cluster.Cluster) []provision.Node {
@@ -233,4 +251,135 @@ func loadBalancerVIP(item cluster.Cluster) (string, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	return provision.LiveVIP(ctx, item, kubeconfig)
+}
+
+func (s *Server) refreshStoragePhases(statuses []ClusterStatus) {
+	s.opMu.Lock()
+	known := make(map[string]StoragePhase, len(s.storagePhases))
+	for name, phase := range s.storagePhases {
+		known[name] = phase
+	}
+	active := make(map[string]bool, len(s.provisions))
+	for name := range s.provisions {
+		active[name] = true
+	}
+	failures := make(map[string]storageProbeFailure, len(s.storageProbeFailures))
+	for name, failure := range s.storageProbeFailures {
+		failures[name] = failure
+	}
+	s.opMu.Unlock()
+
+	for index := range statuses {
+		status := &statuses[index]
+		status.StoragePhase = ""
+		status.StorageError = ""
+		switch {
+		case status.CNI != cluster.CNIFlannel, status.CSI != cluster.CSILocalPath, !status.Running:
+		case known[status.Name] == StoragePhaseLive:
+			status.StoragePhase = StoragePhaseLive
+		case active[status.Name], !status.KubernetesReady:
+			status.StoragePhase = StoragePhaseProvisioning
+		default:
+			status.StoragePhase = StoragePhaseProvisioning
+			if failure, ok := failures[status.Name]; ok && time.Since(failure.at) < storageProbeRetryBackoff {
+				status.StorageError = failure.message
+			} else {
+				s.beginStorageStatusProbe(status.Name)
+			}
+		}
+		status.Hints = Hints(*status)
+	}
+}
+
+func (s *Server) beginStorageStatusProbe(name string) {
+	s.opMu.Lock()
+	failure, failed := s.storageProbeFailures[name]
+	backingOff := failed && time.Since(failure.at) < storageProbeRetryBackoff
+	if !s.clusterRunning(name) || backingOff || s.storagePhases[name] == StoragePhaseLive || s.storageStatusProbes[name].cancel != nil {
+		s.opMu.Unlock()
+		return
+	}
+	if s.storageStatusProbes == nil {
+		s.storageStatusProbes = make(map[string]activeStorageProbe)
+	}
+	parent := s.lifecycleContext
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	s.storageProbeSequence++
+	generation := s.storageProbeSequence
+	s.storageStatusProbes[name] = activeStorageProbe{generation: generation, cancel: cancel}
+	s.opMu.Unlock()
+	go s.runStorageStatusProbe(ctx, name, generation)
+}
+
+func (s *Server) runStorageStatusProbe(ctx context.Context, name string, generation uint64) {
+	err := s.probeStorageStatus(ctx, name)
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	active, ok := s.storageStatusProbes[name]
+	if !ok || active.generation != generation {
+		return
+	}
+	active.cancel()
+	delete(s.storageStatusProbes, name)
+	if err == nil && s.clusterRunning(name) {
+		delete(s.storageProbeFailures, name)
+		s.recordStoragePhaseLocked(name, StoragePhaseLive)
+	} else if err != nil && s.clusterRunning(name) {
+		if s.storageProbeFailures == nil {
+			s.storageProbeFailures = make(map[string]storageProbeFailure)
+		}
+		s.storageProbeFailures[name] = storageProbeFailure{message: err.Error(), at: time.Now()}
+	}
+}
+
+func (s *Server) probeStorageStatus(parent context.Context, name string) error {
+	dir, err := cluster.Dir(name)
+	if err != nil {
+		return err
+	}
+	kubeconfig, err := os.ReadFile(filepath.Join(dir, "kubeconfig"))
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
+	defer cancel()
+	probe := s.storageProbe
+	if probe == nil {
+		probe = func(ctx context.Context, kubeconfig []byte) error {
+			return provision.ProbeLocalPathStorage(ctx, kubeconfig, time.Second)
+		}
+	}
+	return probe(ctx, kubeconfig)
+}
+
+func (s *Server) invalidateStoragePhaseLocked(name string) {
+	delete(s.storagePhases, name)
+	delete(s.storageProbeFailures, name)
+	if active, ok := s.storageStatusProbes[name]; ok {
+		active.cancel()
+		delete(s.storageStatusProbes, name)
+	}
+}
+
+func (s *Server) recordStoragePhaseLocked(name string, phase StoragePhase) {
+	if s.storagePhases == nil {
+		s.storagePhases = make(map[string]StoragePhase)
+	}
+	if phase == "" {
+		phase = StoragePhaseProvisioning
+	}
+	s.storagePhases[name] = phase
+}
+
+func storagePhaseFromProvisionResult(result provision.Result) StoragePhase {
+	if result.StorageLive || result.StoragePhase == provision.StoragePhaseLive {
+		return StoragePhaseLive
+	}
+	if result.StoragePhase == provision.StoragePhaseProvisioning {
+		return StoragePhaseProvisioning
+	}
+	return ""
 }

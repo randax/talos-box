@@ -74,3 +74,70 @@ func TestPrintStatusQuietSuppressesFlannelLiveVIPHint(t *testing.T) {
 		}
 	}
 }
+
+func TestPrintStatusRendersStorageProvisioningAlongsideNetworkingHints(t *testing.T) {
+	t.Parallel()
+
+	status := daemon.ClusterStatus{
+		Name:               "demo",
+		Subnet:             "172.30.4.0/24",
+		Domain:             "demo.k8s.test",
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILocalPath},
+		KubernetesReady:    true,
+		StoragePhase:       daemon.StoragePhaseProvisioning,
+		Nodes: []daemon.NodeStatus{{
+			Name:  "demo-cp-1",
+			Role:  cluster.RoleControlPlane,
+			MAC:   "52:54:00:00:00:01",
+			IP:    "172.30.4.2",
+			Phase: daemon.PhaseConfigured,
+		}},
+	}
+	status.Hints = daemon.Hints(status)
+
+	var output bytes.Buffer
+	if err := printStatus(&output, []daemon.ClusterStatus{status}, false); err != nil {
+		t.Fatal(err)
+	}
+	rendered := output.String()
+	for _, wanted := range []string{
+		"storage provisioning",
+		"waiting for the CSI readiness probe to pass",
+		"Kubernetes is Ready with Talos-managed flannel",
+		"hint [demo]:",
+	} {
+		if !strings.Contains(rendered, wanted) {
+			t.Fatalf("status output missing %q:\n%s", wanted, rendered)
+		}
+	}
+}
+
+func TestPrintStatusRendersStorageLiveHint(t *testing.T) {
+	t.Parallel()
+
+	status := daemon.ClusterStatus{
+		Name:               "demo",
+		Subnet:             "172.30.4.0/24",
+		Domain:             "demo.k8s.test",
+		ProvisioningIntent: cluster.ProvisioningIntent{CSI: cluster.CSILocalPath},
+		StoragePhase:       daemon.StoragePhaseLive,
+		Nodes: []daemon.NodeStatus{{
+			Name:  "demo-cp-1",
+			Role:  cluster.RoleControlPlane,
+			MAC:   "52:54:00:00:00:01",
+			Phase: daemon.PhaseConfigured,
+		}},
+	}
+	status.Hints = daemon.Hints(status)
+
+	var output bytes.Buffer
+	if err := printStatus(&output, []daemon.ClusterStatus{status}, false); err != nil {
+		t.Fatal(err)
+	}
+	rendered := output.String()
+	for _, wanted := range []string{"storage live", "CSI readiness probe passed", "hint [demo]:"} {
+		if !strings.Contains(rendered, wanted) {
+			t.Fatalf("status output missing %q:\n%s", wanted, rendered)
+		}
+	}
+}

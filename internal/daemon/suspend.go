@@ -31,6 +31,8 @@ func (s *Server) suspendCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if !capability.Supported {
 		return ClusterSummary{}, fmt.Errorf("%w: %s", hypervisor.ErrUnsupported, capability.Reason)
 	}
+	s.cancelProvisionLocked(item.Name)
+	s.invalidateStoragePhaseLocked(item.Name)
 	dir, err := cluster.Dir(item.Name)
 	if err != nil {
 		return ClusterSummary{}, err

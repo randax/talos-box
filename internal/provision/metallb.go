@@ -513,6 +513,10 @@ func poll(ctx context.Context, interval time.Duration, check func(context.Contex
 		if err := check(ctx); err == nil {
 			return nil
 		} else {
+			var terminal terminalError
+			if errors.As(err, &terminal) {
+				return terminal.err
+			}
 			lastErr = err
 		}
 		if err := wait(ctx, interval); err != nil {
@@ -522,4 +526,17 @@ func poll(ctx context.Context, interval time.Duration, check func(context.Contex
 			return errors.Join(err, lastErr)
 		}
 	}
+}
+
+type terminalError struct{ err error }
+
+func (err terminalError) Error() string { return err.err.Error() }
+
+func (err terminalError) Unwrap() error { return err.err }
+
+func terminal(err error) error {
+	if err == nil {
+		return nil
+	}
+	return terminalError{err: err}
 }

@@ -27,19 +27,24 @@ type Server struct {
 	cache      *imagecache.Cache
 	hypervisor hypervisor.Hypervisor
 
-	opMu               sync.Mutex
-	vms                map[string]map[string]hypervisor.Machine
-	provisions         map[string]activeProvision
-	provisionSequence  uint64
-	provisionReconcile provisionReconcileFunc
-	nodeIPLookup       func(string, int) string
-	nodeProbe          func(string) ProbeResult
-	lifecycleContext   context.Context
-	lifecycleCancel    context.CancelFunc
-	mirrors            *mirror.Manager
-	defaultSchematic   string
-	subnetSources      cluster.SubnetSources
-	hostPressure       func(string) (hostpressure.Snapshot, error)
+	opMu                 sync.Mutex
+	vms                  map[string]map[string]hypervisor.Machine
+	provisions           map[string]activeProvision
+	storagePhases        map[string]StoragePhase
+	storageStatusProbes  map[string]activeStorageProbe
+	storageProbeFailures map[string]storageProbeFailure
+	storageProbeSequence uint64
+	provisionSequence    uint64
+	provisionReconcile   provisionReconcileFunc
+	storageProbe         func(context.Context, []byte) error
+	nodeIPLookup         func(string, int) string
+	nodeProbe            func(string) ProbeResult
+	lifecycleContext     context.Context
+	lifecycleCancel      context.CancelFunc
+	mirrors              *mirror.Manager
+	defaultSchematic     string
+	subnetSources        cluster.SubnetSources
+	hostPressure         func(string) (hostpressure.Snapshot, error)
 
 	listenerMu   sync.Mutex
 	listener     net.Listener
@@ -51,6 +56,16 @@ type Server struct {
 type activeProvision struct {
 	generation uint64
 	cancel     context.CancelFunc
+}
+
+type activeStorageProbe struct {
+	generation uint64
+	cancel     context.CancelFunc
+}
+
+type storageProbeFailure struct {
+	message string
+	at      time.Time
 }
 
 type lockedListener struct {
@@ -85,15 +100,18 @@ func NewServer(ctx context.Context) (*Server, error) {
 	}
 	lifecycleContext, lifecycleCancel := context.WithCancel(ctx)
 	return &Server{
-		cache:            cache,
-		hypervisor:       backend,
-		vms:              make(map[string]map[string]hypervisor.Machine),
-		provisions:       make(map[string]activeProvision),
-		lifecycleContext: lifecycleContext,
-		lifecycleCancel:  lifecycleCancel,
-		mirrors:          mirror.NewManager(mirror.DefaultDir(root)),
-		subnetSources:    cluster.SystemSubnetSources(),
-		hostPressure:     hostpressure.SystemSnapshot,
+		cache:                cache,
+		hypervisor:           backend,
+		vms:                  make(map[string]map[string]hypervisor.Machine),
+		provisions:           make(map[string]activeProvision),
+		storagePhases:        make(map[string]StoragePhase),
+		storageStatusProbes:  make(map[string]activeStorageProbe),
+		storageProbeFailures: make(map[string]storageProbeFailure),
+		lifecycleContext:     lifecycleContext,
+		lifecycleCancel:      lifecycleCancel,
+		mirrors:              mirror.NewManager(mirror.DefaultDir(root)),
+		subnetSources:        cluster.SystemSubnetSources(),
+		hostPressure:         hostpressure.SystemSnapshot,
 	}, nil
 }
 
@@ -290,6 +308,7 @@ func (s *Server) dispatchStatus(request Request) Response {
 	}
 	s.refreshNodeStatuses(statuses)
 	refreshKubernetesReadiness(statuses)
+	s.refreshStoragePhases(statuses)
 	return success(statuses)
 }
 

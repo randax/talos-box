@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/manifests"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
 	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
@@ -40,6 +41,16 @@ type Phase string
 const (
 	PhaseMaintenance Phase = "maintenance"
 	PhaseConfigured  Phase = "configured"
+)
+
+// StoragePhase is the durable storage readiness projection the daemon can map
+// into user-visible cluster status.
+type StoragePhase string
+
+const (
+	StoragePhaseNone         StoragePhase = ""
+	StoragePhaseProvisioning StoragePhase = "storage-provisioning"
+	StoragePhaseLive         StoragePhase = "storage-live"
 )
 
 // Node is the provisioning-relevant projection of an observed cluster node.
@@ -66,12 +77,19 @@ type LoadBalancerReconciler interface {
 	Reconcile(context.Context, cluster.Cluster, []byte) (LoadBalancerResult, error)
 }
 
+// StorageReconciler installs and verifies the requested storage implementation
+// after Talos has produced a ready Kubernetes API.
+type StorageReconciler interface {
+	Reconcile(context.Context, cluster.Cluster, []byte) (StorageResult, error)
+}
+
 // Request supplies all transient state required for one reconciliation.
 type Request struct {
 	Cluster      cluster.Cluster
 	Observe      func(context.Context) ([]Node, error)
 	Client       TalosClient
 	LoadBalancer LoadBalancerReconciler
+	Storage      StorageReconciler
 	PollInterval time.Duration
 }
 
@@ -81,6 +99,8 @@ type Result struct {
 	KubeconfigPath  string
 	Narration       []string
 	VIP             string
+	StoragePhase    StoragePhase
+	StorageLive     bool
 }
 
 type generated struct {
@@ -200,6 +220,18 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 			result.VIP = loadBalancer.VIP
 			result.Narration = append(result.Narration, loadBalancer.Narration...)
 		}
+		if request.Cluster.CSI == cluster.CSILocalPath {
+			if request.Storage == nil {
+				return Result{}, errors.New("flannel storage provisioning requires a Kubernetes reconciler")
+			}
+			storage, err := request.Storage.Reconcile(ctx, request.Cluster, kubeconfig)
+			if err != nil {
+				return Result{}, fmt.Errorf("reconcile flannel storage: %w", err)
+			}
+			result.StoragePhase = storage.Phase
+			result.StorageLive = storage.Live
+			result.Narration = append(result.Narration, storage.Narration...)
+		}
 		return result, nil
 	}
 }
@@ -254,6 +286,12 @@ func generateFlannel(item cluster.Cluster) (generated, error) {
 		if err != nil {
 			return generated{}, fmt.Errorf("encode %s config: %w", role, err)
 		}
+		bytes, err = applyProvisioningPrerequisites(bytes, manifests.Facts{
+			Cluster: item.Name, SubnetIndex: item.SubnetIndex, BGP: item.BGP,
+		})
+		if err != nil {
+			return generated{}, fmt.Errorf("patch %s config: %w", role, err)
+		}
 		configs[role] = bytes
 	}
 	talosconfig, err := input.Talosconfig()
@@ -261,6 +299,53 @@ func generateFlannel(item cluster.Cluster) (generated, error) {
 		return generated{}, fmt.Errorf("generate talosconfig: %w", err)
 	}
 	return generated{talosconfig: talosconfig, configs: configs, paths: paths}, nil
+}
+
+func applyProvisioningPrerequisites(config []byte, facts manifests.Facts) ([]byte, error) {
+	var document map[string]any
+	if err := yaml.Unmarshal(config, &document); err != nil {
+		return nil, fmt.Errorf("decode generated machine config: %w", err)
+	}
+	machineSection, ok := document["machine"].(map[string]any)
+	if !ok {
+		return nil, errors.New("generated machine config is missing machine settings")
+	}
+	kubeletSection, ok := machineSection["kubelet"].(map[string]any)
+	if !ok {
+		kubeletSection = map[string]any{}
+		machineSection["kubelet"] = kubeletSection
+	}
+
+	mounts := make([]map[string]any, 0, len(manifests.StoragePrerequisiteKubeletExtraMounts()))
+	for _, mount := range manifests.StoragePrerequisiteKubeletExtraMounts() {
+		mounts = append(mounts, map[string]any{
+			"destination": mount.Destination,
+			"type":        mount.Type,
+			"source":      mount.Source,
+			"options":     append([]string(nil), mount.Options...),
+		})
+	}
+	kubeletSection["extraMounts"] = mounts
+
+	var mirrorPatch map[string]any
+	if err := yaml.Unmarshal([]byte(manifests.RegistryMirrors(facts)), &mirrorPatch); err != nil {
+		return nil, fmt.Errorf("decode registry mirror patch: %w", err)
+	}
+	patchMachine, ok := mirrorPatch["machine"].(map[string]any)
+	if !ok {
+		return nil, errors.New("registry mirror patch is missing machine settings")
+	}
+	registries, ok := patchMachine["registries"].(map[string]any)
+	if !ok {
+		return nil, errors.New("registry mirror patch is missing registries settings")
+	}
+	machineSection["registries"] = registries
+
+	patched, err := yaml.Marshal(document)
+	if err != nil {
+		return nil, fmt.Errorf("encode generated machine config: %w", err)
+	}
+	return patched, nil
 }
 
 func loadOrCreateSecrets(path string, contract *machineryconfig.VersionContract) (*secrets.Bundle, error) {
