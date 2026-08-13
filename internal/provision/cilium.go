@@ -14,6 +14,7 @@ import (
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/manifests"
+	"github.com/randax/talos-box/internal/shellquote"
 	"helm.sh/helm/v3/pkg/chart/loader"
 	"helm.sh/helm/v3/pkg/chartutil"
 	"helm.sh/helm/v3/pkg/engine"
@@ -377,14 +378,15 @@ func announcementOwnedByTalosbox(object *unstructured.Unstructured) bool {
 }
 
 func ciliumNarration(item cluster.Cluster, loadBalancer bool) []string {
+	name := shellquote.Quote(item.Name)
 	narration := []string{
-		"≈ helm template cilium cilium/cilium --version " + ciliumChartVersion + " -n " + ciliumNamespace + " | kubectl apply --server-side -f -",
+		"Cilium chart: ≈ tbx manifests " + name + " objects | kubectl apply --server-side -f -",
 	}
 	if loadBalancer {
-		narration = append(narration, "≈ kubectl apply --server-side -f - # Cilium LB-IPAM/L2 pool and VIP probe")
+		narration = append(narration, "Cilium LoadBalancer extras: ≈ tbx manifests "+name+" extras | kubectl apply --server-side -f -")
 	}
 	if item.Hubble {
-		narration = append(narration, "≈ kubectl port-forward -n "+ciliumNamespace+" service/hubble-ui 12000:80 # Hubble UI at http://localhost:12000")
+		narration = append(narration, "Hubble UI: ≈ kubectl port-forward -n "+ciliumNamespace+" service/hubble-ui 12000:80 # http://localhost:12000")
 	}
 	return narration
 }

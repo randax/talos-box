@@ -128,6 +128,9 @@ ingressController:
   enabled: false
 hubble:
   enabled: %t
+  tls:
+    auto:
+      method: cronJob
   relay:
     enabled: %t
   ui:

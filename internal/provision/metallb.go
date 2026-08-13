@@ -14,6 +14,7 @@ import (
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/manifests"
+	"github.com/randax/talos-box/internal/shellquote"
 	"helm.sh/helm/v3/pkg/chart/loader"
 	"helm.sh/helm/v3/pkg/chartutil"
 	"helm.sh/helm/v3/pkg/engine"
@@ -157,10 +158,15 @@ func (r MetalLBReconciler) reconcile(ctx context.Context, item cluster.Cluster, 
 	if err != nil {
 		return LoadBalancerResult{}, err
 	}
-	return LoadBalancerResult{VIP: vip, Narration: []string{
-		"≈ helm template metallb metallb/metallb --version " + metalLBChartVersion + " -n " + metalLBNamespace + " | kubectl apply --server-side -f -",
-		"≈ kubectl apply --server-side -f - # MetalLB L2 pool and VIP probe",
-	}}, nil
+	return LoadBalancerResult{VIP: vip, Narration: metalLBNarration(item)}, nil
+}
+
+func metalLBNarration(item cluster.Cluster) []string {
+	name := shellquote.Quote(item.Name)
+	return []string{
+		"MetalLB chart: ≈ tbx manifests " + name + " objects | kubectl apply --server-side -f -",
+		"MetalLB LoadBalancer extras: ≈ tbx manifests " + name + " extras | kubectl apply --server-side -f -",
+	}
 }
 
 func renderMetalLB(item cluster.Cluster) ([]unstructured.Unstructured, error) {
