@@ -77,30 +77,7 @@ func (c cli) runCluster(args []string) error {
 	case "create":
 		return c.createCluster(args[1:])
 	case "start":
-		name, force, err := parseClusterStartArgs(args[1:], c.err)
-		if err != nil {
-			return err
-		}
-		request := struct {
-			Name  string `json:"name"`
-			Force bool   `json:"force"`
-		}{Name: name, Force: force}
-		var result daemon.ClusterSummary
-		if err := c.call("cluster.start", request, &result); err != nil {
-			return err
-		}
-		if _, err := fmt.Fprintf(c.out, "started cluster %s\n", result.Name); err != nil {
-			return err
-		}
-		if err := printWarning(c.err, result.Warning); err != nil {
-			return err
-		}
-		for _, line := range result.Narration {
-			if _, err := fmt.Fprintln(c.out, line); err != nil {
-				return err
-			}
-		}
-		return nil
+		return c.startCluster(args[1:])
 	case "stop", "suspend", "resume":
 		if len(args) != 2 {
 			return fmt.Errorf("usage: tbx cluster %s <name>", args[0])
@@ -140,17 +117,53 @@ func (c cli) runCluster(args []string) error {
 }
 
 func parseClusterStartArgs(args []string, output io.Writer) (string, bool, error) {
+	name, force, _, err := parseClusterStartOptions(args, output)
+	return name, force, err
+}
+
+func parseClusterStartOptions(args []string, output io.Writer) (string, bool, bool, error) {
 	flags := flag.NewFlagSet("cluster start", flag.ContinueOnError)
 	flags.SetOutput(output)
 	force := flags.Bool("force", false, "proceed despite an overcommit or host-pressure warning")
+	quiet := flags.Bool("quiet", false, "suppress provisioning narration")
 	positionals, err := parseInterspersed(flags, args)
 	if err != nil {
-		return "", false, err
+		return "", false, false, err
 	}
 	if len(positionals) != 1 {
-		return "", false, errors.New("usage: tbx cluster start <name> [--force]")
+		return "", false, false, errors.New("usage: tbx cluster start <name> [--force] [--quiet]")
 	}
-	return positionals[0], *force, nil
+	return positionals[0], *force, *quiet, nil
+}
+
+func (c cli) startCluster(args []string) error {
+	name, force, quiet, err := parseClusterStartOptions(args, c.err)
+	if err != nil {
+		return err
+	}
+	request := struct {
+		Name  string `json:"name"`
+		Force bool   `json:"force"`
+	}{Name: name, Force: force}
+	var result daemon.ClusterSummary
+	if err := c.call("cluster.start", request, &result); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(c.out, "started cluster %s\n", result.Name); err != nil {
+		return err
+	}
+	if err := printWarning(c.err, result.Warning); err != nil {
+		return err
+	}
+	if quiet {
+		return nil
+	}
+	for _, line := range result.Narration {
+		if _, err := fmt.Fprintln(c.out, line); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c cli) createCluster(args []string) error {
@@ -170,6 +183,7 @@ func (c cli) createCluster(args []string) error {
 	lb := flags.Bool("lb", true, "install LoadBalancer support with the CNI")
 	bgp := flags.Bool("bgp", false, "enable Cilium BGP LoadBalancer announcements")
 	hubble := flags.Bool("hubble", false, "enable Cilium Hubble Relay and UI")
+	quiet := flags.Bool("quiet", false, "suppress provisioning narration")
 	force := flags.Bool("force", false, "proceed despite an overcommit or host-pressure warning")
 	positionals, err := parseInterspersed(flags, args)
 	if err != nil {
@@ -230,9 +244,11 @@ func (c cli) createCluster(args []string) error {
 	if err := printWarning(c.err, result.Warning); err != nil {
 		return err
 	}
-	for _, line := range result.Narration {
-		if _, err := fmt.Fprintln(c.out, line); err != nil {
-			return err
+	if !*quiet {
+		for _, line := range result.Narration {
+			if _, err := fmt.Fprintln(c.out, line); err != nil {
+				return err
+			}
 		}
 	}
 	stanza := config.Marshal(config.Config{

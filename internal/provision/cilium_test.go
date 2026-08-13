@@ -124,7 +124,7 @@ func TestCiliumReconcileReassertsHostBGPAfterApplyingCilium(t *testing.T) {
 	order := []string{}
 	client := &fakeClient{kubeData: []byte("kubeconfig")}
 	client.readyHook = func() { order = append(order, "ready") }
-	_, err = Reconcile(context.Background(), Request{
+	result, err := Reconcile(context.Background(), Request{
 		Cluster:      item,
 		Client:       client,
 		PollInterval: 0,
@@ -140,6 +140,9 @@ func TestCiliumReconcileReassertsHostBGPAfterApplyingCilium(t *testing.T) {
 	if got, want := strings.Join(order, ","), "bgp,cilium,ready"; got != want {
 		t.Fatalf("Cilium/BGP reconcile order = %s, want %s", got, want)
 	}
+	if narration := strings.Join(result.Narration, "\n"); !strings.Contains(narration, "host BGP: ≈ tbx bgp enable demo") {
+		t.Fatalf("Cilium/BGP narration missing host stage: %s", narration)
+	}
 }
 
 func TestCiliumL2ReconcileDisablesHostBGPEveryRunAfterApplyingL2(t *testing.T) {
@@ -153,7 +156,7 @@ func TestCiliumL2ReconcileDisablesHostBGPEveryRunAfterApplyingL2(t *testing.T) {
 	order := []string{}
 	client := &fakeClient{kubeData: []byte("kubeconfig")}
 	client.readyHook = func() { order = append(order, "ready") }
-	_, err = Reconcile(context.Background(), Request{
+	result, err := Reconcile(context.Background(), Request{
 		Cluster:      item,
 		Client:       client,
 		PollInterval: 0,
@@ -168,6 +171,9 @@ func TestCiliumL2ReconcileDisablesHostBGPEveryRunAfterApplyingL2(t *testing.T) {
 	}
 	if got, want := strings.Join(order, ","), "cilium,disable-bgp,ready"; got != want {
 		t.Fatalf("Cilium/L2 reconcile order = %s, want %s", got, want)
+	}
+	if narration := strings.Join(result.Narration, "\n"); !strings.Contains(narration, "host BGP: ≈ tbx bgp disable demo") {
+		t.Fatalf("Cilium/L2 narration missing host stage: %s", narration)
 	}
 }
 
@@ -457,7 +463,7 @@ func TestCiliumValuesHaveNoIngressOrHubble(t *testing.T) {
 		"k8sServicePort: 7445",
 		"hostLegacyRouting: true",
 		"enabled: false",
-		"hubble:\n  enabled: false\n  relay:\n    enabled: false\n  ui:\n    enabled: false",
+		"hubble:\n  enabled: false\n  tls:\n    auto:\n      method: cronJob\n  relay:\n    enabled: false\n  ui:\n    enabled: false",
 		"qps: 10",
 		"burst: 20",
 	} {

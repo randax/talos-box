@@ -34,7 +34,7 @@ bin/tbx doctor
 bin/tbx cluster create demo --cp 1 --workers 2
 ```
 
-This downloads the Talos image on first run (cached under `~/.talosbox/cache/`), then creates and starts the VMs. Nodes boot **unconfigured** into Talos maintenance mode — generating and applying machine config with `talosctl` is deliberately left to you; talosbox only provides the substrate (VMs, networking, DNS, image delivery).
+This downloads the Talos image on first run (cached under `~/.talosbox/cache/`), then creates and starts the VMs. Nodes boot **unconfigured** into Talos maintenance mode when you choose the substrate-only path; if you request the curated Cilium path (`--cni cilium` or `talosbox.yaml` with `cni: cilium`), tbx applies the machine prerequisites, boots the cluster, installs Cilium, and waits for the curated LoadBalancer VIP to become live. In both cases, talosbox owns the substrate (VMs, networking, DNS, image delivery); curated CNI and LoadBalancer provisioning are opt-in.
 
 Every imperative command prints the equivalent `talosbox.yaml` stanza. Alternatively, work declaratively from the start: write a `talosbox.yaml` and run `tbx up` (idempotent — it reconciles reality to the file; `tbx down` is its inverse).
 
@@ -51,10 +51,10 @@ clusters:
 ```sh
 bin/tbx status demo            # nodes, IPs, DNS names, plus copy-pasteable next-step hints
 bin/tbx console demo demo-cp-1 # attach to a node's serial console (detach with Ctrl-])
-bin/tbx manifests demo         # print Cilium LB pool / BGP manifests and machine-config patches
+bin/tbx manifests demo         # inspect exact machine patch, pinned chart values/objects, and LB/BGP/MetalLB extras
 ```
 
-`status` is state-aware: it suggests the next step for the state it observes (e.g. the `talosctl --insecure` probe for maintenance-mode nodes). Hints never execute anything; suppress them with `--quiet`.
+`status` is state-aware: it distinguishes provisioning, Ready-without-LB, and a live VIP, while printing credential exports and the flannel NetworkPolicy limitation. Hints never execute anything; suppress them with `--quiet`. `tbx up --quiet` and `tbx cluster create --quiet` keep their final result but suppress stage narration. `tbx manifests` is the exact inspection/fork surface for the curated path: `machine`, `values`, `objects`, and `extras` match the machine prerequisite patch, pinned Helm values, rendered chart objects, and LB/BGP resources tbx applies. Substrate-only clusters stay manual.
 
 ### 5. Lifecycle
 
@@ -74,4 +74,4 @@ cold-boots instead.
 
 Run `bin/tbx help` for the full command surface.
 
-For the complete path from `cluster create` to a browsable nginx URL — talosctl config, Cilium install, ingress — see the [Cilium ingress walkthrough](docs/walkthrough-cilium-ingress.md).
+For the curated Cilium path and optional hand-managed inspection fork, see the [Cilium walkthrough](docs/walkthrough-cilium-ingress.md).
