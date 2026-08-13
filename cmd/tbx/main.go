@@ -295,28 +295,11 @@ func (c cli) inspectDestroy(name string, request struct {
 	Name  string `json:"name"`
 	Force bool   `json:"force"`
 }) error {
-	engine, ok := c.destroyCSIIntent(name)
-	if !ok {
-		return nil
-	}
 	var inspection daemon.DestroyInspection
 	if err := c.call("cluster.destroy.inspect", request, &inspection); err != nil {
-		return printWarning(c.err, daemon.DestroyInspectionDataLossWarning(name, engine))
+		return printWarning(c.err, daemon.DestroyInspectionDataLossWarning(name, ""))
 	}
 	return printWarning(c.err, inspection.Warning)
-}
-
-func (c cli) destroyCSIIntent(name string) (cluster.CSI, bool) {
-	var clusters []daemon.ClusterSummary
-	if err := c.call("cluster.list", struct{}{}, &clusters); err != nil {
-		return "", false
-	}
-	for _, item := range clusters {
-		if item.Name == name {
-			return item.CSI, item.CSI != ""
-		}
-	}
-	return "", false
 }
 
 func (c cli) runNode(args []string) error {

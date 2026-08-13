@@ -14,7 +14,6 @@ import (
 
 func TestDestroyClusterPrintsInspectWarningBeforeDestroy(t *testing.T) {
 	requests, command := newDestroyTestCLI(t, []daemon.Response{
-		{OK: true, Data: json.RawMessage(`[{"name":"demo","csi":"longhorn"}]`)},
 		{OK: true, Data: json.RawMessage(`{"warning":"destroying cluster demo will permanently delete 2 longhorn volumes and their data"}`)},
 		{OK: true, Data: json.RawMessage(`{"name":"demo"}`)},
 	})
@@ -23,7 +22,7 @@ func TestDestroyClusterPrintsInspectWarningBeforeDestroy(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	assertDestroyRequests(t, requests, "cluster.list", "cluster.destroy.inspect", "cluster.destroy")
+	assertDestroyRequests(t, requests, "cluster.destroy.inspect", "cluster.destroy")
 	if got := command.err.(*bytes.Buffer).String(); !strings.Contains(got, "2 longhorn volumes") {
 		t.Fatalf("stderr = %q, want inspect warning", got)
 	}
@@ -34,7 +33,6 @@ func TestDestroyClusterPrintsInspectWarningBeforeDestroy(t *testing.T) {
 
 func TestDestroyClusterStillDestroysAfterInspectError(t *testing.T) {
 	requests, command := newDestroyTestCLI(t, []daemon.Response{
-		{OK: true, Data: json.RawMessage(`[{"name":"demo","csi":"local-path"}]`)},
 		{OK: false, Error: "inspect failed"},
 		{OK: true, Data: json.RawMessage(`{"name":"demo"}`)},
 	})
@@ -43,8 +41,8 @@ func TestDestroyClusterStillDestroysAfterInspectError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	assertDestroyRequests(t, requests, "cluster.list", "cluster.destroy.inspect", "cluster.destroy")
-	if got := command.err.(*bytes.Buffer).String(); !strings.Contains(got, "may permanently delete local-path volumes and their data") {
+	assertDestroyRequests(t, requests, "cluster.destroy.inspect", "cluster.destroy")
+	if got := command.err.(*bytes.Buffer).String(); !strings.Contains(got, "may permanently delete CSI-backed data") {
 		t.Fatalf("stderr = %q, want generic data-loss warning", got)
 	}
 }
