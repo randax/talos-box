@@ -102,7 +102,7 @@ func TestRefreshStoragePhasesReprobesAfterDaemonRestart(t *testing.T) {
 		return nil
 	}}
 	statuses := []ClusterStatus{{
-		Name: "demo", Running: true,
+		Name: "demo", Running: true, KubernetesReady: true,
 		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILocalPath},
 	}}
 
@@ -151,7 +151,7 @@ func TestRefreshStoragePhasesSharesConcurrentRestartProbe(t *testing.T) {
 	}}
 	newStatuses := func() []ClusterStatus {
 		return []ClusterStatus{{
-			Name: "demo", Running: true,
+			Name: "demo", Running: true, KubernetesReady: true,
 			ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILocalPath},
 		}}
 	}
@@ -169,5 +169,24 @@ func TestRefreshStoragePhasesSharesConcurrentRestartProbe(t *testing.T) {
 	}
 	if first[0].StoragePhase != StoragePhaseLive || second[0].StoragePhase != StoragePhaseLive {
 		t.Fatalf("storage phases = %q, %q; want live", first[0].StoragePhase, second[0].StoragePhase)
+	}
+}
+
+func TestRefreshStoragePhasesSkipsProbeUntilKubernetesIsReady(t *testing.T) {
+	called := false
+	service := &Server{storageProbe: func(context.Context, []byte) error {
+		called = true
+		return nil
+	}}
+	statuses := []ClusterStatus{{
+		Name: "demo", Running: true, KubernetesReady: false,
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILocalPath},
+	}}
+	service.refreshStoragePhases(statuses)
+	if called {
+		t.Fatal("storage probe ran while Kubernetes was not ready")
+	}
+	if statuses[0].StoragePhase != StoragePhaseProvisioning {
+		t.Fatalf("storage phase = %q, want provisioning", statuses[0].StoragePhase)
 	}
 }

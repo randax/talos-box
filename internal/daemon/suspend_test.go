@@ -79,6 +79,56 @@ func TestSuspendInvalidatesStorageLiveObservation(t *testing.T) {
 	}
 }
 
+func TestUnsupportedSuspendPreservesStorageLiveObservation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	service := &Server{
+		hypervisor:    &fakeHypervisor{},
+		vms:           map[string]map[string]hypervisor.Machine{item.Name: {item.Nodes[0].Name: &suspendMachineFake{}}},
+		storagePhases: map[string]StoragePhase{item.Name: StoragePhaseLive},
+	}
+	if _, err := service.suspendCluster([]byte(`{"name":"demo"}`)); !errors.Is(err, hypervisor.ErrUnsupported) {
+		t.Fatalf("suspend error = %v, want unsupported", err)
+	}
+	if service.storagePhases[item.Name] != StoragePhaseLive {
+		t.Fatal("unsupported suspend discarded storage-live observation")
+	}
+}
+
+func TestSuspendCancelsActiveProvisioning(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	service := &Server{
+		hypervisor: &fakeHypervisor{capabilities: hypervisor.Capabilities{Suspend: hypervisor.FeatureStatus{Supported: true}}},
+		vms:        map[string]map[string]hypervisor.Machine{item.Name: {item.Nodes[0].Name: &suspendMachineFake{}}},
+		provisions: map[string]activeProvision{item.Name: {generation: 1, cancel: cancel}},
+	}
+	if _, err := service.suspendCluster([]byte(`{"name":"demo"}`)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ctx.Done():
+	default:
+		t.Fatal("suspend did not cancel active provisioning")
+	}
+	if _, ok := service.provisions[item.Name]; ok {
+		t.Fatal("suspend retained active provisioning entry")
+	}
+}
+
 func TestPrepareSavedMachineClosesAfterSaveFailure(t *testing.T) {
 	machine := &suspendMachineFake{suspendErr: errors.New("save failed")}
 

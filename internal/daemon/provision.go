@@ -269,7 +269,7 @@ func (s *Server) refreshStoragePhases(statuses []ClusterStatus) {
 		case status.CNI != cluster.CNIFlannel, status.CSI != cluster.CSILocalPath, !status.Running:
 		case known[status.Name] == StoragePhaseLive:
 			status.StoragePhase = StoragePhaseLive
-		case active[status.Name]:
+		case active[status.Name], !status.KubernetesReady:
 			status.StoragePhase = StoragePhaseProvisioning
 		case s.probeStorageStatus(status.Name) == nil:
 			status.StoragePhase = StoragePhaseLive
