@@ -10,7 +10,12 @@ import (
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/hypervisor"
 )
+
+func runningStorageVMs(name string) map[string]map[string]hypervisor.Machine {
+	return map[string]map[string]hypervisor.Machine{name: {"cp": &fakeMachine{active: true}}}
+}
 
 func eventually(t *testing.T, condition func() bool) {
 	t.Helper()
@@ -105,7 +110,7 @@ func TestRefreshStoragePhasesReprobesAfterDaemonRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	observed := make(chan string, 1)
-	service := &Server{storageProbe: func(_ context.Context, kubeconfig []byte) error {
+	service := &Server{vms: runningStorageVMs("demo"), storageProbe: func(_ context.Context, kubeconfig []byte) error {
 		observed <- string(kubeconfig)
 		return nil
 	}}
@@ -161,7 +166,7 @@ func TestRefreshStoragePhasesSharesConcurrentRestartProbe(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	var calls atomic.Int32
-	service := &Server{storageProbe: func(context.Context, []byte) error {
+	service := &Server{vms: runningStorageVMs("demo"), storageProbe: func(context.Context, []byte) error {
 		if calls.Add(1) == 1 {
 			close(entered)
 		}
@@ -213,5 +218,63 @@ func TestRefreshStoragePhasesSkipsProbeUntilKubernetesIsReady(t *testing.T) {
 	}
 	if statuses[0].StoragePhase != StoragePhaseProvisioning {
 		t.Fatalf("storage phase = %q, want provisioning", statuses[0].StoragePhase)
+	}
+}
+
+func TestStaleRunningSnapshotCannotStartProbeAfterStop(t *testing.T) {
+	called := make(chan struct{}, 1)
+	service := &Server{
+		vms: map[string]map[string]hypervisor.Machine{},
+		storageProbe: func(context.Context, []byte) error {
+			called <- struct{}{}
+			return nil
+		},
+	}
+	statuses := []ClusterStatus{{
+		Name: "demo", Running: true, KubernetesReady: true,
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILocalPath},
+	}}
+	service.refreshStoragePhases(statuses)
+	select {
+	case <-called:
+		t.Fatal("stale running snapshot started a probe after the VM lifetime ended")
+	case <-time.After(10 * time.Millisecond):
+	}
+}
+
+func TestCompletedProbeCannotPublishLiveAfterStop(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir, err := cluster.Dir("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "kubeconfig"), []byte("credentials"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	service := &Server{
+		vms: runningStorageVMs("demo"),
+		storageProbe: func(context.Context, []byte) error {
+			close(entered)
+			<-release
+			return nil
+		},
+	}
+	service.beginStorageStatusProbe("demo")
+	<-entered
+	service.opMu.Lock()
+	service.vms = map[string]map[string]hypervisor.Machine{}
+	service.invalidateStoragePhaseLocked("demo")
+	service.opMu.Unlock()
+	close(release)
+	time.Sleep(10 * time.Millisecond)
+	service.opMu.Lock()
+	defer service.opMu.Unlock()
+	if service.storagePhases["demo"] == StoragePhaseLive {
+		t.Fatal("probe from stopped VM lifetime published storage live")
 	}
 }

@@ -281,7 +281,7 @@ func (s *Server) refreshStoragePhases(statuses []ClusterStatus) {
 
 func (s *Server) beginStorageStatusProbe(name string) {
 	s.opMu.Lock()
-	if s.storagePhases[name] == StoragePhaseLive || s.storageStatusProbes[name].cancel != nil {
+	if !s.clusterRunning(name) || s.storagePhases[name] == StoragePhaseLive || s.storageStatusProbes[name].cancel != nil {
 		s.opMu.Unlock()
 		return
 	}
@@ -310,7 +310,7 @@ func (s *Server) runStorageStatusProbe(ctx context.Context, name string, generat
 	}
 	active.cancel()
 	delete(s.storageStatusProbes, name)
-	if err == nil {
+	if err == nil && s.clusterRunning(name) {
 		s.recordStoragePhaseLocked(name, StoragePhaseLive)
 	}
 }
