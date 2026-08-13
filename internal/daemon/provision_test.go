@@ -70,16 +70,18 @@ func TestRefreshKubernetesReadinessSkipsStoppedFlannelClusters(t *testing.T) {
 
 func TestRefreshStoragePhasesDefaultsCSIClustersToProvisioning(t *testing.T) {
 	service := &Server{}
-	statuses := []ClusterStatus{{
-		Name:               "demo",
-		Running:            true,
-		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILocalPath},
-	}}
+	for _, csi := range []cluster.CSI{cluster.CSILocalPath, cluster.CSILonghorn} {
+		statuses := []ClusterStatus{{
+			Name:               "demo",
+			Running:            true,
+			ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: csi},
+		}}
 
-	service.refreshStoragePhases(statuses)
+		service.refreshStoragePhases(statuses)
 
-	if statuses[0].StoragePhase != StoragePhaseProvisioning {
-		t.Fatalf("storage phase = %q, want %q", statuses[0].StoragePhase, StoragePhaseProvisioning)
+		if statuses[0].StoragePhase != StoragePhaseProvisioning {
+			t.Fatalf("csi=%s storage phase = %q, want %q", csi, statuses[0].StoragePhase, StoragePhaseProvisioning)
+		}
 	}
 }
 
@@ -138,17 +140,17 @@ func TestRefreshStoragePhasesReprobesAfterDaemonRestart(t *testing.T) {
 	}
 }
 
-func TestRefreshStoragePhasesDoesNotClaimUnsupportedBackendIsProvisioning(t *testing.T) {
+func TestRefreshStoragePhasesLeavesClustersWithoutCSIUnset(t *testing.T) {
 	service := &Server{}
 	statuses := []ClusterStatus{{
 		Name: "demo", Running: true,
-		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILonghorn},
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel},
 	}}
 
 	service.refreshStoragePhases(statuses)
 
 	if statuses[0].StoragePhase != "" {
-		t.Fatalf("storage phase = %q, want unknown until Longhorn support is installed", statuses[0].StoragePhase)
+		t.Fatalf("storage phase = %q, want empty when CSI is absent", statuses[0].StoragePhase)
 	}
 }
 

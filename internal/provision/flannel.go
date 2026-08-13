@@ -220,7 +220,7 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 			result.VIP = loadBalancer.VIP
 			result.Narration = append(result.Narration, loadBalancer.Narration...)
 		}
-		if request.Cluster.CSI == cluster.CSILocalPath {
+		if request.Cluster.CSI != "" {
 			if request.Storage == nil {
 				return Result{}, errors.New("flannel storage provisioning requires a Kubernetes reconciler")
 			}

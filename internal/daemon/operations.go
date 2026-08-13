@@ -233,6 +233,8 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	item.Domain = canonicalDomain
 	item.AllowUnsafeDomain = canonicalDomain != "" && args.AllowUnsafeDomain
 	item.ImageArchitecture = string(s.hypervisor.Architecture())
+	longhornWarning := s.checkLonghornMemoryWarning(item)
+	unsupportedCSIWarning := unsupportedCSIProvisioningWarning(item)
 	item.Schematic, item.TalosVersion, err = s.resolveImage(args.Schematic, args.Version)
 	if err != nil {
 		return ClusterSummary{}, err
@@ -257,11 +259,11 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	startWarning, err := s.start(item)
 	if err != nil {
 		result := summary(item, false)
-		result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, subnetWarning)
+		result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, longhornWarning, unsupportedCSIWarning, subnetWarning)
 		return result, fmt.Errorf("cluster created but failed to start: %w", err)
 	}
 	result := summary(item, true)
-	result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, subnetWarning, startWarning)
+	result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, longhornWarning, unsupportedCSIWarning, subnetWarning, startWarning)
 	return result, nil
 }
 
@@ -282,6 +284,8 @@ func (s *Server) startCluster(raw json.RawMessage) (ClusterSummary, error) {
 		}
 		overcommitWarning = w
 	}
+	longhornWarning := s.checkLonghornMemoryWarning(item)
+	unsupportedCSIWarning := unsupportedCSIProvisioningWarning(item)
 	dir, err := cluster.Dir(item.Name)
 	if err != nil {
 		return ClusterSummary{}, err
@@ -295,8 +299,15 @@ func (s *Server) startCluster(raw json.RawMessage) (ClusterSummary, error) {
 		return ClusterSummary{}, err
 	}
 	result := summary(item, true)
-	result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, subnetWarning)
+	result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, longhornWarning, unsupportedCSIWarning, subnetWarning)
 	return result, nil
+}
+
+func unsupportedCSIProvisioningWarning(item cluster.Cluster) string {
+	if item.CSI == "" || item.CNI == "" || item.CNI == cluster.CNIFlannel {
+		return ""
+	}
+	return fmt.Sprintf("curated CSI provisioning for cni: %s is not implemented yet; tbx preserved csi: %s intent but will not install storage until that provisioning path exists", item.CNI, item.CSI)
 }
 
 func (s *Server) start(item cluster.Cluster) (string, error) {
