@@ -1,6 +1,9 @@
 package daemon
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -51,7 +54,7 @@ func TestRefreshStoragePhasesDefaultsCSIClustersToProvisioning(t *testing.T) {
 	statuses := []ClusterStatus{{
 		Name:               "demo",
 		Running:            true,
-		ProvisioningIntent: cluster.ProvisioningIntent{CSI: cluster.CSILocalPath},
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILocalPath},
 	}}
 
 	service.refreshStoragePhases(statuses)
@@ -66,12 +69,58 @@ func TestRefreshStoragePhasesUsesStoredLiveObservation(t *testing.T) {
 	statuses := []ClusterStatus{{
 		Name:               "demo",
 		Running:            true,
-		ProvisioningIntent: cluster.ProvisioningIntent{CSI: cluster.CSILocalPath},
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILocalPath},
 	}}
 
 	service.refreshStoragePhases(statuses)
 
 	if statuses[0].StoragePhase != StoragePhaseLive {
 		t.Fatalf("storage phase = %q, want %q", statuses[0].StoragePhase, StoragePhaseLive)
+	}
+}
+
+func TestRefreshStoragePhasesReprobesAfterDaemonRestart(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir, err := cluster.Dir("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "kubeconfig"), []byte("credentials"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	service := &Server{storageProbe: func(_ context.Context, kubeconfig []byte) error {
+		called = true
+		if string(kubeconfig) != "credentials" {
+			t.Fatalf("kubeconfig = %q", kubeconfig)
+		}
+		return nil
+	}}
+	statuses := []ClusterStatus{{
+		Name: "demo", Running: true,
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILocalPath},
+	}}
+
+	service.refreshStoragePhases(statuses)
+
+	if !called || statuses[0].StoragePhase != StoragePhaseLive {
+		t.Fatalf("called=%v storage phase=%q, want fresh live observation", called, statuses[0].StoragePhase)
+	}
+}
+
+func TestRefreshStoragePhasesDoesNotClaimUnsupportedBackendIsProvisioning(t *testing.T) {
+	service := &Server{}
+	statuses := []ClusterStatus{{
+		Name: "demo", Running: true,
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILonghorn},
+	}}
+
+	service.refreshStoragePhases(statuses)
+
+	if statuses[0].StoragePhase != "" {
+		t.Fatalf("storage phase = %q, want unknown until Longhorn support is installed", statuses[0].StoragePhase)
 	}
 }

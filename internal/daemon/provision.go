@@ -88,7 +88,7 @@ func (s *Server) beginProvisionTasksLocked(items []cluster.Cluster) []provisionT
 		if s.provisions == nil {
 			s.provisions = make(map[string]activeProvision)
 		}
-		if item.CSI != "" {
+		if item.CSI == cluster.CSILocalPath {
 			if s.storagePhases == nil {
 				s.storagePhases = make(map[string]StoragePhase)
 			}
@@ -177,20 +177,21 @@ func (s *Server) provisionFlannel(parent context.Context, item cluster.Cluster) 
 	if reconcile == nil {
 		reconcile = provision.Reconcile
 	}
-	result, err := reconcile(ctx, provision.Request{
+	request := provision.Request{
 		Cluster: item,
 		Client:  provision.MachineryClient{TalosconfigPath: filepath.Join(dir, "talosconfig")},
 		LoadBalancer: provision.MetalLBReconciler{
-			PollInterval: time.Second,
-		},
-		Storage: provision.LocalPathReconciler{
 			PollInterval: time.Second,
 		},
 		Observe: func(context.Context) ([]provision.Node, error) {
 			return s.observeProvisionNodes(item), nil
 		},
 		PollInterval: time.Second,
-	})
+	}
+	if item.CSI == cluster.CSILocalPath {
+		request.Storage = provision.LocalPathReconciler{PollInterval: time.Second}
+	}
+	result, err := reconcile(ctx, request)
 	if err != nil {
 		return nil, "", err
 	}
@@ -251,21 +252,55 @@ func loadBalancerVIP(item cluster.Cluster) (string, bool) {
 
 func (s *Server) refreshStoragePhases(statuses []ClusterStatus) {
 	s.opMu.Lock()
-	defer s.opMu.Unlock()
+	known := make(map[string]StoragePhase, len(s.storagePhases))
+	for name, phase := range s.storagePhases {
+		known[name] = phase
+	}
+	active := make(map[string]bool, len(s.provisions))
+	for name := range s.provisions {
+		active[name] = true
+	}
+	s.opMu.Unlock()
+
 	for index := range statuses {
 		status := &statuses[index]
 		status.StoragePhase = ""
 		switch {
-		case status.CSI == "", !status.Running:
-			status.Hints = Hints(*status)
-		case s.storagePhases != nil && s.storagePhases[status.Name] == StoragePhaseLive:
+		case status.CNI != cluster.CNIFlannel, status.CSI != cluster.CSILocalPath, !status.Running:
+		case known[status.Name] == StoragePhaseLive:
 			status.StoragePhase = StoragePhaseLive
-			status.Hints = Hints(*status)
+		case active[status.Name]:
+			status.StoragePhase = StoragePhaseProvisioning
+		case s.probeStorageStatus(status.Name) == nil:
+			status.StoragePhase = StoragePhaseLive
+			s.opMu.Lock()
+			s.recordStoragePhaseLocked(status.Name, StoragePhaseLive)
+			s.opMu.Unlock()
 		default:
 			status.StoragePhase = StoragePhaseProvisioning
-			status.Hints = Hints(*status)
+		}
+		status.Hints = Hints(*status)
+	}
+}
+
+func (s *Server) probeStorageStatus(name string) error {
+	dir, err := cluster.Dir(name)
+	if err != nil {
+		return err
+	}
+	kubeconfig, err := os.ReadFile(filepath.Join(dir, "kubeconfig"))
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	probe := s.storageProbe
+	if probe == nil {
+		probe = func(ctx context.Context, kubeconfig []byte) error {
+			return provision.ProbeLocalPathStorage(ctx, kubeconfig, time.Second)
 		}
 	}
+	return probe(ctx, kubeconfig)
 }
 
 func (s *Server) recordStoragePhaseLocked(name string, phase StoragePhase) {

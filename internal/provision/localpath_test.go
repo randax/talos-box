@@ -278,6 +278,31 @@ func TestFlannelStorageRequiresKubernetesReconciler(t *testing.T) {
 	}
 }
 
+func TestFlannelReconcileDoesNotRouteLonghornToLocalPath(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.TalosVersion = "v1.13.6"
+	item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILonghorn}
+	storage := &fakeStorageReconciler{}
+	_, err = Reconcile(context.Background(), Request{
+		Cluster: item,
+		Client:  &fakeClient{kubeData: []byte("kubeconfig")},
+		Storage: storage,
+		Observe: func(context.Context) ([]Node, error) {
+			return []Node{{Name: item.Nodes[0].Name, Role: cluster.RoleControlPlane, IP: item.Nodes[0].IP, Phase: PhaseConfigured}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storage.calls != 0 {
+		t.Fatalf("local-path storage reconciler calls = %d, want 0 for longhorn", storage.calls)
+	}
+}
+
 func TestFlannelReconcileRunsStorageAfterLoadBalancer(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{})

@@ -33,6 +33,7 @@ type Server struct {
 	storagePhases      map[string]StoragePhase
 	provisionSequence  uint64
 	provisionReconcile provisionReconcileFunc
+	storageProbe       func(context.Context, []byte) error
 	nodeIPLookup       func(string, int) string
 	nodeProbe          func(string) ProbeResult
 	lifecycleContext   context.Context

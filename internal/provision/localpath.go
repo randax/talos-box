@@ -61,6 +61,33 @@ func (r LocalPathReconciler) Reconcile(ctx context.Context, item cluster.Cluster
 	return r.reconcile(ctx, config, objects)
 }
 
+// ProbeLocalPathStorage re-derives storage readiness without reinstalling the
+// provisioner. The classless PVC keeps status tied to the default-class data
+// path after daemon restarts without persisting observational progress.
+func ProbeLocalPathStorage(ctx context.Context, kubeconfig []byte, interval time.Duration) error {
+	config, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
+	if err != nil {
+		return fmt.Errorf("parse kubeconfig for storage probe: %w", err)
+	}
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
+	if err != nil {
+		return fmt.Errorf("create Kubernetes discovery client: %w", err)
+	}
+	mapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(discoveryClient))
+	dynamicClient, err := dynamic.NewForConfig(config)
+	if err != nil {
+		return fmt.Errorf("create Kubernetes apply client: %w", err)
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return fmt.Errorf("create Kubernetes readiness client: %w", err)
+	}
+	if interval <= 0 {
+		interval = time.Second
+	}
+	return runStorageProbe(ctx, dynamicClient, mapper, clientset, storageProbeSpec{ProbeImage: localPathHelperImage}, interval)
+}
+
 func (r LocalPathReconciler) reconcile(ctx context.Context, config *rest.Config, objects []unstructured.Unstructured) (StorageResult, error) {
 	if r.PollInterval <= 0 {
 		r.PollInterval = time.Second
