@@ -163,6 +163,13 @@ func TestRenderLonghornRejectsNonLonghornIntent(t *testing.T) {
 	}
 }
 
+func TestWaitForCRDsNamesTheCallingComponent(t *testing.T) {
+	err := waitForCRDs(context.Background(), nil, nil, nil, "Longhorn", time.Millisecond)
+	if err == nil || err.Error() != "embedded Longhorn chart contains no CRDs" {
+		t.Fatalf("waitForCRDs() error = %v", err)
+	}
+}
+
 func TestWaitForLonghornRequiresReadyComponents(t *testing.T) {
 	ready := kubernetesfake.NewClientset(
 		&appsv1.DaemonSet{

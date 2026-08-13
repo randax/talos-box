@@ -136,7 +136,7 @@ func (r MetalLBReconciler) reconcile(ctx context.Context, item cluster.Cluster, 
 	if err := applyAll(ctx, dynamicClient, mapper, crds); err != nil {
 		return LoadBalancerResult{}, err
 	}
-	if err := waitForCRDs(ctx, dynamicClient, mapper, crds, r.PollInterval); err != nil {
+	if err := waitForCRDs(ctx, dynamicClient, mapper, crds, "MetalLB", r.PollInterval); err != nil {
 		return LoadBalancerResult{}, err
 	}
 	mapper.Reset()
@@ -359,13 +359,13 @@ func applyAll(ctx context.Context, client dynamic.Interface, mapper meta.RESTMap
 	return nil
 }
 
-func waitForCRDs(ctx context.Context, client dynamic.Interface, mapper *restmapper.DeferredDiscoveryRESTMapper, crds []unstructured.Unstructured, interval time.Duration) error {
+func waitForCRDs(ctx context.Context, client dynamic.Interface, mapper *restmapper.DeferredDiscoveryRESTMapper, crds []unstructured.Unstructured, component string, interval time.Duration) error {
 	if len(crds) == 0 {
-		return errors.New("embedded MetalLB chart contains no CRDs")
+		return fmt.Errorf("embedded %s chart contains no CRDs", component)
 	}
 	mapping, err := mapper.RESTMapping(schema.GroupKind{Group: "apiextensions.k8s.io", Kind: "CustomResourceDefinition"}, "v1")
 	if err != nil {
-		return fmt.Errorf("map MetalLB CRDs: %w", err)
+		return fmt.Errorf("map %s CRDs: %w", component, err)
 	}
 	return poll(ctx, interval, func(ctx context.Context) error {
 		for _, crd := range crds {
