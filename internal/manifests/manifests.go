@@ -11,7 +11,10 @@ import (
 type Facts struct {
 	Cluster     string
 	SubnetIndex int
+	CNI         string
+	LB          bool
 	BGP         bool // cluster is in BGP mode: configure BGP, not L2 announcements
+	Hubble      bool
 }
 
 // MirrorPorts fixes the upstream registry → host mirror port mapping.
@@ -56,6 +59,8 @@ func LBPool(f Facts) string {
 kind: CiliumLoadBalancerIPPool
 metadata:
   name: %s-pool
+  annotations:
+    talosbox.dev/announcement-owned: "talosbox"
 spec:
   blocks:
     - start: %s
@@ -70,15 +75,21 @@ func L2Policy(f Facts) string {
 kind: CiliumL2AnnouncementPolicy
 metadata:
   name: %s-l2
+  annotations:
+    talosbox.dev/announcement-owned: "talosbox"
 spec:
   loadBalancerIPs: true
   nodeSelector: {}
 `, f.Cluster)
 }
 
-// CiliumValues renders the supported Helm values used by the manual Cilium
-// install path. It is host-platform neutral; only cluster facts vary.
+// CiliumValues renders the curated, Talos-safe Cilium value surface. The
+// ingress controller deliberately remains attendee-owned: talosbox proves the
+// LoadBalancer path with its own probe instead of claiming the workshop VIP.
 func CiliumValues(f Facts) string {
+	// The manual Cilium values surface retains its historic L2 default. The
+	// provisioner names Cilium explicitly and turns L2 off with lb: false.
+	l2Enabled := !f.BGP && (f.CNI != "cilium" || f.LB)
 	return fmt.Sprintf(`ipam:
   mode: kubernetes
 kubeProxyReplacement: true
@@ -106,21 +117,24 @@ cgroup:
   autoMount:
     enabled: false
   hostRoot: /sys/fs/cgroup
+bpf:
+  hostLegacyRouting: true
 l2announcements:
   enabled: %t
 bgpControlPlane:
-  enabled: true
+  enabled: %t
 k8sClientRateLimit:
   qps: %d
   burst: %d
 ingressController:
-  enabled: true
-  default: true
-  loadbalancerMode: shared
-  service:
-    annotations:
-      lbipam.cilium.io/ips: %s
-`, !f.BGP, ciliumClientQPS, ciliumClientBurst, f.hostIP(200))
+  enabled: false
+hubble:
+  enabled: %t
+  relay:
+    enabled: %t
+  ui:
+    enabled: %t
+`, l2Enabled, f.BGP, ciliumClientQPS, ciliumClientBurst, f.Hubble, f.Hubble, f.Hubble)
 }
 
 // BGPPolicy renders Cilium's BGP v2 resources for "host as ToR": every node
@@ -130,6 +144,8 @@ func BGPPolicy(f Facts) string {
 kind: CiliumBGPClusterConfig
 metadata:
   name: %s-bgp
+  annotations:
+    talosbox.dev/announcement-owned: "talosbox"
 spec:
   nodeSelector: {}
   bgpInstances:
@@ -146,6 +162,8 @@ apiVersion: cilium.io/v2
 kind: CiliumBGPPeerConfig
 metadata:
   name: %s-bgp-peer
+  annotations:
+    talosbox.dev/announcement-owned: "talosbox"
 spec:
   families:
     - afi: ipv4
@@ -158,6 +176,8 @@ apiVersion: cilium.io/v2
 kind: CiliumBGPAdvertisement
 metadata:
   name: %s-bgp-advertisement
+  annotations:
+    talosbox.dev/announcement-owned: "talosbox"
   labels:
     talosbox.dev/advertisement: service-load-balancer
 spec:

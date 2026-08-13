@@ -154,3 +154,18 @@ func TestPrintActionsWritesWarningsToStderr(t *testing.T) {
 		t.Fatalf("stderr = %q, want host-pressure warning", got)
 	}
 }
+
+func TestPrintActionsNamesIncompleteProvisioningAsReconciliation(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr}
+	err := command.printActions(
+		[]daemon.Action{{Cluster: "demo", Kind: daemon.ActionReconcile}},
+		map[daemon.ActionKind]string{daemon.ActionReconcile: "reconciled %s", daemon.ActionNone: "%s is up to date"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stdout.String(); got != "reconciled demo\n" {
+		t.Fatalf("stdout = %q, want reconciliation instead of up-to-date", got)
+	}
+}

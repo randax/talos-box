@@ -133,6 +133,18 @@ func Hints(status ClusterStatus) []string {
 				fmt.Sprintf("Kubernetes is Ready with Talos-managed flannel; LoadBalancer support is disabled by lb: false, so no VIP is provisioned. export TALOSCONFIG=~/.talosbox/clusters/%s/talosconfig; export KUBECONFIG=~/.talosbox/clusters/%s/kubeconfig", status.Name, status.Name),
 			)
 		}
+		if status.CNI == cluster.CNICilium && status.LB && status.KubernetesReady {
+			if status.VIPLive {
+				hints = append(hints, fmt.Sprintf("Kubernetes is Ready; Cilium LB-IPAM VIP is live at http://%s/.", status.VIP))
+			} else {
+				hints = append(hints, "Kubernetes is Ready; waiting for the Cilium LoadBalancer VIP probe to respond.")
+			}
+		}
+		if status.CNI == cluster.CNICilium && !status.LB && status.KubernetesReady {
+			hints = append(hints,
+				fmt.Sprintf("Kubernetes is Ready with Cilium; LoadBalancer support is disabled by lb: false, so no VIP is provisioned. export TALOSCONFIG=~/.talosbox/clusters/%s/talosconfig; export KUBECONFIG=~/.talosbox/clusters/%s/kubeconfig", status.Name, status.Name),
+			)
+		}
 		if !status.KubernetesReady {
 			hints = append(hints,
 				fmt.Sprintf("all nodes configured. If etcd is not yet bootstrapped: talosctl --nodes %s bootstrap, then talosctl kubeconfig .", cp.IP),

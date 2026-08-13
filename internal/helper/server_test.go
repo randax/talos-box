@@ -40,6 +40,51 @@ func TestBGPRejectsInvalidArguments(t *testing.T) {
 	}
 }
 
+func TestBGPStatusReportsObservedSpeakerOwnership(t *testing.T) {
+	server := NewServer(nil)
+	server.speakers = map[string]bgpSpeaker{"demo": &shutdownSpeaker{}}
+	for _, test := range []struct {
+		name   string
+		args   string
+		active bool
+	}{
+		{name: "active speaker", args: `{"cluster":"demo"}`, active: true},
+		{name: "no speaker", args: `{"cluster":"missing"}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			reply := server.dispatch(Request{Op: "bgp.status", Args: json.RawMessage(test.args)})
+			if !reply.response.OK {
+				t.Fatalf("bgp.status response = %+v", reply.response)
+			}
+			var data struct {
+				Active bool `json:"active"`
+			}
+			if err := json.Unmarshal(reply.response.Data, &data); err != nil {
+				t.Fatal(err)
+			}
+			if data.Active != test.active {
+				t.Fatalf("bgp.status active = %t, want %t", data.Active, test.active)
+			}
+		})
+	}
+}
+
+type shutdownSpeaker struct{ stops int }
+
+func (s *shutdownSpeaker) Stop() { s.stops++ }
+
+func TestShutdownStopsEveryBGPSpeaker(t *testing.T) {
+	server := NewServer(nil)
+	first, second := &shutdownSpeaker{}, &shutdownSpeaker{}
+	server.speakers = map[string]bgpSpeaker{"first": first, "second": second}
+	if err := server.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
+	if first.stops != 1 || second.stops != 1 || len(server.speakers) != 0 {
+		t.Fatalf("BGP shutdown = first:%d second:%d remaining:%d", first.stops, second.stops, len(server.speakers))
+	}
+}
+
 func TestListenUnixSocketPreservesNonCollisionBindError(t *testing.T) {
 	t.Parallel()
 

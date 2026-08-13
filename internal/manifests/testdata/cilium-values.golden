@@ -25,17 +25,20 @@ cgroup:
   autoMount:
     enabled: false
   hostRoot: /sys/fs/cgroup
+bpf:
+  hostLegacyRouting: true
 l2announcements:
   enabled: true
 bgpControlPlane:
-  enabled: true
+  enabled: false
 k8sClientRateLimit:
   qps: 10
   burst: 20
 ingressController:
-  enabled: true
-  default: true
-  loadbalancerMode: shared
-  service:
-    annotations:
-      lbipam.cilium.io/ips: 172.30.0.200
+  enabled: false
+hubble:
+  enabled: false
+  relay:
+    enabled: false
+  ui:
+    enabled: false
