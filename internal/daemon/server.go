@@ -272,6 +272,9 @@ func (s *Server) dispatch(request Request) Response {
 	if request.Op == "cluster.create" || request.Op == "cluster.start" || request.Op == "up" {
 		return s.dispatchProvisioning(request)
 	}
+	if request.Op == "node.add" || request.Op == "node.remove" {
+		return s.dispatchNodeMutation(request)
+	}
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 
@@ -285,6 +288,19 @@ func (s *Server) dispatch(request Request) Response {
 func (s *Server) dispatchProvisioning(request Request) Response {
 	s.opMu.Lock()
 	data, tasks, err := s.handleProvisioningLocked(request)
+	s.opMu.Unlock()
+	if err != nil {
+		return failure(err)
+	}
+	if err := s.runProvisionTasks(data, tasks); err != nil {
+		return failure(err)
+	}
+	return success(data)
+}
+
+func (s *Server) dispatchNodeMutation(request Request) Response {
+	s.opMu.Lock()
+	data, tasks, err := s.handleNodeMutationLocked(request)
 	s.opMu.Unlock()
 	if err != nil {
 		return failure(err)
