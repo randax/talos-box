@@ -188,7 +188,12 @@ func (s *Server) Shutdown() error {
 
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
-	result := s.dhcp.Close()
+	var result error
+	for cluster, speaker := range s.speakers {
+		speaker.Stop()
+		delete(s.speakers, cluster)
+	}
+	result = s.dhcp.Close()
 	for attempt := 1; ; attempt++ {
 		var retainedResult error
 		stop := func(attachment *platformAttachment) bool {
@@ -344,6 +349,18 @@ func (s *Server) handle(request Request) (any, int, func(), error) {
 		return nil, -1, nil, s.enableBGP(request.Args)
 	case "bgp.disable":
 		return nil, -1, nil, s.disableBGP(request.Args)
+	case "bgp.status":
+		var args struct {
+			Cluster string `json:"cluster"`
+		}
+		if err := decodeArgs(request.Args, &args); err != nil {
+			return nil, -1, nil, err
+		}
+		if err := validateBGPCluster(args.Cluster); err != nil {
+			return nil, -1, nil, err
+		}
+		_, active := s.speakers[args.Cluster]
+		return map[string]bool{"active": active}, -1, nil, nil
 	case helperInfoOp:
 		var args struct {
 			ProtocolVersion int `json:"protocolVersion"`

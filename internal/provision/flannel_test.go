@@ -23,25 +23,76 @@ import (
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/siderolabs/talos/pkg/machinery/config/configloader"
+	"github.com/siderolabs/talos/pkg/machinery/config/types/cri"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
 type fakeClient struct {
 	applied   []string
+	configs   [][]byte
 	bootstrap int
 	kube      int
 	kubeData  []byte
+	kubeErrs  []error
 	bootErr   error
 	readyErrs []error
 	expected  [][]string
+	readyHook func()
+}
+
+type fakeLoadBalancer struct {
+	calls int
+	errs  []error
+}
+
+func (f *fakeLoadBalancer) Reconcile(context.Context, cluster.Cluster, []byte) (LoadBalancerResult, error) {
+	f.calls++
+	if len(f.errs) > 0 {
+		err := f.errs[0]
+		f.errs = f.errs[1:]
+		if err != nil {
+			return LoadBalancerResult{}, err
+		}
+	}
+	return LoadBalancerResult{VIP: "172.30.0.200"}, nil
+}
+
+func TestCiliumMachineConfigRoutesRuntimeImagesThroughCatchAllMirror(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("demo", 3, 1, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.TalosVersion = "v1.13.6"
+	item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNICilium}
+	generated, err := generateMachineConfigs(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider, err := configloader.NewFromBytes(generated.configs[cluster.RoleControlPlane])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mirror *cri.RegistryMirrorConfigV1Alpha1
+	for _, document := range provider.Documents() {
+		candidate, ok := document.(*cri.RegistryMirrorConfigV1Alpha1)
+		if ok && candidate.MetaName == "*" {
+			mirror = candidate
+		}
+	}
+	if mirror == nil || !mirror.SkipFallback() || len(mirror.RegistryEndpoints) != 1 || mirror.RegistryEndpoints[0].Endpoint() != "http://172.30.3.1:5059" {
+		t.Fatalf("catch-all mirror = %#v", mirror)
+	}
 }
 
 func (f *fakeClient) Apply(_ context.Context, node string, config []byte) error {
-	if !strings.Contains(string(config), "name: flannel") {
-		return errors.New("machine config did not select Talos-managed flannel")
+	if !strings.Contains(string(config), "name: flannel") && !strings.Contains(string(config), "name: none") {
+		return fmt.Errorf("machine config did not select a curated CNI:\n%s", config)
 	}
 	f.applied = append(f.applied, node)
+	f.configs = append(f.configs, append([]byte(nil), config...))
 	return nil
 }
 
@@ -75,10 +126,43 @@ func TestFlannelReconcileTreatsAlreadyBootstrappedAsSuccess(t *testing.T) {
 
 func (f *fakeClient) Kubeconfig(context.Context, string) ([]byte, error) {
 	f.kube++
+	if len(f.kubeErrs) > 0 {
+		err := f.kubeErrs[0]
+		f.kubeErrs = f.kubeErrs[1:]
+		return nil, err
+	}
 	return f.kubeData, nil
 }
 
+func TestKubeconfigWithRetryHandlesTransientTalosRestart(t *testing.T) {
+	client := &fakeClient{
+		kubeData: []byte("kubeconfig"),
+		kubeErrs: []error{status.Error(codes.Unavailable, "apid restarting")},
+	}
+	got, err := kubeconfigWithRetry(context.Background(), client, "172.30.0.2", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "kubeconfig" || client.kube != 2 {
+		t.Fatalf("kubeconfig retry = %q after %d calls, want successful second call", got, client.kube)
+	}
+}
+
+func TestKubeconfigWithRetryDoesNotHidePermanentErrors(t *testing.T) {
+	client := &fakeClient{kubeErrs: []error{status.Error(codes.PermissionDenied, "bad credential")}}
+	_, err := kubeconfigWithRetry(context.Background(), client, "172.30.0.2", 0)
+	if err == nil || !strings.Contains(err.Error(), "bad credential") {
+		t.Fatalf("kubeconfigWithRetry() error = %v, want permanent error", err)
+	}
+	if client.kube != 1 {
+		t.Fatalf("kubeconfig calls = %d, want 1", client.kube)
+	}
+}
+
 func (f *fakeClient) KubernetesReady(_ context.Context, _ []byte, expectedNodes []string) error {
+	if f.readyHook != nil {
+		f.readyHook()
+	}
 	f.expected = append(f.expected, append([]string(nil), expectedNodes...))
 	if len(f.readyErrs) == 0 {
 		return nil
@@ -194,6 +278,108 @@ func TestFlannelReconcileRemintsDerivedCredentialsWithoutReapply(t *testing.T) {
 	}
 	if contents, err := os.ReadFile(result.KubeconfigPath); err != nil || string(contents) != "reminted" {
 		t.Fatalf("reminted kubeconfig = %q, %v", contents, err)
+	}
+}
+
+func TestFlannelReconcileRecoversFromEveryDocumentedInterruptionStage(t *testing.T) {
+	interrupted := errors.New("simulated process interruption")
+	tests := []struct {
+		name         string
+		loadBalancer bool
+		firstPass    func(cluster.Cluster, *fakeClient, *fakeLoadBalancer) Request
+		verify       func(*testing.T, *fakeClient, *fakeLoadBalancer)
+	}{
+		{
+			name: "post-apply",
+			firstPass: func(item cluster.Cluster, client *fakeClient, _ *fakeLoadBalancer) Request {
+				observations := 0
+				return Request{Cluster: item, Client: client, PollInterval: time.Nanosecond, Observe: func(context.Context) ([]Node, error) {
+					observations++
+					if observations == 1 {
+						return []Node{{Name: item.Nodes[0].Name, Role: cluster.RoleControlPlane, IP: item.Nodes[0].IP, Phase: PhaseMaintenance}}, nil
+					}
+					return nil, interrupted
+				}}
+			},
+			verify: func(t *testing.T, client *fakeClient, _ *fakeLoadBalancer) {
+				if len(client.applied) != 1 {
+					t.Fatalf("machine config apply calls = %d, want one before interruption and no reapply", len(client.applied))
+				}
+			},
+		},
+		{
+			name: "pre-bootstrap",
+			firstPass: func(item cluster.Cluster, client *fakeClient, _ *fakeLoadBalancer) Request {
+				client.bootErr = interrupted
+				return configuredRequest(item, client, nil)
+			},
+			verify: func(t *testing.T, client *fakeClient, _ *fakeLoadBalancer) {
+				if client.bootstrap != 2 {
+					t.Fatalf("bootstrap calls = %d, want interrupted attempt plus successful retry", client.bootstrap)
+				}
+			},
+		},
+		{
+			name: "post-bootstrap",
+			firstPass: func(item cluster.Cluster, client *fakeClient, _ *fakeLoadBalancer) Request {
+				client.kubeErrs = []error{interrupted}
+				return configuredRequest(item, client, nil)
+			},
+			verify: func(t *testing.T, client *fakeClient, _ *fakeLoadBalancer) {
+				if client.kube != 2 {
+					t.Fatalf("kubeconfig calls = %d, want interrupted attempt plus successful retry", client.kube)
+				}
+			},
+		},
+		{
+			name:         "pre-SSA",
+			loadBalancer: true,
+			firstPass: func(item cluster.Cluster, client *fakeClient, loadBalancer *fakeLoadBalancer) Request {
+				loadBalancer.errs = []error{interrupted}
+				return configuredRequest(item, client, loadBalancer)
+			},
+			verify: func(t *testing.T, _ *fakeClient, loadBalancer *fakeLoadBalancer) {
+				if loadBalancer.calls != 2 {
+					t.Fatalf("SSA reconcile calls = %d, want interrupted attempt plus idempotent retry", loadBalancer.calls)
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			item.TalosVersion = "v1.13.6"
+			item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, LB: test.loadBalancer}
+			client := &fakeClient{kubeData: []byte("kubeconfig")}
+			loadBalancer := &fakeLoadBalancer{}
+
+			if _, err := Reconcile(context.Background(), test.firstPass(item, client, loadBalancer)); !errors.Is(err, interrupted) {
+				t.Fatalf("first Reconcile() error = %v, want simulated interruption", err)
+			}
+			client.bootErr = nil
+			result, err := Reconcile(context.Background(), configuredRequest(item, client, loadBalancer))
+			if err != nil {
+				t.Fatalf("retry Reconcile() failed: %v", err)
+			}
+			if result.KubeconfigPath == "" {
+				t.Fatal("retry did not converge to derived credentials")
+			}
+			test.verify(t, client, loadBalancer)
+		})
+	}
+}
+
+func configuredRequest(item cluster.Cluster, client *fakeClient, loadBalancer LoadBalancerReconciler) Request {
+	return Request{
+		Cluster: item, Client: client, LoadBalancer: loadBalancer, PollInterval: time.Nanosecond,
+		Observe: func(context.Context) ([]Node, error) {
+			return []Node{{Name: item.Nodes[0].Name, Role: cluster.RoleControlPlane, IP: item.Nodes[0].IP, Phase: PhaseConfigured}}, nil
+		},
 	}
 }
 
@@ -313,6 +499,80 @@ users:
 	if err := KubernetesReady(context.Background(), invalidCredentials, []string{"cp"}); err == nil || !strings.Contains(err.Error(), "decode kubeconfig CA") {
 		t.Fatalf("KubernetesReady() error = %v, want invalid credential error", err)
 	}
+}
+
+func TestHubbleConvergedRequiresTheDesiredDeployments(t *testing.T) {
+	tests := []struct {
+		name    string
+		desired bool
+		present bool
+		ready   bool
+		wantErr string
+	}{
+		{name: "enabled and ready", desired: true, present: true, ready: true},
+		{name: "enabled but not ready", desired: true, present: true, wantErr: "not Ready"},
+		{name: "enabled but missing", desired: true, wantErr: "404"},
+		{name: "disabled and absent", desired: false},
+		{name: "disabled but still present", desired: false, present: true, ready: true, wantErr: "disabled"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server, kubeconfig := hubbleServer(t, test.present, test.ready)
+			defer server.Close()
+			err := HubbleConverged(context.Background(), kubeconfig, test.desired)
+			if test.wantErr == "" && err != nil {
+				t.Fatal(err)
+			}
+			if test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)) {
+				t.Fatalf("HubbleConverged() error = %v, want %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func hubbleServer(t *testing.T, present, ready bool) (*httptest.Server, []byte) {
+	t.Helper()
+	certificate, certificatePEM, keyPEM := testCertificate(t)
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(certificatePEM) {
+		t.Fatal("parse test CA")
+	}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/apis/apps/v1/namespaces/kube-system/deployments/hubble-relay" && request.URL.Path != "/apis/apps/v1/namespaces/kube-system/deployments/hubble-ui" {
+			writer.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if !present {
+			writer.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if ready {
+			_, _ = writer.Write([]byte(`{"metadata":{"generation":2},"status":{"observedGeneration":2,"readyReplicas":1,"availableReplicas":1}}`))
+			return
+		}
+		_, _ = writer.Write([]byte(`{"metadata":{"generation":2},"status":{"observedGeneration":1}}`))
+	}))
+	server.TLS = &tls.Config{Certificates: []tls.Certificate{certificate}, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool, MinVersion: tls.VersionTLS12}
+	server.StartTLS()
+	kubeconfig := fmt.Sprintf(`apiVersion: v1
+clusters:
+- name: test
+  cluster:
+    server: %s
+    certificate-authority-data: %s
+contexts:
+- name: test
+  context:
+    cluster: test
+    user: admin
+current-context: test
+users:
+- name: admin
+  user:
+    client-certificate-data: %s
+    client-key-data: %s
+`, server.URL, base64.StdEncoding.EncodeToString(certificatePEM), base64.StdEncoding.EncodeToString(certificatePEM), base64.StdEncoding.EncodeToString(keyPEM))
+	return server, []byte(kubeconfig)
 }
 
 func readyServer(t *testing.T, status int, body string) (*httptest.Server, []byte) {

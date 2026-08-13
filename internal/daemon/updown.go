@@ -6,6 +6,7 @@ import (
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/config"
+	"github.com/randax/talos-box/internal/provision"
 )
 
 type upArgs struct {
@@ -17,6 +18,10 @@ type upArgs struct {
 // up reconciles the daemon's world toward the desired clusters: create the
 // missing, start the stopped, leave the running alone.
 func (s *Server) up(raw json.RawMessage) ([]Action, error) {
+	return s.upWithMaintenance(raw, nil)
+}
+
+func (s *Server) upWithMaintenance(raw json.RawMessage, maintenance map[string]maintenanceObservation) ([]Action, error) {
 	var args upArgs
 	if err := decodeArgs(raw, &args); err != nil {
 		return nil, err
@@ -26,13 +31,15 @@ func (s *Server) up(raw json.RawMessage) ([]Action, error) {
 		return nil, err
 	}
 	actions := PlanUp(args.Clusters, existing)
+	updates, err := s.preflightUp(args.Clusters, existing, maintenance)
+	if err != nil {
+		return nil, err
+	}
+	if err := persistIntentUpdates(updates); err != nil {
+		return nil, err
+	}
 	for i, action := range actions {
 		spec := args.Clusters[i]
-		if action.Kind == ActionStart || action.Kind == ActionNone {
-			if err := checkDomainUnchanged(spec); err != nil {
-				return actions[:i], err
-			}
-		}
 		switch action.Kind {
 		case ActionCreate:
 			result, err := s.createFromSpec(spec, args.Talos, args.Force)
@@ -40,7 +47,6 @@ func (s *Server) up(raw json.RawMessage) ([]Action, error) {
 				return actions[:i], fmt.Errorf("create %s: %w", spec.Name, err)
 			}
 			actions[i].Warning = result.Warning
-			actions[i].Narration = result.Narration
 		case ActionStart:
 			encoded, err := json.Marshal(startArgs{Name: spec.Name, Force: args.Force})
 			if err != nil {
@@ -54,6 +60,194 @@ func (s *Server) up(raw json.RawMessage) ([]Action, error) {
 		}
 	}
 	return actions, nil
+}
+
+type maintenanceObservation struct {
+	running map[string]bool
+	phases  map[string]provision.Phase
+}
+
+func (observation maintenanceObservation) sameSnapshot(other maintenanceObservation) bool {
+	if len(observation.running) != len(other.running) || len(observation.phases) != len(other.phases) {
+		return false
+	}
+	for name, running := range observation.running {
+		if otherRunning, ok := other.running[name]; !ok || running != otherRunning {
+			return false
+		}
+	}
+	for name, phase := range observation.phases {
+		if otherPhase, ok := other.phases[name]; !ok || phase != otherPhase {
+			return false
+		}
+	}
+	return true
+}
+
+func (observation maintenanceObservation) allNodesMaintenance(item cluster.Cluster, nodeRunning func(string) bool) bool {
+	if len(item.Nodes) == 0 || len(observation.running) != len(item.Nodes) || len(observation.phases) != len(item.Nodes) {
+		return false
+	}
+	for _, node := range item.Nodes {
+		wasRunning, ok := observation.running[node.Name]
+		if !ok || observation.phases[node.Name] != provision.PhaseMaintenance || wasRunning != nodeRunning(node.Name) {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Server) observeUpMaintenance(raw json.RawMessage) (map[string]maintenanceObservation, error) {
+	var args upArgs
+	if err := decodeArgs(raw, &args); err != nil {
+		return nil, err
+	}
+	type candidate struct {
+		item    cluster.Cluster
+		running map[string]bool
+	}
+	candidates := make([]candidate, 0, len(args.Clusters))
+	load := s.maintenanceLoad
+	if load == nil {
+		load = cluster.Load
+	}
+	for _, spec := range args.Clusters {
+		if spec.CNI == "" {
+			continue
+		}
+		item, err := load(spec.Name)
+		if err != nil {
+			continue
+		}
+		if item.CNI != "" {
+			continue
+		}
+		candidates = append(candidates, candidate{item: item})
+	}
+	s.opMu.Lock()
+	for i := range candidates {
+		candidates[i].running = make(map[string]bool, len(candidates[i].item.Nodes))
+		for _, node := range candidates[i].item.Nodes {
+			candidates[i].running[node.Name] = s.nodeRunning(candidates[i].item.Name, node.Name)
+		}
+	}
+	s.opMu.Unlock()
+
+	observations := make(map[string]maintenanceObservation, len(candidates))
+	for _, candidate := range candidates {
+		phases := make(map[string]provision.Phase, len(candidate.item.Nodes))
+		for _, node := range s.observeProvisionNodesWithRunning(candidate.item, candidate.running) {
+			phases[node.Name] = node.Phase
+		}
+		observations[candidate.item.Name] = maintenanceObservation{running: candidate.running, phases: phases}
+	}
+	return observations, nil
+}
+
+func actionAfterProvision(action ActionKind, narration []string) ActionKind {
+	if action == ActionNone && len(narration) > 0 {
+		return ActionReconcile
+	}
+	return action
+}
+
+type intentUpdate struct {
+	next cluster.Cluster
+}
+
+func persistIntentUpdates(updates []intentUpdate) error {
+	for _, update := range updates {
+		if err := cluster.Save(update.next); err != nil {
+			return fmt.Errorf("persist provisioning intent for %s: %w", update.next.Name, err)
+		}
+	}
+	return nil
+}
+
+// preflightUp validates every existing cluster before it persists an intent
+// update or starts a VM. That makes a multi-cluster `tbx up` fail atomically
+// with respect to its declarative mutation rules: an invalid later cluster
+// cannot leave an earlier one provisioned by surprise.
+func (s *Server) preflightUp(
+	specs []config.ClusterSpec,
+	existing map[string]ClusterState,
+	maintenance map[string]maintenanceObservation,
+) ([]intentUpdate, error) {
+	updates := make([]intentUpdate, 0, len(specs))
+	for _, spec := range specs {
+		if !existing[spec.Name].Exists {
+			continue
+		}
+		item, err := cluster.Load(spec.Name)
+		if err != nil {
+			return nil, fmt.Errorf("load %s: %w", spec.Name, err)
+		}
+		if err := checkDomainUnchanged(item, spec); err != nil {
+			return nil, err
+		}
+		allNodesMaintenance := false
+		if item.CNI == "" && spec.CNI != "" {
+			observation, ok := maintenance[item.Name]
+			allNodesMaintenance = ok && observation.allNodesMaintenance(item, func(nodeName string) bool {
+				return s.nodeRunning(item.Name, nodeName)
+			})
+		}
+		intent, changed, err := reconcileProvisioningIntent(item, spec, allNodesMaintenance)
+		if err != nil {
+			return nil, err
+		}
+		if changed {
+			item.ProvisioningIntent = intent
+			updates = append(updates, intentUpdate{next: item})
+		}
+	}
+	return updates, nil
+}
+
+// reconcileProvisioningIntent returns the only allowed persisted intent
+// update for an existing cluster. It is deliberately pure: its caller first
+// validates the complete desired set, then persists updates before running
+// any host or Talos mutation.
+func reconcileProvisioningIntent(item cluster.Cluster, spec config.ClusterSpec, allMaintenance bool) (cluster.ProvisioningIntent, bool, error) {
+	current := item.ProvisioningIntent
+	desired := spec.ProvisioningIntent
+	if current.CNI == "" {
+		if desired.CNI == "" {
+			return current, false, nil
+		}
+		if !allMaintenance {
+			return current, false, fmt.Errorf(
+				"cluster %q: cni can be added only while all nodes are in maintenance mode; destroy and recreate after configuration",
+				item.Name,
+			)
+		}
+		return desired, true, nil
+	}
+
+	if desired.CNI != current.CNI {
+		return current, false, fmt.Errorf(
+			"cluster %q: cni is immutable once provisioning begins (cluster has %q, talosbox.yaml wants %q); run: tbx cluster destroy %s && tbx up",
+			item.Name, current.CNI, desired.CNI, item.Name,
+		)
+	}
+	if current.LB && !desired.LB {
+		return current, false, fmt.Errorf(
+			"cluster %q: lb is immutable once enabled; run: tbx cluster destroy %s && tbx up to disable it",
+			item.Name, item.Name,
+		)
+	}
+
+	next := current
+	if !next.LB && desired.LB {
+		next.LB = true
+	}
+	// Hubble is the one symmetric optional desired set. CNI and LB rules above
+	// have already fixed the cluster's irreversible substrate contract.
+	if current.CNI == cluster.CNICilium {
+		next.BGP = desired.BGP
+		next.Hubble = desired.Hubble
+	}
+	return next, next != current, nil
 }
 
 // down stops every cluster the file describes; it never destroys.
@@ -81,11 +275,7 @@ func (s *Server) down(raw json.RawMessage) ([]Action, error) {
 // checkDomainUnchanged rejects a talosbox.yaml that asks an existing cluster
 // for a different domain: the domain is immutable (cert SANs bake it in), so
 // silence here would misreport reality as reconciled.
-func checkDomainUnchanged(spec config.ClusterSpec) error {
-	item, err := cluster.Load(spec.Name)
-	if err != nil {
-		return nil // partially-created state; create/start surfaces the real error
-	}
+func checkDomainUnchanged(item cluster.Cluster, spec config.ClusterSpec) error {
 	if specEffectiveDomain(spec) != item.EffectiveDomain() {
 		return fmt.Errorf(
 			"cluster %q: domain is immutable (cluster has %q, talosbox.yaml wants %q); destroy and recreate the cluster to change it",
