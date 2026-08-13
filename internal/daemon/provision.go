@@ -90,7 +90,7 @@ func (s *Server) beginProvisionTasksLocked(items []cluster.Cluster) []provisionT
 		if s.provisions == nil {
 			s.provisions = make(map[string]activeProvision)
 		}
-		if item.CSI == cluster.CSILocalPath {
+		if item.CSI != "" {
 			if s.storagePhases == nil {
 				s.storagePhases = make(map[string]StoragePhase)
 			}
@@ -191,8 +191,11 @@ func (s *Server) provisionFlannel(parent context.Context, item cluster.Cluster) 
 		},
 		PollInterval: time.Second,
 	}
-	if item.CSI == cluster.CSILocalPath {
+	switch item.CSI {
+	case cluster.CSILocalPath:
 		request.Storage = provision.LocalPathReconciler{PollInterval: time.Second}
+	case cluster.CSILonghorn:
+		request.Storage = provision.LonghornReconciler{PollInterval: time.Second}
 	}
 	result, err := reconcile(ctx, request)
 	if err != nil {
@@ -274,7 +277,7 @@ func (s *Server) refreshStoragePhases(statuses []ClusterStatus) {
 		status.StoragePhase = ""
 		status.StorageError = ""
 		switch {
-		case status.CNI != cluster.CNIFlannel, status.CSI != cluster.CSILocalPath, !status.Running:
+		case status.CNI != cluster.CNIFlannel, status.CSI == "", !status.Running:
 		case known[status.Name] == StoragePhaseLive:
 			status.StoragePhase = StoragePhaseLive
 		case active[status.Name], !status.KubernetesReady:
@@ -348,8 +351,19 @@ func (s *Server) probeStorageStatus(parent context.Context, name string) error {
 	defer cancel()
 	probe := s.storageProbe
 	if probe == nil {
+		item, err := cluster.Load(name)
+		if err != nil {
+			return err
+		}
 		probe = func(ctx context.Context, kubeconfig []byte) error {
-			return provision.ProbeLocalPathStorage(ctx, kubeconfig, time.Second)
+			switch item.CSI {
+			case cluster.CSILocalPath:
+				return provision.ProbeLocalPathStorage(ctx, kubeconfig, time.Second)
+			case cluster.CSILonghorn:
+				return provision.ProbeLonghornStorage(ctx, kubeconfig, time.Second)
+			default:
+				return nil
+			}
 		}
 	}
 	return probe(ctx, kubeconfig)

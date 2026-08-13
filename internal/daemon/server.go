@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/randax/talos-box/internal/balloon"
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/hostpressure"
 	"github.com/randax/talos-box/internal/hypervisor"
@@ -39,6 +40,7 @@ type Server struct {
 	storageProbe         func(context.Context, []byte) error
 	nodeIPLookup         func(string, int) string
 	nodeProbe            func(string) ProbeResult
+	hostFreeMemory       func() (int, error)
 	lifecycleContext     context.Context
 	lifecycleCancel      context.CancelFunc
 	mirrors              *mirror.Manager
@@ -112,6 +114,7 @@ func NewServer(ctx context.Context) (*Server, error) {
 		mirrors:              mirror.NewManager(mirror.DefaultDir(root)),
 		subnetSources:        cluster.SystemSubnetSources(),
 		hostPressure:         hostpressure.SystemSnapshot,
+		hostFreeMemory:       balloon.HostFreeMiB,
 	}, nil
 }
 
