@@ -116,6 +116,7 @@ func TestRunStorageProbeWritesReadsAndCleansUp(t *testing.T) {
 	clientset.PrependReactor("get", "persistentvolumeclaims", func(k8stesting.Action) (bool, runtime.Object, error) {
 		return true, &corev1.PersistentVolumeClaim{
 			ObjectMeta: metav1.ObjectMeta{Name: storageProbePVCName, Namespace: probeNamespace},
+			Spec:       corev1.PersistentVolumeClaimSpec{StorageClassName: stringPointer(localPathStorageClass)},
 			Status:     corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
 		}, nil
 	})
@@ -148,7 +149,8 @@ func TestRunStorageProbeWritesReadsAndCleansUp(t *testing.T) {
 	})
 
 	if err := runStorageProbe(context.Background(), dynamicClient, mapper, clientset, storageProbeSpec{
-		ProbeImage: localPathHelperImage,
+		ExpectedStorageClass: localPathStorageClass,
+		ProbeImage:           localPathHelperImage,
 	}, time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +200,8 @@ func TestRunStorageProbeReturnsContextAndCleansUp(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
 	defer cancel()
 	err := runStorageProbe(ctx, dynamicClient, mapper, clientset, storageProbeSpec{
-		ProbeImage: localPathHelperImage,
+		ExpectedStorageClass: localPathStorageClass,
+		ProbeImage:           localPathHelperImage,
 	}, time.Millisecond)
 	if err == nil {
 		t.Fatal("runStorageProbe() error = nil, want context deadline")
@@ -340,7 +343,7 @@ func TestFlannelReconcileRunsStorageAfterLoadBalancer(t *testing.T) {
 }
 
 func TestStorageProbeRendersBarePVCToVerifyDefaultStorageClass(t *testing.T) {
-	objects, err := renderStorageProbe(storageProbeSpec{ProbeImage: "example.invalid/probe:1"})
+	objects, err := renderStorageProbe(storageProbeSpec{ExpectedStorageClass: localPathStorageClass, ProbeImage: "example.invalid/probe:1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -395,11 +398,25 @@ func TestStorageProbePVCBoundIncludesPhase(t *testing.T) {
 			Status:     corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimPending},
 		}, nil
 	})
-	err := waitForBoundPersistentVolumeClaim(ctx, clientset, probeNamespace, storageProbePVCName, time.Millisecond)
+	err := waitForBoundPersistentVolumeClaim(ctx, clientset, probeNamespace, storageProbePVCName, localPathStorageClass, time.Millisecond)
 	if err == nil || !strings.Contains(err.Error(), string(corev1.ClaimPending)) {
 		t.Fatalf("waitForBoundPersistentVolumeClaim() error = %v", err)
 	}
 }
+
+func TestStorageProbeRejectsDifferentDefaultStorageClass(t *testing.T) {
+	clientset := kubernetesfake.NewClientset(&corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: storageProbePVCName, Namespace: probeNamespace},
+		Spec:       corev1.PersistentVolumeClaimSpec{StorageClassName: stringPointer("other-default")},
+		Status:     corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
+	})
+	err := waitForBoundPersistentVolumeClaim(context.Background(), clientset, probeNamespace, storageProbePVCName, localPathStorageClass, time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), `defaulted to StorageClass "other-default"`) {
+		t.Fatalf("waitForBoundPersistentVolumeClaim() error = %v", err)
+	}
+}
+
+func stringPointer(value string) *string { return &value }
 
 func TestStorageProbeDeleteIgnoresMissingObjects(t *testing.T) {
 	clientset := kubernetesfake.NewClientset()

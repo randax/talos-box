@@ -273,9 +273,6 @@ func (s *Server) refreshStoragePhases(statuses []ClusterStatus) {
 			status.StoragePhase = StoragePhaseProvisioning
 		case s.probeStorageStatus(status.Name) == nil:
 			status.StoragePhase = StoragePhaseLive
-			s.opMu.Lock()
-			s.recordStoragePhaseLocked(status.Name, StoragePhaseLive)
-			s.opMu.Unlock()
 		default:
 			status.StoragePhase = StoragePhaseProvisioning
 		}
@@ -284,6 +281,14 @@ func (s *Server) refreshStoragePhases(statuses []ClusterStatus) {
 }
 
 func (s *Server) probeStorageStatus(name string) error {
+	s.storageProbeMu.Lock()
+	defer s.storageProbeMu.Unlock()
+	s.opMu.Lock()
+	alreadyLive := s.storagePhases != nil && s.storagePhases[name] == StoragePhaseLive
+	s.opMu.Unlock()
+	if alreadyLive {
+		return nil
+	}
 	dir, err := cluster.Dir(name)
 	if err != nil {
 		return err
@@ -300,7 +305,13 @@ func (s *Server) probeStorageStatus(name string) error {
 			return provision.ProbeLocalPathStorage(ctx, kubeconfig, time.Second)
 		}
 	}
-	return probe(ctx, kubeconfig)
+	if err := probe(ctx, kubeconfig); err != nil {
+		return err
+	}
+	s.opMu.Lock()
+	s.recordStoragePhaseLocked(name, StoragePhaseLive)
+	s.opMu.Unlock()
+	return nil
 }
 
 func (s *Server) recordStoragePhaseLocked(name string, phase StoragePhase) {

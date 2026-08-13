@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -122,5 +124,50 @@ func TestRefreshStoragePhasesDoesNotClaimUnsupportedBackendIsProvisioning(t *tes
 
 	if statuses[0].StoragePhase != "" {
 		t.Fatalf("storage phase = %q, want unknown until Longhorn support is installed", statuses[0].StoragePhase)
+	}
+}
+
+func TestRefreshStoragePhasesSharesConcurrentRestartProbe(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir, err := cluster.Dir("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "kubeconfig"), []byte("credentials"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	service := &Server{storageProbe: func(context.Context, []byte) error {
+		if calls.Add(1) == 1 {
+			close(entered)
+		}
+		<-release
+		return nil
+	}}
+	newStatuses := func() []ClusterStatus {
+		return []ClusterStatus{{
+			Name: "demo", Running: true,
+			ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILocalPath},
+		}}
+	}
+	first, second := newStatuses(), newStatuses()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); service.refreshStoragePhases(first) }()
+	<-entered
+	go func() { defer wg.Done(); service.refreshStoragePhases(second) }()
+	close(release)
+	wg.Wait()
+
+	if calls.Load() != 1 {
+		t.Fatalf("storage probe calls = %d, want one shared observation", calls.Load())
+	}
+	if first[0].StoragePhase != StoragePhaseLive || second[0].StoragePhase != StoragePhaseLive {
+		t.Fatalf("storage phases = %q, %q; want live", first[0].StoragePhase, second[0].StoragePhase)
 	}
 }

@@ -28,6 +28,7 @@ type Server struct {
 	hypervisor hypervisor.Hypervisor
 
 	opMu               sync.Mutex
+	storageProbeMu     sync.Mutex
 	vms                map[string]map[string]hypervisor.Machine
 	provisions         map[string]activeProvision
 	storagePhases      map[string]StoragePhase

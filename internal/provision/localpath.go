@@ -85,7 +85,10 @@ func ProbeLocalPathStorage(ctx context.Context, kubeconfig []byte, interval time
 	if interval <= 0 {
 		interval = time.Second
 	}
-	return runStorageProbe(ctx, dynamicClient, mapper, clientset, storageProbeSpec{ProbeImage: localPathHelperImage}, interval)
+	return runStorageProbe(ctx, dynamicClient, mapper, clientset, storageProbeSpec{
+		ExpectedStorageClass: localPathStorageClass,
+		ProbeImage:           localPathHelperImage,
+	}, interval)
 }
 
 func (r LocalPathReconciler) reconcile(ctx context.Context, config *rest.Config, objects []unstructured.Unstructured) (StorageResult, error) {
@@ -117,7 +120,8 @@ func (r LocalPathReconciler) reconcile(ctx context.Context, config *rest.Config,
 		return StorageResult{}, err
 	}
 	if err := runStorageProbe(ctx, dynamicClient, mapper, clientset, storageProbeSpec{
-		ProbeImage: localPathHelperImage,
+		ExpectedStorageClass: localPathStorageClass,
+		ProbeImage:           localPathHelperImage,
 	}, r.PollInterval); err != nil {
 		return StorageResult{}, err
 	}

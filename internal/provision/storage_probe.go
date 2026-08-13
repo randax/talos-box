@@ -25,7 +25,8 @@ const (
 )
 
 type storageProbeSpec struct {
-	ProbeImage string
+	ExpectedStorageClass string
+	ProbeImage           string
 }
 
 func runStorageProbe(ctx context.Context, dynamicClient dynamic.Interface, mapper meta.RESTMapper, client kubernetes.Interface, spec storageProbeSpec, interval time.Duration) (err error) {
@@ -55,7 +56,7 @@ func runStorageProbe(ctx context.Context, dynamicClient dynamic.Interface, mappe
 	if err := applyAll(ctx, dynamicClient, mapper, objects[:3]); err != nil {
 		return fmt.Errorf("apply storage probe writer: %w", err)
 	}
-	if err := waitForBoundPersistentVolumeClaim(ctx, client, probeNamespace, storageProbePVCName, interval); err != nil {
+	if err := waitForBoundPersistentVolumeClaim(ctx, client, probeNamespace, storageProbePVCName, spec.ExpectedStorageClass, interval); err != nil {
 		return err
 	}
 	if err := waitForProbePod(ctx, client, probeNamespace, storageProbeWriterPodName, interval); err != nil {
@@ -74,6 +75,9 @@ func runStorageProbe(ctx context.Context, dynamicClient dynamic.Interface, mappe
 }
 
 func renderStorageProbe(spec storageProbeSpec) ([]unstructured.Unstructured, error) {
+	if spec.ExpectedStorageClass == "" {
+		return nil, errors.New("storage probe requires an expected default StorageClass")
+	}
 	if spec.ProbeImage == "" {
 		return nil, errors.New("storage probe requires a probe image")
 	}
@@ -152,7 +156,7 @@ spec:
 	return objects, nil
 }
 
-func waitForBoundPersistentVolumeClaim(ctx context.Context, client kubernetes.Interface, namespace, name string, interval time.Duration) error {
+func waitForBoundPersistentVolumeClaim(ctx context.Context, client kubernetes.Interface, namespace, name, expectedStorageClass string, interval time.Duration) error {
 	return poll(ctx, interval, func(ctx context.Context) error {
 		persistentVolumeClaim, err := client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
@@ -160,6 +164,13 @@ func waitForBoundPersistentVolumeClaim(ctx context.Context, client kubernetes.In
 		}
 		if persistentVolumeClaim.Status.Phase != corev1.ClaimBound {
 			return fmt.Errorf("storage probe PVC %q phase = %s", name, persistentVolumeClaim.Status.Phase)
+		}
+		if persistentVolumeClaim.Spec.StorageClassName == nil || *persistentVolumeClaim.Spec.StorageClassName != expectedStorageClass {
+			actual := ""
+			if persistentVolumeClaim.Spec.StorageClassName != nil {
+				actual = *persistentVolumeClaim.Spec.StorageClassName
+			}
+			return terminal(fmt.Errorf("storage probe PVC %q defaulted to StorageClass %q, want %q", name, actual, expectedStorageClass))
 		}
 		return nil
 	})
