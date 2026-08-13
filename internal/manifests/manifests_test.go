@@ -279,8 +279,8 @@ func TestTalosSectionIncludesStorageKubeletMounts(t *testing.T) {
 	}
 
 	if got, want := kubeletPatch.Machine.Kubelet.ExtraMounts, []talosExtraMount{
-		{Destination: "/var/local-path-provisioner", Type: "bind", Source: "/var/local-path-provisioner", Options: []string{"rshared", "rw"}},
-		{Destination: "/var/lib/longhorn", Type: "bind", Source: "/var/lib/longhorn", Options: []string{"rshared", "rw"}},
+		{Destination: "/var/local-path-provisioner", Type: "bind", Source: "/var/local-path-provisioner", Options: []string{"bind", "rshared", "rw"}},
+		{Destination: "/var/lib/longhorn", Type: "bind", Source: "/var/lib/longhorn", Options: []string{"bind", "rshared", "rw"}},
 	}; !equalTalosExtraMounts(got, want) {
 		t.Fatalf("kubelet extraMounts = %#v, want %#v", got, want)
 	}

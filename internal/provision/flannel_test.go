@@ -245,8 +245,8 @@ func TestGenerateFlannelAddsStorageKubeletMountsForEveryRole(t *testing.T) {
 			}
 
 			want := []talosExtraMount{
-				{Destination: "/var/local-path-provisioner", Type: "bind", Source: "/var/local-path-provisioner", Options: []string{"rshared", "rw"}},
-				{Destination: "/var/lib/longhorn", Type: "bind", Source: "/var/lib/longhorn", Options: []string{"rshared", "rw"}},
+				{Destination: "/var/local-path-provisioner", Type: "bind", Source: "/var/local-path-provisioner", Options: []string{"bind", "rshared", "rw"}},
+				{Destination: "/var/lib/longhorn", Type: "bind", Source: "/var/lib/longhorn", Options: []string{"bind", "rshared", "rw"}},
 			}
 			for _, role := range []cluster.Role{cluster.RoleControlPlane, cluster.RoleWorker} {
 				config, ok := generated.configs[role]

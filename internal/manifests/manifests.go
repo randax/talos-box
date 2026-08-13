@@ -254,13 +254,13 @@ func StoragePrerequisiteKubeletExtraMounts() []KubeletExtraMount {
 			Destination: localPathVolume,
 			Type:        "bind",
 			Source:      localPathVolume,
-			Options:     []string{"rshared", "rw"},
+			Options:     []string{"bind", "rshared", "rw"},
 		},
 		{
 			Destination: longhornVolume,
 			Type:        "bind",
 			Source:      longhornVolume,
-			Options:     []string{"rshared", "rw"},
+			Options:     []string{"bind", "rshared", "rw"},
 		},
 	}
 }
