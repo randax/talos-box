@@ -99,6 +99,12 @@ func Hints(status ClusterStatus) []string {
 	if hint := storageHint(status); hint != "" {
 		hints = append(hints, hint)
 	}
+	if hint := unsupportedCSIHint(status); hint != "" {
+		hints = append(hints, hint)
+	}
+	if hint := longhornSingleNodeHint(status); hint != "" {
+		hints = append(hints, hint)
+	}
 	if len(maintenance) > 0 {
 		first := maintenance[0]
 		endpoint := status.controlPlaneOr(first)
@@ -157,6 +163,23 @@ func storageHint(status ClusterStatus) string {
 	default:
 		return ""
 	}
+}
+
+func longhornSingleNodeHint(status ClusterStatus) string {
+	if status.CSI == cluster.CSILonghorn &&
+		len(status.Nodes) == 1 &&
+		status.Running &&
+		status.StoragePhase == StoragePhaseLive {
+		return "Longhorn is running with a single replica on one node, so volumes have no redundancy."
+	}
+	return ""
+}
+
+func unsupportedCSIHint(status ClusterStatus) string {
+	if status.CSI == "" || status.CNI == "" || status.CNI == cluster.CNIFlannel {
+		return ""
+	}
+	return fmt.Sprintf("curated CSI provisioning for cni: %s is not implemented yet, so tbx preserved the storage intent but did not install it.", status.CNI)
 }
 
 // controlPlaneOr returns the cluster's first control-plane node, or fallback.

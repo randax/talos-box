@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/randax/talos-box/internal/balloon"
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/hostpressure"
 	"github.com/randax/talos-box/internal/hypervisor"
@@ -39,6 +40,7 @@ type Server struct {
 	storageProbe         func(context.Context, []byte) error
 	nodeIPLookup         func(string, int) string
 	nodeProbe            func(string) ProbeResult
+	hostFreeMemory       func() (int, error)
 	lifecycleContext     context.Context
 	lifecycleCancel      context.CancelFunc
 	mirrors              *mirror.Manager
@@ -112,6 +114,7 @@ func NewServer(ctx context.Context) (*Server, error) {
 		mirrors:              mirror.NewManager(mirror.DefaultDir(root)),
 		subnetSources:        cluster.SystemSubnetSources(),
 		hostPressure:         hostpressure.SystemSnapshot,
+		hostFreeMemory:       balloon.HostFreeMiB,
 	}, nil
 }
 
@@ -269,6 +272,9 @@ func (s *Server) dispatch(request Request) Response {
 	if request.Op == "cluster.create" || request.Op == "cluster.start" || request.Op == "up" {
 		return s.dispatchProvisioning(request)
 	}
+	if request.Op == "node.add" || request.Op == "node.remove" {
+		return s.dispatchNodeMutation(request)
+	}
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 
@@ -282,6 +288,19 @@ func (s *Server) dispatch(request Request) Response {
 func (s *Server) dispatchProvisioning(request Request) Response {
 	s.opMu.Lock()
 	data, tasks, err := s.handleProvisioningLocked(request)
+	s.opMu.Unlock()
+	if err != nil {
+		return failure(err)
+	}
+	if err := s.runProvisionTasks(data, tasks); err != nil {
+		return failure(err)
+	}
+	return success(data)
+}
+
+func (s *Server) dispatchNodeMutation(request Request) Response {
+	s.opMu.Lock()
+	data, tasks, err := s.handleNodeMutationLocked(request)
 	s.opMu.Unlock()
 	if err != nil {
 		return failure(err)

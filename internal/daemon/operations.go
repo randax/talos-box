@@ -233,6 +233,9 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	item.Domain = canonicalDomain
 	item.AllowUnsafeDomain = canonicalDomain != "" && args.AllowUnsafeDomain
 	item.ImageArchitecture = string(s.hypervisor.Architecture())
+	longhornWarning := s.checkLonghornMemoryWarning(item)
+	longhornCustomSchematicWarning := s.longhornCustomSchematicWarning(item, args.Schematic != "")
+	unsupportedCSIWarning := unsupportedCSIProvisioningWarning(item)
 	item.Schematic, item.TalosVersion, err = s.resolveImage(args.Schematic, args.Version)
 	if err != nil {
 		return ClusterSummary{}, err
@@ -257,11 +260,11 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	startWarning, err := s.start(item)
 	if err != nil {
 		result := summary(item, false)
-		result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, subnetWarning)
+		result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, longhornWarning, longhornCustomSchematicWarning, unsupportedCSIWarning, subnetWarning)
 		return result, fmt.Errorf("cluster created but failed to start: %w", err)
 	}
 	result := summary(item, true)
-	result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, subnetWarning, startWarning)
+	result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, longhornWarning, longhornCustomSchematicWarning, unsupportedCSIWarning, subnetWarning, startWarning)
 	return result, nil
 }
 
@@ -282,6 +285,9 @@ func (s *Server) startCluster(raw json.RawMessage) (ClusterSummary, error) {
 		}
 		overcommitWarning = w
 	}
+	longhornWarning := s.checkLonghornMemoryWarning(item)
+	longhornCustomSchematicWarning := s.longhornCustomSchematicWarning(item, s.defaultSchematic != "" && item.Schematic != "" && item.Schematic != s.defaultSchematic)
+	unsupportedCSIWarning := unsupportedCSIProvisioningWarning(item)
 	dir, err := cluster.Dir(item.Name)
 	if err != nil {
 		return ClusterSummary{}, err
@@ -295,8 +301,22 @@ func (s *Server) startCluster(raw json.RawMessage) (ClusterSummary, error) {
 		return ClusterSummary{}, err
 	}
 	result := summary(item, true)
-	result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, subnetWarning)
+	result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, longhornWarning, longhornCustomSchematicWarning, unsupportedCSIWarning, subnetWarning)
 	return result, nil
+}
+
+func unsupportedCSIProvisioningWarning(item cluster.Cluster) string {
+	if item.CSI == "" || item.CNI == "" || item.CNI == cluster.CNIFlannel {
+		return ""
+	}
+	return fmt.Sprintf("curated CSI provisioning for cni: %s is not implemented yet; tbx preserved csi: %s intent but will not install storage until that provisioning path exists", item.CNI, item.CSI)
+}
+
+func (s *Server) longhornCustomSchematicWarning(item cluster.Cluster, custom bool) string {
+	if item.CSI != cluster.CSILonghorn || !custom {
+		return ""
+	}
+	return "Longhorn on a custom Talos schematic requires siderolabs/iscsi-tools and siderolabs/util-linux-tools; tbx's default generated schematic already includes them"
 }
 
 func (s *Server) start(item cluster.Cluster) (string, error) {
@@ -569,92 +589,122 @@ func (s *Server) listClusters() ([]ClusterSummary, error) {
 }
 
 func (s *Server) addNode(raw json.RawMessage) (NodeStatus, error) {
+	status, _, err := s.addNodeLocked(raw)
+	return status, err
+}
+
+func (s *Server) addNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTask, error) {
 	var args nodeArgs
 	if err := decodeArgs(raw, &args); err != nil {
-		return NodeStatus{}, err
+		return NodeStatus{}, nil, err
 	}
 	if args.Role == "" {
 		args.Role = cluster.RoleWorker
 	}
 	item, err := cluster.Load(args.Cluster)
 	if err != nil {
-		return NodeStatus{}, err
+		return NodeStatus{}, nil, err
 	}
 	addMiB := item.DefaultsFor(args.Role).MemoryMiB
 	overcommitWarning, err := s.checkOvercommit(addMiB, args.Force)
 	if err != nil {
-		return NodeStatus{}, err
+		return NodeStatus{}, nil, err
 	}
 	dir, err := cluster.Dir(item.Name)
 	if err != nil {
-		return NodeStatus{}, err
+		return NodeStatus{}, nil, err
 	}
 	hostPressureWarning, err := s.checkHostPressure(dir, args.Force)
 	if err != nil {
-		return NodeStatus{}, err
+		return NodeStatus{}, nil, err
 	}
 	running := s.clusterRunning(item.Name)
 	var subnetWarning string
 	if running {
 		subnetWarning, err = cluster.CheckSubnetIndex(item.SubnetIndex, s.hostSubnetSources())
 		if err != nil {
-			return NodeStatus{}, err
+			return NodeStatus{}, nil, err
 		}
 	}
 	cachedDisk, err := s.cachedDisk(item)
 	if err != nil {
-		return NodeStatus{}, err
+		return NodeStatus{}, nil, err
 	}
 	node, err := cluster.AddNode(&item, args.Role, args.Name)
 	if err != nil {
-		return NodeStatus{}, err
+		return NodeStatus{}, nil, err
 	}
 	if err := cluster.ProvisionDisks(item, cachedDisk); err != nil {
 		_ = removeNodeFiles(item.Name, node.Name)
-		return NodeStatus{}, err
+		return NodeStatus{}, nil, err
 	}
 	if err := cluster.Save(item); err != nil {
 		_ = removeNodeFiles(item.Name, node.Name)
-		return NodeStatus{}, err
+		return NodeStatus{}, nil, err
 	}
 	if running {
 		machine, err := s.launchMachine(item, node, nil)
 		if err != nil {
-			return nodeStatus(node, item.SubnetIndex, false), fmt.Errorf("node added but failed to create VM: %w", err)
+			return nodeStatus(node, item.SubnetIndex, false), nil, fmt.Errorf("node added but failed to create VM: %w", err)
 		}
 		s.vms[item.Name][node.Name] = machine
 	}
 	status := nodeStatus(node, item.SubnetIndex, s.nodeRunning(item.Name, node.Name))
-	status.Warning = joinWarnings(overcommitWarning, hostPressureWarning, subnetWarning)
-	return status, nil
+	customSchematic := s.defaultSchematic != "" && item.Schematic != "" && item.Schematic != s.defaultSchematic
+	status.Warning = joinWarnings(overcommitWarning, hostPressureWarning, subnetWarning, s.longhornCustomSchematicWarning(item, customSchematic))
+	return status, s.beginNodeMutationProvisionLocked(item), nil
 }
 
 func (s *Server) removeNode(raw json.RawMessage) (NodeStatus, error) {
+	status, _, err := s.removeNodeLocked(raw)
+	return status, err
+}
+
+func (s *Server) removeNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTask, error) {
 	var args nodeArgs
 	if err := decodeArgs(raw, &args); err != nil {
-		return NodeStatus{}, err
+		return NodeStatus{}, nil, err
 	}
 	item, err := cluster.Load(args.Cluster)
 	if err != nil {
-		return NodeStatus{}, err
+		return NodeStatus{}, nil, err
 	}
 	node, err := cluster.RemoveNode(&item, args.Name)
 	if err != nil {
-		return NodeStatus{}, err
+		return NodeStatus{}, nil, err
 	}
 	if machine := s.vms[item.Name][node.Name]; machine != nil {
 		if err := closeMachine(machine); err != nil {
-			return NodeStatus{}, fmt.Errorf("stop node %s: %w", node.Name, err)
+			return NodeStatus{}, nil, fmt.Errorf("stop node %s: %w", node.Name, err)
 		}
 		delete(s.vms[item.Name], node.Name)
 	}
 	if err := cluster.Save(item); err != nil {
-		return NodeStatus{}, err
+		return NodeStatus{}, nil, err
 	}
 	if err := removeNodeFiles(item.Name, node.Name); err != nil {
-		return NodeStatus{}, err
+		return NodeStatus{}, nil, err
 	}
-	return nodeStatus(node, item.SubnetIndex, false), nil
+	return nodeStatus(node, item.SubnetIndex, false), s.beginNodeMutationProvisionLocked(item), nil
+}
+
+func (s *Server) handleNodeMutationLocked(request Request) (any, []provisionTask, error) {
+	switch request.Op {
+	case "node.add":
+		result, tasks, err := s.addNodeLocked(request.Args)
+		if err != nil {
+			return nil, nil, err
+		}
+		return result, tasks, nil
+	case "node.remove":
+		result, tasks, err := s.removeNodeLocked(request.Args)
+		if err != nil {
+			return nil, nil, err
+		}
+		return result, tasks, nil
+	default:
+		return nil, nil, fmt.Errorf("operation %q is not a node mutation", request.Op)
+	}
 }
 
 func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {

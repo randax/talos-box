@@ -304,7 +304,7 @@ func TestFlannelStorageRequiresKubernetesReconciler(t *testing.T) {
 	}
 }
 
-func TestFlannelReconcileDoesNotRouteLonghornToLocalPath(t *testing.T) {
+func TestFlannelReconcileRoutesLonghornStorage(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{})
 	if err != nil {
@@ -324,8 +324,8 @@ func TestFlannelReconcileDoesNotRouteLonghornToLocalPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if storage.calls != 0 {
-		t.Fatalf("local-path storage reconciler calls = %d, want 0 for longhorn", storage.calls)
+	if storage.calls != 1 {
+		t.Fatalf("storage reconciler calls = %d, want 1 for longhorn", storage.calls)
 	}
 }
 

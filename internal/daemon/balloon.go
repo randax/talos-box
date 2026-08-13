@@ -131,6 +131,29 @@ func (s *Server) checkHostPressure(path string, force bool) (string, error) {
 	return warning + " (forced)", nil
 }
 
+func (s *Server) checkLonghornMemoryWarning(item cluster.Cluster) string {
+	if item.CSI != cluster.CSILonghorn {
+		return ""
+	}
+	measure := s.hostFreeMemory
+	if measure == nil {
+		measure = balloon.HostFreeMiB
+	}
+	freeMiB, err := measure()
+	if err != nil {
+		return ""
+	}
+	reserveMiB := balloon.DefaultConfig().ReserveMiB
+	projectedFreeMiB := freeMiB - clusterMemoryMiB(item)
+	if projectedFreeMiB >= reserveMiB {
+		return ""
+	}
+	if projectedFreeMiB < 0 {
+		projectedFreeMiB = 0
+	}
+	return fmt.Sprintf("Longhorn on a memory-tight host: projected free memory %d MiB is below the %d MiB balloon reserve; storage replicas may stall under swap pressure, but tbx will continue", projectedFreeMiB, reserveMiB)
+}
+
 func clusterMemoryMiB(item cluster.Cluster) int {
 	total := 0
 	for _, node := range item.Nodes {

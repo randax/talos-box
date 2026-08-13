@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -12,6 +13,8 @@ import (
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/hypervisor"
+	"github.com/randax/talos-box/internal/imagecache"
+	"github.com/randax/talos-box/internal/provision"
 )
 
 func runningStorageVMs(name string) map[string]map[string]hypervisor.Machine {
@@ -70,16 +73,129 @@ func TestRefreshKubernetesReadinessSkipsStoppedFlannelClusters(t *testing.T) {
 
 func TestRefreshStoragePhasesDefaultsCSIClustersToProvisioning(t *testing.T) {
 	service := &Server{}
-	statuses := []ClusterStatus{{
-		Name:               "demo",
-		Running:            true,
-		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILocalPath},
-	}}
+	for _, csi := range []cluster.CSI{cluster.CSILocalPath, cluster.CSILonghorn} {
+		statuses := []ClusterStatus{{
+			Name:               "demo",
+			Running:            true,
+			ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: csi},
+		}}
 
-	service.refreshStoragePhases(statuses)
+		service.refreshStoragePhases(statuses)
 
-	if statuses[0].StoragePhase != StoragePhaseProvisioning {
-		t.Fatalf("storage phase = %q, want %q", statuses[0].StoragePhase, StoragePhaseProvisioning)
+		if statuses[0].StoragePhase != StoragePhaseProvisioning {
+			t.Fatalf("csi=%s storage phase = %q, want %q", csi, statuses[0].StoragePhase, StoragePhaseProvisioning)
+		}
+	}
+}
+
+func TestNodeAddReprovisionsRunningLonghornClusterWithUpdatedTopology(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 0)
+	service.storagePhases[item.Name] = StoragePhaseLive
+
+	var reconciledNodes int
+	service.provisionReconcile = func(_ context.Context, request provision.Request) (provision.Result, error) {
+		reconciledNodes = len(request.Cluster.Nodes)
+		service.opMu.Lock()
+		phase := service.storagePhases[request.Cluster.Name]
+		service.opMu.Unlock()
+		if phase != StoragePhaseProvisioning {
+			t.Fatalf("storage phase during node.add reconcile = %q, want %q", phase, StoragePhaseProvisioning)
+		}
+		return provision.Result{StoragePhase: provision.StoragePhaseLive, StorageLive: true}, nil
+	}
+
+	raw, err := json.Marshal(nodeArgs{Cluster: item.Name, Name: "demo-worker-1", Role: cluster.RoleWorker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := service.dispatch(Request{Op: "node.add", Args: raw})
+	if !response.OK {
+		t.Fatalf("node.add failed: %s", response.Error)
+	}
+	if reconciledNodes != 2 {
+		t.Fatalf("node.add reconciled %d nodes, want 2 after 1->2 Longhorn scale-up", reconciledNodes)
+	}
+	if service.storagePhases[item.Name] != StoragePhaseLive {
+		t.Fatalf("storage phase after node.add = %q, want %q", service.storagePhases[item.Name], StoragePhaseLive)
+	}
+	reloaded, err := cluster.Load(item.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded.Nodes) != 2 {
+		t.Fatalf("cluster node count after node.add = %d, want 2", len(reloaded.Nodes))
+	}
+}
+
+func TestNodeAddWarnsForLonghornCustomSchematic(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 0)
+
+	raw, err := json.Marshal(nodeArgs{Cluster: item.Name, Name: "demo-worker-1", Role: cluster.RoleWorker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.addNode(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result.Warning, "iscsi-tools") || !strings.Contains(result.Warning, "util-linux-tools") {
+		t.Fatalf("NodeStatus.Warning = %q, want Longhorn custom schematic warning", result.Warning)
+	}
+}
+
+func TestNodeAddSkipsLonghornCustomSchematicWarningForGeneratedDefault(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 0)
+	service.defaultSchematic = item.Schematic
+
+	raw, err := json.Marshal(nodeArgs{Cluster: item.Name, Name: "demo-worker-1", Role: cluster.RoleWorker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.addNode(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(result.Warning, "iscsi-tools") || strings.Contains(result.Warning, "util-linux-tools") {
+		t.Fatalf("NodeStatus.Warning = %q, did not want Longhorn custom schematic warning", result.Warning)
+	}
+}
+
+func TestNodeRemoveReprovisionsRunningLonghornClusterWithUpdatedTopology(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 2)
+	service.storagePhases[item.Name] = StoragePhaseLive
+
+	var reconciledNodes int
+	service.provisionReconcile = func(_ context.Context, request provision.Request) (provision.Result, error) {
+		reconciledNodes = len(request.Cluster.Nodes)
+		service.opMu.Lock()
+		phase := service.storagePhases[request.Cluster.Name]
+		service.opMu.Unlock()
+		if phase != StoragePhaseProvisioning {
+			t.Fatalf("storage phase during node.remove reconcile = %q, want %q", phase, StoragePhaseProvisioning)
+		}
+		return provision.Result{StoragePhase: provision.StoragePhaseLive, StorageLive: true}, nil
+	}
+
+	raw, err := json.Marshal(nodeArgs{Cluster: item.Name, Name: "demo-worker-2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := service.dispatch(Request{Op: "node.remove", Args: raw})
+	if !response.OK {
+		t.Fatalf("node.remove failed: %s", response.Error)
+	}
+	if reconciledNodes != 2 {
+		t.Fatalf("node.remove reconciled %d nodes, want 2 after Longhorn scale-down", reconciledNodes)
+	}
+	if service.storagePhases[item.Name] != StoragePhaseLive {
+		t.Fatalf("storage phase after node.remove = %q, want %q", service.storagePhases[item.Name], StoragePhaseLive)
+	}
+	reloaded, err := cluster.Load(item.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded.Nodes) != 2 {
+		t.Fatalf("cluster node count after node.remove = %d, want 2", len(reloaded.Nodes))
 	}
 }
 
@@ -138,17 +254,17 @@ func TestRefreshStoragePhasesReprobesAfterDaemonRestart(t *testing.T) {
 	}
 }
 
-func TestRefreshStoragePhasesDoesNotClaimUnsupportedBackendIsProvisioning(t *testing.T) {
+func TestRefreshStoragePhasesLeavesClustersWithoutCSIUnset(t *testing.T) {
 	service := &Server{}
 	statuses := []ClusterStatus{{
 		Name: "demo", Running: true,
-		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILonghorn},
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel},
 	}}
 
 	service.refreshStoragePhases(statuses)
 
 	if statuses[0].StoragePhase != "" {
-		t.Fatalf("storage phase = %q, want unknown until Longhorn support is installed", statuses[0].StoragePhase)
+		t.Fatalf("storage phase = %q, want empty when CSI is absent", statuses[0].StoragePhase)
 	}
 }
 
@@ -321,4 +437,49 @@ func TestFailedBackgroundProbeBacksOffAndSurfacesReason(t *testing.T) {
 	if hints := strings.Join(statuses[0].Hints, "\n"); !strings.Contains(hints, "probe failed") || !strings.Contains(hints, "retrying after backoff") {
 		t.Fatalf("storage hints = %q", hints)
 	}
+}
+
+func runningLonghornClusterForNodeMutation(t *testing.T, controlPlanes, workers int) (*Server, cluster.Cluster) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	item, err := cluster.New("demo", 0, controlPlanes, workers, cluster.NodeDefaults{MemoryMiB: 1, DiskGiB: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILonghorn}
+	item.Schematic = "custom-schematic"
+	item.TalosVersion = "v1.2.3"
+	item.ImageArchitecture = string(hypervisor.ArchitectureARM64)
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+
+	cacheRoot := filepath.Join(home, "cache")
+	cachedDisk := filepath.Join(cacheRoot, item.Schematic, item.TalosVersion, string(hypervisor.ArchitectureARM64), "disk.raw")
+	if err := os.MkdirAll(filepath.Dir(cachedDisk), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cachedDisk, []byte("disk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	nodes := make(map[string]hypervisor.Machine, len(item.Nodes))
+	for _, node := range item.Nodes {
+		nodes[node.Name] = &fakeMachine{active: true}
+	}
+
+	return &Server{
+		cache:                imagecache.New(cacheRoot),
+		hypervisor:           &fakeHypervisor{architecture: hypervisor.ArchitectureARM64},
+		vms:                  map[string]map[string]hypervisor.Machine{item.Name: nodes},
+		provisions:           make(map[string]activeProvision),
+		storagePhases:        make(map[string]StoragePhase),
+		storageStatusProbes:  make(map[string]activeStorageProbe),
+		storageProbeFailures: make(map[string]storageProbeFailure),
+		hostPressure:         noHostPressure,
+		subnetSources:        emptySubnetSources(),
+		defaultSchematic:     "curated-default",
+	}, item
 }

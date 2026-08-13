@@ -179,6 +179,84 @@ func TestHintsDescribeStorageLive(t *testing.T) {
 	}
 }
 
+func TestHintsKeepSingleNodeLonghornWarningAlongsideNetworkingHints(t *testing.T) {
+	status := ClusterStatus{
+		Name:               "demo",
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILonghorn, LB: true},
+		Running:            true,
+		KubernetesReady:    true,
+		StoragePhase:       StoragePhaseLive,
+		VIP:                "172.30.0.200",
+		VIPLive:            true,
+		Nodes: []NodeStatus{{
+			Name: "demo-cp-1", Role: cluster.RoleControlPlane, Phase: PhaseConfigured, IP: "172.30.0.2",
+		}},
+	}
+
+	joined := strings.Join(Hints(status), "\n")
+	for _, wanted := range []string{
+		"storage live",
+		"no redundancy",
+		"http://172.30.0.200/",
+	} {
+		if !strings.Contains(joined, wanted) {
+			t.Fatalf("hints missing %q:\n%s", wanted, joined)
+		}
+	}
+}
+
+func TestHintsSuppressSingleNodeLonghornWarningUntilStorageIsLive(t *testing.T) {
+	node := NodeStatus{
+		Name: "demo-cp-1", Role: cluster.RoleControlPlane, Phase: PhaseConfigured, IP: "172.30.0.2",
+	}
+	tests := []struct {
+		name   string
+		status ClusterStatus
+	}{
+		{
+			name: "stopped cluster",
+			status: ClusterStatus{
+				Name:               "demo",
+				ProvisioningIntent: cluster.ProvisioningIntent{CSI: cluster.CSILonghorn},
+				StoragePhase:       StoragePhaseLive,
+				Nodes:              []NodeStatus{node},
+			},
+		},
+		{
+			name: "storage still provisioning",
+			status: ClusterStatus{
+				Name:               "demo",
+				ProvisioningIntent: cluster.ProvisioningIntent{CSI: cluster.CSILonghorn},
+				Running:            true,
+				StoragePhase:       StoragePhaseProvisioning,
+				Nodes:              []NodeStatus{node},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, hint := range Hints(tt.status) {
+				if strings.Contains(hint, "no redundancy") {
+					t.Fatalf("Hints() unexpectedly reported live single-node Longhorn warning: %q", hint)
+				}
+			}
+		})
+	}
+}
+
+func TestHintsWarnWhenCuratedCSIIntentCannotRunOnCurrentCNI(t *testing.T) {
+	status := ClusterStatus{
+		Name:               "demo",
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, CSI: cluster.CSILonghorn},
+	}
+
+	joined := strings.Join(Hints(status), "\n")
+	if !strings.Contains(joined, "not implemented yet") || !strings.Contains(joined, "cni: cilium") {
+		t.Fatalf("hints = %q, want explicit unsupported curated CSI hint", joined)
+	}
+}
+
 func TestHintsDoNotInferFlannelKubernetesReadiness(t *testing.T) {
 	status := ClusterStatus{
 		Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel},
