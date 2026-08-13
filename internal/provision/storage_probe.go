@@ -25,8 +25,7 @@ const (
 )
 
 type storageProbeSpec struct {
-	StorageClassName string
-	ProbeImage       string
+	ProbeImage string
 }
 
 func runStorageProbe(ctx context.Context, dynamicClient dynamic.Interface, mapper meta.RESTMapper, client kubernetes.Interface, spec storageProbeSpec, interval time.Duration) (err error) {
@@ -75,9 +74,6 @@ func runStorageProbe(ctx context.Context, dynamicClient dynamic.Interface, mappe
 }
 
 func renderStorageProbe(spec storageProbeSpec) ([]unstructured.Unstructured, error) {
-	if spec.StorageClassName == "" {
-		return nil, errors.New("storage probe requires a StorageClass name")
-	}
 	if spec.ProbeImage == "" {
 		return nil, errors.New("storage probe requires a probe image")
 	}
@@ -101,7 +97,6 @@ spec:
   resources:
     requests:
       storage: %s
-  storageClassName: %s
 ---
 apiVersion: v1
 kind: Pod
@@ -150,7 +145,7 @@ spec:
     - name: storage
       persistentVolumeClaim:
         claimName: %s
-`, probeNamespace, storageProbePVCName, probeNamespace, storageProbeSize, spec.StorageClassName, storageProbeWriterPodName, probeNamespace, spec.ProbeImage, storageProbePayload, storageProbeVolumePath, storageProbeVolumePath, storageProbePVCName, storageProbeReaderPodName, probeNamespace, spec.ProbeImage, storageProbeVolumePath, storageProbePayload, storageProbeVolumePath, storageProbePVCName)))
+`, probeNamespace, storageProbePVCName, probeNamespace, storageProbeSize, storageProbeWriterPodName, probeNamespace, spec.ProbeImage, storageProbePayload, storageProbeVolumePath, storageProbeVolumePath, storageProbePVCName, storageProbeReaderPodName, probeNamespace, spec.ProbeImage, storageProbeVolumePath, storageProbePayload, storageProbeVolumePath, storageProbePVCName)))
 	if err != nil {
 		return nil, fmt.Errorf("decode storage probe: %w", err)
 	}

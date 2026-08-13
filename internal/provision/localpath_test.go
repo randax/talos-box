@@ -148,8 +148,7 @@ func TestRunStorageProbeWritesReadsAndCleansUp(t *testing.T) {
 	})
 
 	if err := runStorageProbe(context.Background(), dynamicClient, mapper, clientset, storageProbeSpec{
-		StorageClassName: localPathStorageClass,
-		ProbeImage:       localPathHelperImage,
+		ProbeImage: localPathHelperImage,
 	}, time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
@@ -199,8 +198,7 @@ func TestRunStorageProbeReturnsContextAndCleansUp(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
 	defer cancel()
 	err := runStorageProbe(ctx, dynamicClient, mapper, clientset, storageProbeSpec{
-		StorageClassName: localPathStorageClass,
-		ProbeImage:       localPathHelperImage,
+		ProbeImage: localPathHelperImage,
 	}, time.Millisecond)
 	if err == nil {
 		t.Fatal("runStorageProbe() error = nil, want context deadline")
@@ -316,8 +314,8 @@ func TestFlannelReconcileRunsStorageAfterLoadBalancer(t *testing.T) {
 	}
 }
 
-func TestStorageProbeRendersRequestedStorageClass(t *testing.T) {
-	objects, err := renderStorageProbe(storageProbeSpec{StorageClassName: "custom-storage", ProbeImage: "example.invalid/probe:1"})
+func TestStorageProbeRendersBarePVCToVerifyDefaultStorageClass(t *testing.T) {
+	objects, err := renderStorageProbe(storageProbeSpec{ProbeImage: "example.invalid/probe:1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -325,8 +323,8 @@ func TestStorageProbeRendersRequestedStorageClass(t *testing.T) {
 		t.Fatalf("renderStorageProbe() objects = %d, want 4", len(objects))
 	}
 	pvc := objects[1]
-	if got, _, err := nestedStringField(pvc.Object, "spec", "storageClassName"); err != nil || got != "custom-storage" {
-		t.Fatalf("storageClassName = %q, %v", got, err)
+	if got, found, err := unstructured.NestedString(pvc.Object, "spec", "storageClassName"); err != nil || found {
+		t.Fatalf("storageClassName = %q, found=%v, err=%v; want a bare PVC", got, found, err)
 	}
 	for _, index := range []int{2, 3} {
 		if got, _, err := nestedStringField(objects[index].Object, "spec", "containers", "0", "image"); err != nil || got != "example.invalid/probe:1" {
@@ -394,7 +392,7 @@ func TestStorageProbeCleanupJoinsDeleteErrors(t *testing.T) {
 		deleteAction := action.(k8stesting.DeleteAction)
 		return true, nil, fmt.Errorf("delete pod %s", deleteAction.GetName())
 	})
-	err := cleanupStorageProbe(context.Background(), clientset, storageProbeSpec{StorageClassName: localPathStorageClass})
+	err := cleanupStorageProbe(context.Background(), clientset, storageProbeSpec{})
 	if err == nil || !strings.Contains(err.Error(), storageProbeWriterPodName) {
 		t.Fatalf("cleanupStorageProbe() error = %v", err)
 	}

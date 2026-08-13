@@ -90,8 +90,7 @@ func (r LocalPathReconciler) reconcile(ctx context.Context, config *rest.Config,
 		return StorageResult{}, err
 	}
 	if err := runStorageProbe(ctx, dynamicClient, mapper, clientset, storageProbeSpec{
-		StorageClassName: localPathStorageClass,
-		ProbeImage:       localPathHelperImage,
+		ProbeImage: localPathHelperImage,
 	}, r.PollInterval); err != nil {
 		return StorageResult{}, err
 	}

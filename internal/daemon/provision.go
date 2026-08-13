@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -184,6 +183,9 @@ func (s *Server) provisionFlannel(parent context.Context, item cluster.Cluster) 
 		LoadBalancer: provision.MetalLBReconciler{
 			PollInterval: time.Second,
 		},
+		Storage: provision.LocalPathReconciler{
+			PollInterval: time.Second,
+		},
 		Observe: func(context.Context) ([]provision.Node, error) {
 			return s.observeProvisionNodes(item), nil
 		},
@@ -277,42 +279,11 @@ func (s *Server) recordStoragePhaseLocked(name string, phase StoragePhase) {
 }
 
 func storagePhaseFromProvisionResult(result provision.Result) StoragePhase {
-	value := reflect.ValueOf(result)
-	if phase, ok := storagePhaseFromField(value, "StoragePhase"); ok {
-		return phase
-	}
-	if live, ok := boolField(value, "StorageLive"); ok && live {
+	if result.StorageLive || result.StoragePhase == provision.StoragePhaseLive {
 		return StoragePhaseLive
 	}
-	if ready, ok := boolField(value, "StorageReady"); ok && ready {
-		return StoragePhaseLive
+	if result.StoragePhase == provision.StoragePhaseProvisioning {
+		return StoragePhaseProvisioning
 	}
 	return ""
-}
-
-func storagePhaseFromField(value reflect.Value, field string) (StoragePhase, bool) {
-	item := value.FieldByName(field)
-	if !item.IsValid() || item.Kind() != reflect.String {
-		return "", false
-	}
-	switch item.String() {
-	case string(StoragePhaseProvisioning):
-		return StoragePhaseProvisioning, true
-	case string(StoragePhaseLive):
-		return StoragePhaseLive, true
-	case "storage provisioning":
-		return StoragePhaseProvisioning, true
-	case "storage live":
-		return StoragePhaseLive, true
-	default:
-		return "", false
-	}
-}
-
-func boolField(value reflect.Value, field string) (bool, bool) {
-	item := value.FieldByName(field)
-	if !item.IsValid() || item.Kind() != reflect.Bool {
-		return false, false
-	}
-	return item.Bool(), true
 }
