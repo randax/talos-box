@@ -166,7 +166,10 @@ func storageHint(status ClusterStatus) string {
 }
 
 func longhornSingleNodeHint(status ClusterStatus) string {
-	if status.CSI == cluster.CSILonghorn && len(status.Nodes) == 1 {
+	if status.CSI == cluster.CSILonghorn &&
+		len(status.Nodes) == 1 &&
+		status.Running &&
+		status.StoragePhase == StoragePhaseLive {
 		return "Longhorn is running with a single replica on one node, so volumes have no redundancy."
 	}
 	return ""

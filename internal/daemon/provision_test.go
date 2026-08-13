@@ -127,6 +127,39 @@ func TestNodeAddReprovisionsRunningLonghornClusterWithUpdatedTopology(t *testing
 	}
 }
 
+func TestNodeAddWarnsForLonghornCustomSchematic(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 0)
+
+	raw, err := json.Marshal(nodeArgs{Cluster: item.Name, Name: "demo-worker-1", Role: cluster.RoleWorker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.addNode(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result.Warning, "iscsi-tools") || !strings.Contains(result.Warning, "util-linux-tools") {
+		t.Fatalf("NodeStatus.Warning = %q, want Longhorn custom schematic warning", result.Warning)
+	}
+}
+
+func TestNodeAddSkipsLonghornCustomSchematicWarningForGeneratedDefault(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 0)
+	service.defaultSchematic = item.Schematic
+
+	raw, err := json.Marshal(nodeArgs{Cluster: item.Name, Name: "demo-worker-1", Role: cluster.RoleWorker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.addNode(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(result.Warning, "iscsi-tools") || strings.Contains(result.Warning, "util-linux-tools") {
+		t.Fatalf("NodeStatus.Warning = %q, did not want Longhorn custom schematic warning", result.Warning)
+	}
+}
+
 func TestNodeRemoveReprovisionsRunningLonghornClusterWithUpdatedTopology(t *testing.T) {
 	service, item := runningLonghornClusterForNodeMutation(t, 1, 2)
 	service.storagePhases[item.Name] = StoragePhaseLive
