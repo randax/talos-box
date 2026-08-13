@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -24,6 +25,7 @@ type doctorDependencies struct {
 	listClusters    func() ([]daemon.ClusterSummary, error)
 	listConfig      func() ([]cluster.Cluster, error)
 	getStatus       func() ([]daemon.ClusterStatus, error)
+	listCache       func() (daemon.CacheListResult, error)
 	hostPressure    func() (hostpressure.Snapshot, error)
 	command         commandOutput
 	readFile        func(string) ([]byte, error)
@@ -123,6 +125,7 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 	}
 
 	clusters, clusterErr := deps.listClusters()
+	anyRunning := false
 	if isDaemonUnavailable(clusterErr) {
 		detail := fmt.Sprintf("daemon unavailable: %v", clusterErr)
 		if err := writeFindings(
@@ -155,7 +158,6 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 			return err
 		}
 
-		anyRunning := false
 		for _, item := range clusters {
 			if item.Running {
 				anyRunning = true
@@ -187,6 +189,66 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		}
 	}
 
+	mirrorFinding := doctorFinding{check: "mirror-health"}
+	if deps.listCache == nil {
+		mirrorFinding.level, mirrorFinding.detail = "SKIP", "probe unavailable"
+	} else {
+		cacheResult, err := deps.listCache()
+		if isDaemonUnavailable(err) {
+			mirrorFinding.level, mirrorFinding.detail = "SKIP", fmt.Sprintf("daemon unavailable: %v", err)
+		} else if err != nil {
+			mirrorFinding.level, mirrorFinding.detail = "FAIL", err.Error()
+		} else {
+			totalBytes := cacheResult.MirrorTotal.BlobBytes + cacheResult.MirrorTotal.ManifestBytes
+			cacheDetail := fmt.Sprintf(
+				"cache %d bytes (%d blob(s), %d manifest(s))",
+				totalBytes,
+				cacheResult.MirrorTotal.BlobCount,
+				cacheResult.MirrorTotal.ManifestCount,
+			)
+			var expectedGateways []string
+			for _, item := range clusters {
+				if item.Running {
+					expectedGateways = append(expectedGateways, cluster.Gateway(item.SubnetIndex))
+				}
+			}
+			sort.Strings(expectedGateways)
+			actualGateways := append([]string(nil), cacheResult.MirrorBoundGatewayIPs...)
+			sort.Strings(actualGateways)
+			switch {
+			case clusterErr == nil && len(expectedGateways) == 0 && len(actualGateways) > 0:
+				mirrorFinding.level = "FAIL"
+				mirrorFinding.detail = fmt.Sprintf("mirror listeners bound on %v while no clusters are running; %s", actualGateways, cacheDetail)
+			case clusterErr == nil && len(clusters) == 0:
+				mirrorFinding.level = "SKIP"
+				mirrorFinding.detail = fmt.Sprintf("no clusters exist; %s", cacheDetail)
+			case clusterErr == nil && len(expectedGateways) == 0:
+				mirrorFinding.level = "SKIP"
+				mirrorFinding.detail = fmt.Sprintf("no clusters are running; %s", cacheDetail)
+			case clusterErr == nil && stringSlicesEqual(actualGateways, expectedGateways):
+				mirrorFinding.level = "PASS"
+				mirrorFinding.detail = fmt.Sprintf("mirror serving on %d gateway(s) %v, %s", len(actualGateways), actualGateways, cacheDetail)
+			case clusterErr == nil && len(actualGateways) == 0:
+				mirrorFinding.level = "FAIL"
+				mirrorFinding.detail = fmt.Sprintf("no mirror listeners bound for running cluster(s); expected %v; %s", expectedGateways, cacheDetail)
+			case clusterErr == nil:
+				mirrorFinding.level = "FAIL"
+				mirrorFinding.detail = fmt.Sprintf(
+					"mirror listeners bound on %v, expected %v; %s",
+					actualGateways,
+					expectedGateways,
+					cacheDetail,
+				)
+			default:
+				mirrorFinding.level = "SKIP"
+				mirrorFinding.detail = fmt.Sprintf("cluster state unavailable; %s", cacheDetail)
+			}
+		}
+	}
+	if err := writeFindings(mirrorFinding); err != nil {
+		return err
+	}
+
 	if err := writeFindings(egressFinding(probeFactoryEgress(deps.doHTTP))); err != nil {
 		return err
 	}
@@ -198,6 +260,18 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		return errors.New("one or more doctor checks failed")
 	}
 	return nil
+}
+
+func stringSlicesEqual(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func isDaemonUnavailable(err error) bool {
@@ -224,6 +298,11 @@ func (c cli) doctorDependencies() doctorDependencies {
 		getStatus: func() ([]daemon.ClusterStatus, error) {
 			var result []daemon.ClusterStatus
 			err := c.doctorCall("status", map[string]string{"cluster": ""}, &result)
+			return result, err
+		},
+		listCache: func() (daemon.CacheListResult, error) {
+			var result daemon.CacheListResult
+			err := c.doctorCall("cache.list", struct{}{}, &result)
 			return result, err
 		},
 		hostPressure: func() (hostpressure.Snapshot, error) {

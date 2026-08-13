@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/randax/talos-box/internal/balloon"
@@ -25,8 +26,11 @@ import (
 
 // Server owns all VMs started by one daemon process.
 type Server struct {
-	cache      *imagecache.Cache
-	hypervisor hypervisor.Hypervisor
+	cache               *imagecache.Cache
+	hypervisor          hypervisor.Hypervisor
+	warmCache           func(context.Context, []string, imagecache.Architecture) (CacheWarmResult, error)
+	checkCache          func(context.Context, []string, imagecache.Architecture, bool) (CacheCheckResult, error)
+	boundMirrorGateways func() []string
 
 	opMu                  sync.Mutex
 	vms                   map[string]map[string]hypervisor.Machine
@@ -48,6 +52,7 @@ type Server struct {
 	lifecycleContext      context.Context
 	lifecycleCancel       context.CancelFunc
 	mirrors               *mirror.Manager
+	mirrorOffline         atomic.Bool
 	defaultSchematic      string
 	subnetSources         cluster.SubnetSources
 	hostPressure          func(string) (hostpressure.Snapshot, error)
@@ -105,7 +110,7 @@ func NewServer(ctx context.Context) (*Server, error) {
 		return nil, err
 	}
 	lifecycleContext, lifecycleCancel := context.WithCancel(ctx)
-	return &Server{
+	server := &Server{
 		cache:                 cache,
 		hypervisor:            backend,
 		vms:                   make(map[string]map[string]hypervisor.Machine),
@@ -122,7 +127,60 @@ func NewServer(ctx context.Context) (*Server, error) {
 		destroyVolumeCount:    countDestroyStorageVolumes,
 		storageEngineDelete:   deleteConfiguredStorageEngine,
 		storageEngineValidate: validateConfiguredStorageEngine,
-	}, nil
+	}
+	server.boundMirrorGateways = func() []string {
+		return server.mirrors.BoundGatewayIPs()
+	}
+	server.warmCache = func(ctx context.Context, refs []string, architecture imagecache.Architecture) (CacheWarmResult, error) {
+		summary, err := server.mirrors.Warm(ctx, refs, architecture)
+		if err != nil {
+			return CacheWarmResult{}, err
+		}
+		result := CacheWarmResult{
+			Warmed:          summary.Warmed,
+			AlreadyComplete: summary.AlreadyComplete,
+			Failed:          summary.Failed,
+			Entries:         make([]CacheWarmEntry, 0, len(summary.Results)),
+		}
+		for _, entry := range summary.Results {
+			status := CacheWarmStatusWarmed
+			if entry.Error != "" {
+				status = CacheWarmStatusFailed
+			} else if entry.AlreadyComplete {
+				status = CacheWarmStatusAlreadyComplete
+			}
+			result.Entries = append(result.Entries, CacheWarmEntry{
+				Ref:    entry.Ref,
+				Status: status,
+				Reason: entry.Error,
+			})
+		}
+		return result, nil
+	}
+	server.checkCache = func(ctx context.Context, refs []string, architecture imagecache.Architecture, deep bool) (CacheCheckResult, error) {
+		summary, err := server.mirrors.Check(ctx, refs, architecture, deep)
+		if err != nil {
+			return CacheCheckResult{}, err
+		}
+		result := CacheCheckResult{
+			Complete: summary.Complete,
+			Failed:   summary.Failed,
+			Entries:  make([]CacheCheckEntry, 0, len(summary.Results)),
+		}
+		for _, entry := range summary.Results {
+			status := CacheCheckStatusComplete
+			if entry.Error != "" {
+				status = CacheCheckStatusFailed
+			}
+			result.Entries = append(result.Entries, CacheCheckEntry{
+				Ref:    entry.Ref,
+				Status: status,
+				Reason: entry.Error,
+			})
+		}
+		return result, nil
+	}
+	return server, nil
 }
 
 // Listen creates the daemon socket, replacing it only when it is stale.
@@ -230,6 +288,7 @@ func (s *Server) Shutdown() error {
 	for _, connection := range connections {
 		_ = connection.Close()
 	}
+	s.cancelLifecycle()
 	s.opMu.Lock()
 	s.cancelAllProvisionsLocked()
 	s.opMu.Unlock()
@@ -290,6 +349,14 @@ func (s *Server) dispatch(request Request) Response {
 		return failure(err)
 	}
 	return success(data)
+}
+
+func (s *Server) lifecycleTimeoutContext(timeout time.Duration) (context.Context, context.CancelFunc) {
+	parent := s.lifecycleContext
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(parent, timeout)
 }
 
 func (s *Server) dispatchProvisioning(request Request) Response {
@@ -421,8 +488,18 @@ func (s *Server) handle(request Request) (any, error) {
 		return s.setBGP(request.Args, false)
 	case "cache.pull":
 		return s.pullCache(request.Args)
+	case "cache.warm":
+		return s.warmMirrorCache(request.Args)
+	case "cache.check":
+		return s.checkMirrorCache(request.Args)
+	case "cache.list":
+		return s.listCache()
 	case "cache.prune":
-		return s.pruneCache()
+		return s.pruneCache(request.Args)
+	case "mirror.offline.get":
+		return s.getMirrorOffline()
+	case "mirror.offline.set":
+		return s.setMirrorOffline(request.Args)
 	default:
 		return nil, fmt.Errorf("unknown operation %q", request.Op)
 	}

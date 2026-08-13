@@ -8,8 +8,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -21,14 +23,17 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // Server mirrors one upstream registry, caching immutable blobs on disk.
 type Server struct {
-	base     string // upstream base URL, e.g. https://registry-1.docker.io
-	cacheDir string
-	client   *http.Client
+	base             string // upstream base URL, e.g. https://registry-1.docker.io
+	cacheDir         string
+	client           *http.Client
+	offline          *atomic.Bool
+	validateUpstream func(context.Context) error
 
 	mu     sync.Mutex
 	tokens map[string]token // key: auth challenge scope
@@ -151,9 +156,59 @@ func canonicalLookupHost(host string) string {
 }
 
 var (
-	blobPathRe     = regexp.MustCompile(`^/v2/.+/blobs/(sha256:[a-f0-9]{64})$`)
+	blobPathRe     = regexp.MustCompile(`^/v2/.+/blobs/((?:sha256:[A-Fa-f0-9]{64})|(?:sha512:[A-Fa-f0-9]{128}))$`)
 	manifestPathRe = regexp.MustCompile(`^/v2/(.+)/manifests/(.+)$`)
+	digestRefRe    = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9]*(?:[+._-][A-Za-z][A-Za-z0-9]*)*):([A-Fa-f0-9]+)$`)
 )
+
+type manifestRefreshKey struct{}
+type manifestValidationReferenceKey struct{}
+type stagedManifestKey struct{}
+type warmBlobKey struct{}
+
+func withManifestRefresh(ctx context.Context) context.Context {
+	return context.WithValue(ctx, manifestRefreshKey{}, true)
+}
+
+func shouldRefreshManifest(ctx context.Context) bool {
+	value, _ := ctx.Value(manifestRefreshKey{}).(bool)
+	return value
+}
+
+func withManifestValidationReference(ctx context.Context, reference string) context.Context {
+	return context.WithValue(ctx, manifestValidationReferenceKey{}, reference)
+}
+
+func manifestValidationReference(ctx context.Context, fallback string) string {
+	if value, ok := ctx.Value(manifestValidationReferenceKey{}).(string); ok && value != "" {
+		return value
+	}
+	return fallback
+}
+
+type stagedManifest struct {
+	requestPath string
+	data        []byte
+	metadata    manifestMetadata
+}
+
+func withStagedManifest(ctx context.Context, staged *stagedManifest) context.Context {
+	return context.WithValue(ctx, stagedManifestKey{}, staged)
+}
+
+func stagedManifestFromContext(ctx context.Context) *stagedManifest {
+	staged, _ := ctx.Value(stagedManifestKey{}).(*stagedManifest)
+	return staged
+}
+
+func withWarmBlob(ctx context.Context) context.Context {
+	return context.WithValue(ctx, warmBlobKey{}, true)
+}
+
+func shouldSkipWarmBlobReplay(ctx context.Context) bool {
+	value, _ := ctx.Value(warmBlobKey{}).(bool)
+	return value
+}
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -171,16 +226,46 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var digest string
 	if m := blobPathRe.FindStringSubmatch(r.URL.Path); m != nil {
 		digest = m[1]
-		if s.serveCachedBlob(w, r, digest) {
+	}
+	isManifest := manifestPathRe.MatchString(r.URL.Path)
+	if served, err := s.serveCacheIfAvailable(w, r, digest, isManifest); served {
+		return
+	} else if err != nil {
+		http.Error(w, err.Error(), err.status)
+		return
+	}
+	if s.offlineEnabled() {
+		http.Error(w, "mirror offline: content not cached", http.StatusServiceUnavailable)
+		return
+	}
+	if s.validateUpstream != nil {
+		if err := s.validateUpstream(r.Context()); err != nil {
+			var validationErr *upstreamValidationError
+			if errors.As(err, &validationErr) {
+				http.Error(w, validationErr.Error(), validationErr.status)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
 	}
-	isManifest := manifestPathRe.MatchString(r.URL.Path)
+	if served, err := s.serveCacheIfAvailable(w, r, digest, isManifest); served {
+		return
+	} else if err != nil {
+		http.Error(w, err.Error(), err.status)
+		return
+	}
+	if s.offlineEnabled() {
+		http.Error(w, "mirror offline: content not cached", http.StatusServiceUnavailable)
+		return
+	}
 
 	resp, err := s.fetch(r)
 	if err != nil {
-		// offline: a manifest we cached earlier still serves the pull
-		if isManifest && s.serveCachedManifest(w, r) {
+		if served, cacheErr := s.serveManifestCacheOnFetchFailure(w, r); served {
+			return
+		} else if cacheErr != nil {
+			http.Error(w, cacheErr.Error(), cacheErr.status)
 			return
 		}
 		http.Error(w, fmt.Sprintf("upstream: %v", err), http.StatusBadGateway)
@@ -195,23 +280,35 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, fmt.Sprintf("upstream blob %s: %v", responseURL(resp, s.base+r.URL.RequestURI()), err), http.StatusBadGateway)
 				return
 			}
+			if shouldSkipWarmBlobReplay(r.Context()) {
+				w.Header().Set("Docker-Content-Digest", digest)
+				w.WriteHeader(http.StatusOK)
+				return
+			}
 			copyResponseHeaders(w, resp)
 			if !s.serveCachedBlob(w, r, digest) {
 				http.Error(w, "serve verified blob: cached file unavailable", http.StatusInternalServerError)
 			}
 			return
 		case isManifest:
-			data, err := validateManifest(resp, manifestReference(r.URL.Path))
+			data, metadata, err := validateManifest(resp, manifestValidationReference(r.Context(), manifestReference(r.URL.Path)))
 			if err != nil {
 				http.Error(w, fmt.Sprintf("upstream manifest: %v", err), http.StatusBadGateway)
 				return
 			}
-			// the validated manifest is already in memory; a cache write
-			// failure only costs offline replay, not this pull
-			if err := s.storeManifest(r.URL.Path, resp.Header.Get("Content-Type"), data); err != nil {
-				log.Printf("mirror: cache manifest %s: %v", r.URL.Path, err)
+			if staged := stagedManifestFromContext(r.Context()); staged != nil {
+				staged.requestPath = r.URL.Path
+				staged.data = append([]byte(nil), data...)
+				staged.metadata = metadata
+			} else {
+				// the validated manifest is already in memory; a cache write
+				// failure only costs offline replay, not this pull
+				if err := s.storeManifest(r.URL.Path, metadata, data); err != nil {
+					log.Printf("mirror: cache manifest %s: %v", r.URL.Path, err)
+				}
 			}
 			copyResponseHeaders(w, resp)
+			applyManifestMetadataHeaders(w, metadata)
 			w.WriteHeader(resp.StatusCode)
 			_, _ = w.Write(data)
 			return
@@ -223,6 +320,39 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
+func (s *Server) serveCacheIfAvailable(w http.ResponseWriter, r *http.Request, digest string, isManifest bool) (bool, *cacheReplayError) {
+	if digest != "" && s.serveCachedBlob(w, r, digest) {
+		return true, nil
+	}
+	if isManifest {
+		if shouldRefreshManifest(r.Context()) {
+			return false, nil
+		}
+		reference := manifestReference(r.URL.Path)
+		if isDigestReference(reference) {
+			return s.serveCachedDigestManifest(w, r, reference)
+		}
+		if s.offlineEnabled() && s.serveCachedManifest(w, r) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (s *Server) serveManifestCacheOnFetchFailure(w http.ResponseWriter, r *http.Request) (bool, *cacheReplayError) {
+	if !manifestPathRe.MatchString(r.URL.Path) {
+		return false, nil
+	}
+	reference := manifestReference(r.URL.Path)
+	if isDigestReference(reference) {
+		return s.serveCachedDigestManifest(w, r, reference)
+	}
+	if s.serveCachedManifest(w, r) {
+		return true, nil
+	}
+	return false, nil
+}
+
 func (s *Server) CloseIdleConnections() {
 	type idleCloser interface {
 		CloseIdleConnections()
@@ -232,11 +362,34 @@ func (s *Server) CloseIdleConnections() {
 	}
 }
 
+func (s *Server) setOfflineMode(enabled bool) {
+	if s.offline == nil {
+		s.offline = &atomic.Bool{}
+	}
+	s.offline.Store(enabled)
+}
+
+func (s *Server) offlineEnabled() bool {
+	return s.offline != nil && s.offline.Load()
+}
+
 func copyResponseHeaders(w http.ResponseWriter, resp *http.Response) {
 	for _, header := range []string{"Content-Type", "Content-Length", "Docker-Content-Digest", "Etag"} {
 		if value := resp.Header.Get(header); value != "" {
 			w.Header().Set(header, value)
 		}
+	}
+}
+
+func applyManifestMetadataHeaders(w http.ResponseWriter, metadata manifestMetadata) {
+	if metadata.ContentType != "" {
+		w.Header().Set("Content-Type", metadata.ContentType)
+	}
+	if metadata.ContentLength > 0 {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", metadata.ContentLength))
+	}
+	if metadata.DockerContentDigest != "" {
+		w.Header().Set("Docker-Content-Digest", metadata.DockerContentDigest)
 	}
 }
 
@@ -275,6 +428,10 @@ func (s *Server) fetch(r *http.Request) (*http.Response, error) {
 }
 
 func (s *Server) serveCachedBlob(w http.ResponseWriter, r *http.Request, digest string) bool {
+	canonical, ok := canonicalSupportedDigest(digest)
+	if ok {
+		digest = canonical
+	}
 	path := s.blobPath(digest)
 	file, err := os.Open(path)
 	if err != nil {
@@ -298,6 +455,10 @@ func (s *Server) serveCachedBlob(w http.ResponseWriter, r *http.Request, digest 
 // cacheBlob stages the complete blob and publishes it only after its content
 // hashes to the requested digest. Callers serve the published file afterward.
 func (s *Server) cacheBlob(body io.Reader, digest string) error {
+	canonical, ok := canonicalSupportedDigest(digest)
+	if ok {
+		digest = canonical
+	}
 	path := s.blobPath(digest)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create blob cache directory: %w", err)
@@ -309,16 +470,29 @@ func (s *Server) cacheBlob(body io.Reader, digest string) error {
 	tmpPath := tmp.Name()
 	defer func() { _ = os.Remove(tmpPath) }()
 
-	hasher := sha256.New()
+	algorithm, encoded, ok := splitDigestReference(digest)
+	if !ok {
+		_ = tmp.Close()
+		return fmt.Errorf("invalid digest reference")
+	}
+	var hasher hashWriter
+	switch algorithm {
+	case "sha256":
+		hasher = sha256.New()
+	case "sha512":
+		hasher = sha512.New()
+	default:
+		_ = tmp.Close()
+		return fmt.Errorf("unsupported digest algorithm %q", algorithm)
+	}
 	if _, err := io.Copy(io.MultiWriter(tmp, hasher), body); err != nil {
 		_ = tmp.Close()
 		return fmt.Errorf("download blob: %w", err)
 	}
 	got := hex.EncodeToString(hasher.Sum(nil))
-	want := strings.TrimPrefix(digest, "sha256:")
-	if got != want {
+	if got != encoded {
 		_ = tmp.Close()
-		return fmt.Errorf("digest mismatch: requested sha256:%s, downloaded sha256:%s", want, got)
+		return fmt.Errorf("digest mismatch: requested %s:%s, downloaded %s:%s", algorithm, encoded, algorithm, got)
 	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close staged blob: %w", err)
@@ -329,20 +503,43 @@ func (s *Server) cacheBlob(body io.Reader, digest string) error {
 	return nil
 }
 
+type hashWriter interface {
+	Write([]byte) (int, error)
+	Sum([]byte) []byte
+}
+
 // manifestPath maps a manifest request path to its on-disk cache location.
 func (s *Server) manifestPath(requestPath string) string {
+	if match := manifestPathRe.FindStringSubmatch(requestPath); match != nil {
+		if canonical, ok := canonicalSupportedDigest(match[2]); ok {
+			requestPath = "/v2/" + match[1] + "/manifests/" + canonical
+		}
+	}
 	safe := strings.ReplaceAll(strings.TrimPrefix(requestPath, "/v2/"), "/", "_")
 	return filepath.Join(s.cacheDir, "manifests", safe)
 }
 
-func (s *Server) storeManifest(requestPath, contentType string, data []byte) error {
+type manifestMetadata struct {
+	ContentType         string `json:"contentType"`
+	ContentLength       int64  `json:"contentLength"`
+	DockerContentDigest string `json:"dockerContentDigest"`
+}
+
+func (s *Server) manifestMetadataPath(requestPath string) string {
+	return s.manifestPath(requestPath) + ".meta"
+}
+
+func (s *Server) storeManifest(requestPath string, metadata manifestMetadata, data []byte) error {
 	path := s.manifestPath(requestPath)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create manifest cache directory: %w", err)
 	}
-	// the .ct sidecar publishes first so a published manifest always has one
-	if err := writeFileAtomic(path+".ct", []byte(contentType)); err != nil {
-		return fmt.Errorf("write manifest content type: %w", err)
+	rawMetadata, err := json.Marshal(metadata)
+	if err != nil {
+		return fmt.Errorf("encode manifest metadata: %w", err)
+	}
+	if err := writeFileAtomic(s.manifestMetadataPath(requestPath), rawMetadata); err != nil {
+		return fmt.Errorf("write manifest metadata: %w", err)
 	}
 	if err := writeFileAtomic(path, data); err != nil {
 		return fmt.Errorf("write manifest: %w", err)
@@ -385,40 +582,58 @@ var manifestMediaTypes = map[string]struct{}{
 // indexes are well under 1 MiB, so 10 MiB leaves generous headroom.
 const maxManifestBytes = 10 << 20
 
-func validateManifest(resp *http.Response, requestedReference string) ([]byte, error) {
+func validateManifest(resp *http.Response, requestedReference string) ([]byte, manifestMetadata, error) {
 	manifestURL := responseURL(resp, "upstream URL")
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxManifestBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("read manifest from %s: %w", manifestURL, err)
+		return nil, manifestMetadata{}, fmt.Errorf("read manifest from %s: %w", manifestURL, err)
 	}
 	if len(data) > maxManifestBytes {
-		return nil, fmt.Errorf("manifest response from %s exceeds %d bytes", manifestURL, maxManifestBytes)
+		return nil, manifestMetadata{}, fmt.Errorf("manifest response from %s exceeds %d bytes", manifestURL, maxManifestBytes)
 	}
 
 	contentType := resp.Header.Get("Content-Type")
 	mediaType, _, mediaTypeErr := mime.ParseMediaType(contentType)
 	if strings.EqualFold(mediaType, "text/html") || bytes.HasPrefix(bytes.TrimSpace(data), []byte("<")) {
-		return nil, fmt.Errorf("manifest response from %s looks like a web-filter/proxy block page", manifestURL)
+		return nil, manifestMetadata{}, fmt.Errorf("manifest response from %s looks like a web-filter/proxy block page", manifestURL)
 	}
 	if mediaTypeErr != nil {
-		return nil, fmt.Errorf("manifest response from %s has invalid Content-Type %q: %w", manifestURL, contentType, mediaTypeErr)
+		return nil, manifestMetadata{}, fmt.Errorf("manifest response from %s has invalid Content-Type %q: %w", manifestURL, contentType, mediaTypeErr)
 	}
 	if _, ok := manifestMediaTypes[strings.ToLower(mediaType)]; !ok {
-		return nil, fmt.Errorf("manifest response from %s has unsupported Content-Type %q", manifestURL, contentType)
+		return nil, manifestMetadata{}, fmt.Errorf("manifest response from %s has unsupported Content-Type %q", manifestURL, contentType)
 	}
 	if !json.Valid(data) {
-		return nil, fmt.Errorf("manifest response from %s is not valid JSON", manifestURL)
+		return nil, manifestMetadata{}, fmt.Errorf("manifest response from %s is not valid JSON", manifestURL)
 	}
 
-	actualDigest := "sha256:" + manifestSHA256(data)
-	if headerDigest := strings.TrimSpace(resp.Header.Get("Docker-Content-Digest")); headerDigest != "" && headerDigest != actualDigest {
-		return nil, fmt.Errorf("manifest response from %s has Docker-Content-Digest %s, content is %s", manifestURL, headerDigest, actualDigest)
+	persistedDigest := ""
+	if headerDigest := strings.TrimSpace(resp.Header.Get("Docker-Content-Digest")); headerDigest != "" {
+		canonicalDigest, err := verifySupportedDigest(data, headerDigest)
+		if err != nil {
+			return nil, manifestMetadata{}, fmt.Errorf("manifest response from %s has Docker-Content-Digest %s: %w", manifestURL, headerDigest, err)
+		}
+		persistedDigest = canonicalDigest
 	}
-	if strings.HasPrefix(requestedReference, "sha256:") && requestedReference != actualDigest {
-		return nil, fmt.Errorf("manifest response from %s does not match requested digest %s (content is %s)", manifestURL, requestedReference, actualDigest)
+	if isDigestReference(requestedReference) {
+		canonicalDigest, err := verifySupportedDigest(data, requestedReference)
+		if err != nil {
+			return nil, manifestMetadata{}, fmt.Errorf("manifest response from %s does not match requested digest %s: %w", manifestURL, requestedReference, err)
+		}
+		if persistedDigest != "" && persistedDigest != canonicalDigest {
+			return nil, manifestMetadata{}, fmt.Errorf("manifest response from %s has Docker-Content-Digest %s, requested digest is %s", manifestURL, persistedDigest, canonicalDigest)
+		}
+		persistedDigest = canonicalDigest
+	}
+	if persistedDigest == "" {
+		persistedDigest = "sha256:" + manifestSHA256(data)
 	}
 
-	return data, nil
+	return data, manifestMetadata{
+		ContentType:         contentType,
+		ContentLength:       int64(len(data)),
+		DockerContentDigest: persistedDigest,
+	}, nil
 }
 
 func manifestReference(requestPath string) string {
@@ -426,6 +641,11 @@ func manifestReference(requestPath string) string {
 		return match[2]
 	}
 	return ""
+}
+
+func isDigestReference(reference string) bool {
+	_, _, ok := splitDigestReference(reference)
+	return ok
 }
 
 func responseURL(resp *http.Response, fallback string) string {
@@ -440,15 +660,45 @@ func manifestSHA256(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func manifestSHA512(data []byte) string {
+	sum := sha512.Sum512(data)
+	return hex.EncodeToString(sum[:])
+}
+
 func (s *Server) serveCachedManifest(w http.ResponseWriter, r *http.Request) bool {
-	path := s.manifestPath(r.URL.Path)
-	data, err := os.ReadFile(path)
+	data, err := s.cachedManifestBytes(r.URL.Path)
 	if err != nil {
 		return false
 	}
-	if ct, err := os.ReadFile(path + ".ct"); err == nil && len(ct) > 0 {
-		w.Header().Set("Content-Type", string(ct))
+	metadata := s.cachedManifestMetadata(r.URL.Path, data)
+	return serveManifestBytes(w, r, data, metadata)
+}
+
+func (s *Server) serveCachedDigestManifest(w http.ResponseWriter, r *http.Request, requestedDigest string) (bool, *cacheReplayError) {
+	path := s.manifestPath(r.URL.Path)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false, nil
 	}
+	canonical, err := verifySupportedDigest(data, requestedDigest)
+	if err != nil {
+		if s.offlineEnabled() {
+			return false, &cacheReplayError{
+				status: http.StatusServiceUnavailable,
+				err:    fmt.Errorf("mirror offline: cached digest corrupted"),
+			}
+		}
+		return false, nil
+	}
+	metadata := s.cachedManifestMetadata(r.URL.Path, data)
+	metadata.DockerContentDigest = canonical
+	return serveManifestBytes(w, r, data, metadata), nil
+}
+
+func serveManifestBytes(w http.ResponseWriter, r *http.Request, data []byte, metadata manifestMetadata) bool {
+	w.Header().Set("Content-Type", metadata.ContentType)
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", metadata.ContentLength))
+	w.Header().Set("Docker-Content-Digest", metadata.DockerContentDigest)
 	w.WriteHeader(http.StatusOK)
 	if r.Method == http.MethodGet {
 		_, _ = w.Write(data)
@@ -456,7 +706,64 @@ func (s *Server) serveCachedManifest(w http.ResponseWriter, r *http.Request) boo
 	return true
 }
 
+func (s *Server) cachedManifestBytes(requestPath string) ([]byte, error) {
+	return os.ReadFile(s.manifestPath(requestPath))
+}
+
+func (s *Server) cachedManifestMetadata(requestPath string, data []byte) manifestMetadata {
+	metadata := manifestMetadata{
+		ContentType:         s.cachedManifestContentType(requestPath, data),
+		ContentLength:       int64(len(data)),
+		DockerContentDigest: cachedManifestDigest(data, manifestReference(requestPath), ""),
+	}
+	if rawMetadata, err := readCheckedRegularFile(s.manifestMetadataPath(requestPath), maxCachedManifestSidecarBytes); err == nil {
+		var stored manifestMetadata
+		if json.Unmarshal(rawMetadata, &stored) == nil {
+			_, digestErr := verifySupportedDigest(data, stored.DockerContentDigest)
+			if digestErr == nil && stored.ContentType != "" {
+				metadata.ContentType = stored.ContentType
+			}
+			metadata.DockerContentDigest = cachedManifestDigest(data, manifestReference(requestPath), stored.DockerContentDigest)
+		}
+	}
+	return metadata
+}
+
+func (s *Server) cachedManifestContentType(requestPath string, data []byte) string {
+	if contentType := manifestContentType(data); contentType != "" {
+		return contentType
+	}
+	if contentType := s.cachedLegacyManifestContentType(requestPath); contentType != "" {
+		return contentType
+	}
+	return "application/vnd.oci.image.manifest.v1+json"
+}
+
+func (s *Server) cachedLegacyManifestContentType(requestPath string) string {
+	if ct, err := readCheckedRegularFile(s.manifestPath(requestPath)+".ct", maxCachedManifestSidecarBytes); err == nil && len(ct) > 0 {
+		return string(ct)
+	}
+	return ""
+}
+
+func manifestContentType(data []byte) string {
+	var manifest struct {
+		MediaType string `json:"mediaType"`
+	}
+	if json.Unmarshal(data, &manifest) != nil {
+		return ""
+	}
+	mediaType := strings.TrimSpace(manifest.MediaType)
+	if _, ok := manifestMediaTypes[strings.ToLower(mediaType)]; !ok {
+		return ""
+	}
+	return mediaType
+}
+
 func (s *Server) blobPath(digest string) string {
+	if canonical, ok := canonicalSupportedDigest(digest); ok {
+		digest = canonical
+	}
 	return filepath.Join(s.cacheDir, "blobs", strings.ReplaceAll(digest, ":", "-"))
 }
 
@@ -537,4 +844,84 @@ func decodeJSON(r io.Reader, destination any) error {
 		return err
 	}
 	return json.Unmarshal(data, destination)
+}
+
+type upstreamValidationError struct {
+	status int
+	err    error
+}
+
+func (e *upstreamValidationError) Error() string { return e.err.Error() }
+func (e *upstreamValidationError) Unwrap() error { return e.err }
+
+type cacheReplayError struct {
+	status int
+	err    error
+}
+
+func (e *cacheReplayError) Error() string { return e.err.Error() }
+func (e *cacheReplayError) Unwrap() error { return e.err }
+
+func splitDigestReference(reference string) (string, string, bool) {
+	match := digestRefRe.FindStringSubmatch(reference)
+	if match == nil {
+		return "", "", false
+	}
+	return strings.ToLower(match[1]), strings.ToLower(match[2]), true
+}
+
+func canonicalSupportedDigest(reference string) (string, bool) {
+	algorithm, encoded, ok := splitDigestReference(reference)
+	if !ok {
+		return "", false
+	}
+	switch algorithm {
+	case "sha256":
+		if len(encoded) != 64 {
+			return "", false
+		}
+	case "sha512":
+		if len(encoded) != 128 {
+			return "", false
+		}
+	default:
+		return "", false
+	}
+	return algorithm + ":" + encoded, true
+}
+
+func verifySupportedDigest(data []byte, reference string) (string, error) {
+	algorithm, encoded, ok := splitDigestReference(reference)
+	if !ok {
+		return "", fmt.Errorf("invalid digest reference")
+	}
+	switch algorithm {
+	case "sha256":
+		actual := manifestSHA256(data)
+		if encoded != actual {
+			return "", fmt.Errorf("content is sha256:%s", actual)
+		}
+	case "sha512":
+		actual := manifestSHA512(data)
+		if encoded != actual {
+			return "", fmt.Errorf("content is sha512:%s", actual)
+		}
+	default:
+		return "", fmt.Errorf("unsupported digest algorithm %q", algorithm)
+	}
+	return algorithm + ":" + encoded, nil
+}
+
+func cachedManifestDigest(data []byte, requestedReference, storedDigest string) string {
+	if isDigestReference(requestedReference) {
+		if canonical, err := verifySupportedDigest(data, requestedReference); err == nil {
+			return canonical
+		}
+	}
+	if storedDigest != "" {
+		if canonical, err := verifySupportedDigest(data, storedDigest); err == nil {
+			return canonical
+		}
+	}
+	return "sha256:" + manifestSHA256(data)
 }

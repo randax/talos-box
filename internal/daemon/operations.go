@@ -72,6 +72,27 @@ type cachePullArgs struct {
 	TalosVersion string `json:"talosVersion"`
 }
 
+type CacheWarmArgs struct {
+	Refs []string `json:"refs"`
+}
+
+type CacheCheckArgs struct {
+	Refs []string `json:"refs"`
+	Deep bool     `json:"deep,omitempty"`
+}
+
+type CachePruneScope string
+
+const (
+	CachePruneScopeImages CachePruneScope = "images"
+	CachePruneScopeMirror CachePruneScope = "mirror"
+	CachePruneScopeAll    CachePruneScope = "all"
+)
+
+type CachePruneArgs struct {
+	Scope CachePruneScope `json:"scope"`
+}
+
 // ClusterSummary is the compact cluster.list result.
 type ClusterSummary struct {
 	Name          string               `json:"name"`
@@ -144,6 +165,87 @@ type CachePullResult struct {
 	Version      string                  `json:"version"`
 	Architecture hypervisor.Architecture `json:"architecture"`
 	Path         string                  `json:"path"`
+}
+
+type CacheWarmStatus string
+
+const (
+	CacheWarmStatusWarmed          CacheWarmStatus = "warmed"
+	CacheWarmStatusAlreadyComplete CacheWarmStatus = "already-complete"
+	CacheWarmStatusFailed          CacheWarmStatus = "failed"
+)
+
+type CacheWarmEntry struct {
+	Ref    string          `json:"ref"`
+	Status CacheWarmStatus `json:"status"`
+	Reason string          `json:"reason,omitempty"`
+}
+
+type CacheWarmResult struct {
+	Entries         []CacheWarmEntry `json:"entries"`
+	Warmed          int              `json:"warmed"`
+	AlreadyComplete int              `json:"alreadyComplete"`
+	Failed          int              `json:"failed"`
+}
+
+const cacheWarmTimeout = 2 * time.Hour
+
+type CacheCheckStatus string
+
+const (
+	CacheCheckStatusComplete CacheCheckStatus = "complete"
+	CacheCheckStatusFailed   CacheCheckStatus = "failed"
+)
+
+type CacheCheckEntry struct {
+	Ref    string           `json:"ref"`
+	Status CacheCheckStatus `json:"status"`
+	Reason string           `json:"reason,omitempty"`
+}
+
+type CacheCheckResult struct {
+	Entries  []CacheCheckEntry `json:"entries"`
+	Complete int               `json:"complete"`
+	Failed   int               `json:"failed"`
+}
+type CacheImageEntry struct {
+	Schematic    string `json:"schematic"`
+	Version      string `json:"version"`
+	Architecture string `json:"architecture"`
+	Size         int64  `json:"size"`
+}
+
+type MirrorCacheEntry struct {
+	Upstream      string `json:"upstream"`
+	BlobCount     int    `json:"blobCount"`
+	BlobBytes     int64  `json:"blobBytes"`
+	ManifestCount int    `json:"manifestCount"`
+	ManifestBytes int64  `json:"manifestBytes"`
+}
+
+type MirrorCacheTotals struct {
+	BlobCount     int   `json:"blobCount"`
+	BlobBytes     int64 `json:"blobBytes"`
+	ManifestCount int   `json:"manifestCount"`
+	ManifestBytes int64 `json:"manifestBytes"`
+}
+
+type CacheListResult struct {
+	Images                []CacheImageEntry  `json:"images"`
+	Mirror                []MirrorCacheEntry `json:"mirror"`
+	MirrorTotal           MirrorCacheTotals  `json:"mirrorTotal"`
+	MirrorBoundGatewayIPs []string           `json:"mirrorBoundGatewayIps"`
+}
+
+type CachePruneResult struct {
+	Scope      CachePruneScope   `json:"scope"`
+	ImageCount int               `json:"imageCount"`
+	ImageBytes int64             `json:"imageBytes"`
+	Mirror     MirrorCacheTotals `json:"mirror"`
+}
+
+type MirrorOfflineStatus struct {
+	Enabled bool `json:"enabled"`
 }
 
 func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
@@ -843,15 +945,186 @@ func (s *Server) pullCache(raw json.RawMessage) (CachePullResult, error) {
 	return CachePullResult{Schematic: schematic, Version: talosVersion, Architecture: architecture, Path: path}, nil
 }
 
-func (s *Server) pruneCache() (map[string]int, error) {
+func (s *Server) warmMirrorCache(raw json.RawMessage) (CacheWarmResult, error) {
+	var args CacheWarmArgs
+	if err := decodeArgs(raw, &args); err != nil {
+		return CacheWarmResult{}, err
+	}
+	if len(args.Refs) == 0 {
+		return CacheWarmResult{}, errors.New("at least one image reference is required")
+	}
+	for _, ref := range args.Refs {
+		if err := ValidateWarmRef(ref); err != nil {
+			return CacheWarmResult{}, err
+		}
+	}
+	if s.warmCache == nil {
+		return CacheWarmResult{}, errors.New("cache warm is not configured")
+	}
+	ctx, cancel := s.lifecycleTimeoutContext(cacheWarmTimeout)
+	defer cancel()
+	return s.warmCache(ctx, args.Refs, s.imageArchitecture())
+}
+
+func (s *Server) checkMirrorCache(raw json.RawMessage) (CacheCheckResult, error) {
+	var args CacheCheckArgs
+	if err := decodeArgs(raw, &args); err != nil {
+		return CacheCheckResult{}, err
+	}
+	if len(args.Refs) == 0 {
+		return CacheCheckResult{}, errors.New("at least one image reference is required")
+	}
+	for _, ref := range args.Refs {
+		if err := ValidateWarmRef(ref); err != nil {
+			return CacheCheckResult{}, err
+		}
+	}
+	if s.checkCache == nil {
+		return CacheCheckResult{}, errors.New("cache check is not configured")
+	}
+	ctx, cancel := s.lifecycleTimeoutContext(cacheWarmTimeout)
+	defer cancel()
+	return s.checkCache(ctx, args.Refs, s.imageArchitecture(), args.Deep)
+}
+
+func (s *Server) listCache() (CacheListResult, error) {
 	entries, err := s.cache.List()
 	if err != nil {
-		return nil, err
+		return CacheListResult{}, err
 	}
-	if err := s.cache.Prune(); err != nil {
-		return nil, err
+	mirrorStats, mirrorTotals, err := s.cache.MirrorStats()
+	if err != nil {
+		return CacheListResult{}, err
 	}
-	return map[string]int{"removed": len(entries)}, nil
+	result := CacheListResult{
+		Images:      make([]CacheImageEntry, 0, len(entries)),
+		Mirror:      make([]MirrorCacheEntry, 0, len(mirrorStats)),
+		MirrorTotal: MirrorCacheTotals(mirrorTotals),
+	}
+	if s.boundMirrorGateways != nil {
+		result.MirrorBoundGatewayIPs = s.boundMirrorGateways()
+	}
+	for _, entry := range entries {
+		result.Images = append(result.Images, CacheImageEntry{
+			Schematic:    entry.Schematic,
+			Version:      entry.Version,
+			Architecture: string(entry.Architecture),
+			Size:         entry.Size,
+		})
+	}
+	for _, stat := range mirrorStats {
+		result.Mirror = append(result.Mirror, MirrorCacheEntry{
+			Upstream:      stat.Upstream,
+			BlobCount:     stat.BlobCount,
+			BlobBytes:     stat.BlobBytes,
+			ManifestCount: stat.ManifestCount,
+			ManifestBytes: stat.ManifestBytes,
+		})
+	}
+	return result, nil
+}
+
+func (s *Server) pruneCache(raw json.RawMessage) (CachePruneResult, error) {
+	var args CachePruneArgs
+	if err := decodeArgs(raw, &args); err != nil {
+		return CachePruneResult{}, err
+	}
+	if args.Scope == "" {
+		args.Scope = CachePruneScopeImages
+	}
+	switch args.Scope {
+	case CachePruneScopeImages:
+		result, err := s.cache.PruneDisk()
+		if err != nil {
+			return CachePruneResult{}, err
+		}
+		return CachePruneResult{Scope: args.Scope, ImageCount: result.ImageCount, ImageBytes: result.ImageBytes, Mirror: MirrorCacheTotals(result.Mirror)}, nil
+	case CachePruneScopeMirror:
+		result, err := s.cache.PruneMirror()
+		if err != nil {
+			return CachePruneResult{}, err
+		}
+		return CachePruneResult{Scope: args.Scope, ImageCount: result.ImageCount, ImageBytes: result.ImageBytes, Mirror: MirrorCacheTotals(result.Mirror)}, nil
+	case CachePruneScopeAll:
+		result, err := s.cache.PruneAll()
+		if err != nil {
+			return CachePruneResult{}, err
+		}
+		return CachePruneResult{Scope: args.Scope, ImageCount: result.ImageCount, ImageBytes: result.ImageBytes, Mirror: MirrorCacheTotals(result.Mirror)}, nil
+	default:
+		return CachePruneResult{}, fmt.Errorf("unknown cache prune scope %q", args.Scope)
+	}
+}
+
+func ValidateWarmRef(ref string) error {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return errors.New("image reference is required")
+	}
+	if strings.ContainsAny(ref, "?#") || strings.ContainsFunc(ref, func(character rune) bool {
+		return character <= 0x20
+	}) {
+		return fmt.Errorf("image reference %q is malformed", ref)
+	}
+
+	name, digest, hasDigest := strings.Cut(ref, "@")
+	if hasDigest {
+		if digest == "" || !isSupportedWarmDigest(digest) {
+			return fmt.Errorf("image reference %q must use a sha256 or sha512 digest", ref)
+		}
+	}
+
+	host, remainder, ok := strings.Cut(name, "/")
+	if !ok || remainder == "" || (!strings.Contains(host, ".") && !strings.Contains(host, ":") && host != "localhost") {
+		return fmt.Errorf("image reference %q must include a registry host", ref)
+	}
+	if strings.HasSuffix(name, "/") || strings.HasPrefix(remainder, ":") {
+		return fmt.Errorf("image reference %q is malformed", ref)
+	}
+
+	lastSlash := strings.LastIndex(name, "/")
+	lastColon := strings.LastIndex(name, ":")
+	tag := ""
+	if lastColon > lastSlash {
+		tag = name[lastColon+1:]
+	}
+	if hasDigest && lastColon <= lastSlash {
+		return nil
+	}
+	if hasDigest && lastColon > lastSlash && tag == "" {
+		return fmt.Errorf("image reference %q is malformed", ref)
+	}
+	if lastColon <= lastSlash {
+		return fmt.Errorf("image reference %q must include a non-latest tag or digest", ref)
+	}
+	if tag == "latest" {
+		return fmt.Errorf("image reference %q must not use :latest", ref)
+	}
+	return nil
+}
+
+func isSupportedWarmDigest(value string) bool {
+	algorithm, encoded, ok := strings.Cut(value, ":")
+	if !ok || encoded == "" {
+		return false
+	}
+	for _, character := range encoded {
+		if !isHexDigit(character) {
+			return false
+		}
+	}
+	switch algorithm {
+	case "sha256":
+		return len(encoded) == 64
+	case "sha512":
+		return len(encoded) == 128
+	default:
+		return false
+	}
+}
+
+func isHexDigit(character rune) bool {
+	return (character >= 'a' && character <= 'f') || (character >= 'A' && character <= 'F') || (character >= '0' && character <= '9')
 }
 
 func (s *Server) resolveImage(schematic, talosVersion string) (string, string, error) {

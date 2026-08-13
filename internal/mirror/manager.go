@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/randax/talos-box/internal/manifests"
 )
@@ -42,14 +44,18 @@ type Manager struct {
 	serverFactory      func(upstream, base, cacheDir string) http.Handler
 	resolveUpstreamIPs func(context.Context, string) ([]net.IP, error)
 	hostOwnedIPs       func() ([]net.IP, error)
+	dialContext        func(context.Context, string, string) (net.Conn, error)
+	offline            atomic.Bool
 
 	mu                sync.Mutex
 	bound             map[string][]*http.Server // gateway IP -> its servers
 	dynamic           map[string]http.Handler
+	dynamicServers    map[string]*Server
 	dynamicOrder      *list.List
 	dynamicLRUEntries map[string]*list.Element
 	dynamicClosers    map[string]func()
 	dynamicCap        int
+	warmTagMu         sync.Mutex
 }
 
 const dynamicHandlerCap = 64
@@ -71,9 +77,11 @@ func newManagerWithPorts(cacheRoot string, ports []portBinding, catchAllPort int
 		resolveUpstreamIPs: func(ctx context.Context, host string) ([]net.IP, error) {
 			return lookupNamespaceIPs(ctx, host)
 		},
-		hostOwnedIPs: hostOwnedIPs,
-		bound:        map[string][]*http.Server{},
-		dynamic:      map[string]http.Handler{},
+		hostOwnedIPs:   hostOwnedIPs,
+		dialContext:    defaultEgressDependencies().dialContext,
+		bound:          map[string][]*http.Server{},
+		dynamic:        map[string]http.Handler{},
+		dynamicServers: map[string]*Server{},
 	}
 }
 
@@ -101,7 +109,9 @@ func (m *Manager) Bind(gatewayIP string) error {
 		if m.baseOverride != "" {
 			base = m.baseOverride
 		}
-		server := &http.Server{Handler: NewServer(base, filepath.Join(m.cacheRoot, entry.Upstream))}
+		mirrorServer := NewServer(base, filepath.Join(m.cacheRoot, entry.Upstream))
+		mirrorServer.offline = &m.offline
+		server := &http.Server{Handler: mirrorServer}
 		if m.serverFactory != nil {
 			server.Handler = m.serverFactory(entry.Upstream, base, filepath.Join(m.cacheRoot, entry.Upstream))
 		}
@@ -158,6 +168,18 @@ func (m *Manager) Close() {
 	}
 }
 
+// BoundGatewayIPs reports the currently bound gateway IPs as a sorted copy.
+func (m *Manager) BoundGatewayIPs() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	gateways := make([]string, 0, len(m.bound))
+	for gateway := range m.bound {
+		gateways = append(gateways, gateway)
+	}
+	sort.Strings(gateways)
+	return gateways
+}
+
 // DefaultDir is the mirror cache root under the talosbox cache.
 func DefaultDir(cacheRoot string) string {
 	return filepath.Join(cacheRoot, "mirror")
@@ -169,14 +191,72 @@ func (m *Manager) serveCatchAll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := m.validateResolvedAuthority(r.Context(), authority); err != nil {
-		http.Error(w, err.Error(), http.StatusForbidden)
-		return
-	}
-	handler := m.handlerForUpstream(authority)
 	clone := r.Clone(r.Context())
 	clone.URL = cloneURLWithoutQueryValue(r.URL, "ns")
+	if clone.Method != http.MethodGet && clone.Method != http.MethodHead || clone.URL.Path == "/v2/" {
+		m.cacheProbeServer(authority).ServeHTTP(w, clone)
+		return
+	}
+	if served, cacheErr := m.probeCacheOnly(authority, w, clone); served {
+		return
+	} else if cacheErr != nil {
+		http.Error(w, cacheErr.Error(), cacheErr.status)
+		return
+	}
+	handler, ok := m.dynamicHandler(authority.cacheKey)
+	if !ok {
+		if err := m.validateResolvedAuthority(r.Context(), authority); err != nil {
+			var validationErr *upstreamValidationError
+			if errors.As(err, &validationErr) {
+				http.Error(w, validationErr.Error(), validationErr.status)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		handler = m.handlerForUpstream(authority)
+	}
 	handler.ServeHTTP(w, clone)
+}
+
+func (m *Manager) probeCacheOnly(authority upstreamAuthority, w http.ResponseWriter, r *http.Request) (bool, *cacheReplayError) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false, nil
+	}
+	if r.URL.Path == "/v2/" {
+		return false, nil
+	}
+	server := m.cacheProbeServer(authority)
+	digest := ""
+	if match := blobPathRe.FindStringSubmatch(r.URL.Path); match != nil {
+		digest = match[1]
+	}
+	isManifest := manifestPathRe.MatchString(r.URL.Path)
+	if served, err := server.serveCacheIfAvailable(w, r, digest, isManifest); served || err != nil {
+		return served, err
+	}
+	if server.offlineEnabled() {
+		return false, &cacheReplayError{
+			status: http.StatusServiceUnavailable,
+			err:    fmt.Errorf("mirror offline: content not cached"),
+		}
+	}
+	return false, nil
+}
+
+func (m *Manager) cacheProbeServer(authority upstreamAuthority) *Server {
+	base := authority.base
+	if m.baseOverride != "" {
+		base = m.baseOverride
+	}
+	server := newServerWithEgress(base, filepath.Join(m.cacheRoot, authority.cacheKey), egressDependencies{
+		resolve:     m.resolveUpstreamIPs,
+		hostIPs:     m.hostOwnedIPs,
+		dialContext: m.dialContext,
+		blocked:     namespaceIPBlocked,
+	})
+	server.offline = &m.offline
+	return server
 }
 
 type upstreamAuthority struct {
@@ -224,15 +304,15 @@ func parseUpstreamAuthority(raw string) (upstreamAuthority, error) {
 func (m *Manager) validateResolvedAuthority(ctx context.Context, authority upstreamAuthority) error {
 	ips, err := m.resolveUpstreamIPs(ctx, authority.canonicalHost)
 	if err != nil {
-		return fmt.Errorf("resolve ns %q: %w", authority.canonicalAuthority, err)
+		return &upstreamValidationError{status: http.StatusBadGateway, err: fmt.Errorf("resolve ns %q: %w", authority.canonicalAuthority, err)}
 	}
 	hostIPs, err := m.hostOwnedIPs()
 	if err != nil {
-		return fmt.Errorf("inspect host addresses: %w", err)
+		return &upstreamValidationError{status: http.StatusBadGateway, err: fmt.Errorf("inspect host addresses: %w", err)}
 	}
 	for _, ip := range ips {
 		if namespaceIPBlocked(ip, hostIPs) {
-			return fmt.Errorf("refuse ns %q: address %s is not public", authority.canonicalAuthority, ip.String())
+			return &upstreamValidationError{status: http.StatusForbidden, err: fmt.Errorf("refuse ns %q: address %s is not public", authority.canonicalAuthority, ip.String())}
 		}
 	}
 	return nil
@@ -254,18 +334,25 @@ func (m *Manager) handlerForUpstream(authority upstreamAuthority) http.Handler {
 		base = m.baseOverride
 	}
 	cacheDir := filepath.Join(m.cacheRoot, authority.cacheKey)
-	handler := http.Handler(newServerWithEgress(base, cacheDir, egressDependencies{
-		resolve:     m.resolveUpstreamIPs,
-		hostIPs:     m.hostOwnedIPs,
-		dialContext: defaultEgressDependencies().dialContext,
-		blocked:     namespaceIPBlocked,
-	}))
+	var (
+		handler        http.Handler
+		retainedServer *Server
+	)
 	if m.serverFactory != nil {
 		handler = m.serverFactory(authority.canonicalAuthority, base, cacheDir)
 	}
+	if configuredServer, ok := handler.(*Server); ok {
+		retainedServer = configuredServer
+	} else {
+		retainedServer = m.newDynamicMirrorServer(base, cacheDir, authority)
+		if handler == nil {
+			handler = retainedServer
+		}
+	}
+	m.dynamicServers[authority.cacheKey] = retainedServer
 	m.dynamic[authority.cacheKey] = handler
 	m.dynamicLRUEntries[authority.cacheKey] = m.dynamicOrder.PushBack(authority.cacheKey)
-	if closer := dynamicHandlerCloser(handler); closer != nil {
+	if closer := dynamicResourceCloser(handler, retainedServer); closer != nil {
 		m.dynamicClosers[authority.cacheKey] = closer
 	}
 	for _, closer := range m.evictDynamicLocked() {
@@ -274,9 +361,40 @@ func (m *Manager) handlerForUpstream(authority upstreamAuthority) http.Handler {
 	return handler
 }
 
+func (m *Manager) newDynamicMirrorServer(base, cacheDir string, authority upstreamAuthority) *Server {
+	mirrorServer := newServerWithEgress(base, cacheDir, egressDependencies{
+		resolve:     m.resolveUpstreamIPs,
+		hostIPs:     m.hostOwnedIPs,
+		dialContext: m.dialContext,
+		blocked:     namespaceIPBlocked,
+	})
+	mirrorServer.offline = &m.offline
+	mirrorServer.validateUpstream = func(ctx context.Context) error {
+		return m.validateResolvedAuthority(ctx, authority)
+	}
+	return mirrorServer
+}
+
+func (m *Manager) dynamicHandler(cacheKey string) (http.Handler, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ensureDynamicStateLocked()
+	handler, ok := m.dynamic[cacheKey]
+	if !ok {
+		return nil, false
+	}
+	if element := m.dynamicLRUEntries[cacheKey]; element != nil {
+		m.dynamicOrder.MoveToBack(element)
+	}
+	return handler, true
+}
+
 func (m *Manager) ensureDynamicStateLocked() {
 	if m.dynamic == nil {
 		m.dynamic = map[string]http.Handler{}
+	}
+	if m.dynamicServers == nil {
+		m.dynamicServers = map[string]*Server{}
 	}
 	if m.dynamicOrder == nil {
 		m.dynamicOrder = list.New()
@@ -328,6 +446,7 @@ func (m *Manager) drainDynamicLocked() []func() {
 
 func (m *Manager) removeDynamicLocked(key string) func() {
 	delete(m.dynamic, key)
+	delete(m.dynamicServers, key)
 	if element := m.dynamicLRUEntries[key]; element != nil && m.dynamicOrder != nil {
 		m.dynamicOrder.Remove(element)
 	}
@@ -345,6 +464,38 @@ func dynamicHandlerCloser(handler http.Handler) func() {
 		return value.CloseIdleConnections
 	}
 	return nil
+}
+
+func dynamicResourceCloser(handler http.Handler, retainedServer *Server) func() {
+	var closers []func()
+	if retainedServer != nil {
+		closers = append(closers, retainedServer.CloseIdleConnections)
+	}
+	if configuredServer, ok := handler.(*Server); !ok || configuredServer != retainedServer {
+		if closer := dynamicHandlerCloser(handler); closer != nil {
+			closers = append(closers, closer)
+		}
+	}
+	switch len(closers) {
+	case 0:
+		return nil
+	case 1:
+		return closers[0]
+	default:
+		return func() {
+			for _, closer := range closers {
+				closer()
+			}
+		}
+	}
+}
+
+func (m *Manager) SetOffline(enabled bool) {
+	m.offline.Store(enabled)
+}
+
+func (m *Manager) Offline() bool {
+	return m.offline.Load()
 }
 
 func cloneURLWithoutQueryValue(source *url.URL, key string) *url.URL {
