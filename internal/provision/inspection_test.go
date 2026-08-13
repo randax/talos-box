@@ -156,6 +156,23 @@ func TestInspectionAllWarnsThatMixedOutputIsNotDirectlyApplicable(t *testing.T) 
 	}
 }
 
+func TestInspectionAllQuotesClusterNameInEveryCommand(t *testing.T) {
+	item := cluster.Cluster{Name: "demo; echo owned", SubnetIndex: 2, ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true}}
+	all, err := RenderInspection(item, "all")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, section := range []string{"machine", "values", "objects", "extras"} {
+		want := "tbx manifests 'demo; echo owned' " + section
+		if !strings.Contains(all, want) {
+			t.Fatalf("all inspection missing quoted command %q:\n%s", want, all)
+		}
+	}
+	if strings.Contains(all, "tbx manifests demo; echo owned") {
+		t.Fatalf("all inspection contains unquoted cluster name:\n%s", all)
+	}
+}
+
 func TestProvisioningNarrationUsesExactInspectionSections(t *testing.T) {
 	item := cluster.Cluster{Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true}}
 	for stage, narration := range map[string][]string{

@@ -7,6 +7,7 @@ import (
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/manifests"
+	"github.com/randax/talos-box/internal/shellquote"
 	"go.yaml.in/yaml/v4"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
@@ -219,18 +220,19 @@ func encodeInspectionObjects(objects []unstructured.Unstructured) (string, error
 }
 
 func (i inspection) all(clusterName string) string {
+	quoted := shellquote.Quote(clusterName)
 	sections := []string{
 		"# Inspection bundle only: this stream mixes a Talos patch, Helm values, and Kubernetes objects.\n# Do not pipe it wholesale to talosctl, helm, or kubectl; run the command above each section instead.\n",
 	}
-	sections = append(sections, fmt.Sprintf("# Machine-config prerequisite patch (apply before bootstrap):\n#   tbx manifests %s machine\n%s", clusterName, i.machine))
+	sections = append(sections, fmt.Sprintf("# Machine-config prerequisite patch (apply before bootstrap):\n#   tbx manifests %s machine\n%s", quoted, i.machine))
 	if i.values != "" {
-		sections = append(sections, fmt.Sprintf("# Pinned Helm values used by tbx (release %s in namespace %s):\n#   tbx manifests %s values > values.yaml\n%s", i.chart.release, i.chart.namespace, clusterName, i.values))
+		sections = append(sections, fmt.Sprintf("# Pinned Helm values used by tbx (release %s in namespace %s):\n#   tbx manifests %s values > values.yaml\n%s", i.chart.release, i.chart.namespace, quoted, i.values))
 	}
 	if i.objects != "" {
-		sections = append(sections, fmt.Sprintf("# Exact rendered chart objects tbx applies server-side (%s %s, release %s, namespace %s):\n#   tbx manifests %s objects | kubectl apply --server-side -f -\n%s", i.chart.name, i.chart.version, i.chart.release, i.chart.namespace, clusterName, i.objects))
+		sections = append(sections, fmt.Sprintf("# Exact rendered chart objects tbx applies server-side (%s %s, release %s, namespace %s):\n#   tbx manifests %s objects | kubectl apply --server-side -f -\n%s", i.chart.name, i.chart.version, i.chart.release, i.chart.namespace, quoted, i.objects))
 	}
 	if i.extras != "" {
-		sections = append(sections, fmt.Sprintf("# Exact LoadBalancer/BGP extras and probe tbx applies:\n#   tbx manifests %s extras | kubectl apply --server-side -f -\n%s", clusterName, i.extras))
+		sections = append(sections, fmt.Sprintf("# Exact LoadBalancer/BGP extras and probe tbx applies:\n#   tbx manifests %s extras | kubectl apply --server-side -f -\n%s", quoted, i.extras))
 	}
 	return strings.Join(sections, "---\n")
 }
