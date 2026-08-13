@@ -416,7 +416,7 @@ func (s *Server) stopCluster(raw json.RawMessage) (ClusterSummary, error) {
 
 func (s *Server) stop(name string) error {
 	s.cancelProvisionLocked(name)
-	delete(s.storagePhases, name)
+	s.invalidateStoragePhaseLocked(name)
 	if item, err := cluster.Load(name); err == nil {
 		s.unbindMirrors(item.SubnetIndex)
 	} else {
@@ -511,7 +511,7 @@ func (s *Server) destroyCluster(raw json.RawMessage) (map[string]string, error) 
 	if err := cluster.Destroy(args.Name); err != nil {
 		return nil, err
 	}
-	delete(s.storagePhases, args.Name)
+	s.invalidateStoragePhaseLocked(args.Name)
 	if err := SyncResolverFiles(); err != nil {
 		log.Printf("resolver files after destroying %s: %v", args.Name, err)
 	}

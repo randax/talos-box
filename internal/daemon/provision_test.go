@@ -5,12 +5,23 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
 )
+
+func eventually(t *testing.T, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for !condition() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition did not become true")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
 
 func TestRefreshKubernetesReadinessDoesNotClaimReadyWithoutCredentials(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
@@ -93,12 +104,9 @@ func TestRefreshStoragePhasesReprobesAfterDaemonRestart(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "kubeconfig"), []byte("credentials"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	called := false
+	observed := make(chan string, 1)
 	service := &Server{storageProbe: func(_ context.Context, kubeconfig []byte) error {
-		called = true
-		if string(kubeconfig) != "credentials" {
-			t.Fatalf("kubeconfig = %q", kubeconfig)
-		}
+		observed <- string(kubeconfig)
 		return nil
 	}}
 	statuses := []ClusterStatus{{
@@ -107,9 +115,20 @@ func TestRefreshStoragePhasesReprobesAfterDaemonRestart(t *testing.T) {
 	}}
 
 	service.refreshStoragePhases(statuses)
-
-	if !called || statuses[0].StoragePhase != StoragePhaseLive {
-		t.Fatalf("called=%v storage phase=%q, want fresh live observation", called, statuses[0].StoragePhase)
+	if statuses[0].StoragePhase != StoragePhaseProvisioning {
+		t.Fatalf("initial storage phase=%q, want non-blocking provisioning", statuses[0].StoragePhase)
+	}
+	if got := <-observed; got != "credentials" {
+		t.Fatalf("kubeconfig = %q", got)
+	}
+	eventually(t, func() bool {
+		service.opMu.Lock()
+		defer service.opMu.Unlock()
+		return service.storagePhases["demo"] == StoragePhaseLive
+	})
+	service.refreshStoragePhases(statuses)
+	if statuses[0].StoragePhase != StoragePhaseLive {
+		t.Fatalf("storage phase=%q after background probe, want live", statuses[0].StoragePhase)
 	}
 }
 
@@ -156,19 +175,25 @@ func TestRefreshStoragePhasesSharesConcurrentRestartProbe(t *testing.T) {
 		}}
 	}
 	first, second := newStatuses(), newStatuses()
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); service.refreshStoragePhases(first) }()
+	service.refreshStoragePhases(first)
 	<-entered
-	go func() { defer wg.Done(); service.refreshStoragePhases(second) }()
+	service.refreshStoragePhases(second)
 	close(release)
-	wg.Wait()
-
+	eventually(t, func() bool {
+		service.opMu.Lock()
+		defer service.opMu.Unlock()
+		return service.storagePhases["demo"] == StoragePhaseLive
+	})
 	if calls.Load() != 1 {
 		t.Fatalf("storage probe calls = %d, want one shared observation", calls.Load())
 	}
-	if first[0].StoragePhase != StoragePhaseLive || second[0].StoragePhase != StoragePhaseLive {
-		t.Fatalf("storage phases = %q, %q; want live", first[0].StoragePhase, second[0].StoragePhase)
+	if first[0].StoragePhase != StoragePhaseProvisioning || second[0].StoragePhase != StoragePhaseProvisioning {
+		t.Fatalf("initial storage phases = %q, %q; want non-blocking provisioning", first[0].StoragePhase, second[0].StoragePhase)
+	}
+	third := newStatuses()
+	service.refreshStoragePhases(third)
+	if third[0].StoragePhase != StoragePhaseLive {
+		t.Fatalf("storage phase after shared probe = %q, want live", third[0].StoragePhase)
 	}
 }
 

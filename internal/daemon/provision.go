@@ -271,24 +271,51 @@ func (s *Server) refreshStoragePhases(statuses []ClusterStatus) {
 			status.StoragePhase = StoragePhaseLive
 		case active[status.Name], !status.KubernetesReady:
 			status.StoragePhase = StoragePhaseProvisioning
-		case s.probeStorageStatus(status.Name) == nil:
-			status.StoragePhase = StoragePhaseLive
 		default:
 			status.StoragePhase = StoragePhaseProvisioning
+			s.beginStorageStatusProbe(status.Name)
 		}
 		status.Hints = Hints(*status)
 	}
 }
 
-func (s *Server) probeStorageStatus(name string) error {
-	s.storageProbeMu.Lock()
-	defer s.storageProbeMu.Unlock()
+func (s *Server) beginStorageStatusProbe(name string) {
 	s.opMu.Lock()
-	alreadyLive := s.storagePhases != nil && s.storagePhases[name] == StoragePhaseLive
-	s.opMu.Unlock()
-	if alreadyLive {
-		return nil
+	if s.storagePhases[name] == StoragePhaseLive || s.storageStatusProbes[name].cancel != nil {
+		s.opMu.Unlock()
+		return
 	}
+	if s.storageStatusProbes == nil {
+		s.storageStatusProbes = make(map[string]activeStorageProbe)
+	}
+	parent := s.lifecycleContext
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	s.storageProbeSequence++
+	generation := s.storageProbeSequence
+	s.storageStatusProbes[name] = activeStorageProbe{generation: generation, cancel: cancel}
+	s.opMu.Unlock()
+	go s.runStorageStatusProbe(ctx, name, generation)
+}
+
+func (s *Server) runStorageStatusProbe(ctx context.Context, name string, generation uint64) {
+	err := s.probeStorageStatus(ctx, name)
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	active, ok := s.storageStatusProbes[name]
+	if !ok || active.generation != generation {
+		return
+	}
+	active.cancel()
+	delete(s.storageStatusProbes, name)
+	if err == nil {
+		s.recordStoragePhaseLocked(name, StoragePhaseLive)
+	}
+}
+
+func (s *Server) probeStorageStatus(parent context.Context, name string) error {
 	dir, err := cluster.Dir(name)
 	if err != nil {
 		return err
@@ -297,7 +324,7 @@ func (s *Server) probeStorageStatus(name string) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
 	probe := s.storageProbe
 	if probe == nil {
@@ -305,13 +332,15 @@ func (s *Server) probeStorageStatus(name string) error {
 			return provision.ProbeLocalPathStorage(ctx, kubeconfig, time.Second)
 		}
 	}
-	if err := probe(ctx, kubeconfig); err != nil {
-		return err
+	return probe(ctx, kubeconfig)
+}
+
+func (s *Server) invalidateStoragePhaseLocked(name string) {
+	delete(s.storagePhases, name)
+	if active, ok := s.storageStatusProbes[name]; ok {
+		active.cancel()
+		delete(s.storageStatusProbes, name)
 	}
-	s.opMu.Lock()
-	s.recordStoragePhaseLocked(name, StoragePhaseLive)
-	s.opMu.Unlock()
-	return nil
 }
 
 func (s *Server) recordStoragePhaseLocked(name string, phase StoragePhase) {
