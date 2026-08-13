@@ -198,16 +198,48 @@ func waitForProbePod(ctx context.Context, client kubernetes.Interface, namespace
 
 func cleanupStorageProbe(ctx context.Context, client kubernetes.Interface, _ storageProbeSpec) error {
 	var errs []error
-	if err := deleteStorageProbePod(ctx, client, probeNamespace, storageProbeReaderPodName); err != nil {
+	if err := deleteStorageProbePodAndWait(ctx, client, probeNamespace, storageProbeReaderPodName); err != nil {
 		errs = append(errs, err)
 	}
-	if err := deleteStorageProbePod(ctx, client, probeNamespace, storageProbeWriterPodName); err != nil {
+	if err := deleteStorageProbePodAndWait(ctx, client, probeNamespace, storageProbeWriterPodName); err != nil {
 		errs = append(errs, err)
 	}
-	if err := deleteStorageProbePVC(ctx, client, probeNamespace, storageProbePVCName); err != nil {
+	if err := deleteStorageProbePVCAndWait(ctx, client, probeNamespace, storageProbePVCName); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
+}
+
+func deleteStorageProbePodAndWait(ctx context.Context, client kubernetes.Interface, namespace, name string) error {
+	if err := deleteStorageProbePod(ctx, client, namespace, name); err != nil {
+		return err
+	}
+	return poll(ctx, 100*time.Millisecond, func(ctx context.Context) error {
+		_, err := client.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("observe storage probe pod %q deletion: %w", name, err)
+		}
+		return fmt.Errorf("storage probe pod %q is still terminating", name)
+	})
+}
+
+func deleteStorageProbePVCAndWait(ctx context.Context, client kubernetes.Interface, namespace, name string) error {
+	if err := deleteStorageProbePVC(ctx, client, namespace, name); err != nil {
+		return err
+	}
+	return poll(ctx, 100*time.Millisecond, func(ctx context.Context) error {
+		_, err := client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("observe storage probe PVC %q deletion: %w", name, err)
+		}
+		return fmt.Errorf("storage probe PVC %q is still terminating", name)
+	})
 }
 
 func deleteStorageProbePod(ctx context.Context, client kubernetes.Interface, namespace, name string) error {

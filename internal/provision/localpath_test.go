@@ -13,6 +13,7 @@ import (
 	"github.com/randax/talos-box/internal/cluster"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -113,7 +114,12 @@ func TestRunStorageProbeWritesReadsAndCleansUp(t *testing.T) {
 	clientset := kubernetesfake.NewClientset()
 	writerGets, readerGets := 0, 0
 	deleteKeys := []string{}
+	deleted := map[string]bool{}
 	clientset.PrependReactor("get", "persistentvolumeclaims", func(k8stesting.Action) (bool, runtime.Object, error) {
+		if deleted["pvc/"+storageProbePVCName] {
+			deleted["pvc/"+storageProbePVCName] = false
+			return true, nil, apierrors.NewNotFound(schema.GroupResource{Resource: "persistentvolumeclaims"}, storageProbePVCName)
+		}
 		return true, &corev1.PersistentVolumeClaim{
 			ObjectMeta: metav1.ObjectMeta{Name: storageProbePVCName, Namespace: probeNamespace},
 			Spec:       corev1.PersistentVolumeClaimSpec{StorageClassName: stringPointer(localPathStorageClass)},
@@ -122,6 +128,10 @@ func TestRunStorageProbeWritesReadsAndCleansUp(t *testing.T) {
 	})
 	clientset.PrependReactor("get", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		get := action.(k8stesting.GetAction)
+		if deleted["pod/"+get.GetName()] {
+			deleted["pod/"+get.GetName()] = false
+			return true, nil, apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, get.GetName())
+		}
 		switch get.GetName() {
 		case storageProbeWriterPodName:
 			writerGets++
@@ -140,11 +150,13 @@ func TestRunStorageProbeWritesReadsAndCleansUp(t *testing.T) {
 	clientset.PrependReactor("delete", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		deleteAction := action.(k8stesting.DeleteAction)
 		deleteKeys = append(deleteKeys, "pod/"+deleteAction.GetName())
+		deleted["pod/"+deleteAction.GetName()] = true
 		return true, nil, nil
 	})
 	clientset.PrependReactor("delete", "persistentvolumeclaims", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		deleteAction := action.(k8stesting.DeleteAction)
 		deleteKeys = append(deleteKeys, "pvc/"+deleteAction.GetName())
+		deleted["pvc/"+deleteAction.GetName()] = true
 		return true, nil, nil
 	})
 
@@ -176,7 +188,12 @@ func TestRunStorageProbeReturnsContextAndCleansUp(t *testing.T) {
 	mapper := storageProbeRESTMapper()
 	clientset := kubernetesfake.NewClientset()
 	deleteKeys := []string{}
+	deleted := map[string]bool{}
 	clientset.PrependReactor("get", "persistentvolumeclaims", func(k8stesting.Action) (bool, runtime.Object, error) {
+		if deleted["pvc/"+storageProbePVCName] {
+			deleted["pvc/"+storageProbePVCName] = false
+			return true, nil, apierrors.NewNotFound(schema.GroupResource{Resource: "persistentvolumeclaims"}, storageProbePVCName)
+		}
 		return true, &corev1.PersistentVolumeClaim{
 			ObjectMeta: metav1.ObjectMeta{Name: storageProbePVCName, Namespace: probeNamespace},
 			Status:     corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimPending},
@@ -184,16 +201,22 @@ func TestRunStorageProbeReturnsContextAndCleansUp(t *testing.T) {
 	})
 	clientset.PrependReactor("get", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		get := action.(k8stesting.GetAction)
+		if deleted["pod/"+get.GetName()] {
+			deleted["pod/"+get.GetName()] = false
+			return true, nil, apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, get.GetName())
+		}
 		return true, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: get.GetName(), Namespace: probeNamespace}, Status: corev1.PodStatus{Phase: corev1.PodPending}}, nil
 	})
 	clientset.PrependReactor("delete", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		deleteAction := action.(k8stesting.DeleteAction)
 		deleteKeys = append(deleteKeys, "pod/"+deleteAction.GetName())
+		deleted["pod/"+deleteAction.GetName()] = true
 		return true, nil, nil
 	})
 	clientset.PrependReactor("delete", "persistentvolumeclaims", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		deleteAction := action.(k8stesting.DeleteAction)
 		deleteKeys = append(deleteKeys, "pvc/"+deleteAction.GetName())
+		deleted["pvc/"+deleteAction.GetName()] = true
 		return true, nil, nil
 	})
 
@@ -425,6 +448,31 @@ func TestStorageProbeDeleteIgnoresMissingObjects(t *testing.T) {
 	}
 	if err := deleteStorageProbePVC(context.Background(), clientset, probeNamespace, storageProbePVCName); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestStorageProbeCleanupWaitsForStaleSucceededPodToDisappear(t *testing.T) {
+	clientset := kubernetesfake.NewClientset(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: storageProbeWriterPodName, Namespace: probeNamespace},
+		Status:     corev1.PodStatus{Phase: corev1.PodSucceeded},
+	})
+	gets := 0
+	clientset.PrependReactor("get", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		gets++
+		get := action.(k8stesting.GetAction)
+		if gets == 1 {
+			return true, &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: get.GetName(), Namespace: probeNamespace},
+				Status:     corev1.PodStatus{Phase: corev1.PodSucceeded},
+			}, nil
+		}
+		return true, nil, apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, get.GetName())
+	})
+	if err := deleteStorageProbePodAndWait(context.Background(), clientset, probeNamespace, storageProbeWriterPodName); err != nil {
+		t.Fatal(err)
+	}
+	if gets < 2 {
+		t.Fatalf("pod deletion observations = %d, want stale object followed by NotFound", gets)
 	}
 }
 
