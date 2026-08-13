@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/manifests"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
 	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
@@ -254,6 +255,10 @@ func generateFlannel(item cluster.Cluster) (generated, error) {
 		if err != nil {
 			return generated{}, fmt.Errorf("encode %s config: %w", role, err)
 		}
+		bytes, err = applyStoragePrerequisiteMounts(bytes)
+		if err != nil {
+			return generated{}, fmt.Errorf("patch %s config: %w", role, err)
+		}
 		configs[role] = bytes
 	}
 	talosconfig, err := input.Talosconfig()
@@ -261,6 +266,39 @@ func generateFlannel(item cluster.Cluster) (generated, error) {
 		return generated{}, fmt.Errorf("generate talosconfig: %w", err)
 	}
 	return generated{talosconfig: talosconfig, configs: configs, paths: paths}, nil
+}
+
+func applyStoragePrerequisiteMounts(config []byte) ([]byte, error) {
+	var document map[string]any
+	if err := yaml.Unmarshal(config, &document); err != nil {
+		return nil, fmt.Errorf("decode generated machine config: %w", err)
+	}
+	machineSection, ok := document["machine"].(map[string]any)
+	if !ok {
+		return nil, errors.New("generated machine config is missing machine settings")
+	}
+	kubeletSection, ok := machineSection["kubelet"].(map[string]any)
+	if !ok {
+		kubeletSection = map[string]any{}
+		machineSection["kubelet"] = kubeletSection
+	}
+
+	mounts := make([]map[string]any, 0, len(manifests.StoragePrerequisiteKubeletExtraMounts()))
+	for _, mount := range manifests.StoragePrerequisiteKubeletExtraMounts() {
+		mounts = append(mounts, map[string]any{
+			"destination": mount.Destination,
+			"type":        mount.Type,
+			"source":      mount.Source,
+			"options":     append([]string(nil), mount.Options...),
+		})
+	}
+	kubeletSection["extraMounts"] = mounts
+
+	patched, err := yaml.Marshal(document)
+	if err != nil {
+		return nil, fmt.Errorf("encode generated machine config: %w", err)
+	}
+	return patched, nil
 }
 
 func loadOrCreateSecrets(path string, contract *machineryconfig.VersionContract) (*secrets.Bundle, error) {

@@ -38,6 +38,8 @@ const (
 	// 40 * (1 / 5s) = 8 QPS. Do not undercut Cilium 1.19.6's 10/20 defaults.
 	ciliumClientQPS   = 10
 	ciliumClientBurst = 20
+	localPathVolume   = "/var/local-path-provisioner"
+	longhornVolume    = "/var/lib/longhorn"
 )
 
 // ClusterASN is the BGP ASN for the cluster at the given subnet index.
@@ -236,6 +238,52 @@ func BalloonModule(Facts) string {
 `
 }
 
+type KubeletExtraMount struct {
+	Destination string
+	Type        string
+	Source      string
+	Options     []string
+}
+
+// StoragePrerequisiteKubeletExtraMounts returns the kubelet bind mounts
+// required by the curated storage stacks. Provisioning-generated machine
+// configs and printed Talos patches consume this shared representation.
+func StoragePrerequisiteKubeletExtraMounts() []KubeletExtraMount {
+	return []KubeletExtraMount{
+		{
+			Destination: localPathVolume,
+			Type:        "bind",
+			Source:      localPathVolume,
+			Options:     []string{"rshared", "rw"},
+		},
+		{
+			Destination: longhornVolume,
+			Type:        "bind",
+			Source:      longhornVolume,
+			Options:     []string{"rshared", "rw"},
+		},
+	}
+}
+
+// StoragePrerequisiteKubeletMounts renders the Talos machine-config patch
+// that makes the curated storage host paths visible inside the kubelet.
+func StoragePrerequisiteKubeletMounts() string {
+	var b strings.Builder
+	b.WriteString("machine:\n")
+	b.WriteString("  kubelet:\n")
+	b.WriteString("    extraMounts:\n")
+	for _, mount := range StoragePrerequisiteKubeletExtraMounts() {
+		fmt.Fprintf(&b, "      - destination: %s\n", mount.Destination)
+		fmt.Fprintf(&b, "        type: %s\n", mount.Type)
+		fmt.Fprintf(&b, "        source: %s\n", mount.Source)
+		b.WriteString("        options:\n")
+		for _, option := range mount.Options {
+			fmt.Fprintf(&b, "          - %s\n", option)
+		}
+	}
+	return b.String()
+}
+
 // All renders every document with comments naming the consuming tool and the
 // per-tool section that pipes cleanly into it.
 func All(f Facts) string {
@@ -247,7 +295,7 @@ func All(f Facts) string {
 	b.WriteString(CiliumValues(f))
 	b.WriteString("---\n")
 	fmt.Fprintf(&b, "# Apply with talosctl (machine config patches, e.g. talosctl patch mc -p @file) — this section alone:\n#   tbx manifests %s talos\n", f.Cluster)
-	b.WriteString(join(RegistryMirrors(f), BalloonModule(f)))
+	b.WriteString(join(RegistryMirrors(f), BalloonModule(f), StoragePrerequisiteKubeletMounts()))
 	return b.String()
 }
 
@@ -264,7 +312,9 @@ var sections = map[string]func(Facts) string{
 	"metallb-extras": MetalLBExtras,
 	"balloon":        BalloonModule,
 	"k8s":            k8sSection,
-	"talos":          func(f Facts) string { return join(RegistryMirrors(f), BalloonModule(f)) },
+	"talos": func(f Facts) string {
+		return join(RegistryMirrors(f), BalloonModule(f), StoragePrerequisiteKubeletMounts())
+	},
 }
 
 // k8sSection renders the LB pool plus exactly ONE announcement mechanism —

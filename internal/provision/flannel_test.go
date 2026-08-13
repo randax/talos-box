@@ -25,6 +25,7 @@ import (
 	"github.com/randax/talos-box/internal/cluster"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"gopkg.in/yaml.v3"
 )
 
 type fakeClient struct {
@@ -226,6 +227,40 @@ func TestFlannelReconcileWaitsForEveryKubernetesNode(t *testing.T) {
 	}
 }
 
+func TestGenerateFlannelAddsStorageKubeletMountsForEveryRole(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	for _, csi := range []cluster.CSI{"", cluster.CSILonghorn} {
+		t.Run(fmt.Sprintf("csi=%s", csi), func(t *testing.T) {
+			item, err := cluster.New("demo", 0, 1, 1, cluster.NodeDefaults{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			item.TalosVersion = "v1.13.6"
+			item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: csi}
+
+			generated, err := generateFlannel(item)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			want := []talosExtraMount{
+				{Destination: "/var/local-path-provisioner", Type: "bind", Source: "/var/local-path-provisioner", Options: []string{"rshared", "rw"}},
+				{Destination: "/var/lib/longhorn", Type: "bind", Source: "/var/lib/longhorn", Options: []string{"rshared", "rw"}},
+			}
+			for _, role := range []cluster.Role{cluster.RoleControlPlane, cluster.RoleWorker} {
+				config, ok := generated.configs[role]
+				if !ok {
+					t.Fatalf("missing generated config for %s", role)
+				}
+				if got := decodeGeneratedKubeletExtraMounts(t, config); !equalTalosExtraMounts(got, want) {
+					t.Fatalf("%s kubelet extraMounts = %#v, want %#v", role, got, want)
+				}
+			}
+		})
+	}
+}
+
 func TestFlannelReconcileStopsAtContextDeadline(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{})
@@ -385,4 +420,39 @@ func testCertificate(t *testing.T) (tls.Certificate, []byte, []byte) {
 		t.Fatal(err)
 	}
 	return certificate, certificatePEM, keyPEM
+}
+
+type talosExtraMount struct {
+	Destination string   `yaml:"destination"`
+	Type        string   `yaml:"type"`
+	Source      string   `yaml:"source"`
+	Options     []string `yaml:"options"`
+}
+
+func decodeGeneratedKubeletExtraMounts(t *testing.T, config []byte) []talosExtraMount {
+	t.Helper()
+
+	var decoded struct {
+		Machine struct {
+			Kubelet struct {
+				ExtraMounts []talosExtraMount `yaml:"extraMounts"`
+			} `yaml:"kubelet"`
+		} `yaml:"machine"`
+	}
+	if err := yaml.Unmarshal(config, &decoded); err != nil {
+		t.Fatalf("decode generated config: %v", err)
+	}
+	return decoded.Machine.Kubelet.ExtraMounts
+}
+
+func equalTalosExtraMounts(got, want []talosExtraMount) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for index := range got {
+		if got[index].Destination != want[index].Destination || got[index].Type != want[index].Type || got[index].Source != want[index].Source || strings.Join(got[index].Options, ",") != strings.Join(want[index].Options, ",") {
+			return false
+		}
+	}
+	return true
 }
