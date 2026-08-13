@@ -2,6 +2,8 @@ apiVersion: cilium.io/v2
 kind: CiliumLoadBalancerIPPool
 metadata:
   name: demo-pool
+  annotations:
+    talosbox.dev/announcement-owned: "talosbox"
 spec:
   blocks:
     - start: 172.30.0.200

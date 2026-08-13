@@ -1,7 +1,7 @@
-// Package provision drives Talos's API for the opt-in cluster provisioning
-// path. It deliberately persists only credentials and receives observed node
-// state from the daemon; provisioning progress is never written to cluster
-// state.
+// Package provision drives Talos's API for opt-in cluster provisioning and
+// reconciles curated Kubernetes networking stacks. It persists only
+// credentials and receives observed node state from the daemon; provisioning
+// progress is never written to cluster state.
 package provision
 
 import (
@@ -71,8 +71,8 @@ type TalosClient interface {
 	KubernetesReady(context.Context, []byte, []string) error
 }
 
-// LoadBalancerReconciler installs and verifies the flannel LoadBalancer
-// implementation after Talos has produced a ready Kubernetes API.
+// LoadBalancerReconciler installs and verifies a curated CNI's host-side
+// LoadBalancer implementation through the Kubernetes API.
 type LoadBalancerReconciler interface {
 	Reconcile(context.Context, cluster.Cluster, []byte) (LoadBalancerResult, error)
 }
@@ -83,6 +83,20 @@ type StorageReconciler interface {
 	Reconcile(context.Context, cluster.Cluster, []byte) (StorageResult, error)
 }
 
+// BGPReconciler reasserts the host-side BGP speaker after Cilium has applied
+// the in-cluster peer resources. The host process keeps no durable speaker
+// state, so this belongs in every observed-state provisioning pass.
+type BGPReconciler interface {
+	ReconcileBGP(context.Context, cluster.Cluster) error
+}
+
+// BGPDisabler is optional because only the daemon owns a host speaker. It is
+// intentionally separate from BGPReconciler so isolated render/reconcile
+// callers need not manufacture host-network state.
+type BGPDisabler interface {
+	DisableBGP(context.Context, cluster.Cluster) error
+}
+
 // Request supplies all transient state required for one reconciliation.
 type Request struct {
 	Cluster      cluster.Cluster
@@ -90,6 +104,7 @@ type Request struct {
 	Client       TalosClient
 	LoadBalancer LoadBalancerReconciler
 	Storage      StorageReconciler
+	BGP          BGPReconciler
 	PollInterval time.Duration
 }
 
@@ -116,22 +131,22 @@ type credentialPaths struct {
 	kubeconfig  string
 }
 
-// Reconcile brings exactly the Talos-managed flannel/no-LB path to a usable
-// Kubernetes API. It follows observations rather than recording progress:
-// only nodes currently in maintenance are given a machine config, then the
-// configured control plane is bootstrapped idempotently and yields kubeconfig.
+// Reconcile brings a curated CNI path to a usable Kubernetes API. It follows
+// observations rather than recording progress: only nodes currently in
+// maintenance are given a machine config, then the configured control plane is
+// bootstrapped idempotently and yields kubeconfig.
 func Reconcile(ctx context.Context, request Request) (Result, error) {
-	if request.Cluster.CNI != cluster.CNIFlannel {
+	if request.Cluster.CNI != cluster.CNIFlannel && request.Cluster.CNI != cluster.CNICilium {
 		return Result{}, nil
 	}
 	if request.Client == nil || request.Observe == nil {
-		return Result{}, errors.New("flannel provisioning requires a Talos client and node observer")
+		return Result{}, errors.New("CNI provisioning requires a Talos client and node observer")
 	}
 	if request.PollInterval <= 0 {
 		request.PollInterval = defaultPollInterval
 	}
 
-	generated, err := generateFlannel(request.Cluster)
+	generated, err := generateMachineConfigs(request.Cluster)
 	if err != nil {
 		return Result{}, err
 	}
@@ -189,12 +204,45 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 		result.Narration = append(result.Narration,
 			fmt.Sprintf("≈ talosctl --nodes %s bootstrap", controlPlane.IP),
 		)
-		kubeconfig, err := request.Client.Kubeconfig(ctx, controlPlane.IP)
+		kubeconfig, err := kubeconfigWithRetry(ctx, request.Client, controlPlane.IP, request.PollInterval)
 		if err != nil {
 			return Result{}, fmt.Errorf("retrieve kubeconfig: %w", err)
 		}
 		if err := writeSecure(generated.paths.kubeconfig, kubeconfig); err != nil {
 			return Result{}, fmt.Errorf("write kubeconfig: %w", err)
+		}
+		if request.Cluster.CNI == cluster.CNICilium {
+			if request.LoadBalancer == nil {
+				return Result{}, errors.New("cilium provisioning requires a Kubernetes reconciler")
+			}
+			if request.Cluster.BGP {
+				if request.BGP == nil {
+					return Result{}, errors.New("BGP provisioning requires a host BGP reconciler")
+				}
+				// The Cilium reconcile verifies the VIP from the host. Start the
+				// host peer first so BGP advertisements can install that route
+				// before the reachability probe runs.
+				if err := request.BGP.ReconcileBGP(ctx, request.Cluster); err != nil {
+					return Result{}, fmt.Errorf("reconcile host BGP: %w", err)
+				}
+			}
+			// Cilium is the CNI: cni.name none means Nodes cannot report Ready
+			// until its chart is applied. Reconcile it before the Ready wait.
+			loadBalancer, err := request.LoadBalancer.Reconcile(ctx, request.Cluster, kubeconfig)
+			if err != nil {
+				return Result{}, fmt.Errorf("reconcile Cilium: %w", err)
+			}
+			if request.Cluster.LB && !request.Cluster.BGP {
+				if disabler, ok := request.BGP.(BGPDisabler); ok {
+					// Cilium's reconciler has already applied L2 and removed its
+					// owned BGP objects. Only now may the host withdraw the peer.
+					if err := disabler.DisableBGP(ctx, request.Cluster); err != nil {
+						return Result{}, fmt.Errorf("disable host BGP: %w", err)
+					}
+				}
+			}
+			result.VIP = loadBalancer.VIP
+			result.Narration = append(result.Narration, loadBalancer.Narration...)
 		}
 		for {
 			if err := request.Client.KubernetesReady(ctx, kubeconfig, nodeNames(nodes)); err == nil {
@@ -209,7 +257,7 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 			fmt.Sprintf("export TALOSCONFIG=%s", generated.paths.talosconfig),
 			fmt.Sprintf("export KUBECONFIG=%s", generated.paths.kubeconfig),
 		)
-		if request.Cluster.LB {
+		if request.Cluster.CNI == cluster.CNIFlannel && request.Cluster.LB {
 			if request.LoadBalancer == nil {
 				return Result{}, errors.New("flannel LoadBalancer provisioning requires a Kubernetes reconciler")
 			}
@@ -236,7 +284,7 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 	}
 }
 
-func generateFlannel(item cluster.Cluster) (generated, error) {
+func generateMachineConfigs(item cluster.Cluster) (generated, error) {
 	paths, err := credentials(item.Name)
 	if err != nil {
 		return generated{}, err
@@ -263,6 +311,10 @@ func generateFlannel(item cluster.Cluster) (generated, error) {
 	if controlPlane.IP == "" {
 		return generated{}, errors.New("cluster has no control plane")
 	}
+	cniName := string(item.CNI)
+	if item.CNI == cluster.CNICilium {
+		cniName = "none"
+	}
 	input, err := generate.NewInput(
 		item.Name,
 		"https://"+controlPlane.IP+":6443",
@@ -271,7 +323,7 @@ func generateFlannel(item cluster.Cluster) (generated, error) {
 		generate.WithSecretsBundle(bundle),
 		generate.WithEndpointList(controlPlaneEndpoints),
 		generate.WithInstallDisk("/dev/vda"),
-		generate.WithClusterCNIConfig(&v1alpha1.CNIConfig{CNIName: string(cluster.CNIFlannel)}),
+		generate.WithClusterCNIConfig(&v1alpha1.CNIConfig{CNIName: cniName}),
 	)
 	if err != nil {
 		return generated{}, fmt.Errorf("generate Talos config input: %w", err)
@@ -286,12 +338,17 @@ func generateFlannel(item cluster.Cluster) (generated, error) {
 		if err != nil {
 			return generated{}, fmt.Errorf("encode %s config: %w", role, err)
 		}
-		bytes, err = applyProvisioningPrerequisites(bytes, manifests.Facts{
-			Cluster: item.Name, SubnetIndex: item.SubnetIndex, BGP: item.BGP,
-		})
+		if item.CNI == cluster.CNICilium {
+			bytes, err = disableKubeProxy(bytes)
+			if err != nil {
+				return generated{}, fmt.Errorf("disable kube-proxy in %s config: %w", role, err)
+			}
+		}
+		bytes, err = applyProvisioningPrerequisites(bytes, manifestFacts(item))
 		if err != nil {
 			return generated{}, fmt.Errorf("patch %s config: %w", role, err)
 		}
+		bytes = addCatchAllMirror(bytes, item.SubnetIndex)
 		configs[role] = bytes
 	}
 	talosconfig, err := input.Talosconfig()
@@ -346,6 +403,30 @@ func applyProvisioningPrerequisites(config []byte, facts manifests.Facts) ([]byt
 		return nil, fmt.Errorf("encode generated machine config: %w", err)
 	}
 	return patched, nil
+}
+
+func disableKubeProxy(config []byte) ([]byte, error) {
+	var document map[string]any
+	if err := yaml.Unmarshal(config, &document); err != nil {
+		return nil, err
+	}
+	clusterConfig, ok := document["cluster"].(map[string]any)
+	if !ok {
+		return nil, errors.New("generated config lacks cluster section")
+	}
+	clusterConfig["proxy"] = map[string]any{"disabled": true}
+	return yaml.Marshal(document)
+}
+
+func addCatchAllMirror(config []byte, subnetIndex int) []byte {
+	return append(config, []byte(fmt.Sprintf(`---
+apiVersion: v1alpha1
+kind: RegistryMirrorConfig
+name: "*"
+endpoints:
+  - url: http://172.30.%d.1:%d
+skipFallback: true
+`, subnetIndex, manifests.CatchAllPort))...)
 }
 
 func loadOrCreateSecrets(path string, contract *machineryconfig.VersionContract) (*secrets.Bundle, error) {
@@ -470,6 +551,27 @@ func alreadyBootstrapped(err error) bool {
 	return talosclient.StatusCode(err) == codes.AlreadyExists || strings.Contains(strings.ToLower(err.Error()), "already bootstrapped")
 }
 
+// kubeconfigWithRetry covers the short interval after bootstrap where Talos
+// has accepted the request but apid is still restarting or its Kubernetes
+// credentials are not yet available. Permanent failures remain immediate;
+// an interrupted run is still always safely recoverable by rerunning tbx up.
+func kubeconfigWithRetry(ctx context.Context, client TalosClient, node string, interval time.Duration) ([]byte, error) {
+	for {
+		kubeconfig, err := client.Kubeconfig(ctx, node)
+		if err == nil {
+			return kubeconfig, nil
+		}
+		switch talosclient.StatusCode(err) {
+		case codes.Unavailable, codes.DeadlineExceeded, codes.Canceled:
+			if err := wait(ctx, interval); err != nil {
+				return nil, err
+			}
+		default:
+			return nil, err
+		}
+	}
+}
+
 func wait(ctx context.Context, interval time.Duration) error {
 	if interval <= 0 {
 		return nil
@@ -573,6 +675,58 @@ func KubernetesReady(ctx context.Context, kubeconfig []byte, expectedNodes []str
 	for name := range expected {
 		if !ready[name] {
 			return fmt.Errorf("kubernetes expected node %q was not found", name)
+		}
+	}
+	return nil
+}
+
+// HubbleConverged verifies the optional Cilium Hubble deployments match the
+// desired toggle. It is intentionally a small observed-state check for the
+// fast path: a live VIP and Ready Nodes alone cannot prove that relay and UI
+// converged after their setting changed.
+func HubbleConverged(ctx context.Context, kubeconfig []byte, enabled bool) error {
+	transport, server, err := kubeTransport(kubeconfig)
+	if err != nil {
+		return err
+	}
+	defer transport.CloseIdleConnections()
+	for _, name := range []string{"hubble-relay", "hubble-ui"} {
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, server+"/apis/apps/v1/namespaces/kube-system/deployments/"+name, nil)
+		if err != nil {
+			return err
+		}
+		response, err := (&http.Client{Transport: transport}).Do(request)
+		if err != nil {
+			return err
+		}
+		if !enabled {
+			_ = response.Body.Close()
+			if response.StatusCode != http.StatusNotFound {
+				return fmt.Errorf("hubble is disabled but deployment %q still exists (%s)", name, response.Status)
+			}
+			continue
+		}
+		if response.StatusCode != http.StatusOK {
+			_ = response.Body.Close()
+			return fmt.Errorf("hubble deployment %q: %s", name, response.Status)
+		}
+		var deployment struct {
+			Metadata struct {
+				Generation int64 `json:"generation"`
+			} `json:"metadata"`
+			Status struct {
+				ObservedGeneration int64 `json:"observedGeneration"`
+				ReadyReplicas      int32 `json:"readyReplicas"`
+				AvailableReplicas  int32 `json:"availableReplicas"`
+			} `json:"status"`
+		}
+		decodeErr := json.NewDecoder(response.Body).Decode(&deployment)
+		_ = response.Body.Close()
+		if decodeErr != nil {
+			return fmt.Errorf("decode Hubble deployment %q: %w", name, decodeErr)
+		}
+		if deployment.Status.ObservedGeneration < deployment.Metadata.Generation || deployment.Status.ReadyReplicas < 1 || deployment.Status.AvailableReplicas < 1 {
+			return fmt.Errorf("hubble deployment %q is not Ready", name)
 		}
 	}
 	return nil
