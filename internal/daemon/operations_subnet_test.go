@@ -278,7 +278,7 @@ func TestStartClusterSkipsLonghornCustomSchematicWarningForGeneratedDefault(t *t
 	}
 }
 
-func TestStartClusterWarnsWhenCuratedCSIIsUnsupportedForCilium(t *testing.T) {
+func TestStartClusterDoesNotWarnThatCuratedCSIIsUnsupportedForCilium(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
 	item, err := cluster.New("cilium-csi-warning", 0, 0, 0, cluster.NodeDefaults{})
@@ -306,7 +306,7 @@ func TestStartClusterWarnsWhenCuratedCSIIsUnsupportedForCilium(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(result.Warning, "cni: cilium") || !strings.Contains(result.Warning, "will not install storage") {
-		t.Fatalf("ClusterSummary.Warning = %q, want explicit unsupported curated CSI warning", result.Warning)
+	if strings.Contains(result.Warning, "will not install storage") || strings.Contains(result.Warning, "not implemented") {
+		t.Fatalf("ClusterSummary.Warning = %q, curated CSI now runs on the generalized CNI path", result.Warning)
 	}
 }

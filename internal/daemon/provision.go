@@ -102,7 +102,7 @@ func (s *Server) beginProvisionTasksLocked(items []cluster.Cluster) []provisionT
 		if s.provisions == nil {
 			s.provisions = make(map[string]activeProvision)
 		}
-		if item.CNI == cluster.CNIFlannel && item.CSI != "" {
+		if item.CSI != "" {
 			s.invalidateStoragePhaseLocked(item.Name)
 			if s.storagePhases == nil {
 				s.storagePhases = make(map[string]StoragePhase)
@@ -159,7 +159,7 @@ func (s *Server) cancelAllProvisionsLocked() {
 func (s *Server) runProvisionTasks(data any, tasks []provisionTask) error {
 	for i, task := range tasks {
 		narration, phase, err := s.provisionCNI(task.ctx, task.item, false)
-		if task.item.CNI == cluster.CNIFlannel && task.item.CSI != "" {
+		if task.item.CSI != "" {
 			s.opMu.Lock()
 			s.recordStoragePhaseLocked(task.item.Name, phase)
 			s.opMu.Unlock()
@@ -194,7 +194,7 @@ func (s *Server) provisionCNI(parent context.Context, item cluster.Cluster, forc
 	// no-op. Cilium additionally probes its optional Hubble deployments: a live
 	// VIP and Ready Nodes alone cannot establish that that desired set converged.
 	if !force && s.tryFastNoopReconcile(item) {
-		if item.CNI == cluster.CNIFlannel && item.CSI != "" {
+		if item.CSI != "" {
 			return nil, StoragePhaseLive, nil
 		}
 		return nil, "", nil
@@ -226,13 +226,11 @@ func (s *Server) provisionCNI(parent context.Context, item cluster.Cluster, forc
 		},
 		PollInterval: time.Second,
 	}
-	if item.CNI == cluster.CNIFlannel {
-		switch item.CSI {
-		case cluster.CSILocalPath:
-			request.Storage = provision.LocalPathReconciler{PollInterval: time.Second}
-		case cluster.CSILonghorn:
-			request.Storage = provision.LonghornReconciler{PollInterval: time.Second}
-		}
+	switch item.CSI {
+	case cluster.CSILocalPath:
+		request.Storage = provision.LocalPathReconciler{PollInterval: time.Second}
+	case cluster.CSILonghorn:
+		request.Storage = provision.LonghornReconciler{PollInterval: time.Second}
 	}
 	result, err := reconcile(ctx, request)
 	if err != nil {
@@ -442,7 +440,7 @@ func (s *Server) refreshStoragePhases(statuses []ClusterStatus) {
 		status.StoragePhase = ""
 		status.StorageError = ""
 		switch {
-		case status.CNI != cluster.CNIFlannel, status.CSI == "", !status.Running:
+		case status.CSI == "", !status.Running:
 		case known[status.Name] == StoragePhaseLive:
 			status.StoragePhase = StoragePhaseLive
 		case active[status.Name], !status.KubernetesReady:

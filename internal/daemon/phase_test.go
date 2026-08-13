@@ -245,15 +245,16 @@ func TestHintsSuppressSingleNodeLonghornWarningUntilStorageIsLive(t *testing.T) 
 	}
 }
 
-func TestHintsWarnWhenCuratedCSIIntentCannotRunOnCurrentCNI(t *testing.T) {
+func TestHintsReportCiliumStorageProvisioning(t *testing.T) {
 	status := ClusterStatus{
 		Name:               "demo",
 		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, CSI: cluster.CSILonghorn},
+		StoragePhase:       StoragePhaseProvisioning,
 	}
 
 	joined := strings.Join(Hints(status), "\n")
-	if !strings.Contains(joined, "not implemented yet") || !strings.Contains(joined, "cni: cilium") {
-		t.Fatalf("hints = %q, want explicit unsupported curated CSI hint", joined)
+	if !strings.Contains(joined, "storage provisioning") || strings.Contains(joined, "not implemented") {
+		t.Fatalf("hints = %q, want active Cilium storage provisioning", joined)
 	}
 }
 
