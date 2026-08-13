@@ -39,6 +39,7 @@ type Server struct {
 	provisionReconcile   provisionReconcileFunc
 	storageProbe         func(context.Context, []byte) error
 	destroyVolumeCount   func(context.Context, cluster.Cluster) (int, error)
+	storageEngineDelete  func(context.Context, cluster.Cluster) error
 	nodeIPLookup         func(string, int) string
 	nodeProbe            func(string) ProbeResult
 	hostFreeMemory       func() (int, error)
@@ -117,6 +118,8 @@ func NewServer(ctx context.Context) (*Server, error) {
 		subnetSources:        cluster.SystemSubnetSources(),
 		hostPressure:         hostpressure.SystemSnapshot,
 		hostFreeMemory:       balloon.HostFreeMiB,
+		destroyVolumeCount:   countDestroyStorageVolumes,
+		storageEngineDelete:  deleteConfiguredStorageEngine,
 	}, nil
 }
 
@@ -308,8 +311,25 @@ func (s *Server) dispatchProvisioning(request Request) Response {
 			}
 		}
 	}
+	var storage map[string]storageObservation
+	if request.Op == "up" {
+		var err error
+		storage, err = s.observeUpStorage(request.Args)
+		if err != nil {
+			return failure(err)
+		}
+		s.opMu.Lock()
+		err = s.validateUp(request.Args, maintenance, storage)
+		s.opMu.Unlock()
+		if err != nil {
+			return failure(err)
+		}
+		if err := s.deleteUpStorageTransitions(request.Args, storage); err != nil {
+			return failure(err)
+		}
+	}
 	s.opMu.Lock()
-	data, tasks, err := s.handleProvisioningLocked(request, maintenance)
+	data, tasks, err := s.handleProvisioningLocked(request, maintenance, storage)
 	s.opMu.Unlock()
 	if err != nil {
 		return failure(err)

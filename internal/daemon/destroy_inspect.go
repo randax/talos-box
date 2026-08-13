@@ -5,9 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/provision"
 )
 
 // DestroyInspection is the best-effort storage data-loss warning surfaced
@@ -46,10 +50,21 @@ func (s *Server) inspectDestroyCluster(item cluster.Cluster) DestroyInspection {
 	if err != nil {
 		return DestroyInspection{Warning: DestroyInspectionDataLossWarning(item.Name, item.CSI)}
 	}
-	if count <= 0 {
-		return DestroyInspection{}
-	}
 	return DestroyInspection{Warning: destroyInspectionCountWarning(item.Name, item.CSI, count)}
+}
+
+func countDestroyStorageVolumes(ctx context.Context, item cluster.Cluster) (int, error) {
+	dir, err := cluster.Dir(item.Name)
+	if err != nil {
+		return 0, err
+	}
+	kubeconfig, err := os.ReadFile(filepath.Join(dir, "kubeconfig"))
+	if err != nil {
+		return 0, fmt.Errorf("read kubeconfig for destroy inspection: %w", err)
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return provision.CountProvisionedStorageVolumes(probeCtx, kubeconfig, item.CSI)
 }
 
 func DestroyInspectionDataLossWarning(name string, engine cluster.CSI) string {
