@@ -40,6 +40,27 @@ func TestPlanUpStartsPartiallyRunningCluster(t *testing.T) {
 	}
 }
 
+func TestActionAfterProvisionDoesNotCallReconciledClusterUpToDate(t *testing.T) {
+	tests := []struct {
+		name      string
+		action    ActionKind
+		narration []string
+		want      ActionKind
+	}{
+		{name: "running substrate-only cluster stays no-op", action: ActionNone, want: ActionNone},
+		{name: "fast no-op provisioned cluster is up to date", action: ActionNone, want: ActionNone},
+		{name: "provisioning work is reported as reconciled", action: ActionNone, narration: []string{"≈ kubectl apply --server-side -f -"}, want: ActionReconcile},
+		{name: "stopped provisioned cluster starts before reconciliation", action: ActionStart, narration: []string{"≈ kubectl apply --server-side -f -"}, want: ActionStart},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := actionAfterProvision(test.action, test.narration); got != test.want {
+				t.Fatalf("actionAfterProvision(%q, %q) = %q, want %q", test.action, test.narration, got, test.want)
+			}
+		})
+	}
+}
+
 func TestClusterReadyRequiresEveryPersistedNode(t *testing.T) {
 	item := cluster.Cluster{Nodes: []cluster.Node{{Name: "cp-1"}, {Name: "worker-1"}}}
 	active := map[string]bool{"cp-1": true, "worker-1": false}

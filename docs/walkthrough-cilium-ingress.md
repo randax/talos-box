@@ -1,118 +1,76 @@
-# Walkthrough: from `tbx cluster create` to a browsable nginx URL
+# Walkthrough: curated Cilium to a browsable nginx URL
 
-End-to-end recipe validated 2026-07-21 on an Apple Silicon Mac: create a cluster with
-talosbox, configure it with `talosctl`, install Cilium (as CNI **and** ingress controller),
-deploy nginx, and open `http://nginx.demo.k8s.test/` in a browser. Total time from
-`cluster create` to HTTP 200 was about 10 minutes with a warm image cache.
+This walkthrough uses talosbox's curated Cilium path. `tbx` generates and applies the
+Talos machine configuration, bootstraps Kubernetes, renders the pinned Cilium chart on
+the host, applies it with server-side apply, and waits for its own LoadBalancer probe to
+answer. Cilium's ingress controller is deliberately disabled; applications request
+ordinary `LoadBalancer` Services instead.
 
-Prerequisites: `tbx` installed with `sudo tbx system install` done and `tbx doctor` passing,
-plus `talosctl` (matching the tbx-pinned Talos version, here v1.13.6), `kubectl`, and `helm`.
+Prerequisites: `tbx` installed, `sudo tbx system install` completed, `tbx doctor`
+passing, and `kubectl` available for the application steps.
 
-## 1. Create the cluster
-
-```sh
-tbx cluster create demo --cp 1 --workers 2
-tbx status demo   # wait until all nodes reach PHASE maintenance (~1 minute)
-```
-
-Nodes boot unconfigured. `tbx status` prints the exact `talosctl gen config` and
-`apply-config` commands for the state it sees — the steps below are those hints, plus the
-Cilium-specific extras.
-
-## 2. Generate machine config with the tbx patches
-
-`tbx manifests demo` prints two machine-config patches: the **registry mirrors** patch
-(pull-through mirrors served by `tbxd` on the host — required, since guest-originated
-registry TLS is unreliable behind corporate agents like GlobalProtect) and the
-**virtio_balloon** kernel module patch. Save them together as `patch-all.yaml`:
-
-```yaml
-machine:
-  registries:
-    mirrors:
-      "*":
-        endpoints:
-          - http://172.30.0.1:5059
-        skipFallback: true
-  kernel:
-    modules:
-      - name: virtio_balloon
-```
-
-The single `*` entry is the new-cluster shape rendered by `tbx manifests demo`.
-Legacy fixed listeners on `5055–5058` remain only so older clusters keep working until
-they are recreated with the catch-all mirror patch.
-
-Cilium replaces both the default CNI and kube-proxy, so add `patch-cilium.yaml`:
-
-```yaml
-cluster:
-  network:
-    cni:
-      name: none
-  proxy:
-    disabled: true
-```
-
-Generate the config (the endpoint DNS name comes from the `tbx status` hint;
-`<node>.<cluster>.k8s.test` resolves via the resolver `tbx system install` set up):
+## 1. Create and provision the cluster
 
 ```sh
-talosctl gen config demo https://demo-cp-1.demo.k8s.test:6443 --output-dir . \
-  --config-patch @patch-all.yaml --config-patch @patch-cilium.yaml
+tbx cluster create demo --cp 1 --workers 2 --cni cilium
 ```
 
-## 3. Apply config and bootstrap
+The default `lb: true` selects Cilium LB-IPAM with L2 announcements. The address pool
+is `172.30.<subnet>.200-172.30.<subnet>.239`; talosbox reserves `.200` for its durable
+end-state probe. The command narrates each provisioning stage with its `≈` manual
+equivalent. Add `--quiet` to suppress that narration without hiding the final result.
 
-Node IPs are in `tbx status` (here .2 = control plane, .3/.4 = workers):
+Provisioning is observed-state driven. If the command is interrupted, rerun:
 
 ```sh
-talosctl apply-config --insecure --nodes 172.30.0.2 --file controlplane.yaml
-talosctl apply-config --insecure --nodes 172.30.0.3 --file worker.yaml
-talosctl apply-config --insecure --nodes 172.30.0.4 --file worker.yaml
-
-export TALOSCONFIG=$PWD/talosconfig
-talosctl config endpoint 172.30.0.2
-talosctl config node 172.30.0.2
-talosctl bootstrap        # retry until the configured apid is up (~1–2 min after apply)
-talosctl kubeconfig ./kubeconfig
-export KUBECONFIG=$PWD/kubeconfig
-kubectl get nodes         # all 3 register within ~2 min, NotReady until Cilium lands
+tbx up
 ```
 
-## 4. Install Cilium
+No progress marker is stored. `tbx` observes maintenance nodes, bootstrap/API state,
+owned Cilium objects, Kubernetes Node readiness, and the probe VIP on every run.
 
-Talos specifics: KubePrism serves the API on `localhost:7445`, cgroups are pre-mounted, and
-the agent needs an explicit capability list. talosbox specifics: enable **L2 announcements**
-(the default LB reachability mode) and the **ingress controller**, and pin the shared ingress
-LoadBalancer to **`.200`** — the embedded DNS resolves `*.<cluster>.k8s.test` to the
-cluster's `.200` by convention. The BGP control plane is enabled but remains idle until BGP
-resources are applied.
+## 2. Confirm readiness and use the derived credentials
 
 ```sh
-tbx manifests demo cilium-values > cilium-values.yaml
-helm repo add cilium https://helm.cilium.io/
-helm install cilium cilium/cilium --version 1.19.6 -n kube-system \
-  --values cilium-values.yaml
+tbx status demo
+export TALOSCONFIG=~/.talosbox/clusters/demo/talosconfig
+export KUBECONFIG=~/.talosbox/clusters/demo/kubeconfig
+kubectl get nodes
 ```
 
-The rendered values include the Talos-specific settings above. Forty single-address LB Services
-with the default 5-second lease renewal deadline require 8 QPS (`40 × (1 / 5s)`), below Cilium
-1.19.6's 10 QPS / 20 burst defaults, so talosbox explicitly preserves that higher floor. On
-Linux hosts, the default L2 announcement path already converges quickly on the helper-owned
-bridge; reach for BGP when your upstream is routed, when you want ECMP, or when
-`externalTrafficPolicy: Local` should advertise only nodes with local backends. On macOS, BGP
-also doubles as the fast-failover path because vmnet does not honor gratuitous ARP.
+The ready status names the live probe URL. Deleting either derived credential file is
+safe: `tbx up` re-mints it from the cluster's `secrets.yaml` without modifying
+`~/.talos/config` or `~/.kube/config`.
 
-All images pull through the tbx mirrors; nodes go `Ready` in ~1–2 minutes. Then apply the
-LB pool and L2 announcement policy (the `k8s` section of `tbx manifests`; the `talos` section
-holds the machine-config patches already applied in step 2):
+## 3. Inspect or fork the exact provisioning inputs
+
+`tbx manifests` reads the cluster's persisted CNI intent and exposes the same inputs
+used by reconciliation:
 
 ```sh
-tbx manifests demo k8s | kubectl apply -f -
+tbx manifests demo machine  > machine-patch.yaml
+tbx manifests demo values   > cilium-values.yaml
+tbx manifests demo objects  > cilium-objects.yaml
+tbx manifests demo extras   > cilium-extras.yaml
 ```
 
-## 5. Deploy nginx and expose it
+- `machine` contains `cni.name: none`, `cluster.proxy.disabled: true`, and the
+  subnet-specific catch-all registry mirror document.
+- `values` contains the pinned Talos-compatible Cilium values. There is no arbitrary
+  Helm-values passthrough, and `ingressController.enabled` is false.
+- `objects` contains the exact pinned chart render that `tbx` applies.
+- `extras` contains the LB-IPAM pool, L2 or BGP announcements, and the talosbox-owned
+  probe objects. With `lb: false`, no LB extras are emitted.
+
+These sections are the hand-managed fork surface. Apply the machine prerequisite when
+generating Talos configuration for a substrate-only cluster, bootstrap it, then apply
+`objects` and `extras` in that order with server-side apply. Wait for Cilium's operator
+to establish its CRDs before applying `extras`. The output is subnet- and
+cluster-specific, so review names and addresses before reusing a saved fork elsewhere.
+
+## 4. Deploy nginx as a LoadBalancer Service
+
+The talosbox probe owns `.200`, so this example requests `.201` from the same pool:
 
 ```yaml
 # nginx.yaml
@@ -140,63 +98,34 @@ apiVersion: v1
 kind: Service
 metadata:
   name: nginx
+  annotations:
+    lbipam.cilium.io/ips: 172.30.0.201
 spec:
+  type: LoadBalancer
   selector:
     app: nginx
   ports:
     - port: 80
       targetPort: 80
----
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: nginx
-spec:
-  ingressClassName: cilium
-  rules:
-    - host: nginx.demo.k8s.test
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: nginx
-                port:
-                  number: 80
 ```
 
 ```sh
 kubectl apply -f nginx.yaml
-kubectl get svc -n kube-system cilium-ingress   # EXTERNAL-IP: 172.30.0.200
+kubectl get service nginx --watch
+curl -i http://172.30.0.201/
 ```
 
-## 6. Open it
+For a cluster whose subnet index is not `0`, replace the third octet in the requested
+address. `tbx status demo` shows the cluster subnet and the talosbox probe VIP.
 
-```sh
-curl -i http://nginx.demo.k8s.test/
-```
+## Optional Cilium features
 
-or open **<http://nginx.demo.k8s.test/>** in a browser — DNS resolves it to the L2-announced
-ingress VIP `172.30.0.200`, and Cilium's envoy routes by `Host` header to the nginx service.
-Any other hostname under `.demo.k8s.test` works the same way; just add Ingress rules.
+Declare `hubble: true` (or create with `--hubble`) to add Hubble Relay and UI. Declare
+`bgp: true` only with Cilium and `lb: true`; it replaces L2 announcements with the
+host-routed BGP path. Change these declaratively and rerun `tbx up`. CNI changes and
+LoadBalancer disablement require destroy and recreate because those mutations are not
+safe once provisioning has begun.
 
-## Observed gotchas
-
-- `kubectl apply` does not prune the announcement mode you previously applied. Before switching
-  an existing L2 cluster to BGP, run `tbx bgp enable <cluster>`, rerender `cilium-values`, apply
-  them with `helm upgrade`, and delete the old policy with
-  `kubectl delete ciliuml2announcementpolicy <cluster>-l2 --ignore-not-found`; then apply
-  `tbx manifests <cluster> k8s`. When migrating a pre-1.19 Cilium cluster, also delete its
-  `CiliumBGPPeeringPolicy` named `<cluster>-bgp` while that legacy API is still served, before
-  upgrading Cilium and applying the v2 resources.
-- Run `tbx doctor` before creating or starting a workshop cluster. Extreme host swap or
-  data-volume pressure can reset guests during image unpack and corrupt Talos EPHEMERAL data;
-  free memory/disk space or reduce the cluster size instead of overriding the preflight.
-- If a Talos system service reports `exec format error` (or exits 139) after an unexpected
-  guest reset, assume its unpacked EPHEMERAL snapshot is truncated. Re-pulling the image does
-  not replace the pinned corrupt snapshot chain; destroy and recreate the affected node or
-  cluster after relieving host pressure.
-- The kube-apiserver refuses connections for a minute or two after `bootstrap` while
-  control-plane images pull; keep polling.
-- The default namespace's PodSecurity warning on the nginx deployment is harmless for a demo.
+To keep bootstrapping and CNI installation entirely attendee-managed, omit `cni` when
+creating the cluster. That substrate-only behavior remains unchanged and does not run
+the curated provisioning pipeline.

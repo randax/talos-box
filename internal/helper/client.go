@@ -196,6 +196,21 @@ func (c *Client) DisableBGP(cluster string) error {
 	return err
 }
 
+// HasBGP reports whether the helper currently owns a BGP speaker for cluster.
+func (c *Client) HasBGP(cluster string) (bool, error) {
+	response, _, err := c.call("bgp.status", map[string]any{"cluster": cluster}, false)
+	if err != nil {
+		return false, err
+	}
+	var data struct {
+		Active bool `json:"active"`
+	}
+	if err := json.Unmarshal(response.Data, &data); err != nil {
+		return false, fmt.Errorf("decode BGP status: %w", err)
+	}
+	return data.Active, nil
+}
+
 // Ping verifies that the helper is responsive.
 func (c *Client) Ping() error {
 	response, _, err := c.call("ping", struct{}{}, false)

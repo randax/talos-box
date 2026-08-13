@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/randax/talos-box/internal/balloon"
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/hostpressure"
 	"github.com/randax/talos-box/internal/hypervisor"
@@ -27,24 +28,29 @@ type Server struct {
 	cache      *imagecache.Cache
 	hypervisor hypervisor.Hypervisor
 
-	opMu                 sync.Mutex
-	vms                  map[string]map[string]hypervisor.Machine
-	provisions           map[string]activeProvision
-	storagePhases        map[string]StoragePhase
-	storageStatusProbes  map[string]activeStorageProbe
-	storageProbeFailures map[string]storageProbeFailure
-	storageProbeSequence uint64
-	provisionSequence    uint64
-	provisionReconcile   provisionReconcileFunc
-	storageProbe         func(context.Context, []byte) error
-	nodeIPLookup         func(string, int) string
-	nodeProbe            func(string) ProbeResult
-	lifecycleContext     context.Context
-	lifecycleCancel      context.CancelFunc
-	mirrors              *mirror.Manager
-	defaultSchematic     string
-	subnetSources        cluster.SubnetSources
-	hostPressure         func(string) (hostpressure.Snapshot, error)
+	opMu                  sync.Mutex
+	vms                   map[string]map[string]hypervisor.Machine
+	provisions            map[string]activeProvision
+	storagePhases         map[string]StoragePhase
+	storageStatusProbes   map[string]activeStorageProbe
+	storageProbeFailures  map[string]storageProbeFailure
+	storageProbeSequence  uint64
+	provisionSequence     uint64
+	provisionReconcile    provisionReconcileFunc
+	storageProbe          func(context.Context, []byte) error
+	destroyVolumeCount    func(context.Context, cluster.Cluster) (int, error)
+	storageEngineDelete   func(context.Context, cluster.Cluster) error
+	storageEngineValidate func(context.Context, cluster.Cluster) error
+	nodeIPLookup          func(string, int) string
+	nodeProbe             func(string) ProbeResult
+	hostFreeMemory        func() (int, error)
+	maintenanceLoad       func(string) (cluster.Cluster, error)
+	lifecycleContext      context.Context
+	lifecycleCancel       context.CancelFunc
+	mirrors               *mirror.Manager
+	defaultSchematic      string
+	subnetSources         cluster.SubnetSources
+	hostPressure          func(string) (hostpressure.Snapshot, error)
 
 	listenerMu   sync.Mutex
 	listener     net.Listener
@@ -100,18 +106,22 @@ func NewServer(ctx context.Context) (*Server, error) {
 	}
 	lifecycleContext, lifecycleCancel := context.WithCancel(ctx)
 	return &Server{
-		cache:                cache,
-		hypervisor:           backend,
-		vms:                  make(map[string]map[string]hypervisor.Machine),
-		provisions:           make(map[string]activeProvision),
-		storagePhases:        make(map[string]StoragePhase),
-		storageStatusProbes:  make(map[string]activeStorageProbe),
-		storageProbeFailures: make(map[string]storageProbeFailure),
-		lifecycleContext:     lifecycleContext,
-		lifecycleCancel:      lifecycleCancel,
-		mirrors:              mirror.NewManager(mirror.DefaultDir(root)),
-		subnetSources:        cluster.SystemSubnetSources(),
-		hostPressure:         hostpressure.SystemSnapshot,
+		cache:                 cache,
+		hypervisor:            backend,
+		vms:                   make(map[string]map[string]hypervisor.Machine),
+		provisions:            make(map[string]activeProvision),
+		storagePhases:         make(map[string]StoragePhase),
+		storageStatusProbes:   make(map[string]activeStorageProbe),
+		storageProbeFailures:  make(map[string]storageProbeFailure),
+		lifecycleContext:      lifecycleContext,
+		lifecycleCancel:       lifecycleCancel,
+		mirrors:               mirror.NewManager(mirror.DefaultDir(root)),
+		subnetSources:         cluster.SystemSubnetSources(),
+		hostPressure:          hostpressure.SystemSnapshot,
+		hostFreeMemory:        balloon.HostFreeMiB,
+		destroyVolumeCount:    countDestroyStorageVolumes,
+		storageEngineDelete:   deleteConfiguredStorageEngine,
+		storageEngineValidate: validateConfiguredStorageEngine,
 	}, nil
 }
 
@@ -269,6 +279,9 @@ func (s *Server) dispatch(request Request) Response {
 	if request.Op == "cluster.create" || request.Op == "cluster.start" || request.Op == "up" {
 		return s.dispatchProvisioning(request)
 	}
+	if request.Op == "node.add" || request.Op == "node.remove" {
+		return s.dispatchNodeMutation(request)
+	}
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 
@@ -280,8 +293,58 @@ func (s *Server) dispatch(request Request) Response {
 }
 
 func (s *Server) dispatchProvisioning(request Request) Response {
+	var maintenance map[string]maintenanceObservation
+	if request.Op == "up" {
+		discovered, err := s.observeUpMaintenance(request.Args)
+		if err != nil {
+			return failure(err)
+		}
+		// Confirm the externally-owned Talos phase once more before serialized
+		// preflight. The locked decision also revalidates daemon-owned VM state;
+		// the first observation is discovery, not authority.
+		confirmed, err := s.observeUpMaintenance(request.Args)
+		if err != nil {
+			return failure(err)
+		}
+		maintenance = make(map[string]maintenanceObservation, len(confirmed))
+		for name, observation := range confirmed {
+			if first, ok := discovered[name]; ok && first.sameSnapshot(observation) {
+				maintenance[name] = observation
+			}
+		}
+	}
+	var storage map[string]storageObservation
+	if request.Op == "up" {
+		var err error
+		storage, err = s.observeUpStorage(request.Args)
+		if err != nil {
+			return failure(err)
+		}
+		s.opMu.Lock()
+		err = s.validateUp(request.Args, maintenance, storage)
+		s.opMu.Unlock()
+		if err != nil {
+			return failure(err)
+		}
+		if err := s.deleteUpStorageTransitions(request.Args, storage); err != nil {
+			return failure(err)
+		}
+	}
 	s.opMu.Lock()
-	data, tasks, err := s.handleProvisioningLocked(request)
+	data, tasks, err := s.handleProvisioningLocked(request, maintenance, storage)
+	s.opMu.Unlock()
+	if err != nil {
+		return failure(err)
+	}
+	if err := s.runProvisionTasks(data, tasks); err != nil {
+		return failure(err)
+	}
+	return success(data)
+}
+
+func (s *Server) dispatchNodeMutation(request Request) Response {
+	s.opMu.Lock()
+	data, tasks, err := s.handleNodeMutationLocked(request)
 	s.opMu.Unlock()
 	if err != nil {
 		return failure(err)
@@ -330,6 +393,8 @@ func (s *Server) handle(request Request) (any, error) {
 		return s.stopCluster(request.Args)
 	case "cluster.destroy":
 		return s.destroyCluster(request.Args)
+	case "cluster.destroy.inspect":
+		return s.destroyInspect(request.Args)
 	case "cluster.list":
 		return s.listClusters()
 	case "node.add":

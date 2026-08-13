@@ -174,3 +174,139 @@ func TestStartClusterSurfacesHostPressureProbeFailure(t *testing.T) {
 		t.Fatalf("ClusterSummary.Warning = %q, want probe failure", result.Warning)
 	}
 }
+
+func TestStartClusterSoftWarnsForLonghornMemoryPressure(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	item, err := cluster.New("longhorn-memory-warning", 0, 0, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILonghorn}
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	service := &Server{
+		vms:            make(map[string]map[string]hypervisor.Machine),
+		hostPressure:   noHostPressure,
+		hostFreeMemory: func() (int, error) { return 1024, nil },
+		subnetSources: cluster.SubnetSources{
+			Interfaces: func() ([]cluster.HostInterface, error) { return nil, nil },
+			Route:      func(net.IP) (cluster.HostRoute, error) { return cluster.HostRoute{}, nil },
+		},
+	}
+	raw, err := json.Marshal(startArgs{Name: item.Name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.startCluster(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result.Warning, "Longhorn") || !strings.Contains(result.Warning, "memory-tight") {
+		t.Fatalf("ClusterSummary.Warning = %q, want soft Longhorn memory warning", result.Warning)
+	}
+}
+
+func TestStartClusterWarnsForLonghornCustomSchematic(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	item, err := cluster.New("longhorn-custom-schematic", 0, 0, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILonghorn}
+	item.Schematic = "custom-schematic"
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	service := &Server{
+		vms:              make(map[string]map[string]hypervisor.Machine),
+		defaultSchematic: "generated-default-schematic",
+		hostPressure:     noHostPressure,
+		hostFreeMemory:   func() (int, error) { return 8192, nil },
+		subnetSources: cluster.SubnetSources{
+			Interfaces: func() ([]cluster.HostInterface, error) { return nil, nil },
+			Route:      func(net.IP) (cluster.HostRoute, error) { return cluster.HostRoute{}, nil },
+		},
+	}
+	raw, err := json.Marshal(startArgs{Name: item.Name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.startCluster(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result.Warning, "iscsi-tools") || !strings.Contains(result.Warning, "util-linux-tools") {
+		t.Fatalf("ClusterSummary.Warning = %q, want Longhorn custom schematic warning", result.Warning)
+	}
+}
+
+func TestStartClusterSkipsLonghornCustomSchematicWarningForGeneratedDefault(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	item, err := cluster.New("longhorn-generated-schematic", 0, 0, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILonghorn}
+	item.Schematic = "generated-default-schematic"
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	service := &Server{
+		vms:              make(map[string]map[string]hypervisor.Machine),
+		defaultSchematic: item.Schematic,
+		hostPressure:     noHostPressure,
+		hostFreeMemory:   func() (int, error) { return 8192, nil },
+		subnetSources: cluster.SubnetSources{
+			Interfaces: func() ([]cluster.HostInterface, error) { return nil, nil },
+			Route:      func(net.IP) (cluster.HostRoute, error) { return cluster.HostRoute{}, nil },
+		},
+	}
+	raw, err := json.Marshal(startArgs{Name: item.Name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.startCluster(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(result.Warning, "iscsi-tools") || strings.Contains(result.Warning, "util-linux-tools") {
+		t.Fatalf("ClusterSummary.Warning = %q, did not want Longhorn custom schematic warning", result.Warning)
+	}
+}
+
+func TestStartClusterDoesNotWarnThatCuratedCSIIsUnsupportedForCilium(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	item, err := cluster.New("cilium-csi-warning", 0, 0, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNICilium, CSI: cluster.CSILonghorn}
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	service := &Server{
+		vms:            make(map[string]map[string]hypervisor.Machine),
+		hostPressure:   noHostPressure,
+		hostFreeMemory: func() (int, error) { return 8192, nil },
+		subnetSources: cluster.SubnetSources{
+			Interfaces: func() ([]cluster.HostInterface, error) { return nil, nil },
+			Route:      func(net.IP) (cluster.HostRoute, error) { return cluster.HostRoute{}, nil },
+		},
+	}
+	raw, err := json.Marshal(startArgs{Name: item.Name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.startCluster(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(result.Warning, "will not install storage") || strings.Contains(result.Warning, "not implemented") {
+		t.Fatalf("ClusterSummary.Warning = %q, curated CSI now runs on the generalized CNI path", result.Warning)
+	}
+}

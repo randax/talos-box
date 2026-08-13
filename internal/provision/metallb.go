@@ -14,6 +14,7 @@ import (
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/manifests"
+	"github.com/randax/talos-box/internal/shellquote"
 	"helm.sh/helm/v3/pkg/chart/loader"
 	"helm.sh/helm/v3/pkg/chartutil"
 	"helm.sh/helm/v3/pkg/engine"
@@ -62,10 +63,11 @@ type MetalLBReconciler struct {
 	HTTPClient   *http.Client
 }
 
-// LiveVIP returns the probe VIP only after both Kubernetes has assigned it and
-// the host can receive a successful response through the L2 path.
+// LiveVIP returns the durable tbx probe VIP only after both Kubernetes has
+// assigned it and the host can receive a successful response through the
+// selected CNI's announcement path.
 func LiveVIP(ctx context.Context, item cluster.Cluster, kubeconfig []byte) (string, bool) {
-	if item.CNI != cluster.CNIFlannel || !item.LB {
+	if (item.CNI != cluster.CNIFlannel && item.CNI != cluster.CNICilium) || !item.LB {
 		return "", false
 	}
 	config, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
@@ -136,7 +138,7 @@ func (r MetalLBReconciler) reconcile(ctx context.Context, item cluster.Cluster, 
 	if err := applyAll(ctx, dynamicClient, mapper, crds); err != nil {
 		return LoadBalancerResult{}, err
 	}
-	if err := waitForCRDs(ctx, dynamicClient, mapper, crds, r.PollInterval); err != nil {
+	if err := waitForCRDs(ctx, dynamicClient, mapper, crds, "MetalLB", r.PollInterval); err != nil {
 		return LoadBalancerResult{}, err
 	}
 	mapper.Reset()
@@ -156,10 +158,15 @@ func (r MetalLBReconciler) reconcile(ctx context.Context, item cluster.Cluster, 
 	if err != nil {
 		return LoadBalancerResult{}, err
 	}
-	return LoadBalancerResult{VIP: vip, Narration: []string{
-		"≈ helm template metallb metallb/metallb --version " + metalLBChartVersion + " -n " + metalLBNamespace + " | kubectl apply --server-side -f -",
-		"≈ kubectl apply --server-side -f - # MetalLB L2 pool and VIP probe",
-	}}, nil
+	return LoadBalancerResult{VIP: vip, Narration: metalLBNarration(item)}, nil
+}
+
+func metalLBNarration(item cluster.Cluster) []string {
+	name := shellquote.Quote(item.Name)
+	return []string{
+		"MetalLB chart: ≈ tbx manifests " + name + " objects | kubectl apply --server-side -f -",
+		"MetalLB LoadBalancer extras: ≈ tbx manifests " + name + " extras | kubectl apply --server-side -f -",
+	}
 }
 
 func renderMetalLB(item cluster.Cluster) ([]unstructured.Unstructured, error) {
@@ -234,7 +241,7 @@ func renderMetalLB(item cluster.Cluster) ([]unstructured.Unstructured, error) {
 }
 
 func manifestFacts(item cluster.Cluster) manifests.Facts {
-	return manifests.Facts{Cluster: item.Name, SubnetIndex: item.SubnetIndex, BGP: item.BGP}
+	return manifests.Facts{Cluster: item.Name, SubnetIndex: item.SubnetIndex, CNI: string(item.CNI), LB: item.LB, BGP: item.BGP, Hubble: item.Hubble}
 }
 
 func metalLBProbe(item cluster.Cluster) string {
@@ -359,13 +366,13 @@ func applyAll(ctx context.Context, client dynamic.Interface, mapper meta.RESTMap
 	return nil
 }
 
-func waitForCRDs(ctx context.Context, client dynamic.Interface, mapper *restmapper.DeferredDiscoveryRESTMapper, crds []unstructured.Unstructured, interval time.Duration) error {
+func waitForCRDs(ctx context.Context, client dynamic.Interface, mapper *restmapper.DeferredDiscoveryRESTMapper, crds []unstructured.Unstructured, component string, interval time.Duration) error {
 	if len(crds) == 0 {
-		return errors.New("embedded MetalLB chart contains no CRDs")
+		return fmt.Errorf("embedded %s chart contains no CRDs", component)
 	}
 	mapping, err := mapper.RESTMapping(schema.GroupKind{Group: "apiextensions.k8s.io", Kind: "CustomResourceDefinition"}, "v1")
 	if err != nil {
-		return fmt.Errorf("map MetalLB CRDs: %w", err)
+		return fmt.Errorf("map %s CRDs: %w", component, err)
 	}
 	return poll(ctx, interval, func(ctx context.Context) error {
 		for _, crd := range crds {
