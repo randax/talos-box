@@ -261,9 +261,24 @@ maintenance-mode debugging works before any config exists. Detach with **`Ctrl-]
 session banner states the detach key. Attaching never blocks the VM; multiple attach/detach
 cycles are supported. `tbx manifests` is the exact inspection/fork surface for the declared
 curated path: its `machine`, `values`, `objects`, and `extras` sections match the patch,
-pinned Helm release, rendered objects, and LB/BGP/MetalLB probe resources tbx applies. The
-output can be applied manually on a substrate-only cluster; it does not turn substrate-only
-clusters into a curated path by itself.
+pinned Helm release, rendered objects, and LB/BGP/MetalLB probe resources tbx applies. Its
+`storage` section always includes the kubelet mount prerequisite and privileged-namespace PSA
+guidance, including for a substrate-only cluster. If `csi:` is declared it also includes the
+exact Longhorn values and renderer-derived namespace, CRD, and post-CRD object streams, or
+local-path namespace and object streams, that tbx applies; use `storage-machine`,
+`storage-values`, `storage-namespaces`, `storage-crds`, and `storage-objects` as the clean
+hand-application streams described in the output. Bring-your-own CSI is unsupported above the substrate. Engines needing extensions
+beyond the default schematic use the existing `talos.schematic` override; tbx does not compose
+schematics from extension lists.
+
+For a hand-managed substrate-only CSI, save `tbx manifests <cluster> storage-machine > storage-machine.yaml`
+and apply the resulting patch to **every node** with `talosctl patch mc -p @storage-machine.yaml --nodes
+<node-ip>`. Then, before installing the CSI, create its namespace if needed and apply the
+printed PSA labels. Curated CSI namespace streams carry their own PSA labels. For Longhorn,
+apply `storage-namespaces`, then `storage-crds`, run the printed Established wait against the
+CRD stream, and only then apply post-CRD `storage-objects`; it is not a one-shot apply.
+Longhorn's `storage-values` stream records the exact values used to render those objects.
+Local-path has no CRD barrier, so apply `storage-namespaces` before `storage-objects`.
 
 ## 11. Distribution
 

@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/manifests"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 func TestRenderInspectionMatchesCiliumProvisioningInputs(t *testing.T) {
@@ -83,6 +85,153 @@ func TestRenderInspectionFlannelWithoutLoadBalancerIsHandApplicable(t *testing.T
 	}
 	if !strings.Contains(all, "name: flannel") || strings.Contains(all, "metallb") || strings.Contains(all, "cilium") {
 		t.Fatalf("flannel non-LB inspection = %s", all)
+	}
+}
+
+func TestRenderInspectionStoragePrerequisitesAreAvailableWithoutCuratedIntent(t *testing.T) {
+	item := cluster.Cluster{Name: "demo", SubnetIndex: 6}
+	storage, err := RenderInspection(item, "storage")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"# Storage machine-config prerequisite patch",
+		manifests.StoragePrerequisiteKubeletMounts(),
+		"talosctl patch mc -p @storage-machine.yaml --nodes <node-ip>",
+		"kubectl create namespace <your-csi-namespace> --dry-run=client -o yaml | kubectl apply -f -",
+		"pod-security.kubernetes.io/enforce=privileged",
+		"<your-csi-namespace>",
+	} {
+		if !strings.Contains(storage, want) {
+			t.Fatalf("substrate-only storage inspection missing %q:\n%s", want, storage)
+		}
+	}
+	if strings.Index(storage, "talosctl patch mc") > strings.Index(storage, "kubectl create namespace") || strings.Index(storage, "kubectl create namespace") > strings.Index(storage, "kubectl label namespace") {
+		t.Fatalf("storage inspection does not order node patching, namespace creation, and PSA labeling:\n%s", storage)
+	}
+	all, err := RenderInspection(item, "all")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(all, storage) {
+		t.Fatalf("all inspection omits substrate-only storage section:\n%s", all)
+	}
+}
+
+func TestRenderInspectionRejectsNonStorageSectionsWithoutCuratedCNI(t *testing.T) {
+	item := cluster.Cluster{Name: "demo"}
+	want := `cluster "demo" does not declare a curated cni`
+	for _, section := range []string{
+		"machine", "values", "objects", "extras", "mirrors",
+		"talos", "cilium-values", "metallb-values", "metallb-extras", "k8s",
+		"balloon", "lb-pool", "bgp", "l2",
+	} {
+		_, err := RenderInspection(item, section)
+		if err == nil || err.Error() != want {
+			t.Errorf("RenderInspection(%q) error = %v, want %q", section, err, want)
+		}
+	}
+}
+
+func TestRenderInspectionLonghornStreamsMatchRendererPartitionsAndOrder(t *testing.T) {
+	item := cluster.Cluster{
+		Name: "longhorn", Nodes: make([]cluster.Node, 3),
+		ProvisioningIntent: cluster.ProvisioningIntent{CSI: cluster.CSILonghorn},
+	}
+	objects, err := renderLonghorn(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	namespaces, chartObjects, crds := partitionLonghornObjects(objects)
+	for section, objects := range map[string][]unstructured.Unstructured{
+		"storage-namespaces": namespaces,
+		"storage-crds":       crds,
+		"storage-objects":    chartObjects,
+	} {
+		want, err := encodeInspectionObjects(objects)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := RenderInspection(item, section)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("%s differs from Longhorn renderer partition", section)
+		}
+	}
+	values, err := RenderInspection(item, "storage-values")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if values != longhornValues(3) {
+		t.Fatalf("storage values differ from Longhorn renderer input")
+	}
+	bundle, err := RenderInspection(item, "storage")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands := []string{
+		"tbx manifests longhorn storage-namespaces | kubectl apply --server-side -f -",
+		"tbx manifests longhorn storage-crds | kubectl apply --server-side -f -",
+		"tbx manifests longhorn storage-crds | kubectl wait --for=condition=Established --timeout=120s -f -",
+		"tbx manifests longhorn storage-objects | kubectl apply --server-side -f -",
+	}
+	previous := -1
+	for _, command := range commands {
+		index := strings.Index(bundle, command)
+		if index < 0 {
+			t.Fatalf("storage inspection missing command %q:\n%s", command, bundle)
+		}
+		if index <= previous {
+			t.Fatalf("storage inspection command %q is out of order:\n%s", command, bundle)
+		}
+		previous = index
+	}
+	if !strings.Contains(bundle, "Do not combine them into a one-shot apply") {
+		t.Fatalf("storage inspection implies a one-shot Longhorn apply:\n%s", bundle)
+	}
+	all, err := RenderInspection(item, "all")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(all, bundle) {
+		t.Fatalf("all inspection omits ordered Longhorn storage instructions:\n%s", all)
+	}
+}
+
+func TestRenderInspectionLocalPathStreamsMatchRendererPartitions(t *testing.T) {
+	item := cluster.Cluster{Name: "local-path", ProvisioningIntent: cluster.ProvisioningIntent{CSI: cluster.CSILocalPath}}
+	objects, err := renderLocalPath(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	namespaces, manifestObjects := partitionLocalPathObjects(objects)
+	for section, objects := range map[string][]unstructured.Unstructured{
+		"storage-namespaces": namespaces,
+		"storage-objects":    manifestObjects,
+	} {
+		want, err := encodeInspectionObjects(objects)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := RenderInspection(item, section)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("%s differs from local-path renderer partition", section)
+		}
+	}
+	if _, err := RenderInspection(item, "storage-crds"); err == nil || !strings.Contains(err.Error(), "does not declare Longhorn storage CRDs") {
+		t.Fatalf("local-path storage-crds error = %v, want targeted error", err)
+	}
+	bundle, err := RenderInspection(item, "storage")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(bundle, "Local-path has no CRD barrier") {
+		t.Fatalf("local-path storage inspection does not explain its stream order:\n%s", bundle)
 	}
 }
 
