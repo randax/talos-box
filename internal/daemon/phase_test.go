@@ -130,6 +130,30 @@ func TestHintsDescribeFlannelReadyWithoutLoadBalancer(t *testing.T) {
 	}
 }
 
+func TestHintsAccumulateStorageProvisioningAndFlannelReadyWithoutLoadBalancer(t *testing.T) {
+	status := ClusterStatus{
+		Name:               "demo",
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILocalPath},
+		KubernetesReady:    true,
+		StoragePhase:       StoragePhaseProvisioning,
+		Nodes: []NodeStatus{{
+			Name: "demo-cp-1", Role: cluster.RoleControlPlane, Phase: PhaseConfigured, IP: "172.30.0.2",
+		}},
+	}
+
+	hints := Hints(status)
+	joined := strings.Join(hints, "\n")
+	for _, wanted := range []string{
+		"storage provisioning",
+		"waiting for the CSI readiness probe to pass",
+		"Kubernetes is Ready with Talos-managed flannel",
+	} {
+		if !strings.Contains(joined, wanted) {
+			t.Fatalf("hints missing %q:\n%s", wanted, joined)
+		}
+	}
+}
+
 func TestHintsDescribeLiveFlannelMetalLBVIPAndPolicyLimit(t *testing.T) {
 	status := ClusterStatus{
 		Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, LB: true}, KubernetesReady: true,
@@ -138,6 +162,19 @@ func TestHintsDescribeLiveFlannelMetalLBVIPAndPolicyLimit(t *testing.T) {
 	}
 	hints := Hints(status)
 	if len(hints) != 1 || !strings.Contains(hints[0], "http://172.30.4.200/") || !strings.Contains(hints[0], "does not enforce NetworkPolicies") {
+		t.Fatalf("hints = %v", hints)
+	}
+}
+
+func TestHintsDescribeStorageLive(t *testing.T) {
+	status := ClusterStatus{
+		Name:               "demo",
+		ProvisioningIntent: cluster.ProvisioningIntent{CSI: cluster.CSILocalPath},
+		StoragePhase:       StoragePhaseLive,
+	}
+
+	hints := Hints(status)
+	if len(hints) != 1 || !strings.Contains(hints[0], "storage live") || !strings.Contains(hints[0], "CSI readiness probe passed") {
 		t.Fatalf("hints = %v", hints)
 	}
 }

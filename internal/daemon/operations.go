@@ -111,6 +111,14 @@ type NodeStatus struct {
 	Warning       string       `json:"warning,omitempty"`
 }
 
+// StoragePhase is the observed storage readiness for a CSI-backed cluster.
+type StoragePhase string
+
+const (
+	StoragePhaseProvisioning StoragePhase = "provisioning"
+	StoragePhaseLive         StoragePhase = "live"
+)
+
 // ClusterStatus is the status result for one cluster.
 type ClusterStatus struct {
 	Name   string `json:"name"`
@@ -121,6 +129,7 @@ type ClusterStatus struct {
 	BGP             bool         `json:"bgp"`
 	Running         bool         `json:"running"`
 	KubernetesReady bool         `json:"kubernetesReady"`
+	StoragePhase    StoragePhase `json:"storagePhase,omitempty"`
 	VIP             string       `json:"vip,omitempty"`
 	VIPLive         bool         `json:"vipLive"`
 	Nodes           []NodeStatus `json:"nodes"`
@@ -501,6 +510,7 @@ func (s *Server) destroyCluster(raw json.RawMessage) (map[string]string, error) 
 	if err := cluster.Destroy(args.Name); err != nil {
 		return nil, err
 	}
+	delete(s.storagePhases, args.Name)
 	if err := SyncResolverFiles(); err != nil {
 		log.Printf("resolver files after destroying %s: %v", args.Name, err)
 	}

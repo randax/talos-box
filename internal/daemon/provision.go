@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -88,6 +89,12 @@ func (s *Server) beginProvisionTasksLocked(items []cluster.Cluster) []provisionT
 		if s.provisions == nil {
 			s.provisions = make(map[string]activeProvision)
 		}
+		if item.CSI != "" {
+			if s.storagePhases == nil {
+				s.storagePhases = make(map[string]StoragePhase)
+			}
+			s.storagePhases[item.Name] = StoragePhaseProvisioning
+		}
 		if active, ok := s.provisions[item.Name]; ok {
 			active.cancel()
 		}
@@ -130,7 +137,12 @@ func (s *Server) cancelAllProvisionsLocked() {
 
 func (s *Server) runProvisionTasks(data any, tasks []provisionTask) error {
 	for i, task := range tasks {
-		narration, err := s.provisionFlannel(task.ctx, task.item)
+		narration, phase, err := s.provisionFlannel(task.ctx, task.item)
+		if task.item.CSI != "" {
+			s.opMu.Lock()
+			s.recordStoragePhaseLocked(task.item.Name, phase)
+			s.opMu.Unlock()
+		}
 		s.finishProvision(task)
 		if err != nil {
 			s.opMu.Lock()
@@ -152,13 +164,13 @@ func (s *Server) runProvisionTasks(data any, tasks []provisionTask) error {
 	return nil
 }
 
-func (s *Server) provisionFlannel(parent context.Context, item cluster.Cluster) ([]string, error) {
+func (s *Server) provisionFlannel(parent context.Context, item cluster.Cluster) ([]string, StoragePhase, error) {
 	if item.CNI != cluster.CNIFlannel {
-		return nil, nil
+		return nil, "", nil
 	}
 	dir, err := cluster.Dir(item.Name)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	ctx, cancel := context.WithTimeout(parent, flannelProvisionTimeout)
 	defer cancel()
@@ -178,9 +190,9 @@ func (s *Server) provisionFlannel(parent context.Context, item cluster.Cluster) 
 		PollInterval: time.Second,
 	})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return result.Narration, nil
+	return result.Narration, storagePhaseFromProvisionResult(result), nil
 }
 
 func (s *Server) observeProvisionNodes(item cluster.Cluster) []provision.Node {
@@ -233,4 +245,74 @@ func loadBalancerVIP(item cluster.Cluster) (string, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	return provision.LiveVIP(ctx, item, kubeconfig)
+}
+
+func (s *Server) refreshStoragePhases(statuses []ClusterStatus) {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	for index := range statuses {
+		status := &statuses[index]
+		status.StoragePhase = ""
+		switch {
+		case status.CSI == "", !status.Running:
+			status.Hints = Hints(*status)
+		case s.storagePhases != nil && s.storagePhases[status.Name] == StoragePhaseLive:
+			status.StoragePhase = StoragePhaseLive
+			status.Hints = Hints(*status)
+		default:
+			status.StoragePhase = StoragePhaseProvisioning
+			status.Hints = Hints(*status)
+		}
+	}
+}
+
+func (s *Server) recordStoragePhaseLocked(name string, phase StoragePhase) {
+	if s.storagePhases == nil {
+		s.storagePhases = make(map[string]StoragePhase)
+	}
+	if phase == "" {
+		phase = StoragePhaseProvisioning
+	}
+	s.storagePhases[name] = phase
+}
+
+func storagePhaseFromProvisionResult(result provision.Result) StoragePhase {
+	value := reflect.ValueOf(result)
+	if phase, ok := storagePhaseFromField(value, "StoragePhase"); ok {
+		return phase
+	}
+	if live, ok := boolField(value, "StorageLive"); ok && live {
+		return StoragePhaseLive
+	}
+	if ready, ok := boolField(value, "StorageReady"); ok && ready {
+		return StoragePhaseLive
+	}
+	return ""
+}
+
+func storagePhaseFromField(value reflect.Value, field string) (StoragePhase, bool) {
+	item := value.FieldByName(field)
+	if !item.IsValid() || item.Kind() != reflect.String {
+		return "", false
+	}
+	switch item.String() {
+	case string(StoragePhaseProvisioning):
+		return StoragePhaseProvisioning, true
+	case string(StoragePhaseLive):
+		return StoragePhaseLive, true
+	case "storage provisioning":
+		return StoragePhaseProvisioning, true
+	case "storage live":
+		return StoragePhaseLive, true
+	default:
+		return "", false
+	}
+}
+
+func boolField(value reflect.Value, field string) (bool, bool) {
+	item := value.FieldByName(field)
+	if !item.IsValid() || item.Kind() != reflect.Bool {
+		return false, false
+	}
+	return item.Bool(), true
 }

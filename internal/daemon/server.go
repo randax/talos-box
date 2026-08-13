@@ -30,6 +30,7 @@ type Server struct {
 	opMu               sync.Mutex
 	vms                map[string]map[string]hypervisor.Machine
 	provisions         map[string]activeProvision
+	storagePhases      map[string]StoragePhase
 	provisionSequence  uint64
 	provisionReconcile provisionReconcileFunc
 	nodeIPLookup       func(string, int) string
@@ -89,6 +90,7 @@ func NewServer(ctx context.Context) (*Server, error) {
 		hypervisor:       backend,
 		vms:              make(map[string]map[string]hypervisor.Machine),
 		provisions:       make(map[string]activeProvision),
+		storagePhases:    make(map[string]StoragePhase),
 		lifecycleContext: lifecycleContext,
 		lifecycleCancel:  lifecycleCancel,
 		mirrors:          mirror.NewManager(mirror.DefaultDir(root)),
@@ -290,6 +292,7 @@ func (s *Server) dispatchStatus(request Request) Response {
 	}
 	s.refreshNodeStatuses(statuses)
 	refreshKubernetesReadiness(statuses)
+	s.refreshStoragePhases(statuses)
 	return success(statuses)
 }
 

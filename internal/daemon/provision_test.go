@@ -45,3 +45,33 @@ func TestRefreshKubernetesReadinessSkipsStoppedFlannelClusters(t *testing.T) {
 		t.Fatalf("stopped cluster retained stale VIP state: %+v", statuses[0])
 	}
 }
+
+func TestRefreshStoragePhasesDefaultsCSIClustersToProvisioning(t *testing.T) {
+	service := &Server{}
+	statuses := []ClusterStatus{{
+		Name:               "demo",
+		Running:            true,
+		ProvisioningIntent: cluster.ProvisioningIntent{CSI: cluster.CSILocalPath},
+	}}
+
+	service.refreshStoragePhases(statuses)
+
+	if statuses[0].StoragePhase != StoragePhaseProvisioning {
+		t.Fatalf("storage phase = %q, want %q", statuses[0].StoragePhase, StoragePhaseProvisioning)
+	}
+}
+
+func TestRefreshStoragePhasesUsesStoredLiveObservation(t *testing.T) {
+	service := &Server{storagePhases: map[string]StoragePhase{"demo": StoragePhaseLive}}
+	statuses := []ClusterStatus{{
+		Name:               "demo",
+		Running:            true,
+		ProvisioningIntent: cluster.ProvisioningIntent{CSI: cluster.CSILocalPath},
+	}}
+
+	service.refreshStoragePhases(statuses)
+
+	if statuses[0].StoragePhase != StoragePhaseLive {
+		t.Fatalf("storage phase = %q, want %q", statuses[0].StoragePhase, StoragePhaseLive)
+	}
+}
