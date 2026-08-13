@@ -13,6 +13,8 @@ import (
 
 const flannelProvisionTimeout = 10 * time.Minute
 
+const storageProbeRetryBackoff = time.Minute
+
 type provisionReconcileFunc func(context.Context, provision.Request) (provision.Result, error)
 
 type provisionTask struct {
@@ -93,6 +95,7 @@ func (s *Server) beginProvisionTasksLocked(items []cluster.Cluster) []provisionT
 				s.storagePhases = make(map[string]StoragePhase)
 			}
 			s.storagePhases[item.Name] = StoragePhaseProvisioning
+			delete(s.storageProbeFailures, item.Name)
 		}
 		if active, ok := s.provisions[item.Name]; ok {
 			active.cancel()
@@ -260,11 +263,16 @@ func (s *Server) refreshStoragePhases(statuses []ClusterStatus) {
 	for name := range s.provisions {
 		active[name] = true
 	}
+	failures := make(map[string]storageProbeFailure, len(s.storageProbeFailures))
+	for name, failure := range s.storageProbeFailures {
+		failures[name] = failure
+	}
 	s.opMu.Unlock()
 
 	for index := range statuses {
 		status := &statuses[index]
 		status.StoragePhase = ""
+		status.StorageError = ""
 		switch {
 		case status.CNI != cluster.CNIFlannel, status.CSI != cluster.CSILocalPath, !status.Running:
 		case known[status.Name] == StoragePhaseLive:
@@ -273,7 +281,11 @@ func (s *Server) refreshStoragePhases(statuses []ClusterStatus) {
 			status.StoragePhase = StoragePhaseProvisioning
 		default:
 			status.StoragePhase = StoragePhaseProvisioning
-			s.beginStorageStatusProbe(status.Name)
+			if failure, ok := failures[status.Name]; ok && time.Since(failure.at) < storageProbeRetryBackoff {
+				status.StorageError = failure.message
+			} else {
+				s.beginStorageStatusProbe(status.Name)
+			}
 		}
 		status.Hints = Hints(*status)
 	}
@@ -281,7 +293,9 @@ func (s *Server) refreshStoragePhases(statuses []ClusterStatus) {
 
 func (s *Server) beginStorageStatusProbe(name string) {
 	s.opMu.Lock()
-	if !s.clusterRunning(name) || s.storagePhases[name] == StoragePhaseLive || s.storageStatusProbes[name].cancel != nil {
+	failure, failed := s.storageProbeFailures[name]
+	backingOff := failed && time.Since(failure.at) < storageProbeRetryBackoff
+	if !s.clusterRunning(name) || backingOff || s.storagePhases[name] == StoragePhaseLive || s.storageStatusProbes[name].cancel != nil {
 		s.opMu.Unlock()
 		return
 	}
@@ -311,7 +325,13 @@ func (s *Server) runStorageStatusProbe(ctx context.Context, name string, generat
 	active.cancel()
 	delete(s.storageStatusProbes, name)
 	if err == nil && s.clusterRunning(name) {
+		delete(s.storageProbeFailures, name)
 		s.recordStoragePhaseLocked(name, StoragePhaseLive)
+	} else if err != nil && s.clusterRunning(name) {
+		if s.storageProbeFailures == nil {
+			s.storageProbeFailures = make(map[string]storageProbeFailure)
+		}
+		s.storageProbeFailures[name] = storageProbeFailure{message: err.Error(), at: time.Now()}
 	}
 }
 
@@ -337,6 +357,7 @@ func (s *Server) probeStorageStatus(parent context.Context, name string) error {
 
 func (s *Server) invalidateStoragePhaseLocked(name string) {
 	delete(s.storagePhases, name)
+	delete(s.storageProbeFailures, name)
 	if active, ok := s.storageStatusProbes[name]; ok {
 		active.cancel()
 		delete(s.storageStatusProbes, name)

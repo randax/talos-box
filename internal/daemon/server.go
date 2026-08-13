@@ -32,6 +32,7 @@ type Server struct {
 	provisions           map[string]activeProvision
 	storagePhases        map[string]StoragePhase
 	storageStatusProbes  map[string]activeStorageProbe
+	storageProbeFailures map[string]storageProbeFailure
 	storageProbeSequence uint64
 	provisionSequence    uint64
 	provisionReconcile   provisionReconcileFunc
@@ -60,6 +61,11 @@ type activeProvision struct {
 type activeStorageProbe struct {
 	generation uint64
 	cancel     context.CancelFunc
+}
+
+type storageProbeFailure struct {
+	message string
+	at      time.Time
 }
 
 type lockedListener struct {
@@ -94,17 +100,18 @@ func NewServer(ctx context.Context) (*Server, error) {
 	}
 	lifecycleContext, lifecycleCancel := context.WithCancel(ctx)
 	return &Server{
-		cache:               cache,
-		hypervisor:          backend,
-		vms:                 make(map[string]map[string]hypervisor.Machine),
-		provisions:          make(map[string]activeProvision),
-		storagePhases:       make(map[string]StoragePhase),
-		storageStatusProbes: make(map[string]activeStorageProbe),
-		lifecycleContext:    lifecycleContext,
-		lifecycleCancel:     lifecycleCancel,
-		mirrors:             mirror.NewManager(mirror.DefaultDir(root)),
-		subnetSources:       cluster.SystemSubnetSources(),
-		hostPressure:        hostpressure.SystemSnapshot,
+		cache:                cache,
+		hypervisor:           backend,
+		vms:                  make(map[string]map[string]hypervisor.Machine),
+		provisions:           make(map[string]activeProvision),
+		storagePhases:        make(map[string]StoragePhase),
+		storageStatusProbes:  make(map[string]activeStorageProbe),
+		storageProbeFailures: make(map[string]storageProbeFailure),
+		lifecycleContext:     lifecycleContext,
+		lifecycleCancel:      lifecycleCancel,
+		mirrors:              mirror.NewManager(mirror.DefaultDir(root)),
+		subnetSources:        cluster.SystemSubnetSources(),
+		hostPressure:         hostpressure.SystemSnapshot,
 	}, nil
 }
 

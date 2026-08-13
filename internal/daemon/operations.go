@@ -130,6 +130,7 @@ type ClusterStatus struct {
 	Running         bool         `json:"running"`
 	KubernetesReady bool         `json:"kubernetesReady"`
 	StoragePhase    StoragePhase `json:"storagePhase,omitempty"`
+	StorageError    string       `json:"storageError,omitempty"`
 	VIP             string       `json:"vip,omitempty"`
 	VIPLive         bool         `json:"vipLive"`
 	Nodes           []NodeStatus `json:"nodes"`

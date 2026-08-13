@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -276,5 +277,48 @@ func TestCompletedProbeCannotPublishLiveAfterStop(t *testing.T) {
 	defer service.opMu.Unlock()
 	if service.storagePhases["demo"] == StoragePhaseLive {
 		t.Fatal("probe from stopped VM lifetime published storage live")
+	}
+}
+
+func TestFailedBackgroundProbeBacksOffAndSurfacesReason(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir, err := cluster.Dir("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "kubeconfig"), []byte("credentials"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	service := &Server{
+		vms: runningStorageVMs("demo"),
+		storageProbe: func(context.Context, []byte) error {
+			calls.Add(1)
+			return errors.New("default StorageClass is not local-path")
+		},
+	}
+	statuses := []ClusterStatus{{
+		Name: "demo", Running: true, KubernetesReady: true,
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILocalPath},
+	}}
+	service.refreshStoragePhases(statuses)
+	eventually(t, func() bool {
+		service.opMu.Lock()
+		defer service.opMu.Unlock()
+		return service.storageProbeFailures["demo"].message != ""
+	})
+	service.refreshStoragePhases(statuses)
+	service.refreshStoragePhases(statuses)
+	if calls.Load() != 1 {
+		t.Fatalf("storage probe calls = %d, want one during backoff", calls.Load())
+	}
+	if !strings.Contains(statuses[0].StorageError, "default StorageClass is not local-path") {
+		t.Fatalf("storage error = %q", statuses[0].StorageError)
+	}
+	if hints := strings.Join(statuses[0].Hints, "\n"); !strings.Contains(hints, "probe failed") || !strings.Contains(hints, "retrying after backoff") {
+		t.Fatalf("storage hints = %q", hints)
 	}
 }

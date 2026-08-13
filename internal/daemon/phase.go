@@ -148,6 +148,9 @@ func storageHint(status ClusterStatus) string {
 	}
 	switch status.StoragePhase {
 	case StoragePhaseProvisioning:
+		if status.StorageError != "" {
+			return fmt.Sprintf("storage provisioning: CSI readiness probe failed: %s; retrying after backoff.", status.StorageError)
+		}
 		return "storage provisioning: waiting for the CSI readiness probe to pass."
 	case StoragePhaseLive:
 		return "storage live: the CSI readiness probe passed."
