@@ -91,11 +91,11 @@ func (s *Server) beginProvisionTasksLocked(items []cluster.Cluster) []provisionT
 			s.provisions = make(map[string]activeProvision)
 		}
 		if item.CSI != "" {
+			s.invalidateStoragePhaseLocked(item.Name)
 			if s.storagePhases == nil {
 				s.storagePhases = make(map[string]StoragePhase)
 			}
 			s.storagePhases[item.Name] = StoragePhaseProvisioning
-			delete(s.storageProbeFailures, item.Name)
 		}
 		if active, ok := s.provisions[item.Name]; ok {
 			active.cancel()
@@ -109,6 +109,13 @@ func (s *Server) beginProvisionTasksLocked(items []cluster.Cluster) []provisionT
 		tasks = append(tasks, provisionTask{item: item, ctx: ctx, generation: s.provisionSequence, action: -1})
 	}
 	return tasks
+}
+
+func (s *Server) beginNodeMutationProvisionLocked(item cluster.Cluster) []provisionTask {
+	if !s.clusterRunning(item.Name) {
+		return nil
+	}
+	return s.beginProvisionTasksLocked([]cluster.Cluster{item})
 }
 
 func (s *Server) finishProvision(task provisionTask) {
