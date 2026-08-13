@@ -166,6 +166,11 @@ func (s *Server) deleteUpStorageTransitions(raw json.RawMessage, observations ma
 	if deleteEngine == nil {
 		deleteEngine = deleteConfiguredStorageEngine
 	}
+	validateEngine := s.storageEngineValidate
+	if validateEngine == nil {
+		validateEngine = validateConfiguredStorageEngine
+	}
+	targets := make([]cluster.Cluster, 0, len(observations))
 	for _, spec := range args.Clusters {
 		observation, ok := observations[spec.Name]
 		if !ok {
@@ -184,8 +189,17 @@ func (s *Server) deleteUpStorageTransitions(raw json.RawMessage, observations ma
 			err = storageVolumesBlockChange(item, count)
 		}
 		if err == nil {
-			err = deleteEngine(ctx, item)
+			err = validateEngine(ctx, item)
 		}
+		cancel()
+		if err != nil {
+			return fmt.Errorf("cluster %q: validate removal of %s before changing csi: %w", item.Name, item.CSI, err)
+		}
+		targets = append(targets, item)
+	}
+	for _, item := range targets {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		err := deleteEngine(ctx, item)
 		cancel()
 		if err != nil {
 			return fmt.Errorf("cluster %q: remove %s before changing csi: %w", item.Name, item.CSI, err)
@@ -204,6 +218,18 @@ func deleteConfiguredStorageEngine(ctx context.Context, item cluster.Cluster) er
 		return fmt.Errorf("read kubeconfig for storage cleanup: %w", err)
 	}
 	return provision.DeleteStorageEngineObjects(ctx, kubeconfig, item.CSI)
+}
+
+func validateConfiguredStorageEngine(ctx context.Context, item cluster.Cluster) error {
+	dir, err := cluster.Dir(item.Name)
+	if err != nil {
+		return err
+	}
+	kubeconfig, err := os.ReadFile(filepath.Join(dir, "kubeconfig"))
+	if err != nil {
+		return fmt.Errorf("read kubeconfig for storage cleanup validation: %w", err)
+	}
+	return provision.ValidateStorageEngineObjects(ctx, kubeconfig, item.CSI)
 }
 
 func (observation maintenanceObservation) sameSnapshot(other maintenanceObservation) bool {

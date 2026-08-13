@@ -77,6 +77,35 @@ func DeleteStorageEngineObjects(ctx context.Context, kubeconfig []byte, engine c
 	return DeleteStorageEngineObjectsForConfig(ctx, config, engine)
 }
 
+// ValidateStorageEngineObjects proves every rendered live object is safe for
+// talosbox to delete without mutating the cluster.
+func ValidateStorageEngineObjects(ctx context.Context, kubeconfig []byte, engine cluster.CSI) error {
+	config, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
+	if err != nil {
+		return fmt.Errorf("parse kubeconfig for storage cleanup validation: %w", err)
+	}
+	return ValidateStorageEngineObjectsForConfig(ctx, config, engine)
+}
+
+// ValidateStorageEngineObjectsForConfig validates deletion ownership and REST
+// mappings using an existing REST config, without deleting any object.
+func ValidateStorageEngineObjectsForConfig(ctx context.Context, config *rest.Config, engine cluster.CSI) error {
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
+	if err != nil {
+		return fmt.Errorf("create Kubernetes discovery client for storage cleanup validation: %w", err)
+	}
+	mapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(discoveryClient))
+	dynamicClient, err := dynamic.NewForConfig(config)
+	if err != nil {
+		return fmt.Errorf("create Kubernetes dynamic client for storage cleanup validation: %w", err)
+	}
+	objects, err := storageObjectsForEngine(engine)
+	if err != nil {
+		return err
+	}
+	return validateRenderedStorageObjects(ctx, dynamicClient, mapper, objects)
+}
+
 // DeleteStorageEngineObjectsForConfig removes the rendered Kubernetes objects
 // for the requested curated storage engine using an existing REST config.
 func DeleteStorageEngineObjectsForConfig(ctx context.Context, config *rest.Config, engine cluster.CSI) error {
@@ -102,13 +131,16 @@ func deleteStorageEngineObjects(ctx context.Context, client dynamic.Interface, m
 
 func deleteRenderedStorageObjects(ctx context.Context, client dynamic.Interface, mapper meta.RESTMapper, objects []unstructured.Unstructured) error {
 	ordered := storageDeletionOrder(objects)
+	if err := validateRenderedStorageObjects(ctx, client, mapper, ordered); err != nil {
+		return err
+	}
 	resources := make([]dynamic.ResourceInterface, 0, len(ordered))
 	candidates := make([]unstructured.Unstructured, 0, len(ordered))
 	for _, candidate := range ordered {
 		if storageLifecycleSkipDelete(candidate) {
 			continue
 		}
-		resource, live, found, err := getDynamicObject(ctx, client, mapper, candidate)
+		resource, _, found, err := getDynamicObject(ctx, client, mapper, candidate)
 		if err != nil {
 			return fmt.Errorf("get stale storage %s %q: %w", candidate.GetKind(), candidate.GetName(), err)
 		}
@@ -116,9 +148,6 @@ func deleteRenderedStorageObjects(ctx context.Context, client dynamic.Interface,
 			resources = append(resources, nil)
 			candidates = append(candidates, candidate)
 			continue
-		}
-		if !storageObjectOwnedByTalosbox(live) {
-			return fmt.Errorf("refuse to remove unmanaged storage %s %q", candidate.GetKind(), candidate.GetName())
 		}
 		resources = append(resources, resource)
 		candidates = append(candidates, candidate)
@@ -129,6 +158,22 @@ func deleteRenderedStorageObjects(ctx context.Context, client dynamic.Interface,
 		}
 		if err := resources[i].Delete(ctx, candidate.GetName(), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("delete stale storage %s %q: %w", candidate.GetKind(), candidate.GetName(), err)
+		}
+	}
+	return nil
+}
+
+func validateRenderedStorageObjects(ctx context.Context, client dynamic.Interface, mapper meta.RESTMapper, objects []unstructured.Unstructured) error {
+	for _, candidate := range storageDeletionOrder(objects) {
+		if storageLifecycleSkipDelete(candidate) {
+			continue
+		}
+		_, live, found, err := getDynamicObject(ctx, client, mapper, candidate)
+		if err != nil {
+			return fmt.Errorf("get stale storage %s %q: %w", candidate.GetKind(), candidate.GetName(), err)
+		}
+		if found && !storageObjectOwnedByTalosbox(live) {
+			return fmt.Errorf("refuse to remove unmanaged storage %s %q", candidate.GetKind(), candidate.GetName())
 		}
 	}
 	return nil

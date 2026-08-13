@@ -28,28 +28,29 @@ type Server struct {
 	cache      *imagecache.Cache
 	hypervisor hypervisor.Hypervisor
 
-	opMu                 sync.Mutex
-	vms                  map[string]map[string]hypervisor.Machine
-	provisions           map[string]activeProvision
-	storagePhases        map[string]StoragePhase
-	storageStatusProbes  map[string]activeStorageProbe
-	storageProbeFailures map[string]storageProbeFailure
-	storageProbeSequence uint64
-	provisionSequence    uint64
-	provisionReconcile   provisionReconcileFunc
-	storageProbe         func(context.Context, []byte) error
-	destroyVolumeCount   func(context.Context, cluster.Cluster) (int, error)
-	storageEngineDelete  func(context.Context, cluster.Cluster) error
-	nodeIPLookup         func(string, int) string
-	nodeProbe            func(string) ProbeResult
-	hostFreeMemory       func() (int, error)
-	maintenanceLoad      func(string) (cluster.Cluster, error)
-	lifecycleContext     context.Context
-	lifecycleCancel      context.CancelFunc
-	mirrors              *mirror.Manager
-	defaultSchematic     string
-	subnetSources        cluster.SubnetSources
-	hostPressure         func(string) (hostpressure.Snapshot, error)
+	opMu                  sync.Mutex
+	vms                   map[string]map[string]hypervisor.Machine
+	provisions            map[string]activeProvision
+	storagePhases         map[string]StoragePhase
+	storageStatusProbes   map[string]activeStorageProbe
+	storageProbeFailures  map[string]storageProbeFailure
+	storageProbeSequence  uint64
+	provisionSequence     uint64
+	provisionReconcile    provisionReconcileFunc
+	storageProbe          func(context.Context, []byte) error
+	destroyVolumeCount    func(context.Context, cluster.Cluster) (int, error)
+	storageEngineDelete   func(context.Context, cluster.Cluster) error
+	storageEngineValidate func(context.Context, cluster.Cluster) error
+	nodeIPLookup          func(string, int) string
+	nodeProbe             func(string) ProbeResult
+	hostFreeMemory        func() (int, error)
+	maintenanceLoad       func(string) (cluster.Cluster, error)
+	lifecycleContext      context.Context
+	lifecycleCancel       context.CancelFunc
+	mirrors               *mirror.Manager
+	defaultSchematic      string
+	subnetSources         cluster.SubnetSources
+	hostPressure          func(string) (hostpressure.Snapshot, error)
 
 	listenerMu   sync.Mutex
 	listener     net.Listener
@@ -105,21 +106,22 @@ func NewServer(ctx context.Context) (*Server, error) {
 	}
 	lifecycleContext, lifecycleCancel := context.WithCancel(ctx)
 	return &Server{
-		cache:                cache,
-		hypervisor:           backend,
-		vms:                  make(map[string]map[string]hypervisor.Machine),
-		provisions:           make(map[string]activeProvision),
-		storagePhases:        make(map[string]StoragePhase),
-		storageStatusProbes:  make(map[string]activeStorageProbe),
-		storageProbeFailures: make(map[string]storageProbeFailure),
-		lifecycleContext:     lifecycleContext,
-		lifecycleCancel:      lifecycleCancel,
-		mirrors:              mirror.NewManager(mirror.DefaultDir(root)),
-		subnetSources:        cluster.SystemSubnetSources(),
-		hostPressure:         hostpressure.SystemSnapshot,
-		hostFreeMemory:       balloon.HostFreeMiB,
-		destroyVolumeCount:   countDestroyStorageVolumes,
-		storageEngineDelete:  deleteConfiguredStorageEngine,
+		cache:                 cache,
+		hypervisor:            backend,
+		vms:                   make(map[string]map[string]hypervisor.Machine),
+		provisions:            make(map[string]activeProvision),
+		storagePhases:         make(map[string]StoragePhase),
+		storageStatusProbes:   make(map[string]activeStorageProbe),
+		storageProbeFailures:  make(map[string]storageProbeFailure),
+		lifecycleContext:      lifecycleContext,
+		lifecycleCancel:       lifecycleCancel,
+		mirrors:               mirror.NewManager(mirror.DefaultDir(root)),
+		subnetSources:         cluster.SystemSubnetSources(),
+		hostPressure:          hostpressure.SystemSnapshot,
+		hostFreeMemory:        balloon.HostFreeMiB,
+		destroyVolumeCount:    countDestroyStorageVolumes,
+		storageEngineDelete:   deleteConfiguredStorageEngine,
+		storageEngineValidate: validateConfiguredStorageEngine,
 	}, nil
 }
 

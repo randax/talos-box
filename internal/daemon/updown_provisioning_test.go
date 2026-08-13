@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -206,7 +207,8 @@ func TestStorageTeardownFailureLeavesOldIntentForConvergentRetry(t *testing.T) {
 	}
 	deleteCalls := 0
 	service := &Server{
-		destroyVolumeCount: func(context.Context, cluster.Cluster) (int, error) { return 0, nil },
+		destroyVolumeCount:    func(context.Context, cluster.Cluster) (int, error) { return 0, nil },
+		storageEngineValidate: func(context.Context, cluster.Cluster) error { return nil },
 		storageEngineDelete: func(context.Context, cluster.Cluster) error {
 			deleteCalls++
 			if deleteCalls == 1 {
@@ -266,8 +268,9 @@ func TestUpAddsAndSwitchesCSIWithoutChangingMachineConfig(t *testing.T) {
 			}
 			deletes := 0
 			service := &Server{
-				vms:                map[string]map[string]hypervisor.Machine{item.Name: {item.Nodes[0].Name: &fakeMachine{active: true}}},
-				destroyVolumeCount: func(context.Context, cluster.Cluster) (int, error) { return 0, nil },
+				vms:                   map[string]map[string]hypervisor.Machine{item.Name: {item.Nodes[0].Name: &fakeMachine{active: true}}},
+				destroyVolumeCount:    func(context.Context, cluster.Cluster) (int, error) { return 0, nil },
+				storageEngineValidate: func(context.Context, cluster.Cluster) error { return nil },
 				storageEngineDelete: func(_ context.Context, old cluster.Cluster) error {
 					deletes++
 					if old.CSI != test.current {
@@ -307,6 +310,49 @@ func TestUpAddsAndSwitchesCSIWithoutChangingMachineConfig(t *testing.T) {
 				t.Fatalf("machine config changed while adopting CSI: %q", contents)
 			}
 		})
+	}
+}
+
+func TestStorageTransitionsValidateEveryClusterBeforeAnyDelete(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	var specs []config.ClusterSpec
+	observations := make(map[string]storageObservation)
+	for index, name := range []string{"first", "second"} {
+		item, err := cluster.New(name, index, 1, 0, cluster.NodeDefaults{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILocalPath}
+		if err := cluster.Save(item); err != nil {
+			t.Fatal(err)
+		}
+		specs = append(specs, config.ClusterSpec{Name: name, ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILonghorn}})
+		observations[name] = storageObservation{engine: cluster.CSILocalPath, count: 0, running: map[string]bool{item.Nodes[0].Name: false}}
+	}
+	deletes := 0
+	service := &Server{
+		destroyVolumeCount: func(context.Context, cluster.Cluster) (int, error) { return 0, nil },
+		storageEngineValidate: func(_ context.Context, item cluster.Cluster) error {
+			if item.Name == "second" {
+				return errors.New("unmanaged storage collision")
+			}
+			return nil
+		},
+		storageEngineDelete: func(context.Context, cluster.Cluster) error {
+			deletes++
+			return nil
+		},
+	}
+	raw, err := json.Marshal(upArgs{Clusters: specs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = service.deleteUpStorageTransitions(raw, observations)
+	if err == nil || !strings.Contains(err.Error(), "unmanaged storage collision") {
+		t.Fatalf("deleteUpStorageTransitions() error = %v", err)
+	}
+	if deletes != 0 {
+		t.Fatalf("delete calls = %d, want zero before every target validates", deletes)
 	}
 }
 
