@@ -39,6 +39,17 @@ func TestInspectDestroyClusterFallsBackToGenericDataLossWarning(t *testing.T) {
 	}
 }
 
+func TestInspectDestroyClusterShowsReachableZeroVolumeCount(t *testing.T) {
+	item := cluster.Cluster{Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CSI: cluster.CSILocalPath}}
+	server := &Server{destroyVolumeCount: func(context.Context, cluster.Cluster) (int, error) { return 0, nil }}
+
+	result := server.inspectDestroyCluster(item)
+
+	if !strings.Contains(result.Warning, "0 local-path volumes") {
+		t.Fatalf("warning = %q, want known zero-volume count", result.Warning)
+	}
+}
+
 func TestInspectDestroyClusterSkipsClustersWithoutCSIIntent(t *testing.T) {
 	server := &Server{
 		destroyVolumeCount: func(context.Context, cluster.Cluster) (int, error) {

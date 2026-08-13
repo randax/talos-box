@@ -1,8 +1,12 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/config"
@@ -22,6 +26,10 @@ func (s *Server) up(raw json.RawMessage) ([]Action, error) {
 }
 
 func (s *Server) upWithMaintenance(raw json.RawMessage, maintenance map[string]maintenanceObservation) ([]Action, error) {
+	return s.upWithObservations(raw, maintenance, nil)
+}
+
+func (s *Server) upWithObservations(raw json.RawMessage, maintenance map[string]maintenanceObservation, storage map[string]storageObservation) ([]Action, error) {
 	var args upArgs
 	if err := decodeArgs(raw, &args); err != nil {
 		return nil, err
@@ -31,7 +39,7 @@ func (s *Server) upWithMaintenance(raw json.RawMessage, maintenance map[string]m
 		return nil, err
 	}
 	actions := PlanUp(args.Clusters, existing)
-	updates, err := s.preflightUp(args.Clusters, existing, maintenance)
+	updates, err := s.preflightUpWithStorage(args.Clusters, existing, maintenance, storage)
 	if err != nil {
 		return nil, err
 	}
@@ -62,9 +70,140 @@ func (s *Server) upWithMaintenance(raw json.RawMessage, maintenance map[string]m
 	return actions, nil
 }
 
+func (s *Server) validateUp(raw json.RawMessage, maintenance map[string]maintenanceObservation, storage map[string]storageObservation) error {
+	var args upArgs
+	if err := decodeArgs(raw, &args); err != nil {
+		return err
+	}
+	existing, err := s.existingStates()
+	if err != nil {
+		return err
+	}
+	_, err = s.preflightUpWithStorage(args.Clusters, existing, maintenance, storage)
+	return err
+}
+
 type maintenanceObservation struct {
 	running map[string]bool
 	phases  map[string]provision.Phase
+}
+
+type storageObservation struct {
+	engine  cluster.CSI
+	count   int
+	running map[string]bool
+}
+
+func (observation storageObservation) matches(item cluster.Cluster, nodeRunning func(string) bool) bool {
+	if observation.engine != item.CSI || len(observation.running) != len(item.Nodes) {
+		return false
+	}
+	for _, node := range item.Nodes {
+		wasRunning, ok := observation.running[node.Name]
+		if !ok || wasRunning != nodeRunning(node.Name) {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Server) observeUpStorage(raw json.RawMessage) (map[string]storageObservation, error) {
+	var args upArgs
+	if err := decodeArgs(raw, &args); err != nil {
+		return nil, err
+	}
+	type candidate struct {
+		item    cluster.Cluster
+		running map[string]bool
+	}
+	candidates := make([]candidate, 0, len(args.Clusters))
+	for _, spec := range args.Clusters {
+		item, err := cluster.Load(spec.Name)
+		if err != nil || item.CSI == "" || item.CSI == spec.CSI {
+			continue
+		}
+		candidates = append(candidates, candidate{item: item})
+	}
+	s.opMu.Lock()
+	for i := range candidates {
+		candidates[i].running = make(map[string]bool, len(candidates[i].item.Nodes))
+		for _, node := range candidates[i].item.Nodes {
+			candidates[i].running[node.Name] = s.nodeRunning(candidates[i].item.Name, node.Name)
+		}
+	}
+	s.opMu.Unlock()
+
+	countVolumes := s.destroyVolumeCount
+	if countVolumes == nil {
+		countVolumes = countDestroyStorageVolumes
+	}
+	observations := make(map[string]storageObservation, len(candidates))
+	for _, candidate := range candidates {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		count, err := countVolumes(ctx, candidate.item)
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("cluster %q: cannot verify %s volume count before changing csi: %w", candidate.item.Name, candidate.item.CSI, err)
+		}
+		observations[candidate.item.Name] = storageObservation{engine: candidate.item.CSI, count: count, running: candidate.running}
+	}
+	return observations, nil
+}
+
+func (s *Server) deleteUpStorageTransitions(raw json.RawMessage, observations map[string]storageObservation) error {
+	if len(observations) == 0 {
+		return nil
+	}
+	var args upArgs
+	if err := decodeArgs(raw, &args); err != nil {
+		return err
+	}
+	countVolumes := s.destroyVolumeCount
+	if countVolumes == nil {
+		countVolumes = countDestroyStorageVolumes
+	}
+	deleteEngine := s.storageEngineDelete
+	if deleteEngine == nil {
+		deleteEngine = deleteConfiguredStorageEngine
+	}
+	for _, spec := range args.Clusters {
+		observation, ok := observations[spec.Name]
+		if !ok {
+			continue
+		}
+		item, err := cluster.Load(spec.Name)
+		if err != nil {
+			return err
+		}
+		if item.CSI != observation.engine || item.CSI == spec.CSI {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		count, err := countVolumes(ctx, item)
+		if err == nil && count > 0 {
+			err = storageVolumesBlockChange(item, count)
+		}
+		if err == nil {
+			err = deleteEngine(ctx, item)
+		}
+		cancel()
+		if err != nil {
+			return fmt.Errorf("cluster %q: remove %s before changing csi: %w", item.Name, item.CSI, err)
+		}
+	}
+	return nil
+}
+
+func deleteConfiguredStorageEngine(ctx context.Context, item cluster.Cluster) error {
+	dir, err := cluster.Dir(item.Name)
+	if err != nil {
+		return err
+	}
+	kubeconfig, err := os.ReadFile(filepath.Join(dir, "kubeconfig"))
+	if err != nil {
+		return fmt.Errorf("read kubeconfig for storage cleanup: %w", err)
+	}
+	return provision.DeleteStorageEngineObjects(ctx, kubeconfig, item.CSI)
 }
 
 func (observation maintenanceObservation) sameSnapshot(other maintenanceObservation) bool {
@@ -173,6 +312,15 @@ func (s *Server) preflightUp(
 	existing map[string]ClusterState,
 	maintenance map[string]maintenanceObservation,
 ) ([]intentUpdate, error) {
+	return s.preflightUpWithStorage(specs, existing, maintenance, nil)
+}
+
+func (s *Server) preflightUpWithStorage(
+	specs []config.ClusterSpec,
+	existing map[string]ClusterState,
+	maintenance map[string]maintenanceObservation,
+	storage map[string]storageObservation,
+) ([]intentUpdate, error) {
 	updates := make([]intentUpdate, 0, len(specs))
 	for _, spec := range specs {
 		if !existing[spec.Name].Exists {
@@ -192,7 +340,15 @@ func (s *Server) preflightUp(
 				return s.nodeRunning(item.Name, nodeName)
 			})
 		}
-		intent, changed, err := reconcileProvisioningIntent(item, spec, allNodesMaintenance)
+		var volumeCount *int
+		if item.CSI != "" && item.CSI != spec.CSI {
+			observation, ok := storage[item.Name]
+			if !ok || !observation.matches(item, func(nodeName string) bool { return s.nodeRunning(item.Name, nodeName) }) {
+				return nil, fmt.Errorf("cluster %q: storage state changed while verifying csi mutation; retry tbx up", item.Name)
+			}
+			volumeCount = &observation.count
+		}
+		intent, changed, err := reconcileProvisioningIntentWithVolumes(item, spec, allNodesMaintenance, volumeCount)
 		if err != nil {
 			return nil, err
 		}
@@ -209,6 +365,10 @@ func (s *Server) preflightUp(
 // validates the complete desired set, then persists updates before running
 // any host or Talos mutation.
 func reconcileProvisioningIntent(item cluster.Cluster, spec config.ClusterSpec, allMaintenance bool) (cluster.ProvisioningIntent, bool, error) {
+	return reconcileProvisioningIntentWithVolumes(item, spec, allMaintenance, nil)
+}
+
+func reconcileProvisioningIntentWithVolumes(item cluster.Cluster, spec config.ClusterSpec, allMaintenance bool, volumeCount *int) (cluster.ProvisioningIntent, bool, error) {
 	current := item.ProvisioningIntent
 	desired := spec.ProvisioningIntent
 	if current.CNI == "" {
@@ -241,6 +401,17 @@ func reconcileProvisioningIntent(item cluster.Cluster, spec config.ClusterSpec, 
 	if !next.LB && desired.LB {
 		next.LB = true
 	}
+	if desired.CSI != current.CSI {
+		if current.CSI != "" {
+			if volumeCount == nil {
+				return current, false, fmt.Errorf("cluster %q: csi can be changed only after its volume count is verified", item.Name)
+			}
+			if *volumeCount > 0 {
+				return current, false, storageVolumesBlockChange(item, *volumeCount)
+			}
+		}
+		next.CSI = desired.CSI
+	}
 	// Hubble is the one symmetric optional desired set. CNI and LB rules above
 	// have already fixed the cluster's irreversible substrate contract.
 	if current.CNI == cluster.CNICilium {
@@ -248,6 +419,13 @@ func reconcileProvisioningIntent(item cluster.Cluster, spec config.ClusterSpec, 
 		next.Hubble = desired.Hubble
 	}
 	return next, next != current, nil
+}
+
+func storageVolumesBlockChange(item cluster.Cluster, count int) error {
+	return fmt.Errorf(
+		"cluster %q: cannot change csi from %q while it has %d provisioned volume(s); delete the volumes first, or run: tbx cluster destroy %s",
+		item.Name, item.CSI, count, item.Name,
+	)
 }
 
 // down stops every cluster the file describes; it never destroys.

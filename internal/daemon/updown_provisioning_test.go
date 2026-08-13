@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -9,8 +10,11 @@ import (
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/config"
+	"github.com/randax/talos-box/internal/hypervisor"
 	"github.com/randax/talos-box/internal/provision"
 )
+
+func intPointer(value int) *int { return &value }
 
 func TestCreateFromSpecWithoutCNIUsesLegacyProvisioningFields(t *testing.T) {
 	spec := config.ClusterSpec{Name: "demo"}
@@ -140,6 +144,167 @@ func TestReconcileProvisioningIntentMutationRules(t *testing.T) {
 			}
 			if got != test.want || changed != test.wantChanged {
 				t.Fatalf("reconcileProvisioningIntent() = (%+v, %t), want (%+v, %t)", got, changed, test.want, test.wantChanged)
+			}
+		})
+	}
+}
+
+func TestReconcileProvisioningIntentStorageLifecycleRules(t *testing.T) {
+	item := cluster.Cluster{Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel}}
+	tests := []struct {
+		name    string
+		current cluster.CSI
+		desired cluster.CSI
+		count   *int
+		changed bool
+		want    cluster.CSI
+		errText []string
+	}{
+		{name: "add later", desired: cluster.CSILocalPath, changed: true, want: cluster.CSILocalPath},
+		{name: "same engine no-op", current: cluster.CSILonghorn, desired: cluster.CSILonghorn, want: cluster.CSILonghorn},
+		{name: "switch after zero volumes", current: cluster.CSILocalPath, desired: cluster.CSILonghorn, count: intPointer(0), changed: true, want: cluster.CSILonghorn},
+		{name: "remove after zero volumes", current: cluster.CSILonghorn, count: intPointer(0), changed: true},
+		{name: "switch requires observation", current: cluster.CSILocalPath, desired: cluster.CSILonghorn, errText: []string{"volume count is verified"}},
+		{name: "volumes block switch", current: cluster.CSILocalPath, desired: cluster.CSILonghorn, count: intPointer(2), errText: []string{"delete the volumes first", "tbx cluster destroy demo"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			item.CSI = test.current
+			desired := config.ClusterSpec{Name: item.Name, ProvisioningIntent: item.ProvisioningIntent}
+			desired.CSI = test.desired
+			got, changed, err := reconcileProvisioningIntentWithVolumes(item, desired, false, test.count)
+			if len(test.errText) > 0 {
+				if err == nil {
+					t.Fatal("expected storage lifecycle error")
+				}
+				for _, text := range test.errText {
+					if !strings.Contains(err.Error(), text) {
+						t.Fatalf("error = %q, want %q", err, text)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if changed != test.changed || got.CSI != test.want {
+				t.Fatalf("result = (%q, %t), want (%q, %t)", got.CSI, changed, test.want, test.changed)
+			}
+		})
+	}
+}
+
+func TestStorageTeardownFailureLeavesOldIntentForConvergentRetry(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILocalPath}
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	deleteCalls := 0
+	service := &Server{
+		destroyVolumeCount: func(context.Context, cluster.Cluster) (int, error) { return 0, nil },
+		storageEngineDelete: func(context.Context, cluster.Cluster) error {
+			deleteCalls++
+			if deleteCalls == 1 {
+				return context.Canceled
+			}
+			return nil
+		},
+	}
+	raw, err := json.Marshal(upArgs{Clusters: []config.ClusterSpec{{Name: item.Name, ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILonghorn}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observations := map[string]storageObservation{item.Name: {engine: item.CSI, count: 0, running: map[string]bool{item.Nodes[0].Name: false}}}
+	if err := service.deleteUpStorageTransitions(raw, observations); err == nil {
+		t.Fatal("expected interrupted teardown")
+	}
+	stored, err := cluster.Load(item.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.CSI != cluster.CSILocalPath {
+		t.Fatalf("CSI after interrupted teardown = %q, want old intent", stored.CSI)
+	}
+	if err := service.deleteUpStorageTransitions(raw, observations); err != nil {
+		t.Fatalf("idempotent teardown retry: %v", err)
+	}
+}
+
+func TestUpAddsAndSwitchesCSIWithoutChangingMachineConfig(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		current    cluster.CSI
+		desired    cluster.CSI
+		wantDelete int
+	}{
+		{name: "add later", desired: cluster.CSILocalPath},
+		{name: "switch after zero volumes", current: cluster.CSILocalPath, desired: cluster.CSILonghorn, wantDelete: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: test.current}
+			if err := cluster.Save(item); err != nil {
+				t.Fatal(err)
+			}
+			dir, err := cluster.Dir(item.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			machineConfig := filepath.Join(dir, item.Nodes[0].Name+".yaml")
+			const marker = "machine-config-must-not-change\n"
+			if err := os.WriteFile(machineConfig, []byte(marker), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			deletes := 0
+			service := &Server{
+				vms:                map[string]map[string]hypervisor.Machine{item.Name: {item.Nodes[0].Name: &fakeMachine{active: true}}},
+				destroyVolumeCount: func(context.Context, cluster.Cluster) (int, error) { return 0, nil },
+				storageEngineDelete: func(_ context.Context, old cluster.Cluster) error {
+					deletes++
+					if old.CSI != test.current {
+						t.Fatalf("deleted engine = %q, want %q", old.CSI, test.current)
+					}
+					return nil
+				},
+				provisionReconcile: func(_ context.Context, request provision.Request) (provision.Result, error) {
+					if request.Cluster.CSI != test.desired {
+						t.Fatalf("reconciled CSI = %q, want %q", request.Cluster.CSI, test.desired)
+					}
+					return provision.Result{StoragePhase: provision.StoragePhaseLive, StorageLive: true}, nil
+				},
+			}
+			raw, err := json.Marshal(upArgs{Clusters: []config.ClusterSpec{{
+				Name: item.Name, ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: test.desired},
+			}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := service.dispatchProvisioning(Request{Op: "up", Args: raw})
+			if !response.OK {
+				t.Fatalf("up failed: %s", response.Error)
+			}
+			stored, err := cluster.Load(item.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stored.CSI != test.desired || deletes != test.wantDelete {
+				t.Fatalf("stored CSI/deletes = %q/%d, want %q/%d", stored.CSI, deletes, test.desired, test.wantDelete)
+			}
+			contents, err := os.ReadFile(machineConfig)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(contents) != marker {
+				t.Fatalf("machine config changed while adopting CSI: %q", contents)
 			}
 		})
 	}
