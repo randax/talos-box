@@ -43,6 +43,16 @@ const (
 	PhaseConfigured  Phase = "configured"
 )
 
+// StoragePhase is the durable storage readiness projection the daemon can map
+// into user-visible cluster status.
+type StoragePhase string
+
+const (
+	StoragePhaseNone         StoragePhase = ""
+	StoragePhaseProvisioning StoragePhase = "storage-provisioning"
+	StoragePhaseLive         StoragePhase = "storage-live"
+)
+
 // Node is the provisioning-relevant projection of an observed cluster node.
 type Node struct {
 	Name  string
@@ -67,12 +77,19 @@ type LoadBalancerReconciler interface {
 	Reconcile(context.Context, cluster.Cluster, []byte) (LoadBalancerResult, error)
 }
 
+// StorageReconciler installs and verifies the requested storage implementation
+// after Talos has produced a ready Kubernetes API.
+type StorageReconciler interface {
+	Reconcile(context.Context, cluster.Cluster, []byte) (StorageResult, error)
+}
+
 // Request supplies all transient state required for one reconciliation.
 type Request struct {
 	Cluster      cluster.Cluster
 	Observe      func(context.Context) ([]Node, error)
 	Client       TalosClient
 	LoadBalancer LoadBalancerReconciler
+	Storage      StorageReconciler
 	PollInterval time.Duration
 }
 
@@ -82,6 +99,8 @@ type Result struct {
 	KubeconfigPath  string
 	Narration       []string
 	VIP             string
+	StoragePhase    StoragePhase
+	StorageLive     bool
 }
 
 type generated struct {
@@ -200,6 +219,18 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 			}
 			result.VIP = loadBalancer.VIP
 			result.Narration = append(result.Narration, loadBalancer.Narration...)
+		}
+		if request.Cluster.CSI != "" {
+			if request.Storage == nil {
+				return Result{}, errors.New("flannel storage provisioning requires a Kubernetes reconciler")
+			}
+			storage, err := request.Storage.Reconcile(ctx, request.Cluster, kubeconfig)
+			if err != nil {
+				return Result{}, fmt.Errorf("reconcile flannel storage: %w", err)
+			}
+			result.StoragePhase = storage.Phase
+			result.StorageLive = storage.Live
+			result.Narration = append(result.Narration, storage.Narration...)
 		}
 		return result, nil
 	}
