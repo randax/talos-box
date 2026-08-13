@@ -14,6 +14,7 @@ import (
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/manifests"
+	"github.com/randax/talos-box/internal/shellquote"
 	"helm.sh/helm/v3/pkg/chart/loader"
 	"helm.sh/helm/v3/pkg/chartutil"
 	"helm.sh/helm/v3/pkg/engine"
@@ -62,10 +63,11 @@ type MetalLBReconciler struct {
 	HTTPClient   *http.Client
 }
 
-// LiveVIP returns the probe VIP only after both Kubernetes has assigned it and
-// the host can receive a successful response through the L2 path.
+// LiveVIP returns the durable tbx probe VIP only after both Kubernetes has
+// assigned it and the host can receive a successful response through the
+// selected CNI's announcement path.
 func LiveVIP(ctx context.Context, item cluster.Cluster, kubeconfig []byte) (string, bool) {
-	if item.CNI != cluster.CNIFlannel || !item.LB {
+	if (item.CNI != cluster.CNIFlannel && item.CNI != cluster.CNICilium) || !item.LB {
 		return "", false
 	}
 	config, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
@@ -156,10 +158,15 @@ func (r MetalLBReconciler) reconcile(ctx context.Context, item cluster.Cluster, 
 	if err != nil {
 		return LoadBalancerResult{}, err
 	}
-	return LoadBalancerResult{VIP: vip, Narration: []string{
-		"≈ helm template metallb metallb/metallb --version " + metalLBChartVersion + " -n " + metalLBNamespace + " | kubectl apply --server-side -f -",
-		"≈ kubectl apply --server-side -f - # MetalLB L2 pool and VIP probe",
-	}}, nil
+	return LoadBalancerResult{VIP: vip, Narration: metalLBNarration(item)}, nil
+}
+
+func metalLBNarration(item cluster.Cluster) []string {
+	name := shellquote.Quote(item.Name)
+	return []string{
+		"MetalLB chart: ≈ tbx manifests " + name + " objects | kubectl apply --server-side -f -",
+		"MetalLB LoadBalancer extras: ≈ tbx manifests " + name + " extras | kubectl apply --server-side -f -",
+	}
 }
 
 func renderMetalLB(item cluster.Cluster) ([]unstructured.Unstructured, error) {
@@ -234,7 +241,7 @@ func renderMetalLB(item cluster.Cluster) ([]unstructured.Unstructured, error) {
 }
 
 func manifestFacts(item cluster.Cluster) manifests.Facts {
-	return manifests.Facts{Cluster: item.Name, SubnetIndex: item.SubnetIndex, BGP: item.BGP}
+	return manifests.Facts{Cluster: item.Name, SubnetIndex: item.SubnetIndex, CNI: string(item.CNI), LB: item.LB, BGP: item.BGP, Hubble: item.Hubble}
 }
 
 func metalLBProbe(item cluster.Cluster) string {

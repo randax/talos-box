@@ -11,7 +11,19 @@ import (
 	"github.com/randax/talos-box/internal/provision"
 )
 
-const flannelProvisionTimeout = 10 * time.Minute
+const (
+	cniProvisionTimeout       = 10 * time.Minute
+	kubernetesReadyTimeout    = 5 * time.Second
+	ciliumConvergenceTimeout  = 15 * time.Second
+	storageConvergenceTimeout = 30 * time.Second
+)
+
+var (
+	kubernetesReadyProbe    = provision.KubernetesReady
+	ciliumConvergenceProbe  = provision.CiliumConverged
+	loadBalancerVIPProbe    = loadBalancerVIP
+	storageConvergenceProbe = storageConverged
+)
 
 const storageProbeRetryBackoff = time.Minute
 
@@ -24,7 +36,7 @@ type provisionTask struct {
 	action     int
 }
 
-func (s *Server) handleProvisioningLocked(request Request) (any, []provisionTask, error) {
+func (s *Server) handleProvisioningLocked(request Request, maintenance map[string]maintenanceObservation, storage map[string]storageObservation) (any, []provisionTask, error) {
 	switch request.Op {
 	case "cluster.create":
 		result, err := s.createCluster(request.Args)
@@ -47,7 +59,7 @@ func (s *Server) handleProvisioningLocked(request Request) (any, []provisionTask
 		}
 		return &result, s.beginProvisionTasksLocked([]cluster.Cluster{item}), nil
 	case "up":
-		actions, err := s.up(request.Args)
+		actions, err := s.upWithObservations(request.Args, maintenance, storage)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -84,7 +96,7 @@ func indexAction(actions []Action, name string) int {
 func (s *Server) beginProvisionTasksLocked(items []cluster.Cluster) []provisionTask {
 	tasks := make([]provisionTask, 0, len(items))
 	for _, item := range items {
-		if item.CNI != cluster.CNIFlannel {
+		if item.CNI != cluster.CNIFlannel && item.CNI != cluster.CNICilium {
 			continue
 		}
 		if s.provisions == nil {
@@ -146,7 +158,7 @@ func (s *Server) cancelAllProvisionsLocked() {
 
 func (s *Server) runProvisionTasks(data any, tasks []provisionTask) error {
 	for i, task := range tasks {
-		narration, phase, err := s.provisionFlannel(task.ctx, task.item)
+		narration, phase, err := s.provisionCNI(task.ctx, task.item, false)
 		if task.item.CSI != "" {
 			s.opMu.Lock()
 			s.recordStoragePhaseLocked(task.item.Name, phase)
@@ -167,32 +179,48 @@ func (s *Server) runProvisionTasks(data any, tasks []provisionTask) error {
 		case []Action:
 			if task.action >= 0 {
 				result[task.action].Narration = narration
+				result[task.action].Kind = actionAfterProvision(result[task.action].Kind, narration)
 			}
 		}
 	}
 	return nil
 }
 
-func (s *Server) provisionFlannel(parent context.Context, item cluster.Cluster) ([]string, StoragePhase, error) {
-	if item.CNI != cluster.CNIFlannel {
+func (s *Server) provisionCNI(parent context.Context, item cluster.Cluster, force bool) ([]string, StoragePhase, error) {
+	if item.CNI != cluster.CNIFlannel && item.CNI != cluster.CNICilium {
+		return nil, "", nil
+	}
+	// Once every desired outcome is observed healthy, a rerun is a genuine fast
+	// no-op. Cilium additionally probes its optional Hubble deployments: a live
+	// VIP and Ready Nodes alone cannot establish that that desired set converged.
+	if !force && s.tryFastNoopReconcile(item) {
+		if item.CSI != "" {
+			return nil, StoragePhaseLive, nil
+		}
 		return nil, "", nil
 	}
 	dir, err := cluster.Dir(item.Name)
 	if err != nil {
 		return nil, "", err
 	}
-	ctx, cancel := context.WithTimeout(parent, flannelProvisionTimeout)
+	ctx, cancel := context.WithTimeout(parent, cniProvisionTimeout)
 	defer cancel()
+	var loadBalancer provision.LoadBalancerReconciler
+	switch item.CNI {
+	case cluster.CNIFlannel:
+		loadBalancer = provision.MetalLBReconciler{PollInterval: time.Second}
+	case cluster.CNICilium:
+		loadBalancer = provision.CiliumReconciler{PollInterval: time.Second}
+	}
 	reconcile := s.provisionReconcile
 	if reconcile == nil {
 		reconcile = provision.Reconcile
 	}
 	request := provision.Request{
-		Cluster: item,
-		Client:  provision.MachineryClient{TalosconfigPath: filepath.Join(dir, "talosconfig")},
-		LoadBalancer: provision.MetalLBReconciler{
-			PollInterval: time.Second,
-		},
+		Cluster:      item,
+		Client:       provision.MachineryClient{TalosconfigPath: filepath.Join(dir, "talosconfig")},
+		LoadBalancer: loadBalancer,
+		BGP:          hostBGPReconciler{},
 		Observe: func(context.Context) ([]provision.Node, error) {
 			return s.observeProvisionNodes(item), nil
 		},
@@ -218,7 +246,10 @@ func (s *Server) observeProvisionNodes(item cluster.Cluster) []provision.Node {
 		running[node.Name] = s.nodeRunning(item.Name, node.Name)
 	}
 	s.opMu.Unlock()
+	return s.observeProvisionNodesWithRunning(item, running)
+}
 
+func (s *Server) observeProvisionNodesWithRunning(item cluster.Cluster, running map[string]bool) []provision.Node {
 	lookupIP := s.nodeIPLookup
 	if lookupIP == nil {
 		lookupIP = cluster.LookupIP
@@ -235,6 +266,120 @@ func (s *Server) observeProvisionNodes(item cluster.Cluster) []provision.Node {
 	return states
 }
 
+func (s *Server) tryFastNoopReconcile(item cluster.Cluster) bool {
+	if !s.provisioningComplete(item) {
+		return false
+	}
+	// A BGP -> L2 interruption can leave a process-local speaker behind after
+	// Kubernetes has already converged. Disable is idempotent, so it closes that
+	// gap without a progress marker or a full chart SSA pass.
+	if item.CNI == cluster.CNICilium && item.LB && !item.BGP {
+		return disableHostBGP(item.Name) == nil
+	}
+	return true
+}
+
+func (s *Server) provisioningComplete(item cluster.Cluster) bool {
+	if !provisioningCredentialsPresent(item.Name) {
+		return false
+	}
+	ready := kubernetesReady(item.Name, nodeNames(item))
+	if !ready {
+		return false
+	}
+	vipLive := false
+	if item.LB {
+		_, vipLive = loadBalancerVIPProbe(item)
+	}
+	if item.CNI == cluster.CNICilium {
+		dir, err := cluster.Dir(item.Name)
+		if err != nil {
+			return false
+		}
+		kubeconfig, err := os.ReadFile(filepath.Join(dir, "kubeconfig"))
+		if err != nil {
+			return false
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), ciliumConvergenceTimeout)
+		defer cancel()
+		if ciliumConvergenceProbe(ctx, kubeconfig, item) != nil {
+			return false
+		}
+		if item.LB {
+			if !vipLive {
+				return false
+			}
+			active, err := hostBGPActive(item.Name)
+			if err != nil {
+				return false
+			}
+			return active == item.BGP
+		}
+		return true
+	}
+	if item.CSI != "" {
+		dir, err := cluster.Dir(item.Name)
+		if err != nil {
+			return false
+		}
+		kubeconfig, err := os.ReadFile(filepath.Join(dir, "kubeconfig"))
+		if err != nil {
+			return false
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), storageConvergenceTimeout)
+		defer cancel()
+		if storageConvergenceProbe(ctx, item, kubeconfig) != nil {
+			return false
+		}
+	}
+	return provisioningCompleteEligible(item.ProvisioningIntent, true, ready, vipLive, true)
+}
+
+// provisioningCompleteEligible is deliberately stricter than the generic status view:
+// every requested end state, including Hubble's symmetric toggle, must have
+// a successful observed probe before a cluster is reported as up to date.
+func provisioningCompleteEligible(intent cluster.ProvisioningIntent, credentials, ready, vipLive, hubbleConverged bool) bool {
+	if (intent.CNI != cluster.CNIFlannel && intent.CNI != cluster.CNICilium) || !credentials || !ready {
+		return false
+	}
+	if intent.LB && !vipLive {
+		return false
+	}
+	return intent.CNI != cluster.CNICilium || hubbleConverged
+}
+
+func provisioningCredentialsPresent(name string) bool {
+	dir, err := cluster.Dir(name)
+	if err != nil {
+		return false
+	}
+	for _, file := range []string{"secrets.yaml", "talosconfig", "kubeconfig"} {
+		info, err := os.Stat(filepath.Join(dir, file))
+		if err != nil || !info.Mode().IsRegular() {
+			return false
+		}
+	}
+	return true
+}
+
+func nodeNames(item cluster.Cluster) []string {
+	names := make([]string, 0, len(item.Nodes))
+	for _, node := range item.Nodes {
+		names = append(names, node.Name)
+	}
+	return names
+}
+
+type hostBGPReconciler struct{}
+
+func (hostBGPReconciler) ReconcileBGP(_ context.Context, item cluster.Cluster) error {
+	return enableHostBGP(item)
+}
+
+func (hostBGPReconciler) DisableBGP(_ context.Context, item cluster.Cluster) error {
+	return disableHostBGP(item.Name)
+}
+
 func kubernetesReady(name string, expectedNodes []string) bool {
 	dir, err := cluster.Dir(name)
 	if err != nil {
@@ -244,9 +389,9 @@ func kubernetesReady(name string, expectedNodes []string) bool {
 	if err != nil {
 		return false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), kubernetesReadyTimeout)
 	defer cancel()
-	return provision.KubernetesReady(ctx, kubeconfig, expectedNodes) == nil
+	return kubernetesReadyProbe(ctx, kubeconfig, expectedNodes) == nil
 }
 
 func loadBalancerVIP(item cluster.Cluster) (string, bool) {
@@ -261,6 +406,17 @@ func loadBalancerVIP(item cluster.Cluster) (string, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	return provision.LiveVIP(ctx, item, kubeconfig)
+}
+
+func storageConverged(ctx context.Context, item cluster.Cluster, kubeconfig []byte) error {
+	switch item.CSI {
+	case cluster.CSILocalPath:
+		return provision.ProbeLocalPathStorage(ctx, kubeconfig, time.Second)
+	case cluster.CSILonghorn:
+		return provision.ProbeLonghornStorage(ctx, kubeconfig, time.Second)
+	default:
+		return nil
+	}
 }
 
 func (s *Server) refreshStoragePhases(statuses []ClusterStatus) {
@@ -284,7 +440,7 @@ func (s *Server) refreshStoragePhases(statuses []ClusterStatus) {
 		status.StoragePhase = ""
 		status.StorageError = ""
 		switch {
-		case status.CNI != cluster.CNIFlannel, status.CSI == "", !status.Running:
+		case status.CSI == "", !status.Running:
 		case known[status.Name] == StoragePhaseLive:
 			status.StoragePhase = StoragePhaseLive
 		case active[status.Name], !status.KubernetesReady:

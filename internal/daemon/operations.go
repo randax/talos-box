@@ -235,7 +235,6 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	item.ImageArchitecture = string(s.hypervisor.Architecture())
 	longhornWarning := s.checkLonghornMemoryWarning(item)
 	longhornCustomSchematicWarning := s.longhornCustomSchematicWarning(item, args.Schematic != "")
-	unsupportedCSIWarning := unsupportedCSIProvisioningWarning(item)
 	item.Schematic, item.TalosVersion, err = s.resolveImage(args.Schematic, args.Version)
 	if err != nil {
 		return ClusterSummary{}, err
@@ -260,11 +259,11 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	startWarning, err := s.start(item)
 	if err != nil {
 		result := summary(item, false)
-		result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, longhornWarning, longhornCustomSchematicWarning, unsupportedCSIWarning, subnetWarning)
+		result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, longhornWarning, longhornCustomSchematicWarning, subnetWarning)
 		return result, fmt.Errorf("cluster created but failed to start: %w", err)
 	}
 	result := summary(item, true)
-	result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, longhornWarning, longhornCustomSchematicWarning, unsupportedCSIWarning, subnetWarning, startWarning)
+	result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, longhornWarning, longhornCustomSchematicWarning, subnetWarning, startWarning)
 	return result, nil
 }
 
@@ -287,7 +286,6 @@ func (s *Server) startCluster(raw json.RawMessage) (ClusterSummary, error) {
 	}
 	longhornWarning := s.checkLonghornMemoryWarning(item)
 	longhornCustomSchematicWarning := s.longhornCustomSchematicWarning(item, s.defaultSchematic != "" && item.Schematic != "" && item.Schematic != s.defaultSchematic)
-	unsupportedCSIWarning := unsupportedCSIProvisioningWarning(item)
 	dir, err := cluster.Dir(item.Name)
 	if err != nil {
 		return ClusterSummary{}, err
@@ -301,15 +299,8 @@ func (s *Server) startCluster(raw json.RawMessage) (ClusterSummary, error) {
 		return ClusterSummary{}, err
 	}
 	result := summary(item, true)
-	result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, longhornWarning, longhornCustomSchematicWarning, unsupportedCSIWarning, subnetWarning)
+	result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, longhornWarning, longhornCustomSchematicWarning, subnetWarning)
 	return result, nil
-}
-
-func unsupportedCSIProvisioningWarning(item cluster.Cluster) string {
-	if item.CSI == "" || item.CNI == "" || item.CNI == cluster.CNIFlannel {
-		return ""
-	}
-	return fmt.Sprintf("curated CSI provisioning for cni: %s is not implemented yet; tbx preserved csi: %s intent but will not install storage until that provisioning path exists", item.CNI, item.CSI)
 }
 
 func (s *Server) longhornCustomSchematicWarning(item cluster.Cluster, custom bool) string {
@@ -521,6 +512,9 @@ func (s *Server) destroyCluster(raw json.RawMessage) (map[string]string, error) 
 	}
 	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("cluster %q does not exist", args.Name)
+	}
+	if err := disableHostBGP(args.Name); err != nil {
+		log.Printf("disable host BGP for %s during force destroy: %v", args.Name, err)
 	}
 	// stop what we can, but a partially-destroyed cluster (state dir present,
 	// cluster.json gone) must still be removable
@@ -764,7 +758,7 @@ func (s *Server) refreshNodeStatuses(statuses []ClusterStatus) {
 func refreshKubernetesReadiness(statuses []ClusterStatus) {
 	for index := range statuses {
 		status := &statuses[index]
-		if status.CNI != cluster.CNIFlannel {
+		if status.CNI != cluster.CNIFlannel && status.CNI != cluster.CNICilium {
 			continue
 		}
 		if !status.Running {

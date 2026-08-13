@@ -20,12 +20,12 @@ func TestLoadUpConfigFileAcceptsForce(t *testing.T) {
 	if err := os.WriteFile(path, []byte("version: 1\nclusters:\n  - name: demo\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg, force, err := loadUpConfigFile([]string{"-f", path, "--force"})
+	cfg, force, quiet, err := loadUpConfigFile([]string{"-f", path, "--force"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.Clusters) != 1 || cfg.Clusters[0].Name != "demo" || !force {
-		t.Fatalf("loadUpConfigFile() = clusters %+v, force %v; want demo, true", cfg.Clusters, force)
+	if len(cfg.Clusters) != 1 || cfg.Clusters[0].Name != "demo" || !force || quiet {
+		t.Fatalf("loadUpConfigFile() = clusters %+v, force %v, quiet %v; want demo, true, false", cfg.Clusters, force, quiet)
 	}
 }
 
@@ -101,6 +101,64 @@ clusters:
 	}
 }
 
+func TestRunUpQuietSuppressesNarrationButDefaultOutputShowsManualEquivalents(t *testing.T) {
+	t.Run("default output includes stage narration", func(t *testing.T) {
+		home, requests := startUpTestDaemon(t,
+			daemon.Response{OK: true, Data: json.RawMessage(fmt.Sprintf(`{"protocolVersion":%d}`, daemon.ProtocolVersion))},
+			daemon.Response{OK: true, Data: json.RawMessage(`[{"cluster":"demo","action":"reconcile","narration":["machine config: ≈ talosctl apply-config --insecure --nodes 172.30.0.2 --file controlplane.yaml","Cilium chart: ≈ helm template cilium cilium/cilium --version 1.19.6 -n kube-system | kubectl apply --server-side -f -"]}]`)},
+		)
+		path := filepath.Join(home, "talosbox.yaml")
+		if err := os.WriteFile(path, []byte("version: 1\nclusters:\n  - name: demo\n    cni: cilium\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		var stdout, stderr bytes.Buffer
+		if err := (cli{out: &stdout, err: &stderr}).runUp([]string{"-f", path}); err != nil {
+			t.Fatal(err)
+		}
+		if request := <-requests; request.Op != "daemon.info" {
+			t.Fatalf("first operation = %q, want daemon.info", request.Op)
+		}
+		if request := <-requests; request.Op != "up" {
+			t.Fatalf("second operation = %q, want up", request.Op)
+		}
+		for _, want := range []string{
+			"reconciled demo\n",
+			"machine config: ≈ talosctl apply-config --insecure --nodes 172.30.0.2 --file controlplane.yaml",
+			"Cilium chart: ≈ helm template cilium cilium/cilium --version 1.19.6 -n kube-system | kubectl apply --server-side -f -",
+		} {
+			if !strings.Contains(stdout.String(), want) {
+				t.Fatalf("default runUp output missing %q:\n%s", want, stdout.String())
+			}
+		}
+	})
+
+	t.Run("quiet suppresses stage narration", func(t *testing.T) {
+		home, requests := startUpTestDaemon(t,
+			daemon.Response{OK: true, Data: json.RawMessage(fmt.Sprintf(`{"protocolVersion":%d}`, daemon.ProtocolVersion))},
+			daemon.Response{OK: true, Data: json.RawMessage(`[{"cluster":"demo","action":"reconcile","narration":["machine config: ≈ talosctl apply-config --insecure --nodes 172.30.0.2 --file controlplane.yaml","Cilium chart: ≈ helm template cilium cilium/cilium --version 1.19.6 -n kube-system | kubectl apply --server-side -f -"]}]`)},
+		)
+		path := filepath.Join(home, "talosbox.yaml")
+		if err := os.WriteFile(path, []byte("version: 1\nclusters:\n  - name: demo\n    cni: cilium\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		var stdout, stderr bytes.Buffer
+		if err := (cli{out: &stdout, err: &stderr}).runUp([]string{"-f", path, "--quiet"}); err != nil {
+			t.Fatal(err)
+		}
+		if request := <-requests; request.Op != "daemon.info" {
+			t.Fatalf("first operation = %q, want daemon.info", request.Op)
+		}
+		if request := <-requests; request.Op != "up" {
+			t.Fatalf("second operation = %q, want up", request.Op)
+		}
+		if got := stdout.String(); got != "reconciled demo\n" {
+			t.Fatalf("quiet runUp output = %q, want final action only", got)
+		}
+	})
+}
+
 func startUpTestDaemon(t *testing.T, responses ...daemon.Response) (string, <-chan daemon.Request) {
 	t.Helper()
 	home, err := os.MkdirTemp("/tmp", "tbx-")
@@ -152,5 +210,35 @@ func TestPrintActionsWritesWarningsToStderr(t *testing.T) {
 	}
 	if got := stderr.String(); !strings.Contains(got, "warning: host pressure (forced)") {
 		t.Fatalf("stderr = %q, want host-pressure warning", got)
+	}
+}
+
+func TestPrintActionsNamesIncompleteProvisioningAsReconciliation(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr}
+	err := command.printActions(
+		[]daemon.Action{{Cluster: "demo", Kind: daemon.ActionReconcile}},
+		map[daemon.ActionKind]string{daemon.ActionReconcile: "reconciled %s", daemon.ActionNone: "%s is up to date"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stdout.String(); got != "reconciled demo\n" {
+		t.Fatalf("stdout = %q, want reconciliation instead of up-to-date", got)
+	}
+}
+
+func TestPrintActionsQuietKeepsFinalOutputButSuppressesNarration(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr}
+	err := command.printActions(
+		[]daemon.Action{{Cluster: "demo", Kind: daemon.ActionCreate, Narration: []string{"≈ talosctl apply-config"}}},
+		map[daemon.ActionKind]string{daemon.ActionCreate: "created %s"}, true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stdout.String(); got != "created demo\n" {
+		t.Fatalf("quiet output = %q, want final action only", got)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -71,19 +72,194 @@ func TestRefreshKubernetesReadinessSkipsStoppedFlannelClusters(t *testing.T) {
 	}
 }
 
+func TestProvisioningCompleteUsesMultiSecondProbeBudgets(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir, err := cluster.Dir("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"secrets.yaml", "talosconfig", "kubeconfig"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("test"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	originalReady := kubernetesReadyProbe
+	originalCilium := ciliumConvergenceProbe
+	t.Cleanup(func() {
+		kubernetesReadyProbe = originalReady
+		ciliumConvergenceProbe = originalCilium
+	})
+	remaining := func(ctx context.Context) time.Duration {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("probe context has no deadline")
+		}
+		return time.Until(deadline)
+	}
+	kubernetesReadyProbe = func(ctx context.Context, _ []byte, _ []string) error {
+		if got := remaining(ctx); got < 4*time.Second {
+			t.Errorf("Kubernetes Ready budget = %s, want at least 4s", got)
+		}
+		return nil
+	}
+	ciliumConvergenceProbe = func(ctx context.Context, _ []byte, _ cluster.Cluster) error {
+		if got := remaining(ctx); got < 14*time.Second {
+			t.Errorf("Cilium convergence budget = %s, want at least 14s", got)
+		}
+		return nil
+	}
+
+	item := cluster.Cluster{Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium}}
+	if !(&Server{}).provisioningComplete(item) {
+		t.Fatal("healthy Cilium cluster was not considered complete")
+	}
+}
+
+func TestProvisioningCompleteCiliumRequiresLiveVIPAndMatchingBGP(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir, err := cluster.Dir("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"secrets.yaml", "talosconfig", "kubeconfig"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("not a kubeconfig"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	originalReady := kubernetesReadyProbe
+	originalCilium := ciliumConvergenceProbe
+	originalVIP := loadBalancerVIPProbe
+	originalHelper := connectBGPHelper
+	t.Cleanup(func() {
+		kubernetesReadyProbe = originalReady
+		ciliumConvergenceProbe = originalCilium
+		loadBalancerVIPProbe = originalVIP
+		connectBGPHelper = originalHelper
+	})
+	kubernetesReadyProbe = func(context.Context, []byte, []string) error { return nil }
+	ciliumConvergenceProbe = func(context.Context, []byte, cluster.Cluster) error { return nil }
+
+	tests := []struct {
+		name      string
+		vipLive   bool
+		wantBGP   bool
+		activeBGP bool
+		want      bool
+	}{
+		{name: "VIP not live", want: false},
+		{name: "VIP live and BGP disabled", vipLive: true, want: true},
+		{name: "VIP live but stale BGP active", vipLive: true, activeBGP: true, want: false},
+		{name: "VIP live but BGP inactive", vipLive: true, wantBGP: true, want: false},
+		{name: "VIP live and BGP matches", vipLive: true, wantBGP: true, activeBGP: true, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			loadBalancerVIPProbe = func(cluster.Cluster) (string, bool) { return "172.30.0.200", tt.vipLive }
+			connectBGPHelper = func() (bgpHelperClient, error) {
+				return &fakeBGPClient{active: tt.activeBGP}, nil
+			}
+			item := cluster.Cluster{
+				Name: "demo",
+				ProvisioningIntent: cluster.ProvisioningIntent{
+					CNI: cluster.CNICilium,
+					LB:  true,
+					BGP: tt.wantBGP,
+				},
+			}
+			if got := (&Server{}).provisioningComplete(item); got != tt.want {
+				t.Fatalf("provisioningComplete() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestProvisioningCompleteEligibleRequiresObservedEndState(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name        string
+		intent      cluster.ProvisioningIntent
+		credentials bool
+		ready       bool
+		vipLive     bool
+		hubbleReady bool
+		want        bool
+	}{
+		{name: "flannel without LoadBalancer", intent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel}, credentials: true, ready: true, want: true},
+		{name: "flannel LoadBalancer VIP", intent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, LB: true}, credentials: true, ready: true, vipLive: true, want: true},
+		{name: "missing credentials remints", intent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel}, ready: true},
+		{name: "not Ready continues reconciliation", intent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel}, credentials: true},
+		{name: "VIP unavailable continues reconciliation", intent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, LB: true}, credentials: true, ready: true},
+		{name: "Cilium skips only after Hubble convergence", intent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true, Hubble: true}, credentials: true, ready: true, vipLive: true, hubbleReady: true, want: true},
+		{name: "Cilium without LoadBalancer has no host BGP dependency", intent: cluster.ProvisioningIntent{CNI: cluster.CNICilium}, credentials: true, ready: true, hubbleReady: true, want: true},
+		{name: "Cilium Hubble drift continues reconciliation", intent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true, Hubble: true}, credentials: true, ready: true, vipLive: true},
+		{name: "BGP end state is complete before peer reassertion", intent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true, BGP: true}, credentials: true, ready: true, vipLive: true, hubbleReady: true, want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := provisioningCompleteEligible(test.intent, test.credentials, test.ready, test.vipLive, test.hubbleReady); got != test.want {
+				t.Fatalf("provisioningCompleteEligible(%+v, %t, %t, %t, %t) = %t, want %t", test.intent, test.credentials, test.ready, test.vipLive, test.hubbleReady, got, test.want)
+			}
+		})
+	}
+}
+
 func TestRefreshStoragePhasesDefaultsCSIClustersToProvisioning(t *testing.T) {
 	service := &Server{}
-	for _, csi := range []cluster.CSI{cluster.CSILocalPath, cluster.CSILonghorn} {
+	for _, combination := range []struct {
+		cni cluster.CNI
+		csi cluster.CSI
+	}{
+		{cluster.CNIFlannel, cluster.CSILocalPath},
+		{cluster.CNIFlannel, cluster.CSILonghorn},
+		{cluster.CNICilium, cluster.CSILocalPath},
+		{cluster.CNICilium, cluster.CSILonghorn},
+	} {
 		statuses := []ClusterStatus{{
 			Name:               "demo",
 			Running:            true,
-			ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: csi},
+			ProvisioningIntent: cluster.ProvisioningIntent{CNI: combination.cni, CSI: combination.csi},
 		}}
 
 		service.refreshStoragePhases(statuses)
 
 		if statuses[0].StoragePhase != StoragePhaseProvisioning {
-			t.Fatalf("csi=%s storage phase = %q, want %q", csi, statuses[0].StoragePhase, StoragePhaseProvisioning)
+			t.Fatalf("cni=%s csi=%s storage phase = %q, want %q", combination.cni, combination.csi, statuses[0].StoragePhase, StoragePhaseProvisioning)
+		}
+	}
+}
+
+func TestProvisionCNIAttachesStorageReconcilerForCilium(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	for _, test := range []struct {
+		csi      cluster.CSI
+		wantType string
+	}{
+		{cluster.CSILocalPath, "provision.LocalPathReconciler"},
+		{cluster.CSILonghorn, "provision.LonghornReconciler"},
+	} {
+		item, err := cluster.New("demo-"+string(test.csi), 0, 1, 0, cluster.NodeDefaults{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNICilium, CSI: test.csi}
+		service := &Server{provisionReconcile: func(_ context.Context, request provision.Request) (provision.Result, error) {
+			if got := fmt.Sprintf("%T", request.Storage); got != test.wantType {
+				t.Fatalf("csi=%s storage reconciler = %s, want %s", test.csi, got, test.wantType)
+			}
+			return provision.Result{StoragePhase: provision.StoragePhaseLive, StorageLive: true}, nil
+		}}
+		if _, phase, err := service.provisionCNI(context.Background(), item, true); err != nil {
+			t.Fatal(err)
+		} else if phase != StoragePhaseLive {
+			t.Fatalf("csi=%s phase = %q, want %q", test.csi, phase, StoragePhaseLive)
 		}
 	}
 }

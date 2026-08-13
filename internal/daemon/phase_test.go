@@ -245,15 +245,56 @@ func TestHintsSuppressSingleNodeLonghornWarningUntilStorageIsLive(t *testing.T) 
 	}
 }
 
-func TestHintsWarnWhenCuratedCSIIntentCannotRunOnCurrentCNI(t *testing.T) {
+func TestHintsReportCiliumStorageProvisioning(t *testing.T) {
 	status := ClusterStatus{
 		Name:               "demo",
 		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, CSI: cluster.CSILonghorn},
+		StoragePhase:       StoragePhaseProvisioning,
 	}
 
 	joined := strings.Join(Hints(status), "\n")
-	if !strings.Contains(joined, "not implemented yet") || !strings.Contains(joined, "cni: cilium") {
-		t.Fatalf("hints = %q, want explicit unsupported curated CSI hint", joined)
+	if !strings.Contains(joined, "storage provisioning") || strings.Contains(joined, "not implemented") {
+		t.Fatalf("hints = %q, want active Cilium storage provisioning", joined)
+	}
+}
+
+func TestHintsDescribeCiliumReadyWithAndWithoutLoadBalancer(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		intent cluster.ProvisioningIntent
+		vip    string
+		live   bool
+		wants  []string
+	}{
+		{
+			name:   "live VIP",
+			intent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true},
+			vip:    "172.30.4.200",
+			live:   true,
+			wants:  []string{"Cilium LB-IPAM", "http://172.30.4.200/"},
+		},
+		{
+			name:   "load balancer disabled",
+			intent: cluster.ProvisioningIntent{CNI: cluster.CNICilium},
+			wants:  []string{"Ready", "lb: false", "no VIP"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			status := ClusterStatus{
+				Name:               "demo",
+				ProvisioningIntent: test.intent,
+				KubernetesReady:    true,
+				VIP:                test.vip,
+				VIPLive:            test.live,
+				Nodes:              []NodeStatus{{Role: cluster.RoleControlPlane, Phase: PhaseConfigured}},
+			}
+			joined := strings.Join(Hints(status), "\n")
+			for _, wanted := range test.wants {
+				if !strings.Contains(joined, wanted) {
+					t.Fatalf("hints missing %q:\n%s", wanted, joined)
+				}
+			}
+		})
 	}
 }
 
@@ -265,6 +306,31 @@ func TestHintsDoNotInferFlannelKubernetesReadiness(t *testing.T) {
 	for _, hint := range Hints(status) {
 		if strings.Contains(hint, "Kubernetes is Ready") {
 			t.Fatalf("Hints() inferred Kubernetes readiness from Talos state: %q", hint)
+		}
+	}
+}
+
+func TestHintsDescribeProvisioningInProgressAndExports(t *testing.T) {
+	status := ClusterStatus{
+		Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true},
+		Nodes: []NodeStatus{{Name: "demo-cp-1", Role: cluster.RoleControlPlane, Phase: PhaseConfigured}},
+	}
+	joined := strings.Join(Hints(status), "\n")
+	for _, want := range []string{"provisioning is in progress", "tbx up; export TALOSCONFIG=~/.talosbox/clusters/demo/talosconfig", "KUBECONFIG=~/.talosbox/clusters/demo/kubeconfig"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("provisioning hint missing %q:\n%s", want, joined)
+		}
+	}
+}
+
+func TestCredentialExportsQuoteClusterName(t *testing.T) {
+	got := credentialExports("demo; echo owned")
+	for _, want := range []string{
+		"TALOSCONFIG=~/.talosbox/clusters/'demo; echo owned'/talosconfig",
+		"KUBECONFIG=~/.talosbox/clusters/'demo; echo owned'/kubeconfig",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("credentialExports() missing %q: %s", want, got)
 		}
 	}
 }

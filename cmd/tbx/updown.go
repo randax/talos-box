@@ -13,7 +13,7 @@ import (
 const defaultConfigFile = "talosbox.yaml"
 
 func (c cli) runUp(args []string) error {
-	cfg, force, err := loadUpConfigFile(args)
+	cfg, force, quiet, err := loadUpConfigFile(args)
 	if err != nil {
 		return err
 	}
@@ -31,10 +31,11 @@ func (c cli) runUp(args []string) error {
 		return err
 	}
 	return c.printActions(actions, map[daemon.ActionKind]string{
-		daemon.ActionCreate: "created %s",
-		daemon.ActionStart:  "started %s",
-		daemon.ActionNone:   "%s is up to date",
-	})
+		daemon.ActionCreate:    "created %s",
+		daemon.ActionStart:     "started %s",
+		daemon.ActionReconcile: "reconciled %s",
+		daemon.ActionNone:      "%s is up to date",
+	}, quiet)
 }
 
 func strongestProvisioningIntent(cfg config.Config) (cluster.ProvisioningIntentInput, bool) {
@@ -69,7 +70,8 @@ func (c cli) runDown(args []string) error {
 	})
 }
 
-func (c cli) printActions(actions []daemon.Action, wording map[daemon.ActionKind]string) error {
+func (c cli) printActions(actions []daemon.Action, wording map[daemon.ActionKind]string, quiet ...bool) error {
+	suppressNarration := len(quiet) > 0 && quiet[0]
 	for _, action := range actions {
 		format, ok := wording[action.Kind]
 		if !ok {
@@ -81,6 +83,9 @@ func (c cli) printActions(actions []daemon.Action, wording map[daemon.ActionKind
 		if err := printWarning(c.err, action.Warning); err != nil {
 			return err
 		}
+		if suppressNarration {
+			continue
+		}
 		for _, line := range action.Narration {
 			if _, err := fmt.Fprintln(c.out, line); err != nil {
 				return err
@@ -90,19 +95,20 @@ func (c cli) printActions(actions []daemon.Action, wording map[daemon.ActionKind
 	return nil
 }
 
-func loadUpConfigFile(args []string) (config.Config, bool, error) {
+func loadUpConfigFile(args []string) (config.Config, bool, bool, error) {
 	fs := flag.NewFlagSet("up", flag.ContinueOnError)
 	path := fs.String("f", defaultConfigFile, "path to talosbox.yaml")
 	force := fs.Bool("force", false, "override overcommit or host-pressure safeguards")
+	quiet := fs.Bool("quiet", false, "suppress provisioning narration")
 	if err := fs.Parse(args); err != nil {
-		return config.Config{}, false, err
+		return config.Config{}, false, false, err
 	}
 	data, err := os.ReadFile(*path)
 	if err != nil {
-		return config.Config{}, false, fmt.Errorf("read %s: %w", *path, err)
+		return config.Config{}, false, false, fmt.Errorf("read %s: %w", *path, err)
 	}
 	cfg, err := config.Parse(data)
-	return cfg, *force, err
+	return cfg, *force, *quiet, err
 }
 
 func loadConfigFile(args []string, verb string) (config.Config, error) {
