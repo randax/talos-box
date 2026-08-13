@@ -4,13 +4,14 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/daemon"
-	"github.com/randax/talos-box/internal/manifests"
+	"github.com/randax/talos-box/internal/provision"
 )
 
 func (c cli) runManifests(args []string) error {
 	if len(args) < 1 || len(args) > 2 {
-		return fmt.Errorf("usage: tbx manifests <cluster> [%s]", strings.Join(manifests.Sections(), "|"))
+		return fmt.Errorf("usage: tbx manifests <cluster> [%s]", strings.Join(provision.InspectionSections(), "|"))
 	}
 	section := "all"
 	if len(args) == 2 {
@@ -22,7 +23,7 @@ func (c cli) runManifests(args []string) error {
 	}
 	for _, item := range clusters {
 		if item.Name == args[0] {
-			out, err := manifests.Render(manifests.Facts{Cluster: item.Name, SubnetIndex: item.SubnetIndex, BGP: item.BGP}, section)
+			out, err := provision.RenderInspection(clusterFromSummary(item), section)
 			if err != nil {
 				return err
 			}
@@ -31,4 +32,12 @@ func (c cli) runManifests(args []string) error {
 		}
 	}
 	return fmt.Errorf("cluster %q does not exist", args[0])
+}
+
+func clusterFromSummary(item daemon.ClusterSummary) cluster.Cluster {
+	return cluster.Cluster{
+		Name:               item.Name,
+		SubnetIndex:        item.SubnetIndex,
+		ProvisioningIntent: item.ProvisioningIntent,
+	}
 }

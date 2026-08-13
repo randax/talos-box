@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/shellquote"
 )
 
 // Phase is a node's observed lifecycle state, derived without Talos credentials:
@@ -105,6 +106,9 @@ func Hints(status ClusterStatus) []string {
 	if hint := longhornSingleNodeHint(status); hint != "" {
 		hints = append(hints, hint)
 	}
+	if status.CNI != "" && !status.KubernetesReady {
+		hints = append(hints, fmt.Sprintf("%s provisioning is in progress; tbx will apply machine config, bootstrap, and reconcile the CNI. Rerun: tbx up;%s", status.CNI, credentialExports(status.Name)))
+	}
 	if len(maintenance) > 0 {
 		first := maintenance[0]
 		endpoint := status.controlPlaneOr(first)
@@ -120,30 +124,28 @@ func Hints(status ClusterStatus) []string {
 		if status.CNI == cluster.CNIFlannel && status.LB && status.KubernetesReady {
 			if status.VIPLive {
 				hints = append(hints,
-					fmt.Sprintf("Kubernetes is Ready; MetalLB L2 VIP is live at http://%s/. Flannel does not enforce NetworkPolicies; use cilium to exercise policies.", status.VIP),
+					fmt.Sprintf("Kubernetes is Ready; MetalLB L2 VIP is live at http://%s/. Flannel does not enforce NetworkPolicies; use cilium to exercise policies.%s", status.VIP, credentialExports(status.Name)),
 				)
 			} else {
 				hints = append(hints,
-					"Kubernetes is Ready; waiting for the MetalLB L2 LoadBalancer VIP probe to respond. Flannel does not enforce NetworkPolicies; use cilium to exercise policies.",
+					"Kubernetes is Ready; waiting for the MetalLB L2 LoadBalancer VIP probe to respond. Flannel does not enforce NetworkPolicies; use cilium to exercise policies."+credentialExports(status.Name),
 				)
 			}
 		}
 		if status.CNI == cluster.CNIFlannel && !status.LB && status.KubernetesReady {
 			hints = append(hints,
-				fmt.Sprintf("Kubernetes is Ready with Talos-managed flannel; LoadBalancer support is disabled by lb: false, so no VIP is provisioned. export TALOSCONFIG=~/.talosbox/clusters/%s/talosconfig; export KUBECONFIG=~/.talosbox/clusters/%s/kubeconfig", status.Name, status.Name),
+				"Kubernetes is Ready with Talos-managed flannel; LoadBalancer support is disabled by lb: false, so no VIP is provisioned."+credentialExports(status.Name),
 			)
 		}
 		if status.CNI == cluster.CNICilium && status.LB && status.KubernetesReady {
 			if status.VIPLive {
-				hints = append(hints, fmt.Sprintf("Kubernetes is Ready; Cilium LB-IPAM VIP is live at http://%s/.", status.VIP))
+				hints = append(hints, fmt.Sprintf("Kubernetes is Ready; Cilium LB-IPAM VIP is live at http://%s/.%s", status.VIP, credentialExports(status.Name)))
 			} else {
-				hints = append(hints, "Kubernetes is Ready; waiting for the Cilium LoadBalancer VIP probe to respond.")
+				hints = append(hints, "Kubernetes is Ready; waiting for the Cilium LoadBalancer VIP probe to respond."+credentialExports(status.Name))
 			}
 		}
 		if status.CNI == cluster.CNICilium && !status.LB && status.KubernetesReady {
-			hints = append(hints,
-				fmt.Sprintf("Kubernetes is Ready with Cilium; LoadBalancer support is disabled by lb: false, so no VIP is provisioned. export TALOSCONFIG=~/.talosbox/clusters/%s/talosconfig; export KUBECONFIG=~/.talosbox/clusters/%s/kubeconfig", status.Name, status.Name),
-			)
+			hints = append(hints, "Kubernetes is Ready with Cilium; LoadBalancer support is disabled by lb: false, so no VIP is provisioned."+credentialExports(status.Name))
 		}
 		if !status.KubernetesReady {
 			hints = append(hints,
@@ -158,6 +160,11 @@ func Hints(status ClusterStatus) []string {
 		)
 	}
 	return hints
+}
+
+func credentialExports(name string) string {
+	name = shellquote.Quote(name)
+	return fmt.Sprintf(" export TALOSCONFIG=~/.talosbox/clusters/%s/talosconfig; export KUBECONFIG=~/.talosbox/clusters/%s/kubeconfig", name, name)
 }
 
 func storageHint(status ClusterStatus) string {
