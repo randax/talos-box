@@ -227,7 +227,7 @@ func TestFlannelReconcileWaitsForEveryKubernetesNode(t *testing.T) {
 	}
 }
 
-func TestGenerateFlannelAddsStorageKubeletMountsForEveryRole(t *testing.T) {
+func TestGenerateFlannelAddsStorageAndMirrorPrerequisitesForEveryRole(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
 	for _, csi := range []cluster.CSI{"", cluster.CSILonghorn} {
@@ -255,6 +255,10 @@ func TestGenerateFlannelAddsStorageKubeletMountsForEveryRole(t *testing.T) {
 				}
 				if got := decodeGeneratedKubeletExtraMounts(t, config); !equalTalosExtraMounts(got, want) {
 					t.Fatalf("%s kubelet extraMounts = %#v, want %#v", role, got, want)
+				}
+				endpoint, skipFallback := decodeGeneratedCatchAllMirror(t, config)
+				if endpoint != "http://172.30.0.1:5059" || !skipFallback {
+					t.Fatalf("%s catch-all mirror = %q skipFallback=%v", role, endpoint, skipFallback)
 				}
 			}
 		})
@@ -443,6 +447,28 @@ func decodeGeneratedKubeletExtraMounts(t *testing.T, config []byte) []talosExtra
 		t.Fatalf("decode generated config: %v", err)
 	}
 	return decoded.Machine.Kubelet.ExtraMounts
+}
+
+func decodeGeneratedCatchAllMirror(t *testing.T, config []byte) (string, bool) {
+	t.Helper()
+	var decoded struct {
+		Machine struct {
+			Registries struct {
+				Mirrors map[string]struct {
+					Endpoints    []string `yaml:"endpoints"`
+					SkipFallback bool     `yaml:"skipFallback"`
+				} `yaml:"mirrors"`
+			} `yaml:"registries"`
+		} `yaml:"machine"`
+	}
+	if err := yaml.Unmarshal(config, &decoded); err != nil {
+		t.Fatalf("decode generated config mirrors: %v", err)
+	}
+	catchAll := decoded.Machine.Registries.Mirrors["*"]
+	if len(catchAll.Endpoints) != 1 {
+		t.Fatalf("catch-all endpoints = %v, want one", catchAll.Endpoints)
+	}
+	return catchAll.Endpoints[0], catchAll.SkipFallback
 }
 
 func equalTalosExtraMounts(got, want []talosExtraMount) bool {

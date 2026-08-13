@@ -286,7 +286,9 @@ func generateFlannel(item cluster.Cluster) (generated, error) {
 		if err != nil {
 			return generated{}, fmt.Errorf("encode %s config: %w", role, err)
 		}
-		bytes, err = applyStoragePrerequisiteMounts(bytes)
+		bytes, err = applyProvisioningPrerequisites(bytes, manifests.Facts{
+			Cluster: item.Name, SubnetIndex: item.SubnetIndex, BGP: item.BGP,
+		})
 		if err != nil {
 			return generated{}, fmt.Errorf("patch %s config: %w", role, err)
 		}
@@ -299,7 +301,7 @@ func generateFlannel(item cluster.Cluster) (generated, error) {
 	return generated{talosconfig: talosconfig, configs: configs, paths: paths}, nil
 }
 
-func applyStoragePrerequisiteMounts(config []byte) ([]byte, error) {
+func applyProvisioningPrerequisites(config []byte, facts manifests.Facts) ([]byte, error) {
 	var document map[string]any
 	if err := yaml.Unmarshal(config, &document); err != nil {
 		return nil, fmt.Errorf("decode generated machine config: %w", err)
@@ -324,6 +326,20 @@ func applyStoragePrerequisiteMounts(config []byte) ([]byte, error) {
 		})
 	}
 	kubeletSection["extraMounts"] = mounts
+
+	var mirrorPatch map[string]any
+	if err := yaml.Unmarshal([]byte(manifests.RegistryMirrors(facts)), &mirrorPatch); err != nil {
+		return nil, fmt.Errorf("decode registry mirror patch: %w", err)
+	}
+	patchMachine, ok := mirrorPatch["machine"].(map[string]any)
+	if !ok {
+		return nil, errors.New("registry mirror patch is missing machine settings")
+	}
+	registries, ok := patchMachine["registries"].(map[string]any)
+	if !ok {
+		return nil, errors.New("registry mirror patch is missing registries settings")
+	}
+	machineSection["registries"] = registries
 
 	patched, err := yaml.Marshal(document)
 	if err != nil {
