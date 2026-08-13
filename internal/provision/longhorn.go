@@ -113,7 +113,7 @@ func (r LonghornReconciler) reconcile(ctx context.Context, config *rest.Config, 
 	if err := applyAll(ctx, dynamicClient, mapper, crds); err != nil {
 		return StorageResult{}, err
 	}
-	if err := waitForCRDs(ctx, dynamicClient, mapper, crds, r.PollInterval); err != nil {
+	if err := waitForCRDs(ctx, dynamicClient, mapper, crds, "Longhorn", r.PollInterval); err != nil {
 		return StorageResult{}, err
 	}
 	mapper.Reset()
