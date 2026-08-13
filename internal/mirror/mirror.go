@@ -534,15 +534,15 @@ func (s *Server) storeManifest(requestPath string, metadata manifestMetadata, da
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create manifest cache directory: %w", err)
 	}
-	if err := writeFileAtomic(path, data); err != nil {
-		return fmt.Errorf("write manifest: %w", err)
-	}
 	rawMetadata, err := json.Marshal(metadata)
 	if err != nil {
 		return fmt.Errorf("encode manifest metadata: %w", err)
 	}
 	if err := writeFileAtomic(s.manifestMetadataPath(requestPath), rawMetadata); err != nil {
 		return fmt.Errorf("write manifest metadata: %w", err)
+	}
+	if err := writeFileAtomic(path, data); err != nil {
+		return fmt.Errorf("write manifest: %w", err)
 	}
 	return nil
 }
@@ -712,24 +712,52 @@ func (s *Server) cachedManifestBytes(requestPath string) ([]byte, error) {
 
 func (s *Server) cachedManifestMetadata(requestPath string, data []byte) manifestMetadata {
 	metadata := manifestMetadata{
-		ContentType:         "application/vnd.oci.image.manifest.v1+json",
+		ContentType:         s.cachedManifestContentType(requestPath, data),
 		ContentLength:       int64(len(data)),
 		DockerContentDigest: cachedManifestDigest(data, manifestReference(requestPath), ""),
 	}
 	if rawMetadata, err := os.ReadFile(s.manifestMetadataPath(requestPath)); err == nil {
 		var stored manifestMetadata
 		if json.Unmarshal(rawMetadata, &stored) == nil {
-			if stored.ContentType != "" {
+			_, digestErr := verifySupportedDigest(data, stored.DockerContentDigest)
+			if digestErr == nil && stored.ContentType != "" {
 				metadata.ContentType = stored.ContentType
 			}
 			metadata.DockerContentDigest = cachedManifestDigest(data, manifestReference(requestPath), stored.DockerContentDigest)
-		} else if ct, err := os.ReadFile(s.manifestPath(requestPath) + ".ct"); err == nil && len(ct) > 0 {
-			metadata.ContentType = string(ct)
 		}
-	} else if ct, err := os.ReadFile(s.manifestPath(requestPath) + ".ct"); err == nil && len(ct) > 0 {
-		metadata.ContentType = string(ct)
 	}
 	return metadata
+}
+
+func (s *Server) cachedManifestContentType(requestPath string, data []byte) string {
+	if contentType := manifestContentType(data); contentType != "" {
+		return contentType
+	}
+	if contentType := s.cachedLegacyManifestContentType(requestPath); contentType != "" {
+		return contentType
+	}
+	return "application/vnd.oci.image.manifest.v1+json"
+}
+
+func (s *Server) cachedLegacyManifestContentType(requestPath string) string {
+	if ct, err := os.ReadFile(s.manifestPath(requestPath) + ".ct"); err == nil && len(ct) > 0 {
+		return string(ct)
+	}
+	return ""
+}
+
+func manifestContentType(data []byte) string {
+	var manifest struct {
+		MediaType string `json:"mediaType"`
+	}
+	if json.Unmarshal(data, &manifest) != nil {
+		return ""
+	}
+	mediaType := strings.TrimSpace(manifest.MediaType)
+	if _, ok := manifestMediaTypes[strings.ToLower(mediaType)]; !ok {
+		return ""
+	}
+	return mediaType
 }
 
 func (s *Server) blobPath(digest string) string {

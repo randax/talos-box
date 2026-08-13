@@ -1285,6 +1285,69 @@ func TestCachedManifestMetadataFallbackRevalidatesCurrentBytes(t *testing.T) {
 	}
 }
 
+func TestCachedManifestMetadataIgnoresStaleContentType(t *testing.T) {
+	server := newLoopbackMirrorServer(t, "http://127.0.0.1", t.TempDir())
+	requestPath := "/v2/app/manifests/latest"
+	data := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json"}`)
+
+	if err := os.MkdirAll(filepath.Dir(server.manifestMetadataPath(requestPath)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stale := manifestMetadata{
+		ContentType:         "application/vnd.oci.image.manifest.v1+json",
+		ContentLength:       int64(len(data)),
+		DockerContentDigest: "sha256:" + sha256Hex([]byte("previous manifest")),
+	}
+	raw, err := json.Marshal(stale)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(server.manifestMetadataPath(requestPath), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	metadata := server.cachedManifestMetadata(requestPath, data)
+	if got, want := metadata.ContentType, "application/vnd.oci.image.index.v1+json"; got != want {
+		t.Fatalf("ContentType = %q, want %q", got, want)
+	}
+	if got, want := metadata.DockerContentDigest, "sha256:"+sha256Hex(data); got != want {
+		t.Fatalf("DockerContentDigest = %q, want %q", got, want)
+	}
+}
+
+func TestCachedManifestMetadataUsesLegacySidecarWhenMetaDigestIsStale(t *testing.T) {
+	server := newLoopbackMirrorServer(t, "http://127.0.0.1", t.TempDir())
+	requestPath := "/v2/app/manifests/latest"
+	data := []byte(manifestBody)
+
+	if err := os.MkdirAll(filepath.Dir(server.manifestMetadataPath(requestPath)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stale := manifestMetadata{
+		ContentType:         "application/vnd.oci.image.index.v1+json",
+		ContentLength:       int64(len(data)),
+		DockerContentDigest: "sha256:" + sha256Hex([]byte("previous manifest")),
+	}
+	raw, err := json.Marshal(stale)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(server.manifestMetadataPath(requestPath), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(server.manifestPath(requestPath)+".ct", []byte("application/vnd.docker.distribution.manifest.v2+json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	metadata := server.cachedManifestMetadata(requestPath, data)
+	if got, want := metadata.ContentType, "application/vnd.docker.distribution.manifest.v2+json"; got != want {
+		t.Fatalf("ContentType = %q, want %q", got, want)
+	}
+	if got, want := metadata.DockerContentDigest, "sha256:"+sha256Hex(data); got != want {
+		t.Fatalf("DockerContentDigest = %q, want %q", got, want)
+	}
+}
+
 func TestManifestDigestSupportIncludesSha512AndRejectsUnsupportedAlgorithms(t *testing.T) {
 	sha512Digest := "sha512:" + sha512Hex([]byte(manifestBody))
 	tests := []struct {
