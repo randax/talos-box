@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -212,17 +213,53 @@ func TestProvisioningCompleteEligibleRequiresObservedEndState(t *testing.T) {
 
 func TestRefreshStoragePhasesDefaultsCSIClustersToProvisioning(t *testing.T) {
 	service := &Server{}
-	for _, csi := range []cluster.CSI{cluster.CSILocalPath, cluster.CSILonghorn} {
+	for _, combination := range []struct {
+		cni cluster.CNI
+		csi cluster.CSI
+	}{
+		{cluster.CNIFlannel, cluster.CSILocalPath},
+		{cluster.CNIFlannel, cluster.CSILonghorn},
+		{cluster.CNICilium, cluster.CSILocalPath},
+		{cluster.CNICilium, cluster.CSILonghorn},
+	} {
 		statuses := []ClusterStatus{{
 			Name:               "demo",
 			Running:            true,
-			ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: csi},
+			ProvisioningIntent: cluster.ProvisioningIntent{CNI: combination.cni, CSI: combination.csi},
 		}}
 
 		service.refreshStoragePhases(statuses)
 
 		if statuses[0].StoragePhase != StoragePhaseProvisioning {
-			t.Fatalf("csi=%s storage phase = %q, want %q", csi, statuses[0].StoragePhase, StoragePhaseProvisioning)
+			t.Fatalf("cni=%s csi=%s storage phase = %q, want %q", combination.cni, combination.csi, statuses[0].StoragePhase, StoragePhaseProvisioning)
+		}
+	}
+}
+
+func TestProvisionCNIAttachesStorageReconcilerForCilium(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	for _, test := range []struct {
+		csi      cluster.CSI
+		wantType string
+	}{
+		{cluster.CSILocalPath, "provision.LocalPathReconciler"},
+		{cluster.CSILonghorn, "provision.LonghornReconciler"},
+	} {
+		item, err := cluster.New("demo-"+string(test.csi), 0, 1, 0, cluster.NodeDefaults{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNICilium, CSI: test.csi}
+		service := &Server{provisionReconcile: func(_ context.Context, request provision.Request) (provision.Result, error) {
+			if got := fmt.Sprintf("%T", request.Storage); got != test.wantType {
+				t.Fatalf("csi=%s storage reconciler = %s, want %s", test.csi, got, test.wantType)
+			}
+			return provision.Result{StoragePhase: provision.StoragePhaseLive, StorageLive: true}, nil
+		}}
+		if _, phase, err := service.provisionCNI(context.Background(), item, true); err != nil {
+			t.Fatal(err)
+		} else if phase != StoragePhaseLive {
+			t.Fatalf("csi=%s phase = %q, want %q", test.csi, phase, StoragePhaseLive)
 		}
 	}
 }
