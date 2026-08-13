@@ -48,3 +48,36 @@ func TestRunManifestsFlannelMetalLBInspectionSurface(t *testing.T) {
 		t.Fatalf("tbx manifests flannel output leaked Cilium metadata:\n%s", stdout)
 	}
 }
+
+func TestRunManifestsStorageInspectionUsesClusterTopology(t *testing.T) {
+	stdout := runCLIWithResponse(t,
+		`[{"name":"demo","subnetIndex":5,"controlPlanes":1,"workers":2,"cni":"flannel","csi":"longhorn"}]`,
+		func(command cli) error { return command.runManifests([]string{"demo", "storage"}) },
+	)
+	for _, want := range []string{
+		"# Storage machine-config prerequisite patch",
+		"defaultClassReplicaCount: 3",
+		"kind: StorageClass",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("tbx manifests storage output missing %q:\n%s", want, stdout)
+		}
+	}
+}
+
+func TestRunManifestsSubstrateOnlyIncludesStorageGuidance(t *testing.T) {
+	stdout := runCLIWithResponse(t,
+		`[{"name":"demo","subnetIndex":5,"controlPlanes":1,"workers":2}]`,
+		func(command cli) error { return command.runManifests([]string{"demo"}) },
+	)
+	for _, want := range []string{
+		"# Storage machine-config prerequisite patch",
+		"destination: /var/local-path-provisioner",
+		"destination: /var/lib/longhorn",
+		"kubectl label namespace <your-csi-namespace>",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("tbx manifests substrate-only output missing %q:\n%s", want, stdout)
+		}
+	}
+}

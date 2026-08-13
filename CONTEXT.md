@@ -14,6 +14,10 @@ The opt-in fast path that goes beyond the substrate: talosbox generates and appl
 
 A CNI from talosbox's fixed, tested set (initially `cilium` and `flannel`). Each curated CNI has a known answer to how it reaches the production-style networking model's end state — a working LoadBalancer path and the ingress VIP — whether natively (Cilium) or via a talosbox-shipped companion (flannel + MetalLB). Arbitrary user-supplied CNIs are not a supported concept.
 
+## Curated CSI
+
+A storage engine from talosbox's fixed, tested set (`longhorn` or `local-path`). It is available only through the provisioning path, where talosbox applies its pinned rendered objects and verifies a storage write/readback probe. Bring-your-own CSI remains unsupported above the substrate; `tbx manifests <cluster> storage` prints the Talos mounts and PSA guidance needed to prepare a substrate-only cluster, and `talos.schematic` is the escape hatch for engines requiring other image extensions.
+
 ## Cluster domain
 
 The DNS domain a cluster is reachable under on the host, from which its node records and ingress wildcard both derive. Chosen at cluster create and immutable thereafter; every cluster has exactly one, and no two clusters share one. A substrate concept — it exists regardless of provisioning path.

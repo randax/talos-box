@@ -35,9 +35,17 @@ func (c cli) runManifests(args []string) error {
 }
 
 func clusterFromSummary(item daemon.ClusterSummary) cluster.Cluster {
+	nodes := make([]cluster.Node, 0, item.ControlPlanes+item.Workers)
+	for range item.ControlPlanes {
+		nodes = append(nodes, cluster.Node{Role: cluster.RoleControlPlane})
+	}
+	for range item.Workers {
+		nodes = append(nodes, cluster.Node{Role: cluster.RoleWorker})
+	}
 	return cluster.Cluster{
 		Name:               item.Name,
 		SubnetIndex:        item.SubnetIndex,
 		ProvisioningIntent: item.ProvisioningIntent,
+		Nodes:              nodes,
 	}
 }
