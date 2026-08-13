@@ -38,6 +38,7 @@ type Server struct {
 	provisionSequence    uint64
 	provisionReconcile   provisionReconcileFunc
 	storageProbe         func(context.Context, []byte) error
+	destroyVolumeCount   func(context.Context, cluster.Cluster) (int, error)
 	nodeIPLookup         func(string, int) string
 	nodeProbe            func(string) ProbeResult
 	hostFreeMemory       func() (int, error)
@@ -370,6 +371,8 @@ func (s *Server) handle(request Request) (any, error) {
 		return s.stopCluster(request.Args)
 	case "cluster.destroy":
 		return s.destroyCluster(request.Args)
+	case "cluster.destroy.inspect":
+		return s.destroyInspect(request.Args)
 	case "cluster.list":
 		return s.listClusters()
 	case "node.add":
