@@ -146,10 +146,13 @@ func (s *Server) cancelProvisionLocked(name string) {
 	}
 }
 
-func (s *Server) cancelAllProvisionsLocked() {
+func (s *Server) cancelLifecycle() {
 	if s.lifecycleCancel != nil {
 		s.lifecycleCancel()
 	}
+}
+
+func (s *Server) cancelAllProvisionsLocked() {
 	for name, active := range s.provisions {
 		active.cancel()
 		delete(s.provisions, name)

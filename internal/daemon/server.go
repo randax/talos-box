@@ -288,6 +288,7 @@ func (s *Server) Shutdown() error {
 	for _, connection := range connections {
 		_ = connection.Close()
 	}
+	s.cancelLifecycle()
 	s.opMu.Lock()
 	s.cancelAllProvisionsLocked()
 	s.opMu.Unlock()

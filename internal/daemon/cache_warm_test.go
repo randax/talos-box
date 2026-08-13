@@ -70,7 +70,7 @@ func TestCacheWarmUsesBoundedContext(t *testing.T) {
 	}
 }
 
-func TestCacheWarmObservesLifecycleCancellation(t *testing.T) {
+func TestShutdownCancelsInFlightCacheWarm(t *testing.T) {
 	t.Parallel()
 
 	lifecycle, cancel := context.WithCancel(context.Background())
@@ -103,7 +103,10 @@ func TestCacheWarmObservesLifecycleCancellation(t *testing.T) {
 		t.Fatal("cache.warm did not start")
 	}
 
-	service.lifecycleCancel()
+	shutdown := make(chan error, 1)
+	go func() {
+		shutdown <- service.Shutdown()
+	}()
 
 	select {
 	case got := <-response:
@@ -114,7 +117,16 @@ func TestCacheWarmObservesLifecycleCancellation(t *testing.T) {
 			t.Fatalf("cache.warm error = %q, want %q", got.Error, context.Canceled)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("cache.warm did not return after lifecycle cancellation")
+		t.Fatal("cache.warm did not return after shutdown cancellation")
+	}
+
+	select {
+	case err := <-shutdown:
+		if err != nil {
+			t.Fatalf("Shutdown() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Shutdown() did not return after canceling cache.warm")
 	}
 }
 

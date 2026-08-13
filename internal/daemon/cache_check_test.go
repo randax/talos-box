@@ -76,7 +76,7 @@ func TestCacheCheckUsesBoundedContextAndOptions(t *testing.T) {
 	}
 }
 
-func TestCacheCheckObservesLifecycleCancellation(t *testing.T) {
+func TestShutdownCancelsInFlightCacheCheck(t *testing.T) {
 	t.Parallel()
 
 	lifecycle, cancel := context.WithCancel(context.Background())
@@ -109,7 +109,10 @@ func TestCacheCheckObservesLifecycleCancellation(t *testing.T) {
 		t.Fatal("cache.check did not start")
 	}
 
-	service.lifecycleCancel()
+	shutdown := make(chan error, 1)
+	go func() {
+		shutdown <- service.Shutdown()
+	}()
 
 	select {
 	case got := <-response:
@@ -120,7 +123,16 @@ func TestCacheCheckObservesLifecycleCancellation(t *testing.T) {
 			t.Fatalf("cache.check error = %q, want %q", got.Error, context.Canceled)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("cache.check did not return after lifecycle cancellation")
+		t.Fatal("cache.check did not return after shutdown cancellation")
+	}
+
+	select {
+	case err := <-shutdown:
+		if err != nil {
+			t.Fatalf("Shutdown() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Shutdown() did not return after canceling cache.check")
 	}
 }
 
