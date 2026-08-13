@@ -21,7 +21,7 @@ import (
 )
 
 func TestCountProvisionedStorageVolumesCountsOnlyMatchingEnginePVs(t *testing.T) {
-	client := kubernetesfake.NewSimpleClientset(
+	client := kubernetesfake.NewClientset(
 		&corev1.PersistentVolume{
 			ObjectMeta: metav1.ObjectMeta{Name: "longhorn-user"},
 			Spec: corev1.PersistentVolumeSpec{
@@ -59,7 +59,7 @@ func TestCountProvisionedStorageVolumesCountsOnlyMatchingEnginePVs(t *testing.T)
 }
 
 func TestCountProvisionedStorageVolumesReturnsListErrors(t *testing.T) {
-	client := kubernetesfake.NewSimpleClientset()
+	client := kubernetesfake.NewClientset()
 	client.PrependReactor("list", "persistentvolumes", func(k8stesting.Action) (bool, runtime.Object, error) {
 		return true, nil, errors.New("dial tcp timeout")
 	})
@@ -71,7 +71,7 @@ func TestCountProvisionedStorageVolumesReturnsListErrors(t *testing.T) {
 }
 
 func TestCountProvisionedStorageVolumesRejectsUnknownEngine(t *testing.T) {
-	_, err := countProvisionedStorageVolumes(context.Background(), kubernetesfake.NewSimpleClientset(), cluster.CSI("rook"))
+	_, err := countProvisionedStorageVolumes(context.Background(), kubernetesfake.NewClientset(), cluster.CSI("rook"))
 	if err == nil || !strings.Contains(err.Error(), `unsupported storage engine "rook"`) {
 		t.Fatalf("countProvisionedStorageVolumes() error = %v", err)
 	}
