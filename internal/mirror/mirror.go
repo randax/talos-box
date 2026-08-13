@@ -716,7 +716,7 @@ func (s *Server) cachedManifestMetadata(requestPath string, data []byte) manifes
 		ContentLength:       int64(len(data)),
 		DockerContentDigest: cachedManifestDigest(data, manifestReference(requestPath), ""),
 	}
-	if rawMetadata, err := os.ReadFile(s.manifestMetadataPath(requestPath)); err == nil {
+	if rawMetadata, err := readCheckedRegularFile(s.manifestMetadataPath(requestPath), maxCachedManifestSidecarBytes); err == nil {
 		var stored manifestMetadata
 		if json.Unmarshal(rawMetadata, &stored) == nil {
 			_, digestErr := verifySupportedDigest(data, stored.DockerContentDigest)
@@ -740,7 +740,7 @@ func (s *Server) cachedManifestContentType(requestPath string, data []byte) stri
 }
 
 func (s *Server) cachedLegacyManifestContentType(requestPath string) string {
-	if ct, err := os.ReadFile(s.manifestPath(requestPath) + ".ct"); err == nil && len(ct) > 0 {
+	if ct, err := readCheckedRegularFile(s.manifestPath(requestPath)+".ct", maxCachedManifestSidecarBytes); err == nil && len(ct) > 0 {
 		return string(ct)
 	}
 	return ""

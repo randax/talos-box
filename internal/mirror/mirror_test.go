@@ -1348,6 +1348,82 @@ func TestCachedManifestMetadataUsesLegacySidecarWhenMetaDigestIsStale(t *testing
 	}
 }
 
+func TestCachedManifestMetadataRejectsUnsafeSidecars(t *testing.T) {
+	data := []byte(manifestBody)
+	wantContentType := "application/vnd.oci.image.manifest.v1+json"
+	wrongContentType := "application/vnd.oci.image.index.v1+json"
+
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, server *Server, requestPath string)
+	}{
+		{
+			name: "oversized metadata",
+			setup: func(t *testing.T, server *Server, requestPath string) {
+				t.Helper()
+				raw := fmt.Sprintf(`{"contentType":%q,"dockerContentDigest":%q,"padding":%q}`,
+					wrongContentType, "sha256:"+sha256Hex(data), strings.Repeat("x", maxCachedManifestSidecarBytes))
+				if err := os.WriteFile(server.manifestMetadataPath(requestPath), []byte(raw), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "symlinked metadata",
+			setup: func(t *testing.T, server *Server, requestPath string) {
+				t.Helper()
+				target := filepath.Join(t.TempDir(), "metadata.json")
+				raw := fmt.Sprintf(`{"contentType":%q,"dockerContentDigest":%q}`,
+					wrongContentType, "sha256:"+sha256Hex(data))
+				if err := os.WriteFile(target, []byte(raw), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, server.manifestMetadataPath(requestPath)); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "oversized legacy content type",
+			setup: func(t *testing.T, server *Server, requestPath string) {
+				t.Helper()
+				if err := os.WriteFile(server.manifestPath(requestPath)+".ct", []byte(strings.Repeat("x", maxCachedManifestSidecarBytes+1)), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "symlinked legacy content type",
+			setup: func(t *testing.T, server *Server, requestPath string) {
+				t.Helper()
+				target := filepath.Join(t.TempDir(), "content-type")
+				if err := os.WriteFile(target, []byte(wrongContentType), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, server.manifestPath(requestPath)+".ct"); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := newLoopbackMirrorServer(t, "http://127.0.0.1", t.TempDir())
+			requestPath := "/v2/app/manifests/latest"
+			if err := os.MkdirAll(filepath.Dir(server.manifestMetadataPath(requestPath)), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			test.setup(t, server, requestPath)
+
+			metadata := server.cachedManifestMetadata(requestPath, data)
+			if got := metadata.ContentType; got != wantContentType {
+				t.Fatalf("ContentType = %q, want %q", got, wantContentType)
+			}
+		})
+	}
+}
+
 func TestManifestDigestSupportIncludesSha512AndRejectsUnsupportedAlgorithms(t *testing.T) {
 	sha512Digest := "sha512:" + sha512Hex([]byte(manifestBody))
 	tests := []struct {
