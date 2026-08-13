@@ -181,6 +181,62 @@ func TestProvisioningCompleteCiliumRequiresLiveVIPAndMatchingBGP(t *testing.T) {
 	}
 }
 
+func TestProvisionCNICiliumStorageDriftBypassesFastNoop(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir, err := cluster.Dir("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"secrets.yaml", "talosconfig", "kubeconfig"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("test"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	originalReady := kubernetesReadyProbe
+	originalCilium := ciliumConvergenceProbe
+	originalStorage := storageConvergenceProbe
+	t.Cleanup(func() {
+		kubernetesReadyProbe = originalReady
+		ciliumConvergenceProbe = originalCilium
+		storageConvergenceProbe = originalStorage
+	})
+	kubernetesReadyProbe = func(context.Context, []byte, []string) error { return nil }
+	ciliumConvergenceProbe = func(context.Context, []byte, cluster.Cluster) error { return nil }
+	storageConvergenceProbe = func(context.Context, cluster.Cluster, []byte) error {
+		return errors.New("storage probe failed")
+	}
+
+	reconciled := false
+	service := &Server{provisionReconcile: func(_ context.Context, request provision.Request) (provision.Result, error) {
+		reconciled = true
+		if _, ok := request.Storage.(provision.LonghornReconciler); !ok {
+			t.Fatalf("storage reconciler = %T, want provision.LonghornReconciler", request.Storage)
+		}
+		return provision.Result{StoragePhase: provision.StoragePhaseProvisioning}, nil
+	}}
+	item := cluster.Cluster{
+		Name: "demo",
+		ProvisioningIntent: cluster.ProvisioningIntent{
+			CNI: cluster.CNICilium,
+			CSI: cluster.CSILonghorn,
+		},
+	}
+	_, phase, err := service.provisionCNI(context.Background(), item, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reconciled {
+		t.Fatal("Cilium storage drift incorrectly took the fast no-op path")
+	}
+	if phase != StoragePhaseProvisioning {
+		t.Fatalf("storage phase = %q, want %q while reconciliation resumes", phase, StoragePhaseProvisioning)
+	}
+}
+
 func TestProvisioningCompleteEligibleRequiresObservedEndState(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

@@ -291,15 +291,25 @@ func (s *Server) provisioningComplete(item cluster.Cluster) bool {
 	if item.LB {
 		_, vipLive = loadBalancerVIPProbe(item)
 	}
-	if item.CNI == cluster.CNICilium {
+	var kubeconfig []byte
+	if item.CNI == cluster.CNICilium || item.CSI != "" {
 		dir, err := cluster.Dir(item.Name)
 		if err != nil {
 			return false
 		}
-		kubeconfig, err := os.ReadFile(filepath.Join(dir, "kubeconfig"))
+		kubeconfig, err = os.ReadFile(filepath.Join(dir, "kubeconfig"))
 		if err != nil {
 			return false
 		}
+	}
+	if item.CSI != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), storageConvergenceTimeout)
+		defer cancel()
+		if storageConvergenceProbe(ctx, item, kubeconfig) != nil {
+			return false
+		}
+	}
+	if item.CNI == cluster.CNICilium {
 		ctx, cancel := context.WithTimeout(context.Background(), ciliumConvergenceTimeout)
 		defer cancel()
 		if ciliumConvergenceProbe(ctx, kubeconfig, item) != nil {
@@ -316,21 +326,6 @@ func (s *Server) provisioningComplete(item cluster.Cluster) bool {
 			return active == item.BGP
 		}
 		return true
-	}
-	if item.CSI != "" {
-		dir, err := cluster.Dir(item.Name)
-		if err != nil {
-			return false
-		}
-		kubeconfig, err := os.ReadFile(filepath.Join(dir, "kubeconfig"))
-		if err != nil {
-			return false
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), storageConvergenceTimeout)
-		defer cancel()
-		if storageConvergenceProbe(ctx, item, kubeconfig) != nil {
-			return false
-		}
 	}
 	return provisioningCompleteEligible(item.ProvisioningIntent, true, ready, vipLive, true)
 }
