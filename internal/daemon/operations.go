@@ -650,7 +650,8 @@ func (s *Server) addNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTask
 		s.vms[item.Name][node.Name] = machine
 	}
 	status := nodeStatus(node, item.SubnetIndex, s.nodeRunning(item.Name, node.Name))
-	status.Warning = joinWarnings(overcommitWarning, hostPressureWarning, subnetWarning, s.longhornCustomSchematicWarning(item, false))
+	customSchematic := s.defaultSchematic != "" && item.Schematic != "" && item.Schematic != s.defaultSchematic
+	status.Warning = joinWarnings(overcommitWarning, hostPressureWarning, subnetWarning, s.longhornCustomSchematicWarning(item, customSchematic))
 	return status, s.beginNodeMutationProvisionLocked(item), nil
 }
 
