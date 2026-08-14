@@ -50,7 +50,19 @@ require 'cluster_cleanup_needed=true' "$harness"
 require 'daemon_pid=$!' "$harness"
 require 'wait_for_process_socket "tbxd"' "$harness"
 require "cat \"\$log_file\" >&2" "$harness"
+require 'dump_failure_diagnostics() (' "$harness"
+require 'tbx-helper.log' "$harness"
+require "kill -0 \"\$daemon_pid\"" "$harness"
+require 'ip -details address show' "$harness"
+require 'nft list ruleset' "$harness"
+require 'console e2e' "$harness"
 require 'sha256sum --check --strict' "$harness"
+kvm_gate_line=$(grep -nF 'test -w /dev/kvm' "$harness" | head -n 1 | cut -d: -f1)
+diagnostic_trap_line=$(grep -nF 'trap dump_failure_diagnostics ERR' "$harness" | cut -d: -f1)
+if [[ -z "$kvm_gate_line" || -z "$diagnostic_trap_line" || $kvm_gate_line -ge $diagnostic_trap_line ]]; then
+  printf 'hard KVM gate must run before diagnostics and setup\n' >&2
+  exit 1
+fi
 if grep -Fq -- 'setfacl' "$workflow" || grep -Fq -- ' acl' "$workflow"; then
   printf 'KVM access must come from the udev rule, not ACL setup\n' >&2
   exit 1

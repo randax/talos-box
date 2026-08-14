@@ -56,6 +56,40 @@ helper_socket=""
 helper_pid=""
 daemon_pid=""
 cluster_cleanup_needed=false
+dump_failure_diagnostics() (
+  trap - ERR
+  set +e
+  printf '\n===== talosbox KVM e2e failure diagnostics =====\n' >&2
+  for log_file in "$workdir/tbx-helper.log" "$workdir/tbxd.log"; do
+    if [[ -f "$log_file" ]]; then
+      printf '\n===== %s =====\n' "$(basename "$log_file")" >&2
+      cat "$log_file" >&2
+    fi
+  done
+  daemon_ready=false
+  if [[ -n "$daemon_pid" && -n "$home" && -S "$home/.talosbox/tbxd.sock" ]] && kill -0 "$daemon_pid" 2>/dev/null; then
+    daemon_ready=true
+    HOME="$home" TBX_HELPER_SOCKET="$helper_socket" "$root/bin/tbx" status e2e --quiet -o json >&2
+  fi
+  printf '\n===== host network =====\n' >&2
+  sudo ip -details address show >&2
+  sudo ip route show table all >&2
+  sudo ip neigh show >&2
+  sudo bridge link show >&2
+  sudo bridge fdb show >&2
+  printf '\n===== host firewall =====\n' >&2
+  sudo nft list ruleset >&2
+  sudo iptables-save >&2
+  printf '\n===== QEMU processes =====\n' >&2
+  pgrep -a -f qemu-system >&2
+  if [[ "$daemon_ready" == true && -x "$root/bin/tbx" ]]; then
+    for node in e2e-cp-1 e2e-worker-1 e2e-worker-2; do
+      printf '\n===== console e2e/%s =====\n' "$node" >&2
+      timeout 3s "$root/bin/tbx" console e2e "$node" </dev/null >&2
+    done
+  fi
+  printf '\n===== end diagnostics =====\n' >&2
+)
 cleanup() {
   if [[ "$cluster_cleanup_needed" == true && -x "$root/bin/tbx" && -n "$home" && -n "$helper_socket" ]]; then
     HOME="$home" TBX_HELPER_SOCKET="$helper_socket" "$root/bin/tbx" cluster destroy e2e --force || true
@@ -71,6 +105,7 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+trap dump_failure_diagnostics ERR
 
 if [[ -n ${TBX_E2E_WORKDIR:-} ]]; then
   scratch_parent=$(dirname "$TBX_E2E_WORKDIR")
