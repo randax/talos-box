@@ -58,8 +58,8 @@ if grep -Eq -- '--(cni|lb|bgp|hubble)([ =]|$)' "$harness"; then
   printf 'substrate-only e2e must not request talosbox provisioning flags\n' >&2
   exit 1
 fi
-if sed -n '/^  linux:/,$p' "$workflow" | grep -Eq 'uses: [^[:space:]]+@v[0-9]'; then
-  printf 'new CI jobs must pin actions to immutable commit SHAs\n' >&2
+if grep -Eq 'uses: [^[:space:]]+@v[0-9]' "$workflow"; then
+  printf 'scheduled CI jobs must pin actions to immutable commit SHAs\n' >&2
   exit 1
 fi
 
