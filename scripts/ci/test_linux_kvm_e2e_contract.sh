@@ -47,6 +47,8 @@ require 'retry "Flannel apply"' "$harness"
 require 'retry "substrate cluster creation"' "$harness"
 require 'cluster_cleanup_needed=true' "$harness"
 require 'daemon_pid=$!' "$harness"
+require 'wait_for_process_socket "tbxd"' "$harness"
+require "cat \"\$log_file\" >&2" "$harness"
 require 'sha256sum --check --strict' "$harness"
 if grep -Fq -- 'setfacl' "$workflow" || grep -Fq -- ' acl' "$workflow"; then
   printf 'KVM access must come from the udev rule, not ACL setup\n' >&2

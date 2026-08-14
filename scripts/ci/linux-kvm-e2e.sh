@@ -121,6 +121,28 @@ retry() {
   return 1
 }
 
+wait_for_process_socket() {
+  local label=$1 attempts=$2 delay=$3 pid=$4 socket=$5 log_file=$6 attempt status
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    if socket_ready "$socket"; then
+      return 0
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      status=0
+      wait "$pid" || status=$?
+      printf '%s exited with status %d before creating %s\n' "$label" "$status" "$socket" >&2
+      cat "$log_file" >&2
+      return 1
+    fi
+    if ((attempt < attempts)); then
+      sleep "$delay"
+    fi
+  done
+  printf 'timed out waiting for %s after %d attempts\n' "$label" "$attempts" >&2
+  cat "$log_file" >&2
+  return 1
+}
+
 talos_version=v1.13.6
 kubectl_version=v1.34.1
 talosctl_sha256=540c5e7cb0d3fa3a9b2e1c717ced212727b73bcaf0cf9cf9ba2472ec381041d4
@@ -150,7 +172,7 @@ retry "helper socket" 30 1 socket_ready "$helper_socket"
 
 "$root/bin/tbxd" >"$workdir/tbxd.log" 2>&1 &
 daemon_pid=$!
-retry "daemon socket" 30 1 socket_ready "$home/.talosbox/tbxd.sock"
+wait_for_process_socket "tbxd" 30 1 "$daemon_pid" "$home/.talosbox/tbxd.sock" "$workdir/tbxd.log"
 
 # No CNI/provisioning keys: talosbox creates substrate only. The explicit role
 # sizes keep the Talos control plane above its 2 GiB minimum while preserving

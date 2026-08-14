@@ -80,29 +80,6 @@ func (r *frameRouter) addPort(subnet int, send func([]byte) error) *routerPort {
 	return port
 }
 
-func (r *frameRouter) removePort(port *routerPort) {
-	if port == nil {
-		return
-	}
-
-	r.mu.Lock()
-
-	current, ok := r.ports[port.id]
-	if !ok || current != port {
-		r.mu.Unlock()
-		return
-	}
-	delete(r.ports, port.id)
-	for ip := range port.ips {
-		if owner := r.ipToPort[ip]; owner == port {
-			delete(r.ipToPort, ip)
-		}
-	}
-	r.mu.Unlock()
-
-	port.closeSend()
-}
-
 func (r *frameRouter) route(port *routerPort, frame []byte) (bool, error) {
 	dstMAC, srcMAC, etherType, payload, ok := parseRouterEthernetFrame(frame)
 	if !ok {
@@ -313,12 +290,6 @@ func (p *routerPort) sendFrame(frame []byte) error {
 		return fmt.Errorf("router port %d is closed", p.id)
 	}
 	return p.send(frame)
-}
-
-func (p *routerPort) closeSend() {
-	p.sendMu.Lock()
-	p.closed = true
-	p.sendMu.Unlock()
 }
 
 func routerGatewayMAC(subnet int) net.HardwareAddr {
