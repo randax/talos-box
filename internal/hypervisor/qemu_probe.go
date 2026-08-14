@@ -14,8 +14,9 @@ var (
 )
 
 type qemuProbe struct {
-	Version  qemuVersion
-	Machines []string
+	Version        qemuVersion
+	Machines       []string
+	MachineAliases []string
 }
 
 func validateQEMUProbe(probe qemuProbe, requiredMachine string) error {
@@ -24,6 +25,11 @@ func validateQEMUProbe(probe qemuProbe, requiredMachine string) error {
 	}
 	for _, machine := range probe.Machines {
 		if machine == requiredMachine {
+			return nil
+		}
+	}
+	for _, alias := range probe.MachineAliases {
+		if alias == requiredMachine {
 			return nil
 		}
 	}

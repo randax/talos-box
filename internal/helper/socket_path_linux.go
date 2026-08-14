@@ -32,8 +32,10 @@ func linuxClientSocketPath(effectiveUID uint32, sudoUID, override string) (strin
 	if path, err := socketPathOverride(override); path != "" || err != nil {
 		return path, err
 	}
-	if parsed, err := strconv.ParseUint(sudoUID, 10, 32); err == nil && parsed != 0 {
-		return linuxUserSocketPath(uint32(parsed)), nil
+	if effectiveUID == 0 {
+		if parsed, err := strconv.ParseUint(sudoUID, 10, 32); err == nil && parsed != 0 {
+			return linuxUserSocketPath(uint32(parsed)), nil
+		}
 	}
 	if effectiveUID != 0 {
 		userPath := linuxUserSocketPath(effectiveUID)

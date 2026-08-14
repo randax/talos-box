@@ -65,7 +65,8 @@ func probeQEMU(ctx context.Context, binary string) (qemuProbe, error) {
 		return qemuProbe{}, fmt.Errorf("query QEMU version: %w", err)
 	}
 	var machineResponse []struct {
-		Name string `json:"name"`
+		Name  string `json:"name"`
+		Alias string `json:"alias"`
 	}
 	if err := client.execute(ctx, "query-machines", nil, &machineResponse); err != nil {
 		return qemuProbe{}, fmt.Errorf("query QEMU machines: %w", err)
@@ -80,6 +81,9 @@ func probeQEMU(ctx context.Context, binary string) (qemuProbe, error) {
 	}
 	for _, machine := range machineResponse {
 		probe.Machines = append(probe.Machines, machine.Name)
+		if machine.Alias != "" {
+			probe.MachineAliases = append(probe.MachineAliases, machine.Alias)
+		}
 	}
 	// QEMU normally replies before exiting. Treat EOF after quit as success too:
 	// the probe has already collected everything it needs.
