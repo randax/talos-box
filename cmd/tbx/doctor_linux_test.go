@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -172,18 +173,22 @@ func TestLinuxPlatformDoctorFindingsKVMAccessHint(t *testing.T) {
 func TestLinuxPlatformDoctorFindingsQEMUMissingRequiredMachine(t *testing.T) {
 	t.Parallel()
 
+	system, err := doctorQEMUSystemForArchitecture(runtime.GOARCH)
+	if err != nil {
+		t.Fatal(err)
+	}
 	finding := linuxQEMUFinding(func(name string, args ...string) ([]byte, error) {
 		switch {
-		case name == "qemu-system-x86_64" && fmt.Sprint(args) == "[--version]":
+		case name == system.binary && fmt.Sprint(args) == "[--version]":
 			return []byte("QEMU emulator version 8.2.2\n"), nil
-		case name == "qemu-system-x86_64" && fmt.Sprint(args) == "[-machine help]":
-			return []byte("pc  Standard PC (i440FX + PIIX, 1996)\n"), nil
+		case name == system.binary && fmt.Sprint(args) == "[-machine help]":
+			return []byte("unsupported-machine  Test machine\n"), nil
 		default:
 			t.Fatalf("unexpected command %s %v", name, args)
 			return nil, nil
 		}
 	})
-	if finding.level != "FAIL" || !strings.Contains(finding.detail, `required machine type "q35"`) {
+	if finding.level != "FAIL" || !strings.Contains(finding.detail, fmt.Sprintf("required machine type %q", system.machine)) {
 		t.Fatalf("finding = %+v", finding)
 	}
 }
@@ -191,8 +196,12 @@ func TestLinuxPlatformDoctorFindingsQEMUMissingRequiredMachine(t *testing.T) {
 func TestLinuxPlatformDoctorFindingsQEMUInstallHint(t *testing.T) {
 	t.Parallel()
 
+	system, err := doctorQEMUSystemForArchitecture(runtime.GOARCH)
+	if err != nil {
+		t.Fatal(err)
+	}
 	finding := linuxQEMUFinding(func(name string, args ...string) ([]byte, error) {
-		if name != "qemu-system-x86_64" || fmt.Sprint(args) != "[--version]" {
+		if name != system.binary || fmt.Sprint(args) != "[--version]" {
 			t.Fatalf("unexpected command %s %v", name, args)
 		}
 		return nil, errors.New("executable file not found")
