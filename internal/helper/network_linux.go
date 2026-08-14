@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/google/nftables"
@@ -145,6 +146,13 @@ func (realLinuxNetworkOps) EnsureManagedTaps(subnetIndexes []int) error {
 		if !ok || tap.Mode != netlink.TUNTAP_MODE_TAP {
 			return fmt.Errorf("helper-owned interface name %s has type %s, want tap", link.Attrs().Name, link.Type())
 		}
+		flags, err := readLinuxTunFlags(tap.Attrs().Name)
+		if err != nil {
+			return fmt.Errorf("inspect tap framing for %s: %w", tap.Attrs().Name, err)
+		}
+		if err := requireLinuxTapNoPacketInfo(tap.Attrs().Name, flags); err != nil {
+			return err
+		}
 		bridge, err := requireLinuxBridge(bridgeNameForSubnet(index))
 		if err != nil {
 			return err
@@ -157,6 +165,21 @@ func (realLinuxNetworkOps) EnsureManagedTaps(subnetIndexes []int) error {
 		}
 	}
 	return nil
+}
+
+func requireLinuxTapNoPacketInfo(name string, flags int64) error {
+	if flags&unix.IFF_NO_PI == 0 {
+		return fmt.Errorf("helper-owned tap %s uses packet-info framing; stop the stale VM before retrying", name)
+	}
+	return nil
+}
+
+func readLinuxTunFlags(name string) (int64, error) {
+	contents, err := os.ReadFile(filepath.Join("/sys/class/net", name, "tun_flags"))
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseInt(strings.TrimSpace(string(contents)), 0, 64)
 }
 
 func ensureLinuxSysctl(path string) error {
@@ -282,6 +305,18 @@ func (realLinuxNetworkOps) EnsureLinkUp(name string) error {
 	return nil
 }
 
+func newLinuxTap(name string, subnetIndex, masterIndex int) *netlink.Tuntap {
+	return &netlink.Tuntap{
+		LinkAttrs:  netlink.LinkAttrs{Name: name, Alias: tapAliasForSubnet(subnetIndex), MasterIndex: masterIndex},
+		Mode:       netlink.TUNTAP_MODE_TAP,
+		Flags:      netlink.TUNTAP_DEFAULTS | netlink.TUNTAP_NO_PI,
+		NonPersist: true,
+		Queues:     1,
+		Owner:      uint32(os.Geteuid()),
+		Group:      uint32(os.Getegid()),
+	}
+}
+
 func (realLinuxNetworkOps) CreateTap(name, bridgeName string) (*os.File, error) {
 	subnetIndex, ok := subnetIndexFromTapName(name)
 	if !ok || bridgeName != bridgeNameForSubnet(subnetIndex) {
@@ -300,15 +335,7 @@ func (realLinuxNetworkOps) CreateTap(name, bridgeName string) (*os.File, error) 
 		}
 	}
 
-	tap := &netlink.Tuntap{
-		LinkAttrs:  netlink.LinkAttrs{Name: name, Alias: tapAliasForSubnet(subnetIndex), MasterIndex: bridge.Attrs().Index},
-		Mode:       netlink.TUNTAP_MODE_TAP,
-		Flags:      netlink.TUNTAP_DEFAULTS,
-		NonPersist: true,
-		Queues:     1,
-		Owner:      uint32(os.Geteuid()),
-		Group:      uint32(os.Getegid()),
-	}
+	tap := newLinuxTap(name, subnetIndex, bridge.Attrs().Index)
 	if err := netlink.LinkAdd(tap); err != nil {
 		return nil, fmt.Errorf("create tap %s: %w", name, err)
 	}
