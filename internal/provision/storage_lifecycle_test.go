@@ -264,15 +264,22 @@ metadata:
 }
 
 func TestReplaceDriftedStorageClassDeletesOnlyOnImmutableParameterDrift(t *testing.T) {
-	rendered := storageClassFixture("longhorn", map[string]any{"numberOfReplicas": "2"})
+	rendered := storageClassFixture("longhorn", map[string]any{"numberOfReplicas": "2"}, true)
 	tests := []struct {
 		name       string
 		live       *unstructured.Unstructured
 		wantDelete bool
+		wantErr    string
 	}{
 		{name: "no live StorageClass", live: nil, wantDelete: false},
-		{name: "same parameters", live: storageClassFixture("longhorn", map[string]any{"numberOfReplicas": "2"}), wantDelete: false},
-		{name: "drifted parameters", live: storageClassFixture("longhorn", map[string]any{"numberOfReplicas": "3"}), wantDelete: true},
+		{name: "same parameters", live: storageClassFixture("longhorn", map[string]any{"numberOfReplicas": "2"}, true), wantDelete: false},
+		{name: "drifted parameters", live: storageClassFixture("longhorn", map[string]any{"numberOfReplicas": "3"}, true), wantDelete: true},
+		{
+			name:       "drifted but unowned StorageClass",
+			live:       storageClassFixture("longhorn", map[string]any{"numberOfReplicas": "3"}, false),
+			wantDelete: false,
+			wantErr:    "not managed by talosbox",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -283,8 +290,12 @@ func TestReplaceDriftedStorageClassDeletesOnlyOnImmutableParameterDrift(t *testi
 				createStorageLifecycleObjects(t, client, mapper, []unstructured.Unstructured{*tt.live})
 			}
 
-			if err := replaceDriftedStorageClass(context.Background(), client, mapper, objects); err != nil {
+			err := replaceDriftedStorageClass(context.Background(), client, mapper, objects)
+			if tt.wantErr == "" && err != nil {
 				t.Fatal(err)
+			}
+			if tt.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErr)) {
+				t.Fatalf("replaceDriftedStorageClass() error = %v, want containing %q", err, tt.wantErr)
 			}
 
 			gotDelete := len(storageLifecycleDeleteActions(client.Actions())) > 0
@@ -295,13 +306,17 @@ func TestReplaceDriftedStorageClassDeletesOnlyOnImmutableParameterDrift(t *testi
 	}
 }
 
-func storageClassFixture(name string, parameters map[string]any) *unstructured.Unstructured {
-	return &unstructured.Unstructured{Object: map[string]any{
+func storageClassFixture(name string, parameters map[string]any, owned bool) *unstructured.Unstructured {
+	object := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "storage.k8s.io/v1",
 		"kind":       "StorageClass",
 		"metadata":   map[string]any{"name": name},
 		"parameters": parameters,
 	}}
+	if owned {
+		ensureManagedLabel(object)
+	}
+	return object
 }
 
 func TestDeleteRenderedStorageObjectsRecoversFromInterruptedRun(t *testing.T) {

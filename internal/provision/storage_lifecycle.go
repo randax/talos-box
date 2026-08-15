@@ -197,6 +197,9 @@ func replaceDriftedStorageClass(ctx context.Context, client dynamic.Interface, m
 		if maps.Equal(liveParameters, renderedParameters) {
 			continue
 		}
+		if !storageObjectOwnedByTalosbox(live) {
+			return fmt.Errorf("StorageClass %q exists with different parameters but is not managed by talosbox; remove or rename it before provisioning curated storage", object.GetName())
+		}
 		if err := client.Resource(mapping.Resource).Delete(ctx, object.GetName(), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("replace StorageClass %q: %w", object.GetName(), err)
 		}
