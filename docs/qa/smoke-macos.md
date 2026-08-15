@@ -20,14 +20,21 @@ Never improvise recovery mid-charter: if a step fails, capture the evidence list
 
 ## Preflight
 
+**Obtain tbx first**: use the brew install if present; otherwise build from source in the checkout — `make build` (which ad-hoc signs `bin/tbx`/`bin/tbxd` with the virtualization entitlement; unsigned binaries cannot start VMs). Run all commands below as `./bin/tbx` when built from source.
+
 Abort the run (report BLOCKED, not FAIL) if any of these don't hold:
 
 1. `tbx version` prints a version; record it.
 2. `git -C <talos-box checkout> rev-parse HEAD` — record the commit if running from source.
 3. `tbx doctor` exits 0. Expected: helper, vmnet, DNS wiring, forwarding all OK; `host-pressure` present (macOS). Record any WARN lines as friction.
+   - Known BLOCKED cause — **helper protocol mismatch**: the LaunchDaemon plist (`/Library/LaunchDaemons/dev.talosbox.helper.plist`) pins the helper at an absolute path, so a moved/renamed checkout leaves an old helper running. Fix: `sudo <checkout>/bin/tbx system install` (full path — tbx may not be on PATH), then rerun doctor.
+   - Known artifact: the DNS check may FAIL with `connection refused` on 127.0.0.1:5399 when tbxd simply isn't running yet (it starts on demand); the daemon-dependent siblings SKIP. If DNS is the only FAIL and no tbxd process exists, treat preflight as passed and record the inconsistency as friction.
 4. `tbx status` shows no cluster named `qa-smoke` (destroy leftovers first: `tbx cluster destroy qa-smoke --force`).
-5. Host has ≥ 8 GiB free RAM (`memory_pressure` or Activity Monitor) — the default cluster wants 6 GiB.
-6. Network can reach `factory.talos.dev` (smoke assumes online; offline behavior is a deep runbook).
+5. Host has ≥ 8 GiB free RAM (`memory_pressure`: use the system-wide free percentage — macOS swap-used numbers stay high after pressure clears) — the default cluster wants 6 GiB.
+6. Host volume holding `~/.talosbox` has ≥ 25 GiB free (`df -h ~`) — node disks are 20 GB sparse and doctor warns that low storage can corrupt guest writes.
+7. Network can reach `factory.talos.dev` (smoke assumes online; offline behavior is a deep runbook).
+
+If C1 fails with `dial unix ~/.talosbox/tbxd.sock: no such file`, tbx spawned tbxd and it died — read `~/.talosbox/tbxd.log` for the real error before reporting.
 
 ## Charters
 
