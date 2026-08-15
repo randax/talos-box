@@ -249,13 +249,18 @@ for node_ip in "${node_ips[@]}"; do
   retry "Talos maintenance API at $node_ip" 120 5 maintenance_api_ready "$node_ip"
 done
 
-cat >"$talos_config/cni-none.yaml" <<'EOF'
+cat >"$talos_config/ci-machine.yaml" <<'EOF'
+machine:
+  # QEMU inherits the synchronized runner clock. GitHub-hosted runners block
+  # guest UDP/123, so do not make this isolated CI cluster wait on public NTP.
+  time:
+    disabled: true
 cluster:
   network:
     cni:
       name: none
 EOF
-talosctl gen config e2e "https://${cp_ip}:6443" --output-dir "$talos_config" --config-patch "@$talos_config/cni-none.yaml"
+talosctl gen config e2e "https://${cp_ip}:6443" --output-dir "$talos_config" --config-patch "@$talos_config/ci-machine.yaml"
 talosctl apply-config --nodes "$cp_ip" --insecure --file "$talos_config/controlplane.yaml"
 for node_ip in "${node_ips[@]:1}"; do
   talosctl apply-config --nodes "$node_ip" --insecure --file "$talos_config/worker.yaml"
