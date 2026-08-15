@@ -76,10 +76,16 @@ jobs:
           sudo udevadm trigger --name-match=kvm
           sudo udevadm settle
           test -w /dev/kvm
-      - name: Allow talosbox bridged traffic
+      - name: Allow talosbox routed traffic
         run: |
-          if ! sudo iptables -C FORWARD -m physdev --physdev-is-bridged --physdev-in 'br-tbx+' -j ACCEPT; then
-            sudo iptables -I FORWARD -m physdev --physdev-is-bridged --physdev-in 'br-tbx+' -j ACCEPT
+          # Ubuntu-hosted runners filter guest egress in FORWARD after the bridge
+          # turns packets into routed traffic, so the CI lane must allow traffic
+          # to leave br-tbx and permit return flows back into the guests.
+          if ! sudo iptables -C FORWARD -i 'br-tbx+' -j ACCEPT; then
+            sudo iptables -I FORWARD 1 -i 'br-tbx+' -j ACCEPT
+          fi
+          if ! sudo iptables -C FORWARD -o 'br-tbx+' -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; then
+            sudo iptables -I FORWARD 1 -o 'br-tbx+' -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
           fi
       - name: Build Linux binaries
         run: |
