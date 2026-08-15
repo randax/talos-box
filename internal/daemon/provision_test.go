@@ -715,3 +715,17 @@ func runningLonghornClusterForNodeMutation(t *testing.T, controlPlanes, workers 
 		defaultSchematic:     "curated-default",
 	}, item
 }
+
+func TestProvisionTimeoutGrowsWhenStorageIsDeclared(t *testing.T) {
+	base := cluster.Cluster{ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel}}
+	if got := provisionTimeout(base); got != cniProvisionTimeout {
+		t.Fatalf("provisionTimeout(no csi) = %v, want %v", got, cniProvisionTimeout)
+	}
+	base.CSI = cluster.CSILonghorn
+	if got := provisionTimeout(base); got != storageProvisionTimeout {
+		t.Fatalf("provisionTimeout(csi) = %v, want %v", got, storageProvisionTimeout)
+	}
+	if storageProvisionTimeout <= cniProvisionTimeout {
+		t.Fatalf("storageProvisionTimeout %v must exceed cniProvisionTimeout %v: a storage stage adds engine image pulls and the write/readback probe", storageProvisionTimeout, cniProvisionTimeout)
+	}
+}

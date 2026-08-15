@@ -12,7 +12,11 @@ import (
 )
 
 const (
-	cniProvisionTimeout       = 10 * time.Minute
+	cniProvisionTimeout = 10 * time.Minute
+	// A declared storage engine adds its image pulls (Longhorn alone is
+	// gigabytes across every node) and the write/readback probe to the same
+	// provisioning pass, so it gets a larger budget.
+	storageProvisionTimeout   = 25 * time.Minute
 	kubernetesReadyTimeout    = 5 * time.Second
 	ciliumConvergenceTimeout  = 15 * time.Second
 	storageConvergenceTimeout = 30 * time.Second
@@ -189,6 +193,14 @@ func (s *Server) runProvisionTasks(data any, tasks []provisionTask) error {
 	return nil
 }
 
+// provisionTimeout budgets one provisioning pass by what it must converge.
+func provisionTimeout(item cluster.Cluster) time.Duration {
+	if item.CSI != "" {
+		return storageProvisionTimeout
+	}
+	return cniProvisionTimeout
+}
+
 func (s *Server) provisionCNI(parent context.Context, item cluster.Cluster, force bool) ([]string, StoragePhase, error) {
 	if item.CNI != cluster.CNIFlannel && item.CNI != cluster.CNICilium {
 		return nil, "", nil
@@ -206,7 +218,7 @@ func (s *Server) provisionCNI(parent context.Context, item cluster.Cluster, forc
 	if err != nil {
 		return nil, "", err
 	}
-	ctx, cancel := context.WithTimeout(parent, cniProvisionTimeout)
+	ctx, cancel := context.WithTimeout(parent, provisionTimeout(item))
 	defer cancel()
 	var loadBalancer provision.LoadBalancerReconciler
 	switch item.CNI {

@@ -461,6 +461,66 @@ func TestGenerateFlannelAddsStorageAndMirrorPrerequisitesForEveryRole(t *testing
 	}
 }
 
+func TestReconcileAppliesEachNodeItsOwnHostname(t *testing.T) {
+	// Kubernetes node names come from the guest hostname, and downstream
+	// checks (KubernetesReady, DNS naming, Longhorn replica placement) expect
+	// tbx node names. Role-level configs cannot carry them, so the apply loop
+	// must patch machine.network.hostname per node.
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("demo", 0, 1, 1, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNIFlannel}
+	item.TalosVersion = "v1.13.6"
+	client := &fakeClient{kubeData: []byte("kubeconfig")}
+	observations := [][]Node{
+		{
+			{Name: "demo-cp-1", Role: cluster.RoleControlPlane, IP: item.Nodes[0].IP, Phase: PhaseMaintenance},
+			{Name: "demo-worker-1", Role: cluster.RoleWorker, IP: item.Nodes[1].IP, Phase: PhaseMaintenance},
+		},
+		{
+			{Name: "demo-cp-1", Role: cluster.RoleControlPlane, IP: item.Nodes[0].IP, Phase: PhaseConfigured},
+			{Name: "demo-worker-1", Role: cluster.RoleWorker, IP: item.Nodes[1].IP, Phase: PhaseConfigured},
+		},
+	}
+	call := 0
+	if _, err := Reconcile(context.Background(), Request{
+		Cluster: item,
+		Observe: func(context.Context) ([]Node, error) {
+			index := call
+			if index >= len(observations) {
+				index = len(observations) - 1
+			}
+			call++
+			return observations[index], nil
+		},
+		Client: client, PollInterval: 0,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(client.configs) != 2 {
+		t.Fatalf("applied config count = %d, want 2", len(client.configs))
+	}
+	wantByIP := map[string]string{item.Nodes[0].IP: "demo-cp-1", item.Nodes[1].IP: "demo-worker-1"}
+	for i, config := range client.configs {
+		var document struct {
+			Machine struct {
+				Network struct {
+					Hostname string `yaml:"hostname"`
+				} `yaml:"network"`
+			} `yaml:"machine"`
+		}
+		if err := yaml.Unmarshal(config, &document); err != nil {
+			t.Fatal(err)
+		}
+		if got, want := document.Machine.Network.Hostname, wantByIP[client.applied[i]]; got != want {
+			t.Fatalf("config %d (node %s) hostname = %q, want %q", i, client.applied[i], got, want)
+		}
+	}
+}
+
 func TestGenerateAllowsSchedulingOnControlPlanesOnlyWithoutWorkers(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
