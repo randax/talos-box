@@ -14,6 +14,7 @@ func TestValidateQEMUProbe(t *testing.T) {
 		wantErr string
 	}{
 		{name: "minimum", probe: qemuProbe{Version: qemuVersion{Major: 6, Minor: 2}, Machines: []string{"q35"}}, machine: "q35"},
+		{name: "machine alias", probe: qemuProbe{Version: qemuVersion{Major: 8, Minor: 2}, Machines: []string{"pc-q35-8.2"}, MachineAliases: []string{"q35"}}, machine: "q35"},
 		{name: "too old", probe: qemuProbe{Version: qemuVersion{Major: 6, Minor: 1}, Machines: []string{"q35"}}, machine: "q35", wantErr: "QEMU >= 6.2 is required"},
 		{name: "machine absent", probe: qemuProbe{Version: qemuVersion{Major: 8, Minor: 2}, Machines: []string{"pc"}}, machine: "q35", wantErr: `required machine type "q35"`},
 	}

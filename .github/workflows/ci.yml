@@ -5,20 +5,95 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    - cron: '17 3 * * *'
 
 jobs:
   build:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: "1.26"
           cache: false
       - run: make build
       - name: lint
-        uses: golangci/golangci-lint-action@v8
+        uses: golangci/golangci-lint-action@4afd733a84b1f43292c63897423277bb7f4313a9 # v8
         with:
           version: v2.12
       - run: make test
       # E2E tests require Virtualization.framework, which is unavailable on GitHub-hosted runners.
+
+  linux:
+    name: Linux (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26"
+          cache: false
+      - run: go build ./...
+      - name: lint
+        uses: golangci/golangci-lint-action@4afd733a84b1f43292c63897423277bb7f4313a9 # v8
+        with:
+          version: v2.12
+      - run: make test
+
+  nix:
+    name: Nix flake check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: DeterminateSystems/nix-installer-action@786fff0690178f1234e4e1fe9b536e94f5433196 # v20
+      - run: nix flake check
+
+  linux-kvm-e2e:
+    name: Linux KVM substrate e2e
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26"
+          cache: false
+      - name: Install KVM, QEMU, and EFI firmware
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes qemu-system-x86 qemu-utils ovmf xz-utils curl jq iptables
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo udevadm settle
+          test -w /dev/kvm
+      - name: Allow talosbox routed traffic
+        run: |
+          # Ubuntu-hosted runners filter guest egress in FORWARD after the bridge
+          # turns packets into routed traffic, so the CI lane must allow traffic
+          # to leave br-tbx and permit return flows back into the guests.
+          if ! sudo iptables -C FORWARD -i 'br-tbx+' -j ACCEPT; then
+            sudo iptables -I FORWARD 1 -i 'br-tbx+' -j ACCEPT
+          fi
+          if ! sudo iptables -C FORWARD -o 'br-tbx+' -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; then
+            sudo iptables -I FORWARD 1 -o 'br-tbx+' -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+          fi
+      - name: Build Linux binaries
+        run: |
+          mkdir -p bin
+          go build -o bin/tbx ./cmd/tbx
+          go build -o bin/tbxd ./cmd/tbxd
+          go build -o bin/tbx-helper ./cmd/tbx-helper
+      - name: Assert CI contract
+        run: scripts/ci/test_linux_kvm_e2e_contract.sh
+      - name: Verify KVM substrate-only cluster
+        run: scripts/ci/linux-kvm-e2e.sh

@@ -146,8 +146,8 @@ func Hints(status ClusterStatus) []string {
 		}
 		if !status.KubernetesReady {
 			hints = append(hints,
-				fmt.Sprintf("all nodes configured. If etcd is not yet bootstrapped: talosctl --nodes %s bootstrap, then talosctl kubeconfig .", cp.IP),
-				fmt.Sprintf("node TUI (the Talos dashboard): talosctl dashboard --nodes %s", cp.IP),
+				fmt.Sprintf("all nodes configured. If etcd is not yet bootstrapped: talosctl bootstrap --talosconfig ./talosconfig --nodes %[1]s --endpoints %[1]s, then talosctl kubeconfig . --talosconfig ./talosconfig --nodes %[1]s --endpoints %[1]s", cp.IP),
+				fmt.Sprintf("node TUI (the Talos dashboard): talosctl dashboard --talosconfig ./talosconfig --nodes %[1]s --endpoints %[1]s", cp.IP),
 			)
 		}
 	}

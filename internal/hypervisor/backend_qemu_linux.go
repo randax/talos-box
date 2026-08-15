@@ -17,6 +17,9 @@ import (
 
 // New probes the host QEMU/KVM backend once before the daemon accepts work.
 func New(ctx context.Context) (Hypervisor, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	architecture := Architecture(runtime.GOARCH)
 	system, err := qemuSystemForArchitecture(architecture)
 	if err != nil {

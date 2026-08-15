@@ -9,7 +9,29 @@ import (
 	"testing"
 
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
+
+func TestNewLinuxTapDisablesPacketInfo(t *testing.T) {
+	t.Parallel()
+
+	tap := newLinuxTap("tbx0-deadbeef", 0, 42)
+	if tap.Flags&netlink.TUNTAP_NO_PI == 0 {
+		t.Fatalf("tap flags = %#x, want TUNTAP_NO_PI", tap.Flags)
+	}
+}
+
+func TestRequireLinuxTapNoPacketInfo(t *testing.T) {
+	t.Parallel()
+
+	if err := requireLinuxTapNoPacketInfo("tbx0-deadbeef", int64(unix.IFF_TAP|unix.IFF_NO_PI)); err != nil {
+		t.Fatalf("NO_PI tap rejected: %v", err)
+	}
+	err := requireLinuxTapNoPacketInfo("tbx0-deadbeef", int64(unix.IFF_TAP))
+	if err == nil || !strings.Contains(err.Error(), "packet-info framing") || !strings.Contains(err.Error(), "stale VM") {
+		t.Fatalf("PI tap error = %v, want actionable stale-VM diagnostic", err)
+	}
+}
 
 func TestListLinuxLinkStatesSkipsVanishedLink(t *testing.T) {
 	t.Parallel()

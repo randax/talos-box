@@ -18,7 +18,7 @@ func TestCreateQuietSuppressesProvisioningNarration(t *testing.T) {
 		`{"name":"demo","controlPlanes":1,"workers":2,"nodeDefaults":{"memoryMiB":2048,"cpus":2,"diskGiB":20},"cni":"flannel","lb":false,"narration":["machine config: ≈ talosctl apply-config"]}`,
 	},
 		func(command cli) error {
-			return command.createCluster([]string{"demo", "--cni=flannel", "--lb=false", "--quiet"})
+			return command.createCluster([]string{"demo", "--schematic=test-schematic", "--cni=flannel", "--lb=false", "--quiet"})
 		},
 	)
 	if strings.Contains(stdout, "≈ talosctl") {

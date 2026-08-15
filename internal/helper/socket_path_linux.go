@@ -32,8 +32,10 @@ func linuxClientSocketPath(effectiveUID uint32, sudoUID, override string) (strin
 	if path, err := socketPathOverride(override); path != "" || err != nil {
 		return path, err
 	}
-	if parsed, err := strconv.ParseUint(sudoUID, 10, 32); err == nil && parsed != 0 {
-		return linuxUserSocketPath(uint32(parsed)), nil
+	if effectiveUID == 0 {
+		if parsed, err := strconv.ParseUint(sudoUID, 10, 32); err == nil && parsed != 0 {
+			return linuxUserSocketPath(uint32(parsed)), nil
+		}
 	}
 	if effectiveUID != 0 {
 		userPath := linuxUserSocketPath(effectiveUID)
@@ -72,10 +74,10 @@ func validateLinuxSocketPath(path, override string, pathErr error) (string, erro
 	runtimeDir := filepath.Dir(path)
 	info, err := os.Stat(runtimeDir)
 	if err != nil {
-		return "", fmt.Errorf("Linux runtime directory %s is unavailable: %w; set %s to an accessible absolute path", runtimeDir, err, helperSocketEnv)
+		return "", fmt.Errorf("linux runtime directory %s is unavailable: %w; set %s to an accessible absolute path", runtimeDir, err, helperSocketEnv)
 	}
 	if !info.IsDir() {
-		return "", fmt.Errorf("Linux runtime path %s is not a directory; set %s to an accessible absolute path", runtimeDir, helperSocketEnv)
+		return "", fmt.Errorf("linux runtime path %s is not a directory; set %s to an accessible absolute path", runtimeDir, helperSocketEnv)
 	}
 	return path, nil
 }

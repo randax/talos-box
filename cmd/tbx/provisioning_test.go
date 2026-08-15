@@ -105,7 +105,7 @@ func TestCreateClusterSendsProvisioningIntentAndPrintsIt(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	command := cli{out: &stdout, err: &stderr}
-	if err := command.createCluster([]string{"demo", "--cni=cilium", "--csi=longhorn", "--bgp", "--hubble"}); err != nil {
+	if err := command.createCluster([]string{"demo", "--schematic=test-schematic", "--cni=cilium", "--csi=longhorn", "--bgp", "--hubble"}); err != nil {
 		t.Fatal(err)
 	}
 	infoRequest := <-requests
@@ -176,7 +176,7 @@ func TestCreateClusterDefaultsFlannelLoadBalancerOn(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	command := cli{out: &stdout, err: &stderr}
-	if err := command.createCluster([]string{"demo", "--cni=flannel"}); err != nil {
+	if err := command.createCluster([]string{"demo", "--schematic=test-schematic", "--cni=flannel"}); err != nil {
 		t.Fatal(err)
 	}
 	if request := <-requests; request.Op != "daemon.info" {
@@ -383,7 +383,7 @@ func TestCreateClusterWithoutCNIUsesLegacyProtocolAndOutput(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	command := cli{out: &stdout, err: &stderr}
-	if err := command.createCluster([]string{"demo"}); err != nil {
+	if err := command.createCluster([]string{"demo", "--schematic=test-schematic"}); err != nil {
 		t.Fatal(err)
 	}
 	request := <-requests
@@ -438,7 +438,7 @@ func TestCreateClusterWithoutProvisioningIntentSkipsHandshake(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	command := cli{out: &stdout, err: &stderr}
-	if err := command.createCluster([]string{"demo"}); err != nil {
+	if err := command.createCluster([]string{"demo", "--schematic=test-schematic"}); err != nil {
 		t.Fatal(err)
 	}
 	request := <-requests

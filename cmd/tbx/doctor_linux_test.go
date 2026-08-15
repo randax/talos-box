@@ -211,7 +211,7 @@ func TestLinuxPlatformDoctorFindingsQEMUInstallHint(t *testing.T) {
 	}
 }
 
-func TestLinuxPlatformDoctorFindingsBridgeNetfilterSignature(t *testing.T) {
+func TestLinuxPlatformDoctorFindingsBridgeNetfilterRecommendsRoutedRules(t *testing.T) {
 	t.Parallel()
 
 	finding := linuxBridgeNetfilterFinding(
@@ -228,7 +228,71 @@ func TestLinuxPlatformDoctorFindingsBridgeNetfilterSignature(t *testing.T) {
 			return []byte("-P FORWARD DROP\n-A FORWARD -j DOCKER-USER\n"), nil
 		},
 	)
-	if finding.level != "FAIL" || !strings.Contains(finding.detail, "physdev") {
+	if finding.level != "FAIL" ||
+		!strings.Contains(finding.detail, "-i br-tbx+ -j ACCEPT") ||
+		!strings.Contains(finding.detail, "-o br-tbx+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT") {
+		t.Fatalf("finding = %+v", finding)
+	}
+}
+
+func TestLinuxPlatformDoctorFindingsBridgeNetfilterAcceptsRoutedRules(t *testing.T) {
+	t.Parallel()
+
+	finding := linuxBridgeNetfilterFinding(
+		func(string) ([]byte, error) { return []byte("1\n"), nil },
+		func(string, ...string) ([]byte, error) {
+			return []byte("-P FORWARD DROP\n" +
+				"-A FORWARD -i br-tbx+ -j ACCEPT\n" +
+				"-A FORWARD -o br-tbx+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT\n"), nil
+		},
+	)
+	if finding.level != "PASS" {
+		t.Fatalf("finding = %+v", finding)
+	}
+}
+
+func TestLinuxPlatformDoctorFindingsBridgeNetfilterRejectsIncompleteRoutedRules(t *testing.T) {
+	t.Parallel()
+
+	finding := linuxBridgeNetfilterFinding(
+		func(string) ([]byte, error) { return []byte("1\n"), nil },
+		func(string, ...string) ([]byte, error) {
+			return []byte("-P FORWARD DROP\n-A FORWARD -i br-tbx+ -j ACCEPT\n"), nil
+		},
+	)
+	if finding.level != "FAIL" {
+		t.Fatalf("finding = %+v", finding)
+	}
+}
+
+func TestLinuxPlatformDoctorFindingsBridgeNetfilterAcceptsConcreteBridgeRules(t *testing.T) {
+	t.Parallel()
+
+	finding := linuxBridgeNetfilterFinding(
+		func(string) ([]byte, error) { return []byte("1\n"), nil },
+		func(string, ...string) ([]byte, error) {
+			return []byte("-P FORWARD DROP\n" +
+				"-A FORWARD -i br-tbx7 -j ACCEPT\n" +
+				"-A FORWARD -o br-tbx7 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n"), nil
+		},
+	)
+	if finding.level != "PASS" {
+		t.Fatalf("finding = %+v", finding)
+	}
+}
+
+func TestLinuxPlatformDoctorFindingsBridgeNetfilterRejectsMismatchedBridgeRules(t *testing.T) {
+	t.Parallel()
+
+	finding := linuxBridgeNetfilterFinding(
+		func(string) ([]byte, error) { return []byte("1\n"), nil },
+		func(string, ...string) ([]byte, error) {
+			return []byte("-P FORWARD DROP\n" +
+				"-A FORWARD -i br-tbx7 -j ACCEPT\n" +
+				"-A FORWARD -o br-tbx8 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT\n"), nil
+		},
+	)
+	if finding.level != "FAIL" {
 		t.Fatalf("finding = %+v", finding)
 	}
 }

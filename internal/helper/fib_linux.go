@@ -38,10 +38,19 @@ type RouteFIBError struct {
 }
 
 func (e *RouteFIBError) Error() string {
-	if e.Nexthop == "" {
-		return fmt.Sprintf("%s route %s: %v", e.Operation, e.Prefix, e.Err)
+	operation := e.Operation
+	switch operation {
+	case "parse-prefix":
+		operation = "parse route prefix"
+	case "parse-nexthop":
+		operation = "parse route next hop"
+	default:
+		operation += " route"
 	}
-	return fmt.Sprintf("%s route %s via %s: %v", e.Operation, e.Prefix, e.Nexthop, e.Err)
+	if e.Nexthop == "" {
+		return fmt.Sprintf("%s %s: %v", operation, e.Prefix, e.Err)
+	}
+	return fmt.Sprintf("%s %s via %s: %v", operation, e.Prefix, e.Nexthop, e.Err)
 }
 
 func (e *RouteFIBError) Unwrap() error { return e.Err }

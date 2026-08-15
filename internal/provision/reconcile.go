@@ -20,6 +20,7 @@ import (
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/manifests"
+	"github.com/randax/talos-box/internal/shellquote"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
 	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
@@ -202,7 +203,7 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 			return Result{}, fmt.Errorf("bootstrap Kubernetes: %w", err)
 		}
 		result.Narration = append(result.Narration,
-			fmt.Sprintf("bootstrap: ≈ talosctl --nodes %s bootstrap", controlPlane.IP),
+			fmt.Sprintf("bootstrap: ≈ talosctl bootstrap --talosconfig %s --nodes %[2]s --endpoints %[2]s", shellquote.Quote(generated.paths.talosconfig), controlPlane.IP),
 		)
 		kubeconfig, err := kubeconfigWithRetry(ctx, request.Client, controlPlane.IP, request.PollInterval)
 		if err != nil {
@@ -259,9 +260,9 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 			}
 		}
 		result.Narration = append(result.Narration,
-			fmt.Sprintf("credentials: ≈ talosctl --nodes %s kubeconfig %s", controlPlane.IP, generated.paths.kubeconfig),
-			fmt.Sprintf("export TALOSCONFIG=%s", generated.paths.talosconfig),
-			fmt.Sprintf("export KUBECONFIG=%s", generated.paths.kubeconfig),
+			fmt.Sprintf("credentials: ≈ talosctl kubeconfig %s --talosconfig %s --nodes %[3]s --endpoints %[3]s", shellquote.Quote(generated.paths.kubeconfig), shellquote.Quote(generated.paths.talosconfig), controlPlane.IP),
+			fmt.Sprintf("export TALOSCONFIG=%s", shellquote.Quote(generated.paths.talosconfig)),
+			fmt.Sprintf("export KUBECONFIG=%s", shellquote.Quote(generated.paths.kubeconfig)),
 		)
 		if request.Cluster.CNI == cluster.CNIFlannel && request.Cluster.LB {
 			if request.LoadBalancer == nil {

@@ -48,12 +48,11 @@ func TestBindListensOnGatewayNotWildcard(t *testing.T) {
 		} else {
 			_ = conn.Close()
 		}
-		// crucially, 0.0.0.0:port is NOT held by us — a wildcard listen still works
-		wildcard, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", p.Port))
-		if err != nil {
-			t.Errorf("port %d appears bound on 0.0.0.0 (should be gateway-specific): %v", p.Port, err)
-		} else {
-			_ = wildcard.Close()
+		// A wildcard listener would also accept traffic on another loopback IP.
+		other, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.2:%d", p.Port), 100*time.Millisecond)
+		if err == nil {
+			_ = other.Close()
+			t.Errorf("port %d accepts traffic outside the requested gateway address", p.Port)
 		}
 	}
 }
