@@ -345,8 +345,11 @@ prints a soft pre-flight warning (never a hard gate). Storage is ordinary provis
 volume data. Cluster-level operations never delete user data except `tbx cluster destroy`:
 switching or removing `csi:` is allowed only while the engine holds zero volumes (hard error
 otherwise), and the destroy confirmation reports a best-effort volume count without ever
-blocking the destroy of an unreachable cluster. `tbx node remove` deletes that node's disk, and
-node-local data — local-path volumes, unreplicated Longhorn replicas — goes with it.
+blocking the destroy of an unreachable cluster. `tbx node remove` deletes that node's disk, so
+it is volume-gated the same best-effort way: when the engine reports the node holds the only
+copy of volume data — local-path volumes pinned to it, Longhorn volumes with no healthy replica
+elsewhere — the removal is refused unless rerun with `--force`, and a stopped or unreachable
+cluster never blocks removal but degrades to a data-loss warning instead.
 
 ## 10. Guided output
 

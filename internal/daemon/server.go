@@ -43,6 +43,7 @@ type Server struct {
 	provisionReconcile    provisionReconcileFunc
 	storageProbe          func(context.Context, []byte) error
 	destroyVolumeCount    func(context.Context, cluster.Cluster) (int, error)
+	nodeVolumeCount       func(context.Context, cluster.Cluster, string) (int, error)
 	storageEngineDelete   func(context.Context, cluster.Cluster) error
 	storageEngineValidate func(context.Context, cluster.Cluster) error
 	nodeIPLookup          func(string, int) string
@@ -125,6 +126,7 @@ func NewServer(ctx context.Context) (*Server, error) {
 		hostPressure:          hostpressure.SystemSnapshot,
 		hostFreeMemory:        balloon.HostFreeMiB,
 		destroyVolumeCount:    countDestroyStorageVolumes,
+		nodeVolumeCount:       countNodeRemovalStorageVolumes,
 		storageEngineDelete:   deleteConfiguredStorageEngine,
 		storageEngineValidate: validateConfiguredStorageEngine,
 	}
@@ -410,11 +412,25 @@ func (s *Server) dispatchProvisioning(request Request) Response {
 }
 
 func (s *Server) dispatchNodeMutation(request Request) Response {
+	var removalWarning string
+	if request.Op == "node.remove" {
+		warning, err := s.gateNodeRemoval(request.Args)
+		if err != nil {
+			return failure(err)
+		}
+		removalWarning = warning
+	}
 	s.opMu.Lock()
 	data, tasks, err := s.handleNodeMutationLocked(request)
 	s.opMu.Unlock()
 	if err != nil {
 		return failure(err)
+	}
+	if removalWarning != "" {
+		if status, ok := data.(NodeStatus); ok {
+			status.Warning = joinWarnings(status.Warning, removalWarning)
+			data = status
+		}
 	}
 	if err := s.runProvisionTasks(data, tasks); err != nil {
 		return failure(err)

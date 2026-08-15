@@ -68,9 +68,10 @@ node — capped at 3, so a bare PVC just works. `tbx status` reports storage as
 provisioning until a real write/readback probe passes, then live; a single-node Longhorn
 cluster is reminded its volumes have no redundancy, and Longhorn on a memory-tight host gets a
 soft warning. Adding `csi:` to an already-provisioned cluster is just `tbx up`; switching or
-removing it is refused while the engine holds volumes. At the cluster level only
-`tbx cluster destroy` deletes data, and its confirmation reports the volume count — but
-`tbx node remove` deletes that node's disk along with any node-local volume data.
+removing it is refused while the engine holds volumes. Only `tbx cluster destroy` deletes
+data wholesale, and its confirmation reports the volume count. `tbx node remove` deletes that
+node's disk, so it is refused while the node holds the only copy of volume data
+(`--force` overrides); an unreachable cluster never blocks removal — it warns instead.
 
 Every imperative command prints the equivalent `talosbox.yaml` stanza. Alternatively, work
 declaratively from the start: write a `talosbox.yaml` and run `tbx up` (idempotent — it
