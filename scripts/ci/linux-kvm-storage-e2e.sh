@@ -306,4 +306,4 @@ kc delete namespace storage-e2e --wait
 "$root/bin/tbx" cluster destroy e2es --force
 cluster_cleanup_needed=false
 
-printf 'verified longhorn (3-node, 3 replicas) and local-path (single-node) PVC write/readback through the provisioning path\n'
+printf 'verified longhorn (1cp+2w, 2 replicas) and local-path (single-node) PVC write/readback through the provisioning path\n'

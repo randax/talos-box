@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
 	corev1 "k8s.io/api/core/v1"
@@ -290,7 +291,7 @@ func TestReplaceDriftedStorageClassDeletesOnlyOnImmutableParameterDrift(t *testi
 				createStorageLifecycleObjects(t, client, mapper, []unstructured.Unstructured{*tt.live})
 			}
 
-			err := replaceDriftedStorageClass(context.Background(), client, mapper, objects)
+			err := replaceDriftedStorageClass(context.Background(), client, mapper, objects, time.Millisecond)
 			if tt.wantErr == "" && err != nil {
 				t.Fatal(err)
 			}
@@ -303,6 +304,36 @@ func TestReplaceDriftedStorageClassDeletesOnlyOnImmutableParameterDrift(t *testi
 				t.Fatalf("StorageClass delete issued = %v, want %v", gotDelete, tt.wantDelete)
 			}
 		})
+	}
+}
+
+func TestReplaceDriftedStorageClassWaitsOutAsynchronousDeletion(t *testing.T) {
+	rendered := storageClassFixture("longhorn", map[string]any{"numberOfReplicas": "2"}, true)
+	live := storageClassFixture("longhorn", map[string]any{"numberOfReplicas": "3"}, true)
+	objects := []unstructured.Unstructured{*rendered}
+	client := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
+	mapper := storageLifecycleTestMapper(objects)
+
+	// Serve the drift-inspection get, then keep the object visible for two
+	// more gets after the delete — Kubernetes deletion is asynchronous, so a
+	// terminating StorageClass must not be treated as gone.
+	gets := 0
+	client.PrependReactor("get", "storageclasses", func(k8stesting.Action) (bool, runtime.Object, error) {
+		gets++
+		if gets <= 3 {
+			return true, live.DeepCopy(), nil
+		}
+		return true, nil, apierrors.NewNotFound(schema.GroupResource{Group: "storage.k8s.io", Resource: "storageclasses"}, "longhorn")
+	})
+
+	if err := replaceDriftedStorageClass(context.Background(), client, mapper, objects, time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if len(storageLifecycleDeleteActions(client.Actions())) == 0 {
+		t.Fatal("replaceDriftedStorageClass() issued no delete")
+	}
+	if gets < 4 {
+		t.Fatalf("replaceDriftedStorageClass() returned after %d gets, before deletion completed", gets)
 	}
 }
 
