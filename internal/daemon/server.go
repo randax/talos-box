@@ -444,6 +444,11 @@ func (s *Server) dispatchNodeMutation(request Request) Response {
 	s.opMu.Unlock()
 	unlockRemoval()
 	if err != nil {
+		if removalWarning != "" {
+			// the removal may have deleted state before failing; the data-loss
+			// note must reach the user alongside the failure
+			return failure(fmt.Errorf("%w (warning: %s)", err, removalWarning))
+		}
 		return failure(err)
 	}
 	if removalWarning != "" {

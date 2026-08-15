@@ -98,7 +98,7 @@ func removeNodeDataLossWarning(item cluster.Cluster, nodeName string, count int)
 
 func removeNodeUnverifiedDataWarning(item cluster.Cluster, nodeName string) string {
 	return fmt.Sprintf(
-		"removing node %s may permanently delete %s volume data; inspect persistent volumes manually if you need to keep it",
+		"node %s was removed without verifying %s volume data; any volume whose only copy lived on it is permanently deleted — verify your volumes once the cluster is reachable",
 		nodeName,
 		item.CSI,
 	)

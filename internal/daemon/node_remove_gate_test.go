@@ -168,7 +168,7 @@ func TestNodeRemoveProceedsWithWarningWhenVolumesAreUnverifiable(t *testing.T) {
 		t.Fatalf("node.remove with unverifiable volumes failed: %s", response.Error)
 	}
 	status := decodeNodeStatus(t, response)
-	if !strings.Contains(status.Warning, "demo-worker-2") || !strings.Contains(status.Warning, "may permanently delete") {
+	if !strings.Contains(status.Warning, "demo-worker-2") || !strings.Contains(status.Warning, "without verifying") {
 		t.Fatalf("unverifiable-remove warning %q does not state the possible data loss", status.Warning)
 	}
 }
@@ -188,8 +188,51 @@ func TestNodeRemoveSkipsVolumeObservationOnStoppedCluster(t *testing.T) {
 		t.Fatalf("node.remove on stopped cluster failed: %s", response.Error)
 	}
 	status := decodeNodeStatus(t, response)
-	if !strings.Contains(status.Warning, "may permanently delete") {
+	if !strings.Contains(status.Warning, "without verifying") {
 		t.Fatalf("stopped-cluster remove warning %q does not state the possible data loss", status.Warning)
+	}
+}
+
+func TestNodeRemoveObservationTimeoutDegradesToWarning(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 2)
+	stubNodeMutationReconcile(service)
+	lifecycleContext, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	service.lifecycleContext = lifecycleContext
+	service.nodeVolumeCount = func(ctx context.Context, _ cluster.Cluster, _ string) (int, error) {
+		<-ctx.Done()
+		return 0, ctx.Err()
+	}
+
+	start := time.Now()
+	response := dispatchNodeRemove(t, service, item.Name, "demo-worker-2", false)
+
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("node.remove blocked %v on a hanging observation", elapsed)
+	}
+	if !response.OK {
+		t.Fatalf("node.remove with a hanging observation failed: %s", response.Error)
+	}
+	if status := decodeNodeStatus(t, response); !strings.Contains(status.Warning, "without verifying") {
+		t.Fatalf("timeout-remove warning %q does not state the possible data loss", status.Warning)
+	}
+}
+
+func TestNodeRemoveLegacyArgsWithoutForceStillGate(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 2)
+	service.nodeVolumeCount = func(context.Context, cluster.Cluster, string) (int, error) {
+		return 1, nil
+	}
+
+	// a pre-gate CLI sends no force field at all; the zero value must gate
+	raw := json.RawMessage(`{"cluster":"` + item.Name + `","name":"demo-worker-2"}`)
+	response := service.dispatch(Request{Op: "node.remove", Args: raw})
+
+	if response.OK {
+		t.Fatal("legacy node.remove args bypassed the volume gate")
+	}
+	if !strings.Contains(response.Error, "--force") {
+		t.Fatalf("legacy-args refusal %q does not name the way forward", response.Error)
 	}
 }
 
