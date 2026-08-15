@@ -84,8 +84,14 @@ TCP 50000, Reader role for `talosctl --insecure`); `apply-config` lands in ~10 s
 reboot and zero network; a configured node cold-boots in ~16 s. The ISO+install path is
 dropped.
 
-- Cache: `~/.talosbox/cache/<schematic>/<version>/<architecture>/` — `tbx cache pull` (eager, pre-venue),
-  `tbx cache prune`.
+- Cache: `~/.talosbox/cache/` stores Talos disk images by
+  `<schematic>/<version>/<architecture>/` and registry-mirror content separately. `tbx cache pull`
+  fetches a Talos disk eagerly. `tbx cache warm <list>...` prepares registry content from one or
+  more lists (use `-` for stdin once); blank lines and `#` comments are ignored. Each entry is a
+  fully qualified image reference with a non-`latest` tag or a `sha256`/`sha512` digest; a
+  tag-plus-digest entry is the immutable list form. `tbx cache warm --check [--deep] <list>...`
+  verifies that content locally and offline; `--deep` also rehashes blobs and requires `--check`.
+  This verifies cache completeness, not a live-cluster pull.
 - Node disks: `~/.talosbox/clusters/<name>/<node>.img`, **20 GB sparse** default.
 - **Talos version matrix**: each tbx release pins one tested default Talos version (initially
   v1.13.6, the validated one); `talosbox.yaml` may override `talos.version` and
@@ -155,7 +161,10 @@ physical/VPN interfaces and distinct gateways share the fixed ports without conf
 printed machine configs set Talos `machine.registries.mirrors."*"` to a single endpoint
 `http://172.30.<n>.1:5059` with `skipFallback: true`; legacy fixed listeners on `5055–5058`
 remain only so older clusters keep working until they are recreated. Mirror storage lives in
-the cache and doubles as the offline-venue answer.
+the cache and doubles as the offline-venue answer. `tbx mirror offline` reports its current
+mode; `tbx mirror offline on` permits cached responses only and rejects cache misses without
+upstream fallback, while `tbx mirror offline off` restores pull-through behavior. Mirror content
+is shared cache state, not cluster state: it survives cluster destruction and recreation.
 
 **Reachability guarantees** (the tested surface): host ↔ node IPs; host ↔ LB VIPs (L2 or BGP);
 **cluster ↔ cluster** (nodes and VIPs) through the host as inter-subnet router — first-class,
@@ -222,8 +231,18 @@ tbx snapshot create|restore|list|delete <cluster> [name]
 tbx status [cluster]      tbx manifests <cluster>
 tbx console <cluster> <node>
 tbx bgp enable|disable <cluster>
-tbx cache pull|prune      tbx doctor      tbx system install|uninstall
+tbx mirror offline [on|off]
+tbx cache pull [--talos-version VERSION --schematic ID]
+tbx cache warm [--check [--deep]] <list-file> [<list-file>...]
+tbx cache list
+tbx cache prune [--mirror|--all]
+tbx doctor      tbx system install|uninstall
 ```
+
+`tbx cache list` reports Talos disk images and mirror-cache totals. Cache pruning is
+scope-limited: without a flag it removes disk images only and leaves mirror content intact;
+`--mirror` removes mirror content only; `--all` removes both. These are the only cache-prune
+scopes.
 
 Schema (v1):
 

@@ -164,7 +164,7 @@ func TestCatchAllMirrorRoutesByNamespaceCachesUnderUpstreamAndMapsDockerIO(t *te
 		t.Fatalf("docker.io upstream host = %v, want registry-1.docker.io", got)
 	}
 
-	manifestCache := filepath.Join(cacheRoot, "docker.io", "manifests", "app_manifests_latest")
+	manifestCache := NewServer("https://registry-1.docker.io", filepath.Join(cacheRoot, "docker.io")).manifestPath("/v2/app/manifests/latest")
 	if _, err := os.Stat(manifestCache); err != nil {
 		t.Fatalf("manifest cache missing at %s: %v", manifestCache, err)
 	}
@@ -1262,7 +1262,7 @@ func TestFreshManagerOfflineCorruptCachedDigestFailsWithoutNetworkAndOnlineRefet
 	}
 	warm.Close()
 
-	corruptPath := filepath.Join(cacheRoot, "docker.io", "manifests", "app_manifests_"+validDigest)
+	corruptPath := NewServer("https://registry-1.docker.io", filepath.Join(cacheRoot, "docker.io")).manifestPath("/v2/app/manifests/" + validDigest)
 	if err := os.WriteFile(corruptPath, []byte("corrupt-manifest"), 0o644); err != nil {
 		t.Fatal(err)
 	}

@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -35,7 +34,7 @@ func TestRunCacheWarmCheckRequestsOfflineVerification(t *testing.T) {
 	}
 
 	done := make(chan struct{})
-	go serveSingleDaemonRequest(t, listener, func(request daemon.Request) daemon.Response {
+	go serveDaemonRequests(t, listener, 1, func(_ int, request daemon.Request) daemon.Response {
 		if request.Op != "cache.check" {
 			t.Fatalf("request op = %q, want cache.check", request.Op)
 		}
@@ -95,7 +94,7 @@ func TestRunCacheWarmCheckDeepRequestsDeepVerification(t *testing.T) {
 	}
 
 	done := make(chan struct{})
-	go serveSingleDaemonRequest(t, listener, func(request daemon.Request) daemon.Response {
+	go serveDaemonRequests(t, listener, 1, func(_ int, request daemon.Request) daemon.Response {
 		var args daemon.CacheCheckArgs
 		if err := json.Unmarshal(request.Args, &args); err != nil {
 			t.Fatal(err)
@@ -156,7 +155,7 @@ func TestRunCacheWarmCheckReadsFilesAndStdinThenPrintsMixedSummary(t *testing.T)
 	}
 
 	done := make(chan struct{})
-	go serveSingleDaemonRequest(t, listener, func(request daemon.Request) daemon.Response {
+	go serveDaemonRequests(t, listener, 3, func(index int, request daemon.Request) daemon.Response {
 		if request.Op != "cache.check" {
 			t.Fatalf("request op = %q, want cache.check", request.Op)
 		}
@@ -165,18 +164,17 @@ func TestRunCacheWarmCheckReadsFilesAndStdinThenPrintsMixedSummary(t *testing.T)
 			t.Fatal(err)
 		}
 		wantRefs := []string{firstRef, secondRef, thirdRef}
-		if fmt.Sprint(args.Refs) != fmt.Sprint(wantRefs) {
-			t.Fatalf("refs = %v, want %v", args.Refs, wantRefs)
+		if len(args.Refs) != 1 || args.Refs[0] != wantRefs[index] {
+			t.Fatalf("refs = %v, want [%q]", args.Refs, wantRefs[index])
 		}
-		return daemon.Response{OK: true, Data: mustJSON(t, daemon.CacheCheckResult{
-			Entries: []daemon.CacheCheckEntry{
-				{Ref: firstRef, Status: daemon.CacheCheckStatusComplete},
-				{Ref: secondRef, Status: daemon.CacheCheckStatusFailed, Reason: "blob sha256:deadbeef not cached"},
-				{Ref: thirdRef, Status: daemon.CacheCheckStatusComplete},
-			},
-			Complete: 2,
-			Failed:   1,
-		})}
+		result := daemon.CacheCheckResult{Entries: []daemon.CacheCheckEntry{{Ref: wantRefs[index], Status: daemon.CacheCheckStatusComplete}}, Complete: 1}
+		if index == 1 {
+			result.Entries[0].Status = daemon.CacheCheckStatusFailed
+			result.Entries[0].Reason = "blob sha256:deadbeef not cached"
+			result.Complete = 0
+			result.Failed = 1
+		}
+		return daemon.Response{OK: true, Data: mustJSON(t, result)}
 	}, done)
 
 	var stdout, stderr bytes.Buffer
@@ -240,15 +238,22 @@ func TestRunCacheWarmCheckReportsEveryRefBeforeFailing(t *testing.T) {
 	}
 
 	done := make(chan struct{})
-	go serveSingleDaemonRequest(t, listener, func(request daemon.Request) daemon.Response {
-		return daemon.Response{OK: true, Data: mustJSON(t, daemon.CacheCheckResult{
-			Entries: []daemon.CacheCheckEntry{
-				{Ref: refs[0], Status: daemon.CacheCheckStatusFailed, Reason: "blob missing"},
-				{Ref: refs[1], Status: daemon.CacheCheckStatusComplete},
-			},
-			Complete: 1,
-			Failed:   1,
-		})}
+	go serveDaemonRequests(t, listener, len(refs), func(index int, request daemon.Request) daemon.Response {
+		var args daemon.CacheCheckArgs
+		if err := json.Unmarshal(request.Args, &args); err != nil {
+			t.Fatal(err)
+		}
+		if len(args.Refs) != 1 || args.Refs[0] != refs[index] {
+			t.Fatalf("refs = %v, want [%q]", args.Refs, refs[index])
+		}
+		result := daemon.CacheCheckResult{Entries: []daemon.CacheCheckEntry{{Ref: refs[index], Status: daemon.CacheCheckStatusComplete}}, Complete: 1}
+		if index == 0 {
+			result.Entries[0].Status = daemon.CacheCheckStatusFailed
+			result.Entries[0].Reason = "blob missing"
+			result.Complete = 0
+			result.Failed = 1
+		}
+		return daemon.Response{OK: true, Data: mustJSON(t, result)}
 	}, done)
 
 	var stdout, stderr bytes.Buffer

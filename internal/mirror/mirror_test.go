@@ -773,7 +773,7 @@ func TestManifestPathCanonicalizesSupportedDigestCase(t *testing.T) {
 	}
 }
 
-func TestManifestPathLeavesTagAndUnsupportedDigestLikeRefsUnchanged(t *testing.T) {
+func TestManifestPathUsesVersionedKeyForTagsAndUnsupportedDigestLikeRefs(t *testing.T) {
 	cacheDir := t.TempDir()
 	server := NewServer("https://registry.example", cacheDir)
 
@@ -782,10 +782,118 @@ func TestManifestPathLeavesTagAndUnsupportedDigestLikeRefsUnchanged(t *testing.T
 		"/v2/app/manifests/md5:" + strings.ToUpper(strings.Repeat("ab", 16)),
 		"/v2/app/manifests/sha256:ABCD",
 	} {
-		want := filepath.Join(cacheDir, "manifests", strings.ReplaceAll(strings.TrimPrefix(path, "/v2/"), "/", "_"))
-		if got := server.manifestPath(path); got != want {
-			t.Fatalf("manifestPath(%q) = %q, want %q", path, got, want)
+		got := server.manifestPath(path)
+		if filepath.Dir(got) != filepath.Join(cacheDir, "manifests") || !strings.HasPrefix(filepath.Base(got), "v2-") {
+			t.Fatalf("manifestPath(%q) = %q, want versioned manifest cache key", path, got)
 		}
+	}
+}
+
+func TestLegacyManifestMigrationDoesNotTrustTagsAndVerifiesDigests(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		requestPath string
+		legacyPath  string
+		body        string
+		wantStatus  int
+	}{
+		{
+			name:        "tag is ignored",
+			requestPath: "/v2/a_b/manifests/latest",
+			legacyPath:  "/v2/a/b/manifests/latest",
+			body:        `{"schemaVersion":2,"repository":"a/b"}`,
+			wantStatus:  http.StatusServiceUnavailable,
+		},
+		{
+			name:        "verified digest replays",
+			requestPath: "/v2/a_b/manifests/sha256:bafebd36189ad3688b7b3915ea55d461e0bfcfbdde11e54b0a123999fb6be50f",
+			legacyPath:  "/v2/a/b/manifests/sha256:bafebd36189ad3688b7b3915ea55d461e0bfcfbdde11e54b0a123999fb6be50f",
+			body:        `{"schemaVersion":2}`,
+			wantStatus:  http.StatusOK,
+		},
+		{
+			name:        "mismatched digest is rejected",
+			requestPath: "/v2/a_b/manifests/sha256:bafebd36189ad3688b7b3915ea55d461e0bfcfbdde11e54b0a123999fb6be50f",
+			legacyPath:  "/v2/a/b/manifests/sha256:bafebd36189ad3688b7b3915ea55d461e0bfcfbdde11e54b0a123999fb6be50f",
+			body:        `{"schemaVersion":2,"not":"the requested digest"}`,
+			wantStatus:  http.StatusServiceUnavailable,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := NewServer("https://registry.example", t.TempDir())
+			legacyPath := server.legacyManifestPath(test.legacyPath)
+			if err := os.MkdirAll(filepath.Dir(legacyPath), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(legacyPath, []byte(test.body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			server.setOfflineMode(true)
+			mirror := httptest.NewServer(server)
+			defer mirror.Close()
+
+			resp, body := get(t, mirror.URL+test.requestPath)
+			if resp.StatusCode != test.wantStatus {
+				t.Fatalf("legacy replay = %d %q, want %d", resp.StatusCode, body, test.wantStatus)
+			}
+			if test.wantStatus == http.StatusOK && body != test.body {
+				t.Fatalf("legacy digest body = %q, want %q", body, test.body)
+			}
+		})
+	}
+}
+
+func TestDistinctRepositoryManifestTagsDoNotCrossServeWhenUnavailable(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		unavailable func(*Server, *httptest.Server)
+		wantStatus  int
+	}{
+		{
+			name: "offline",
+			unavailable: func(server *Server, _ *httptest.Server) {
+				server.setOfflineMode(true)
+			},
+			wantStatus: http.StatusServiceUnavailable,
+		},
+		{
+			name: "upstream failure",
+			unavailable: func(_ *Server, upstream *httptest.Server) {
+				upstream.Close()
+			},
+			wantStatus: http.StatusBadGateway,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const cachedBody = `{"schemaVersion":2,"repository":"a/b"}`
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/v2/a/b/manifests/latest" {
+					http.NotFound(w, r)
+					return
+				}
+				w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+				_, _ = fmt.Fprint(w, cachedBody)
+			}))
+			defer upstream.Close()
+
+			server := newLoopbackMirrorServer(t, upstream.URL, t.TempDir())
+			mirror := httptest.NewServer(server)
+			defer mirror.Close()
+
+			resp, body := get(t, mirror.URL+"/v2/a/b/manifests/latest")
+			if resp.StatusCode != http.StatusOK || body != cachedBody {
+				t.Fatalf("warm a/b: status = %d, body = %q", resp.StatusCode, body)
+			}
+
+			test.unavailable(server, upstream)
+			resp, body = get(t, mirror.URL+"/v2/a_b/manifests/latest")
+			if resp.StatusCode != test.wantStatus {
+				t.Fatalf("a_b while unavailable: status = %d, want %d; body = %q", resp.StatusCode, test.wantStatus, body)
+			}
+			if body == cachedBody {
+				t.Fatalf("a_b received cached a/b manifest %q", body)
+			}
+		})
 	}
 }
 
