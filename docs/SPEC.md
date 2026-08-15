@@ -95,8 +95,13 @@ because both backends expose the Talos console as virtio `hvc0`. **Both args are
 ordered**: Factory's extraKernelArgs *replace* the image's default console args, and
 `console=hvc0` alone bricks the boot under vz (verified: no boot, no output; with
 `console=tty0 console=hvc0` the node boots and streams kernel+machined logs on hvc0 — gate G6,
-closed). Schematics are content-addressed, so this is one deterministic POST to
-`factory.talos.dev/schematics`; user-supplied schematics get the args appended the same way.
+closed). The default schematic also bakes in the always-on storage extensions
+`siderolabs/iscsi-tools` and `siderolabs/util-linux-tools` (#171). Schematics are
+content-addressed, so this is one deterministic POST to `factory.talos.dev/schematics`.
+User-supplied schematic ids are opaque and used **verbatim** — neither the kernel args nor the
+storage extensions are appended (an earlier revision of this spec claimed otherwise; corrected
+per [#194](https://github.com/randax/talos-box/issues/194)). §4a specifies how curated
+extensions re-compose a user schematic.
 Per schematic + Talos version + target hypervisor architecture, `tbx` downloads Image Factory's
 `metal-arm64.raw.xz` or `metal-amd64.raw.xz` once into the cache and decompresses it. macOS
 provisions each node disk as an APFS `clonefile` clone; Linux currently copies the cached raw
@@ -115,9 +120,76 @@ end-to-end timing and cluster-up gate remains #97. The ISO+install path is dropp
   verifies that content locally and offline; `--deep` also rehashes blobs and requires `--check`.
   This verifies cache completeness, not a live-cluster pull.
 - Node disks: `~/.talosbox/clusters/<name>/<node>.img`, **20 GB sparse** default.
-- **Talos version matrix**: each tbx release pins one tested default Talos version (initially
-  v1.13.6, the validated one); `talosbox.yaml` may override `talos.version` and
-  `talos.schematic` per file. Only the pinned default is CI-verified.
+- **Talos version and extensions**: per-cluster, chosen at create — §4a.
+
+## 4a. Talos version and curated extensions
+
+(All decisions on the
+[version/extensions wayfinder map](https://github.com/randax/talos-box/issues/190); each
+paragraph links its ticket.)
+
+Every cluster chooses its Talos version, schematic, and curated extensions **at create**,
+immutable thereafter; different clusters on one host may run different versions. In-place
+Talos upgrades are out of scope (map #190). `talosbox.yaml` carries the file-level
+`talos: {version, schematic, extensions}` block as an **inheritable default**, and each
+cluster entry may carry its own; precedence is **field-wise** — an unset per-cluster field
+inherits the file-level value, a set field overrides it, and lists override rather than
+concatenate, so `extensions: []` is a meaningful opt-out
+([#195](https://github.com/randax/talos-box/issues/195)).
+
+**Version policy** ([#196](https://github.com/randax/talos-box/issues/196)): each tbx release
+pins `DefaultTalosVersion` (tested; the per-PR KVM e2e boots it) and `MinTalosVersion` — the
+default's **previous minor** — as a hard floor, dragged up in the same diff whenever the
+default bumps a minor. The floor is tbx's own check: machinery's `ParseContractFromVersion`
+is purely syntactic and silently generates wrong-shaped configs for out-of-range versions, so
+both the CLI and the daemon (`resolveImage`, and the contract parse in
+`internal/provision/reconcile.go`) must refuse below-floor or malformed versions with an error
+naming the requested and minimum versions. Versions in `[floor, default]` pass silently; above
+the default, one warning line at create ("newer than last tested"), never repeated in
+`status`. A **scheduled CI lane** boots a floor-version cluster and runs the curated-extension
+probes there; its failure blocks releases, not merges. CI also asserts machinery still carries
+a contract for the pinned floor.
+
+**Curated extensions** ([#193](https://github.com/randax/talos-box/issues/193)): a fixed,
+tbx-tested set — initially `qemu-guest-agent`, `gvisor`, `nfs-utils` — referenced by **bare
+short name** and purely additive on top of the always-on storage extensions. Membership
+requires a functional probe in the cluster e2e: guest-ping over the qga socket, a
+`runtimeClassName: runsc` pod, an NFSv3 mount+lock test. An extension that cannot function on
+a host substrate (qemu-guest-agent on macOS vz) is **capability-gated**, not rejected: baked
+anyway, gate reported unavailable-with-reason in `status`/`doctor`, so config files stay
+portable across hosts. Validation is two-stage
+([#195](https://github.com/randax/talos-box/issues/195)): unknown names are rejected locally
+against the curated set (offline-safe, near-miss suggestions); version availability is checked
+online against the Factory catalog (`GET /version/{v}/extensions/official`), with catalog
+descriptions in the error. Already-cached composed images are never re-validated. Arbitrary
+extension lists remain unsupported; `talos.schematic` stays the escape hatch.
+
+**Re-composition** ([#194](https://github.com/randax/talos-box/issues/194)): when a cluster
+sets both `schematic:` and `extensions:`, tbx fetches the schematic's definition
+(`GET /schematics/{id}` — image-factory ≥ v1.0.0, irrelevant while the factory URL is a
+constant), merges **only** the requested curated extensions (deduped; no kernel args or
+storage extensions injected — a brought schematic stays sovereign), and POSTs for the composed
+id; content addressing makes the resolution deterministic. Online, a failed fetch hard-fails
+the create — requested extensions are never silently dropped. `tbx cache pull` performs
+re-composition while online and caches under the composed id, so offline creates from cache
+never touch the factory. Cluster state persists the **composed id plus the original inputs**
+for legible `status` and future drift detection.
+
+**Cache retention** ([#197](https://github.com/randax/talos-box/issues/197)): nothing is ever
+deleted automatically. `tbx cache prune` (no flag) becomes **reference-aware**: it removes
+disk-image combinations referenced by no persisted cluster, keeping the built-in default combo
+and every combo **pinned** by an explicit `cache pull`, and lists sizes before deleting;
+`--all` remains the sledgehammer. Flagless file-aware `cache pull` resolves every cluster's
+combination from `talosbox.yaml`, pulls each distinct one, and afterwards **reports** strays
+(pinned combos referenced by neither a cluster nor the current file) — pull never deletes.
+`tbx cache list` grows a status column: pinned / in-use / orphan.
+
+Implementation notes carried from the tickets: add the `org.qemu.guest_agent.0` virtserialport
+to the QEMU device graph (virtio-serial is currently `max_ports=1`, console-only); collapse
+the duplicate hardcoded version literal in `internal/provision/reconcile.go` onto
+`daemon.DefaultTalosVersion`; update the README's bring-your-own-CSI and cache-prune wording
+when this ships (the README describes implemented behavior, so it changes with the code, not
+with this spec).
 
 ## 5. Networking
 
@@ -286,29 +358,36 @@ tbx status [cluster]      tbx manifests <cluster>
 tbx console <cluster> <node>
 tbx bgp enable|disable <cluster>
 tbx mirror offline [on|off]
-tbx cache pull [--talos-version VERSION --schematic ID]
+tbx cache pull [--talos-version VERSION --schematic ID --extensions a,b,c]
 tbx cache warm [--check [--deep]] <list-file> [<list-file>...]
 tbx cache list
 tbx cache prune [--mirror|--all]
 tbx doctor      tbx system install|uninstall
 ```
 
-`tbx cache list` reports Talos disk images and mirror-cache totals. Cache pruning is
-scope-limited: without a flag it removes disk images only and leaves mirror content intact;
-`--mirror` removes mirror content only; `--all` removes both. These are the only cache-prune
-scopes.
+`tbx cluster create` accepts the matching `--talos-version`, `--schematic`, and
+`--extensions a,b,c` flags (one comma-separated list). Flagless `tbx cache pull` is
+file-aware — it resolves and pulls every cluster's combination (§4a). `tbx cache list` reports
+Talos disk images (with pinned / in-use / orphan status) and mirror-cache totals. Cache pruning
+is scope-limited: without a flag it removes only **unreferenced, unpinned** disk images (§4a)
+and leaves mirror content intact; `--mirror` removes mirror content only; `--all` removes
+both. These are the only cache-prune scopes.
 
 Schema (v1):
 
 ```yaml
 version: 1
-talos:
+talos:                    # file-level default; clusters inherit field-wise (§4a)
   version: v1.13.6        # optional; defaults to the release's pinned version
   schematic: ""           # optional Image Factory schematic id
+  extensions: []          # optional curated extension short names
 clusters:
   - name: demo
     controlPlanes: 1
     workers: 2
+    talos:                # optional per-cluster override; set fields win, lists override
+      version: v1.13.6
+      extensions: [qemu-guest-agent]
     bgp: false
     domain: lab.internal   # optional cluster domain; default <name>.k8s.test
     allowUnsafeDomain: false # explicit opt-in for domains that can shadow real DNS
@@ -341,8 +420,8 @@ exact Longhorn values and renderer-derived namespace, CRD, and post-CRD object s
 local-path namespace and object streams, that tbx applies; use `storage-machine`,
 `storage-values`, `storage-namespaces`, `storage-crds`, and `storage-objects` as the clean
 hand-application streams described in the output. Bring-your-own CSI is unsupported above the substrate. Engines needing extensions
-beyond the default schematic use the existing `talos.schematic` override; tbx does not compose
-schematics from extension lists.
+beyond the curated set (§4a) use the existing `talos.schematic` override; curated extensions
+are the only lists tbx composes into schematics.
 
 For a hand-managed substrate-only CSI, save `tbx manifests <cluster> storage-machine > storage-machine.yaml`
 and apply the resulting patch to **every node** with `talosctl patch mc -p @storage-machine.yaml --nodes
@@ -432,10 +511,12 @@ Implementation must close these before v1 ships:
 
 - Research: `docs/research/` on branches `research/hypervisor-stack`,
   `research/talos-boot-mechanics`, `research/macos-networking-substrate`,
-  `research/qemu-qmp-parity`, `research/linux-l2-bgp-vip`, and
-  `research/distro-packaging-lsm`
+  `research/qemu-qmp-parity`, `research/linux-l2-bgp-vip`,
+  `research/distro-packaging-lsm`, `research/factory-api`, and
+  `research/curated-extensions`
 - Prototypes: `prototypes/talos-vz-boot/` on branches `prototype/talos-vz-boot` (boot
   validation) and `prototype/vmnet-arp` (ARP filter, Alpine serial harness, raw-image and
   registry experiments)
-- Decision indexes: [macOS wayfinder map](https://github.com/randax/talos-box/issues/1) and
-  [Linux parity map](https://github.com/randax/talos-box/issues/71)
+- Decision indexes: [macOS wayfinder map](https://github.com/randax/talos-box/issues/1),
+  [Linux parity map](https://github.com/randax/talos-box/issues/71), and the
+  [Talos version & extensions map](https://github.com/randax/talos-box/issues/190)
