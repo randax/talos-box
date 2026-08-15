@@ -56,7 +56,7 @@ func TestRunManifestsStorageInspectionUsesClusterTopology(t *testing.T) {
 	)
 	for _, want := range []string{
 		"# Storage machine-config prerequisite patch",
-		"defaultClassReplicaCount: 3",
+		"defaultClassReplicaCount: 2",
 		"kind: StorageClass",
 	} {
 		if !strings.Contains(stdout, want) {

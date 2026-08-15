@@ -209,6 +209,36 @@ func TestHintsKeepSingleNodeLonghornWarningAlongsideNetworkingHints(t *testing.T
 	}
 }
 
+func TestHintsReportLonghornRedundancyByStorageNodeCount(t *testing.T) {
+	controlPlane := NodeStatus{Name: "demo-cp-1", Role: cluster.RoleControlPlane, Phase: PhaseConfigured, IP: "172.30.0.2"}
+	worker1 := NodeStatus{Name: "demo-worker-1", Role: cluster.RoleWorker, Phase: PhaseConfigured, IP: "172.30.0.3"}
+	worker2 := NodeStatus{Name: "demo-worker-2", Role: cluster.RoleWorker, Phase: PhaseConfigured, IP: "172.30.0.4"}
+	tests := []struct {
+		name  string
+		nodes []NodeStatus
+		want  bool
+	}{
+		{name: "one worker holds the only replica", nodes: []NodeStatus{controlPlane, worker1}, want: true},
+		{name: "two workers replicate", nodes: []NodeStatus{controlPlane, worker1, worker2}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status := ClusterStatus{
+				Name:               "demo",
+				ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILonghorn},
+				Running:            true,
+				KubernetesReady:    true,
+				StoragePhase:       StoragePhaseLive,
+				Nodes:              tt.nodes,
+			}
+			got := strings.Contains(strings.Join(Hints(status), "\n"), "no redundancy")
+			if got != tt.want {
+				t.Fatalf("no-redundancy hint present = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestHintsSuppressSingleNodeLonghornWarningUntilStorageIsLive(t *testing.T) {
 	node := NodeStatus{
 		Name: "demo-cp-1", Role: cluster.RoleControlPlane, Phase: PhaseConfigured, IP: "172.30.0.2",

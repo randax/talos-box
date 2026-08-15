@@ -329,21 +329,24 @@ clusters:
     worker: {}
 ```
 
-**Curated storage semantics.** `csi:` is a flat scalar and rejects any value without a curated
+**Curated CSI semantics.** `csi:` is a flat scalar and rejects any value without a curated
 `cni:` before anything mutates. Longhorn (pinned v1-series) is the multinode engine; local-path
 (pinned) is the lightweight single-node option. Both keep their data under `/var` on the node
 disks, mark their StorageClass as the cluster default, and derive everything else from cluster
-facts: Longhorn's replica count is the node count capped at 3. Storage counts as **live** only
+facts: Longhorn's replica count follows the nodes that can host replicas — the workers, or the
+control planes of a worker-less cluster (which tbx makes schedulable) — capped at 3, so volumes
+are healthy by construction rather than pinned above what can ever schedule. Storage counts as **live** only
 after a real end-state probe — a bare PVC binds against the default StorageClass, a writer pod
 writes, a reader pod reads the data back, and the probe objects are cleaned up. Until then
 `tbx status` reports storage as **provisioning**; a single-node Longhorn cluster gains a
 status hint that its volumes have no redundancy, and choosing Longhorn on a memory-tight host
 prints a soft pre-flight warning (never a hard gate). Storage is ordinary provisioned state —
 `tbx up` converges the storage stage from any interruption and `tbx down`/restarts preserve
-volume data. tbx never deletes user data except by `tbx cluster destroy`: switching or removing
-`csi:` is allowed only while the engine holds zero volumes (hard error otherwise), and the
-destroy confirmation reports a best-effort volume count without ever blocking the destroy of an
-unreachable cluster.
+volume data. Cluster-level operations never delete user data except `tbx cluster destroy`:
+switching or removing `csi:` is allowed only while the engine holds zero volumes (hard error
+otherwise), and the destroy confirmation reports a best-effort volume count without ever
+blocking the destroy of an unreachable cluster. `tbx node remove` deletes that node's disk, and
+node-local data — local-path volumes, unreplicated Longhorn replicas — goes with it.
 
 ## 10. Guided output
 

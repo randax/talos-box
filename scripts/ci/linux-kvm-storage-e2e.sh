@@ -30,7 +30,7 @@ helper_socket=""
 helper_pid=""
 daemon_pid=""
 cluster_cleanup_needed=false
-diagnostics_cluster=e2e-storage
+
 dump_failure_diagnostics() (
   trap - ERR
   set +e
@@ -44,9 +44,9 @@ dump_failure_diagnostics() (
   daemon_ready=false
   if [[ -n "$daemon_pid" && -n "$home" && -S "$home/.talosbox/tbxd.sock" ]] && kill -0 "$daemon_pid" 2>/dev/null; then
     daemon_ready=true
-    HOME="$home" TBX_HELPER_SOCKET="$helper_socket" "$root/bin/tbx" status "$diagnostics_cluster" --quiet -o json >&2
+    HOME="$home" TBX_HELPER_SOCKET="$helper_socket" "$root/bin/tbx" status e2e-storage --quiet -o json >&2
   fi
-  kubeconfig="$home/.talosbox/clusters/$diagnostics_cluster/kubeconfig"
+  kubeconfig="$home/.talosbox/clusters/e2e-storage/kubeconfig"
   if [[ -f "$kubeconfig" ]]; then
     printf '\n===== cluster workloads =====\n' >&2
     kubectl --kubeconfig "$kubeconfig" get nodes -o wide >&2
@@ -68,9 +68,9 @@ dump_failure_diagnostics() (
   if [[ "$daemon_ready" == true && -x "$root/bin/tbx" ]]; then
     while read -r node; do
       [[ -n "$node" ]] || continue
-      printf '\n===== console %s/%s =====\n' "$diagnostics_cluster" "$node" >&2
-      timeout 3s "$root/bin/tbx" console "$diagnostics_cluster" "$node" </dev/null >&2
-    done < <(HOME="$home" TBX_HELPER_SOCKET="$helper_socket" "$root/bin/tbx" status "$diagnostics_cluster" --quiet -o json | jq -r '.[0].nodes[].name')
+      printf '\n===== console %s/%s =====\n' e2e-storage "$node" >&2
+      timeout 3s "$root/bin/tbx" console e2e-storage "$node" </dev/null >&2
+    done < <(HOME="$home" TBX_HELPER_SOCKET="$helper_socket" "$root/bin/tbx" status e2e-storage --quiet -o json | jq -r '.[0].nodes[].name')
   fi
   printf '\n===== end diagnostics =====\n' >&2
 )
@@ -91,23 +91,7 @@ cleanup() {
 trap cleanup EXIT
 trap dump_failure_diagnostics ERR
 
-if [[ -n ${TBX_E2E_WORKDIR:-} ]]; then
-  scratch_parent=$(dirname "$TBX_E2E_WORKDIR")
-  usable_scratch "$scratch_parent" || {
-    printf 'TBX_E2E_WORKDIR parent %s is not suitable scratch\n' "$scratch_parent" >&2
-    exit 1
-  }
-  workdir=$TBX_E2E_WORKDIR
-  [[ ! -e "$workdir" ]] || {
-    printf 'refusing to reuse existing TBX_E2E_WORKDIR %s\n' "$workdir" >&2
-    exit 1
-  }
-  mkdir "$workdir"
-else
-  workdir=$(mktemp -d "$(select_scratch)/talosbox-kvm-storage-e2e.XXXXXX")
-fi
-touch "$workdir/.talosbox-e2e-owned"
-workdir_owned=true
+prepare_workdir "talosbox-kvm-storage-e2e.XXXXXX"
 
 home="$workdir/home"
 helper_socket="$workdir/tbx-helper.sock"
@@ -209,6 +193,11 @@ spec:
 EOF
   retry "writer pod completion" 120 5 pod_succeeded writer
   [[ "$(kc get pvc probe -n storage-e2e -o jsonpath='{.status.phase}')" == Bound ]]
+  # Engine-specific assertions run while the writer still holds the volume
+  # attached — longhorn robustness reads "unknown" on a detached volume.
+  if [[ $# -gt 0 ]]; then
+    "$@"
+  fi
   kc delete pod writer -n storage-e2e --wait
   kc apply -f - <<'EOF'
 apiVersion: v1
@@ -236,16 +225,29 @@ EOF
   retry "reader pod readback" 120 5 pod_succeeded reader
 }
 
-# Replicas derive from node count capped at 3, so this 3-node cluster must
-# replicate the probe volume exactly 3 times.
+# Replicas derive from the nodes that can host them (workers, capped at 3), so
+# this 1cp+2w cluster must replicate the probe volume exactly twice — and the
+# volume must actually reach healthy robustness, proving every replica scheduled.
 assert_longhorn_replicas() {
   local replica_counts
   replica_counts=$(kc -n longhorn-system get volumes.longhorn.io -o json |
     jq -r '[.items[].spec.numberOfReplicas] | unique | join(",")')
-  if [[ "$replica_counts" != "3" ]]; then
-    printf 'longhorn volume numberOfReplicas = %q, want exactly "3"\n' "$replica_counts" >&2
+  if [[ "$replica_counts" != "2" ]]; then
+    printf 'longhorn volume numberOfReplicas = %q, want exactly "2"\n' "$replica_counts" >&2
     return 1
   fi
+}
+
+longhorn_volumes_healthy() {
+  local robustness
+  robustness=$(kc -n longhorn-system get volumes.longhorn.io -o json |
+    jq -r '[.items[].status.robustness] | unique | join(",")')
+  [[ "$robustness" == healthy ]]
+}
+
+assert_longhorn_replicated() {
+  assert_longhorn_replicas
+  retry "healthy longhorn volume robustness" 60 5 longhorn_volumes_healthy
 }
 
 longhorn_config="$workdir/talosbox-longhorn.yaml"
@@ -270,8 +272,7 @@ cluster_cleanup_needed=true
 retry "longhorn cluster provisioning" 3 10 "$root/bin/tbx" up -f "$longhorn_config" --force --quiet
 retry "longhorn storage live" 60 5 storage_live
 assert_default_storage_class longhorn
-verify_pvc_write_readback
-assert_longhorn_replicas
+verify_pvc_write_readback assert_longhorn_replicated
 kc delete namespace storage-e2e --wait
 "$root/bin/tbx" cluster destroy e2e-storage --force
 

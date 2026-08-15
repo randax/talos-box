@@ -41,6 +41,8 @@ require 'retry() {' "$lib"
 require 'wait_for_process_socket() {' "$lib"
 require 'select_scratch() {' "$lib"
 require 'usable_scratch() {' "$lib"
+require 'prepare_workdir() {' "$lib"
+require 'refusing to reuse existing TBX_E2E_WORKDIR' "$lib"
 require 'socket_ready() {' "$lib"
 require 'cat "$log_file" >&2' "$lib"
 require 'source "$root/scripts/ci/kvm-e2e-lib.sh"' "$harness"
@@ -92,6 +94,7 @@ require 'retry "local-path cluster provisioning"' "$storage_harness"
 require 'storagePhase' "$storage_harness"
 require 'is-default-class' "$storage_harness"
 require 'numberOfReplicas' "$storage_harness"
+require 'robustness' "$storage_harness"
 require 'cat /data/probe' "$storage_harness"
 require 'cluster destroy e2e-storage --force' "$storage_harness"
 require 'sha256sum --check --strict' "$storage_harness"
@@ -118,7 +121,7 @@ for checked_harness in "$harness" "$storage_harness"; do
   fi
 done
 require 'console e2e' "$harness"
-require 'console "$diagnostics_cluster"' "$storage_harness"
+require 'console e2e-storage' "$storage_harness"
 
 if grep -Fq -- 'setfacl' "$workflow" || grep -Fq -- ' acl' "$workflow"; then
   printf 'KVM access must come from the udev rule, not ACL setup\n' >&2

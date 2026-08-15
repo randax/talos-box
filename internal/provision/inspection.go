@@ -259,7 +259,7 @@ func storageInspectionValues(item cluster.Cluster) (string, error) {
 	if item.CSI != cluster.CSILonghorn {
 		return "", fmt.Errorf("cluster %q does not declare Longhorn storage values", item.Name)
 	}
-	return longhornValues(longhornReplicaCount(len(item.Nodes))), nil
+	return longhornValues(longhornReplicaCount(storageNodeCount(item))), nil
 }
 
 func storageInspectionObjects(item cluster.Cluster) (string, error) {

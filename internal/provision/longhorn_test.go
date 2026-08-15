@@ -19,7 +19,7 @@ import (
 )
 
 func TestRenderLonghornUsesPinnedChartAndImages(t *testing.T) {
-	item, err := cluster.New("demo", 0, 1, 2, cluster.NodeDefaults{})
+	item, err := cluster.New("demo", 0, 1, 3, cluster.NodeDefaults{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,19 +123,24 @@ func TestEmbeddedLonghornChartPinsEveryCuratedImage(t *testing.T) {
 	}
 }
 
-func TestRenderLonghornReplicasFollowNodeCount(t *testing.T) {
+func TestRenderLonghornReplicasFollowStorageNodeCount(t *testing.T) {
+	// Replicas can only live on nodes that host Longhorn: workers, or the
+	// control planes of a worker-less cluster (which tbx makes schedulable).
 	tests := []struct {
-		nodes int
-		want  string
+		controlPlanes int
+		workers       int
+		want          string
 	}{
-		{nodes: 1, want: "1"},
-		{nodes: 2, want: "2"},
-		{nodes: 3, want: "3"},
-		{nodes: 4, want: "3"},
+		{controlPlanes: 1, workers: 0, want: "1"},
+		{controlPlanes: 1, workers: 1, want: "1"},
+		{controlPlanes: 1, workers: 2, want: "2"},
+		{controlPlanes: 1, workers: 3, want: "3"},
+		{controlPlanes: 1, workers: 4, want: "3"},
+		{controlPlanes: 3, workers: 0, want: "3"},
 	}
 	for _, tt := range tests {
-		t.Run(fmt.Sprintf("%d-nodes", tt.nodes), func(t *testing.T) {
-			item, err := cluster.New("demo", 0, 1, tt.nodes-1, cluster.NodeDefaults{})
+		t.Run(fmt.Sprintf("%dcp-%dw", tt.controlPlanes, tt.workers), func(t *testing.T) {
+			item, err := cluster.New("demo", 0, tt.controlPlanes, tt.workers, cluster.NodeDefaults{})
 			if err != nil {
 				t.Fatal(err)
 			}

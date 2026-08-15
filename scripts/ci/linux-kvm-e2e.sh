@@ -78,23 +78,7 @@ cleanup() {
 trap cleanup EXIT
 trap dump_failure_diagnostics ERR
 
-if [[ -n ${TBX_E2E_WORKDIR:-} ]]; then
-  scratch_parent=$(dirname "$TBX_E2E_WORKDIR")
-  usable_scratch "$scratch_parent" || {
-    printf 'TBX_E2E_WORKDIR parent %s is not suitable scratch\n' "$scratch_parent" >&2
-    exit 1
-  }
-  workdir=$TBX_E2E_WORKDIR
-  [[ ! -e "$workdir" ]] || {
-    printf 'refusing to reuse existing TBX_E2E_WORKDIR %s\n' "$workdir" >&2
-    exit 1
-  }
-  mkdir "$workdir"
-else
-  workdir=$(mktemp -d "$(select_scratch)/talosbox-kvm-e2e.XXXXXX")
-fi
-touch "$workdir/.talosbox-e2e-owned"
-workdir_owned=true
+prepare_workdir "talosbox-kvm-e2e.XXXXXX"
 
 home="$workdir/home"
 helper_socket="$workdir/tbx-helper.sock"

@@ -35,6 +35,31 @@ select_scratch() {
   printf '%s\n' "$best"
 }
 
+# prepare_workdir honors TBX_E2E_WORKDIR (never reusing an existing path) or
+# picks the best scratch mount, then marks the directory as harness-owned.
+# Sets the caller's $workdir and $workdir_owned.
+prepare_workdir() {
+  local template=$1 scratch_parent
+  if [[ -n ${TBX_E2E_WORKDIR:-} ]]; then
+    scratch_parent=$(dirname "$TBX_E2E_WORKDIR")
+    usable_scratch "$scratch_parent" || {
+      printf 'TBX_E2E_WORKDIR parent %s is not suitable scratch\n' "$scratch_parent" >&2
+      exit 1
+    }
+    workdir=$TBX_E2E_WORKDIR
+    [[ ! -e "$workdir" ]] || {
+      printf 'refusing to reuse existing TBX_E2E_WORKDIR %s\n' "$workdir" >&2
+      exit 1
+    }
+    mkdir "$workdir"
+  else
+    workdir=$(mktemp -d "$(select_scratch)/$template")
+  fi
+  touch "$workdir/.talosbox-e2e-owned"
+  # shellcheck disable=SC2034 # read by the callers' cleanup traps
+  workdir_owned=true
+}
+
 retry() {
   local label=$1 attempts=$2 delay=$3 attempt
   shift 3
