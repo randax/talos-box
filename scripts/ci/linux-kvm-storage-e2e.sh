@@ -274,7 +274,7 @@ clusters:
       cpus: 1
 EOF
 cluster_cleanup_needed=true
-retry "longhorn cluster provisioning" 3 10 "$root/bin/tbx" up -f "$longhorn_config" --force --quiet
+retry "longhorn cluster provisioning" 2 10 "$root/bin/tbx" up -f "$longhorn_config" --force --quiet
 retry "longhorn storage live" 60 5 storage_live
 assert_default_storage_class longhorn
 verify_pvc_write_readback assert_longhorn_replicated
@@ -298,7 +298,7 @@ clusters:
       memory: 3GiB
       cpus: 2
 EOF
-retry "local-path cluster provisioning" 3 10 "$root/bin/tbx" up -f "$localpath_config" --force --quiet
+retry "local-path cluster provisioning" 2 10 "$root/bin/tbx" up -f "$localpath_config" --force --quiet
 retry "local-path storage live" 60 5 storage_live
 assert_default_storage_class local-path
 verify_pvc_write_readback

@@ -221,12 +221,19 @@ func renderMetalLB(item cluster.Cluster) ([]unstructured.Unstructured, error) {
 			result = append(result, object)
 		}
 	}
+	// The speaker and frr-k8s DaemonSets need hostNetwork and NET_ADMIN/NET_RAW,
+	// which Talos's default baseline PodSecurity rejects without these labels.
 	result = append([]unstructured.Unstructured{{Object: map[string]any{
 		"apiVersion": "v1",
 		"kind":       "Namespace",
 		"metadata": map[string]any{
-			"name":   metalLBNamespace,
-			"labels": map[string]any{"talosbox.dev/managed": "true"},
+			"name": metalLBNamespace,
+			"labels": map[string]any{
+				"talosbox.dev/managed":               "true",
+				"pod-security.kubernetes.io/enforce": "privileged",
+				"pod-security.kubernetes.io/audit":   "privileged",
+				"pod-security.kubernetes.io/warn":    "privileged",
+			},
 		},
 	}}}, result...)
 	extras, err := decodeObjects([]byte(manifests.MetalLBExtras(manifestFacts(item))))
