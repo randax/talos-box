@@ -117,6 +117,9 @@ func (r LonghornReconciler) reconcile(ctx context.Context, config *rest.Config, 
 		return StorageResult{}, err
 	}
 	mapper.Reset()
+	if err := replaceDriftedStorageClass(ctx, dynamicClient, mapper, chartObjects); err != nil {
+		return StorageResult{}, err
+	}
 	if err := applyAll(ctx, dynamicClient, mapper, chartObjects); err != nil {
 		return StorageResult{}, err
 	}

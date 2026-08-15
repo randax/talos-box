@@ -3,6 +3,7 @@ package provision
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -158,6 +159,46 @@ func deleteRenderedStorageObjects(ctx context.Context, client dynamic.Interface,
 		}
 		if err := resources[i].Delete(ctx, candidate.GetName(), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("delete stale storage %s %q: %w", candidate.GetKind(), candidate.GetName(), err)
+		}
+	}
+	return nil
+}
+
+// replaceDriftedStorageClass deletes a live StorageClass whose parameters no
+// longer match the rendered ones — parameters are immutable, so a derived
+// replica-count change can never be applied in place. Deleting a StorageClass
+// never touches existing PersistentVolumes or claims; the following apply
+// recreates it with the new parameters.
+func replaceDriftedStorageClass(ctx context.Context, client dynamic.Interface, mapper meta.RESTMapper, objects []unstructured.Unstructured) error {
+	for i := range objects {
+		object := &objects[i]
+		if object.GetKind() != "StorageClass" {
+			continue
+		}
+		mapping, err := mapper.RESTMapping(object.GroupVersionKind().GroupKind(), object.GroupVersionKind().Version)
+		if err != nil {
+			return fmt.Errorf("map StorageClass %q: %w", object.GetName(), err)
+		}
+		live, err := client.Resource(mapping.Resource).Get(ctx, object.GetName(), metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("inspect StorageClass %q: %w", object.GetName(), err)
+		}
+		liveParameters, _, err := unstructured.NestedStringMap(live.Object, "parameters")
+		if err != nil {
+			return fmt.Errorf("decode live StorageClass %q parameters: %w", object.GetName(), err)
+		}
+		renderedParameters, _, err := unstructured.NestedStringMap(object.Object, "parameters")
+		if err != nil {
+			return fmt.Errorf("decode rendered StorageClass %q parameters: %w", object.GetName(), err)
+		}
+		if maps.Equal(liveParameters, renderedParameters) {
+			continue
+		}
+		if err := client.Resource(mapping.Resource).Delete(ctx, object.GetName(), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("replace StorageClass %q: %w", object.GetName(), err)
 		}
 	}
 	return nil

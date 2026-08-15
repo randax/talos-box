@@ -263,6 +263,47 @@ metadata:
 	}
 }
 
+func TestReplaceDriftedStorageClassDeletesOnlyOnImmutableParameterDrift(t *testing.T) {
+	rendered := storageClassFixture("longhorn", map[string]any{"numberOfReplicas": "2"})
+	tests := []struct {
+		name       string
+		live       *unstructured.Unstructured
+		wantDelete bool
+	}{
+		{name: "no live StorageClass", live: nil, wantDelete: false},
+		{name: "same parameters", live: storageClassFixture("longhorn", map[string]any{"numberOfReplicas": "2"}), wantDelete: false},
+		{name: "drifted parameters", live: storageClassFixture("longhorn", map[string]any{"numberOfReplicas": "3"}), wantDelete: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			objects := []unstructured.Unstructured{*rendered}
+			client := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
+			mapper := storageLifecycleTestMapper(objects)
+			if tt.live != nil {
+				createStorageLifecycleObjects(t, client, mapper, []unstructured.Unstructured{*tt.live})
+			}
+
+			if err := replaceDriftedStorageClass(context.Background(), client, mapper, objects); err != nil {
+				t.Fatal(err)
+			}
+
+			gotDelete := len(storageLifecycleDeleteActions(client.Actions())) > 0
+			if gotDelete != tt.wantDelete {
+				t.Fatalf("StorageClass delete issued = %v, want %v", gotDelete, tt.wantDelete)
+			}
+		})
+	}
+}
+
+func storageClassFixture(name string, parameters map[string]any) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "storage.k8s.io/v1",
+		"kind":       "StorageClass",
+		"metadata":   map[string]any{"name": name},
+		"parameters": parameters,
+	}}
+}
+
 func TestDeleteRenderedStorageObjectsRecoversFromInterruptedRun(t *testing.T) {
 	objects := storageLifecycleObjects(t, cluster.CSILocalPath)
 	client := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
