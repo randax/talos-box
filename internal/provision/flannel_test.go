@@ -542,6 +542,9 @@ func TestGenerateAllowsSchedulingOnControlPlanesOnlyWithoutWorkers(t *testing.T)
 			}
 
 			var document struct {
+				Machine struct {
+					NodeLabels map[string]string `yaml:"nodeLabels"`
+				} `yaml:"machine"`
 				Cluster struct {
 					AllowSchedulingOnControlPlanes bool `yaml:"allowSchedulingOnControlPlanes"`
 				} `yaml:"cluster"`
@@ -551,6 +554,13 @@ func TestGenerateAllowsSchedulingOnControlPlanesOnlyWithoutWorkers(t *testing.T)
 			}
 			if got := document.Cluster.AllowSchedulingOnControlPlanes; got != test.want {
 				t.Fatalf("allowSchedulingOnControlPlanes = %v, want %v", got, test.want)
+			}
+			// A worker-less control plane is also the only node that can
+			// announce LoadBalancer VIPs, so the Talos-generated exclusion
+			// label must go with the taint.
+			_, excluded := document.Machine.NodeLabels["node.kubernetes.io/exclude-from-external-load-balancers"]
+			if wantExcluded := test.workers > 0; excluded != wantExcluded {
+				t.Fatalf("exclude-from-external-load-balancers label present = %v, want %v", excluded, wantExcluded)
 			}
 		})
 	}
