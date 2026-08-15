@@ -25,7 +25,7 @@ const (
 	doctorHelperSocketUnit            = "tbx-helper.socket"
 	doctorHelperServiceUnit           = "tbx-helper.service"
 	doctorBridgeNFCall                = "/proc/sys/net/bridge/bridge-nf-call-iptables"
-	doctorForwardPolicyFix            = "sudo iptables -I FORWARD -m physdev --physdev-is-bridged --physdev-in br-tbx+ -j ACCEPT"
+	doctorForwardPolicyFix            = "sudo iptables -I FORWARD 1 -i br-tbx+ -j ACCEPT && sudo iptables -I FORWARD 1 -o br-tbx+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
 	doctorHelperGroupFix              = "sudo usermod -aG tbx $USER"
 	doctorKVMGroupFix                 = "sudo usermod -aG kvm $USER"
 	doctorRPFilterLooseFix            = "sudo sysctl -w net.ipv4.conf.all.rp_filter=2"
@@ -337,15 +337,43 @@ func linuxBridgeNetfilterFinding(readFile func(string) ([]byte, error), command 
 	if !strings.Contains(text, "-P FORWARD DROP") {
 		return finding
 	}
-	if strings.Contains(text, "physdev") && strings.Contains(text, "br-tbx") && strings.Contains(text, "ACCEPT") {
+	if linuxRoutedForwardRulesPresent(text) {
 		return finding
 	}
 	finding.level = "FAIL"
 	finding.detail = fmt.Sprintf(
-		"br_netfilter is active with a default-DROP FORWARD policy; bridged cluster traffic will hang. Add a targeted ACCEPT rule such as `%s`, or disable bridge netfilter on this host",
+		"br_netfilter is active with a default-DROP FORWARD policy; routed cluster traffic will hang. Add targeted egress and established-return rules such as `%s`, or disable bridge netfilter on this host",
 		doctorForwardPolicyFix,
 	)
 	return finding
+}
+
+func linuxRoutedForwardRulesPresent(text string) bool {
+	outbound := map[string]struct{}{}
+	establishedReturn := map[string]struct{}{}
+	scanner := bufio.NewScanner(strings.NewReader(text))
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		switch {
+		case len(fields) == 6 &&
+			fields[0] == "-A" && fields[1] == "FORWARD" && fields[2] == "-i" &&
+			strings.HasPrefix(fields[3], "br-tbx") && fields[4] == "-j" && fields[5] == "ACCEPT":
+			outbound[fields[3]] = struct{}{}
+		case len(fields) == 10 &&
+			fields[0] == "-A" && fields[1] == "FORWARD" && fields[2] == "-o" &&
+			strings.HasPrefix(fields[3], "br-tbx") && fields[4] == "-m" && fields[5] == "conntrack" &&
+			fields[6] == "--ctstate" &&
+			(fields[7] == "RELATED,ESTABLISHED" || fields[7] == "ESTABLISHED,RELATED") &&
+			fields[8] == "-j" && fields[9] == "ACCEPT":
+			establishedReturn[fields[3]] = struct{}{}
+		}
+	}
+	for bridge := range outbound {
+		if _, ok := establishedReturn[bridge]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func linuxBridgeSTPFinding(listClusters func() ([]cluster.Cluster, error), readFile func(string) ([]byte, error)) doctorFinding {
