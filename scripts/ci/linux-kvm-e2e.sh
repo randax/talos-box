@@ -300,6 +300,13 @@ apply_flannel() {
   kubectl --kubeconfig "$kubeconfig" apply -f "$tools/kube-flannel.yml"
 }
 retry "Flannel apply" 12 5 apply_flannel
+
+all_nodes_registered() {
+  local node_count
+  node_count=$(kubectl --kubeconfig "$kubeconfig" get nodes -o name 2>/dev/null | awk 'END { print NR }') || return 1
+  [[ "$node_count" -eq 3 ]]
+}
+retry "node registration" 120 5 all_nodes_registered
 kubectl --kubeconfig "$kubeconfig" wait --for=condition=Ready node --all --timeout=10m
 ready_nodes=$(kubectl --kubeconfig "$kubeconfig" get nodes --no-headers | awk '$2 == "Ready" { count++ } END { print count + 0 }')
 [[ "$ready_nodes" -eq 3 ]]
