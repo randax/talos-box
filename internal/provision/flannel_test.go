@@ -461,6 +461,41 @@ func TestGenerateFlannelAddsStorageAndMirrorPrerequisitesForEveryRole(t *testing
 	}
 }
 
+func TestGenerateAllowsSchedulingOnControlPlanesOnlyWithoutWorkers(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	for _, test := range []struct {
+		workers int
+		want    bool
+	}{{workers: 0, want: true}, {workers: 1, want: false}} {
+		t.Run(fmt.Sprintf("workers=%d", test.workers), func(t *testing.T) {
+			item, err := cluster.New("demo", 0, 1, test.workers, cluster.NodeDefaults{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			item.TalosVersion = "v1.13.6"
+			item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILocalPath}
+
+			generated, err := generateMachineConfigs(item)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var document struct {
+				Cluster struct {
+					AllowSchedulingOnControlPlanes bool `yaml:"allowSchedulingOnControlPlanes"`
+				} `yaml:"cluster"`
+			}
+			if err := yaml.Unmarshal(generated.configs[cluster.RoleControlPlane], &document); err != nil {
+				t.Fatal(err)
+			}
+			if got := document.Cluster.AllowSchedulingOnControlPlanes; got != test.want {
+				t.Fatalf("allowSchedulingOnControlPlanes = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestFlannelReconcileStopsAtContextDeadline(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{})

@@ -319,15 +319,23 @@ func generateMachineConfigs(item cluster.Cluster) (generated, error) {
 		return generated{}, errors.New("cluster has no control plane")
 	}
 	cniName := machineCNIName(item)
-	input, err := generate.NewInput(
-		item.Name,
-		"https://"+controlPlane.IP+":6443",
-		constants.DefaultKubernetesVersion,
+	options := []generate.Option{
 		generate.WithVersionContract(contract),
 		generate.WithSecretsBundle(bundle),
 		generate.WithEndpointList(controlPlaneEndpoints),
 		generate.WithInstallDisk("/dev/vda"),
 		generate.WithClusterCNIConfig(&v1alpha1.CNIConfig{CNIName: cniName}),
+	}
+	// A worker-less cluster has nowhere else to run workloads, so the CSI
+	// components and the storage probe need the control plane schedulable.
+	if !clusterHasWorkers(item) {
+		options = append(options, generate.WithAllowSchedulingOnControlPlanes(true))
+	}
+	input, err := generate.NewInput(
+		item.Name,
+		"https://"+controlPlane.IP+":6443",
+		constants.DefaultKubernetesVersion,
+		options...,
 	)
 	if err != nil {
 		return generated{}, fmt.Errorf("generate Talos config input: %w", err)
@@ -514,6 +522,15 @@ func credentials(name string) (credentialPaths, error) {
 		dir: dir, secrets: filepath.Join(dir, "secrets.yaml"),
 		talosconfig: filepath.Join(dir, "talosconfig"), kubeconfig: filepath.Join(dir, "kubeconfig"),
 	}, nil
+}
+
+func clusterHasWorkers(item cluster.Cluster) bool {
+	for _, node := range item.Nodes {
+		if node.Role == cluster.RoleWorker {
+			return true
+		}
+	}
+	return false
 }
 
 func clusterControlPlane(item cluster.Cluster) (Node, []string) {

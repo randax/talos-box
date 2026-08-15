@@ -15,39 +15,10 @@ else
   test -w "$kvm_device"
 fi
 
+# shellcheck source=scripts/ci/kvm-e2e-lib.sh
+source "$root/scripts/ci/kvm-e2e-lib.sh"
+
 required_bytes=$((14 * 1024 * 1024 * 1024))
-
-available_bytes() {
-  df -Pk "$1" | awk 'NR == 2 { print $4 * 1024 }'
-}
-
-usable_scratch() {
-  local path=$1 probe available
-  [[ -d "$path" && -w "$path" ]] || return 1
-  probe=$(mktemp "$path/talosbox-e2e-probe.XXXXXX") || return 1
-  rm -f "$probe"
-  available=$(available_bytes "$path")
-  [[ ${available:-0} -ge $required_bytes ]]
-}
-
-select_scratch() {
-  local candidate best="" best_available=0 available
-  for candidate in "${RUNNER_TEMP:-}" /mnt /tmp "$root"; do
-    [[ -n "$candidate" ]] || continue
-    if usable_scratch "$candidate"; then
-      available=$(available_bytes "$candidate")
-      if [[ $available -gt $best_available ]]; then
-        best=$candidate
-        best_available=$available
-      fi
-    fi
-  done
-  [[ -n "$best" ]] || {
-    printf 'no writable scratch mount has the required %d bytes\n' "$required_bytes" >&2
-    return 1
-  }
-  printf '%s\n' "$best"
-}
 
 workdir=""
 workdir_owned=false
@@ -141,43 +112,6 @@ for binary in tbx tbxd tbx-helper; do
   test -x "$root/bin/$binary"
 done
 
-retry() {
-  local label=$1 attempts=$2 delay=$3 attempt
-  shift 3
-  for ((attempt = 1; attempt <= attempts; attempt++)); do
-    if "$@"; then
-      return 0
-    fi
-    if ((attempt < attempts)); then
-      sleep "$delay"
-    fi
-  done
-  printf 'timed out waiting for %s after %d attempts\n' "$label" "$attempts" >&2
-  return 1
-}
-
-wait_for_process_socket() {
-  local label=$1 attempts=$2 delay=$3 pid=$4 socket=$5 log_file=$6 attempt status
-  for ((attempt = 1; attempt <= attempts; attempt++)); do
-    if socket_ready "$socket"; then
-      return 0
-    fi
-    if ! kill -0 "$pid" 2>/dev/null; then
-      status=0
-      wait "$pid" || status=$?
-      printf '%s exited with status %d before creating %s\n' "$label" "$status" "$socket" >&2
-      cat "$log_file" >&2
-      return 1
-    fi
-    if ((attempt < attempts)); then
-      sleep "$delay"
-    fi
-  done
-  printf 'timed out waiting for %s after %d attempts\n' "$label" "$attempts" >&2
-  cat "$log_file" >&2
-  return 1
-}
-
 talos_version=v1.13.6
 kubectl_version=v1.34.1
 talosctl_sha256=540c5e7cb0d3fa3a9b2e1c717ced212727b73bcaf0cf9cf9ba2472ec381041d4
@@ -200,9 +134,6 @@ chmod +x "$tools/talosctl" "$tools/kubectl"
 sudo env HOME="$home" TBX_HELPER_SOCKET="$helper_socket" "$root/bin/tbx-helper" --allowed-uid "$(id -u)" \
   >"$workdir/tbx-helper.log" 2>&1 &
 helper_pid=$!
-socket_ready() {
-  [[ -S "$1" ]]
-}
 retry "helper socket" 30 1 socket_ready "$helper_socket"
 
 "$root/bin/tbxd" >"$workdir/tbxd.log" 2>&1 &
