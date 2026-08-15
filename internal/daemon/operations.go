@@ -752,11 +752,6 @@ func (s *Server) addNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTask
 	return status, s.beginNodeMutationProvisionLocked(item), nil
 }
 
-func (s *Server) removeNode(raw json.RawMessage) (NodeStatus, error) {
-	status, _, err := s.removeNodeLocked(raw)
-	return status, err
-}
-
 func (s *Server) removeNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTask, error) {
 	var args nodeArgs
 	if err := decodeArgs(raw, &args); err != nil {

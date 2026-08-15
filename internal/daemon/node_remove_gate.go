@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -60,15 +58,17 @@ func (s *Server) gateNodeRemoval(raw json.RawMessage) (string, error) {
 }
 
 func countNodeRemovalStorageVolumes(ctx context.Context, item cluster.Cluster, nodeName string) (int, error) {
-	dir, err := cluster.Dir(item.Name)
-	if err != nil {
-		return 0, err
-	}
-	kubeconfig, err := os.ReadFile(filepath.Join(dir, "kubeconfig"))
+	kubeconfig, err := clusterKubeconfig(item.Name)
 	if err != nil {
 		return 0, fmt.Errorf("read kubeconfig for node volume count: %w", err)
 	}
-	return provision.CountNodeStorageVolumes(ctx, kubeconfig, item.CSI, nodeName)
+	remaining := make([]string, 0, len(item.Nodes))
+	for _, node := range item.Nodes {
+		if node.Name != nodeName {
+			remaining = append(remaining, node.Name)
+		}
+	}
+	return provision.CountNodeStorageVolumes(ctx, kubeconfig, item.CSI, nodeName, remaining)
 }
 
 func removeNodeVolumesBlockRemoval(item cluster.Cluster, nodeName string, count int) error {

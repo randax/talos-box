@@ -54,17 +54,21 @@ func (s *Server) inspectDestroyCluster(item cluster.Cluster) DestroyInspection {
 }
 
 func countDestroyStorageVolumes(ctx context.Context, item cluster.Cluster) (int, error) {
-	dir, err := cluster.Dir(item.Name)
-	if err != nil {
-		return 0, err
-	}
-	kubeconfig, err := os.ReadFile(filepath.Join(dir, "kubeconfig"))
+	kubeconfig, err := clusterKubeconfig(item.Name)
 	if err != nil {
 		return 0, fmt.Errorf("read kubeconfig for destroy inspection: %w", err)
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	return provision.CountProvisionedStorageVolumes(probeCtx, kubeconfig, item.CSI)
+}
+
+func clusterKubeconfig(name string) ([]byte, error) {
+	dir, err := cluster.Dir(name)
+	if err != nil {
+		return nil, err
+	}
+	return os.ReadFile(filepath.Join(dir, "kubeconfig"))
 }
 
 func DestroyInspectionDataLossWarning(name string, engine cluster.CSI) string {
@@ -80,15 +84,11 @@ func DestroyInspectionDataLossWarning(name string, engine cluster.CSI) string {
 }
 
 func destroyInspectionCountWarning(name string, engine cluster.CSI, count int) string {
-	unit := "volumes"
-	if count == 1 {
-		unit = "volume"
-	}
 	return fmt.Sprintf(
 		"destroying cluster %s will permanently delete %d %s %s and their data",
 		name,
 		count,
 		strings.TrimSpace(string(engine)),
-		unit,
+		volumeUnit(count),
 	)
 }

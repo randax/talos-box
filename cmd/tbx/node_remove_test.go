@@ -11,6 +11,7 @@ import (
 
 func TestNodeRemoveSendsForceAndPrintsWarning(t *testing.T) {
 	requests, command := newDestroyTestCLI(t, []daemon.Response{
+		{OK: true, Data: json.RawMessage(`{"protocolVersion":4}`)},
 		{OK: true, Data: json.RawMessage(`{"name":"demo-worker-2","warning":"removing node demo-worker-2 permanently deletes the only copy of 1 longhorn volume"}`)},
 	})
 
@@ -18,6 +19,9 @@ func TestNodeRemoveSendsForceAndPrintsWarning(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if op := (<-requests).Op; op != "daemon.info" {
+		t.Fatalf("first request op = %q, want daemon.info handshake", op)
+	}
 	request := <-requests
 	if request.Op != "node.remove" {
 		t.Fatalf("request op = %q, want node.remove", request.Op)
@@ -43,6 +47,7 @@ func TestNodeRemoveSendsForceAndPrintsWarning(t *testing.T) {
 
 func TestNodeRemoveDefaultsToUnforcedAndStaysQuietWithoutWarning(t *testing.T) {
 	requests, command := newDestroyTestCLI(t, []daemon.Response{
+		{OK: true, Data: json.RawMessage(`{"protocolVersion":4}`)},
 		{OK: true, Data: json.RawMessage(`{"name":"demo-worker-2"}`)},
 	})
 
@@ -50,6 +55,9 @@ func TestNodeRemoveDefaultsToUnforcedAndStaysQuietWithoutWarning(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if op := (<-requests).Op; op != "daemon.info" {
+		t.Fatalf("first request op = %q, want daemon.info handshake", op)
+	}
 	request := <-requests
 	var args struct {
 		Force bool `json:"force"`
@@ -74,5 +82,19 @@ func TestNodeRemoveUsageMentionsForce(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "usage: tbx node remove <cluster> <node> [--force]") {
 		t.Fatalf("usage error = %q, want usage with --force", err)
+	}
+}
+
+func TestNodeRemoveRefusesOldDaemonProtocol(t *testing.T) {
+	_, command := newDestroyTestCLI(t, []daemon.Response{
+		{OK: true, Data: json.RawMessage(`{"protocolVersion":3}`)},
+	})
+
+	err := command.runNode([]string{"remove", "demo", "demo-worker-2"})
+	if err == nil {
+		t.Fatal("node remove against a protocol-3 daemon succeeded, want handshake refusal")
+	}
+	if !strings.Contains(err.Error(), "restart or upgrade tbxd") {
+		t.Fatalf("handshake error = %q, want upgrade guidance", err)
 	}
 }

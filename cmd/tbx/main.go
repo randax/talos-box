@@ -345,6 +345,9 @@ func (c cli) runNode(args []string) error {
 		if len(positionals) != 2 {
 			return errors.New("usage: tbx node remove <cluster> <node> [--force]")
 		}
+		if err := c.ensureNodeRemoveSupport(); err != nil {
+			return err
+		}
 		request := map[string]any{"cluster": positionals[0], "name": positionals[1], "force": *force}
 		var result daemon.NodeStatus
 		if err := c.call("node.remove", request, &result); err != nil {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/provision"
@@ -89,6 +90,68 @@ func TestNodeRemoveForceDeletesAndWarnsAboutVolumeData(t *testing.T) {
 	}
 	if len(reloaded.Nodes) != 2 {
 		t.Fatalf("cluster node count after forced remove = %d, want 2", len(reloaded.Nodes))
+	}
+}
+
+func TestNodeRemoveKeepsDataLossWarningWhenReconcileFails(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 2)
+	service.provisionReconcile = func(context.Context, provision.Request) (provision.Result, error) {
+		return provision.Result{}, errors.New("api server unreachable")
+	}
+	service.nodeVolumeCount = func(context.Context, cluster.Cluster, string) (int, error) {
+		return 1, nil
+	}
+
+	response := dispatchNodeRemove(t, service, item.Name, "demo-worker-2", true)
+
+	if response.OK {
+		t.Fatal("node.remove reported success despite a failed reconcile")
+	}
+	if !strings.Contains(response.Error, "permanently deletes the only copy of 1 longhorn volume") {
+		t.Fatalf("reconcile-failure error %q lost the data-loss warning", response.Error)
+	}
+}
+
+func TestNodeRemoveSerializesObservationWithRemoval(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 2)
+	stubNodeMutationReconcile(service)
+	firstObserving := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var secondSawNodes int
+	service.nodeVolumeCount = func(_ context.Context, _ cluster.Cluster, node string) (int, error) {
+		if node == "demo-worker-1" {
+			close(firstObserving)
+			<-releaseFirst
+			return 0, nil
+		}
+		reloaded, err := cluster.Load(item.Name)
+		if err != nil {
+			t.Errorf("load cluster during second observation: %v", err)
+			return 0, err
+		}
+		secondSawNodes = len(reloaded.Nodes)
+		return 0, nil
+	}
+
+	firstDone := make(chan Response, 1)
+	go func() { firstDone <- dispatchNodeRemove(t, service, item.Name, "demo-worker-1", false) }()
+	<-firstObserving
+	secondDone := make(chan Response, 1)
+	go func() { secondDone <- dispatchNodeRemove(t, service, item.Name, "demo-worker-2", false) }()
+	time.Sleep(50 * time.Millisecond)
+	close(releaseFirst)
+
+	if response := <-firstDone; !response.OK {
+		t.Fatalf("first node.remove failed: %s", response.Error)
+	}
+	if response := <-secondDone; !response.OK {
+		t.Fatalf("second node.remove failed: %s", response.Error)
+	}
+	// The second observation must run against the post-first-removal cluster:
+	// an unserialized gate would have observed 3 nodes while the first
+	// removal was still pending.
+	if secondSawNodes != 2 {
+		t.Fatalf("second observation saw %d nodes, want 2 (after the first removal completed)", secondSawNodes)
 	}
 }
 

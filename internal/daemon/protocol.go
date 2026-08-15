@@ -13,7 +13,8 @@ const DefaultTalosVersion = "v1.13.6"
 
 // ProtocolVersion is the daemon wire version understood by this CLI/server
 // pair. New request fields must negotiate support before relying on them.
-const ProtocolVersion = 3
+// Version 4 volume-gates node.remove and honors its force field.
+const ProtocolVersion = 4
 
 // Request is one newline-delimited daemon request.
 type Request struct {
