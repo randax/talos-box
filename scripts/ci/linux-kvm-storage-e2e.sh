@@ -3,7 +3,7 @@
 # longhorn on a multinode cluster (including replica behavior), then flannel +
 # local-path on a single node. PVC bind and write/readback are verified with
 # kubectl, independently of tbx's own storage probe.
-set -euo pipefail
+set -Eeuo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 # The override exists only so the contract test can prove the gate fails before
@@ -198,11 +198,6 @@ spec:
 EOF
   retry "writer pod completion" 120 5 pod_succeeded writer
   [[ "$(kc get pvc probe -n storage-e2e -o jsonpath='{.status.phase}')" == Bound ]]
-  # Engine-specific assertions run while the writer still holds the volume
-  # attached — longhorn robustness reads "unknown" on a detached volume.
-  if [[ $# -gt 0 ]]; then
-    "$@"
-  fi
   kc delete pod writer -n storage-e2e --wait
   kc apply -f - <<'EOF'
 apiVersion: v1
@@ -243,16 +238,15 @@ assert_longhorn_replicas() {
   fi
 }
 
-longhorn_volumes_healthy() {
-  local robustness
-  robustness=$(kc -n longhorn-system get volumes.longhorn.io -o json |
-    jq -r '[.items[].status.robustness] | unique | join(",")')
-  [[ "$robustness" == healthy ]]
-}
-
-assert_longhorn_replicated() {
-  assert_longhorn_replicas
-  retry "healthy longhorn volume robustness" 60 5 longhorn_volumes_healthy
+# Replica CRs record their scheduled node in spec.nodeID and survive volume
+# detach (robustness reads "unknown" once the workload pod terminates), so this
+# proves both replicas actually landed on distinct nodes without racing the
+# writer pod's lifetime.
+longhorn_replicas_scheduled() {
+  local nodes
+  nodes=$(kc -n longhorn-system get replicas.longhorn.io -o json |
+    jq -r '[.items[].spec.nodeID | select(. != null and . != "")] | unique | length')
+  [[ "$nodes" -eq 2 ]]
 }
 
 longhorn_config="$workdir/talosbox-longhorn.yaml"
@@ -277,7 +271,9 @@ cluster_cleanup_needed=true
 retry "longhorn cluster provisioning" 2 10 "$root/bin/tbx" up -f "$longhorn_config" --force --quiet
 retry "longhorn storage live" 60 5 storage_live
 assert_default_storage_class longhorn
-verify_pvc_write_readback assert_longhorn_replicated
+verify_pvc_write_readback
+assert_longhorn_replicas
+retry "longhorn replicas scheduled on 2 nodes" 60 5 longhorn_replicas_scheduled
 kc delete namespace storage-e2e --wait
 "$root/bin/tbx" cluster destroy e2es --force
 

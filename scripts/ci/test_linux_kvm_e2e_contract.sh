@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Contract needles are literal grep patterns, not expansions.
 # shellcheck disable=SC2016
-set -euo pipefail
+set -Eeuo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 workflow="$root/.github/workflows/ci.yml"
@@ -94,7 +94,7 @@ require 'retry "local-path cluster provisioning"' "$storage_harness"
 require 'storagePhase' "$storage_harness"
 require 'is-default-class' "$storage_harness"
 require 'numberOfReplicas' "$storage_harness"
-require 'robustness' "$storage_harness"
+require 'replicas.longhorn.io' "$storage_harness"
 require 'cat /data/probe' "$storage_harness"
 require 'cluster destroy e2es --force' "$storage_harness"
 require 'sha256sum --check --strict' "$storage_harness"

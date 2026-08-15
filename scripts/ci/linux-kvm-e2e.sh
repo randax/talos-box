@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Exercises the public substrate-only workflow from VM creation through
 # externally managed Talos configuration, bootstrap, Flannel, and Ready nodes.
-set -euo pipefail
+set -Eeuo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 # The override exists only so the contract test can prove the gate fails before
