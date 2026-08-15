@@ -508,15 +508,40 @@ type hashWriter interface {
 	Sum([]byte) []byte
 }
 
-// manifestPath maps a manifest request path to its on-disk cache location.
-func (s *Server) manifestPath(requestPath string) string {
+// canonicalManifestRequestPath normalizes supported digest references before
+// they become cache keys, so differently cased requests share one entry.
+func canonicalManifestRequestPath(requestPath string) string {
 	if match := manifestPathRe.FindStringSubmatch(requestPath); match != nil {
 		if canonical, ok := canonicalSupportedDigest(match[2]); ok {
-			requestPath = "/v2/" + match[1] + "/manifests/" + canonical
+			return "/v2/" + match[1] + "/manifests/" + canonical
 		}
 	}
-	safe := strings.ReplaceAll(strings.TrimPrefix(requestPath, "/v2/"), "/", "_")
+	return requestPath
+}
+
+// manifestPath maps a canonical manifest request path to a versioned,
+// collision-resistant on-disk cache key. The previous slash-to-underscore
+// format could map distinct repositories (for example a/b and a_b) to the
+// same file.
+func (s *Server) manifestPath(requestPath string) string {
+	key := sha256.Sum256([]byte(canonicalManifestRequestPath(requestPath)))
+	return filepath.Join(s.cacheDir, "manifests", "v2-"+hex.EncodeToString(key[:]))
+}
+
+func (s *Server) legacyManifestPath(requestPath string) string {
+	safe := strings.ReplaceAll(strings.TrimPrefix(canonicalManifestRequestPath(requestPath), "/v2/"), "/", "_")
 	return filepath.Join(s.cacheDir, "manifests", safe)
+}
+
+func (s *Server) legacyManifestFallbackPath(requestPath string) (string, bool) {
+	match := manifestPathRe.FindStringSubmatch(canonicalManifestRequestPath(requestPath))
+	if match == nil || !isDigestReference(match[2]) {
+		return "", false
+	}
+	// A legacy tag key flattened both the repository and tag with underscores,
+	// so no tag key can prove which repository created it. Digest entries are
+	// safe to replay only after their bytes verify against the request.
+	return s.legacyManifestPath(requestPath), true
 }
 
 type manifestMetadata struct {
@@ -666,18 +691,23 @@ func manifestSHA512(data []byte) string {
 }
 
 func (s *Server) serveCachedManifest(w http.ResponseWriter, r *http.Request) bool {
-	data, err := s.cachedManifestBytes(r.URL.Path)
+	data, path, err := s.cachedManifest(r.URL.Path)
 	if err != nil {
 		return false
 	}
-	metadata := s.cachedManifestMetadata(r.URL.Path, data)
+	metadata := s.cachedManifestMetadataAtPath(r.URL.Path, path, data)
 	return serveManifestBytes(w, r, data, metadata)
 }
 
 func (s *Server) serveCachedDigestManifest(w http.ResponseWriter, r *http.Request, requestedDigest string) (bool, *cacheReplayError) {
-	path := s.manifestPath(r.URL.Path)
-	data, err := os.ReadFile(path)
+	data, path, err := s.cachedManifest(r.URL.Path)
 	if err != nil {
+		if s.offlineEnabled() && errors.Is(err, errCachedManifestDigestMismatch) {
+			return false, &cacheReplayError{
+				status: http.StatusServiceUnavailable,
+				err:    fmt.Errorf("mirror offline: cached digest corrupted"),
+			}
+		}
 		return false, nil
 	}
 	canonical, err := verifySupportedDigest(data, requestedDigest)
@@ -690,7 +720,7 @@ func (s *Server) serveCachedDigestManifest(w http.ResponseWriter, r *http.Reques
 		}
 		return false, nil
 	}
-	metadata := s.cachedManifestMetadata(r.URL.Path, data)
+	metadata := s.cachedManifestMetadataAtPath(r.URL.Path, path, data)
 	metadata.DockerContentDigest = canonical
 	return serveManifestBytes(w, r, data, metadata), nil
 }
@@ -707,16 +737,46 @@ func serveManifestBytes(w http.ResponseWriter, r *http.Request, data []byte, met
 }
 
 func (s *Server) cachedManifestBytes(requestPath string) ([]byte, error) {
-	return os.ReadFile(s.manifestPath(requestPath))
+	data, _, err := s.cachedManifest(requestPath)
+	return data, err
+}
+
+var errCachedManifestDigestMismatch = errors.New("cached manifest does not match requested digest")
+
+func (s *Server) cachedManifest(requestPath string) ([]byte, string, error) {
+	path := s.manifestPath(requestPath)
+	data, err := os.ReadFile(path)
+	if err == nil || !errors.Is(err, os.ErrNotExist) {
+		return data, path, err
+	}
+
+	legacyPath, ok := s.legacyManifestFallbackPath(requestPath)
+	if !ok {
+		return nil, path, err
+	}
+	data, err = os.ReadFile(legacyPath)
+	if err != nil {
+		return nil, legacyPath, err
+	}
+	if reference := manifestReference(requestPath); isDigestReference(reference) {
+		if _, err := verifySupportedDigest(data, reference); err != nil {
+			return nil, legacyPath, fmt.Errorf("%w: %v", errCachedManifestDigestMismatch, err)
+		}
+	}
+	return data, legacyPath, nil
 }
 
 func (s *Server) cachedManifestMetadata(requestPath string, data []byte) manifestMetadata {
+	return s.cachedManifestMetadataAtPath(requestPath, s.manifestPath(requestPath), data)
+}
+
+func (s *Server) cachedManifestMetadataAtPath(requestPath, path string, data []byte) manifestMetadata {
 	metadata := manifestMetadata{
-		ContentType:         s.cachedManifestContentType(requestPath, data),
+		ContentType:         s.cachedManifestContentTypeAtPath(path, data),
 		ContentLength:       int64(len(data)),
 		DockerContentDigest: cachedManifestDigest(data, manifestReference(requestPath), ""),
 	}
-	if rawMetadata, err := readCheckedRegularFile(s.manifestMetadataPath(requestPath), maxCachedManifestSidecarBytes); err == nil {
+	if rawMetadata, err := readCheckedRegularFile(path+".meta", maxCachedManifestSidecarBytes); err == nil {
 		var stored manifestMetadata
 		if json.Unmarshal(rawMetadata, &stored) == nil {
 			_, digestErr := verifySupportedDigest(data, stored.DockerContentDigest)
@@ -729,18 +789,18 @@ func (s *Server) cachedManifestMetadata(requestPath string, data []byte) manifes
 	return metadata
 }
 
-func (s *Server) cachedManifestContentType(requestPath string, data []byte) string {
+func (s *Server) cachedManifestContentTypeAtPath(path string, data []byte) string {
 	if contentType := manifestContentType(data); contentType != "" {
 		return contentType
 	}
-	if contentType := s.cachedLegacyManifestContentType(requestPath); contentType != "" {
+	if contentType := s.cachedLegacyManifestContentTypeAtPath(path); contentType != "" {
 		return contentType
 	}
 	return "application/vnd.oci.image.manifest.v1+json"
 }
 
-func (s *Server) cachedLegacyManifestContentType(requestPath string) string {
-	if ct, err := readCheckedRegularFile(s.manifestPath(requestPath)+".ct", maxCachedManifestSidecarBytes); err == nil && len(ct) > 0 {
+func (s *Server) cachedLegacyManifestContentTypeAtPath(path string) string {
+	if ct, err := readCheckedRegularFile(path+".ct", maxCachedManifestSidecarBytes); err == nil && len(ct) > 0 {
 		return string(ct)
 	}
 	return ""

@@ -76,6 +76,41 @@ Suspend/resume preserves guest memory while the same `tbxd` process remains aliv
 the daemon loses vz's file-handle-backed device identity, so resume reports a warning and safely
 cold-boots instead.
 
+### 6. Prepare and inspect the offline cache
+
+Warm the registry mirror before travel with a list of fully qualified image references. Each
+non-comment line must use a non-`latest` tag or a `sha256`/`sha512` digest; use a tag plus
+digest when the list must be immutable.
+
+```text
+# workshop-images.txt
+docker.io/library/pause:3.10
+ghcr.io/example/app:v2.4.1@sha256:<64-hex-digest>
+```
+
+```sh
+bin/tbx cache warm workshop-images.txt more-images.txt # any number of lists; `-` reads stdin once
+bin/tbx cache warm --check workshop-images.txt         # verify locally, without downloading
+bin/tbx cache warm --check --deep workshop-images.txt  # also rehash cached blobs
+bin/tbx cache list                                     # disk images and mirror-cache totals
+```
+
+Blank lines and lines beginning with `#` are ignored. `--check` verifies the cached manifest
+graph and host-platform image offline; `--deep` is valid only with `--check` and additionally
+rehashes blobs. It does not run a live-cluster pull test.
+
+`tbx mirror offline` reports whether the pull-through mirror may reach upstream registries;
+`tbx mirror offline on` serves cached content only (uncached content fails), and `off` restores
+normal pull-through behavior. New machine configs use the catch-all mirror at the cluster
+gateway with `skipFallback: true`, so nodes do not bypass that mirror directly.
+
+The cache is independent of cluster lifecycle: destroying a cluster leaves warmed mirror
+content intact. To reclaim space safely, `tbx cache prune` removes Talos disk images only,
+`tbx cache prune --mirror` removes mirror content only, and `tbx cache prune --all` removes
+both. After upgrading from a build that used the original flat manifest-cache layout, run
+`tbx cache warm` again before going offline: verified digest entries remain reusable, but legacy
+tag entries are deliberately ignored because their old filenames cannot prove repository identity.
+
 Run `bin/tbx help` for the full command surface.
 
 For the curated Cilium path and optional hand-managed inspection fork, see the [Cilium walkthrough](docs/walkthrough-cilium-ingress.md).

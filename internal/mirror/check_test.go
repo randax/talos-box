@@ -37,6 +37,27 @@ func TestCheckPassesOfflineAfterCompletedWarm(t *testing.T) {
 	}
 }
 
+func TestCheckCachedManifestUsesVerifiedLegacyDigest(t *testing.T) {
+	data := []byte(`{"schemaVersion":2}`)
+	digest := "sha256:" + sha256Hex(data)
+	server := NewServer("https://registry.example", t.TempDir())
+	legacyPath := server.legacyManifestPath("/v2/a/b/manifests/" + digest)
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyPath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, resolvedDigest, err := checkCachedManifest(context.Background(), server, "/v2/a_b/manifests/"+digest, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(data) || resolvedDigest != digest {
+		t.Fatalf("legacy digest cache = %q %q, want %q %q", got, resolvedDigest, data, digest)
+	}
+}
+
 func TestCheckFailsWhenChildManifestIsMissing(t *testing.T) {
 	fixture := newCheckIndexFixture(t)
 	defer fixture.manager.Close()

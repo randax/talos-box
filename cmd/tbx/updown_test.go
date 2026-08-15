@@ -41,8 +41,8 @@ func TestStrongestProvisioningIntentRequiresCSIProtocolRegardlessOfOrder(t *test
 	if input.CSI != string(cluster.CSILocalPath) {
 		t.Fatalf("strongest provisioning input = %+v, want CSI-bearing cluster", input)
 	}
-	if got := minimumProvisioningIntentProtocol(input); got != daemon.ProtocolVersion {
-		t.Fatalf("mixed config minimum protocol = %d, want %d", got, daemon.ProtocolVersion)
+	if got := minimumProvisioningIntentProtocol(input); got != csiProvisioningIntentProtocolVersion {
+		t.Fatalf("mixed config minimum protocol = %d, want %d", got, csiProvisioningIntentProtocolVersion)
 	}
 }
 

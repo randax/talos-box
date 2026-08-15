@@ -21,7 +21,10 @@ type dialError struct{ err error }
 
 func (e dialError) Error() string { return e.err.Error() }
 
-const legacyProvisioningIntentProtocolVersion = 1
+const (
+	legacyProvisioningIntentProtocolVersion = 1
+	csiProvisioningIntentProtocolVersion    = 2
+)
 
 func requiresProvisioningIntentHandshake(input cluster.ProvisioningIntentInput) bool {
 	return input.CNI != "" || input.CSI != "" || input.LB != nil || input.BGP != nil || input.Hubble != nil
@@ -29,7 +32,7 @@ func requiresProvisioningIntentHandshake(input cluster.ProvisioningIntentInput) 
 
 func minimumProvisioningIntentProtocol(input cluster.ProvisioningIntentInput) int {
 	if input.CSI != "" {
-		return daemon.ProtocolVersion
+		return csiProvisioningIntentProtocolVersion
 	}
 	return legacyProvisioningIntentProtocolVersion
 }
@@ -51,6 +54,23 @@ func (c cli) ensureProvisioningIntentSupport(input cluster.ProvisioningIntentInp
 	}
 	if info.ProtocolVersion > daemon.ProtocolVersion {
 		return fmt.Errorf("tbx is too old: protocol %d does not support tbxd protocol %d; upgrade tbx before using --cni/--csi/--hubble/--lb/--bgp", daemon.ProtocolVersion, info.ProtocolVersion)
+	}
+	return nil
+}
+
+func (c cli) ensureCacheWarmSupport() error {
+	var info daemon.Info
+	if err := c.call("daemon.info", struct{}{}, &info); err != nil {
+		if strings.Contains(err.Error(), "unknown operation") {
+			return errors.New("tbxd is too old; restart or upgrade tbxd before using cache warm/check")
+		}
+		return err
+	}
+	if info.ProtocolVersion < daemon.ProtocolVersion {
+		return fmt.Errorf("tbxd protocol %d is too old; restart or upgrade tbxd before using cache warm/check", info.ProtocolVersion)
+	}
+	if info.ProtocolVersion > daemon.ProtocolVersion {
+		return fmt.Errorf("tbx is too old: protocol %d does not support tbxd protocol %d; upgrade tbx before using cache warm/check", daemon.ProtocolVersion, info.ProtocolVersion)
 	}
 	return nil
 }

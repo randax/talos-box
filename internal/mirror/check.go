@@ -136,14 +136,14 @@ func checkCachedManifest(ctx context.Context, server *Server, requestPath, expec
 	if err := ctx.Err(); err != nil {
 		return nil, "", err
 	}
-	data, err := checkedCachedManifestBytes(server, requestPath)
+	data, path, err := checkedCachedManifest(server, requestPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, "", fmt.Errorf("%s not cached", requestPath)
 		}
 		return nil, "", fmt.Errorf("%s invalid: %w", requestPath, err)
 	}
-	resolvedDigest := checkedCachedManifestMetadata(server, requestPath, data).DockerContentDigest
+	resolvedDigest := checkedCachedManifestMetadataAtPath(requestPath, path, data).DockerContentDigest
 	if expectedDigest != "" {
 		canonical, err := verifySupportedDigest(data, expectedDigest)
 		if err != nil {
@@ -239,17 +239,36 @@ func checkedSupportedDigest(reference string) (string, string, error) {
 	return algorithm, encoded, nil
 }
 
-func checkedCachedManifestBytes(server *Server, requestPath string) ([]byte, error) {
-	return readCheckedRegularFile(server.manifestPath(requestPath), maxManifestBytes)
+func checkedCachedManifest(server *Server, requestPath string) ([]byte, string, error) {
+	path := server.manifestPath(requestPath)
+	data, err := readCheckedRegularFile(path, maxManifestBytes)
+	if err == nil || !errors.Is(err, os.ErrNotExist) {
+		return data, path, err
+	}
+
+	legacyPath, ok := server.legacyManifestFallbackPath(requestPath)
+	if !ok {
+		return nil, path, err
+	}
+	data, err = readCheckedRegularFile(legacyPath, maxManifestBytes)
+	if err != nil {
+		return nil, legacyPath, err
+	}
+	if reference := manifestReference(requestPath); isDigestReference(reference) {
+		if _, err := verifySupportedDigest(data, reference); err != nil {
+			return nil, legacyPath, fmt.Errorf("%w: %v", errCachedManifestDigestMismatch, err)
+		}
+	}
+	return data, legacyPath, nil
 }
 
-func checkedCachedManifestMetadata(server *Server, requestPath string, data []byte) manifestMetadata {
+func checkedCachedManifestMetadataAtPath(requestPath, path string, data []byte) manifestMetadata {
 	metadata := manifestMetadata{
 		ContentType:         "application/vnd.oci.image.manifest.v1+json",
 		ContentLength:       int64(len(data)),
 		DockerContentDigest: cachedManifestDigest(data, manifestReference(requestPath), ""),
 	}
-	if rawMetadata, err := readCheckedRegularFile(server.manifestMetadataPath(requestPath), maxCachedManifestSidecarBytes); err == nil {
+	if rawMetadata, err := readCheckedRegularFile(path+".meta", maxCachedManifestSidecarBytes); err == nil {
 		var stored manifestMetadata
 		if json.Unmarshal(rawMetadata, &stored) == nil {
 			if stored.ContentType != "" {
@@ -259,7 +278,7 @@ func checkedCachedManifestMetadata(server *Server, requestPath string, data []by
 			return metadata
 		}
 	}
-	if ct, err := readCheckedRegularFile(server.manifestPath(requestPath)+".ct", maxCachedManifestSidecarBytes); err == nil && len(ct) > 0 {
+	if ct, err := readCheckedRegularFile(path+".ct", maxCachedManifestSidecarBytes); err == nil && len(ct) > 0 {
 		metadata.ContentType = string(ct)
 	}
 	return metadata

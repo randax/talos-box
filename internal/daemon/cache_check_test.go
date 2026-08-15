@@ -31,6 +31,13 @@ func TestCacheCheckRejectsUnpinnedRefsBeforeStartingCheck(t *testing.T) {
 		{"docker.io/library/nginx:1.2.3?query"},
 		{"docker.io/library/nginx:1.2.3#fragment"},
 		{"docker.io/library/ bad:1.2.3"},
+		{"registry.example/repo:one:two"},
+		{"registry.example/Uppercase/repo:1.2.3"},
+		{"registry.example/repo:-not-a-tag"},
+		{"registry.example:0/repo:tag"},
+		{"registry.example:99999/repo:tag"},
+		{strings.Repeat("a", 64) + ".example/repo:tag"},
+		{strings.Repeat("a.", 126) + "aaaa/repo:tag"},
 	} {
 		t.Run(strings.Join(refs, ","), func(t *testing.T) {
 			_, err := service.handle(Request{Op: "cache.check", Args: mustCheckArgs(t, CacheCheckArgs{Refs: refs})})

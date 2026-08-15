@@ -31,6 +31,13 @@ func TestCacheWarmRejectsUnpinnedRefsBeforeStartingWarm(t *testing.T) {
 		{"docker.io/library/nginx:1.2.3?query"},
 		{"docker.io/library/nginx:1.2.3#fragment"},
 		{"docker.io/library/ bad:1.2.3"},
+		{"registry.example/repo:one:two"},
+		{"registry.example/Uppercase/repo:1.2.3"},
+		{"registry.example/repo:-not-a-tag"},
+		{"registry.example:0/repo:tag"},
+		{"registry.example:99999/repo:tag"},
+		{strings.Repeat("a", 64) + ".example/repo:tag"},
+		{strings.Repeat("a.", 126) + "aaaa/repo:tag"},
 	} {
 		t.Run(strings.Join(refs, ","), func(t *testing.T) {
 			_, err := service.handle(Request{Op: "cache.warm", Args: mustWarmArgs(t, CacheWarmArgs{Refs: refs})})
@@ -67,6 +74,22 @@ func TestCacheWarmUsesBoundedContext(t *testing.T) {
 		Args: mustWarmArgs(t, CacheWarmArgs{Refs: []string{"docker.io/library/nginx:1.27.0"}}),
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestValidateWarmRefAcceptsDistributionRepositoryAndIPv6AuthorityGrammar(t *testing.T) {
+	t.Parallel()
+
+	for _, ref := range []string{
+		"registry.example/team/foo--bar__baz:1",
+		"REGISTRY.example/team/foo:1",
+		"[2001:db8::1]:5000/repo:tag",
+	} {
+		t.Run(ref, func(t *testing.T) {
+			if err := ValidateWarmRef(ref); err != nil {
+				t.Fatalf("ValidateWarmRef(%q) = %v, want nil", ref, err)
+			}
+		})
 	}
 }
 

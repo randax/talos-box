@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1067,6 +1068,9 @@ func ValidateWarmRef(ref string) error {
 		return fmt.Errorf("image reference %q is malformed", ref)
 	}
 
+	if strings.Count(ref, "@") > 1 {
+		return fmt.Errorf("image reference %q is malformed", ref)
+	}
 	name, digest, hasDigest := strings.Cut(ref, "@")
 	if hasDigest {
 		if digest == "" || !isSupportedWarmDigest(digest) {
@@ -1078,29 +1082,164 @@ func ValidateWarmRef(ref string) error {
 	if !ok || remainder == "" || (!strings.Contains(host, ".") && !strings.Contains(host, ":") && host != "localhost") {
 		return fmt.Errorf("image reference %q must include a registry host", ref)
 	}
-	if strings.HasSuffix(name, "/") || strings.HasPrefix(remainder, ":") {
+	if !isValidWarmRegistry(host) || strings.HasSuffix(name, "/") || strings.HasPrefix(remainder, ":") {
 		return fmt.Errorf("image reference %q is malformed", ref)
 	}
 
-	lastSlash := strings.LastIndex(name, "/")
-	lastColon := strings.LastIndex(name, ":")
-	tag := ""
-	if lastColon > lastSlash {
-		tag = name[lastColon+1:]
+	repository, tag, hasTag := remainder, "", false
+	if colon := strings.LastIndex(remainder, ":"); colon >= 0 {
+		repository, tag, hasTag = remainder[:colon], remainder[colon+1:], true
 	}
-	if hasDigest && lastColon <= lastSlash {
-		return nil
-	}
-	if hasDigest && lastColon > lastSlash && tag == "" {
+	if !isValidWarmRepository(repository) || hasTag && !isValidWarmTag(tag) {
 		return fmt.Errorf("image reference %q is malformed", ref)
 	}
-	if lastColon <= lastSlash {
+	if !hasDigest && !hasTag {
 		return fmt.Errorf("image reference %q must include a non-latest tag or digest", ref)
 	}
 	if tag == "latest" {
 		return fmt.Errorf("image reference %q must not use :latest", ref)
 	}
 	return nil
+}
+
+func isValidWarmRegistry(value string) bool {
+	if strings.HasPrefix(value, "[") {
+		closingBracket := strings.IndexByte(value, ']')
+		if closingBracket < 0 {
+			return false
+		}
+		address := value[1:closingBracket]
+		if !strings.Contains(address, ":") || net.ParseIP(address) == nil {
+			return false
+		}
+		port := value[closingBracket+1:]
+		return port == "" || strings.HasPrefix(port, ":") && isValidWarmPort(port[1:])
+	}
+	host := value
+	if colon := strings.LastIndex(value, ":"); colon >= 0 {
+		host = value[:colon]
+		if host == "" || !isValidWarmPort(value[colon+1:]) {
+			return false
+		}
+	}
+	if host == "localhost" {
+		return true
+	}
+	if len(host) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if !isValidWarmHostLabel(label) {
+			return false
+		}
+	}
+	return true
+}
+
+func isValidWarmHostLabel(value string) bool {
+	if value == "" || len(value) > 63 || value[0] == '-' || value[len(value)-1] == '-' {
+		return false
+	}
+	for _, character := range value {
+		if !isAlphaNumeric(character) && character != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func isValidWarmRepository(value string) bool {
+	if value == "" || len(value) > 255 {
+		return false
+	}
+	for _, component := range strings.Split(value, "/") {
+		if !isValidWarmRepositoryComponent(component) {
+			return false
+		}
+	}
+	return true
+}
+
+func isValidWarmRepositoryComponent(value string) bool {
+	if value == "" || !isLowerAlphaNumeric(value[0]) {
+		return false
+	}
+	for index := 1; index < len(value); {
+		character := value[index]
+		if isLowerAlphaNumeric(character) {
+			index++
+			continue
+		}
+		switch character {
+		case '-':
+			for index < len(value) && value[index] == '-' {
+				index++
+			}
+		case '.', '_':
+			index++
+			if character == '_' && index < len(value) && value[index] == '_' {
+				index++
+			}
+		default:
+			return false
+		}
+		if index == len(value) || !isLowerAlphaNumeric(value[index]) {
+			return false
+		}
+	}
+	return true
+}
+
+func isValidWarmTag(value string) bool {
+	if len(value) == 0 || len(value) > 128 || !isTagStart(value[0]) {
+		return false
+	}
+	for index := 1; index < len(value); index++ {
+		character := value[index]
+		if !isTagStart(character) && character != '.' && character != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func isLowerAlphaNumeric(character byte) bool {
+	return (character >= 'a' && character <= 'z') || (character >= '0' && character <= '9')
+}
+
+func isAlphaNumeric(character rune) bool {
+	return (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9')
+}
+
+func isTagStart(character byte) bool {
+	return isLowerAlphaNumeric(character) || (character >= 'A' && character <= 'Z') || character == '_'
+}
+
+func isDecimal(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isValidWarmPort(value string) bool {
+	if !isDecimal(value) {
+		return false
+	}
+	port := 0
+	for _, character := range value {
+		digit := int(character - '0')
+		if port > (65535-digit)/10 {
+			return false
+		}
+		port = port*10 + digit
+	}
+	return port > 0
 }
 
 func isSupportedWarmDigest(value string) bool {

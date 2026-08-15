@@ -28,8 +28,8 @@ func TestMinimumProvisioningIntentProtocolPreservesLegacyCNICompatibility(t *tes
 	if got := minimumProvisioningIntentProtocol(cluster.ProvisioningIntentInput{CNI: "cilium"}); got != 1 {
 		t.Fatalf("CNI-only minimum protocol = %d, want 1", got)
 	}
-	if got := minimumProvisioningIntentProtocol(cluster.ProvisioningIntentInput{CNI: "cilium", CSI: "longhorn"}); got != daemon.ProtocolVersion {
-		t.Fatalf("CSI minimum protocol = %d, want %d", got, daemon.ProtocolVersion)
+	if got := minimumProvisioningIntentProtocol(cluster.ProvisioningIntentInput{CNI: "cilium", CSI: "longhorn"}); got != csiProvisioningIntentProtocolVersion {
+		t.Fatalf("CSI minimum protocol = %d, want %d", got, csiProvisioningIntentProtocolVersion)
 	}
 }
 
@@ -282,14 +282,14 @@ func TestCreateClusterWithCSIRejectsOldDaemonBeforeMutation(t *testing.T) {
 			return
 		}
 		requests <- request
-		response := fmt.Sprintf(`{"protocolVersion":%d}`, daemon.ProtocolVersion-1)
+		response := fmt.Sprintf(`{"protocolVersion":%d}`, csiProvisioningIntentProtocolVersion-1)
 		_ = json.NewEncoder(connection).Encode(daemon.Response{OK: true, Data: json.RawMessage(response)})
 	}()
 
 	var stdout, stderr bytes.Buffer
 	command := cli{out: &stdout, err: &stderr}
 	err = command.createCluster([]string{"demo", "--cni=cilium", "--csi=longhorn"})
-	if err == nil || !strings.Contains(err.Error(), "tbxd protocol 1 is too old") || !strings.Contains(err.Error(), "--csi") {
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("tbxd protocol %d is too old", csiProvisioningIntentProtocolVersion-1)) || !strings.Contains(err.Error(), "--csi") {
 		t.Fatalf("createCluster() error = %v, want CSI protocol upgrade refusal", err)
 	}
 	if request := <-requests; request.Op != "daemon.info" {
