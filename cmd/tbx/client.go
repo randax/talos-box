@@ -24,6 +24,7 @@ func (e dialError) Error() string { return e.err.Error() }
 const (
 	legacyProvisioningIntentProtocolVersion = 1
 	csiProvisioningIntentProtocolVersion    = 2
+	cacheWarmProtocolVersion                = 3
 	nodeRemoveGateProtocolVersion           = 4
 )
 
@@ -86,7 +87,7 @@ func (c cli) ensureCacheWarmSupport() error {
 		}
 		return err
 	}
-	if info.ProtocolVersion < daemon.ProtocolVersion {
+	if info.ProtocolVersion < cacheWarmProtocolVersion {
 		return fmt.Errorf("tbxd protocol %d is too old; restart or upgrade tbxd before using cache warm/check", info.ProtocolVersion)
 	}
 	if info.ProtocolVersion > daemon.ProtocolVersion {
