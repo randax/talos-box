@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -469,6 +470,9 @@ func (s *Server) dispatchNodeMutation(request Request) Response {
 }
 
 func (s *Server) nodeRemovalLock(clusterName string) *sync.Mutex {
+	// normalize the key: on a case-insensitive filesystem "Demo" and "demo"
+	// load the same cluster state and must share one removal lock
+	clusterName = strings.ToLower(clusterName)
 	s.nodeRemoveMu.Lock()
 	defer s.nodeRemoveMu.Unlock()
 	if s.nodeRemoveLocks == nil {

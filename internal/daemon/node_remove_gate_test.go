@@ -168,7 +168,7 @@ func TestNodeRemoveProceedsWithWarningWhenVolumesAreUnverifiable(t *testing.T) {
 		t.Fatalf("node.remove with unverifiable volumes failed: %s", response.Error)
 	}
 	status := decodeNodeStatus(t, response)
-	if !strings.Contains(status.Warning, "demo-worker-2") || !strings.Contains(status.Warning, "without verifying") {
+	if !strings.Contains(status.Warning, "demo-worker-2") || !strings.Contains(status.Warning, "could not verify") {
 		t.Fatalf("unverifiable-remove warning %q does not state the possible data loss", status.Warning)
 	}
 }
@@ -188,7 +188,7 @@ func TestNodeRemoveSkipsVolumeObservationOnStoppedCluster(t *testing.T) {
 		t.Fatalf("node.remove on stopped cluster failed: %s", response.Error)
 	}
 	status := decodeNodeStatus(t, response)
-	if !strings.Contains(status.Warning, "without verifying") {
+	if !strings.Contains(status.Warning, "could not verify") {
 		t.Fatalf("stopped-cluster remove warning %q does not state the possible data loss", status.Warning)
 	}
 }
@@ -213,7 +213,7 @@ func TestNodeRemoveObservationTimeoutDegradesToWarning(t *testing.T) {
 	if !response.OK {
 		t.Fatalf("node.remove with a hanging observation failed: %s", response.Error)
 	}
-	if status := decodeNodeStatus(t, response); !strings.Contains(status.Warning, "without verifying") {
+	if status := decodeNodeStatus(t, response); !strings.Contains(status.Warning, "could not verify") {
 		t.Fatalf("timeout-remove warning %q does not state the possible data loss", status.Warning)
 	}
 }

@@ -96,9 +96,13 @@ func removeNodeDataLossWarning(item cluster.Cluster, nodeName string, count int)
 	)
 }
 
+// removeNodeUnverifiedDataWarning must read honestly both after a completed
+// removal and appended to a failure that may have stopped short of deleting
+// the disk, so it ties the data loss to the disk deletion rather than
+// asserting it happened.
 func removeNodeUnverifiedDataWarning(item cluster.Cluster, nodeName string) string {
 	return fmt.Sprintf(
-		"node %s was removed without verifying %s volume data; any volume whose only copy lived on it is permanently deleted — verify your volumes once the cluster is reachable",
+		"removing node %s could not verify %s volume data; any volume whose only copy lives on it is permanently deleted with its disk — verify your volumes once the cluster is reachable",
 		nodeName,
 		item.CSI,
 	)

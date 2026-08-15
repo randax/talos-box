@@ -183,8 +183,9 @@ func longhornProbeVolumeHandles(ctx context.Context, client kubernetes.Interface
 }
 
 // replicaActive reports whether the replica is the volume's live copy rather
-// than a leftover from an engine upgrade. A missing active field (older CRD
-// shapes) counts as active, keeping the gate conservative.
+// than a leftover from an engine upgrade. A missing active field counts as
+// active: CRD shapes that predate the field only ever described live
+// replicas.
 func replicaActive(replica *unstructured.Unstructured) bool {
 	active, found, err := unstructured.NestedBool(replica.Object, "spec", "active")
 	if err != nil || !found {
