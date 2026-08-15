@@ -37,3 +37,12 @@ func TestDetachReader(t *testing.T) {
 		t.Errorf("post-detach read error = %v, want errDetached", err)
 	}
 }
+
+func TestConfiguredConsoleTipIncludesEndpoint(t *testing.T) {
+	t.Parallel()
+
+	want := "tip: this node is configured — for the Talos dashboard TUI run: talosctl dashboard --talosconfig '/tmp/demo cluster/talosconfig' --nodes 172.30.0.2 --endpoints 172.30.0.2"
+	if got := configuredConsoleTip("172.30.0.2", "/tmp/demo cluster/talosconfig"); got != want {
+		t.Fatalf("configuredConsoleTip() = %q, want %q", got, want)
+	}
+}

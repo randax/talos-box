@@ -47,7 +47,11 @@ func TestHints(t *testing.T) {
 		{
 			name:  "all configured suggests bootstrap and the dashboard",
 			nodes: []NodeStatus{node("demo-cp-1", PhaseConfigured)},
-			want:  []string{"talosctl", "bootstrap", "dashboard"},
+			want: []string{
+				"talosctl bootstrap --talosconfig ./talosconfig --nodes 172.30.0.2 --endpoints 172.30.0.2",
+				"talosctl kubeconfig . --talosconfig ./talosconfig --nodes 172.30.0.2 --endpoints 172.30.0.2",
+				"talosctl dashboard --talosconfig ./talosconfig --nodes 172.30.0.2 --endpoints 172.30.0.2",
+			},
 		},
 		{
 			name:  "stopped cluster suggests start",

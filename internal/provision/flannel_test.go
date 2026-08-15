@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/shellquote"
 	"github.com/siderolabs/talos/pkg/machinery/config/configloader"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/cri"
 	"google.golang.org/grpc/codes"
@@ -174,7 +175,10 @@ func (f *fakeClient) KubernetesReady(_ context.Context, _ []byte, expectedNodes 
 }
 
 func TestFlannelReconcileAppliesOnlyMaintenanceThenBootstraps(t *testing.T) {
-	home := t.TempDir()
+	home := filepath.Join(t.TempDir(), "home with space")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("HOME", home)
 	item, err := cluster.New("demo", 0, 1, 1, cluster.NodeDefaults{})
 	if err != nil {
@@ -219,7 +223,13 @@ func TestFlannelReconcileAppliesOnlyMaintenanceThenBootstraps(t *testing.T) {
 		t.Fatalf("result paths = %+v", result)
 	}
 	narration := strings.Join(result.Narration, "\n")
-	for _, wanted := range []string{"apply-config --insecure", "bootstrap", "kubeconfig", "export TALOSCONFIG=", "export KUBECONFIG="} {
+	for _, wanted := range []string{
+		"apply-config --insecure",
+		fmt.Sprintf("bootstrap: ≈ talosctl bootstrap --talosconfig %s --nodes %[2]s --endpoints %[2]s", shellquote.Quote(result.TalosconfigPath), item.Nodes[0].IP),
+		fmt.Sprintf("credentials: ≈ talosctl kubeconfig %s --talosconfig %s --nodes %[3]s --endpoints %[3]s", shellquote.Quote(result.KubeconfigPath), shellquote.Quote(result.TalosconfigPath), item.Nodes[0].IP),
+		"export TALOSCONFIG=" + shellquote.Quote(result.TalosconfigPath),
+		"export KUBECONFIG=" + shellquote.Quote(result.KubeconfigPath),
+	} {
 		if !strings.Contains(narration, wanted) {
 			t.Fatalf("narration missing %q:\n%s", wanted, narration)
 		}

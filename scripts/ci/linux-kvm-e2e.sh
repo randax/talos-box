@@ -243,7 +243,7 @@ for disk in "$home/.talosbox/clusters/e2e"/*.img; do
 done
 
 maintenance_api_ready() {
-  talosctl --nodes "$1" --insecure version >/dev/null 2>&1
+  talosctl version --nodes "$1" --insecure >/dev/null 2>&1
 }
 for node_ip in "${node_ips[@]}"; do
   retry "Talos maintenance API at $node_ip" 120 5 maintenance_api_ready "$node_ip"
@@ -256,19 +256,19 @@ cluster:
       name: none
 EOF
 talosctl gen config e2e "https://${cp_ip}:6443" --output-dir "$talos_config" --config-patch "@$talos_config/cni-none.yaml"
-talosctl --nodes "$cp_ip" --insecure apply-config --file "$talos_config/controlplane.yaml"
+talosctl apply-config --nodes "$cp_ip" --insecure --file "$talos_config/controlplane.yaml"
 for node_ip in "${node_ips[@]:1}"; do
-  talosctl --nodes "$node_ip" --insecure apply-config --file "$talos_config/worker.yaml"
+  talosctl apply-config --nodes "$node_ip" --insecure --file "$talos_config/worker.yaml"
 done
 
 configured_api_ready() {
-  talosctl --talosconfig "$talos_config/talosconfig" --nodes "$cp_ip" version >/dev/null 2>&1
+  talosctl version --talosconfig "$talos_config/talosconfig" --nodes "$cp_ip" --endpoints "$cp_ip" >/dev/null 2>&1
 }
 retry "configured Talos API" 120 5 configured_api_ready
 
 bootstrap_cluster() {
   local output
-  if output=$(talosctl --talosconfig "$talos_config/talosconfig" --nodes "$cp_ip" bootstrap 2>&1); then
+  if output=$(talosctl bootstrap --talosconfig "$talos_config/talosconfig" --nodes "$cp_ip" --endpoints "$cp_ip" 2>&1); then
     return 0
   fi
   if grep -qi 'already bootstrapped' <<<"$output"; then
@@ -280,7 +280,7 @@ bootstrap_cluster() {
 retry "Talos bootstrap" 12 5 bootstrap_cluster
 
 retrieve_kubeconfig() {
-  talosctl --talosconfig "$talos_config/talosconfig" --nodes "$cp_ip" kubeconfig "$kubeconfig" --force >/dev/null 2>&1
+  talosctl kubeconfig "$kubeconfig" --talosconfig "$talos_config/talosconfig" --nodes "$cp_ip" --endpoints "$cp_ip" --force >/dev/null 2>&1
 }
 retry "kubeconfig retrieval" 120 5 retrieve_kubeconfig
 

@@ -14,6 +14,7 @@ import (
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/daemon"
+	"github.com/randax/talos-box/internal/shellquote"
 )
 
 // detachByte is Ctrl-] — the telnet-style detach key (SPEC §10).
@@ -83,7 +84,7 @@ func (c cli) runConsole(args []string) error {
 
 	_, _ = fmt.Fprintf(c.err, "attached to %s/%s console (kernel + machined logs; recent output replays) — detach with Ctrl-]\n", clusterName, nodeName)
 	if target.Phase == daemon.PhaseConfigured {
-		_, _ = fmt.Fprintf(c.err, "tip: this node is configured — for the Talos dashboard TUI run: talosctl dashboard --nodes %s\n", target.IP)
+		_, _ = fmt.Fprintln(c.err, configuredConsoleTip(target.IP, filepath.Join(dir, "talosconfig")))
 	}
 
 	stdinFd := int(os.Stdin.Fd())
@@ -118,4 +119,8 @@ func (c cli) runConsole(args []string) error {
 		return nil
 	}
 	return err
+}
+
+func configuredConsoleTip(ip, talosconfig string) string {
+	return fmt.Sprintf("tip: this node is configured — for the Talos dashboard TUI run: talosctl dashboard --talosconfig %s --nodes %[2]s --endpoints %[2]s", shellquote.Quote(talosconfig), ip)
 }
