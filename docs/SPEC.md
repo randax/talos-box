@@ -17,7 +17,8 @@ The tool always guarantees the **substrate** — VMs, networking, DNS, and image
 Without `cni`, it deliberately stops there so workshops can teach Talos bootstrap and CNI
 installation themselves. Declaring `cni: cilium|flannel` opts into the curated path: `tbx`
 generates and applies Talos machine config, bootstraps Kubernetes, and reconciles the pinned CNI
-and optional LoadBalancer resources from the host. Ingress controllers and attendee workloads
+and optional LoadBalancer resources from the host. Declaring `csi: longhorn|local-path`
+(requires `cni`) adds curated persistent storage to the same path (§9). Ingress controllers and attendee workloads
 remain **attendee work**; Cilium's built-in ingress controller is disabled.
 
 Out of scope ([original map](https://github.com/randax/talos-box/issues/1),
@@ -90,8 +91,10 @@ prototype harness.
 [Talos boot mechanics](https://github.com/randax/talos-box/issues/3))
 
 **Raw disk images, never in-VM installs.** talosbox generates its **own default Image Factory
-schematic** — vanilla plus `customization.extraKernelArgs: ["console=tty0", "console=hvc0"]` —
-because both backends expose the Talos console as virtio `hvc0`. **Both args are mandatory and
+schematic** — vanilla plus `customization.extraKernelArgs: ["console=tty0", "console=hvc0"]`
+and the `siderolabs/iscsi-tools` and `siderolabs/util-linux-tools` system extensions, so every
+tbx image is storage-capable from birth. The kernel args exist because both backends expose the
+Talos console as virtio `hvc0`. **Both args are mandatory and
 ordered**: Factory's extraKernelArgs *replace* the image's default console args, and
 `console=hvc0` alone bricks the boot under vz (verified: no boot, no output; with
 `console=tty0 console=hvc0` the node boots and streams kernel+machined logs on hvc0 — gate G6,
@@ -232,7 +235,8 @@ preserves memory; after a daemon restart it warns and gracefully cold-boots beca
 file-handle-backed device identity required by vz restore no longer exists. Linux QEMU 8.2+
 saves to a versioned file and can restore after a daemon restart when the QEMU version,
 architecture, and machine type match; older QEMU refuses suspend with the capability reason.
-Nodes always come up **unconfigured** — talosbox never generates or applies machine config.
+On the substrate-only path, nodes always come up **unconfigured** — talosbox generates and
+applies machine config only when a curated `cni:` is declared (§1).
 `tbx status` reports each node's observed phase — `stopped`, `unreachable`, `maintenance`,
 `configured` — derived from a credential-free TLS probe of apid: **both** apid modes serve TLS
 (empirical correction, #31 — the earlier "insecure = maintenance" model was wrong);
@@ -279,6 +283,7 @@ equivalent YAML.
 ```
 tbx up / tbx down
 tbx cluster create|start|stop|destroy|list [name] [--cp N --workers N]
+                  [--cni cilium|flannel] [--csi longhorn|local-path] [--lb] [--bgp] [--hubble]
 tbx node add|remove|start|stop <cluster> [node]
 tbx cluster suspend|resume <cluster>
 tbx snapshot create|restore|list|delete <cluster> [name]
@@ -309,7 +314,11 @@ clusters:
   - name: demo
     controlPlanes: 1
     workers: 2
+    cni: cilium            # optional curated CNI: cilium|flannel; absent = substrate only
+    csi: longhorn          # optional curated storage: longhorn|local-path; requires cni
+    lb: true               # LoadBalancer support with the curated CNI
     bgp: false
+    hubble: false          # Cilium Hubble Relay and UI
     domain: lab.internal   # optional cluster domain; default <name>.k8s.test
     allowUnsafeDomain: false # explicit opt-in for domains that can shadow real DNS
     node:                  # defaults for all nodes
@@ -320,9 +329,26 @@ clusters:
     worker: {}
 ```
 
+**Curated storage semantics.** `csi:` is a flat scalar and rejects any value without a curated
+`cni:` before anything mutates. Longhorn (pinned v1-series) is the multinode engine; local-path
+(pinned) is the lightweight single-node option. Both keep their data under `/var` on the node
+disks, mark their StorageClass as the cluster default, and derive everything else from cluster
+facts: Longhorn's replica count is the node count capped at 3. Storage counts as **live** only
+after a real end-state probe — a bare PVC binds against the default StorageClass, a writer pod
+writes, a reader pod reads the data back, and the probe objects are cleaned up. Until then
+`tbx status` reports storage as **provisioning**; a single-node Longhorn cluster gains a
+status hint that its volumes have no redundancy, and choosing Longhorn on a memory-tight host
+prints a soft pre-flight warning (never a hard gate). Storage is ordinary provisioned state —
+`tbx up` converges the storage stage from any interruption and `tbx down`/restarts preserve
+volume data. tbx never deletes user data except by `tbx cluster destroy`: switching or removing
+`csi:` is allowed only while the engine holds zero volumes (hard error otherwise), and the
+destroy confirmation reports a best-effort volume count without ever blocking the destroy of an
+unreachable cluster.
+
 ## 10. Guided output
 
-`tbx status` is **state-aware**: alongside nodes/IPs/DNS names/LB pool/BGP state it appends
+`tbx status` is **state-aware**: alongside nodes/IPs/DNS names/LB pool/BGP state and the
+storage phase (provisioning → live, gated by the write/readback probe, §9) it appends
 copy-pasteable next-step hints keyed to observed state (maintenance node → the
 `talosctl --insecure` probe; provisioned clusters report convergence progress and a safe `tbx up` rerun; substrate-only clusters retain manual guidance).
 Hints **never execute anything**. `--quiet` suppresses them; all list/status commands support
