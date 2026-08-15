@@ -1,0 +1,100 @@
+# QA Scenario: Offline venue rehearsal
+
+| | |
+|---|---|
+| **Tier** | Combination scenario (mirror × skipFallback × digest-serving × provisioning) |
+| **Platform** | macOS + Linux |
+| **Estimated duration** | 60–90 min |
+| **Destructive** | Creates and destroys cluster `qa-venue`; requires cutting upstream network mid-run |
+| **Runbook version** | against talos-box main @ the commit recorded in your report |
+
+## How to execute this runbook (agent instructions)
+
+You are running QA, not demos. For every charter: run the steps exactly, compare against **Expected observations**, and record **PASS**, **FAIL**, or **PASS-with-friction**. Friction — confusing messages, doc/behavior mismatch, missing knowledge, misleading output — is a first-class result even on passing charters. No improvised recovery: capture the **On failure** evidence, mark FAIL, continue unless a dependency broke.
+
+**Report destination**: one `qa-run` issue, title `QA scenario-offline-venue <platform> <date>`.
+
+## Preflight
+
+BLOCKED unless: doctor clean; no cluster `qa-venue`; you have a way to cut upstream connectivity for the tbx host that you can also undo (Wi-Fi off / unplug / firewall rule) — record the mechanism; ≥ 10 GiB RAM.
+
+## Charters
+
+### C1 — Prepare while online
+
+**Goal**: everything a provisioned cluster needs enters the cache before the network goes away.
+
+Steps:
+1. `tbx cache pull` (default Talos disk image for this host's arch).
+2. Create the provisioned cluster once online to let the mirror warm organically: `tbx cluster create qa-venue --cni cilium --csi longhorn`, wait for the full end state (VIP live, storage ready), exercise a PVC write.
+3. `tbx cache warm --check --deep <list>` if you maintain a pin list for extra workload images you'll use in C3; otherwise record that the mirror was warmed organically.
+4. `tbx cache list` — record disk-image and per-upstream mirror totals.
+5. `tbx cluster destroy qa-venue --force` (the venue rehearsal starts from nothing).
+
+Expected observations: cache list shows the Talos image and substantial mirror content across the upstreams the curated path uses.
+
+Pass criteria: cache populated; cluster destroyed clean.
+
+On failure: capture cache list and create output.
+
+### C2 — Go dark
+
+**Goal**: the offline boundary is real.
+
+Steps:
+1. `tbx mirror offline on`; confirm with `tbx mirror offline`.
+2. Cut upstream connectivity (your recorded mechanism). Verify: `curl --max-time 5 https://factory.talos.dev` fails.
+
+Pass criteria: host provably offline; mirror mode on.
+
+### C3 — Create the full provisioned cluster with zero upstream (depends on C1, C2)
+
+**Goal**: the venue promise: disk image from cache, every container pull served by the offline mirror, cluster reaches the same end state as online.
+
+Steps:
+1. `tbx cluster create qa-venue --cni cilium --csi longhorn`
+2. Follow status to the end state; export credentials; verify VIP answers and a PVC write/readback works.
+3. Watch for any stall or image-pull backoff: `kubectl get events -A | grep -i pull` — a single upstream-dial attempt is a FAIL even if retried successfully later.
+
+Expected observations: create uses the cached disk image (no factory download); all pods reach Running with images served from the mirror cache; total time comparable to the online run (record both); zero pull failures.
+
+Pass criteria: full end state (VIP + storage probe) with the network cut the entire time.
+
+On failure: capture the stalled pod's describe/events, `tbx cache list`, mirror mode, and exactly which image reference missed.
+
+### C4 — Miss behavior stays honest (depends on C3)
+
+**Goal**: an uncached image fails fast and clearly, not with a hang.
+
+Steps:
+1. Deploy a pod with an image that was never warmed. Expect a clear pull failure (offline: content not cached) within a bounded time, no infinite hang.
+
+Pass criteria: hard, legible failure; cluster otherwise unaffected.
+
+On failure: capture pod events and how long it took to surface.
+
+### C5 — Return to daylight and cleanup (always run)
+
+Steps: restore connectivity; `tbx mirror offline off`; confirm the C4 pod now pulls; `tbx cluster destroy qa-venue --force`; verify no residue; leave the mirror cache intact (do NOT prune — the cache is the venue asset).
+
+Pass criteria: pull-through restored; no residue; cache preserved.
+
+## Report template
+
+```markdown
+## QA scenario-offline-venue <platform> — <date>
+
+- tbx version / commit; platform details; offline mechanism used:
+- Preflight: OK | BLOCKED (<why>)
+
+| Charter | Verdict | Duration | Notes |
+|---|---|---|---|
+| C1 prepare online | | | |
+| C2 go dark | | | |
+| C3 offline create | | | |
+| C4 miss behavior | | | |
+| C5 daylight + cleanup | | | |
+
+### Friction log
+### Failures
+```
