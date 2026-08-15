@@ -1,0 +1,128 @@
+# QA Runbook: Mirror, offline & cache
+
+| | |
+|---|---|
+| **Tier** | Deep (one feature area exercised against defaults) |
+| **Platform** | macOS + Linux (port-5000 hazard is macOS-flavored but checks run everywhere) |
+| **Estimated duration** | 45–60 min |
+| **Destructive** | Creates and destroys cluster `qa-mir`; **prunes only what it warmed** (uses `--mirror` prune at the end — do NOT run on a host whose mirror cache you need to keep) |
+| **Runbook version** | against talos-box main @ the commit recorded in your report |
+
+## How to execute this runbook (agent instructions)
+
+You are running QA, not demos. For every charter: run the steps exactly, compare against **Expected observations**, and record **PASS**, **FAIL**, or **PASS-with-friction**. Friction — confusing messages, doc/behavior mismatch, missing knowledge, misleading output — is a first-class result even on passing charters. No improvised recovery: capture the **On failure** evidence, mark FAIL, continue unless a dependency broke.
+
+**Report destination**: one `qa-run` issue, title `QA deep-mirror-offline-cache <platform> <date>`.
+
+## Preflight
+
+BLOCKED unless: `tbx version` recorded; `tbx doctor` exits 0 (egress OK); no cluster `qa-mir`; the host's mirror cache is expendable (see Destructive above); online.
+
+## Charters
+
+### C1 — Warm list contract
+
+**Goal**: `cache warm` accepts pinned refs, rejects unpinned, and reports per-image progress.
+
+Steps:
+1. Write a list file with: one tag-pinned ref (e.g. `docker.io/library/pause:3.10`), one digest-pinned ref, one tag+digest ref, a `#` comment, and a blank line. Run `tbx cache warm <file>`.
+2. Run again — record what a re-warm does (should be cheap/no-op-ish).
+3. Negative: a list containing `docker.io/library/pause:latest` — expect rejection; a tagless ref — expect rejection; a tag+digest where the digest is wrong — expect a resolution-mismatch error.
+4. `tbx cache warm --check <file>` then `--check --deep <file>`; also `--deep` without `--check` — expect refusal.
+
+Expected observations: per-image progress with continue-through-failures and non-zero exit on any gap; `latest`/tagless rejected by design; mismatch pinned-digest error names the ref; `--check` verifies offline (no upstream dials — verify by watching for network errors with upstream unreachable if feasible, else trust exit + wording); `--deep` requires `--check`.
+
+Pass criteria: all accept/reject behaviors as documented.
+
+On failure: capture full command output per case.
+
+### C2 — Gateway-only binds and port layout (depends on a running cluster)
+
+**Goal**: mirror ports live on cluster gateways only, added/removed with cluster lifecycle.
+
+Steps:
+1. `tbx cluster create qa-mir --cni cilium` (provisioned so nodes actually pull through the mirror).
+2. On the host: check listeners — `lsof -iTCP:5059 -sTCP:LISTEN` (macOS) / `ss -tlnp | grep 5059` (Linux). Also ports 5055–5058.
+3. Confirm binds are on the cluster gateway IP (`172.30.<n>.1`), NOT `0.0.0.0` and NOT the host's LAN address.
+4. `tbx cluster stop qa-mir`; re-check — binds for that gateway gone. `tbx cluster start qa-mir` to continue.
+5. macOS only: confirm nothing tbx-owned listens on 5000 (AirPlay hazard).
+
+Expected observations: catch-all `:5059` on the gateway; legacy 5055–5058 present per current behavior (record exactly which); binds tied to cluster start/stop; no wildcard binds ever.
+
+Pass criteria: gateway-only binds, lifecycle-tied.
+
+On failure: capture the listener table verbatim.
+
+### C3 — skipFallback contract on the node (depends on C2)
+
+**Goal**: machine config points all pulls at the single catch-all with no upstream bypass.
+
+Steps:
+1. `tbx manifests qa-mir mirrors` — expect `"*"` → `http://172.30.<n>.1:5059`, `skipFallback: true`.
+2. From a test pod, pull an image that is NOT cached and NOT warmable (while online): confirm it arrives via the mirror (mirror stats change: `tbx cache list` before/after shows the upstream's counters grow).
+
+Expected observations: the rendered mirror config matches the live pull behavior; `cache list` per-upstream counters reflect the pull.
+
+Pass criteria: pulls route through the mirror; config matches.
+
+On failure: capture `manifests mirrors` output and `cache list` before/after.
+
+### C4 — Offline mode semantics (depends on C3)
+
+**Goal**: `mirror offline on` serves cache-only and fails misses hard; mode survives restarts.
+
+Steps:
+1. Warm one specific tag-pinned image (C1's list). `tbx mirror offline on`; `tbx mirror offline` reports `on`.
+2. From a test pod, pull the warmed image by tag — succeeds from cache. Pull it by digest — also succeeds (digest/tag parity).
+3. Pull an uncached image — expect a hard failure mentioning offline/not-cached (skipFallback means the node cannot bypass; the pull fails, it does not hang).
+4. Restart the daemon path you can exercise (e.g. `tbx cluster stop qa-mir && tbx cluster start qa-mir`, or note if a real tbxd restart is available); `tbx mirror offline` still reports `on`.
+5. `tbx mirror offline off`; the previously failing pull now succeeds.
+
+Expected observations: cached tag AND digest served offline; miss = clear hard failure, not a hang; mode persists; `off` restores pull-through.
+
+Pass criteria: all five behaviors exact.
+
+On failure: capture pod events (`kubectl describe pod`), mirror mode outputs.
+
+### C5 — Prune scopes (depends on C4)
+
+**Goal**: prune scope boundaries hold.
+
+Steps:
+1. `tbx cache list` — record disk images and mirror totals.
+2. `tbx cache prune` (no flag) — disk images gone, mirror intact (`cache list` confirms; output should say mirror untouched).
+3. `tbx cache prune --mirror` — mirror content gone, remaining disk images (if any re-pulled) intact.
+4. `tbx cache prune --mirror --all` — expect flag-exclusivity refusal.
+
+Expected observations: scopes exactly as documented; explicit output about what was and wasn't touched.
+
+Pass criteria: scope boundaries and exclusivity hold.
+
+On failure: capture `cache list` before/after each prune.
+
+### C6 — Destroy and cleanup (always run)
+
+Steps: `tbx mirror offline off` (leave pull-through); `tbx cluster destroy qa-mir --force`; verify no residue; note that mirror cache emptiness is expected here only because C5 pruned it.
+
+Pass criteria: no residue; mirror mode back to off.
+
+## Report template
+
+```markdown
+## QA deep-mirror-offline-cache <platform> — <date>
+
+- tbx version / commit; platform details:
+- Preflight: OK | BLOCKED (<why>)
+
+| Charter | Verdict | Duration | Notes |
+|---|---|---|---|
+| C1 warm contract | | | |
+| C2 gateway binds | | | |
+| C3 skipFallback | | | |
+| C4 offline semantics | | | |
+| C5 prune scopes | | | |
+| C6 destroy | | | |
+
+### Friction log
+### Failures
+```
