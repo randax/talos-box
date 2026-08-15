@@ -23,6 +23,11 @@ source "$root/scripts/ci/kvm-e2e-lib.sh"
 # Two sequential clusters plus the mirror cache holding the curated storage images.
 required_bytes=$((20 * 1024 * 1024 * 1024))
 
+# The cluster is named "e2es" and the workdir template kept short deliberately:
+# the daemon binds per-node Unix sockets under
+# $HOME/.talosbox/clusters/<name>/<node>.console.sock, and Linux rejects socket
+# paths over 108 bytes with "bind: invalid argument".
+
 workdir=""
 workdir_owned=false
 home=""
@@ -44,9 +49,9 @@ dump_failure_diagnostics() (
   daemon_ready=false
   if [[ -n "$daemon_pid" && -n "$home" && -S "$home/.talosbox/tbxd.sock" ]] && kill -0 "$daemon_pid" 2>/dev/null; then
     daemon_ready=true
-    HOME="$home" TBX_HELPER_SOCKET="$helper_socket" "$root/bin/tbx" status e2e-storage --quiet -o json >&2
+    HOME="$home" TBX_HELPER_SOCKET="$helper_socket" "$root/bin/tbx" status e2es --quiet -o json >&2
   fi
-  kubeconfig="$home/.talosbox/clusters/e2e-storage/kubeconfig"
+  kubeconfig="$home/.talosbox/clusters/e2es/kubeconfig"
   if [[ -f "$kubeconfig" ]]; then
     printf '\n===== cluster workloads =====\n' >&2
     kubectl --kubeconfig "$kubeconfig" get nodes -o wide >&2
@@ -68,15 +73,15 @@ dump_failure_diagnostics() (
   if [[ "$daemon_ready" == true && -x "$root/bin/tbx" ]]; then
     while read -r node; do
       [[ -n "$node" ]] || continue
-      printf '\n===== console %s/%s =====\n' e2e-storage "$node" >&2
-      timeout 3s "$root/bin/tbx" console e2e-storage "$node" </dev/null >&2
-    done < <(HOME="$home" TBX_HELPER_SOCKET="$helper_socket" "$root/bin/tbx" status e2e-storage --quiet -o json | jq -r '.[0].nodes[].name')
+      printf '\n===== console %s/%s =====\n' e2es "$node" >&2
+      timeout 3s "$root/bin/tbx" console e2es "$node" </dev/null >&2
+    done < <(HOME="$home" TBX_HELPER_SOCKET="$helper_socket" "$root/bin/tbx" status e2es --quiet -o json | jq -r '.[0].nodes[].name')
   fi
   printf '\n===== end diagnostics =====\n' >&2
 )
 cleanup() {
   if [[ "$cluster_cleanup_needed" == true && -x "$root/bin/tbx" && -n "$home" && -n "$helper_socket" ]]; then
-    HOME="$home" TBX_HELPER_SOCKET="$helper_socket" "$root/bin/tbx" cluster destroy e2e-storage --force || true
+    HOME="$home" TBX_HELPER_SOCKET="$helper_socket" "$root/bin/tbx" cluster destroy e2es --force || true
   fi
   if [[ -n "$daemon_pid" ]]; then
     kill "$daemon_pid" 2>/dev/null || true
@@ -91,7 +96,7 @@ cleanup() {
 trap cleanup EXIT
 trap dump_failure_diagnostics ERR
 
-prepare_workdir "talosbox-kvm-storage-e2e.XXXXXX"
+prepare_workdir "tbx-storage.XXXXXX"
 
 home="$workdir/home"
 helper_socket="$workdir/tbx-helper.sock"
@@ -124,13 +129,13 @@ retry "helper socket" 30 1 socket_ready "$helper_socket"
 daemon_pid=$!
 wait_for_process_socket "tbxd" 30 1 "$daemon_pid" "$home/.talosbox/tbxd.sock" "$workdir/tbxd.log"
 
-kubeconfig="$home/.talosbox/clusters/e2e-storage/kubeconfig"
+kubeconfig="$home/.talosbox/clusters/e2es/kubeconfig"
 kc() {
   kubectl --kubeconfig "$kubeconfig" "$@"
 }
 
 storage_live() {
-  [[ "$("$root/bin/tbx" status e2e-storage --quiet -o json | jq -r '.[0].storagePhase')" == live ]]
+  [[ "$("$root/bin/tbx" status e2es --quiet -o json | jq -r '.[0].storagePhase')" == live ]]
 }
 
 assert_default_storage_class() {
@@ -254,7 +259,7 @@ longhorn_config="$workdir/talosbox-longhorn.yaml"
 cat >"$longhorn_config" <<'EOF'
 version: 1
 clusters:
-  - name: e2e-storage
+  - name: e2es
     controlPlanes: 1
     workers: 2
     cni: flannel
@@ -274,7 +279,7 @@ retry "longhorn storage live" 60 5 storage_live
 assert_default_storage_class longhorn
 verify_pvc_write_readback assert_longhorn_replicated
 kc delete namespace storage-e2e --wait
-"$root/bin/tbx" cluster destroy e2e-storage --force
+"$root/bin/tbx" cluster destroy e2es --force
 
 # The single-node shape proves the lightweight engine and that a worker-less
 # control plane schedules workloads at all.
@@ -282,7 +287,7 @@ localpath_config="$workdir/talosbox-local-path.yaml"
 cat >"$localpath_config" <<'EOF'
 version: 1
 clusters:
-  - name: e2e-storage
+  - name: e2es
     controlPlanes: 1
     workers: 0
     cni: flannel
@@ -298,7 +303,7 @@ retry "local-path storage live" 60 5 storage_live
 assert_default_storage_class local-path
 verify_pvc_write_readback
 kc delete namespace storage-e2e --wait
-"$root/bin/tbx" cluster destroy e2e-storage --force
+"$root/bin/tbx" cluster destroy e2es --force
 cluster_cleanup_needed=false
 
 printf 'verified longhorn (3-node, 3 replicas) and local-path (single-node) PVC write/readback through the provisioning path\n'

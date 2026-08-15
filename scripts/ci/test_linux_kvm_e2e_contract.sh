@@ -96,7 +96,7 @@ require 'is-default-class' "$storage_harness"
 require 'numberOfReplicas' "$storage_harness"
 require 'robustness' "$storage_harness"
 require 'cat /data/probe' "$storage_harness"
-require 'cluster destroy e2e-storage --force' "$storage_harness"
+require 'cluster destroy e2es --force' "$storage_harness"
 require 'sha256sum --check --strict' "$storage_harness"
 
 for checked_harness in "$harness" "$storage_harness"; do
@@ -121,7 +121,7 @@ for checked_harness in "$harness" "$storage_harness"; do
   fi
 done
 require 'console e2e' "$harness"
-require 'console e2e-storage' "$storage_harness"
+require 'console e2es' "$storage_harness"
 
 if grep -Fq -- 'setfacl' "$workflow" || grep -Fq -- ' acl' "$workflow"; then
   printf 'KVM access must come from the udev rule, not ACL setup\n' >&2
