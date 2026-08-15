@@ -5,6 +5,7 @@
 package provision
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -177,6 +178,10 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 			if !ok {
 				return Result{}, fmt.Errorf("generate machine config for node %q: unknown role %q", node.Name, node.Role)
 			}
+			config, err := withNodeHostname(config, node.Name)
+			if err != nil {
+				return Result{}, fmt.Errorf("set hostname for node %q: %w", node.Name, err)
+			}
 			if err := request.Client.Apply(ctx, node.IP, config); err != nil {
 				return Result{}, fmt.Errorf("apply machine config to %s: %w", node.Name, err)
 			}
@@ -319,15 +324,23 @@ func generateMachineConfigs(item cluster.Cluster) (generated, error) {
 		return generated{}, errors.New("cluster has no control plane")
 	}
 	cniName := machineCNIName(item)
-	input, err := generate.NewInput(
-		item.Name,
-		"https://"+controlPlane.IP+":6443",
-		constants.DefaultKubernetesVersion,
+	options := []generate.Option{
 		generate.WithVersionContract(contract),
 		generate.WithSecretsBundle(bundle),
 		generate.WithEndpointList(controlPlaneEndpoints),
 		generate.WithInstallDisk("/dev/vda"),
 		generate.WithClusterCNIConfig(&v1alpha1.CNIConfig{CNIName: cniName}),
+	}
+	// A worker-less cluster has nowhere else to run workloads, so the CSI
+	// components and the storage probe need the control plane schedulable.
+	if !clusterHasWorkers(item) {
+		options = append(options, generate.WithAllowSchedulingOnControlPlanes(true))
+	}
+	input, err := generate.NewInput(
+		item.Name,
+		"https://"+controlPlane.IP+":6443",
+		constants.DefaultKubernetesVersion,
+		options...,
 	)
 	if err != nil {
 		return generated{}, fmt.Errorf("generate Talos config input: %w", err)
@@ -351,6 +364,15 @@ func generateMachineConfigs(item cluster.Cluster) (generated, error) {
 		bytes, err = applyProvisioningPrerequisites(bytes, manifestFacts(item))
 		if err != nil {
 			return generated{}, fmt.Errorf("patch %s config: %w", role, err)
+		}
+		// A worker-less control plane is also the only node that can announce
+		// LoadBalancer VIPs, so Talos's generated exclusion label goes with
+		// the taint.
+		if role == cluster.RoleControlPlane && !clusterHasWorkers(item) {
+			bytes, err = withoutLoadBalancerExclusion(bytes)
+			if err != nil {
+				return generated{}, fmt.Errorf("patch %s config: %w", role, err)
+			}
 		}
 		bytes = addCatchAllMirror(bytes, item.SubnetIndex)
 		configs[role] = bytes
@@ -514,6 +536,74 @@ func credentials(name string) (credentialPaths, error) {
 		dir: dir, secrets: filepath.Join(dir, "secrets.yaml"),
 		talosconfig: filepath.Join(dir, "talosconfig"), kubeconfig: filepath.Join(dir, "kubeconfig"),
 	}, nil
+}
+
+// withNodeHostname sets machine.network.hostname on a role-level config so the
+// guest — and therefore its Kubernetes node — carries the tbx node name.
+// KubernetesReady, DNS naming, and replica placement all key on these names,
+// and DHCP on the substrate does not hand out hostnames.
+func withNodeHostname(config []byte, name string) ([]byte, error) {
+	// The generated config is multi-document YAML (the v1alpha1 config plus
+	// appended documents like the catch-all mirror); patch only the first
+	// document and carry the rest through untouched.
+	first, rest, multiDocument := bytes.Cut(config, []byte("\n---\n"))
+	var document map[string]any
+	if err := yaml.Unmarshal(first, &document); err != nil {
+		return nil, fmt.Errorf("decode machine config: %w", err)
+	}
+	machineSection, ok := document["machine"].(map[string]any)
+	if !ok {
+		return nil, errors.New("machine config is missing machine settings")
+	}
+	networkSection, ok := machineSection["network"].(map[string]any)
+	if !ok {
+		networkSection = map[string]any{}
+		machineSection["network"] = networkSection
+	}
+	networkSection["hostname"] = name
+	patched, err := yaml.Marshal(document)
+	if err != nil {
+		return nil, fmt.Errorf("encode machine config: %w", err)
+	}
+	if multiDocument {
+		patched = append(patched, []byte("---\n")...)
+		patched = append(patched, rest...)
+	}
+	return patched, nil
+}
+
+// withoutLoadBalancerExclusion drops the node.kubernetes.io/exclude-from-
+// external-load-balancers label Talos bakes into control-plane configs;
+// MetalLB and Cilium honor it and would otherwise never announce a VIP on a
+// worker-less cluster.
+func withoutLoadBalancerExclusion(config []byte) ([]byte, error) {
+	var document map[string]any
+	if err := yaml.Unmarshal(config, &document); err != nil {
+		return nil, fmt.Errorf("decode machine config: %w", err)
+	}
+	machineSection, ok := document["machine"].(map[string]any)
+	if !ok {
+		return nil, errors.New("machine config is missing machine settings")
+	}
+	nodeLabels, ok := machineSection["nodeLabels"].(map[string]any)
+	if !ok {
+		return config, nil
+	}
+	delete(nodeLabels, "node.kubernetes.io/exclude-from-external-load-balancers")
+	patched, err := yaml.Marshal(document)
+	if err != nil {
+		return nil, fmt.Errorf("encode machine config: %w", err)
+	}
+	return patched, nil
+}
+
+func clusterHasWorkers(item cluster.Cluster) bool {
+	for _, node := range item.Nodes {
+		if node.Role == cluster.RoleWorker {
+			return true
+		}
+	}
+	return false
 }
 
 func clusterControlPlane(item cluster.Cluster) (Node, []string) {

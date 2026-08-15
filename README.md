@@ -60,6 +60,18 @@ applies the machine prerequisites, boots the cluster, installs Cilium, and waits
 LoadBalancer VIP to become live. In both cases, talosbox owns the substrate (VMs, networking,
 DNS, and image delivery); curated CNI and LoadBalancer provisioning are opt-in.
 
+Add `--csi longhorn` (multinode, replicated) or `--csi local-path` (lightweight, single-node)
+— or the `csi:` key in `talosbox.yaml` — for persistent storage; it requires a curated CNI.
+The engine's StorageClass becomes the cluster default and Longhorn's replica count derives
+from the nodes that can hold data — the workers, or the control plane when it is the only
+node — capped at 3, so a bare PVC just works. `tbx status` reports storage as
+provisioning until a real write/readback probe passes, then live; a single-node Longhorn
+cluster is reminded its volumes have no redundancy, and Longhorn on a memory-tight host gets a
+soft warning. Adding `csi:` to an already-provisioned cluster is just `tbx up`; switching or
+removing it is refused while the engine holds volumes. At the cluster level only
+`tbx cluster destroy` deletes data, and its confirmation reports the volume count — but
+`tbx node remove` deletes that node's disk along with any node-local volume data.
+
 Every imperative command prints the equivalent `talosbox.yaml` stanza. Alternatively, work
 declaratively from the start: write a `talosbox.yaml` and run `tbx up` (idempotent — it
 reconciles reality to the file; `tbx down` is its inverse).
@@ -80,7 +92,8 @@ tbx console demo demo-cp-1 # attach to a node's serial console (detach with Ctrl
 tbx manifests demo         # exact machine patch, chart values/objects, and LB/BGP extras
 ```
 
-`status` is state-aware: it distinguishes provisioning, Ready-without-LB, and a live VIP, while
+`status` is state-aware: it distinguishes provisioning, Ready-without-LB, a live VIP, and
+storage provisioning from probe-verified live storage, while
 printing credential exports and the flannel NetworkPolicy limitation. Hints never execute
 anything; suppress them with `--quiet`. `tbx up --quiet` and `tbx cluster create --quiet` keep
 their final result but suppress stage narration. `tbx manifests` is the exact inspection/fork

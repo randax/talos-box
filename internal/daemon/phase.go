@@ -183,12 +183,27 @@ func storageHint(status ClusterStatus) string {
 
 func longhornSingleNodeHint(status ClusterStatus) string {
 	if status.CSI == cluster.CSILonghorn &&
-		len(status.Nodes) == 1 &&
+		storageNodeCount(status) == 1 &&
 		status.Running &&
 		status.StoragePhase == StoragePhaseLive {
 		return "Longhorn is running with a single replica on one node, so volumes have no redundancy."
 	}
 	return ""
+}
+
+// storageNodeCount mirrors the provisioning replica policy: replicas live on
+// workers, or on the control planes of a worker-less cluster.
+func storageNodeCount(status ClusterStatus) int {
+	workers := 0
+	for _, node := range status.Nodes {
+		if node.Role == cluster.RoleWorker {
+			workers++
+		}
+	}
+	if workers == 0 {
+		return len(status.Nodes)
+	}
+	return workers
 }
 
 // controlPlaneOr returns the cluster's first control-plane node, or fallback.

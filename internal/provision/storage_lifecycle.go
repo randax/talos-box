@@ -3,7 +3,9 @@ package provision
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
+	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
 	corev1 "k8s.io/api/core/v1"
@@ -158,6 +160,63 @@ func deleteRenderedStorageObjects(ctx context.Context, client dynamic.Interface,
 		}
 		if err := resources[i].Delete(ctx, candidate.GetName(), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("delete stale storage %s %q: %w", candidate.GetKind(), candidate.GetName(), err)
+		}
+	}
+	return nil
+}
+
+// replaceDriftedStorageClass deletes a live StorageClass whose parameters no
+// longer match the rendered ones — parameters are immutable, so a derived
+// replica-count change can never be applied in place. Deleting a StorageClass
+// never touches existing PersistentVolumes or claims; the following apply
+// recreates it with the new parameters. Deletion is asynchronous, so the
+// replacement waits until the object is actually gone before returning.
+func replaceDriftedStorageClass(ctx context.Context, client dynamic.Interface, mapper meta.RESTMapper, objects []unstructured.Unstructured, interval time.Duration) error {
+	for i := range objects {
+		object := &objects[i]
+		if object.GetKind() != "StorageClass" {
+			continue
+		}
+		mapping, err := mapper.RESTMapping(object.GroupVersionKind().GroupKind(), object.GroupVersionKind().Version)
+		if err != nil {
+			return fmt.Errorf("map StorageClass %q: %w", object.GetName(), err)
+		}
+		live, err := client.Resource(mapping.Resource).Get(ctx, object.GetName(), metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("inspect StorageClass %q: %w", object.GetName(), err)
+		}
+		liveParameters, _, err := unstructured.NestedStringMap(live.Object, "parameters")
+		if err != nil {
+			return fmt.Errorf("decode live StorageClass %q parameters: %w", object.GetName(), err)
+		}
+		renderedParameters, _, err := unstructured.NestedStringMap(object.Object, "parameters")
+		if err != nil {
+			return fmt.Errorf("decode rendered StorageClass %q parameters: %w", object.GetName(), err)
+		}
+		if maps.Equal(liveParameters, renderedParameters) {
+			continue
+		}
+		if !storageObjectOwnedByTalosbox(live) {
+			return fmt.Errorf("StorageClass %q exists with different parameters but is not managed by talosbox; remove or rename it before provisioning curated storage", object.GetName())
+		}
+		if err := client.Resource(mapping.Resource).Delete(ctx, object.GetName(), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("replace StorageClass %q: %w", object.GetName(), err)
+		}
+		name := object.GetName()
+		if err := poll(ctx, interval, func(ctx context.Context) error {
+			_, err := client.Resource(mapping.Resource).Get(ctx, name, metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			if err != nil {
+				return terminalError{err: fmt.Errorf("await StorageClass %q deletion: %w", name, err)}
+			}
+			return fmt.Errorf("StorageClass %q is still terminating", name)
+		}); err != nil {
+			return err
 		}
 	}
 	return nil

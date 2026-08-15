@@ -40,6 +40,13 @@ func TestRenderMetalLBUsesPinnedL2OnlyAssets(t *testing.T) {
 	if len(namespaces) != 1 || namespaces[0].GetName() != metalLBNamespace {
 		t.Fatalf("namespaces = %v, want managed %s namespace", objectNames(namespaces), metalLBNamespace)
 	}
+	// The speaker and frr-k8s DaemonSets need hostNetwork and NET_ADMIN/NET_RAW,
+	// which Talos's default baseline PodSecurity rejects without these labels.
+	for _, label := range []string{"pod-security.kubernetes.io/enforce", "pod-security.kubernetes.io/audit", "pod-security.kubernetes.io/warn"} {
+		if got := namespaces[0].GetLabels()[label]; got != "privileged" {
+			t.Fatalf("namespace label %s = %q, want privileged", label, got)
+		}
+	}
 	if len(crds) != 9 {
 		t.Fatalf("MetalLB CRDs = %d, want 9", len(crds))
 	}

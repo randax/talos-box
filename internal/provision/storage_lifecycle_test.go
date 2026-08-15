@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
 	corev1 "k8s.io/api/core/v1"
@@ -261,6 +262,92 @@ metadata:
 	if _, err := storageLifecycleTestResource(t, client, mapper, &objects[1]).Get(context.Background(), objects[1].GetName(), metav1.GetOptions{}); err != nil {
 		t.Fatalf("PersistentVolumeClaim was deleted: %v", err)
 	}
+}
+
+func TestReplaceDriftedStorageClassDeletesOnlyOnImmutableParameterDrift(t *testing.T) {
+	rendered := storageClassFixture("longhorn", map[string]any{"numberOfReplicas": "2"}, true)
+	tests := []struct {
+		name       string
+		live       *unstructured.Unstructured
+		wantDelete bool
+		wantErr    string
+	}{
+		{name: "no live StorageClass", live: nil, wantDelete: false},
+		{name: "same parameters", live: storageClassFixture("longhorn", map[string]any{"numberOfReplicas": "2"}, true), wantDelete: false},
+		{name: "drifted parameters", live: storageClassFixture("longhorn", map[string]any{"numberOfReplicas": "3"}, true), wantDelete: true},
+		{
+			name:       "drifted but unowned StorageClass",
+			live:       storageClassFixture("longhorn", map[string]any{"numberOfReplicas": "3"}, false),
+			wantDelete: false,
+			wantErr:    "not managed by talosbox",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			objects := []unstructured.Unstructured{*rendered}
+			client := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
+			mapper := storageLifecycleTestMapper(objects)
+			if tt.live != nil {
+				createStorageLifecycleObjects(t, client, mapper, []unstructured.Unstructured{*tt.live})
+			}
+
+			err := replaceDriftedStorageClass(context.Background(), client, mapper, objects, time.Millisecond)
+			if tt.wantErr == "" && err != nil {
+				t.Fatal(err)
+			}
+			if tt.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErr)) {
+				t.Fatalf("replaceDriftedStorageClass() error = %v, want containing %q", err, tt.wantErr)
+			}
+
+			gotDelete := len(storageLifecycleDeleteActions(client.Actions())) > 0
+			if gotDelete != tt.wantDelete {
+				t.Fatalf("StorageClass delete issued = %v, want %v", gotDelete, tt.wantDelete)
+			}
+		})
+	}
+}
+
+func TestReplaceDriftedStorageClassWaitsOutAsynchronousDeletion(t *testing.T) {
+	rendered := storageClassFixture("longhorn", map[string]any{"numberOfReplicas": "2"}, true)
+	live := storageClassFixture("longhorn", map[string]any{"numberOfReplicas": "3"}, true)
+	objects := []unstructured.Unstructured{*rendered}
+	client := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
+	mapper := storageLifecycleTestMapper(objects)
+
+	// Serve the drift-inspection get, then keep the object visible for two
+	// more gets after the delete — Kubernetes deletion is asynchronous, so a
+	// terminating StorageClass must not be treated as gone.
+	gets := 0
+	client.PrependReactor("get", "storageclasses", func(k8stesting.Action) (bool, runtime.Object, error) {
+		gets++
+		if gets <= 3 {
+			return true, live.DeepCopy(), nil
+		}
+		return true, nil, apierrors.NewNotFound(schema.GroupResource{Group: "storage.k8s.io", Resource: "storageclasses"}, "longhorn")
+	})
+
+	if err := replaceDriftedStorageClass(context.Background(), client, mapper, objects, time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if len(storageLifecycleDeleteActions(client.Actions())) == 0 {
+		t.Fatal("replaceDriftedStorageClass() issued no delete")
+	}
+	if gets < 4 {
+		t.Fatalf("replaceDriftedStorageClass() returned after %d gets, before deletion completed", gets)
+	}
+}
+
+func storageClassFixture(name string, parameters map[string]any, owned bool) *unstructured.Unstructured {
+	object := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "storage.k8s.io/v1",
+		"kind":       "StorageClass",
+		"metadata":   map[string]any{"name": name},
+		"parameters": parameters,
+	}}
+	if owned {
+		ensureManagedLabel(object)
+	}
+	return object
 }
 
 func TestDeleteRenderedStorageObjectsRecoversFromInterruptedRun(t *testing.T) {

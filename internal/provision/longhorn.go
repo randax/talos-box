@@ -117,6 +117,9 @@ func (r LonghornReconciler) reconcile(ctx context.Context, config *rest.Config, 
 		return StorageResult{}, err
 	}
 	mapper.Reset()
+	if err := replaceDriftedStorageClass(ctx, dynamicClient, mapper, chartObjects, r.PollInterval); err != nil {
+		return StorageResult{}, err
+	}
 	if err := applyAll(ctx, dynamicClient, mapper, chartObjects); err != nil {
 		return StorageResult{}, err
 	}
@@ -149,7 +152,7 @@ func renderLonghorn(item cluster.Cluster) ([]unstructured.Unstructured, error) {
 	if chart.Metadata.Version != longhornChartVersion {
 		return nil, fmt.Errorf("embedded Longhorn chart version = %s, want %s", chart.Metadata.Version, longhornChartVersion)
 	}
-	replicas := longhornReplicaCount(len(item.Nodes))
+	replicas := longhornReplicaCount(storageNodeCount(item))
 	values, err := chartutil.ReadValues([]byte(longhornValues(replicas)))
 	if err != nil {
 		return nil, fmt.Errorf("decode Longhorn values: %w", err)
@@ -204,6 +207,23 @@ func renderLonghorn(item cluster.Cluster) ([]unstructured.Unstructured, error) {
 		}
 	}
 	return result, nil
+}
+
+// storageNodeCount counts the nodes that can host Longhorn replicas: workers,
+// or every node on a worker-less cluster, whose control planes tbx makes
+// schedulable. Counting tainted control planes would pin the replica target
+// above what can ever schedule and leave volumes permanently degraded.
+func storageNodeCount(item cluster.Cluster) int {
+	workers := 0
+	for _, node := range item.Nodes {
+		if node.Role == cluster.RoleWorker {
+			workers++
+		}
+	}
+	if workers == 0 {
+		return len(item.Nodes)
+	}
+	return workers
 }
 
 func longhornReplicaCount(nodes int) int {
