@@ -32,6 +32,24 @@ func TestVZLaunchOwnsAndClosesRejectedAttachment(t *testing.T) {
 	}
 }
 
+func TestProbeBootLoaderHasVariableStoreAndCleansUp(t *testing.T) {
+	bootLoader, storePath, cleanup, err := newProbeBootLoader()
+	if err != nil {
+		t.Fatalf("newProbeBootLoader() = %v", err)
+	}
+	t.Cleanup(cleanup)
+	if bootLoader == nil {
+		t.Fatal("newProbeBootLoader() returned nil boot loader")
+	}
+	if _, err := os.Stat(storePath); err != nil {
+		t.Fatalf("probe EFI variable store missing before cleanup: %v", err)
+	}
+	cleanup()
+	if _, err := os.Stat(storePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("probe EFI variable store not removed by cleanup: %v", err)
+	}
+}
+
 func TestVZLaunchValidatesBeforeAcquiringNetwork(t *testing.T) {
 	backend := &vzHypervisor{saved: make(map[string]*vzMachine)}
 	acquired := false

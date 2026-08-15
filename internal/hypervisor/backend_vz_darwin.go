@@ -31,10 +31,11 @@ func New(ctx context.Context) (Hypervisor, error) {
 		vz.VirtualMachineConfigurationMinimumAllowedMemorySize() == 0 {
 		return nil, errors.New("virtualization.framework reported no usable VM configuration")
 	}
-	bootLoader, err := vz.NewEFIBootLoader()
+	bootLoader, _, cleanup, err := newProbeBootLoader()
 	if err != nil {
 		return nil, fmt.Errorf("probe Virtualization.framework EFI support: %w", err)
 	}
+	defer cleanup()
 	probe, err := vz.NewVirtualMachineConfiguration(
 		bootLoader,
 		vz.VirtualMachineConfigurationMinimumAllowedCPUCount(),
@@ -192,6 +193,24 @@ func (h *vzHypervisor) newMachine(spec Spec) (*vzMachine, error) {
 		network:     attachment,
 		balloon:     balloon,
 	}, nil
+}
+
+// newProbeBootLoader builds an EFI boot loader backed by a throwaway variable
+// store: macOS rejects an EFI boot loader whose variableStore is nil at
+// Validate() time, so the startup probe needs a real store just like a VM.
+func newProbeBootLoader() (*vz.EFIBootLoader, string, func(), error) {
+	dir, err := os.MkdirTemp("", "tbx-vz-probe-")
+	if err != nil {
+		return nil, "", nil, fmt.Errorf("create probe EFI variable store directory: %w", err)
+	}
+	cleanup := func() { _ = os.RemoveAll(dir) }
+	storePath := filepath.Join(dir, "probe.efivars")
+	bootLoader, err := newEFIBootLoader(storePath)
+	if err != nil {
+		cleanup()
+		return nil, "", nil, err
+	}
+	return bootLoader, storePath, cleanup, nil
 }
 
 func newEFIBootLoader(path string) (*vz.EFIBootLoader, error) {
