@@ -147,6 +147,7 @@ func countLonghornNodeVolumes(ctx context.Context, client kubernetes.Interface, 
 			continue
 		}
 		healthy := replica.GetDeletionTimestamp() == nil &&
+			replicaActive(replica) &&
 			nestedString(replica, "spec", "failedAt") == "" &&
 			nestedString(replica, "spec", "healthyAt") != ""
 		if healthy {
@@ -179,6 +180,17 @@ func longhornProbeVolumeHandles(ctx context.Context, client kubernetes.Interface
 		handles[persistentVolume.Spec.CSI.VolumeHandle] = true
 	}
 	return handles, nil
+}
+
+// replicaActive reports whether the replica is the volume's live copy rather
+// than a leftover from an engine upgrade. A missing active field (older CRD
+// shapes) counts as active, keeping the gate conservative.
+func replicaActive(replica *unstructured.Unstructured) bool {
+	active, found, err := unstructured.NestedBool(replica.Object, "spec", "active")
+	if err != nil || !found {
+		return true
+	}
+	return active
 }
 
 func nestedString(object *unstructured.Unstructured, fields ...string) string {

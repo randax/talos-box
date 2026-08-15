@@ -32,10 +32,12 @@ type Server struct {
 	checkCache          func(context.Context, []string, imagecache.Architecture, bool) (CacheCheckResult, error)
 	boundMirrorGateways func() []string
 
-	// nodeRemoveMu serializes node.remove's unlocked volume observation with
-	// its locked removal, so concurrent removals cannot gate against each
-	// other's about-to-vanish replicas.
-	nodeRemoveMu sync.Mutex
+	// nodeRemoveMu guards nodeRemoveLocks, whose per-cluster mutexes
+	// serialize node.remove's unlocked volume observation with its locked
+	// removal, so concurrent removals cannot gate against each other's
+	// about-to-vanish replicas.
+	nodeRemoveMu    sync.Mutex
+	nodeRemoveLocks map[string]*sync.Mutex
 
 	opMu                  sync.Mutex
 	vms                   map[string]map[string]hypervisor.Machine
@@ -418,14 +420,21 @@ func (s *Server) dispatchProvisioning(request Request) Response {
 
 func (s *Server) dispatchNodeMutation(request Request) Response {
 	var removalWarning string
+	unlockRemoval := func() {}
 	if request.Op == "node.remove" {
-		// Gate and removal serialize under nodeRemoveMu: two concurrent
-		// removals could otherwise each observe the other's node as the
-		// surviving replica holder and delete both copies of a volume.
-		s.nodeRemoveMu.Lock()
-		warning, err := s.gateNodeRemoval(request.Args)
+		var args nodeArgs
+		if err := decodeArgs(request.Args, &args); err != nil {
+			return failure(err)
+		}
+		// Gate and removal serialize per cluster: two concurrent removals
+		// could otherwise each observe the other's node as the surviving
+		// replica holder and delete both copies of a volume.
+		lock := s.nodeRemovalLock(args.Cluster)
+		lock.Lock()
+		unlockRemoval = lock.Unlock
+		warning, err := s.gateNodeRemoval(args)
 		if err != nil {
-			s.nodeRemoveMu.Unlock()
+			lock.Unlock()
 			return failure(err)
 		}
 		removalWarning = warning
@@ -433,9 +442,7 @@ func (s *Server) dispatchNodeMutation(request Request) Response {
 	s.opMu.Lock()
 	data, tasks, err := s.handleNodeMutationLocked(request)
 	s.opMu.Unlock()
-	if request.Op == "node.remove" {
-		s.nodeRemoveMu.Unlock()
-	}
+	unlockRemoval()
 	if err != nil {
 		return failure(err)
 	}
@@ -454,6 +461,20 @@ func (s *Server) dispatchNodeMutation(request Request) Response {
 		return failure(err)
 	}
 	return success(data)
+}
+
+func (s *Server) nodeRemovalLock(clusterName string) *sync.Mutex {
+	s.nodeRemoveMu.Lock()
+	defer s.nodeRemoveMu.Unlock()
+	if s.nodeRemoveLocks == nil {
+		s.nodeRemoveLocks = make(map[string]*sync.Mutex)
+	}
+	lock, ok := s.nodeRemoveLocks[clusterName]
+	if !ok {
+		lock = &sync.Mutex{}
+		s.nodeRemoveLocks[clusterName] = lock
+	}
+	return lock
 }
 
 // dispatchStatus keeps the existing VM-state snapshot serialized, then probes

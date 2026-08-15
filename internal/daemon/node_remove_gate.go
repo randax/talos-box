@@ -2,8 +2,8 @@ package daemon
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -19,17 +19,21 @@ const nodeVolumeCountTimeout = 10 * time.Second
 // unreachable cluster never blocks removal — per the #150 lifecycle principle
 // — and degrades to a data-loss warning instead. It returns the warning to
 // attach to the removal's NodeStatus, or the refusal error.
-func (s *Server) gateNodeRemoval(raw json.RawMessage) (string, error) {
-	var args nodeArgs
-	if err := decodeArgs(raw, &args); err != nil {
-		return "", err
-	}
+func (s *Server) gateNodeRemoval(args nodeArgs) (string, error) {
 	item, err := cluster.Load(args.Cluster)
 	if err != nil {
 		// the locked handler owns reporting load failures
 		return "", nil
 	}
 	if item.CSI == "" {
+		return "", nil
+	}
+	member := slices.ContainsFunc(item.Nodes, func(node cluster.Node) bool {
+		return node.Name == args.Name
+	})
+	if !member {
+		// the locked handler owns the no-such-node error; gating a stale PV's
+		// node name would misreport a typo as held volume data
 		return "", nil
 	}
 	s.opMu.Lock()

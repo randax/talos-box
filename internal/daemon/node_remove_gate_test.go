@@ -193,6 +193,23 @@ func TestNodeRemoveSkipsVolumeObservationOnStoppedCluster(t *testing.T) {
 	}
 }
 
+func TestNodeRemoveSkipsVolumeObservationForUnknownNode(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 2)
+	service.nodeVolumeCount = func(context.Context, cluster.Cluster, string) (int, error) {
+		t.Fatal("volume observation ran for a node that is not a cluster member")
+		return 0, nil
+	}
+
+	response := dispatchNodeRemove(t, service, item.Name, "demo-worker-9", false)
+
+	if response.OK {
+		t.Fatal("node.remove of an unknown node succeeded")
+	}
+	if strings.Contains(response.Error, "--force") {
+		t.Fatalf("unknown-node error %q gated on volumes instead of naming the missing node", response.Error)
+	}
+}
+
 func TestNodeRemoveSkipsVolumeObservationWithoutCSI(t *testing.T) {
 	service, item := runningLonghornClusterForNodeMutation(t, 1, 2)
 	stubNodeMutationReconcile(service)

@@ -195,6 +195,28 @@ func TestCountNodeStorageVolumesLonghornIgnoresTerminatingReplicaElsewhere(t *te
 	}
 }
 
+func TestCountNodeStorageVolumesLonghornIgnoresInactiveReplicaElsewhere(t *testing.T) {
+	// An inactive replica (leftover from an engine live-upgrade) may be
+	// stale; only an active healthy replica counts as a surviving copy.
+	inactive := longhornReplica("upg-r2", "pvc-upg", "demo-worker-2", "", "2026-01-01T00:00:00Z")
+	if err := unstructured.SetNestedField(inactive.Object, false, "spec", "active"); err != nil {
+		t.Fatal(err)
+	}
+	client := kubernetesfake.NewClientset(longhornPV("upg", "pvc-upg"))
+	dynamicClient := fakeLonghornReplicas(
+		longhornReplica("upg-r1", "pvc-upg", "demo-worker-1", "", "2026-01-01T00:00:00Z"),
+		inactive,
+	)
+
+	count, err := countNodeStorageVolumes(context.Background(), client, dynamicClient, cluster.CSILonghorn, "demo-worker-1", []string{"demo-worker-2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("countNodeStorageVolumes(longhorn inactive elsewhere) = %d, want 1", count)
+	}
+}
+
 func TestCountNodeStorageVolumesLonghornExcludesProbeResidue(t *testing.T) {
 	probe := longhornPV("probe", "pvc-probe")
 	probe.Spec.ClaimRef = &corev1.ObjectReference{Namespace: probeNamespace, Name: storageProbePVCName}
