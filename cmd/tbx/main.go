@@ -335,15 +335,28 @@ func (c cli) runNode(args []string) error {
 		}
 		return printWarning(c.err, result.Warning)
 	case "remove":
-		if len(args) != 3 {
-			return errors.New("usage: tbx node remove <cluster> <node>")
-		}
-		request := map[string]string{"cluster": args[1], "name": args[2]}
-		if err := c.call("node.remove", request, nil); err != nil {
+		flags := flag.NewFlagSet("node remove", flag.ContinueOnError)
+		flags.SetOutput(c.err)
+		force := flags.Bool("force", false, "remove the node even when it holds the only copy of volume data")
+		positionals, err := parseInterspersed(flags, args[1:])
+		if err != nil {
 			return err
 		}
-		_, err := fmt.Fprintf(c.out, "removed node %s from cluster %s\n", args[2], args[1])
-		return err
+		if len(positionals) != 2 {
+			return errors.New("usage: tbx node remove <cluster> <node> [--force]")
+		}
+		if err := c.ensureNodeRemoveSupport(); err != nil {
+			return err
+		}
+		request := map[string]any{"cluster": positionals[0], "name": positionals[1], "force": *force}
+		var result daemon.NodeStatus
+		if err := c.call("node.remove", request, &result); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(c.out, "removed node %s from cluster %s\n", positionals[1], positionals[0]); err != nil {
+			return err
+		}
+		return printWarning(c.err, result.Warning)
 	default:
 		return fmt.Errorf("unknown node command %q", args[0])
 	}

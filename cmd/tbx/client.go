@@ -24,6 +24,8 @@ func (e dialError) Error() string { return e.err.Error() }
 const (
 	legacyProvisioningIntentProtocolVersion = 1
 	csiProvisioningIntentProtocolVersion    = 2
+	cacheWarmProtocolVersion                = 3
+	nodeRemoveGateProtocolVersion           = 4
 )
 
 func requiresProvisioningIntentHandshake(input cluster.ProvisioningIntentInput) bool {
@@ -58,6 +60,25 @@ func (c cli) ensureProvisioningIntentSupport(input cluster.ProvisioningIntentInp
 	return nil
 }
 
+// ensureNodeRemoveSupport refuses to send node.remove to a daemon that would
+// ignore its force field and delete the node's disk ungated.
+func (c cli) ensureNodeRemoveSupport() error {
+	var info daemon.Info
+	if err := c.call("daemon.info", struct{}{}, &info); err != nil {
+		if strings.Contains(err.Error(), "unknown operation") {
+			return errors.New("tbxd is too old; restart or upgrade tbxd before using node remove")
+		}
+		return err
+	}
+	if info.ProtocolVersion < nodeRemoveGateProtocolVersion {
+		return fmt.Errorf("tbxd protocol %d is too old; restart or upgrade tbxd before using node remove", info.ProtocolVersion)
+	}
+	if info.ProtocolVersion > daemon.ProtocolVersion {
+		return fmt.Errorf("tbx is too old: protocol %d does not support tbxd protocol %d; upgrade tbx before using node remove", daemon.ProtocolVersion, info.ProtocolVersion)
+	}
+	return nil
+}
+
 func (c cli) ensureCacheWarmSupport() error {
 	var info daemon.Info
 	if err := c.call("daemon.info", struct{}{}, &info); err != nil {
@@ -66,7 +87,7 @@ func (c cli) ensureCacheWarmSupport() error {
 		}
 		return err
 	}
-	if info.ProtocolVersion < daemon.ProtocolVersion {
+	if info.ProtocolVersion < cacheWarmProtocolVersion {
 		return fmt.Errorf("tbxd protocol %d is too old; restart or upgrade tbxd before using cache warm/check", info.ProtocolVersion)
 	}
 	if info.ProtocolVersion > daemon.ProtocolVersion {

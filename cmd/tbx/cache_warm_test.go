@@ -189,14 +189,14 @@ func TestRunCacheWarmRefusesOldProtocolBeforeCacheRPC(t *testing.T) {
 		if request.Op != "daemon.info" {
 			t.Fatalf("first operation = %q, want daemon.info", request.Op)
 		}
-		return daemon.Response{OK: true, Data: mustJSON(t, daemon.Info{ProtocolVersion: daemon.ProtocolVersion - 1})}
+		return daemon.Response{OK: true, Data: mustJSON(t, daemon.Info{ProtocolVersion: cacheWarmProtocolVersion - 1})}
 	}, done)
 
 	var stdout, stderr bytes.Buffer
 	command := cli{out: &stdout, err: &stderr, in: bytes.NewBuffer(nil)}
 	err = command.run([]string{"cache", "warm", listPath})
 	<-done
-	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("tbxd protocol %d is too old", daemon.ProtocolVersion-1)) || !strings.Contains(err.Error(), "restart or upgrade tbxd") {
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("tbxd protocol %d is too old", cacheWarmProtocolVersion-1)) || !strings.Contains(err.Error(), "restart or upgrade tbxd") {
 		t.Fatalf("err = %v, want old-daemon restart/upgrade guidance", err)
 	}
 	if stdout.Len() != 0 {

@@ -46,26 +46,11 @@ func CountProvisionedStorageVolumesForConfig(ctx context.Context, config *rest.C
 }
 
 func countProvisionedStorageVolumes(ctx context.Context, client kubernetes.Interface, engine cluster.CSI) (int, error) {
-	storageClassName, err := storageClassForEngine(engine)
+	persistentVolumes, err := enginePersistentVolumes(ctx, client, engine)
 	if err != nil {
 		return 0, err
 	}
-	persistentVolumes, err := client.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return 0, fmt.Errorf("list %s persistent volumes: %w", engine, err)
-	}
-	count := 0
-	for i := range persistentVolumes.Items {
-		persistentVolume := &persistentVolumes.Items[i]
-		if persistentVolume.Spec.StorageClassName != storageClassName {
-			continue
-		}
-		if storageProbePVResidue(persistentVolume) {
-			continue
-		}
-		count++
-	}
-	return count, nil
+	return len(persistentVolumes), nil
 }
 
 // DeleteStorageEngineObjects removes the rendered Kubernetes objects for the

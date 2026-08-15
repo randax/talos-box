@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,6 +33,13 @@ type Server struct {
 	checkCache          func(context.Context, []string, imagecache.Architecture, bool) (CacheCheckResult, error)
 	boundMirrorGateways func() []string
 
+	// nodeRemoveMu guards nodeRemoveLocks, whose per-cluster mutexes
+	// serialize node.remove's unlocked volume observation with its locked
+	// removal, so concurrent removals cannot gate against each other's
+	// about-to-vanish replicas.
+	nodeRemoveMu    sync.Mutex
+	nodeRemoveLocks map[string]*sync.Mutex
+
 	opMu                  sync.Mutex
 	vms                   map[string]map[string]hypervisor.Machine
 	provisions            map[string]activeProvision
@@ -43,6 +51,7 @@ type Server struct {
 	provisionReconcile    provisionReconcileFunc
 	storageProbe          func(context.Context, []byte) error
 	destroyVolumeCount    func(context.Context, cluster.Cluster) (int, error)
+	nodeVolumeCount       func(context.Context, cluster.Cluster, string) (int, error)
 	storageEngineDelete   func(context.Context, cluster.Cluster) error
 	storageEngineValidate func(context.Context, cluster.Cluster) error
 	nodeIPLookup          func(string, int) string
@@ -125,6 +134,7 @@ func NewServer(ctx context.Context) (*Server, error) {
 		hostPressure:          hostpressure.SystemSnapshot,
 		hostFreeMemory:        balloon.HostFreeMiB,
 		destroyVolumeCount:    countDestroyStorageVolumes,
+		nodeVolumeCount:       countNodeRemovalStorageVolumes,
 		storageEngineDelete:   deleteConfiguredStorageEngine,
 		storageEngineValidate: validateConfiguredStorageEngine,
 	}
@@ -410,16 +420,70 @@ func (s *Server) dispatchProvisioning(request Request) Response {
 }
 
 func (s *Server) dispatchNodeMutation(request Request) Response {
+	var removalWarning string
+	unlockRemoval := func() {}
+	if request.Op == "node.remove" {
+		var args nodeArgs
+		if err := decodeArgs(request.Args, &args); err != nil {
+			return failure(err)
+		}
+		// Gate and removal serialize per cluster: two concurrent removals
+		// could otherwise each observe the other's node as the surviving
+		// replica holder and delete both copies of a volume.
+		lock := s.nodeRemovalLock(args.Cluster)
+		lock.Lock()
+		unlockRemoval = lock.Unlock
+		warning, err := s.gateNodeRemoval(args)
+		if err != nil {
+			lock.Unlock()
+			return failure(err)
+		}
+		removalWarning = warning
+	}
 	s.opMu.Lock()
 	data, tasks, err := s.handleNodeMutationLocked(request)
 	s.opMu.Unlock()
+	unlockRemoval()
 	if err != nil {
+		if removalWarning != "" {
+			// the removal may have deleted state before failing; the data-loss
+			// note must reach the user alongside the failure
+			return failure(fmt.Errorf("%w (warning: %s)", err, removalWarning))
+		}
 		return failure(err)
 	}
+	if removalWarning != "" {
+		if status, ok := data.(NodeStatus); ok {
+			status.Warning = joinWarnings(status.Warning, removalWarning)
+			data = status
+		}
+	}
 	if err := s.runProvisionTasks(data, tasks); err != nil {
+		if removalWarning != "" {
+			// the node's disk is already gone; the data-loss note must survive
+			// a failed follow-up reconcile
+			return failure(fmt.Errorf("%w (warning: %s)", err, removalWarning))
+		}
 		return failure(err)
 	}
 	return success(data)
+}
+
+func (s *Server) nodeRemovalLock(clusterName string) *sync.Mutex {
+	// normalize the key: on a case-insensitive filesystem "Demo" and "demo"
+	// load the same cluster state and must share one removal lock
+	clusterName = strings.ToLower(clusterName)
+	s.nodeRemoveMu.Lock()
+	defer s.nodeRemoveMu.Unlock()
+	if s.nodeRemoveLocks == nil {
+		s.nodeRemoveLocks = make(map[string]*sync.Mutex)
+	}
+	lock, ok := s.nodeRemoveLocks[clusterName]
+	if !ok {
+		lock = &sync.Mutex{}
+		s.nodeRemoveLocks[clusterName] = lock
+	}
+	return lock
 }
 
 // dispatchStatus keeps the existing VM-state snapshot serialized, then probes
@@ -464,10 +528,10 @@ func (s *Server) handle(request Request) (any, error) {
 		return s.destroyInspect(request.Args)
 	case "cluster.list":
 		return s.listClusters()
-	case "node.add":
-		return s.addNode(request.Args)
-	case "node.remove":
-		return s.removeNode(request.Args)
+	case "node.add", "node.remove":
+		// node mutations flow through dispatchNodeMutation, which volume-gates
+		// node.remove before taking opMu; a locked ungated path must not exist
+		return nil, fmt.Errorf("operation %q must be dispatched as a node mutation", request.Op)
 	case "status":
 		return s.status(request.Args)
 	case "cluster.suspend":
