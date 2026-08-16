@@ -298,7 +298,7 @@ func (s *Server) provisioningComplete(item cluster.Cluster) bool {
 	if !provisioningCredentialsPresent(item.Name) {
 		return false
 	}
-	ready := kubernetesReady(item.Name, nodeNames(item))
+	ready := kubernetesReady(item.Name, nodeNames(item.Nodes))
 	if !ready {
 		return false
 	}
@@ -370,14 +370,6 @@ func provisioningCredentialsPresent(name string) bool {
 		}
 	}
 	return true
-}
-
-func nodeNames(item cluster.Cluster) []string {
-	names := make([]string, 0, len(item.Nodes))
-	for _, node := range item.Nodes {
-		names = append(names, node.Name)
-	}
-	return names
 }
 
 type hostBGPReconciler struct{}

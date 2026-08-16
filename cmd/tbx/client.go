@@ -27,6 +27,7 @@ const (
 	cacheWarmProtocolVersion                = 3
 	nodeRemoveGateProtocolVersion           = 4
 	perClusterTalosProtocolVersion          = 5
+	snapshotRestoreGateProtocolVersion      = 6
 )
 
 func requiresProvisioningIntentHandshake(input cluster.ProvisioningIntentInput) bool {
@@ -70,6 +71,13 @@ func (c cli) ensureProvisioningIntentSupport(input cluster.ProvisioningIntentInp
 // ignore its force field and delete the node's disk ungated.
 func (c cli) ensureNodeRemoveSupport() error {
 	return c.ensureProtocolAtLeast(nodeRemoveGateProtocolVersion, "node remove")
+}
+
+// ensureSnapshotRestoreSupport refuses to send snapshot.restore to a daemon
+// that would ignore its force field, delete the nodes the snapshot never
+// captured ungated, and answer with the pre-gate response shape.
+func (c cli) ensureSnapshotRestoreSupport() error {
+	return c.ensureProtocolAtLeast(snapshotRestoreGateProtocolVersion, "snapshot restore")
 }
 
 // ensurePerClusterTalosSupport refuses to send an up request with per-cluster

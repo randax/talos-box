@@ -278,6 +278,16 @@ auto-snapshots, no live checkpoints — restore always passes through a stop; a 
 ~1-minute cold boot. macOS uses APFS clonefile; Linux falls back to a full raw-image copy when
 the filesystem clone primitive is unavailable.
 
+A restore reverts the surviving nodes' disks to the snapshot as well, so by design every
+volume write made after the snapshot is rolled back — the gate below covers only the disks that
+disappear entirely, not that intended rollback. A restore deletes every live node the snapshot
+did not capture, disks included, so those nodes are volume-gated like `tbx node remove` (§9):
+when the engine reports volume data on them, the restore refuses and names each node with its
+volume count; `--force` overrides and warns about the data it deletes. No surviving node can
+vouch for a copy, precisely because its disk is reverted too. The observation is best-effort —
+a stopped or unreachable cluster never blocks a restore and degrades to a warning that the
+deleted disks' volume data was unverified.
+
 ## 8. Resource model
 
 ([Resource model and efficiency](https://github.com/randax/talos-box/issues/8))
@@ -311,7 +321,9 @@ tbx cluster create|start|stop|destroy|list [name] [--cp N --workers N]
                   [--talos-version VERSION] [--schematic ID] [--extensions LIST]
 tbx node add|remove|start|stop <cluster> [node]
 tbx cluster suspend|resume <cluster>
-tbx snapshot create|restore|list|delete <cluster> [name]
+tbx snapshot create <cluster> [name] [--yes]
+tbx snapshot restore <cluster> <name> [--yes] [--force]
+tbx snapshot list <cluster>      tbx snapshot delete <cluster> <name>
 tbx status [cluster]      tbx manifests <cluster> [section|images]
 tbx console <cluster> <node>
 tbx bgp enable|disable <cluster>
@@ -385,7 +397,10 @@ blocking the destroy of an unreachable cluster. `tbx node remove` deletes that n
 it is volume-gated the same best-effort way: when the engine reports the node holds the only
 copy of volume data — local-path volumes pinned to it, Longhorn volumes with no healthy replica
 elsewhere — the removal is refused unless rerun with `--force`, and a stopped or unreachable
-cluster never blocks removal but degrades to a data-loss warning instead.
+cluster never blocks removal but degrades to a data-loss warning instead. `tbx snapshot
+restore` deletes the disks of every node the snapshot did not capture, and is gated the same
+way — except that no surviving node counts as a safe copy, since a restore reverts its disk
+too (§7).
 
 ## 10. Guided output
 

@@ -11,6 +11,16 @@ import (
 type snapshotArgs struct {
 	Cluster string `json:"cluster"`
 	Name    string `json:"name"`
+	// Force overrides the restore's storage-volume gate; the other snapshot
+	// operations delete no node disk and ignore it.
+	Force bool `json:"force"`
+}
+
+// SnapshotRestoreStatus is snapshot.restore's response: the cluster's
+// snapshots plus the best-effort storage data-loss warning from its gate.
+type SnapshotRestoreStatus struct {
+	Snapshots []cluster.SnapshotInfo `json:"snapshots"`
+	Warning   string                 `json:"warning,omitempty"`
 }
 
 // withClusterStopped runs body with the cluster's VMs stopped, restarting them
