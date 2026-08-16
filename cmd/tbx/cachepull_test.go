@@ -99,12 +99,26 @@ func TestCachePullFlagsSendOneAdHocCombination(t *testing.T) {
 // TestFlaglessCachePullWithoutAConfigFileKeepsTheDefaultCombination guards the
 // long-standing behaviour of a bare `tbx cache pull` outside a project.
 func TestFlaglessCachePullWithoutAConfigFileKeepsTheDefaultCombination(t *testing.T) {
-	response := json.RawMessage(`{"schematic":"aaa","version":"v1.13.6","architecture":"arm64","path":"/cache/disk.raw"}`)
+	_, requests := startUpTestDaemon(t,
+		daemon.Response{OK: true, Data: json.RawMessage(fmt.Sprintf(`{"protocolVersion":%d}`, daemon.ProtocolVersion))},
+		daemon.Response{OK: true, Data: json.RawMessage(`{"schematic":"aaa","version":"v1.13.6","architecture":"arm64","path":"/cache/disk.raw"}`)},
+	)
 	t.Chdir(t.TempDir())
 
-	request := runWithDaemonResponse(t, response, func(command cli) error {
-		return command.runCache([]string{"pull"})
-	})
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr}
+	if err := command.runCache([]string{"pull"}); err != nil {
+		t.Fatal(err)
+	}
+	// FromFile alone turns on warming and pinning daemon-side, so even the
+	// no-project form must refuse a daemon that would silently drop it.
+	if request := <-requests; request.Op != "daemon.info" {
+		t.Fatalf("first operation = %q, want daemon.info", request.Op)
+	}
+	request := <-requests
+	if request.Op != "cache.pull" {
+		t.Fatalf("second operation = %q, want cache.pull", request.Op)
+	}
 	var args daemon.CachePullArgs
 	if err := json.Unmarshal(request.Args, &args); err != nil {
 		t.Fatal(err)

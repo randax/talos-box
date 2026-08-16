@@ -37,13 +37,12 @@ func (c cli) runCachePull(args []string) error {
 	flags.Visit(func(item *flag.Flag) { provided[item.Name] = true })
 
 	var combinations []daemon.CachePullCombination
-	fileBacked := false
 	fromFile := !provided["talos-version"] && !provided["schematic"] && !provided["extensions"]
 	if !fromFile {
 		combinations = []daemon.CachePullCombination{{
 			Schematic: *schematic, Version: *talosVersion, Extensions: parseExtensionList(*extensionList),
 		}}
-	} else if combinations, fileBacked, err = configPullCombinations(*path, provided["f"], *talosVersion); err != nil {
+	} else if combinations, err = configPullCombinations(*path, provided["f"], *talosVersion); err != nil {
 		return err
 	}
 	// Both checks are local: a typo or an out-of-window version must be
@@ -60,12 +59,12 @@ func (c cli) runCachePull(args []string) error {
 		}
 		requiresExtensions = requiresExtensions || len(combination.Extensions) > 0
 	}
-	// Combinations, FromFile, and SkipImages only exist at protocol 5. A
-	// bare pull outside a project and a single extension-free ad-hoc pull
-	// still work against an older daemon through the scalar fields below;
-	// everything else would silently degrade (one default-version pull, no
-	// warm, no strays), so refuse instead.
-	if requiresExtensions || fileBacked || len(combinations) > 1 || *noImages {
+	// Combinations, FromFile, and SkipImages only exist at protocol 5. Only
+	// the single extension-free ad-hoc pull round-trips safely through the
+	// scalar fields below; every fromFile form ships FromFile, which alone
+	// turns on warming, pinning, and stray reporting, so an older daemon
+	// dropping it would silently break the offline promise. Refuse instead.
+	if requiresExtensions || fromFile || *noImages {
 		if err := c.ensurePerClusterTalosSupport(); err != nil {
 			return err
 		}
@@ -109,18 +108,18 @@ func (c cli) runCachePull(args []string) error {
 // configPullCombinations reads the desired combinations from talosbox.yaml.
 // A missing default file is not an error: `tbx cache pull` outside a project
 // still means "the default combination".
-func configPullCombinations(path string, explicit bool, defaultVersion string) ([]daemon.CachePullCombination, bool, error) {
+func configPullCombinations(path string, explicit bool, defaultVersion string) ([]daemon.CachePullCombination, error) {
 	fallback := []daemon.CachePullCombination{{Version: defaultVersion}}
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) && !explicit {
-		return fallback, false, nil
+		return fallback, nil
 	}
 	if err != nil {
-		return nil, false, fmt.Errorf("read %s: %w", path, err)
+		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
 	cfg, err := config.Parse(data)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	var combinations []daemon.CachePullCombination
 	seen := map[string]struct{}{}
@@ -143,7 +142,7 @@ func configPullCombinations(path string, explicit bool, defaultVersion string) (
 		combinations = append(combinations, combination)
 	}
 	if len(combinations) == 0 {
-		return fallback, true, nil
+		return fallback, nil
 	}
-	return combinations, true, nil
+	return combinations, nil
 }
