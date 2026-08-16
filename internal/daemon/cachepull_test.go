@@ -1,9 +1,11 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -187,5 +189,110 @@ func TestUpAfterPullCreatesEveryClusterOffline(t *testing.T) {
 		if item.Schematic != wantSchematic {
 			t.Fatalf("cluster %s schematic = %q, want %q", name, item.Schematic, wantSchematic)
 		}
+	}
+}
+
+// TestFileAwarePullWarmsEveryClusterImageSet is the auto-warm promise: the
+// same file that was pulled has its container images replayed into the mirror,
+// per cluster's declared intent, without a second command.
+func TestFileAwarePullWarmsEveryClusterImageSet(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	service, _ := newPullTestServer(t)
+	var warmed []string
+	service.warmCache = func(_ context.Context, refs []string, _ imagecache.Architecture) (CacheWarmResult, error) {
+		warmed = append(warmed, refs...)
+		return CacheWarmResult{Warmed: len(refs)}, nil
+	}
+	raw, err := json.Marshal(CachePullArgs{FromFile: true, Combinations: []CachePullCombination{
+		{Intent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, CSI: cluster.CSILonghorn}},
+		{Version: "v1.14.0", Intent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, LB: true}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.pullCache(raw)
+	if err != nil {
+		t.Fatalf("pullCache() error = %v", err)
+	}
+	if result.Warm == nil || result.Warm.Warmed != len(warmed) {
+		t.Fatalf("pullCache() warm = %+v, want the %d warmed refs reported", result.Warm, len(warmed))
+	}
+	for _, want := range []string{
+		"docker.io/longhornio/longhorn-manager:v1.12.0",
+		"factory.talos.dev/metal-installer/" + pullDefaultSchematic + ":" + DefaultTalosVersion,
+		"factory.talos.dev/metal-installer/" + pullDefaultSchematic + ":v1.14.0",
+	} {
+		if !slices.Contains(warmed, want) {
+			t.Errorf("warmed refs missing %q, got %v", want, warmed)
+		}
+	}
+	for _, ref := range warmed {
+		if err := ValidateWarmRef(ref); err != nil {
+			t.Errorf("warmed ref %q is not warmable: %v", ref, err)
+		}
+	}
+}
+
+// TestFileAwarePullSkipsImagesOnRequest keeps --no-images an opt-out of the
+// image warming only; the disk images are still fetched.
+func TestFileAwarePullSkipsImagesOnRequest(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	service, _ := newPullTestServer(t)
+	service.warmCache = func(context.Context, []string, imagecache.Architecture) (CacheWarmResult, error) {
+		t.Error("pullCache() warmed images with --no-images")
+		return CacheWarmResult{}, nil
+	}
+	raw, err := json.Marshal(CachePullArgs{FromFile: true, SkipImages: true, Combinations: []CachePullCombination{
+		{Intent: cluster.ProvisioningIntent{CNI: cluster.CNICilium}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.pullCache(raw)
+	if err != nil {
+		t.Fatalf("pullCache() error = %v", err)
+	}
+	if result.Warm != nil {
+		t.Fatalf("pullCache() warm = %+v, want none", result.Warm)
+	}
+	if len(result.Images) != 1 {
+		t.Fatalf("pullCache() images = %+v, want the disk image still fetched", result.Images)
+	}
+}
+
+// TestFileAwarePullReportsStraysWithoutDeleting covers the retention rule: a
+// pin nothing claims any more is named, and left exactly where it is.
+func TestFileAwarePullReportsStraysWithoutDeleting(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	service, cache := newPullTestServer(t)
+	if err := cache.Pin(pullDefaultSchematic, "v1.14.0", imagecache.ArchitectureARM64); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(CachePullArgs{FromFile: true, Combinations: []CachePullCombination{{}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.pullCache(raw)
+	if err != nil {
+		t.Fatalf("pullCache() error = %v", err)
+	}
+	if len(result.Strays) != 1 || result.Strays[0].Schematic != pullDefaultSchematic || result.Strays[0].Version != "v1.14.0" {
+		t.Fatalf("pullCache() strays = %+v, want the unclaimed v1.14.0 pin", result.Strays)
+	}
+	pinned, err := cache.Pinned(pullDefaultSchematic, "v1.14.0", imagecache.ArchitectureARM64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pinned {
+		t.Fatal("reporting a stray removed its pin")
+	}
+	entries, err := cache.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(entries, func(entry imagecache.Entry) bool {
+		return entry.Schematic == pullDefaultSchematic && entry.Version == "v1.14.0"
+	}) {
+		t.Fatalf("reporting a stray removed its image: %+v", entries)
 	}
 }

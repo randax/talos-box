@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"github.com/randax/talos-box/internal/helper"
 	"github.com/randax/talos-box/internal/hypervisor"
 	"github.com/randax/talos-box/internal/imagecache"
+	"github.com/randax/talos-box/internal/provision"
 	"github.com/randax/talos-box/internal/talosversion"
 )
 
@@ -82,14 +84,22 @@ type CachePullArgs struct {
 	Version      string                 `json:"version,omitempty"`
 	TalosVersion string                 `json:"talosVersion,omitempty"`
 	Combinations []CachePullCombination `json:"combinations,omitempty"`
+	// FromFile marks the flagless form, where the combinations describe every
+	// cluster the file declares. Only then does warming their images and
+	// calling every other pinned combination a stray mean anything.
+	FromFile bool `json:"fromFile,omitempty"`
+	// SkipImages is --no-images: fetch the disk images and stop there.
+	SkipImages bool `json:"skipImages,omitempty"`
 }
 
 // CachePullCombination is one cluster's resolved image pin, with inheritance
-// already applied by the client.
+// already applied by the client. Intent is the cluster's declared provisioning
+// path, which decides the images the pull warms alongside the disk image.
 type CachePullCombination struct {
-	Schematic  string   `json:"schematic,omitempty"`
-	Version    string   `json:"version,omitempty"`
-	Extensions []string `json:"extensions,omitempty"`
+	Schematic  string                     `json:"schematic,omitempty"`
+	Version    string                     `json:"version,omitempty"`
+	Extensions []string                   `json:"extensions,omitempty"`
+	Intent     cluster.ProvisioningIntent `json:"intent"`
 }
 
 type CacheWarmArgs struct {
@@ -210,6 +220,12 @@ type CachePullResult struct {
 	Architecture hypervisor.Architecture `json:"architecture"`
 	Path         string                  `json:"path"`
 	Images       []CachePullImage        `json:"images,omitempty"`
+	// Warm reports the mirror warming the pull performed for the clusters it
+	// pulled for; nil means none was attempted.
+	Warm *CacheWarmResult `json:"warm,omitempty"`
+	// Strays are pinned combinations referenced by neither a cluster nor the
+	// file that was pulled. They are reported and never deleted.
+	Strays []CacheImageEntry `json:"strays,omitempty"`
 }
 
 // CachePullImage is one cached and pinned disk image.
@@ -1048,6 +1064,7 @@ func (s *Server) pullCache(raw json.RawMessage) (CachePullResult, error) {
 	// spellings apart: dedupe on the resolved combination so each image is
 	// downloaded once.
 	fetched := make(map[CachePullImage]struct{}, len(combinations))
+	pulledFor := make([]cluster.Cluster, 0, len(combinations))
 	for _, combination := range combinations {
 		// Resolution composes while online, which is what makes the same
 		// combination answerable from cache afterwards.
@@ -1055,6 +1072,14 @@ func (s *Server) pullCache(raw json.RawMessage) (CachePullResult, error) {
 		if err != nil {
 			return CachePullResult{}, err
 		}
+		// Clusters sharing a disk image still install their own provisioning
+		// path, so every combination contributes its images even when the
+		// download collapses into one.
+		pulledFor = append(pulledFor, cluster.Cluster{
+			Schematic:          schematic,
+			TalosVersion:       talosVersion,
+			ProvisioningIntent: combination.Intent,
+		})
 		image := CachePullImage{Schematic: schematic, Version: talosVersion, Architecture: architecture}
 		if _, duplicate := fetched[image]; duplicate {
 			continue
@@ -1076,7 +1101,110 @@ func (s *Server) pullCache(raw json.RawMessage) (CachePullResult, error) {
 		result.Schematic, result.Version = first.Schematic, first.Version
 		result.Architecture, result.Path = first.Architecture, first.Path
 	}
+	if !args.FromFile {
+		return result, nil
+	}
+	if !args.SkipImages {
+		warm, err := s.warmClusterImages(pulledFor)
+		if err != nil {
+			return CachePullResult{}, err
+		}
+		result.Warm = warm
+	}
+	// Reporting only: a combination that lost its cluster and its place in the
+	// file is still someone's deliberate pin until they prune it.
+	strays, err := s.strayPinnedImages(result.Images)
+	if err != nil {
+		return CachePullResult{}, err
+	}
+	result.Strays = strays
 	return result, nil
+}
+
+// warmClusterImages replays every image the pulled clusters will pull into the
+// mirror cache, so the same file comes up offline afterwards.
+func (s *Server) warmClusterImages(items []cluster.Cluster) (*CacheWarmResult, error) {
+	if s.warmCache == nil {
+		return nil, nil
+	}
+	seen := map[string]struct{}{}
+	var refs []string
+	for _, item := range items {
+		images, err := provision.ClusterImages(item)
+		if err != nil {
+			return nil, err
+		}
+		for _, ref := range images {
+			if _, duplicate := seen[ref]; duplicate {
+				continue
+			}
+			seen[ref] = struct{}{}
+			refs = append(refs, ref)
+		}
+	}
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	slices.Sort(refs)
+	for _, ref := range refs {
+		if err := ValidateWarmRef(ref); err != nil {
+			return nil, err
+		}
+	}
+	ctx, cancel := s.lifecycleTimeoutContext(cacheWarmTimeout)
+	defer cancel()
+	result, err := s.warmCache(ctx, refs, s.imageArchitecture())
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// strayPinnedImages names every pinned combination that this pull did not ask
+// for and no cluster references.
+func (s *Server) strayPinnedImages(pulled []CachePullImage) ([]CacheImageEntry, error) {
+	classifier, err := s.cacheImageClassifier()
+	if err != nil {
+		return nil, err
+	}
+	requested := make(map[imagecache.Combination]struct{}, len(pulled))
+	for _, image := range pulled {
+		requested[imagecache.Combination{
+			Schematic:    image.Schematic,
+			Version:      image.Version,
+			Architecture: imagecache.Architecture(image.Architecture),
+		}] = struct{}{}
+	}
+	entries, err := s.cache.List()
+	if err != nil {
+		return nil, err
+	}
+	var strays []CacheImageEntry
+	for _, entry := range entries {
+		combination := imagecache.Combination{
+			Schematic:    entry.Schematic,
+			Version:      entry.Version,
+			Architecture: entry.Architecture,
+		}
+		if _, wanted := requested[combination]; wanted {
+			continue
+		}
+		status, _, err := classifier.status(combination)
+		if err != nil {
+			return nil, err
+		}
+		if status != CacheImageStatusPinned {
+			continue
+		}
+		strays = append(strays, CacheImageEntry{
+			Schematic:    entry.Schematic,
+			Version:      entry.Version,
+			Architecture: string(entry.Architecture),
+			Size:         entry.Size,
+			Status:       status,
+		})
+	}
+	return strays, nil
 }
 
 func (s *Server) warmMirrorCache(raw json.RawMessage) (CacheWarmResult, error) {

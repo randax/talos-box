@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/daemon"
 )
 
@@ -125,5 +126,116 @@ func TestCachePullRejectsBelowFloorVersionBeforeCallingTheDaemon(t *testing.T) {
 	err := (cli{out: &bytes.Buffer{}, err: &bytes.Buffer{}}).runCache([]string{"pull", "--talos-version=v1.11.0"})
 	if err == nil || !strings.Contains(err.Error(), "v1.11.0") {
 		t.Fatalf("cache pull error = %v, want a version-floor refusal", err)
+	}
+}
+
+// TestFlaglessCachePullWarmsImagesAndReportsStrays covers the file-aware
+// defaults end to end at the client: warming is on, each cluster's declared
+// intent travels with its pin, and unclaimed pins are named, not removed.
+func TestFlaglessCachePullWarmsImagesAndReportsStrays(t *testing.T) {
+	home, requests := startUpTestDaemon(t,
+		daemon.Response{OK: true, Data: json.RawMessage(`{"schematic":"aaa","version":"v1.13.6","architecture":"arm64","path":"/cache/aaa/disk.raw",
+			"images":[{"schematic":"aaa","version":"v1.13.6","architecture":"arm64","path":"/cache/aaa/disk.raw"}],
+			"warm":{"warmed":12,"alreadyComplete":3,"failed":0},
+			"strays":[{"schematic":"bbb","version":"v1.12.0","architecture":"arm64","size":42}]}`)},
+	)
+	path := filepath.Join(home, "talosbox.yaml")
+	contents := `version: 1
+clusters:
+  - name: demo
+    cni: cilium
+    csi: longhorn
+`
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr}
+	if err := command.runCache([]string{"pull", "-f", path}); err != nil {
+		t.Fatal(err)
+	}
+	request := <-requests
+	if request.Op != "cache.pull" {
+		t.Fatalf("operation = %q, want cache.pull", request.Op)
+	}
+	var args daemon.CachePullArgs
+	if err := json.Unmarshal(request.Args, &args); err != nil {
+		t.Fatal(err)
+	}
+	if !args.FromFile || args.SkipImages {
+		t.Fatalf("cache pull args = %+v, want the file-aware form with warming on", args)
+	}
+	want := []daemon.CachePullCombination{{Intent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, CSI: cluster.CSILonghorn, LB: true}}}
+	if !reflect.DeepEqual(args.Combinations, want) {
+		t.Fatalf("combinations = %+v, want %+v", args.Combinations, want)
+	}
+	for _, line := range []string{
+		"images: 12 warmed, 3 already complete, 0 failed",
+		"Stray pinned disk images (no cluster, not in this file; nothing was removed):",
+		"- bbb v1.12.0 arm64 42 bytes",
+	} {
+		if !strings.Contains(stdout.String(), line) {
+			t.Fatalf("pull output missing %q:\n%s", line, stdout.String())
+		}
+	}
+}
+
+// TestFlaglessCachePullNoImagesOptsOutOfWarming keeps the opt-out explicit.
+func TestFlaglessCachePullNoImagesOptsOutOfWarming(t *testing.T) {
+	response := json.RawMessage(`{"schematic":"aaa","version":"v1.13.6","architecture":"arm64","path":"/cache/disk.raw"}`)
+	t.Chdir(t.TempDir())
+
+	request := runWithDaemonResponse(t, response, func(command cli) error {
+		return command.runCache([]string{"pull", "--no-images"})
+	})
+	var args daemon.CachePullArgs
+	if err := json.Unmarshal(request.Args, &args); err != nil {
+		t.Fatal(err)
+	}
+	if !args.FromFile || !args.SkipImages {
+		t.Fatalf("cache pull args = %+v, want the file-aware form with warming off", args)
+	}
+}
+
+// TestCachePullSeparatesClustersThatShareAPinButNotAnIntent keeps the warm set
+// honest: the same disk image with two provisioning paths is two combinations.
+func TestCachePullSeparatesClustersThatShareAPinButNotAnIntent(t *testing.T) {
+	home, requests := startUpTestDaemon(t,
+		daemon.Response{OK: true, Data: json.RawMessage(`{"schematic":"aaa","version":"v1.13.6","architecture":"arm64","path":"/cache/aaa/disk.raw"}`)},
+	)
+	path := filepath.Join(home, "talosbox.yaml")
+	contents := `version: 1
+clusters:
+  - name: plain
+    cni: cilium
+  - name: same-again
+    cni: cilium
+  - name: with-storage
+    cni: cilium
+    csi: longhorn
+`
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr}
+	if err := command.runCache([]string{"pull", "-f", path}); err != nil {
+		t.Fatal(err)
+	}
+	request := <-requests
+	if request.Op != "cache.pull" {
+		t.Fatalf("operation = %q, want cache.pull", request.Op)
+	}
+	var args daemon.CachePullArgs
+	if err := json.Unmarshal(request.Args, &args); err != nil {
+		t.Fatal(err)
+	}
+	want := []daemon.CachePullCombination{
+		{Intent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true}},
+		{Intent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, CSI: cluster.CSILonghorn, LB: true}},
+	}
+	if !reflect.DeepEqual(args.Combinations, want) {
+		t.Fatalf("combinations = %+v, want %+v", args.Combinations, want)
 	}
 }

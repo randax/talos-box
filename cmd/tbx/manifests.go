@@ -43,8 +43,12 @@ func clusterFromSummary(item daemon.ClusterSummary) cluster.Cluster {
 		nodes = append(nodes, cluster.Node{Role: cluster.RoleWorker})
 	}
 	return cluster.Cluster{
-		Name:               item.Name,
-		SubnetIndex:        item.SubnetIndex,
+		Name:        item.Name,
+		SubnetIndex: item.SubnetIndex,
+		// The pin travels with the summary because the images section
+		// names the Talos system images the cluster was created against.
+		Schematic:          item.Schematic,
+		TalosVersion:       item.TalosVersion,
 		ProvisioningIntent: item.ProvisioningIntent,
 		Nodes:              nodes,
 	}

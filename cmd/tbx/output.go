@@ -152,3 +152,39 @@ func printPrunedImages(output io.Writer, images []daemon.CacheImageEntry) error 
 	}
 	return nil
 }
+
+// printWarmedImages summarises the mirror warming a file-aware pull performed.
+// Only failures are named: a successful warm is one line, not one per image.
+func printWarmedImages(output io.Writer, result *daemon.CacheWarmResult) error {
+	if result == nil {
+		return nil
+	}
+	for _, entry := range result.Entries {
+		if entry.Status != daemon.CacheWarmStatusFailed {
+			continue
+		}
+		if _, err := fmt.Fprintf(output, "✗ %s %s\n", entry.Ref, entry.Reason); err != nil {
+			return err
+		}
+	}
+	_, err := fmt.Fprintf(output, "images: %d warmed, %d already complete, %d failed\n",
+		result.Warmed, result.AlreadyComplete, result.Failed)
+	return err
+}
+
+// printStrayImages names pinned combinations the pull found unclaimed. It is a
+// report, not a plan: prune is the only thing that deletes.
+func printStrayImages(output io.Writer, images []daemon.CacheImageEntry) error {
+	if len(images) == 0 {
+		return nil
+	}
+	if _, err := fmt.Fprintln(output, "Stray pinned disk images (no cluster, not in this file; nothing was removed):"); err != nil {
+		return err
+	}
+	for _, entry := range images {
+		if _, err := fmt.Fprintf(output, "- %s\n", cacheImageLine(entry)); err != nil {
+			return err
+		}
+	}
+	return nil
+}

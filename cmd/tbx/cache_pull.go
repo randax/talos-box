@@ -25,18 +25,20 @@ func (c cli) runCachePull(args []string) error {
 	schematic := flags.String("schematic", "", "Image Factory schematic")
 	extensionList := flags.String("extensions", "", "curated Talos extensions, comma-separated: "+strings.Join(extensions.Names(), "|"))
 	path := flags.String("f", defaultConfigFile, "path to talosbox.yaml")
+	noImages := flags.Bool("no-images", false, "pull disk images only, without warming the clusters' container images")
 	positionals, err := parseInterspersed(flags, args)
 	if err != nil {
 		return err
 	}
 	if len(positionals) != 0 {
-		return errors.New("usage: tbx cache pull [-f talosbox.yaml] [--talos-version VERSION --schematic ID --extensions LIST]")
+		return errors.New("usage: tbx cache pull [-f talosbox.yaml] [--no-images] [--talos-version VERSION --schematic ID --extensions LIST]")
 	}
 	provided := map[string]bool{}
 	flags.Visit(func(item *flag.Flag) { provided[item.Name] = true })
 
 	var combinations []daemon.CachePullCombination
-	if provided["talos-version"] || provided["schematic"] || provided["extensions"] {
+	fromFile := !provided["talos-version"] && !provided["schematic"] && !provided["extensions"]
+	if !fromFile {
 		combinations = []daemon.CachePullCombination{{
 			Schematic: *schematic, Version: *talosVersion, Extensions: parseExtensionList(*extensionList),
 		}}
@@ -63,7 +65,7 @@ func (c cli) runCachePull(args []string) error {
 		}
 	}
 
-	request := daemon.CachePullArgs{Combinations: combinations}
+	request := daemon.CachePullArgs{Combinations: combinations, FromFile: fromFile, SkipImages: *noImages}
 	if len(combinations) == 1 {
 		// A daemon predating the combination list reads only these, and
 		// then pulls exactly the one combination that was asked for.
@@ -85,6 +87,15 @@ func (c cli) runCachePull(args []string) error {
 			image.Version, image.Architecture, image.Schematic, image.Path); err != nil {
 			return err
 		}
+	}
+	if err := printWarmedImages(c.out, result.Warm); err != nil {
+		return err
+	}
+	if err := printStrayImages(c.out, result.Strays); err != nil {
+		return err
+	}
+	if result.Warm != nil && result.Warm.Failed > 0 {
+		return fmt.Errorf("cache warm failed for %d ref(s)", result.Warm.Failed)
 	}
 	return nil
 }
@@ -112,8 +123,13 @@ func configPullCombinations(path string, explicit bool, defaultVersion string) (
 		// cluster's field-wise overrides applied.
 		combination := daemon.CachePullCombination{
 			Schematic: spec.Talos.Schematic, Version: spec.Talos.Version, Extensions: spec.Talos.Extensions,
+			Intent: spec.ProvisioningIntent,
 		}
-		key := strings.Join(append([]string{combination.Schematic, combination.Version}, combination.Extensions...), "\x00")
+		// Two clusters collapse into one combination only when they also
+		// install the same thing: the intent decides which images get warmed.
+		key := strings.Join(append([]string{
+			combination.Schematic, combination.Version, fmt.Sprintf("%+v", combination.Intent),
+		}, combination.Extensions...), "\x00")
 		if _, duplicate := seen[key]; duplicate {
 			continue
 		}
