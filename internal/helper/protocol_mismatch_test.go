@@ -82,6 +82,25 @@ func TestProtocolHandshakeFailureWrapsForeignDetailOnce(t *testing.T) {
 	}
 }
 
+func TestProtocolMismatchAdviceQuotesPathsWithSpaces(t *testing.T) {
+	t.Parallel()
+
+	advice := protocolMismatchAdviceFor("/Users/o r/projects/talos box/bin/tbxd", nil)
+	if !strings.Contains(advice, "sudo '/Users/o r/projects/talos box/bin/tbx' system install") {
+		t.Errorf("advice %q does not shell-quote the tbx path", advice)
+	}
+
+	plain := protocolMismatchAdviceFor("/opt/talosbox/bin/tbxd", nil)
+	if !strings.Contains(plain, "sudo /opt/talosbox/bin/tbx system install") {
+		t.Errorf("advice %q needlessly quotes a safe path", plain)
+	}
+
+	fallback := protocolMismatchAdviceFor("", errors.New("unknown executable"))
+	if !strings.Contains(fallback, "tbx system install") {
+		t.Errorf("fallback advice %q missing remediation", fallback)
+	}
+}
+
 func TestProtocolHandshakeFailureEmptyDetail(t *testing.T) {
 	t.Parallel()
 

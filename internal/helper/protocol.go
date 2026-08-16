@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/randax/talos-box/internal/shellquote"
 )
 
 const (
@@ -25,11 +27,16 @@ var errProtocolMismatch = errors.New("helper protocol mismatch")
 // does not resolve a checkout's bin directory: tbx and tbxd sit next to each
 // other, so the running executable's directory locates tbx from either.
 func protocolMismatchAdvice() string {
-	if executable, err := os.Executable(); err == nil {
-		tbxPath := filepath.Join(filepath.Dir(executable), "tbx")
-		return fmt.Sprintf("run `sudo %s system install` to reinstall the helper", tbxPath)
+	executable, err := os.Executable()
+	return protocolMismatchAdviceFor(executable, err)
+}
+
+func protocolMismatchAdviceFor(executable string, lookupErr error) string {
+	if lookupErr != nil {
+		return "run `sudo tbx system install` from the current checkout to reinstall the helper"
 	}
-	return "run `sudo tbx system install` from the current checkout to reinstall the helper"
+	tbxPath := shellquote.Quote(filepath.Join(filepath.Dir(executable), "tbx"))
+	return fmt.Sprintf("run `sudo %s system install` to reinstall the helper", tbxPath)
 }
 
 // Request is one newline-delimited helper request.
