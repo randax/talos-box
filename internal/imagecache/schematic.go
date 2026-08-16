@@ -118,15 +118,7 @@ func schematicRequestBody(extensionRefs, extraArgs []string) ([]byte, error) {
 }
 
 func mergeExtensions(extensionRefs []string) []string {
-	seen := make(map[string]struct{}, len(requiredExtensions)+len(extensionRefs))
-	merged := make([]string, 0, len(requiredExtensions)+len(extensionRefs))
-	for _, ref := range append(append([]string(nil), requiredExtensions...), extensionRefs...) {
-		if _, duplicate := seen[ref]; duplicate {
-			continue
-		}
-		seen[ref] = struct{}{}
-		merged = append(merged, ref)
-	}
+	merged := dedupeStrings(append(append([]string(nil), requiredExtensions...), extensionRefs...))
 	sort.Strings(merged)
 	return merged
 }

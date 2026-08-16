@@ -26,6 +26,14 @@ A Talos system extension from talosbox's fixed, tested set, referenced by bare s
 
 The Talos versions a cluster may request: from the pinned floor (`MinTalosVersion`, the tested default's previous minor) up. Below the floor or malformed is refused at every request boundary; between floor and the tested default passes silently; above the default is accepted with a single newer-than-tested warning at create. Both pins live in `internal/talosversion` and move together in one diff. Stored cluster state is exempt — a floor bump never retroactively refuses an existing cluster.
 
+## Image combination
+
+A distinct schematic, Talos version, and architecture triple. It is what the disk-image cache is keyed by: two clusters agreeing on all three boot the same cached image, and any divergence is a separate combination to be fetched and held.
+
+## Pin
+
+A marker recording that a combination was explicitly pulled for offline use. A pinned combination is spared by the default prune even when no cluster references it, and only `cache prune --all` clears it.
+
 ## Host substrate
 
 The platform-specific VM, networking, DNS, and service-manager implementation beneath the shared talosbox cluster model. A host substrate may have different mechanics without changing the guest-visible contract.

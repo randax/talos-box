@@ -93,7 +93,7 @@ func TestRef(t *testing.T) {
 	if got, ok := Ref("qemu-guest-agent"); !ok || got != "siderolabs/qemu-guest-agent" {
 		t.Fatalf("Ref(\"qemu-guest-agent\") = (%q, %t), want (\"siderolabs/qemu-guest-agent\", true)", got, ok)
 	}
-	if _, ok := Ref("zfs"); ok {
-		t.Fatal("Ref(\"zfs\") reported a curated extension")
+	if got, ok := Ref("zfs"); ok {
+		t.Fatalf("Ref(\"zfs\") = (%q, %t), want (\"\", false)", got, ok)
 	}
 }

@@ -57,6 +57,8 @@ func contentAddressedFactory(t *testing.T, definitions map[string]string, archiv
 // schematic, the composed ids, the images themselves — is on disk afterwards,
 // so a later create resolves the same combinations without a single request.
 func TestPulledCombinationsResolveOfflineAfterRestart(t *testing.T) {
+	t.Parallel()
+
 	requireXZ(t)
 
 	const (
@@ -128,6 +130,8 @@ func TestPulledCombinationsResolveOfflineAfterRestart(t *testing.T) {
 // TestDefaultSchematicIsComposedOnlyOnce keeps the default combination on the
 // same offline footing as a composed one: the id is recorded on first use.
 func TestDefaultSchematicIsComposedOnlyOnce(t *testing.T) {
+	t.Parallel()
+
 	upstream, requests := contentAddressedFactory(t, nil, nil)
 
 	root := t.TempDir()

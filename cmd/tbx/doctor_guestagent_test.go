@@ -13,6 +13,8 @@ import (
 )
 
 func TestRunDoctorReportsGuestAgentCapabilityGate(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name     string
 		clusters []cluster.Cluster
@@ -48,6 +50,8 @@ func TestRunDoctorReportsGuestAgentCapabilityGate(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
 			deps := guestAgentDoctorDependencies()
 			deps.listConfig = func() ([]cluster.Cluster, error) { return test.clusters, test.listErr }
 			deps.guestAgentSupport = func() hypervisor.FeatureStatus { return test.support }

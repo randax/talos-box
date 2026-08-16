@@ -105,6 +105,8 @@ func unreachableCache(t *testing.T, root string) *Cache {
 }
 
 func TestComposeSchematicAddsRequestedExtensionsToAlwaysOnSet(t *testing.T) {
+	t.Parallel()
+
 	fake := newFactoryFake(t, "composed-id", catalogJSON)
 	cache := New(t.TempDir())
 	fake.attach(cache)
@@ -129,6 +131,8 @@ func TestComposeSchematicAddsRequestedExtensionsToAlwaysOnSet(t *testing.T) {
 }
 
 func TestComposeSchematicRejectsUnknownNameOffline(t *testing.T) {
+	t.Parallel()
+
 	cache := offlineCache(t, t.TempDir())
 
 	_, err := cache.ComposeSchematic("", "v1.13.6", []string{"gvisr"})
@@ -143,6 +147,8 @@ func TestComposeSchematicRejectsUnknownNameOffline(t *testing.T) {
 }
 
 func TestComposeSchematicRejectsExtensionMissingFromVersionCatalog(t *testing.T) {
+	t.Parallel()
+
 	const withoutGvisor = `[
 		{"name":"siderolabs/nfs-utils","ref":"ghcr.io/siderolabs/nfs-utils:1","description":"NFSv3 client with locking.\nSecond line."}
 	]`
@@ -171,6 +177,8 @@ func TestComposeSchematicRejectsExtensionMissingFromVersionCatalog(t *testing.T)
 }
 
 func TestComposeSchematicReusesRecordedComposition(t *testing.T) {
+	t.Parallel()
+
 	root := t.TempDir()
 	fake := newFactoryFake(t, "composed-id", catalogJSON)
 	cache := New(root)
@@ -203,6 +211,8 @@ func TestComposeSchematicReusesRecordedComposition(t *testing.T) {
 }
 
 func TestCompositionRecordRoundTrip(t *testing.T) {
+	t.Parallel()
+
 	cache := New(t.TempDir())
 
 	if _, found, err := cache.CompositionID("", "v1.13.6", []string{"gvisor"}); err != nil || found {
@@ -224,6 +234,8 @@ func TestCompositionRecordRoundTrip(t *testing.T) {
 // to whatever it already declares — no kernel args and no always-on storage
 // extensions are injected, and its own omissions survive.
 func TestComposeSchematicRecomposesBroughtSchematic(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name       string
 		definition string
@@ -265,6 +277,8 @@ func TestComposeSchematicRecomposesBroughtSchematic(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
 			fake := newFactoryFake(t, "composed-id", catalogJSON)
 			fake.definitions = map[string]string{"brought": test.definition}
 			cache := New(t.TempDir())
@@ -291,6 +305,8 @@ func TestComposeSchematicRecomposesBroughtSchematic(t *testing.T) {
 // contract: the same inputs must produce the same request, and therefore the
 // same composed id, from any cache.
 func TestComposeSchematicRecompositionIsDeterministic(t *testing.T) {
+	t.Parallel()
+
 	const definition = "customization:\n" +
 		"    systemExtensions:\n" +
 		"        officialExtensions:\n" +
@@ -317,7 +333,11 @@ func TestComposeSchematicRecompositionIsDeterministic(t *testing.T) {
 }
 
 func TestComposeSchematicFailsWhenBroughtSchematicCannotBeFetched(t *testing.T) {
+	t.Parallel()
+
 	t.Run("factory unreachable", func(t *testing.T) {
+		t.Parallel()
+
 		cache := unreachableCache(t, t.TempDir())
 
 		_, err := cache.ComposeSchematic("brought", "v1.13.6", []string{"gvisor"})
@@ -332,6 +352,8 @@ func TestComposeSchematicFailsWhenBroughtSchematicCannotBeFetched(t *testing.T) 
 	})
 
 	t.Run("unknown schematic id", func(t *testing.T) {
+		t.Parallel()
+
 		fake := newFactoryFake(t, "composed-id", catalogJSON)
 		cache := New(t.TempDir())
 		fake.attach(cache)
@@ -353,6 +375,8 @@ func TestComposeSchematicFailsWhenBroughtSchematicCannotBeFetched(t *testing.T) 
 	})
 
 	t.Run("unknown extension name", func(t *testing.T) {
+		t.Parallel()
+
 		cache := offlineCache(t, t.TempDir())
 
 		if _, err := cache.ComposeSchematic("brought", "v1.13.6", []string{"gvisr"}); err == nil {
@@ -364,6 +388,8 @@ func TestComposeSchematicFailsWhenBroughtSchematicCannotBeFetched(t *testing.T) 
 // TestComposeSchematicReusesRecordedRecomposition keeps the offline path intact
 // for brought schematics too: the recorded id is the whole answer.
 func TestComposeSchematicReusesRecordedRecomposition(t *testing.T) {
+	t.Parallel()
+
 	root := t.TempDir()
 	if err := New(root).RecordComposition("brought", "v1.13.6", []string{"gvisor"}, "composed-id"); err != nil {
 		t.Fatalf("RecordComposition() error = %v", err)

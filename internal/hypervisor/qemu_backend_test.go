@@ -116,7 +116,7 @@ func TestQEMUNewMachineBindsGuestAgentSocket(t *testing.T) {
 		t.Fatalf("extraFiles() length = %d, want %d", got, want)
 	}
 	if got := machine.extraFiles()[2]; got != machine.guestAgent {
-		t.Fatal("guest-agent descriptor is not the third inherited file")
+		t.Fatalf("extraFiles()[2] = %v, want the guest-agent descriptor %v", got, machine.guestAgent)
 	}
 	if got, want := machine.launchConfig("/run/qmp.sock", "").GuestAgentFD, 5; got != want {
 		t.Fatalf("launchConfig().GuestAgentFD = %d, want %d", got, want)

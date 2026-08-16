@@ -139,18 +139,7 @@ func cacheImageStatusSuffix(entry daemon.CacheImageEntry) string {
 // ahead of the summary line: nothing about the default scope is automatic, so
 // the user sees exactly what was unreferenced.
 func printPrunedImages(output io.Writer, images []daemon.CacheImageEntry) error {
-	if len(images) == 0 {
-		return nil
-	}
-	if _, err := fmt.Fprintln(output, "Removing unreferenced disk images:"); err != nil {
-		return err
-	}
-	for _, entry := range images {
-		if _, err := fmt.Fprintf(output, "- %s\n", cacheImageLine(entry)); err != nil {
-			return err
-		}
-	}
-	return nil
+	return printCacheImageList(output, "Removing unreferenced disk images:", images)
 }
 
 // printWarmedImages summarises the mirror warming a file-aware pull performed.
@@ -175,10 +164,16 @@ func printWarmedImages(output io.Writer, result *daemon.CacheWarmResult) error {
 // printStrayImages names pinned combinations the pull found unclaimed. It is a
 // report, not a plan: prune is the only thing that deletes.
 func printStrayImages(output io.Writer, images []daemon.CacheImageEntry) error {
+	return printCacheImageList(output, "Stray pinned disk images (no cluster, not in this file; nothing was removed):", images)
+}
+
+// printCacheImageList renders a headed list of combinations, or nothing at all
+// when there are none: an empty section would read as a claim of its own.
+func printCacheImageList(output io.Writer, header string, images []daemon.CacheImageEntry) error {
 	if len(images) == 0 {
 		return nil
 	}
-	if _, err := fmt.Fprintln(output, "Stray pinned disk images (no cluster, not in this file; nothing was removed):"); err != nil {
+	if _, err := fmt.Fprintln(output, header); err != nil {
 		return err
 	}
 	for _, entry := range images {

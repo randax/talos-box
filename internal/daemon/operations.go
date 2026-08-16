@@ -1189,6 +1189,13 @@ func (s *Server) strayPinnedImages(pulled []CachePullImage) ([]CacheImageEntry, 
 		if _, wanted := requested[combination]; wanted {
 			continue
 		}
+		// The built-in default combination is spared by prune and shown as
+		// `default` by list even when it also carries a pin, so it is never a
+		// stray — status() would report it as pinned because a pin outranks the
+		// default, which is the wrong answer here.
+		if classifier.hasDefault && combination == classifier.defaultCombination {
+			continue
+		}
 		status, _, err := classifier.status(combination)
 		if err != nil {
 			return nil, err

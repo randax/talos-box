@@ -156,16 +156,7 @@ func mergeSchematicExtensions(definition []byte, refs []string) ([]byte, error) 
 	if err != nil {
 		return nil, fmt.Errorf("customization.systemExtensions.officialExtensions: %w", err)
 	}
-	seen := make(map[string]struct{}, len(existing)+len(refs))
-	merged := make([]string, 0, len(existing)+len(refs))
-	for _, ref := range append(existing, refs...) {
-		if _, duplicate := seen[ref]; duplicate {
-			continue
-		}
-		seen[ref] = struct{}{}
-		merged = append(merged, ref)
-	}
-	systemExtensions["officialExtensions"] = merged
+	systemExtensions["officialExtensions"] = dedupeStrings(append(existing, refs...))
 	customization["systemExtensions"] = systemExtensions
 	document["customization"] = customization
 
@@ -341,15 +332,24 @@ func (c *Cache) compositionPath(base, talosVersion string, requested []string) s
 // composed id is content-addressed, so order and repeats must not key a
 // separate record.
 func canonicalExtensions(requested []string) []string {
-	seen := make(map[string]struct{}, len(requested))
-	canonical := make([]string, 0, len(requested))
-	for _, name := range requested {
-		if _, duplicate := seen[name]; duplicate {
-			continue
-		}
-		seen[name] = struct{}{}
-		canonical = append(canonical, name)
-	}
+	canonical := dedupeStrings(requested)
 	sort.Strings(canonical)
 	return canonical
+}
+
+// dedupeStrings keeps the first spelling of each value in the order it was
+// seen. Callers that need a canonical order sort the result; the schematic
+// merge deliberately does not, because a brought schematic's own ordering is
+// part of what it declared.
+func dedupeStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	unique := make([]string, 0, len(values))
+	for _, value := range values {
+		if _, duplicate := seen[value]; duplicate {
+			continue
+		}
+		seen[value] = struct{}{}
+		unique = append(unique, value)
+	}
+	return unique
 }

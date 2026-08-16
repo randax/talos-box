@@ -261,14 +261,20 @@ func TestFileAwarePullSkipsImagesOnRequest(t *testing.T) {
 }
 
 // TestFileAwarePullReportsStraysWithoutDeleting covers the retention rule: a
-// pin nothing claims any more is named, and left exactly where it is.
+// pin nothing claims any more is named, and left exactly where it is. The
+// built-in default combination is pinned too, and must stay unreported: prune
+// and `cache list` spare it, so calling it stray would be a lie.
 func TestFileAwarePullReportsStraysWithoutDeleting(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	service, cache := newPullTestServer(t)
-	if err := cache.Pin(pullDefaultSchematic, "v1.14.0", imagecache.ArchitectureARM64); err != nil {
-		t.Fatal(err)
+	for _, version := range []string{"v1.14.0", DefaultTalosVersion} {
+		if err := cache.Pin(pullDefaultSchematic, version, imagecache.ArchitectureARM64); err != nil {
+			t.Fatal(err)
+		}
 	}
-	raw, err := json.Marshal(CachePullArgs{FromFile: true, Combinations: []CachePullCombination{{}}})
+	raw, err := json.Marshal(CachePullArgs{FromFile: true, Combinations: []CachePullCombination{
+		{Schematic: "brought", Extensions: []string{"gvisor"}},
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
