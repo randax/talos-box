@@ -109,7 +109,7 @@ func runningLinuxClusters(
 	}
 	runtimeClusters, err := listRuntime()
 	if isDaemonUnavailable(err) {
-		return nil, skippedDoctorCheck{detail: fmt.Sprintf("daemon unavailable: %v", err)}
+		return nil, skippedDoctorCheck{detail: daemonUnavailableDetail(err)}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("list running clusters: %w", err)

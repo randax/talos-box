@@ -104,12 +104,13 @@ func (c cli) call(op string, args, destination any) error {
 	response, err := exchange(socketPath, op, args)
 	var connectionError dialError
 	if errors.As(err, &connectionError) {
-		if err := startDaemon(); err != nil {
-			return err
+		logOffset, startErr := startDaemon()
+		if startErr != nil {
+			return startErr
 		}
 		// a daemon shutting down with live VMs can hold the lock for >10s before a
 		// replacement can bind — retry long enough to outlast that
-		deadline := time.Now().Add(20 * time.Second)
+		deadline := time.Now().Add(daemonWaitTimeout)
 		backoff := 50 * time.Millisecond
 		for {
 			response, err = exchange(socketPath, op, args)
@@ -120,6 +121,13 @@ func (c cli) call(op string, args, destination any) error {
 			if backoff < 500*time.Millisecond {
 				backoff *= 2
 			}
+		}
+		if errors.As(err, &connectionError) {
+			logPath, pathErr := daemonLogPath()
+			if pathErr != nil {
+				logPath = ""
+			}
+			return daemonSpawnFailure(err, logPath, logOffset)
 		}
 	}
 	if err != nil {
@@ -161,38 +169,102 @@ func exchange(socketPath, op string, args any) (daemon.Response, error) {
 	return response, nil
 }
 
-func startDaemon() error {
-	executable, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("find tbx executable: %w", err)
+// daemonWaitTimeout bounds how long a just-spawned daemon may take to serve.
+const daemonWaitTimeout = 20 * time.Second
+
+// daemonSpawnFailure explains a daemon that was spawned but never served: the
+// bare dial error hides that tbxd itself crashed, and the cause is in its log.
+// An empty logPath (home directory unknown) falls back to a display-only path.
+// logOffset is the log size before the spawn, so only lines this daemon wrote
+// are quoted — the log is append-only across runs, and a stale line from a
+// previous run would mislead.
+func daemonSpawnFailure(dialErr error, logPath string, logOffset int64) error {
+	quoted := ""
+	if logPath == "" {
+		logPath = "~/.talosbox/tbxd.log"
+	} else {
+		quoted = lastLogLine(logPath, logOffset)
 	}
-	daemonPath := filepath.Join(filepath.Dir(executable), "tbxd")
+	message := fmt.Sprintf("tbxd was started but did not serve its socket within %s (%v); see %s",
+		daemonWaitTimeout, dialErr, logPath)
+	if quoted != "" {
+		message = fmt.Sprintf("%s (last log line: %s)", message, quoted)
+	}
+	return errors.New(message)
+}
+
+// lastLogLine best-effort reads the last non-empty line of the daemon log
+// written at or after fromOffset. The log is append-only and can be large, so
+// only its tail is read.
+func lastLogLine(logPath string, fromOffset int64) string {
+	file, err := os.Open(logPath)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = file.Close() }()
+	info, err := file.Stat()
+	if err != nil || info.Size() <= fromOffset {
+		return ""
+	}
+	const tailBytes = 4096
+	offset := max(info.Size()-tailBytes, fromOffset)
+	content := make([]byte, info.Size()-offset)
+	if _, err := file.ReadAt(content, offset); err != nil {
+		return ""
+	}
+	lines := strings.Split(string(content), "\n")
+	for index := len(lines) - 1; index >= 0; index-- {
+		if line := strings.TrimSpace(lines[index]); line != "" {
+			return line
+		}
+	}
+	return ""
+}
+
+func daemonLogPath() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return fmt.Errorf("find home directory: %w", err)
+		return "", fmt.Errorf("find home directory: %w", err)
 	}
-	stateDir := filepath.Join(home, ".talosbox")
-	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		return fmt.Errorf("create daemon directory: %w", err)
+	return filepath.Join(home, ".talosbox", "tbxd.log"), nil
+}
+
+// startDaemon spawns tbxd and returns the daemon log's size before the spawn,
+// so a later failure report can quote only what this daemon wrote.
+func startDaemon() (int64, error) {
+	executable, err := os.Executable()
+	if err != nil {
+		return 0, fmt.Errorf("find tbx executable: %w", err)
 	}
-	logPath := filepath.Join(stateDir, "tbxd.log")
+	daemonPath := filepath.Join(filepath.Dir(executable), "tbxd")
+	logPath, err := daemonLogPath()
+	if err != nil {
+		return 0, err
+	}
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		return 0, fmt.Errorf("create daemon directory: %w", err)
+	}
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
-		return fmt.Errorf("open daemon log: %w", err)
+		return 0, fmt.Errorf("open daemon log: %w", err)
 	}
 	defer func() { _ = logFile.Close() }()
+	logInfo, err := logFile.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("inspect daemon log: %w", err)
+	}
 
 	command := exec.Command(daemonPath)
 	command.Stdout = logFile
 	command.Stderr = logFile
 	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := command.Start(); err != nil {
-		return fmt.Errorf("start %s: %w", daemonPath, err)
+		return 0, fmt.Errorf("start %s: %w", daemonPath, err)
 	}
 	if err := command.Process.Release(); err != nil {
-		return fmt.Errorf("detach tbxd: %w", err)
+		return 0, fmt.Errorf("detach tbxd: %w", err)
 	}
-	return nil
+	return logInfo.Size(), nil
 }
 
 func parseInterspersed(flags *flag.FlagSet, args []string) ([]string, error) {

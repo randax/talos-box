@@ -48,8 +48,8 @@ func TestConnectRejectsProtocolVersionMismatch(t *testing.T) {
 		_ = client.Close()
 		t.Fatal("Connect() succeeded")
 	}
-	if err == nil || !strings.Contains(err.Error(), "restart the helper") {
-		t.Fatalf("Connect() error = %v, want restart guidance", err)
+	if err == nil || !strings.Contains(err.Error(), "tbx system install") {
+		t.Fatalf("Connect() error = %v, want reinstall guidance", err)
 	}
 	<-done
 }
