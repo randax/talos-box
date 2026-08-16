@@ -403,6 +403,30 @@ clusters:
 			},
 		},
 		{
+			name: "empty per-cluster block inherits everything",
+			yaml: `version: 1
+talos:
+  version: v1.13.6
+  extensions: [gvisor]
+clusters:
+  - name: demo
+    talos: {}
+`,
+			want: []TalosSpec{{Version: "v1.13.6", Extensions: []string{"gvisor"}}},
+		},
+		{
+			name: "explicit null extensions means unset, so it inherits",
+			yaml: `version: 1
+talos:
+  extensions: [gvisor]
+clusters:
+  - name: demo
+    talos:
+      extensions:
+`,
+			want: []TalosSpec{{Extensions: []string{"gvisor"}}},
+		},
+		{
 			name: "per-cluster block without file-level block",
 			yaml: `version: 1
 clusters:
