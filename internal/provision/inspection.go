@@ -23,11 +23,25 @@ func InspectionSections() []string {
 // than parallel templates so a user can fork the output onto a substrate-only
 // cluster without guessing what tbx would have applied.
 func RenderInspection(item cluster.Cluster, section string) (string, error) {
+	return RenderInspectionWithCNI(item, section, "")
+}
+
+// RenderInspectionWithCNI is RenderInspection with the `--cni` override the
+// manifests command accepts. A substrate-only cluster declares no curated CNI,
+// so the sections derived from one have nothing to render until the user names
+// the CNI they intend to install by hand; the substrate sections never need it.
+// Naming a CNI a cluster already declares is accepted, naming a different one
+// is refused rather than silently rendering a path the cluster is not on.
+func RenderInspectionWithCNI(item cluster.Cluster, section, cni string) (string, error) {
 	if section == "" {
 		section = "all"
 	}
-	if section != "all" && section != "images" && !isStorageInspectionSection(section) && item.CNI != cluster.CNICilium && item.CNI != cluster.CNIFlannel {
-		return "", fmt.Errorf("cluster %q does not declare a curated cni", item.Name)
+	item, err := applyInspectionCNI(item, cni)
+	if err != nil {
+		return "", err
+	}
+	if isCNIDerivedInspectionSection(section) && !hasCuratedCNI(item) {
+		return "", fmt.Errorf("cluster %q does not declare a curated cni: section %q is derived from one, so pass --cni cilium or --cni flannel to render what tbx would apply", item.Name, section)
 	}
 	switch section {
 	case "talos":
@@ -98,13 +112,45 @@ func RenderInspection(item cluster.Cluster, section string) (string, error) {
 	}
 }
 
-func isStorageInspectionSection(section string) bool {
+// isCNIDerivedInspectionSection reports whether a section's content comes out
+// of the curated CNI's rendered charts. Everything else — the machine patch,
+// the catch-all registry mirror, the storage prerequisites, the image list —
+// is substrate, and renders for a cluster that declares no CNI at all.
+func isCNIDerivedInspectionSection(section string) bool {
 	switch section {
-	case "storage", "storage-machine", "storage-values", "storage-namespaces", "storage-crds", "storage-objects":
+	case "values", "objects", "extras", "k8s",
+		"cilium-values", "metallb-values", "metallb-extras",
+		"lb-pool", "bgp", "l2":
 		return true
 	default:
 		return false
 	}
+}
+
+func hasCuratedCNI(item cluster.Cluster) bool {
+	return item.CNI == cluster.CNICilium || item.CNI == cluster.CNIFlannel
+}
+
+// applyInspectionCNI folds a `--cni` override into the inspected cluster. On a
+// substrate-only cluster it stands in for the intent the user has not declared,
+// including the LoadBalancer default a curated path is created with.
+func applyInspectionCNI(item cluster.Cluster, cni string) (cluster.Cluster, error) {
+	if cni == "" {
+		return item, nil
+	}
+	requested := cluster.CNI(cni)
+	if requested != cluster.CNICilium && requested != cluster.CNIFlannel {
+		return cluster.Cluster{}, fmt.Errorf("--cni must be one of cilium or flannel, got %q", cni)
+	}
+	if hasCuratedCNI(item) {
+		if item.CNI != requested {
+			return cluster.Cluster{}, fmt.Errorf("cluster %q declares cni %s; drop --cni %s or pass --cni %s", item.Name, item.CNI, requested, item.CNI)
+		}
+		return item, nil
+	}
+	item.CNI = requested
+	item.LB = true
+	return item, nil
 }
 
 func inspectionValues(item cluster.Cluster) (string, error) {
@@ -160,7 +206,10 @@ type inspection struct {
 	values  string
 	objects string
 	extras  string
-	chart   inspectionChartMetadata
+	// substrateOnly records that the cluster declares no curated CNI, so the
+	// bundle names --cni instead of silently omitting the CNI-derived sections.
+	substrateOnly bool
+	chart         inspectionChartMetadata
 }
 
 type inspectionChartMetadata struct {
@@ -220,6 +269,11 @@ func inspectProvisioning(item cluster.Cluster) (inspection, error) {
 		if err != nil {
 			return inspection{}, err
 		}
+	default:
+		// Substrate-only: the machine patch is still the cluster's own, and
+		// the CNI-derived sections need the user to name a curated CNI.
+		result.machine = machinePrerequisitePatch(item)
+		result.substrateOnly = true
 	}
 	return result, nil
 }
@@ -391,6 +445,9 @@ func (i inspection) all(clusterName, storage string) string {
 	}
 	if i.extras != "" {
 		sections = append(sections, fmt.Sprintf("# Exact LoadBalancer/BGP extras and probe tbx applies:\n#   tbx manifests %s extras | kubectl apply --server-side -f -\n%s", quoted, i.extras))
+	}
+	if i.substrateOnly {
+		sections = append(sections, fmt.Sprintf("# This cluster declares no curated CNI, so no Helm values, chart objects, or\n# LoadBalancer extras are part of it. To see what tbx would apply for a curated\n# CNI you install by hand, name it:\n#   tbx manifests %s values --cni cilium\n#   tbx manifests %s objects --cni cilium\n#   tbx manifests %s extras --cni cilium\n", quoted, quoted, quoted))
 	}
 	sections = append(sections, storage)
 	return strings.Join(sections, "---\n")

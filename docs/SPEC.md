@@ -417,7 +417,12 @@ maintenance-mode debugging works before any config exists. Detach with **`Ctrl-]
 session banner states the detach key. Attaching never blocks the VM; multiple attach/detach
 cycles are supported. `tbx manifests` is the exact inspection/fork surface for the declared
 curated path: its `machine`, `values`, `objects`, and `extras` sections match the patch,
-pinned Helm release, rendered objects, and LB/BGP/MetalLB probe resources tbx applies. Its
+pinned Helm release, rendered objects, and LB/BGP/MetalLB probe resources tbx applies. The gate
+is per section: `machine`, `mirrors`, `images`, and the `storage` streams are substrate and
+render for a cluster that declares no CNI, while the CNI-derived sections (`values`, `objects`,
+`extras`, `lb-pool`, `l2`, `bgp`) refuse with a message naming `--cni`. `tbx manifests <cluster>
+<section> --cni cilium|flannel` renders what tbx **would** apply for that curated CNI on a
+substrate-only cluster; naming a CNI that contradicts a declared one is refused. Its
 `storage` section always includes the kubelet mount prerequisite and privileged-namespace PSA
 guidance, including for a substrate-only cluster. If `csi:` is declared it also includes the
 exact Longhorn values and renderer-derived namespace, CRD, and post-CRD object streams, or

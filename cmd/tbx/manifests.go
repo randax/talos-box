@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"strings"
 
@@ -10,20 +11,27 @@ import (
 )
 
 func (c cli) runManifests(args []string) error {
-	if len(args) < 1 || len(args) > 2 {
-		return fmt.Errorf("usage: tbx manifests <cluster> [%s]", strings.Join(provision.InspectionSections(), "|"))
+	flags := flag.NewFlagSet("manifests", flag.ContinueOnError)
+	flags.SetOutput(c.err)
+	cni := flags.String("cni", "", "curated cni to render CNI-derived sections for on a substrate-only cluster")
+	positionals, err := parseInterspersed(flags, args)
+	if err != nil {
+		return err
+	}
+	if len(positionals) < 1 || len(positionals) > 2 {
+		return fmt.Errorf("usage: tbx manifests <cluster> [%s] [--cni cilium|flannel]", strings.Join(provision.InspectionSections(), "|"))
 	}
 	section := "all"
-	if len(args) == 2 {
-		section = args[1]
+	if len(positionals) == 2 {
+		section = positionals[1]
 	}
 	var clusters []daemon.ClusterSummary
 	if err := c.call("cluster.list", struct{}{}, &clusters); err != nil {
 		return err
 	}
 	for _, item := range clusters {
-		if item.Name == args[0] {
-			out, err := provision.RenderInspection(clusterFromSummary(item), section)
+		if item.Name == positionals[0] {
+			out, err := provision.RenderInspectionWithCNI(clusterFromSummary(item), section, *cni)
 			if err != nil {
 				return err
 			}
@@ -31,7 +39,7 @@ func (c cli) runManifests(args []string) error {
 			return err
 		}
 	}
-	return fmt.Errorf("cluster %q does not exist", args[0])
+	return fmt.Errorf("cluster %q does not exist", positionals[0])
 }
 
 func clusterFromSummary(item daemon.ClusterSummary) cluster.Cluster {

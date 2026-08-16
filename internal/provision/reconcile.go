@@ -515,11 +515,15 @@ func addCatchAllMirror(config []byte, subnetIndex int) []byte {
 	return append(config, []byte(catchAllMirrorDocument(subnetIndex))...)
 }
 
+// machineCNIName is the value of cluster.network.cni.name for the cluster.
+// Cilium and a substrate-only cluster both take "none": tbx installs Cilium
+// itself, and a hand-bootstrapping user installs their own CNI, so in neither
+// case may Talos apply its built-in flannel manifests.
 func machineCNIName(item cluster.Cluster) string {
-	if item.CNI == cluster.CNICilium {
-		return "none"
+	if item.CNI == cluster.CNIFlannel {
+		return string(cluster.CNIFlannel)
 	}
-	return string(item.CNI)
+	return "none"
 }
 
 func ciliumDisablesKubeProxy(item cluster.Cluster) bool {

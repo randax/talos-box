@@ -100,7 +100,12 @@ anything; suppress them with `--quiet`. `tbx up --quiet` and `tbx cluster create
 their final result but suppress stage narration. `tbx manifests` is the exact inspection/fork
 surface for the curated path: `machine`, `values`, `objects`, and `extras` match the machine
 prerequisite patch, pinned Helm values, rendered chart objects, and LB/BGP resources `tbx`
-applies. Its `storage` section is also available on substrate-only clusters: it prints the
+applies. The substrate sections — `machine`, `mirrors`, `images`, and the `storage` streams —
+render on a substrate-only cluster too, since the machine patch and the catch-all registry
+mirror are substrate, not CNI. The CNI-derived sections (`values`, `objects`, `extras`, and the
+`lb-pool`/`l2`/`bgp` filters) need a curated CNI: on a substrate-only cluster name the one you
+intend to install by hand with `--cni cilium` or `--cni flannel`, and `tbx` prints exactly what
+it would apply for it. Its `storage` section is also available on substrate-only clusters: it prints the
 required kubelet mounts and Pod Security Admission guidance, then prints exact curated CSI
 inputs when `csi:` is declared. Use `storage-machine`, `storage-values`, `storage-namespaces`,
 `storage-crds`, and `storage-objects` as the hand-application streams described in that output.
