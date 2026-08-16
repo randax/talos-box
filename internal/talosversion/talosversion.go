@@ -18,7 +18,8 @@ const Min = "v1.12.0"
 
 // Machinery's contract parse validates nothing beyond a leading
 // vMAJOR.MINOR, so image resolution needs the full triple checked here.
-var versionShape = regexp.MustCompile(`^v(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?$`)
+// Pre-release identifiers are dot-separated and never empty, per semver.
+var versionShape = regexp.MustCompile(`^v(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$`)
 
 var (
 	floor  = mustParse(Min)

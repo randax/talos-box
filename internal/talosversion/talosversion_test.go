@@ -28,7 +28,11 @@ func TestValidateRefusesBelowFloorNamingBothVersions(t *testing.T) {
 }
 
 func TestValidateRefusesMalformedVersions(t *testing.T) {
-	for _, version := range []string{"garbage", "1.13", "v1.13", "v1..6", "v1.13.six", "latest", "v1.13.6 ", ""} {
+	for _, version := range []string{
+		"garbage", "1.13", "v1.13", "v1..6", "v1.13.six", "latest", "v1.13.6 ", "",
+		// Semver forbids empty dot-separated pre-release identifiers.
+		"v1.14.0-", "v1.14.0-..", "v1.14.0-.a", "v1.14.0-a..b", "v1.14.0-a.",
+	} {
 		if err := Validate(version); err == nil {
 			t.Errorf("Validate(%q) = nil, want malformed-version refusal", version)
 		}
