@@ -848,20 +848,73 @@ type bearerChallenge struct {
 }
 
 // bearerChallengeFrom returns the first Bearer challenge among the response's
-// WWW-Authenticate values, so an upstream that leads with another scheme
-// (e.g. Basic on a separate header line) is still answered.
+// WWW-Authenticate values, so an upstream that leads with another scheme —
+// on a separate header line or ahead of Bearer inside one value — is still
+// answered.
 func bearerChallengeFrom(headers []string) (bearerChallenge, bool) {
 	for _, header := range headers {
-		if challenge, ok := parseBearerChallenge(header); ok {
-			return challenge, true
+		for _, single := range splitChallenges(header) {
+			if challenge, ok := parseBearerChallenge(single); ok {
+				return challenge, true
+			}
 		}
 	}
 	return bearerChallenge{}, false
 }
 
-// parseBearerChallenge reports whether header carries a Bearer challenge and,
-// if so, its parameters. Nothing here is registry-specific: every value comes
-// from the challenge itself.
+// splitChallenges splits one WWW-Authenticate value into its individual
+// challenges (RFC 7235 allows several per value, comma-separated). A segment
+// opening with a scheme token starts a new challenge; a key=value segment
+// belongs to the current one. Commas inside quoted strings do not split.
+func splitChallenges(header string) []string {
+	var segments []string
+	depth := false // inside a quoted string
+	start := 0
+	for i := 0; i < len(header); i++ {
+		switch header[i] {
+		case '"':
+			depth = !depth
+		case '\\':
+			if depth {
+				i++
+			}
+		case ',':
+			if !depth {
+				segments = append(segments, header[start:i])
+				start = i + 1
+			}
+		}
+	}
+	segments = append(segments, header[start:])
+
+	var challenges []string
+	current := ""
+	for _, segment := range segments {
+		segment = strings.TrimSpace(segment)
+		if segment == "" {
+			continue
+		}
+		// A parameter is "key=..."; anything else (a bare token, or
+		// "Scheme param=...") opens a new challenge.
+		head, _, _ := strings.Cut(segment, "=")
+		if current != "" && !strings.ContainsAny(strings.TrimSpace(head), " \t") && strings.Contains(segment, "=") {
+			current += ", " + segment
+			continue
+		}
+		if current != "" {
+			challenges = append(challenges, current)
+		}
+		current = segment
+	}
+	if current != "" {
+		challenges = append(challenges, current)
+	}
+	return challenges
+}
+
+// parseBearerChallenge reports whether the single challenge carries the
+// Bearer scheme and, if so, its parameters. Nothing here is
+// registry-specific: every value comes from the challenge itself.
 func parseBearerChallenge(header string) (bearerChallenge, bool) {
 	scheme, rest, ok := strings.Cut(strings.TrimSpace(header), " ")
 	if !ok || !strings.EqualFold(scheme, "Bearer") {

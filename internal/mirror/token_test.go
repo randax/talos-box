@@ -56,6 +56,55 @@ func TestParseBearerChallenge(t *testing.T) {
 	}
 }
 
+// One WWW-Authenticate value can legally carry several challenges; the Bearer
+// parameters must not be polluted by a neighboring scheme's, and Bearer must
+// be found even when it is not the first scheme in the value.
+func TestBearerChallengeFromMixedChallenges(t *testing.T) {
+	tests := []struct {
+		name    string
+		headers []string
+		want    bearerChallenge
+		wantOK  bool
+	}{
+		{
+			name:    "bearer then basic in one value",
+			headers: []string{`Bearer realm="https://auth.example/token",service="svc",scope="repo:pull", Basic realm="registry"`},
+			want:    bearerChallenge{realm: "https://auth.example/token", service: "svc", scope: "repo:pull"},
+			wantOK:  true,
+		},
+		{
+			name:    "basic then bearer in one value",
+			headers: []string{`Basic realm="registry", Bearer realm="https://auth.example/token",service="svc"`},
+			want:    bearerChallenge{realm: "https://auth.example/token", service: "svc"},
+			wantOK:  true,
+		},
+		{
+			name:    "comma inside quoted scope does not split",
+			headers: []string{`Bearer realm="https://auth.example/token",scope="repository:a:pull,push"`},
+			want:    bearerChallenge{realm: "https://auth.example/token", scope: "repository:a:pull,push"},
+			wantOK:  true,
+		},
+		{
+			name:    "bearer on a later header line",
+			headers: []string{`Basic realm="registry"`, `Bearer realm="https://auth.example/token"`},
+			want:    bearerChallenge{realm: "https://auth.example/token"},
+			wantOK:  true,
+		},
+		{
+			name:    "no bearer at all",
+			headers: []string{`Basic realm="registry", Negotiate`},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, ok := bearerChallengeFrom(test.headers)
+			if ok != test.wantOK || got != test.want {
+				t.Fatalf("bearerChallengeFrom(%q) = %+v, %v; want %+v, %v", test.headers, got, ok, test.want, test.wantOK)
+			}
+		})
+	}
+}
+
 // tokenAuthRegistry is a Docker-Hub-shaped upstream: it demands a bearer token
 // scoped to the repository but issues a challenge that carries no scope.
 type tokenAuthRegistry struct {
