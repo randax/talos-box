@@ -104,7 +104,9 @@ func runWithDaemonResponse(t *testing.T, data json.RawMessage, run func(cli) err
 	}
 }
 
-func TestCreateClusterEchoesPerClusterTalosStanza(t *testing.T) {
+func TestCreateClusterEchoesFileLevelTalosBlock(t *testing.T) {
+	// A file-level pin is semantically identical for a single cluster and the
+	// echoed file replays against daemons predating per-cluster talos.
 	response := json.RawMessage(`{"name":"demo","controlPlanes":1,"workers":2,"nodeDefaults":{"memoryMiB":2048,"cpus":2,"diskGiB":20},"talosVersion":"v1.14.0","schematic":"user-supplied-schematic"}`)
 	var stdout string
 	runWithDaemonResponse(t, response, func(command cli) error {
@@ -114,15 +116,11 @@ func TestCreateClusterEchoesPerClusterTalosStanza(t *testing.T) {
 		stdout = buffer.String()
 		return err
 	})
-	for _, wanted := range []string{
-		"    talos:\n      version: v1.14.0\n      schematic: user-supplied-schematic\n",
-	} {
-		if !strings.Contains(stdout, wanted) {
-			t.Fatalf("create echo missing per-cluster talos stanza %q:\n%s", wanted, stdout)
-		}
+	if wanted := "talos:\n  version: v1.14.0\n  schematic: user-supplied-schematic\n"; !strings.Contains(stdout, wanted) {
+		t.Fatalf("create echo missing file-level talos block %q:\n%s", wanted, stdout)
 	}
-	if strings.Contains(stdout, "\ntalos:\n") {
-		t.Fatalf("create echo still emits a file-level talos block:\n%s", stdout)
+	if strings.Contains(stdout, "    talos:") {
+		t.Fatalf("create echo emits a per-cluster talos stanza:\n%s", stdout)
 	}
 }
 

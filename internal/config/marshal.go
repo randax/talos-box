@@ -41,9 +41,10 @@ func Marshal(cfg Config) string {
 		if c.AllowUnsafeDomain {
 			b.WriteString("    allowUnsafeDomain: true\n")
 		}
-		// A resolved talos equal to the file-level block is pure inheritance;
-		// only a divergence needs its own stanza.
-		if !c.Talos.Equal(cfg.Talos) {
+		// A resolved talos equal to the file-level block is pure inheritance,
+		// and a zero one has nothing to say; only a divergence needs its own
+		// stanza.
+		if !c.Talos.IsZero() && !c.Talos.Equal(cfg.Talos) {
 			b.WriteString("    talos:\n")
 			writeTalosFields(&b, c.Talos, "      ")
 		}

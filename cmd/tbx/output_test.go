@@ -175,3 +175,24 @@ func TestPrintStatusShowsTalosVersionAndSchematic(t *testing.T) {
 		}
 	}
 }
+
+func TestPrintStatusQuietSuppressesSchematicLines(t *testing.T) {
+	t.Parallel()
+
+	status := daemon.ClusterStatus{
+		Name: "demo", Subnet: "172.30.3.0/24", Domain: "demo.k8s.test",
+		TalosVersion: "v1.13.6", Schematic: "aaa111",
+		Nodes: []daemon.NodeStatus{{Name: "demo-cp-1", Role: cluster.RoleControlPlane, MAC: "52:54:00:00:00:01", Phase: daemon.PhaseConfigured}},
+	}
+
+	var output bytes.Buffer
+	if err := printStatus(&output, []daemon.ClusterStatus{status}, true); err != nil {
+		t.Fatal(err)
+	}
+	if rendered := output.String(); strings.Contains(rendered, "schematic") {
+		t.Fatalf("quiet status unexpectedly included the schematic line:\n%s", rendered)
+	}
+	if rendered := output.String(); !strings.Contains(rendered, "v1.13.6") {
+		t.Fatalf("quiet status lost the TALOS column:\n%s", rendered)
+	}
+}

@@ -61,11 +61,6 @@ func printStatus(output io.Writer, clusters []daemon.ClusterStatus, quiet bool) 
 		return err
 	}
 	for _, item := range clusters {
-		if item.Schematic != "" {
-			if _, err := fmt.Fprintf(output, "cluster %s: schematic %s\n", item.Name, item.Schematic); err != nil {
-				return err
-			}
-		}
 		if item.BGP {
 			if _, err := fmt.Fprintf(output, "cluster %s: BGP mode enabled\n", item.Name); err != nil {
 				return err
@@ -74,6 +69,15 @@ func printStatus(output io.Writer, clusters []daemon.ClusterStatus, quiet bool) 
 	}
 	if quiet {
 		return nil
+	}
+	// Every cluster carries a schematic (the daemon default when nothing was
+	// pinned), so the full 64-hex ids stay out of quiet output.
+	for _, item := range clusters {
+		if item.Schematic != "" {
+			if _, err := fmt.Fprintf(output, "cluster %s: schematic %s\n", item.Name, item.Schematic); err != nil {
+				return err
+			}
+		}
 	}
 	printed := false
 	for _, item := range clusters {
