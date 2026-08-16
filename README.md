@@ -105,7 +105,7 @@ required kubelet mounts and Pod Security Admission guidance, then prints exact c
 inputs when `csi:` is declared. Use `storage-machine`, `storage-values`, `storage-namespaces`,
 `storage-crds`, and `storage-objects` as the hand-application streams described in that output.
 
-Bring-your-own CSI is unsupported above the talosbox substrate. The default image covers the curated storage requirements; an engine requiring other Talos extensions must use the existing `talos.schematic` override in `talosbox.yaml`. talosbox does not compose schematics from extension lists.
+Bring-your-own CSI is unsupported above the talosbox substrate. The default image covers the curated storage requirements, and `talos.extensions` composes a closed curated set — `gvisor`, `nfs-utils`, `qemu-guest-agent` — on top of it, so an NFS-backed engine gets its client from `extensions: [nfs-utils]`. Names outside that set are rejected before anything is created; an engine needing any other Talos extension still uses the `talos.schematic` override in `talosbox.yaml`. A brought schematic combined with a curated list is re-composed through the Image Factory, so bringing your own schematic never silently drops the extensions you asked for — but that combination does require Factory access at create time unless the composed image is already cached.
 
 For a substrate-only BYO install, first save the patch with `tbx manifests demo storage-machine > storage-machine.yaml` and apply it to **every node** with `talosctl patch mc -p @storage-machine.yaml --nodes <node-ip>`. Before installing the CSI, create its namespace if needed and label it with the PSA commands printed by `tbx manifests demo storage`; then apply the CSI's own manifests. A declared curated CSI supplies exact streams (and Longhorn values through `storage-values`). For Longhorn, apply `storage-namespaces`, then `storage-crds`, wait for those CRDs to become Established, and only then apply post-CRD `storage-objects`; do not use a one-shot apply. Local-path has no CRD barrier: apply `storage-namespaces` before `storage-objects`.
 
@@ -152,6 +152,11 @@ tbx cache warm --check --deep workshop-images.txt  # also rehash cached blobs
 tbx cache list                                     # disk images and mirror-cache totals
 ```
 
+`tbx manifests demo images` prints the exact pinned image set a cluster will pull — the curated
+path's rendered objects for its declared intent plus the Talos system images for its pinned
+version — in this same list format, so `tbx manifests demo images | tbx cache warm -` needs no
+hand-maintained list at all.
+
 Blank lines and lines beginning with `#` are ignored. `--check` verifies the cached manifest
 graph and host-platform image offline; `--deep` is valid only with `--check` and additionally
 rehashes blobs. It does not run a live-cluster pull test.
@@ -161,10 +166,22 @@ rehashes blobs. It does not run a live-cluster pull test.
 normal pull-through behavior. New machine configs use the catch-all mirror at the cluster
 gateway with `skipFallback: true`, so nodes do not bypass that mirror directly.
 
+`tbx cache pull` with no flags reads `talosbox.yaml` the way `tbx up` does: it resolves every
+cluster's Talos version, schematic, and extensions with inheritance applied, performs any
+schematic re-composition while the Image Factory is still reachable, downloads each distinct
+disk-image combination, and warms the container images those clusters will pull (`--no-images`
+skips the warming). Everything it fetches is pinned, so a later fully offline `tbx up` of the
+same file contacts nothing. `--talos-version`, `--schematic`, and `--extensions` still pull one
+ad-hoc combination instead.
+
 The cache is independent of cluster lifecycle: destroying a cluster leaves warmed mirror
-content intact. To reclaim space safely, `tbx cache prune` removes Talos disk images only,
-`tbx cache prune --mirror` removes mirror content only, and `tbx cache prune --all` removes
-both. After upgrading from a build that used the original flat manifest-cache layout, run
+content intact. To reclaim space safely, `tbx cache prune` is reference-aware: it removes only
+disk-image combinations that no persisted cluster references, that were not pinned by an
+explicit pull, and that are not the built-in default, listing each one with its size before
+deleting. `tbx cache prune --mirror` removes mirror content only, and `tbx cache prune --all`
+removes both and clears pins. Nothing is ever deleted automatically, and `tbx cache list`
+labels every combination `in-use` (naming the clusters), `pinned`, `default`, or `orphan`, so
+it reads as the prune preview. After upgrading from a build that used the original flat manifest-cache layout, run
 `tbx cache warm` again before going offline: verified digest entries remain reusable, but legacy
 tag entries are deliberately ignored because their old filenames cannot prove repository identity.
 
