@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/randax/talos-box/internal/helper"
 )
 
 const (
@@ -92,7 +94,39 @@ func (c cli) installSystem(args []string) error {
 	return err
 }
 
+// dnsUninstaller is the helper surface the uninstall path needs.
+type dnsUninstaller interface {
+	UninstallDNS() error
+	Close() error
+}
+
+func connectHelperForUninstall() (dnsUninstaller, error) {
+	return helper.Connect()
+}
+
+// removeScopedResolver drops the k8s.test scoped resolver while the helper is
+// still loaded. It is best effort: an unreachable helper (never installed, or
+// already booted out) only warns, and the helper reports a missing resolver
+// file as success, so repeated uninstalls stay idempotent.
+func (c cli) removeScopedResolver(connect func() (dnsUninstaller, error)) error {
+	client, err := connect()
+	if err != nil {
+		_, printErr := fmt.Fprintf(c.err, "warning: skipping resolver removal; helper is unreachable: %v\n", err)
+		return printErr
+	}
+	defer func() { _ = client.Close() }()
+	if err := client.UninstallDNS(); err != nil {
+		_, printErr := fmt.Fprintf(c.err, "warning: could not remove the k8s.test resolver: %v\n", err)
+		return printErr
+	}
+	return nil
+}
+
 func (c cli) uninstallSystem() error {
+	// Ask before teardown, while the helper can still service the request.
+	if err := c.removeScopedResolver(connectHelperForUninstall); err != nil {
+		return err
+	}
 	if _, err := os.Stat(helperPlistPath); err == nil {
 		if err := runLaunchctl("bootout", "system", helperPlistPath); err != nil {
 			return err

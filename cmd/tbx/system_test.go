@@ -1,11 +1,87 @@
 package main
 
 import (
+	"bytes"
+	"errors"
 	"strings"
 	"testing"
 )
 
 func uidPtr(uid uint32) *uint32 { return &uid }
+
+type fakeDNSUninstaller struct {
+	calls    int
+	closed   bool
+	uninstal error
+}
+
+func (f *fakeDNSUninstaller) UninstallDNS() error {
+	f.calls++
+	return f.uninstal
+}
+
+func (f *fakeDNSUninstaller) Close() error {
+	f.closed = true
+	return nil
+}
+
+func TestRemoveScopedResolverUninstallsThroughHelper(t *testing.T) {
+	t.Parallel()
+
+	client := &fakeDNSUninstaller{}
+	var stderr bytes.Buffer
+	command := cli{out: &bytes.Buffer{}, err: &stderr}
+	for range 2 {
+		if err := command.removeScopedResolver(func() (dnsUninstaller, error) {
+			return client, nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if client.calls != 2 {
+		t.Fatalf("UninstallDNS calls = %d, want 2", client.calls)
+	}
+	if !client.closed {
+		t.Fatal("helper connection was not closed")
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestRemoveScopedResolverWarnsWhenHelperIsUnreachable(t *testing.T) {
+	t.Parallel()
+
+	var stderr bytes.Buffer
+	command := cli{out: &bytes.Buffer{}, err: &stderr}
+	if err := command.removeScopedResolver(func() (dnsUninstaller, error) {
+		return nil, errors.New("connect to helper at /var/run/tbx-helper.sock: no such file")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr.String(), "warning: skipping resolver removal") {
+		t.Fatalf("stderr = %q, want an unreachable-helper warning", stderr.String())
+	}
+}
+
+func TestRemoveScopedResolverWarnsWhenUninstallFails(t *testing.T) {
+	t.Parallel()
+
+	client := &fakeDNSUninstaller{uninstal: errors.New("remove resolver file: permission denied")}
+	var stderr bytes.Buffer
+	command := cli{out: &bytes.Buffer{}, err: &stderr}
+	if err := command.removeScopedResolver(func() (dnsUninstaller, error) {
+		return client, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !client.closed {
+		t.Fatal("helper connection was not closed")
+	}
+	if !strings.Contains(stderr.String(), "warning: could not remove the k8s.test resolver") {
+		t.Fatalf("stderr = %q, want a resolver-removal warning", stderr.String())
+	}
+}
 
 func TestRenderLaunchdPlist(t *testing.T) {
 	t.Parallel()
