@@ -16,10 +16,13 @@ const (
 	// A declared storage engine adds its image pulls (Longhorn alone is
 	// gigabytes across every node) and the write/readback probe to the same
 	// provisioning pass, so it gets a larger budget.
-	storageProvisionTimeout   = 25 * time.Minute
-	kubernetesReadyTimeout    = 5 * time.Second
-	ciliumConvergenceTimeout  = 15 * time.Second
-	storageConvergenceTimeout = 30 * time.Second
+	storageProvisionTimeout = 25 * time.Minute
+	kubernetesReadyTimeout  = 5 * time.Second
+	// The scheduling posture is one small Nodes read, on the same budget as the
+	// readiness probe it accompanies.
+	controlPlaneSchedulingTimeout = 5 * time.Second
+	ciliumConvergenceTimeout      = 15 * time.Second
+	storageConvergenceTimeout     = 30 * time.Second
 )
 
 var (
@@ -27,6 +30,10 @@ var (
 	ciliumConvergenceProbe  = provision.CiliumConverged
 	loadBalancerVIPProbe    = loadBalancerVIP
 	storageConvergenceProbe = storageConverged
+	// The zero-worker boundary has no other end-state probe: an interrupted
+	// mutation pass leaves the control plane's machine config drifted while
+	// every health probe still passes.
+	controlPlaneSchedulingProbe = provision.ControlPlaneSchedulingConverged
 )
 
 const storageProbeRetryBackoff = time.Minute
@@ -38,6 +45,9 @@ type provisionTask struct {
 	ctx        context.Context
 	generation uint64
 	action     int
+	// force skips the fast no-op path: a topology mutation changes the machine
+	// config already-configured nodes need, which no health probe observes.
+	force bool
 }
 
 func (s *Server) handleProvisioningLocked(request Request, maintenance map[string]maintenanceObservation, storage map[string]storageObservation) (any, []provisionTask, error) {
@@ -131,7 +141,11 @@ func (s *Server) beginNodeMutationProvisionLocked(item cluster.Cluster) []provis
 	if !s.clusterRunning(item.Name) {
 		return nil
 	}
-	return s.beginProvisionTasksLocked([]cluster.Cluster{item})
+	tasks := s.beginProvisionTasksLocked([]cluster.Cluster{item})
+	for i := range tasks {
+		tasks[i].force = true
+	}
+	return tasks
 }
 
 func (s *Server) finishProvision(task provisionTask) {
@@ -165,7 +179,7 @@ func (s *Server) cancelAllProvisionsLocked() {
 
 func (s *Server) runProvisionTasks(data any, tasks []provisionTask) error {
 	for i, task := range tasks {
-		narration, phase, err := s.provisionCNI(task.ctx, task.item, false)
+		narration, phase, err := s.provisionCNI(task.ctx, task.item, task.force)
 		if task.item.CSI != "" {
 			s.opMu.Lock()
 			s.recordStoragePhaseLocked(task.item.Name, phase)
@@ -306,16 +320,16 @@ func (s *Server) provisioningComplete(item cluster.Cluster) bool {
 	if item.LB {
 		_, vipLive = loadBalancerVIPProbe(item)
 	}
-	var kubeconfig []byte
-	if item.CNI == cluster.CNICilium || item.CSI != "" {
-		dir, err := cluster.Dir(item.Name)
-		if err != nil {
-			return false
-		}
-		kubeconfig, err = os.ReadFile(filepath.Join(dir, "kubeconfig"))
-		if err != nil {
-			return false
-		}
+	dir, err := cluster.Dir(item.Name)
+	if err != nil {
+		return false
+	}
+	kubeconfig, err := os.ReadFile(filepath.Join(dir, "kubeconfig"))
+	if err != nil {
+		return false
+	}
+	if !controlPlaneSchedulingConverged(item, kubeconfig) {
+		return false
 	}
 	if item.CSI != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), storageConvergenceTimeout)
@@ -356,6 +370,16 @@ func provisioningCompleteEligible(intent cluster.ProvisioningIntent, credentials
 		return false
 	}
 	return intent.CNI != cluster.CNICilium || hubbleConverged
+}
+
+// controlPlaneSchedulingConverged decides the fast no-op on observed state
+// rather than on the in-memory force flag: a mutation pass that failed or was
+// superseded before it patched the control planes must still be recoverable by
+// rerunning tbx up.
+func controlPlaneSchedulingConverged(item cluster.Cluster, kubeconfig []byte) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), controlPlaneSchedulingTimeout)
+	defer cancel()
+	return controlPlaneSchedulingProbe(ctx, kubeconfig, item) == nil
 }
 
 func provisioningCredentialsPresent(name string) bool {
@@ -415,7 +439,19 @@ func storageConverged(ctx context.Context, item cluster.Cluster, kubeconfig []by
 	case cluster.CSILocalPath:
 		return provision.ProbeLocalPathStorage(ctx, kubeconfig, time.Second)
 	case cluster.CSILonghorn:
-		return provision.ProbeLonghornStorage(ctx, kubeconfig, time.Second)
+		if err := provision.ProbeLonghornStorage(ctx, kubeconfig, time.Second); err != nil {
+			return err
+		}
+		// The write/readback probe passes regardless of where replicas may
+		// land, so storage convergence has to include the control-plane
+		// scheduling posture or a mutation interrupted before the storage
+		// stage would fast no-op forever. The scheduling read gets its own
+		// small budget: sharing the probe's context would fail it on
+		// whatever deadline the write/readback left over and force a full
+		// reconcile of a healthy cluster.
+		schedulingCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), controlPlaneSchedulingTimeout)
+		defer cancel()
+		return provision.LonghornSchedulingConverged(schedulingCtx, kubeconfig, item)
 	default:
 		return nil
 	}
