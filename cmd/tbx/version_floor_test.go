@@ -12,9 +12,11 @@ import (
 func TestEmptyTalosVersionFlagMeansDaemonDefault(t *testing.T) {
 	// An explicit empty value defers to the daemon default, matching the
 	// daemon boundary's own convention — it must not be refused as malformed.
+	// The explicit schematic keeps default-schematic resolution from
+	// contacting the Image Factory — CI's nix sandbox has no network.
 	response := json.RawMessage(`{"name":"demo","controlPlanes":1,"workers":2,"nodeDefaults":{"memoryMiB":2048,"cpus":2,"diskGiB":20}}`)
 	runWithDaemonResponse(t, response, func(command cli) error {
-		return command.createCluster([]string{"demo", "--talos-version="})
+		return command.createCluster([]string{"demo", "--talos-version=", "--schematic=user-supplied-schematic"})
 	})
 }
 
