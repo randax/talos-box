@@ -609,6 +609,23 @@ func TestRunDoctorReportsRuntimeDependentChecksAsSkipped(t *testing.T) {
 	}
 }
 
+func TestRunDoctorPassesHostPressureForStickySwap(t *testing.T) {
+	deps := passingDoctorDependencies()
+	deps.hostPressure = func() (hostpressure.Snapshot, error) {
+		return hostpressure.Snapshot{
+			Swap:           hostpressure.Usage{TotalBytes: 10 << 30, AvailableBytes: 1 << 30},
+			MemoryPressure: hostpressure.MemoryPressureNormal,
+		}, nil
+	}
+	var output strings.Builder
+	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
+		t.Fatalf("runDoctorWithDependencies() = %v for sticky swap with normal pressure", err)
+	}
+	if !strings.Contains(output.String(), "PASS host-pressure") {
+		t.Fatalf("output missing host-pressure PASS for sticky swap:\n%s", output.String())
+	}
+}
+
 func TestRunDoctorWarnsOnExtremeHostPressure(t *testing.T) {
 	deps := passingDoctorDependencies()
 	deps.hostPressure = func() (hostpressure.Snapshot, error) {

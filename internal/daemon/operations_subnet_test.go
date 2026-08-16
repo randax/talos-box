@@ -105,6 +105,40 @@ func TestStartClusterRefusesExtremeHostPressure(t *testing.T) {
 	}
 }
 
+func TestStartClusterAllowsStickySwapWhileMemoryPressureIsNormal(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	item, err := cluster.New("sticky-swap", 0, 0, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	service := &Server{
+		vms: make(map[string]map[string]hypervisor.Machine),
+		hostPressure: func(string) (hostpressure.Snapshot, error) {
+			return hostpressure.Snapshot{
+				Swap:           hostpressure.Usage{TotalBytes: 10 << 30, AvailableBytes: 1 << 30},
+				MemoryPressure: hostpressure.MemoryPressureNormal,
+			}, nil
+		},
+		subnetSources: cluster.SubnetSources{
+			Interfaces: func() ([]cluster.HostInterface, error) { return nil, nil },
+			Route:      func(net.IP) (cluster.HostRoute, error) { return cluster.HostRoute{}, nil },
+		},
+	}
+	raw, err := json.Marshal(startArgs{Name: item.Name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// macOS keeps swap allocated after pressure clears; the guard must not
+	// block on the swap percentage alone.
+	if _, err := service.startCluster(raw); err != nil && strings.Contains(err.Error(), "host swap") {
+		t.Fatalf("startCluster() blocked on sticky swap despite normal memory pressure: %v", err)
+	}
+}
+
 func TestStartClusterForceSurfacesExtremeHostPressureWarning(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 

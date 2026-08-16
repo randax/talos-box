@@ -3,18 +3,35 @@
 package hostpressure
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
 
+// sysctlTimeout bounds each probe subprocess; system utilities can stall
+// behind stuck directory services or security agents, and a hung probe would
+// hang cluster create/start and doctor with it.
+const sysctlTimeout = 10 * time.Second
+
+func sysctlValue(name string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), sysctlTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "/usr/sbin/sysctl", "-n", name).Output()
+	if ctx.Err() != nil {
+		return nil, fmt.Errorf("sysctl %s timed out after %s", name, sysctlTimeout)
+	}
+	return out, err
+}
+
 // SystemSnapshot measures macOS swap and the volume that contains path.
 func SystemSnapshot(path string) (Snapshot, error) {
-	out, err := exec.Command("/usr/sbin/sysctl", "-n", "vm.swapusage").Output()
+	out, err := sysctlValue("vm.swapusage")
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("read swap usage: %w", err)
 	}
@@ -26,7 +43,31 @@ func SystemSnapshot(path string) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, err
 	}
-	return Snapshot{Swap: swap, DataVolume: dataVolume}, nil
+	return Snapshot{Swap: swap, DataVolume: dataVolume, MemoryPressure: measureMemoryPressure()}, nil
+}
+
+// measureMemoryPressure reads the kernel's pressure verdict; failures degrade
+// to Unknown rather than failing the snapshot, which keeps the conservative
+// swap warning in force.
+func measureMemoryPressure() MemoryPressure {
+	out, err := sysctlValue("kern.memorystatus_vm_pressure_level")
+	if err != nil {
+		return MemoryPressureUnknown
+	}
+	return memoryPressureFromLevel(strings.TrimSpace(string(out)))
+}
+
+func memoryPressureFromLevel(value string) MemoryPressure {
+	switch value {
+	case "1":
+		return MemoryPressureNormal
+	case "2":
+		return MemoryPressureWarning
+	case "4":
+		return MemoryPressureCritical
+	default:
+		return MemoryPressureUnknown
+	}
 }
 
 func parseSwapUsage(output string) (Usage, error) {

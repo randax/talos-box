@@ -30,6 +30,25 @@ func TestCreateClusterChecksHostPressureBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestCheckHostPressureAllowsStickySwapWhileMemoryPressureIsNormal(t *testing.T) {
+	// checkHostPressure is the shared guard behind both createCluster call
+	// sites and startCluster. macOS keeps swap allocated after pressure
+	// clears; the guard must not block on the swap percentage alone.
+	service := &Server{hostPressure: func(string) (hostpressure.Snapshot, error) {
+		return hostpressure.Snapshot{
+			Swap:           hostpressure.Usage{TotalBytes: 10 << 30, AvailableBytes: 1 << 30},
+			MemoryPressure: hostpressure.MemoryPressureNormal,
+		}, nil
+	}}
+	warning, err := service.checkHostPressure(t.TempDir(), false)
+	if err != nil {
+		t.Fatalf("checkHostPressure() = %v, want no refusal for sticky swap with normal pressure", err)
+	}
+	if warning != "" {
+		t.Fatalf("checkHostPressure() warning = %q, want none", warning)
+	}
+}
+
 func TestCreateClusterRejectsInvalidProvisioningIntentBeforeMutation(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	service := &Server{}

@@ -16,20 +16,60 @@ type Usage struct {
 	AvailableBytes uint64
 }
 
+// MemoryPressure is the kernel's current memory-pressure verdict.
+type MemoryPressure int
+
+const (
+	MemoryPressureUnknown MemoryPressure = iota
+	MemoryPressureNormal
+	MemoryPressureWarning
+	MemoryPressureCritical
+)
+
+func (p MemoryPressure) String() string {
+	switch p {
+	case MemoryPressureNormal:
+		return "normal"
+	case MemoryPressureWarning:
+		return "warning"
+	case MemoryPressureCritical:
+		return "critical"
+	default:
+		return "unknown"
+	}
+}
+
 // Snapshot is the host capacity relevant to safe VM startup.
 type Snapshot struct {
-	Swap       Usage
-	DataVolume Usage
+	Swap           Usage
+	DataVolume     Usage
+	MemoryPressure MemoryPressure
 }
 
 // Warnings returns actionable diagnostics for resource usage observed at
 // levels associated with guest resets or corrupt writes.
+//
+// Memory pressure is the primary memory signal: macOS keeps swap allocated
+// long after pressure clears, so a high swap-used percentage alone says
+// nothing about current availability. Swap exhaustion is secondary — it only
+// warns while pressure is elevated, or conservatively when pressure could not
+// be measured.
 func Warnings(snapshot Snapshot) []string {
+	const memoryRemedy = "guest VMs may reset and corrupt Talos EPHEMERAL data; free memory or reduce the cluster size before continuing"
+
 	var warnings []string
-	if percentUsed(snapshot.Swap) >= extremeSwapUsedPercent {
+	if snapshot.MemoryPressure == MemoryPressureCritical {
+		warnings = append(warnings, "host memory pressure is critical; "+memoryRemedy)
+	}
+	// sticky swap with memory to spare is not a fault
+	if percentUsed(snapshot.Swap) >= extremeSwapUsedPercent && snapshot.MemoryPressure != MemoryPressureNormal {
+		pressureClause := " and memory pressure could not be measured"
+		if snapshot.MemoryPressure != MemoryPressureUnknown {
+			pressureClause = fmt.Sprintf(" while memory pressure is %s", snapshot.MemoryPressure)
+		}
 		warnings = append(warnings, fmt.Sprintf(
-			"host swap is %d%% used (%.1f GiB of %.1f GiB); guest VMs may reset and corrupt Talos EPHEMERAL data; free memory or reduce the cluster size before continuing",
-			percentUsed(snapshot.Swap), gib(snapshot.Swap.usedBytes()), gib(snapshot.Swap.TotalBytes),
+			"host swap is %d%% used (%.1f GiB of %.1f GiB)%s; %s",
+			percentUsed(snapshot.Swap), gib(snapshot.Swap.usedBytes()), gib(snapshot.Swap.TotalBytes), pressureClause, memoryRemedy,
 		))
 	}
 	if percentUsed(snapshot.DataVolume) >= extremeDataVolumeUsedPercent {
