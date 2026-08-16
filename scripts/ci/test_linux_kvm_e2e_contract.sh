@@ -99,7 +99,8 @@ require 'talos_version=${TBX_E2E_TALOS_VERSION:-v1.13.6}' "$harness"
 require '  v1.12.0)' "$harness"
 
 # The storage harness exercises the curated provisioning path end to end:
-# longhorn on a multinode cluster, then local-path on a single node.
+# longhorn on a multinode cluster, then local-path on a single node, and both
+# crossings of the zero-worker boundary on the worker-less cluster.
 require "\"\$root/bin/tbx\" up -f" "$storage_harness"
 require 'cni: flannel' "$storage_harness"
 require 'csi: longhorn' "$storage_harness"
@@ -115,6 +116,13 @@ require 'is-default-class' "$storage_harness"
 require 'numberOfReplicas' "$storage_harness"
 require 'replicas.longhorn.io' "$storage_harness"
 require 'cat /data/probe' "$storage_harness"
+require 'control_plane_reserved() {' "$storage_harness"
+require 'node-role.kubernetes.io/control-plane' "$storage_harness"
+require 'node.kubernetes.io/exclude-from-external-load-balancers' "$storage_harness"
+require 'node add e2es --role worker --force' "$storage_harness"
+require 'node remove e2es "$added_worker" --force' "$storage_harness"
+require 'retry "control plane reserved after node add" 120 5 control_plane_reserved true' "$storage_harness"
+require 'retry "control plane schedulable after node remove" 120 5 control_plane_reserved false' "$storage_harness"
 require 'cluster destroy e2es --force' "$storage_harness"
 require 'sha256sum --check --strict' "$storage_harness"
 

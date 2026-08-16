@@ -15,6 +15,10 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 	kubernetesfake "k8s.io/client-go/kubernetes/fake"
 )
 
@@ -158,6 +162,136 @@ func TestRenderLonghornReplicasFollowStorageNodeCount(t *testing.T) {
 				t.Fatalf("StorageClass numberOfReplicas = %q, want %q", parameters["numberOfReplicas"], tt.want)
 			}
 		})
+	}
+}
+
+func TestRenderLonghornToleratesTheControlPlaneTaint(t *testing.T) {
+	// A cluster that ran worker-less holds replicas on its control plane; the
+	// NoSchedule taint returns as soon as a worker joins, so every Longhorn
+	// component must tolerate it or those replicas fault on the next restart.
+	item, err := cluster.New("demo", 0, 1, 1, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILonghorn}
+	objects, err := renderLonghorn(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, workload := range []struct{ kind, name string }{
+		{kind: "DaemonSet", name: longhornManagerName},
+		{kind: "Deployment", name: longhornDriverDeployerName},
+		{kind: "Deployment", name: longhornUIName},
+	} {
+		object := findObject(t, objects, workload.kind, workload.name)
+		tolerations, found, err := unstructured.NestedSlice(object.Object, "spec", "template", "spec", "tolerations")
+		if err != nil || !found {
+			t.Fatalf("%s/%s tolerations found=%v err=%v", workload.kind, workload.name, found, err)
+		}
+		tolerated := false
+		for _, entry := range tolerations {
+			toleration, ok := entry.(map[string]any)
+			if !ok {
+				continue
+			}
+			if toleration["key"] == controlPlaneTaint && toleration["effect"] == "NoSchedule" && toleration["operator"] == "Exists" {
+				tolerated = true
+			}
+		}
+		if !tolerated {
+			t.Fatalf("%s/%s tolerations = %v, want %s:NoSchedule", workload.kind, workload.name, tolerations, controlPlaneTaint)
+		}
+	}
+	settings := findObject(t, objects, "ConfigMap", "longhorn-default-setting")
+	data, found, err := unstructured.NestedStringMap(settings.Object, "data")
+	if err != nil || !found {
+		t.Fatalf("longhorn-default-setting data found=%v err=%v", found, err)
+	}
+	if want := fmt.Sprintf("taint-toleration: %q", controlPlaneTaint+":NoSchedule"); !strings.Contains(data["default-setting.yaml"], want) {
+		t.Fatalf("longhorn default settings = %q, want %s", data["default-setting.yaml"], want)
+	}
+}
+
+func longhornNodeCR(name string, allowScheduling bool) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "longhorn.io/v1beta2",
+		"kind":       "Node",
+		"metadata":   map[string]any{"name": name, "namespace": longhornNamespace},
+		"spec":       map[string]any{"allowScheduling": allowScheduling},
+	}}
+}
+
+func longhornNodeScheduling(t *testing.T, client dynamic.Interface, name string) bool {
+	t.Helper()
+	live, err := client.Resource(longhornNodeResource).Namespace(longhornNamespace).Get(context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowScheduling, found, err := unstructured.NestedBool(live.Object, "spec", "allowScheduling")
+	if err != nil || !found {
+		t.Fatalf("longhorn node %q allowScheduling found=%v err=%v", name, found, err)
+	}
+	return allowScheduling
+}
+
+// Tolerating the control-plane taint lets longhorn-manager run on a control
+// plane; only the node resource decides whether replicas land there.
+func TestReconcileLonghornControlPlaneSchedulingFollowsWorkerCount(t *testing.T) {
+	tests := []struct {
+		name                string
+		workers             int
+		allowScheduling     bool
+		wantAllowScheduling bool
+	}{
+		{name: "worker-ful cluster reserves the control plane", workers: 2, allowScheduling: true},
+		{name: "worker-ful cluster stays reserved", workers: 2},
+		{name: "worker-less cluster hosts replicas", workers: 0, wantAllowScheduling: true},
+		{name: "worker-less cluster reopens scheduling", workers: 0, wantAllowScheduling: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			item, err := cluster.New("demo", 0, 1, test.workers, cluster.NodeDefaults{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			objects := []runtime.Object{longhornNodeCR(item.Nodes[0].Name, test.allowScheduling)}
+			for _, node := range item.Nodes[1:] {
+				objects = append(objects, longhornNodeCR(node.Name, true))
+			}
+			client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+				runtime.NewScheme(),
+				map[schema.GroupVersionResource]string{longhornNodeResource: "NodeList"},
+				objects...,
+			)
+			if err := reconcileLonghornControlPlaneScheduling(context.Background(), client, item, time.Millisecond); err != nil {
+				t.Fatal(err)
+			}
+			if got := longhornNodeScheduling(t, client, item.Nodes[0].Name); got != test.wantAllowScheduling {
+				t.Fatalf("control plane allowScheduling = %t, want %t", got, test.wantAllowScheduling)
+			}
+			for _, node := range item.Nodes[1:] {
+				if !longhornNodeScheduling(t, client, node.Name) {
+					t.Fatalf("worker %s allowScheduling = false, want true", node.Name)
+				}
+			}
+		})
+	}
+}
+
+func TestReconcileLonghornControlPlaneSchedulingRetriesUntilTheNodeRegisters(t *testing.T) {
+	item, err := cluster.New("demo", 0, 1, 1, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{longhornNodeResource: "NodeList"},
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = reconcileLonghornControlPlaneScheduling(ctx, client, item, time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), item.Nodes[0].Name) {
+		t.Fatalf("reconcileLonghornControlPlaneScheduling() error = %v, want the missing control plane node", err)
 	}
 }
 

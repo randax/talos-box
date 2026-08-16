@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -29,12 +30,15 @@ func convergedClusterForFastNoop(t *testing.T, name string) {
 	}
 	originalReady := kubernetesReadyProbe
 	originalStorage := storageConvergenceProbe
+	originalScheduling := controlPlaneSchedulingProbe
 	t.Cleanup(func() {
 		kubernetesReadyProbe = originalReady
 		storageConvergenceProbe = originalStorage
+		controlPlaneSchedulingProbe = originalScheduling
 	})
 	kubernetesReadyProbe = func(context.Context, []byte, []string) error { return nil }
 	storageConvergenceProbe = func(context.Context, cluster.Cluster, []byte) error { return nil }
+	controlPlaneSchedulingProbe = func(context.Context, []byte, cluster.Cluster) error { return nil }
 }
 
 // A topology change alters the machine config that already-configured nodes
@@ -109,5 +113,33 @@ func TestProvisionCNIKeepsFastNoopWithoutForce(t *testing.T) {
 	}
 	if phase != StoragePhaseLive {
 		t.Fatalf("fast no-op storage phase = %q, want %q", phase, StoragePhaseLive)
+	}
+}
+
+// A mutation pass that failed or was superseded before it patched the control
+// planes leaves drift behind while every health probe still passes. Recovery
+// must not depend on the in-memory force flag: rerunning tbx up observes the
+// scheduling posture and runs a full pass.
+func TestProvisionCNIRecoversDriftedControlPlaneSchedulingWithoutForce(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 1)
+	convergedClusterForFastNoop(t, item.Name)
+	controlPlaneSchedulingProbe = func(context.Context, []byte, cluster.Cluster) error {
+		return errors.New("control plane is still schedulable")
+	}
+	if service.provisioningComplete(item) {
+		t.Fatal("drifted control plane scheduling was reported as converged")
+	}
+
+	reconciled := false
+	service.provisionReconcile = func(context.Context, provision.Request) (provision.Result, error) {
+		reconciled = true
+		return provision.Result{StoragePhase: provision.StoragePhaseLive, StorageLive: true}, nil
+	}
+
+	if _, _, err := service.provisionCNI(context.Background(), item, false); err != nil {
+		t.Fatal(err)
+	}
+	if !reconciled {
+		t.Fatal("drifted control plane scheduling took the fast no-op path")
 	}
 }

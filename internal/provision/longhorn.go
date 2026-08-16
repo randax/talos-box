@@ -17,6 +17,7 @@ import (
 	"helm.sh/helm/v3/pkg/releaseutil"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
@@ -39,6 +40,8 @@ const (
 //go:embed assets/longhorn-1.12.0.tgz
 var longhornChart []byte
 
+var longhornNodeResource = schema.GroupVersionResource{Group: "longhorn.io", Version: "v1beta2", Resource: "nodes"}
+
 // LonghornReconciler installs and verifies the pinned Longhorn chart through
 // the same host-side Helm render and server-side apply path used by the rest of
 // provisioning.
@@ -55,7 +58,7 @@ func (r LonghornReconciler) Reconcile(ctx context.Context, item cluster.Cluster,
 	if err != nil {
 		return StorageResult{}, fmt.Errorf("parse kubeconfig for Kubernetes apply: %w", err)
 	}
-	return r.reconcile(ctx, config, objects)
+	return r.reconcile(ctx, config, item, objects)
 }
 
 // ProbeLonghornStorage re-runs the shared default-StorageClass write/readback
@@ -88,7 +91,7 @@ func ProbeLonghornStorage(ctx context.Context, kubeconfig []byte, interval time.
 	}, interval)
 }
 
-func (r LonghornReconciler) reconcile(ctx context.Context, config *rest.Config, objects []unstructured.Unstructured) (StorageResult, error) {
+func (r LonghornReconciler) reconcile(ctx context.Context, config *rest.Config, item cluster.Cluster, objects []unstructured.Unstructured) (StorageResult, error) {
 	if r.PollInterval <= 0 {
 		r.PollInterval = time.Second
 	}
@@ -124,6 +127,9 @@ func (r LonghornReconciler) reconcile(ctx context.Context, config *rest.Config, 
 		return StorageResult{}, err
 	}
 	if err := waitForLonghorn(ctx, clientset, r.PollInterval); err != nil {
+		return StorageResult{}, err
+	}
+	if err := reconcileLonghornControlPlaneScheduling(ctx, dynamicClient, item, r.PollInterval); err != nil {
 		return StorageResult{}, err
 	}
 	if err := runStorageProbe(ctx, dynamicClient, mapper, clientset, storageProbeSpec{
@@ -211,8 +217,10 @@ func renderLonghorn(item cluster.Cluster) ([]unstructured.Unstructured, error) {
 
 // storageNodeCount counts the nodes that can host Longhorn replicas: workers,
 // or every node on a worker-less cluster, whose control planes tbx makes
-// schedulable. Counting tainted control planes would pin the replica target
-// above what can ever schedule and leave volumes permanently degraded.
+// schedulable. Counting reserved control planes would pin the replica target
+// above what can ever schedule and leave volumes permanently degraded;
+// reconcileLonghornControlPlaneScheduling keeps the live cluster to the same
+// set of replica-eligible nodes.
 func storageNodeCount(item cluster.Cluster) int {
 	workers := 0
 	for _, node := range item.Nodes {
@@ -237,14 +245,83 @@ func longhornReplicaCount(nodes int) int {
 	}
 }
 
+// longhornValues tolerates controlPlaneTaint in both the DaemonSet/Deployment
+// pod specs (global.tolerations) and the system-managed components
+// (defaultSettings.taintToleration). Crossing the zero-worker boundary by
+// mutation returns that taint to a control plane that still holds replicas
+// written while the cluster was worker-less; without a toleration neither
+// longhorn-manager nor its instance managers could ever be recreated there and
+// those replicas would fault on the next restart. Running there is not the
+// same as being replica-eligible: reconcileLonghornControlPlaneScheduling
+// clears spec.allowScheduling on the control planes of a cluster that has
+// workers, so tolerating the taint never widens replica placement.
 func longhornValues(replicas int) string {
-	return fmt.Sprintf(`persistence:
+	return fmt.Sprintf(`global:
+  tolerations:
+    - key: %[1]s
+      operator: Exists
+      effect: NoSchedule
+persistence:
   defaultClass: true
-  defaultClassReplicaCount: %d
+  defaultClassReplicaCount: %[2]d
 defaultSettings:
   defaultDataPath: /var/lib/longhorn
-  defaultReplicaCount: "%d"
-`, replicas, replicas)
+  defaultReplicaCount: "%[2]d"
+  taintToleration: %[1]s:NoSchedule
+`, controlPlaneTaint, replicas)
+}
+
+// reconcileLonghornControlPlaneScheduling holds the live cluster to the
+// replica-eligible set storageNodeCount derives: a control plane attracts
+// replicas only while the cluster is worker-less. Longhorn schedules onto
+// every node its manager runs on, and the manager tolerates the control-plane
+// taint (see longhornValues), so the cluster shape has to be expressed on the
+// node resource instead. Clearing spec.allowScheduling stops new replicas
+// without evicting copies a worker-less phase already placed there — replica
+// I/O beside etcd is what the taint exists to prevent.
+func reconcileLonghornControlPlaneScheduling(ctx context.Context, client dynamic.Interface, item cluster.Cluster, interval time.Duration) error {
+	allowScheduling := !clusterHasWorkers(item)
+	for _, node := range item.Nodes {
+		if node.Role != cluster.RoleControlPlane {
+			continue
+		}
+		name := node.Name
+		if err := poll(ctx, interval, func(ctx context.Context) error {
+			return setLonghornNodeScheduling(ctx, client, name, allowScheduling)
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func setLonghornNodeScheduling(ctx context.Context, client dynamic.Interface, name string, allowScheduling bool) error {
+	nodes := client.Resource(longhornNodeResource).Namespace(longhornNamespace)
+	// longhorn-manager creates the node resource once its pod registers the
+	// node; the manager DaemonSet is Ready by this point, so a missing
+	// resource is a race worth retrying rather than a failure.
+	live, err := nodes.Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get longhorn node %q: %w", name, err)
+	}
+	current, found, err := unstructured.NestedBool(live.Object, "spec", "allowScheduling")
+	if err != nil {
+		return terminal(fmt.Errorf("decode longhorn node %q scheduling: %w", name, err))
+	}
+	if !found {
+		// Longhorn schedules onto a newly registered node by default.
+		current = true
+	}
+	if current == allowScheduling {
+		return nil
+	}
+	if err := unstructured.SetNestedField(live.Object, allowScheduling, "spec", "allowScheduling"); err != nil {
+		return terminal(fmt.Errorf("set longhorn node %q scheduling: %w", name, err))
+	}
+	if _, err := nodes.Update(ctx, live, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("update longhorn node %q scheduling: %w", name, err)
+	}
+	return nil
 }
 
 func decodeLonghornStorageClass(configMap *unstructured.Unstructured) ([]unstructured.Unstructured, error) {

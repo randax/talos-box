@@ -126,8 +126,37 @@ func TestReconcileMakesConfiguredControlPlaneSchedulableWhenWorkerless(t *testin
 		t.Fatalf("scheduling calls = %+v, want one worker-less call for %s", client.scheduling, item.Nodes[0].IP)
 	}
 	narration := strings.Join(result.Narration, "\n")
-	if !strings.Contains(narration, "talosctl patch mc") || !strings.Contains(narration, item.Nodes[0].IP) {
+	// The narrated equivalent has to reproduce the whole change (scheduling flag
+	// and load-balancer exclusion label) and nothing else: a whole-config apply
+	// would also clear the per-node hostname tbx injects, renaming the
+	// Kubernetes node the reconcile just converged.
+	if !strings.Contains(narration, "talosctl patch mc --mode auto") || !strings.Contains(narration, item.Nodes[0].IP) {
 		t.Fatalf("narration missing machine config patch:\n%s", narration)
+	}
+	if strings.Contains(narration, "apply-config --mode auto") || strings.Contains(narration, "--file controlplane.yaml") {
+		t.Fatalf("narration applies a whole config to a running node:\n%s", narration)
+	}
+	if !strings.Contains(narration, `"allowSchedulingOnControlPlanes":true`) || !strings.Contains(narration, `{"$patch":"delete"}`) {
+		t.Fatalf("narrated patch does not move both worker-less adaptations:\n%s", narration)
+	}
+}
+
+func TestControlPlaneSchedulingPatchMovesBothAdaptations(t *testing.T) {
+	workerless := controlPlaneSchedulingPatch(true)
+	if !strings.Contains(workerless, `"allowSchedulingOnControlPlanes":true`) ||
+		!strings.Contains(workerless, `"`+loadBalancerExclusionLabel+`":{"$patch":"delete"}`) {
+		t.Fatalf("worker-less patch = %s", workerless)
+	}
+	reserved := controlPlaneSchedulingPatch(false)
+	if !strings.Contains(reserved, `"allowSchedulingOnControlPlanes":false`) ||
+		!strings.Contains(reserved, `"`+loadBalancerExclusionLabel+`":""`) {
+		t.Fatalf("reserved patch = %s", reserved)
+	}
+	for _, patch := range []string{workerless, reserved} {
+		var document map[string]any
+		if err := yaml.Unmarshal([]byte(patch), &document); err != nil {
+			t.Fatalf("narrated patch %s is not valid YAML: %v", patch, err)
+		}
 	}
 }
 
@@ -154,7 +183,7 @@ func TestReconcileStaysSilentWhenControlPlaneSchedulingIsConverged(t *testing.T)
 	if len(client.scheduling) != 1 {
 		t.Fatalf("scheduling calls = %+v, want one", client.scheduling)
 	}
-	if narration := strings.Join(result.Narration, "\n"); strings.Contains(narration, "patch mc") {
+	if narration := strings.Join(result.Narration, "\n"); strings.Contains(narration, "patch mc --mode auto") {
 		t.Fatalf("converged scheduling was narrated:\n%s", narration)
 	}
 }
@@ -173,5 +202,69 @@ func TestReconcileFailsWithNodeContextWhenSchedulingReconcileFails(t *testing.T)
 	}
 	if client.bootstrap != 0 {
 		t.Fatalf("bootstrap calls = %d, want none after a failed scheduling reconcile", client.bootstrap)
+	}
+}
+
+func controlPlaneNodeBody(taint, exclusion bool) string {
+	taints := ""
+	if taint {
+		taints = `"taints":[{"key":"node-role.kubernetes.io/control-plane","effect":"NoSchedule"}]`
+	}
+	labels := ""
+	if exclusion {
+		labels = `,"node.kubernetes.io/exclude-from-external-load-balancers":""`
+	}
+	return `{"items":[{"metadata":{"name":"demo-cp-1","labels":{"kubernetes.io/hostname":"demo-cp-1"` + labels + `}},"spec":{` + taints + `}}]}`
+}
+
+// The zero-worker boundary is the one desired end state with no other probe,
+// so the fast no-op depends on observing it in both directions.
+func TestControlPlaneSchedulingConvergedObservesBothDirections(t *testing.T) {
+	tests := []struct {
+		name      string
+		workers   int
+		taint     bool
+		exclusion bool
+		wantErr   string
+	}{
+		{name: "worker-less and schedulable", workers: 0},
+		{name: "worker-less but still tainted", workers: 0, taint: true, exclusion: true, wantErr: "NoSchedule taint"},
+		{name: "worker-less but still excluded", workers: 0, exclusion: true, wantErr: "exclusion label"},
+		{name: "with workers and reserved", workers: 1, taint: true, exclusion: true},
+		{name: "with workers but still schedulable", workers: 1, wantErr: "NoSchedule taint"},
+		{name: "with workers but still announcing", workers: 1, taint: true, wantErr: "exclusion label"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			item, err := cluster.New("demo", 0, 1, test.workers, cluster.NodeDefaults{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			server, kubeconfig := readyServer(t, 200, controlPlaneNodeBody(test.taint, test.exclusion))
+			defer server.Close()
+			err = ControlPlaneSchedulingConverged(context.Background(), kubeconfig, item)
+			if test.wantErr == "" {
+				if err != nil {
+					t.Fatalf("ControlPlaneSchedulingConverged() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("ControlPlaneSchedulingConverged() error = %v, want %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestControlPlaneSchedulingConvergedRequiresEveryControlPlane(t *testing.T) {
+	item, err := cluster.New("demo", 0, 2, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, kubeconfig := readyServer(t, 200, controlPlaneNodeBody(false, false))
+	defer server.Close()
+	err = ControlPlaneSchedulingConverged(context.Background(), kubeconfig, item)
+	if err == nil || !strings.Contains(err.Error(), "was not found") {
+		t.Fatalf("ControlPlaneSchedulingConverged() error = %v, want a missing control plane", err)
 	}
 }

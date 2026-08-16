@@ -142,9 +142,12 @@ type credentialPaths struct {
 }
 
 // Reconcile brings a curated CNI path to a usable Kubernetes API. It follows
-// observations rather than recording progress: only nodes currently in
-// maintenance are given a machine config, then the configured control plane is
-// bootstrapped idempotently and yields kubeconfig.
+// observations rather than recording progress: nodes in maintenance are given
+// their generated machine config, already-configured control planes have their
+// worker-less adaptations reconciled against the cluster's current worker count
+// over the authenticated API (the only machine-config write tbx makes to a
+// running node), then the control plane is bootstrapped idempotently and yields
+// kubeconfig.
 func Reconcile(ctx context.Context, request Request) (Result, error) {
 	if request.Cluster.CNI != cluster.CNIFlannel && request.Cluster.CNI != cluster.CNICilium {
 		return Result{}, nil
@@ -227,9 +230,15 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 			if !changed {
 				continue
 			}
+			// The manual equivalent is a strategic merge patch, which edits the
+			// node's own applied config: it moves both fields the reconcile
+			// moves and nothing else. A whole-config apply is not equivalent —
+			// it would drop the per-node hostname tbx injects at apply time —
+			// and JSON6902 is unusable on the multi-document configs tbx
+			// generates.
 			result.Narration = append(result.Narration,
-				fmt.Sprintf("machine config: ≈ talosctl patch mc --talosconfig %s --nodes %[2]s --endpoints %[2]s --patch '[{\"op\":\"replace\",\"path\":\"/cluster/allowSchedulingOnControlPlanes\",\"value\":%[3]t}]'",
-					shellquote.Quote(generated.paths.talosconfig), node.IP, workerless),
+				fmt.Sprintf("machine config: ≈ talosctl patch mc --mode auto --talosconfig %s --nodes %[2]s --endpoints %[2]s --patch %[3]s",
+					shellquote.Quote(generated.paths.talosconfig), node.IP, shellquote.Quote(controlPlaneSchedulingPatch(workerless))),
 			)
 		}
 		if err := request.Client.Bootstrap(ctx, controlPlane.IP); err != nil && !alreadyBootstrapped(err) {
@@ -683,6 +692,20 @@ func withControlPlaneScheduling(config []byte, workerless bool) ([]byte, bool, e
 	return patched, true, nil
 }
 
+// controlPlaneSchedulingPatch narrates withControlPlaneScheduling as the
+// strategic merge patch a user would apply by hand. Talos merges such a patch
+// into the node's own applied config, so — unlike a whole-config apply — it
+// leaves the per-node hostname and the appended documents alone; JSON6902 is
+// not an option because tbx configs are multi-document.
+func controlPlaneSchedulingPatch(workerless bool) string {
+	exclusion := `""`
+	if workerless {
+		exclusion = `{"$patch":"delete"}`
+	}
+	return fmt.Sprintf(`{"cluster":{"allowSchedulingOnControlPlanes":%t},"machine":{"nodeLabels":{%q:%s}}}`,
+		workerless, loadBalancerExclusionLabel, exclusion)
+}
+
 // withoutLoadBalancerExclusion drops the node.kubernetes.io/exclude-from-
 // external-load-balancers label Talos bakes into control-plane configs;
 // MetalLB and Cilium honor it and would otherwise never announce a VIP on a
@@ -911,25 +934,9 @@ func (MachineryClient) KubernetesReady(ctx context.Context, kubeconfig []byte, e
 // KubernetesReady verifies the API server reports every expected Node as
 // Ready using the credentials generated for this cluster.
 func KubernetesReady(ctx context.Context, kubeconfig []byte, expectedNodes []string) error {
-	transport, server, err := kubeTransport(kubeconfig)
+	nodes, err := kubernetesNodes(ctx, kubeconfig)
 	if err != nil {
 		return err
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, server+"/api/v1/nodes", nil)
-	if err != nil {
-		return err
-	}
-	response, err := (&http.Client{Transport: transport}).Do(request)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = response.Body.Close() }()
-	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("kubernetes nodes API: %s", response.Status)
-	}
-	var nodes kubernetesNodeList
-	if err := json.NewDecoder(response.Body).Decode(&nodes); err != nil {
-		return fmt.Errorf("decode Kubernetes nodes: %w", err)
 	}
 	expected := make(map[string]struct{}, len(expectedNodes))
 	for _, name := range expectedNodes {
@@ -948,6 +955,74 @@ func KubernetesReady(ctx context.Context, kubeconfig []byte, expectedNodes []str
 	for name := range expected {
 		if !ready[name] {
 			return fmt.Errorf("kubernetes expected node %q was not found", name)
+		}
+	}
+	return nil
+}
+
+func kubernetesNodes(ctx context.Context, kubeconfig []byte) (kubernetesNodeList, error) {
+	var nodes kubernetesNodeList
+	transport, server, err := kubeTransport(kubeconfig)
+	if err != nil {
+		return nodes, err
+	}
+	defer transport.CloseIdleConnections()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, server+"/api/v1/nodes", nil)
+	if err != nil {
+		return nodes, err
+	}
+	response, err := (&http.Client{Transport: transport}).Do(request)
+	if err != nil {
+		return nodes, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		return nodes, fmt.Errorf("kubernetes nodes API: %s", response.Status)
+	}
+	if err := json.NewDecoder(response.Body).Decode(&nodes); err != nil {
+		return nodes, fmt.Errorf("decode Kubernetes nodes: %w", err)
+	}
+	return nodes, nil
+}
+
+// ControlPlaneSchedulingConverged observes the live posture the worker-less
+// machine-config adaptations produce: worker-less control planes carry no
+// NoSchedule taint and no load-balancer exclusion label, and control planes of
+// a cluster that has workers carry both. It is the end-state probe for the
+// zero-worker boundary; without it an interrupted mutation pass would leave
+// drift that no other probe can see, so a rerun would report the cluster up to
+// date forever.
+func ControlPlaneSchedulingConverged(ctx context.Context, kubeconfig []byte, item cluster.Cluster) error {
+	expected := make(map[string]struct{}, len(item.Nodes))
+	for _, node := range item.Nodes {
+		if node.Role == cluster.RoleControlPlane {
+			expected[node.Name] = struct{}{}
+		}
+	}
+	if len(expected) == 0 {
+		return nil
+	}
+	reserved := clusterHasWorkers(item)
+	nodes, err := kubernetesNodes(ctx, kubeconfig)
+	if err != nil {
+		return err
+	}
+	observed := make(map[string]bool, len(expected))
+	for _, node := range nodes.Items {
+		if _, wanted := expected[node.Metadata.Name]; !wanted {
+			continue
+		}
+		if node.controlPlaneNoSchedule() != reserved {
+			return fmt.Errorf("kubernetes node %q NoSchedule taint = %t, want %t", node.Metadata.Name, !reserved, reserved)
+		}
+		if _, excluded := node.Metadata.Labels[loadBalancerExclusionLabel]; excluded != reserved {
+			return fmt.Errorf("kubernetes node %q load-balancer exclusion label = %t, want %t", node.Metadata.Name, excluded, reserved)
+		}
+		observed[node.Metadata.Name] = true
+	}
+	for name := range expected {
+		if !observed[name] {
+			return fmt.Errorf("kubernetes control plane %q was not found", name)
 		}
 	}
 	return nil
@@ -1036,14 +1111,34 @@ type kubernetesNodeList struct {
 
 type kubernetesNode struct {
 	Metadata struct {
-		Name string `json:"name"`
+		Name   string            `json:"name"`
+		Labels map[string]string `json:"labels"`
 	} `json:"metadata"`
+	Spec struct {
+		Taints []struct {
+			Key    string `json:"key"`
+			Effect string `json:"effect"`
+		} `json:"taints"`
+	} `json:"spec"`
 	Status struct {
 		Conditions []struct {
 			Type   string `json:"type"`
 			Status string `json:"status"`
 		} `json:"conditions"`
 	} `json:"status"`
+}
+
+// controlPlaneTaint is the taint Talos applies to control planes that are not
+// meant to run workloads; a worker-less cluster drops it.
+const controlPlaneTaint = "node-role.kubernetes.io/control-plane"
+
+func (node kubernetesNode) controlPlaneNoSchedule() bool {
+	for _, taint := range node.Spec.Taints {
+		if taint.Key == controlPlaneTaint && taint.Effect == "NoSchedule" {
+			return true
+		}
+	}
+	return false
 }
 
 func (node kubernetesNode) ready() bool {

@@ -16,10 +16,13 @@ const (
 	// A declared storage engine adds its image pulls (Longhorn alone is
 	// gigabytes across every node) and the write/readback probe to the same
 	// provisioning pass, so it gets a larger budget.
-	storageProvisionTimeout   = 25 * time.Minute
-	kubernetesReadyTimeout    = 5 * time.Second
-	ciliumConvergenceTimeout  = 15 * time.Second
-	storageConvergenceTimeout = 30 * time.Second
+	storageProvisionTimeout = 25 * time.Minute
+	kubernetesReadyTimeout  = 5 * time.Second
+	// The scheduling posture is one small Nodes read, on the same budget as the
+	// readiness probe it accompanies.
+	controlPlaneSchedulingTimeout = 5 * time.Second
+	ciliumConvergenceTimeout      = 15 * time.Second
+	storageConvergenceTimeout     = 30 * time.Second
 )
 
 var (
@@ -27,6 +30,10 @@ var (
 	ciliumConvergenceProbe  = provision.CiliumConverged
 	loadBalancerVIPProbe    = loadBalancerVIP
 	storageConvergenceProbe = storageConverged
+	// The zero-worker boundary has no other end-state probe: an interrupted
+	// mutation pass leaves the control plane's machine config drifted while
+	// every health probe still passes.
+	controlPlaneSchedulingProbe = provision.ControlPlaneSchedulingConverged
 )
 
 const storageProbeRetryBackoff = time.Minute
@@ -313,16 +320,16 @@ func (s *Server) provisioningComplete(item cluster.Cluster) bool {
 	if item.LB {
 		_, vipLive = loadBalancerVIPProbe(item)
 	}
-	var kubeconfig []byte
-	if item.CNI == cluster.CNICilium || item.CSI != "" {
-		dir, err := cluster.Dir(item.Name)
-		if err != nil {
-			return false
-		}
-		kubeconfig, err = os.ReadFile(filepath.Join(dir, "kubeconfig"))
-		if err != nil {
-			return false
-		}
+	dir, err := cluster.Dir(item.Name)
+	if err != nil {
+		return false
+	}
+	kubeconfig, err := os.ReadFile(filepath.Join(dir, "kubeconfig"))
+	if err != nil {
+		return false
+	}
+	if !controlPlaneSchedulingConverged(item, kubeconfig) {
+		return false
 	}
 	if item.CSI != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), storageConvergenceTimeout)
@@ -363,6 +370,16 @@ func provisioningCompleteEligible(intent cluster.ProvisioningIntent, credentials
 		return false
 	}
 	return intent.CNI != cluster.CNICilium || hubbleConverged
+}
+
+// controlPlaneSchedulingConverged decides the fast no-op on observed state
+// rather than on the in-memory force flag: a mutation pass that failed or was
+// superseded before it patched the control planes must still be recoverable by
+// rerunning tbx up.
+func controlPlaneSchedulingConverged(item cluster.Cluster, kubeconfig []byte) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), controlPlaneSchedulingTimeout)
+	defer cancel()
+	return controlPlaneSchedulingProbe(ctx, kubeconfig, item) == nil
 }
 
 func provisioningCredentialsPresent(name string) bool {

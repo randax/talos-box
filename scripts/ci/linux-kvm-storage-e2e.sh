@@ -267,12 +267,26 @@ assert_longhorn_replicas() {
 # Replica CRs record their scheduled node in spec.nodeID and survive volume
 # detach (robustness reads "unknown" once the workload pod terminates), so this
 # proves both replicas actually landed on distinct nodes without racing the
-# writer pod's lifetime.
+# writer pod's lifetime. longhorn-manager tolerates the control-plane taint, so
+# "2 distinct nodes" alone would also pass with a replica beside etcd: the
+# control plane must hold none while the cluster has workers.
 longhorn_replicas_scheduled() {
-  local nodes
+  local control_plane nodes
+  control_plane=$(node_name_by_role control-plane) || return 1
+  [[ -n "$control_plane" ]] || return 1
   nodes=$(kc -n longhorn-system get replicas.longhorn.io -o json |
-    jq -r '[.items[].spec.nodeID | select(. != null and . != "")] | unique | length')
-  [[ "$nodes" -eq 2 ]]
+    jq -r '[.items[].spec.nodeID | select(. != null and . != "")] | unique')
+  [[ "$(jq -r 'length' <<<"$nodes")" -eq 2 ]] || return 1
+  [[ "$(jq -r --arg cp "$control_plane" 'index($cp) // "none"' <<<"$nodes")" == none ]]
+}
+
+# The node resource is what keeps replicas off a tainted control plane, since
+# tolerating the taint makes it a scheduling candidate again.
+longhorn_control_plane_unschedulable() {
+  local node
+  node=$(node_name_by_role control-plane) || return 1
+  [[ -n "$node" ]] || return 1
+  [[ "$(kc -n longhorn-system get nodes.longhorn.io "$node" -o jsonpath='{.spec.allowScheduling}' 2>/dev/null)" == false ]]
 }
 
 longhorn_config="$workdir/talosbox-longhorn.yaml"
@@ -299,7 +313,8 @@ retry "longhorn storage live" 60 5 storage_live
 assert_default_storage_class longhorn
 verify_pvc_write_readback
 assert_longhorn_replicas
-retry "longhorn replicas scheduled on 2 nodes" 60 5 longhorn_replicas_scheduled
+retry "longhorn control plane unschedulable" 60 5 longhorn_control_plane_unschedulable
+retry "longhorn replicas scheduled on 2 workers" 60 5 longhorn_replicas_scheduled
 kc delete namespace storage-e2e --wait
 "$root/bin/tbx" cluster destroy e2es --force
 
