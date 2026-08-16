@@ -106,6 +106,26 @@ func CheckSubnetIndex(index int, sources SubnetSources) (string, error) {
 	return inspection.warning, nil
 }
 
+// AttachedSubnetWarning reports advisory host-routing findings for a subnet
+// that is already attached. It never reports a collision: a running cluster's
+// own bridge legitimately occupies its subnet — under whatever name the host
+// gave that bridge — and a genuine foreign collision is not something a node
+// mutation can resolve, since the attachment already exists.
+func AttachedSubnetWarning(index int, sources SubnetSources) (string, error) {
+	if index < 0 || index > MaxSubnetIndex {
+		return "", fmt.Errorf("subnet index must be between 0 and %d", MaxSubnetIndex)
+	}
+	interfaces, err := readHostInterfaces(sources)
+	if err != nil {
+		return "", err
+	}
+	inspection, err := inspectSubnet(index, interfaces, sources.Route, true)
+	if err != nil {
+		return "", err
+	}
+	return inspection.warning, nil
+}
+
 func allocatedSubnetIndexes(clusters []Cluster) []bool {
 	used := make([]bool, MaxSubnetIndex+1)
 	for _, item := range clusters {
