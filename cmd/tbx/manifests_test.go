@@ -81,3 +81,49 @@ func TestRunManifestsSubstrateOnlyIncludesStorageGuidance(t *testing.T) {
 		}
 	}
 }
+
+// TestRunManifestsImagesRoundTripsThroughTheWarmList is the composability
+// promise: `tbx manifests demo images | tbx cache warm -` must parse, so every
+// emitted line is checked with the warm list's own parser.
+func TestRunManifestsImagesRoundTripsThroughTheWarmList(t *testing.T) {
+	stdout := runCLIWithResponse(t,
+		`[{"name":"demo","subnetIndex":3,"controlPlanes":1,"workers":2,"talosVersion":"v1.13.6","schematic":"cafe1234","cni":"cilium","csi":"longhorn"}]`,
+		func(command cli) error { return command.runManifests([]string{"demo", "images"}) },
+	)
+	entries, problems := parseWarmListSource("stdin", strings.NewReader(stdout))
+	if len(problems) != 0 {
+		t.Fatalf("images output is not a valid warm list: %v", problems)
+	}
+	if len(entries) == 0 {
+		t.Fatalf("images output produced no warm entries:\n%s", stdout)
+	}
+	for _, want := range []string{
+		"factory.talos.dev/metal-installer/cafe1234:v1.13.6",
+		"docker.io/longhornio/longhorn-manager:v1.12.0",
+	} {
+		found := false
+		for _, entry := range entries {
+			if entry.Ref == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("images output missing %q:\n%s", want, stdout)
+		}
+	}
+}
+
+// TestRunManifestsImagesFollowsTheDeclaredIntent guards the export against
+// claiming images an intent never installs.
+func TestRunManifestsImagesFollowsTheDeclaredIntent(t *testing.T) {
+	stdout := runCLIWithResponse(t,
+		`[{"name":"demo","subnetIndex":3,"controlPlanes":1,"workers":2,"talosVersion":"v1.13.6","schematic":"cafe1234"}]`,
+		func(command cli) error { return command.runManifests([]string{"demo", "images"}) },
+	)
+	if strings.Contains(stdout, "longhornio/") || strings.Contains(stdout, "quay.io/cilium/") {
+		t.Fatalf("substrate-only images output claims curated images:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "registry.k8s.io/kube-proxy:") {
+		t.Fatalf("substrate-only images output missing kube-proxy:\n%s", stdout)
+	}
+}

@@ -13,8 +13,10 @@ import (
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/daemon"
+	"github.com/randax/talos-box/internal/extensions"
 	"github.com/randax/talos-box/internal/helper"
 	"github.com/randax/talos-box/internal/hostpressure"
+	"github.com/randax/talos-box/internal/hypervisor"
 )
 
 type doctorDependencies struct {
@@ -27,13 +29,16 @@ type doctorDependencies struct {
 	getStatus       func() ([]daemon.ClusterStatus, error)
 	listCache       func() (daemon.CacheListResult, error)
 	hostPressure    func() (hostpressure.Snapshot, error)
-	command         commandOutput
-	readFile        func(string) ([]byte, error)
-	accessRW        func(string) error
-	listenPacket    func(string, string) (net.PacketConn, error)
-	listenStream    func(string, string) (io.Closer, error)
-	doHTTP          httpDo
-	platform        func() []doctorFinding
+	// guestAgentSupport is the host capability, not a running backend's, so the
+	// gate is explained even with the daemon down.
+	guestAgentSupport func() hypervisor.FeatureStatus
+	command           commandOutput
+	readFile          func(string) ([]byte, error)
+	accessRW          func(string) error
+	listenPacket      func(string, string) (net.PacketConn, error)
+	listenStream      func(string, string) (io.Closer, error)
+	doHTTP            httpDo
+	platform          func() []doctorFinding
 }
 
 type doctorFinding struct {
@@ -189,6 +194,10 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		}
 	}
 
+	if err := writeFindings(guestAgentFinding(deps.listConfig, deps.guestAgentSupport)); err != nil {
+		return err
+	}
+
 	mirrorFinding := doctorFinding{check: "mirror-health"}
 	if deps.listCache == nil {
 		mirrorFinding.level, mirrorFinding.detail = "SKIP", "probe unavailable"
@@ -262,6 +271,43 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 	return nil
 }
 
+// guestAgentFinding reports the capability gate for clusters that baked
+// qemu-guest-agent. The gate is a warning, never a failure: the config is valid
+// and portable, the extension is simply inert on this host.
+func guestAgentFinding(
+	listConfig func() ([]cluster.Cluster, error),
+	support func() hypervisor.FeatureStatus,
+) doctorFinding {
+	finding := doctorFinding{check: "guest-agent"}
+	if listConfig == nil || support == nil {
+		finding.level, finding.detail = "SKIP", "probe unavailable"
+		return finding
+	}
+	items, err := listConfig()
+	if err != nil {
+		finding.level, finding.detail = "SKIP", fmt.Sprintf("cluster state unavailable: %v", err)
+		return finding
+	}
+	var requesting []string
+	for _, item := range items {
+		if extensions.Requested(item.TalosExtensions, extensions.GuestAgent) {
+			requesting = append(requesting, item.Name)
+		}
+	}
+	if len(requesting) == 0 {
+		finding.level, finding.detail = "SKIP", "no cluster requests "+extensions.GuestAgent
+		return finding
+	}
+	if status := support(); !status.Supported {
+		finding.level = "WARN"
+		finding.detail = fmt.Sprintf("cluster(s) %s request %s: %s", strings.Join(requesting, ", "), extensions.GuestAgent, status.Reason)
+		return finding
+	}
+	finding.level = "PASS"
+	finding.detail = fmt.Sprintf("channel available for cluster(s) %s", strings.Join(requesting, ", "))
+	return finding
+}
+
 func stringSlicesEqual(left, right []string) bool {
 	if len(left) != len(right) {
 		return false
@@ -289,11 +335,12 @@ func isDaemonUnavailable(err error) bool {
 func (c cli) doctorDependencies() doctorDependencies {
 	command := execCombinedOutput
 	deps := doctorDependencies{
-		checkHelper:     checkHelper,
-		checkResolver:   checkResolver,
-		checkDirectDNS:  checkPlatformDirectDNS,
-		checkForwarding: checkForwarding,
-		listConfig:      cluster.List,
+		checkHelper:       checkHelper,
+		checkResolver:     checkResolver,
+		checkDirectDNS:    checkPlatformDirectDNS,
+		checkForwarding:   checkForwarding,
+		listConfig:        cluster.List,
+		guestAgentSupport: hypervisor.GuestAgentSupport,
 		listClusters: func() ([]daemon.ClusterSummary, error) {
 			var result []daemon.ClusterSummary
 			err := c.doctorCall("cluster.list", struct{}{}, &result)

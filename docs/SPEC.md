@@ -111,7 +111,11 @@ end-to-end timing and cluster-up gate remains #97. The ISO+install path is dropp
 
 - Cache: `~/.talosbox/cache/` stores Talos disk images by
   `<schematic>/<version>/<architecture>/` and registry-mirror content separately. `tbx cache pull`
-  fetches a Talos disk eagerly. `tbx cache warm <list>...` prepares registry content from one or
+  fetches Talos disks eagerly: with no flags it reads `talosbox.yaml` the way `tbx up` does,
+  resolves every cluster's combination with inheritance applied, performs any schematic
+  re-composition while the Factory is reachable, and warms each cluster's container-image set
+  (`--no-images` opts out); explicit flags pull one ad-hoc combination. Either way what is
+  fetched is **pinned**. `tbx cache warm <list>...` prepares registry content from one or
   more lists (use `-` for stdin once); blank lines and `#` comments are ignored. Each entry is a
   fully qualified image reference with a non-`latest` tag or a `sha256`/`sha512` digest; a
   tag-plus-digest entry is the immutable list form. `tbx cache warm --check [--deep] <list>...`
@@ -122,7 +126,25 @@ end-to-end timing and cluster-up gate remains #97. The ISO+install path is dropp
   v1.13.6, the validated one); `talosbox.yaml` may override `talos.version`, `talos.schematic`,
   and `talos.extensions` at file level and per cluster, inheriting field-wise (set fields
   override, lists override rather than concatenate, `extensions: []` opts out). Only the
-  pinned default is CI-verified.
+  pinned default is CI-verified on every change; the floor of the supported window is booted by
+  a scheduled nightly e2e lane running the same curated-extension probes, whose failure blocks
+  a **release**, not a merge.
+- **Curated extensions**: `talos.extensions` names members of a closed curated set —
+  `gvisor`, `nfs-utils`, `qemu-guest-agent` — by bare short name; tbx owns the mapping to
+  official Image Factory refs and composes them on top of the always-baked storage pair. Unknown
+  names are rejected offline against the set (with a near-miss suggestion) before anything is
+  created; availability for the cluster's Talos version is checked against the Factory's
+  official-extension catalog. A brought `talos.schematic` plus extensions is **re-composed**:
+  tbx fetches that schematic's definition, merges in only the requested extensions, and POSTs
+  for the composed id — the brought schematic stays sovereign (no kernel args, no storage
+  extensions injected) and requested extensions are never silently dropped. Composition is
+  content-addressed, so the same inputs yield the same id, and a cached composed image creates
+  a cluster with no Factory contact at all. Extensions whose usefulness depends on the host
+  backend (`qemu-guest-agent` under Virtualization.framework) are capability-gated and reported
+  by `tbx status` and `tbx doctor`, never rejected: the file stays portable. On the provisioning
+  path, requesting `gvisor` also sets `user.max_user_namespaces` in the generated machine config
+  (Talos's hardening pins it to 0, which would fail every runsc sandbox); substrate-only clusters
+  bring their own machine config and must apply that sysctl themselves.
 
 ## 5. Networking
 
@@ -286,24 +308,31 @@ equivalent YAML.
 tbx up / tbx down
 tbx cluster create|start|stop|destroy|list [name] [--cp N --workers N]
                   [--cni cilium|flannel] [--csi longhorn|local-path] [--lb] [--bgp] [--hubble]
+                  [--talos-version VERSION] [--schematic ID] [--extensions LIST]
 tbx node add|remove|start|stop <cluster> [node]
 tbx cluster suspend|resume <cluster>
 tbx snapshot create|restore|list|delete <cluster> [name]
-tbx status [cluster]      tbx manifests <cluster>
+tbx status [cluster]      tbx manifests <cluster> [section|images]
 tbx console <cluster> <node>
 tbx bgp enable|disable <cluster>
 tbx mirror offline [on|off]
-tbx cache pull [--talos-version VERSION --schematic ID]
+tbx cache pull [-f talosbox.yaml] [--no-images]
+               [--talos-version VERSION --schematic ID --extensions LIST]
 tbx cache warm [--check [--deep]] <list-file> [<list-file>...]
 tbx cache list
 tbx cache prune [--mirror|--all]
 tbx doctor      tbx system install|uninstall
 ```
 
-`tbx cache list` reports Talos disk images and mirror-cache totals. Cache pruning is
-scope-limited: without a flag it removes disk images only and leaves mirror content intact;
-`--mirror` removes mirror content only; `--all` removes both. These are the only cache-prune
-scopes.
+`tbx cache list` reports Talos disk images and mirror-cache totals, labelling each disk-image
+combination `in-use` (naming the clusters that reference it), `pinned`, `default`, or `orphan`.
+Cache pruning is scope-limited: without a flag it removes disk images only and leaves mirror
+content intact; `--mirror` removes mirror content only; `--all` removes both and clears pins.
+These are the only cache-prune scopes. The default scope is additionally **reference-aware**:
+it deletes only the combinations `cache list` calls `orphan` — referenced by no persisted
+cluster, not pinned by an explicit pull, and not the built-in default — and prints each one with
+its size before deleting. Nothing in the cache is ever deleted automatically; a file-aware pull
+reports stray pinned combinations but removes nothing.
 
 Schema (v1):
 
@@ -312,7 +341,8 @@ version: 1
 talos:
   version: v1.13.6        # optional; defaults to the release's pinned version
   schematic: ""           # optional Image Factory schematic id
-  extensions: []          # optional curated Talos extensions
+  extensions: []          # optional curated Talos extensions, bare short names:
+                          # gvisor|nfs-utils|qemu-guest-agent
 clusters:
   - name: demo
     controlPlanes: 1

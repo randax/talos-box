@@ -302,3 +302,107 @@ func TestRunCacheListPrintsZeroMirrorTotalWhenEmpty(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 }
+
+func TestRunCachePruneListsRemovedImagesBeforeTheSummary(t *testing.T) {
+	t.Setenv("HOME", shortTestHome(t))
+	socketPath, err := daemon.SocketPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	done := make(chan struct{})
+	go serveSingleDaemonRequest(t, listener, func(request daemon.Request) daemon.Response {
+		if request.Op != "cache.prune" {
+			t.Fatalf("request op = %q, want cache.prune", request.Op)
+		}
+		return daemon.Response{OK: true, Data: mustJSON(t, daemon.CachePruneResult{
+			Scope:      daemon.CachePruneScopeImages,
+			ImageCount: 2,
+			ImageBytes: 30,
+			Images: []daemon.CacheImageEntry{
+				{Schematic: "orphan-a", Version: "v1.2.3", Architecture: "amd64", Size: 10, Status: daemon.CacheImageStatusOrphan},
+				{Schematic: "orphan-b", Version: "v1.2.4", Architecture: "arm64", Size: 20, Status: daemon.CacheImageStatusOrphan},
+			},
+		})}
+	}, done)
+
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr}
+	if err := command.run([]string{"cache", "prune"}); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+
+	want := "" +
+		"Removing unreferenced disk images:\n" +
+		"- orphan-a v1.2.3 amd64 10 bytes\n" +
+		"- orphan-b v1.2.4 arm64 20 bytes\n" +
+		"pruned disk cache: 2 image(s), 30 bytes; mirror cache untouched\n"
+	if got := stdout.String(); got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestRunCacheListShowsCombinationStatus(t *testing.T) {
+	t.Setenv("HOME", shortTestHome(t))
+	socketPath, err := daemon.SocketPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	done := make(chan struct{})
+	go serveSingleDaemonRequest(t, listener, func(request daemon.Request) daemon.Response {
+		if request.Op != "cache.list" {
+			t.Fatalf("request op = %q, want cache.list", request.Op)
+		}
+		return daemon.Response{OK: true, Data: mustJSON(t, daemon.CacheListResult{
+			Images: []daemon.CacheImageEntry{
+				{Schematic: "in-use", Version: "v1.2.3", Architecture: "amd64", Size: 10, Status: daemon.CacheImageStatusInUse, Clusters: []string{"demo", "other"}},
+				{Schematic: "pinned", Version: "v1.2.3", Architecture: "amd64", Size: 11, Status: daemon.CacheImageStatusPinned},
+				{Schematic: "standard", Version: "v1.2.3", Architecture: "amd64", Size: 12, Status: daemon.CacheImageStatusDefault},
+				{Schematic: "stray", Version: "v1.2.3", Architecture: "amd64", Size: 13, Status: daemon.CacheImageStatusOrphan},
+			},
+		})}
+	}, done)
+
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr}
+	if err := command.run([]string{"cache", "list"}); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+
+	want := "" +
+		"Talos disk images:\n" +
+		"- in-use v1.2.3 amd64 10 bytes in-use (demo, other)\n" +
+		"- pinned v1.2.3 amd64 11 bytes pinned\n" +
+		"- standard v1.2.3 amd64 12 bytes default\n" +
+		"- stray v1.2.3 amd64 13 bytes orphan\n" +
+		"Mirror cache: empty\n" +
+		"Mirror total: 0 blob(s) 0 bytes, 0 manifest(s) 0 bytes\n"
+	if got := stdout.String(); got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}

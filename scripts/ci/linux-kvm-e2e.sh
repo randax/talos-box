@@ -27,6 +27,10 @@ helper_socket=""
 helper_pid=""
 daemon_pid=""
 cluster_cleanup_needed=false
+# The NFS probe exports a directory from the runner itself, so the export has to
+# go away before the workdir holding it does.
+nfs_exports_file=/etc/exports.d/talosbox-e2e.exports
+nfs_export_active=false
 dump_failure_diagnostics() (
   trap - ERR
   set +e
@@ -41,6 +45,25 @@ dump_failure_diagnostics() (
   if [[ -n "$daemon_pid" && -n "$home" && -S "$home/.talosbox/tbxd.sock" ]] && kill -0 "$daemon_pid" 2>/dev/null; then
     daemon_ready=true
     HOME="$home" TBX_HELPER_SOCKET="$helper_socket" "$root/bin/tbx" status e2e --quiet -o json >&2
+  fi
+  if [[ -f "${kubeconfig:-}" ]]; then
+    printf '\n===== extension probes =====\n' >&2
+    kubectl --kubeconfig "$kubeconfig" get pods -n extensions-e2e -o wide >&2
+    kubectl --kubeconfig "$kubeconfig" describe pods -n extensions-e2e >&2
+  fi
+  if [[ -n "${home:-}" ]]; then
+    printf '\n===== guest-agent channel =====\n' >&2
+    ls -l "$home"/.talosbox/clusters/e2e/*.qga.sock >&2
+    # Who holds the listening socket, and does QEMU carry it as fd 5?
+    sudo ss -xlp >&2 | grep -F 'qga.sock' >&2 || true
+    for pid in $(pgrep -f qemu-system || true); do
+      printf 'qemu pid %s fd 5: ' "$pid" >&2
+      sudo readlink "/proc/$pid/fd/5" >&2 || true
+    done
+    # One verbose attempt with errors visible, so a connect failure is
+    # distinguishable from an unanswered ping.
+    printf '\xff{"execute":"guest-sync-delimited","arguments":{"id":42}}\n{"execute":"guest-ping"}\n' \
+      | socat -d -d -t 10 -T 10 STDIO,ignoreeof "UNIX-CONNECT:$home/.talosbox/clusters/e2e/e2e-cp-1.qga.sock" >&2 || true
   fi
   printf '\n===== host network =====\n' >&2
   sudo ip -details address show >&2
@@ -62,6 +85,10 @@ dump_failure_diagnostics() (
   printf '\n===== end diagnostics =====\n' >&2
 )
 cleanup() {
+  if [[ "$nfs_export_active" == true ]]; then
+    sudo rm -f "$nfs_exports_file" || true
+    sudo exportfs -ra || true
+  fi
   if [[ "$cluster_cleanup_needed" == true && -x "$root/bin/tbx" && -n "$home" && -n "$helper_socket" ]]; then
     HOME="$home" TBX_HELPER_SOCKET="$helper_socket" "$root/bin/tbx" cluster destroy e2e --force || true
   fi
@@ -96,9 +123,24 @@ for binary in tbx tbxd tbx-helper; do
   test -x "$root/bin/$binary"
 done
 
-talos_version=v1.13.6
+# talosctl generates the machine config, so it must match the Talos version the
+# cluster boots: every version this harness can boot pins its own checksum. The
+# default is the release's tested version; the scheduled floor lane passes the
+# bottom of the supported window instead.
+talos_version=${TBX_E2E_TALOS_VERSION:-v1.13.6}
+case "$talos_version" in
+  v1.13.6)
+    talosctl_sha256=540c5e7cb0d3fa3a9b2e1c717ced212727b73bcaf0cf9cf9ba2472ec381041d4
+    ;;
+  v1.12.0)
+    talosctl_sha256=11a2745cf92b016b4783acf5eb56bfc394aede61a976dd17b5e8f6d09397e22a
+    ;;
+  *)
+    printf 'no pinned talosctl checksum for Talos %s\n' "$talos_version" >&2
+    exit 1
+    ;;
+esac
 kubectl_version=v1.34.1
-talosctl_sha256=540c5e7cb0d3fa3a9b2e1c717ced212727b73bcaf0cf9cf9ba2472ec381041d4
 kubectl_sha256=7721f265e18709862655affba5343e85e1980639395d5754473dafaadcaa69e3
 flannel_sha256=f17c57f82ffef1d53dbf558ac30755241980563044622778a15df339e4346c57
 curl --fail --location --retry 3 --output "$tools/talosctl" \
@@ -126,13 +168,17 @@ wait_for_process_socket "tbxd" 30 1 "$daemon_pid" "$home/.talosbox/tbxd.sock" "$
 
 # No CNI/provisioning keys: talosbox creates substrate only. The explicit role
 # sizes keep the Talos control plane above its 2 GiB minimum while preserving
-# a modest hosted-runner footprint and sparse 10 GiB raw disks.
-cat >"$cluster_config" <<'EOF'
+# a modest hosted-runner footprint and sparse 10 GiB raw disks. The full curated
+# extension set is requested so every member gets a functional probe below.
+cat >"$cluster_config" <<EOF
 version: 1
 clusters:
   - name: e2e
     controlPlanes: 1
     workers: 2
+    talos:
+      version: $talos_version
+      extensions: [gvisor, nfs-utils, qemu-guest-agent]
     node:
       diskSize: 10GiB
     controlPlane:
@@ -170,6 +216,12 @@ machine:
   # guest UDP/123, so do not make this isolated CI cluster wait on public NTP.
   time:
     disabled: true
+  # gVisor forks its gofer into new user namespaces, and Talos's KSPP
+  # hardening pins user.max_user_namespaces to 0 — runsc then fails at
+  # sandbox create with a misleading ENOSPC ("no space left on device").
+  # The value mirrors the gvisor extension's documented prerequisite.
+  sysctls:
+    user.max_user_namespaces: "11255"
 cluster:
   network:
     cni:
@@ -226,3 +278,151 @@ kubectl --kubeconfig "$kubeconfig" wait --for=condition=Ready node --all --timeo
 ready_nodes=$(kubectl --kubeconfig "$kubeconfig" get nodes --no-headers | awk '$2 == "Ready" { count++ } END { print count + 0 }')
 [[ "$ready_nodes" -eq 3 ]]
 printf 'verified 1 control plane + 2 workers through substrate-only path to Ready nodes\n'
+
+kc() {
+  kubectl --kubeconfig "$kubeconfig" "$@"
+}
+
+pod_succeeded() {
+  [[ "$(kc get pod "$1" -n extensions-e2e -o jsonpath='{.status.phase}' 2>/dev/null)" == Succeeded ]]
+}
+
+# Every curated extension gets a functional probe, not a presence check: the
+# curated set is closed precisely because each member is provable here.
+
+# The guest-agent socket exists per node only because the cluster requested
+# qemu-guest-agent, and only the extension's service inside the guest answers on
+# it, so a reply to guest-ping proves both halves of the channel.
+qga_socket="$home/.talosbox/clusters/e2e/e2e-cp-1.qga.sock"
+test -S "$qga_socket"
+guest_ping_answered() {
+  local response
+  # Two virtio-serial realities shape this probe: a plain pipe's EOF makes
+  # socat half-close and QEMU tear down the chardev before qemu-ga's reply
+  # lands, so ignoreeof keeps the write half open; and qemu-ga cannot see
+  # client disconnects, so a torn-down earlier attempt leaves its JSON parser
+  # mid-object — the 0xFF sentinel plus guest-sync-delimited resynchronize it
+  # before the ping. Two "return" replies (sync + ping) prove the round trip.
+  response=$(printf '\xff{"execute":"guest-sync-delimited","arguments":{"id":42}}\n{"execute":"guest-ping"}\n' \
+    | socat -t 10 -T 10 STDIO,ignoreeof "UNIX-CONNECT:$qga_socket" 2>/dev/null) || return 1
+  [[ $(grep -c '"return"' <<<"$response") -ge 2 ]]
+}
+retry "qemu-guest-agent guest-ping" 30 5 guest_ping_answered
+
+# gVisor's sandbox kernel announces itself in the container's own dmesg ring, so
+# grepping it from inside the pod proves the runsc handler really ran the
+# container instead of silently falling back to runc.
+verify_runsc_pod() {
+  kc apply -f - <<'EOF'
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: extensions-e2e
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: runsc
+handler: runsc
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: runsc-probe
+  namespace: extensions-e2e
+spec:
+  runtimeClassName: runsc
+  restartPolicy: Never
+  containers:
+    - name: probe
+      image: docker.io/library/busybox:1.37.0
+      command:
+        - sh
+        - -c
+        - dmesg | grep -qi gvisor
+EOF
+  retry "runsc pod completion" 120 5 pod_succeeded runsc-probe
+}
+verify_runsc_pod
+
+# Talos cannot serve NFS — nfsd is deliberately outside the curated set — so the
+# export lives on the runner and the nodes reach it through their own gateway.
+# nfsvers=3 is the whole point: without nfs-utils' rpcbind and rpc.statd in the
+# image the mount fails outright, and flock over NFSv3 has to travel through NLM.
+subnet=$("$root/bin/tbx" status e2e --quiet -o json | jq -r '.[0].subnet')
+gateway="${subnet%.0/24}.1"
+nfs_export="$workdir/nfs"
+mkdir -p "$nfs_export"
+chmod 0777 "$nfs_export"
+sudo mkdir -p /etc/exports.d
+printf '%s %s(rw,sync,no_subtree_check,no_root_squash,insecure)\n' "$nfs_export" "$subnet" |
+  sudo tee "$nfs_exports_file" >/dev/null
+nfs_export_active=true
+sudo systemctl restart nfs-server
+sudo exportfs -ra
+
+verify_nfsv3_mount_and_lock() {
+  kc apply -f - <<EOF
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: nfs-probe
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  mountOptions:
+    - nfsvers=3
+  nfs:
+    server: $gateway
+    path: $nfs_export
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nfs-probe
+  namespace: extensions-e2e
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  volumeName: nfs-probe
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nfs-probe
+  namespace: extensions-e2e
+spec:
+  restartPolicy: Never
+  containers:
+    - name: probe
+      image: docker.io/library/busybox:1.37.0
+      command:
+        - sh
+        - -c
+        - flock /data/probe -c 'printf talosbox-nfs-e2e > /data/probe && sync'
+      volumeMounts:
+        - name: nfs
+          mountPath: /data
+  volumes:
+    - name: nfs
+      persistentVolumeClaim:
+        claimName: nfs-probe
+EOF
+  retry "NFSv3 locked write" 120 5 pod_succeeded nfs-probe
+  # The readback happens on the server side: the lock and the write both had to
+  # reach the export, not just the client's page cache.
+  [[ "$(cat "$nfs_export/probe")" == talosbox-nfs-e2e ]]
+}
+verify_nfsv3_mount_and_lock
+
+kc delete namespace extensions-e2e --wait
+kc delete pv nfs-probe --wait
+printf 'verified curated extensions: guest-ping, runsc pod, NFSv3 mount with locking\n'

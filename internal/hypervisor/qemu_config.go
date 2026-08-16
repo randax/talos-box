@@ -15,6 +15,10 @@ import (
 
 const qemuIncomingOffset = 1 << 20
 
+// guestAgentPortName is the virtio-serial port name the QEMU guest agent inside
+// the guest waits for; it is protocol, not a tbx choice.
+const guestAgentPortName = "org.qemu.guest_agent.0"
+
 type qemuVersion struct {
 	Major int
 	Minor int
@@ -52,13 +56,17 @@ type qemuFirmwareCandidate struct {
 }
 
 type qemuLaunchConfig struct {
-	Architecture   Architecture
-	CPUs           int
-	MemoryMiB      int
-	DiskPath       string
-	MAC            string
-	TapFD          int
-	ConsoleFD      int
+	Architecture Architecture
+	CPUs         int
+	MemoryMiB    int
+	DiskPath     string
+	MAC          string
+	TapFD        int
+	ConsoleFD    int
+	// GuestAgentFD is the inherited listening socket QEMU accepts guest-agent
+	// clients on. Zero means no guest-agent channel: QEMU inherits 0-2 as its
+	// standard streams, so a descriptor tbx passes is never zero.
+	GuestAgentFD   int
 	QMPSocketPath  string
 	Firmware       qemuFirmware
 	IncomingPath   string
@@ -302,21 +310,46 @@ func buildQEMUArgv(cfg qemuLaunchConfig) ([]string, error) {
 			"id=charconsole",
 			"fd="+strconv.Itoa(cfg.ConsoleFD),
 		),
+	}
+	// The virtio-serial controller carries the console on port 0; the guest
+	// agent needs a second port, and only clusters that asked for it get the
+	// wider controller so every other device graph stays byte-identical.
+	serialPorts := 1
+	if cfg.GuestAgentFD != 0 {
+		serialPorts = 2
+		args = append(args, "-chardev", qemuOption(
+			"socket",
+			"id=charqga",
+			"fd="+strconv.Itoa(cfg.GuestAgentFD),
+			"server=on",
+			"wait=off",
+		))
+	}
+	args = append(args,
 		"-device", qemuOption(
 			"virtio-serial-pci",
 			"id=virtioconsole0",
-			"max_ports=1",
+			"max_ports="+strconv.Itoa(serialPorts),
 		),
 		"-device", qemuOption(
 			"virtconsole",
 			"chardev=charconsole",
 		),
+	)
+	if cfg.GuestAgentFD != 0 {
+		args = append(args, "-device", qemuOption(
+			"virtserialport",
+			"chardev=charqga",
+			"name="+guestAgentPortName,
+		))
+	}
+	args = append(args,
 		"-qmp", qemuOption(
 			"unix:"+qemuOptionValue(cfg.QMPSocketPath),
 			"server=on",
 			"wait=off",
 		),
-	}
+	)
 	if cfg.IncomingPath != "" {
 		offset := cfg.IncomingOffset
 		if offset == 0 {
@@ -337,6 +370,8 @@ func validateQEMULaunchConfig(cfg qemuLaunchConfig) error {
 		return errors.New("QEMU tap FD must be non-negative")
 	case cfg.ConsoleFD < 0:
 		return errors.New("QEMU console FD must be non-negative")
+	case cfg.GuestAgentFD < 0:
+		return errors.New("QEMU guest-agent FD must be non-negative")
 	case cfg.Firmware.CodePath == "":
 		return errors.New("QEMU firmware code path is required")
 	case cfg.Firmware.VarsPath == "":

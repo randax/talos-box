@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -16,9 +17,11 @@ import (
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/dns"
 	"github.com/randax/talos-box/internal/domain"
+	"github.com/randax/talos-box/internal/extensions"
 	"github.com/randax/talos-box/internal/helper"
 	"github.com/randax/talos-box/internal/hypervisor"
 	"github.com/randax/talos-box/internal/imagecache"
+	"github.com/randax/talos-box/internal/provision"
 	"github.com/randax/talos-box/internal/talosversion"
 )
 
@@ -40,10 +43,10 @@ type createArgs struct {
 	Schematic         string `json:"schematic"`
 	Version           string `json:"version"`
 	TalosVersion      string `json:"talosVersion"`
-	// Extensions are the requested curated Talos extensions. Parsed and
-	// persisted since protocol 5; composed into the schematic by later work.
-	// No omitempty: an explicit empty list (the config-level opt-out) must
-	// survive the wire distinct from the field being absent.
+	// Extensions are the requested curated Talos extensions, composed into
+	// the schematic at create. No omitempty: an explicit empty list (the
+	// config-level opt-out) must survive the wire distinct from the field
+	// being absent.
 	Extensions []string `json:"extensions"`
 }
 
@@ -73,10 +76,30 @@ type statusArgs struct {
 	Name    string `json:"name"`
 }
 
-type cachePullArgs struct {
-	Schematic    string `json:"schematic"`
-	Version      string `json:"version"`
-	TalosVersion string `json:"talosVersion"`
+// CachePullArgs asks for image combinations to be made available offline.
+// Combinations carries the file-aware form; the scalar fields are the older
+// single-combination wire shape and stay honoured for an older tbx.
+type CachePullArgs struct {
+	Schematic    string                 `json:"schematic,omitempty"`
+	Version      string                 `json:"version,omitempty"`
+	TalosVersion string                 `json:"talosVersion,omitempty"`
+	Combinations []CachePullCombination `json:"combinations,omitempty"`
+	// FromFile marks the flagless form, where the combinations describe every
+	// cluster the file declares. Only then does warming their images and
+	// calling every other pinned combination a stray mean anything.
+	FromFile bool `json:"fromFile,omitempty"`
+	// SkipImages is --no-images: fetch the disk images and stop there.
+	SkipImages bool `json:"skipImages,omitempty"`
+}
+
+// CachePullCombination is one cluster's resolved image pin, with inheritance
+// already applied by the client. Intent is the cluster's declared provisioning
+// path, which decides the images the pull warms alongside the disk image.
+type CachePullCombination struct {
+	Schematic  string                     `json:"schematic,omitempty"`
+	Version    string                     `json:"version,omitempty"`
+	Extensions []string                   `json:"extensions,omitempty"`
+	Intent     cluster.ProvisioningIntent `json:"intent"`
 }
 
 type CacheWarmArgs struct {
@@ -157,6 +180,12 @@ type ClusterStatus struct {
 	// from, as persisted at create.
 	TalosVersion string `json:"talosVersion,omitempty"`
 	Schematic    string `json:"schematic,omitempty"`
+	// BaseSchematic is the schematic the extensions were re-composed into,
+	// when the cluster brought one.
+	BaseSchematic string `json:"baseSchematic,omitempty"`
+	// TalosExtensions are the curated extensions the schematic was composed
+	// from, as requested at create.
+	TalosExtensions []string `json:"talosExtensions,omitempty"`
 	cluster.ProvisioningIntent
 	BGP             bool         `json:"bgp"`
 	Running         bool         `json:"running"`
@@ -166,12 +195,41 @@ type ClusterStatus struct {
 	VIP             string       `json:"vip,omitempty"`
 	VIPLive         bool         `json:"vipLive"`
 	Nodes           []NodeStatus `json:"nodes"`
-	Hints           []string     `json:"hints,omitempty"`
-	subnetIndex     int
+	// Capabilities reports the host capabilities this cluster's configuration
+	// depends on, so a file stays portable across host substrates and the gate
+	// is visible instead of silently doing nothing.
+	Capabilities []CapabilityStatus `json:"capabilities,omitempty"`
+	Hints        []string           `json:"hints,omitempty"`
+	subnetIndex  int
 }
 
-// CachePullResult describes the image made ready by cache.pull.
+// CapabilityStatus is one host capability a cluster depends on, with the reason
+// the active hypervisor backend cannot provide it.
+type CapabilityStatus struct {
+	Name      string `json:"name"`
+	Supported bool   `json:"supported"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+// CachePullResult describes the images made ready by cache.pull. The scalar
+// fields repeat the first image so a tbx predating Images still reports the
+// single-combination pull it asked for.
 type CachePullResult struct {
+	Schematic    string                  `json:"schematic"`
+	Version      string                  `json:"version"`
+	Architecture hypervisor.Architecture `json:"architecture"`
+	Path         string                  `json:"path"`
+	Images       []CachePullImage        `json:"images,omitempty"`
+	// Warm reports the mirror warming the pull performed for the clusters it
+	// pulled for; nil means none was attempted.
+	Warm *CacheWarmResult `json:"warm,omitempty"`
+	// Strays are pinned combinations referenced by neither a cluster nor the
+	// file that was pulled. They are reported and never deleted.
+	Strays []CacheImageEntry `json:"strays,omitempty"`
+}
+
+// CachePullImage is one cached and pinned disk image.
+type CachePullImage struct {
 	Schematic    string                  `json:"schematic"`
 	Version      string                  `json:"version"`
 	Architecture hypervisor.Architecture `json:"architecture"`
@@ -224,6 +282,10 @@ type CacheImageEntry struct {
 	Version      string `json:"version"`
 	Architecture string `json:"architecture"`
 	Size         int64  `json:"size"`
+	// Status and Clusters explain why the combination is kept; an older
+	// daemon leaves them empty, which the client renders as no status.
+	Status   CacheImageStatus `json:"status,omitempty"`
+	Clusters []string         `json:"clusters,omitempty"`
 }
 
 type MirrorCacheEntry struct {
@@ -249,10 +311,13 @@ type CacheListResult struct {
 }
 
 type CachePruneResult struct {
-	Scope      CachePruneScope   `json:"scope"`
-	ImageCount int               `json:"imageCount"`
-	ImageBytes int64             `json:"imageBytes"`
-	Mirror     MirrorCacheTotals `json:"mirror"`
+	Scope      CachePruneScope `json:"scope"`
+	ImageCount int             `json:"imageCount"`
+	ImageBytes int64           `json:"imageBytes"`
+	// Images is the removal plan the reference-aware scope executed, so the
+	// client can name every combination it lost with its size.
+	Images []CacheImageEntry `json:"images,omitempty"`
+	Mirror MirrorCacheTotals `json:"mirror"`
 }
 
 type MirrorOfflineStatus struct {
@@ -353,9 +418,14 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	item.ImageArchitecture = string(s.hypervisor.Architecture())
 	longhornWarning := s.checkLonghornMemoryWarning(item)
 	longhornCustomSchematicWarning := s.longhornCustomSchematicWarning(item, args.Schematic != "")
-	item.Schematic, item.TalosVersion, err = s.resolveImage(args.Schematic, args.Version)
+	item.Schematic, item.TalosVersion, err = s.resolveImage(args.Schematic, args.Version, args.Extensions)
 	if err != nil {
 		return ClusterSummary{}, err
+	}
+	if args.Schematic != "" && item.Schematic != args.Schematic {
+		// The schematic was re-composed: keep the brought id, since the
+		// composed one no longer names anything the user wrote.
+		item.BaseSchematic = args.Schematic
 	}
 	// One line at create only; startCluster and status never repeat it.
 	talosVersionWarning := talosversion.NewerThanTestedWarning(item.TalosVersion)
@@ -517,10 +587,21 @@ func (s *Server) launchMachine(item cluster.Cluster, node cluster.Node, restore 
 			}
 			return attachment, err
 		},
-		EFIVarsPath:       filepath.Join(dir, node.Name+".efi"),
-		ConsoleSocketPath: filepath.Join(dir, node.Name+".console.sock"),
-		Restore:           restore,
+		EFIVarsPath:          filepath.Join(dir, node.Name+".efi"),
+		ConsoleSocketPath:    filepath.Join(dir, node.Name+".console.sock"),
+		GuestAgentSocketPath: guestAgentSocketPath(item, dir, node),
+		Restore:              restore,
 	})
+}
+
+// guestAgentSocketPath asks the backend for a guest-agent channel only when the
+// cluster baked the extension. Backends without the capability ignore it, which
+// is what keeps the same file usable on both host substrates.
+func guestAgentSocketPath(item cluster.Cluster, dir string, node cluster.Node) string {
+	if !extensions.Requested(item.TalosExtensions, extensions.GuestAgent) {
+		return ""
+	}
+	return filepath.Join(dir, node.Name+".qga.sock")
 }
 
 func helperInstallError(err error) error {
@@ -854,7 +935,7 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 
 	result := make([]ClusterStatus, 0, len(items))
 	for _, item := range items {
-		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), TalosVersion: item.TalosVersion, Schematic: item.Schematic, ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: s.clusterRunning(item.Name), subnetIndex: item.SubnetIndex}
+		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), TalosVersion: item.TalosVersion, Schematic: item.Schematic, BaseSchematic: item.BaseSchematic, TalosExtensions: item.TalosExtensions, ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: s.clusterRunning(item.Name), Capabilities: s.clusterCapabilities(item), subnetIndex: item.SubnetIndex}
 		for _, node := range item.Nodes {
 			running := s.nodeRunning(item.Name, node.Name)
 			clusterStatus.Nodes = append(clusterStatus.Nodes, NodeStatus{Name: node.Name, Role: node.Role, MAC: node.MAC, Phase: ClassifyPhase(running, ProbeResult{})})
@@ -863,6 +944,20 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 		result = append(result, clusterStatus)
 	}
 	return result, nil
+}
+
+// clusterCapabilities reports only the capabilities this cluster actually asked
+// for, so a status listing stays silent about gates nobody depends on.
+func (s *Server) clusterCapabilities(item cluster.Cluster) []CapabilityStatus {
+	if s.hypervisor == nil || !extensions.Requested(item.TalosExtensions, extensions.GuestAgent) {
+		return nil
+	}
+	guestAgent := s.hypervisor.Capabilities().GuestAgent
+	return []CapabilityStatus{{
+		Name:      extensions.GuestAgent,
+		Supported: guestAgent.Supported,
+		Reason:    guestAgent.Reason,
+	}}
 }
 
 func (s *Server) refreshNodeStatuses(statuses []ClusterStatus) {
@@ -952,23 +1047,171 @@ func nodeStatusWith(
 }
 
 func (s *Server) pullCache(raw json.RawMessage) (CachePullResult, error) {
-	var args cachePullArgs
+	var args CachePullArgs
 	if err := decodeArgs(raw, &args); err != nil {
 		return CachePullResult{}, err
 	}
 	if args.Version == "" {
 		args.Version = args.TalosVersion
 	}
-	schematic, talosVersion, err := s.resolveImage(args.Schematic, args.Version)
-	if err != nil {
-		return CachePullResult{}, err
+	combinations := args.Combinations
+	if len(combinations) == 0 {
+		combinations = []CachePullCombination{{Schematic: args.Schematic, Version: args.Version}}
 	}
 	architecture := s.hypervisor.Architecture()
-	path, err := s.cache.Ensure(schematic, talosVersion, imagecache.Architecture(architecture))
+	var result CachePullResult
+	// Distinct clusters routinely share a pin, and re-composition resolves
+	// spellings apart: dedupe on the resolved combination so each image is
+	// downloaded once.
+	fetched := make(map[CachePullImage]struct{}, len(combinations))
+	pulledFor := make([]cluster.Cluster, 0, len(combinations))
+	for _, combination := range combinations {
+		// Resolution composes while online, which is what makes the same
+		// combination answerable from cache afterwards.
+		schematic, talosVersion, err := s.resolveImage(combination.Schematic, combination.Version, combination.Extensions)
+		if err != nil {
+			return CachePullResult{}, err
+		}
+		// Clusters sharing a disk image still install their own provisioning
+		// path, so every combination contributes its images even when the
+		// download collapses into one.
+		pulledFor = append(pulledFor, cluster.Cluster{
+			Schematic:          schematic,
+			TalosVersion:       talosVersion,
+			ProvisioningIntent: combination.Intent,
+		})
+		image := CachePullImage{Schematic: schematic, Version: talosVersion, Architecture: architecture}
+		if _, duplicate := fetched[image]; duplicate {
+			continue
+		}
+		fetched[image] = struct{}{}
+		image.Path, err = s.cache.Ensure(schematic, talosVersion, imagecache.Architecture(architecture))
+		if err != nil {
+			return CachePullResult{}, err
+		}
+		// An explicit pull is the statement that this combination is
+		// wanted; the pin is what keeps prune off it.
+		if err := s.cache.Pin(schematic, talosVersion, imagecache.Architecture(architecture)); err != nil {
+			return CachePullResult{}, err
+		}
+		result.Images = append(result.Images, image)
+	}
+	if len(result.Images) > 0 {
+		first := result.Images[0]
+		result.Schematic, result.Version = first.Schematic, first.Version
+		result.Architecture, result.Path = first.Architecture, first.Path
+	}
+	if !args.FromFile {
+		return result, nil
+	}
+	if !args.SkipImages {
+		warm, err := s.warmClusterImages(pulledFor)
+		if err != nil {
+			return CachePullResult{}, err
+		}
+		result.Warm = warm
+	}
+	// Reporting only: a combination that lost its cluster and its place in the
+	// file is still someone's deliberate pin until they prune it.
+	strays, err := s.strayPinnedImages(result.Images)
 	if err != nil {
 		return CachePullResult{}, err
 	}
-	return CachePullResult{Schematic: schematic, Version: talosVersion, Architecture: architecture, Path: path}, nil
+	result.Strays = strays
+	return result, nil
+}
+
+// warmClusterImages replays every image the pulled clusters will pull into the
+// mirror cache, so the same file comes up offline afterwards.
+func (s *Server) warmClusterImages(items []cluster.Cluster) (*CacheWarmResult, error) {
+	if s.warmCache == nil {
+		return nil, nil
+	}
+	seen := map[string]struct{}{}
+	var refs []string
+	for _, item := range items {
+		images, err := provision.ClusterImages(item)
+		if err != nil {
+			return nil, err
+		}
+		for _, ref := range images {
+			if _, duplicate := seen[ref]; duplicate {
+				continue
+			}
+			seen[ref] = struct{}{}
+			refs = append(refs, ref)
+		}
+	}
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	slices.Sort(refs)
+	for _, ref := range refs {
+		if err := ValidateWarmRef(ref); err != nil {
+			return nil, err
+		}
+	}
+	ctx, cancel := s.lifecycleTimeoutContext(cacheWarmTimeout)
+	defer cancel()
+	result, err := s.warmCache(ctx, refs, s.imageArchitecture())
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// strayPinnedImages names every pinned combination that this pull did not ask
+// for and no cluster references.
+func (s *Server) strayPinnedImages(pulled []CachePullImage) ([]CacheImageEntry, error) {
+	classifier, err := s.cacheImageClassifier()
+	if err != nil {
+		return nil, err
+	}
+	requested := make(map[imagecache.Combination]struct{}, len(pulled))
+	for _, image := range pulled {
+		requested[imagecache.Combination{
+			Schematic:    image.Schematic,
+			Version:      image.Version,
+			Architecture: imagecache.Architecture(image.Architecture),
+		}] = struct{}{}
+	}
+	entries, err := s.cache.List()
+	if err != nil {
+		return nil, err
+	}
+	var strays []CacheImageEntry
+	for _, entry := range entries {
+		combination := imagecache.Combination{
+			Schematic:    entry.Schematic,
+			Version:      entry.Version,
+			Architecture: entry.Architecture,
+		}
+		if _, wanted := requested[combination]; wanted {
+			continue
+		}
+		// The built-in default combination is spared by prune and shown as
+		// `default` by list even when it also carries a pin, so it is never a
+		// stray — status() would report it as pinned because a pin outranks the
+		// default, which is the wrong answer here.
+		if classifier.hasDefault && combination == classifier.defaultCombination {
+			continue
+		}
+		status, _, err := classifier.status(combination)
+		if err != nil {
+			return nil, err
+		}
+		if status != CacheImageStatusPinned {
+			continue
+		}
+		strays = append(strays, CacheImageEntry{
+			Schematic:    entry.Schematic,
+			Version:      entry.Version,
+			Architecture: string(entry.Architecture),
+			Size:         entry.Size,
+			Status:       status,
+		})
+	}
+	return strays, nil
 }
 
 func (s *Server) warmMirrorCache(raw json.RawMessage) (CacheWarmResult, error) {
@@ -1030,12 +1273,26 @@ func (s *Server) listCache() (CacheListResult, error) {
 	if s.boundMirrorGateways != nil {
 		result.MirrorBoundGatewayIPs = s.boundMirrorGateways()
 	}
+	classifier, err := s.cacheImageClassifier()
+	if err != nil {
+		return CacheListResult{}, err
+	}
 	for _, entry := range entries {
+		status, clusters, err := classifier.status(imagecache.Combination{
+			Schematic:    entry.Schematic,
+			Version:      entry.Version,
+			Architecture: entry.Architecture,
+		})
+		if err != nil {
+			return CacheListResult{}, err
+		}
 		result.Images = append(result.Images, CacheImageEntry{
 			Schematic:    entry.Schematic,
 			Version:      entry.Version,
 			Architecture: string(entry.Architecture),
 			Size:         entry.Size,
+			Status:       status,
+			Clusters:     clusters,
 		})
 	}
 	for _, stat := range mirrorStats {
@@ -1060,11 +1317,23 @@ func (s *Server) pruneCache(raw json.RawMessage) (CachePruneResult, error) {
 	}
 	switch args.Scope {
 	case CachePruneScopeImages:
-		result, err := s.cache.PruneDisk()
+		// The default scope is reference-aware: only combinations no
+		// cluster, no pin, and not the default combination claims go.
+		classifier, err := s.cacheImageClassifier()
 		if err != nil {
 			return CachePruneResult{}, err
 		}
-		return CachePruneResult{Scope: args.Scope, ImageCount: result.ImageCount, ImageBytes: result.ImageBytes, Mirror: MirrorCacheTotals(result.Mirror)}, nil
+		result, err := s.cache.PruneDiskExcept(classifier.keep)
+		if err != nil {
+			return CachePruneResult{}, err
+		}
+		return CachePruneResult{
+			Scope:      args.Scope,
+			ImageCount: result.ImageCount,
+			ImageBytes: result.ImageBytes,
+			Images:     prunedImageEntries(result.Images),
+			Mirror:     MirrorCacheTotals(result.Mirror),
+		}, nil
 	case CachePruneScopeMirror:
 		result, err := s.cache.PruneMirror()
 		if err != nil {
@@ -1080,6 +1349,20 @@ func (s *Server) pruneCache(raw json.RawMessage) (CachePruneResult, error) {
 	default:
 		return CachePruneResult{}, fmt.Errorf("unknown cache prune scope %q", args.Scope)
 	}
+}
+
+func prunedImageEntries(removed []imagecache.PrunedCombination) []CacheImageEntry {
+	entries := make([]CacheImageEntry, 0, len(removed))
+	for _, combination := range removed {
+		entries = append(entries, CacheImageEntry{
+			Schematic:    combination.Schematic,
+			Version:      combination.Version,
+			Architecture: string(combination.Architecture),
+			Size:         combination.Bytes,
+			Status:       CacheImageStatusOrphan,
+		})
+	}
+	return entries
 }
 
 func ValidateWarmRef(ref string) error {
@@ -1295,23 +1578,35 @@ func isHexDigit(character rune) bool {
 // well-formed and inside the support window before it reaches image
 // resolution. Stored cluster state goes through imageDefaults instead —
 // a floor bump must not retroactively refuse clusters that already exist.
-func (s *Server) resolveImage(schematic, talosVersion string) (string, string, error) {
+func (s *Server) resolveImage(schematic, talosVersion string, requestedExtensions []string) (string, string, error) {
 	if talosVersion != "" {
 		if err := talosversion.Validate(talosVersion); err != nil {
 			return "", "", err
 		}
 	}
-	return s.imageDefaults(schematic, talosVersion)
+	return s.imageDefaults(schematic, talosVersion, requestedExtensions)
 }
 
-func (s *Server) imageDefaults(schematic, talosVersion string) (string, string, error) {
+func (s *Server) imageDefaults(schematic, talosVersion string, requestedExtensions []string) (string, string, error) {
 	if talosVersion == "" {
 		talosVersion = DefaultTalosVersion
+	}
+	if len(requestedExtensions) > 0 {
+		// Composition owns validation: it is skipped entirely when the
+		// composed id is already recorded, which is what lets a cached
+		// composed image be created from offline.
+		composed, err := s.cache.ComposeSchematic(schematic, talosVersion, requestedExtensions)
+		if err != nil {
+			return "", "", err
+		}
+		return composed, talosVersion, nil
 	}
 	if schematic == "" {
 		if s.defaultSchematic == "" {
 			var err error
-			s.defaultSchematic, err = s.cache.Schematic()
+			// The recorded default id is what an offline daemon
+			// resolves from, so memoizing is only a shortcut.
+			s.defaultSchematic, err = s.cache.DefaultSchematic()
 			if err != nil {
 				return "", "", err
 			}
@@ -1322,7 +1617,9 @@ func (s *Server) imageDefaults(schematic, talosVersion string) (string, string, 
 }
 
 func (s *Server) cachedDisk(item cluster.Cluster) (string, error) {
-	schematic, talosVersion, err := s.imageDefaults(item.Schematic, item.TalosVersion)
+	// item.Schematic already is the composed id when the cluster requested
+	// extensions, so stored state never re-composes.
+	schematic, talosVersion, err := s.imageDefaults(item.Schematic, item.TalosVersion, nil)
 	if err != nil {
 		return "", err
 	}

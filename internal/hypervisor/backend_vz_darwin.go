@@ -57,9 +57,18 @@ func New(ctx context.Context) (Hypervisor, error) {
 			BalloonReadback: FeatureStatus{
 				Reason: "Virtualization.framework does not report the guest-visible balloon size",
 			},
+			GuestAgent: GuestAgentSupport(),
 		},
 		saved: make(map[string]*vzMachine),
 	}, nil
+}
+
+// GuestAgentSupport reports the host's guest-agent capability without probing a
+// backend, so `tbx doctor` can explain the gate with the daemon down.
+func GuestAgentSupport() FeatureStatus {
+	return FeatureStatus{
+		Reason: "Virtualization.framework has no virtio-serial guest-agent channel; the extension is baked into the image but its service never starts",
+	}
 }
 
 func (h *vzHypervisor) Capabilities() Capabilities { return h.capabilities }

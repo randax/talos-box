@@ -94,8 +94,15 @@ func Hints(status ClusterStatus) []string {
 	}
 
 	var hints []string
+	// Capability gates hold whatever the cluster is doing: the config is
+	// accepted and the extension baked, but this host cannot honour it.
+	for _, capability := range status.Capabilities {
+		if !capability.Supported {
+			hints = append(hints, fmt.Sprintf("%s is unavailable on this host: %s", capability.Name, capability.Reason))
+		}
+	}
 	if len(status.Nodes) > 0 && len(stopped) == len(status.Nodes) {
-		return []string{fmt.Sprintf("cluster is stopped — start it with: tbx cluster start %s", status.Name)}
+		return append(hints, fmt.Sprintf("cluster is stopped — start it with: tbx cluster start %s", status.Name))
 	}
 	if hint := storageHint(status); hint != "" {
 		hints = append(hints, hint)

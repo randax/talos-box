@@ -26,7 +26,11 @@ require 'linux-kvm-e2e' "$workflow"
 require 'linux-kvm-storage-e2e' "$workflow"
 require 'scripts/ci/linux-kvm-storage-e2e.sh' "$workflow"
 require "if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository" "$workflow"
+require 'linux-kvm-floor-e2e' "$workflow"
+require "if: github.event_name == 'schedule'" "$workflow"
+require 'TBX_E2E_TALOS_VERSION: v1.12.0' "$workflow"
 require 'qemu-system-x86' "$workflow"
+require 'socat nfs-kernel-server' "$workflow"
 require '/etc/udev/rules.d/99-kvm4all.rules' "$workflow"
 require 'MODE="0666"' "$workflow"
 require 'OPTIONS+="static_node=kvm"' "$workflow"
@@ -78,6 +82,21 @@ require 'retry "node registration"' "$harness"
 require "kubectl --kubeconfig \"\$kubeconfig\" get nodes -o name" "$harness"
 require "[[ \"\$node_count\" -eq 3 ]]" "$harness"
 require 'retry "substrate cluster creation"' "$harness"
+
+# Each curated extension is proved functionally, and the same harness boots
+# either end of the supported version window.
+require 'extensions: [gvisor, nfs-utils, qemu-guest-agent]' "$harness"
+require 'guest-ping' "$harness"
+require 'UNIX-CONNECT:$qga_socket' "$harness"
+require 'retry "qemu-guest-agent guest-ping"' "$harness"
+require 'runtimeClassName: runsc' "$harness"
+require 'handler: runsc' "$harness"
+require 'retry "runsc pod completion"' "$harness"
+require 'nfsvers=3' "$harness"
+require 'flock /data/probe' "$harness"
+require 'retry "NFSv3 locked write"' "$harness"
+require 'talos_version=${TBX_E2E_TALOS_VERSION:-v1.13.6}' "$harness"
+require '  v1.12.0)' "$harness"
 
 # The storage harness exercises the curated provisioning path end to end:
 # longhorn on a multinode cluster, then local-path on a single node.

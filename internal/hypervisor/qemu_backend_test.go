@@ -67,6 +67,109 @@ func TestQEMUNewMachineClosesRejectedAttachment(t *testing.T) {
 	}
 }
 
+func TestQEMUNewMachineBindsGuestAgentSocket(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "tbx-qga-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	varsTemplate := filepath.Join(dir, "OVMF_VARS.fd")
+	if err := os.WriteFile(varsTemplate, []byte("vars"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tapRead, tapWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tapWrite.Close() }()
+	backend := &qemuHypervisor{
+		firmware: qemuFirmware{VarsPath: varsTemplate},
+		newConsole: func(string) (*consoleProxy, *os.File, error) {
+			file, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+			return nil, file, err
+		},
+	}
+	guestAgentPath := filepath.Join(dir, "node.qga.sock")
+	machine, err := backend.newMachine(Spec{
+		CPUs:                 1,
+		MemoryMiB:            1024,
+		DiskPath:             filepath.Join(dir, "node.img"),
+		MAC:                  "02:00:00:00:00:01",
+		EFIVarsPath:          filepath.Join(dir, "node.efi"),
+		ConsoleSocketPath:    filepath.Join(dir, "node.console.sock"),
+		GuestAgentSocketPath: guestAgentPath,
+		Network: func() (*helper.Attachment, error) {
+			return &helper.Attachment{Kind: helper.AttachmentTapFD, File: tapRead}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(guestAgentPath)
+	if err != nil {
+		t.Fatalf("guest-agent socket not bound: %v", err)
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("guest-agent path mode = %v, want a socket", info.Mode())
+	}
+	if got, want := len(machine.extraFiles()), 3; got != want {
+		t.Fatalf("extraFiles() length = %d, want %d", got, want)
+	}
+	if got := machine.extraFiles()[2]; got != machine.guestAgent {
+		t.Fatalf("extraFiles()[2] = %v, want the guest-agent descriptor %v", got, machine.guestAgent)
+	}
+	if got, want := machine.launchConfig("/run/qmp.sock", "").GuestAgentFD, 5; got != want {
+		t.Fatalf("launchConfig().GuestAgentFD = %d, want %d", got, want)
+	}
+	if err := machine.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(guestAgentPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Close() left the guest-agent socket behind: %v", err)
+	}
+}
+
+func TestQEMUNewMachineWithoutGuestAgent(t *testing.T) {
+	dir := t.TempDir()
+	varsTemplate := filepath.Join(dir, "OVMF_VARS.fd")
+	if err := os.WriteFile(varsTemplate, []byte("vars"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tapRead, tapWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tapWrite.Close() }()
+	backend := &qemuHypervisor{
+		firmware: qemuFirmware{VarsPath: varsTemplate},
+		newConsole: func(string) (*consoleProxy, *os.File, error) {
+			file, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+			return nil, file, err
+		},
+	}
+	machine, err := backend.newMachine(Spec{
+		CPUs:              1,
+		MemoryMiB:         1024,
+		DiskPath:          filepath.Join(dir, "node.img"),
+		MAC:               "02:00:00:00:00:01",
+		EFIVarsPath:       filepath.Join(dir, "node.efi"),
+		ConsoleSocketPath: filepath.Join(dir, "node.console.sock"),
+		Network: func() (*helper.Attachment, error) {
+			return &helper.Attachment{Kind: helper.AttachmentTapFD, File: tapRead}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = machine.Close() }()
+	if got, want := len(machine.extraFiles()), 2; got != want {
+		t.Fatalf("extraFiles() length = %d, want %d", got, want)
+	}
+	if got := machine.launchConfig("/run/qmp.sock", "").GuestAgentFD; got != 0 {
+		t.Fatalf("launchConfig().GuestAgentFD = %d, want 0", got)
+	}
+}
+
 func TestQEMUBackendHelper(t *testing.T) {
 	if os.Getenv("TBX_QEMU_BACKEND_HELPER") != "1" {
 		return

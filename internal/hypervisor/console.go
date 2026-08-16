@@ -34,7 +34,7 @@ func newConsoleProxy(path string) (*consoleProxy, *os.File, *os.File, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, nil, nil, fmt.Errorf("create console directory: %w", err)
 	}
-	listener, err := listenUnix(path)
+	listener, err := listenUnix(path, "console")
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -70,7 +70,9 @@ func startConsoleProxy(listener *net.UnixListener, input io.Writer, output io.Re
 	return proxy
 }
 
-func listenUnix(path string) (*net.UnixListener, error) {
+// listenUnix binds path, reclaiming it from a socket no process still answers
+// on. label names the socket in every error the caller may surface.
+func listenUnix(path, label string) (*net.UnixListener, error) {
 	addr := &net.UnixAddr{Name: path, Net: "unix"}
 	listener, err := net.ListenUnix("unix", addr)
 	if err == nil {
@@ -78,19 +80,19 @@ func listenUnix(path string) (*net.UnixListener, error) {
 	}
 	info, statErr := os.Lstat(path)
 	if statErr != nil || info.Mode()&os.ModeSocket == 0 {
-		return nil, fmt.Errorf("listen on console socket: %w", err)
+		return nil, fmt.Errorf("listen on %s socket: %w", label, err)
 	}
 	conn, dialErr := net.DialTimeout("unix", path, 100*time.Millisecond)
 	if dialErr == nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("console socket is already in use: %s", path)
+		return nil, fmt.Errorf("%s socket is already in use: %s", label, path)
 	}
 	if removeErr := os.Remove(path); removeErr != nil {
-		return nil, fmt.Errorf("remove stale console socket: %w", removeErr)
+		return nil, fmt.Errorf("remove stale %s socket: %w", label, removeErr)
 	}
 	listener, err = net.ListenUnix("unix", addr)
 	if err != nil {
-		return nil, fmt.Errorf("listen on console socket: %w", err)
+		return nil, fmt.Errorf("listen on %s socket: %w", label, err)
 	}
 	return listener, nil
 }

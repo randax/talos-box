@@ -15,7 +15,7 @@ import (
 // InspectionSections are the path-aware documents tbx manifests can expose.
 // The legacy aliases remain accepted so existing shell snippets keep working.
 func InspectionSections() []string {
-	return []string{"all", "machine", "values", "objects", "extras", "storage", "storage-machine", "storage-values", "storage-namespaces", "storage-crds", "storage-objects", "talos", "cilium-values", "metallb-values", "metallb-extras", "k8s", "mirrors", "balloon", "lb-pool", "bgp", "l2"}
+	return []string{"all", "machine", "values", "objects", "extras", "storage", "storage-machine", "storage-values", "storage-namespaces", "storage-crds", "storage-objects", "images", "talos", "cilium-values", "metallb-values", "metallb-extras", "k8s", "mirrors", "balloon", "lb-pool", "bgp", "l2"}
 }
 
 // RenderInspection renders the exact inputs consumed by the provisioning
@@ -26,7 +26,7 @@ func RenderInspection(item cluster.Cluster, section string) (string, error) {
 	if section == "" {
 		section = "all"
 	}
-	if section != "all" && !isStorageInspectionSection(section) && item.CNI != cluster.CNICilium && item.CNI != cluster.CNIFlannel {
+	if section != "all" && section != "images" && !isStorageInspectionSection(section) && item.CNI != cluster.CNICilium && item.CNI != cluster.CNIFlannel {
 		return "", fmt.Errorf("cluster %q does not declare a curated cni", item.Name)
 	}
 	switch section {
@@ -68,6 +68,8 @@ func RenderInspection(item cluster.Cluster, section string) (string, error) {
 		return storageInspectionCRDs(item)
 	case "storage-objects":
 		return storageInspectionObjects(item)
+	case "images":
+		return imageInspection(item)
 	case "mirrors":
 		return catchAllMirrorDocument(item.SubnetIndex), nil
 	case "balloon":

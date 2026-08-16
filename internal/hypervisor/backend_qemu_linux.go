@@ -56,6 +56,13 @@ func New(ctx context.Context) (Hypervisor, error) {
 	}, nil
 }
 
+// GuestAgentSupport reports the host's guest-agent capability without probing a
+// backend, so `tbx doctor` can explain the gate with the daemon down. QEMU can
+// always carry the channel; only the extension itself is optional.
+func GuestAgentSupport() FeatureStatus {
+	return FeatureStatus{Supported: true}
+}
+
 func probeKVM(path string) error {
 	return probeKVMWith(path, func(fd uintptr) (int, error) {
 		version, _, errno := unix.Syscall(unix.SYS_IOCTL, fd, uintptr(0xae00), 0) // KVM_GET_API_VERSION
@@ -148,7 +155,7 @@ func newQEMUConsoleProxy(path string) (*consoleProxy, *os.File, error) {
 		_ = guestFile.Close()
 		return nil, nil, fmt.Errorf("open QEMU console socketpair: %w", err)
 	}
-	listener, err := listenUnix(path)
+	listener, err := listenUnix(path, "console")
 	if err != nil {
 		_ = hostConnection.Close()
 		_ = guestFile.Close()

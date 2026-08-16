@@ -67,9 +67,25 @@ type MirrorTotals struct {
 	ManifestBytes int64
 }
 
+// Combination identifies one disk-image directory in the cache: the unit both
+// pinning and reference-aware pruning reason about.
+type Combination struct {
+	Schematic    string
+	Version      string
+	Architecture Architecture
+}
+
+// PrunedCombination is one combination a prune removed, with the bytes its
+// artifacts occupied.
+type PrunedCombination struct {
+	Combination
+	Bytes int64
+}
+
 type CachePruneResult struct {
 	ImageCount int
 	ImageBytes int64
+	Images     []PrunedCombination
 	Mirror     MirrorTotals
 }
 
@@ -272,10 +288,18 @@ func (c *Cache) MirrorStats() ([]MirrorUpstreamStats, MirrorTotals, error) {
 }
 
 func (c *Cache) PruneDisk() (CachePruneResult, error) {
+	return c.PruneDiskExcept(nil)
+}
+
+// PruneDiskExcept removes cached disk images except the combinations keep
+// reports as worth keeping. A nil keep removes every combination, which is
+// what the explicit whole-cache scope asks for. Nothing is removed when keep
+// fails: an undecidable classification must never widen the deletion.
+func (c *Cache) PruneDiskExcept(keep func(Combination) (bool, error)) (CachePruneResult, error) {
 	if err := validateCacheRoot(c.root); err != nil {
 		return CachePruneResult{}, err
 	}
-	result, err := c.pruneKnownDiskArtifacts()
+	result, err := c.pruneKnownDiskArtifacts(keep)
 	if err != nil {
 		return CachePruneResult{}, fmt.Errorf("prune disk cache: %w", err)
 	}
@@ -412,12 +436,24 @@ type pruneAction struct {
 	countAsImage bool
 }
 
+// combinationPlan groups the artifacts of one combination so a prune can
+// report what it removed per combination, not just in total.
+type combinationPlan struct {
+	combination Combination
+	actions     []pruneAction
+	// temporariesOnly marks a kept combination whose abandoned partial
+	// downloads are being swept: the space is reclaimed but the combination
+	// must not be reported as pruned, or the itemized list would contradict
+	// the keep decision `cache list` shows.
+	temporariesOnly bool
+}
+
 type mirrorPrunePlan struct {
 	root   string
 	totals MirrorTotals
 }
 
-func (c *Cache) pruneKnownDiskArtifacts() (CachePruneResult, error) {
+func (c *Cache) pruneKnownDiskArtifacts(keep func(Combination) (bool, error)) (CachePruneResult, error) {
 	rootEntries, err := os.ReadDir(c.root)
 	if errors.Is(err, os.ErrNotExist) {
 		return CachePruneResult{}, nil
@@ -427,7 +463,7 @@ func (c *Cache) pruneKnownDiskArtifacts() (CachePruneResult, error) {
 	}
 
 	var result CachePruneResult
-	var plan []pruneAction
+	var plan []combinationPlan
 	var cleanupDirs []string
 	for _, schematic := range rootEntries {
 		if schematic.Name() == "mirror" || !schematic.IsDir() {
@@ -450,7 +486,7 @@ func (c *Cache) pruneKnownDiskArtifacts() (CachePruneResult, error) {
 			if err := requireDirectoryPath(versionPath); err != nil {
 				return CachePruneResult{}, err
 			}
-			versionPlan, versionCleanup, touchedVersion, err := planKnownVersionPrune(versionPath)
+			versionPlan, versionCleanup, touchedVersion, err := planKnownVersionPrune(versionPath, schematic.Name(), version.Name(), keep)
 			if err != nil {
 				return CachePruneResult{}, err
 			}
@@ -466,14 +502,21 @@ func (c *Cache) pruneKnownDiskArtifacts() (CachePruneResult, error) {
 			cleanupDirs = append(cleanupDirs, schematicPath)
 		}
 	}
-	for _, action := range plan {
-		if err := os.Remove(action.path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return CachePruneResult{}, err
+	for _, combination := range plan {
+		var bytes int64
+		for _, action := range combination.actions {
+			if err := os.Remove(action.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return CachePruneResult{}, err
+			}
+			if action.countAsImage {
+				result.ImageCount++
+			}
+			bytes += action.size
 		}
-		if action.countAsImage {
-			result.ImageCount++
+		result.ImageBytes += bytes
+		if len(combination.actions) != 0 && !combination.temporariesOnly {
+			result.Images = append(result.Images, PrunedCombination{Combination: combination.combination, Bytes: bytes})
 		}
-		result.ImageBytes += action.size
 	}
 	for _, path := range cleanupDirs {
 		if err := removeIfEmpty(path); err != nil {
@@ -483,8 +526,8 @@ func (c *Cache) pruneKnownDiskArtifacts() (CachePruneResult, error) {
 	return result, nil
 }
 
-func planKnownVersionPrune(versionPath string) ([]pruneAction, []string, bool, error) {
-	var plan []pruneAction
+func planKnownVersionPrune(versionPath, schematic, version string, keep func(Combination) (bool, error)) ([]combinationPlan, []string, bool, error) {
+	var plan []combinationPlan
 	var cleanupDirs []string
 	touched := false
 	for _, architecture := range []Architecture{ArchitectureAMD64, ArchitectureARM64} {
@@ -495,12 +538,39 @@ func planKnownVersionPrune(versionPath string) ([]pruneAction, []string, bool, e
 		}
 		if exists {
 			touched = true
+			combination := Combination{Schematic: schematic, Version: version, Architecture: architecture}
+			kept, err := keepCombination(keep, combination)
+			if err != nil {
+				return nil, nil, false, err
+			}
+			if kept {
+				// A kept combination still sheds abandoned partial
+				// downloads: they are safe to delete regardless of
+				// retention and would otherwise accumulate forever.
+				if err := requireDirectoryPath(archDir); err != nil {
+					return nil, nil, false, err
+				}
+				tempPlan, err := planKnownFiles(archDir, nil, []knownPrunePrefix{
+					{prefix: ".disk.raw-"},
+					{prefix: fmt.Sprintf(".metal-%s.raw.xz-", architecture)},
+				})
+				if err != nil {
+					return nil, nil, false, err
+				}
+				if len(tempPlan) != 0 {
+					plan = append(plan, combinationPlan{combination: combination, actions: tempPlan, temporariesOnly: true})
+				}
+				continue
+			}
 			if err := requireDirectoryPath(archDir); err != nil {
 				return nil, nil, false, err
 			}
 			archPlan, err := planKnownFiles(archDir, []knownPruneName{
 				{name: "disk.raw", countAsImage: true},
 				{name: fmt.Sprintf("metal-%s.raw.xz", architecture)},
+				// A surviving pin marker would keep the directory alive
+				// and re-pin an image the next pull downloads.
+				{name: pinMarkerName},
 			}, []knownPrunePrefix{
 				{prefix: ".disk.raw-"},
 				{prefix: fmt.Sprintf(".metal-%s.raw.xz-", architecture)},
@@ -508,16 +578,33 @@ func planKnownVersionPrune(versionPath string) ([]pruneAction, []string, bool, e
 			if err != nil {
 				return nil, nil, false, err
 			}
-			plan = append(plan, archPlan...)
+			plan = append(plan, combinationPlan{combination: combination, actions: archPlan})
 			cleanupDirs = append(cleanupDirs, archDir)
 		}
 	}
-	legacyPlan, err := planKnownFiles(versionPath, []knownPruneName{{name: "disk.raw", countAsImage: true}}, nil)
+	// The legacy flat layout only ever held arm64 images.
+	legacy := Combination{Schematic: schematic, Version: version, Architecture: ArchitectureARM64}
+	kept, err := keepCombination(keep, legacy)
 	if err != nil {
 		return nil, nil, false, err
 	}
-	plan = append(plan, legacyPlan...)
+	if !kept {
+		legacyPlan, err := planKnownFiles(versionPath, []knownPruneName{{name: "disk.raw", countAsImage: true}}, nil)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		if len(legacyPlan) != 0 {
+			plan = append(plan, combinationPlan{combination: legacy, actions: legacyPlan})
+		}
+	}
 	return plan, cleanupDirs, touched || len(plan) > 0, nil
+}
+
+func keepCombination(keep func(Combination) (bool, error), combination Combination) (bool, error) {
+	if keep == nil {
+		return false, nil
+	}
+	return keep(combination)
 }
 
 type knownPruneName struct {

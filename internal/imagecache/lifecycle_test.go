@@ -1,6 +1,7 @@
 package imagecache
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -476,5 +477,135 @@ func TestPruneAllRejectsInvalidMirrorRootWithoutDeletingDisk(t *testing.T) {
 				t.Fatalf("disk bytes changed after failed prune-all: got %q want %q", string(after), string(before))
 			}
 		})
+	}
+}
+
+func TestPruneDiskExceptKeepsRequestedCombinationsAndReportsRemovedOnes(t *testing.T) {
+	root := t.TempDir()
+	cache := New(root)
+
+	kept := Combination{Schematic: "schematic-a", Version: "v1.2.3", Architecture: ArchitectureAMD64}
+	removed := Combination{Schematic: "schematic-b", Version: "v1.2.3", Architecture: ArchitectureAMD64}
+	for _, combination := range []Combination{kept, removed} {
+		dir := filepath.Join(root, combination.Schematic, combination.Version, string(combination.Architecture))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for name, body := range map[string]string{"disk.raw": "disk", "metal-amd64.raw.xz": "archive"} {
+			if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := cache.Pin(kept.Schematic, kept.Version, kept.Architecture); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := cache.PruneDiskExcept(func(combination Combination) (bool, error) {
+		return combination == kept, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBytes := int64(len("disk") + len("archive"))
+	if result.ImageCount != 1 || result.ImageBytes != wantBytes {
+		t.Fatalf("prune result = %+v, want count=1 bytes=%d", result, wantBytes)
+	}
+	if len(result.Images) != 1 || result.Images[0].Combination != removed || result.Images[0].Bytes != wantBytes {
+		t.Fatalf("removed combinations = %+v, want %+v with %d bytes", result.Images, removed, wantBytes)
+	}
+	for _, name := range []string{"disk.raw", "metal-amd64.raw.xz", pinMarkerName} {
+		path := filepath.Join(root, kept.Schematic, kept.Version, string(kept.Architecture), name)
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("kept artifact missing after prune: %s (%v)", path, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, removed.Schematic)); !os.IsNotExist(err) {
+		t.Fatalf("removed combination still exists after prune: %v", err)
+	}
+}
+
+func TestPruneDiskExceptKeepsLegacyLayoutCombination(t *testing.T) {
+	root := t.TempDir()
+	cache := New(root)
+
+	legacyPath := filepath.Join(root, "schematic", "v1.2.3", "disk.raw")
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyPath, []byte("legacy-disk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := cache.PruneDiskExcept(func(combination Combination) (bool, error) {
+		return combination.Architecture == ArchitectureARM64, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ImageCount != 0 || len(result.Images) != 0 {
+		t.Fatalf("prune result = %+v, want nothing removed", result)
+	}
+	if _, err := os.Stat(legacyPath); err != nil {
+		t.Fatalf("legacy disk missing after prune: %v", err)
+	}
+}
+
+func TestPruneDiskExceptPropagatesKeepErrors(t *testing.T) {
+	root := t.TempDir()
+	cache := New(root)
+
+	diskPath := filepath.Join(root, "schematic", "v1.2.3", "amd64", "disk.raw")
+	if err := os.MkdirAll(filepath.Dir(diskPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(diskPath, []byte("disk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := cache.PruneDiskExcept(func(Combination) (bool, error) {
+		return false, errors.New("cannot classify")
+	}); err == nil {
+		t.Fatal("prune ignored a classification failure")
+	}
+	if _, err := os.Stat(diskPath); err != nil {
+		t.Fatalf("disk removed despite a classification failure: %v", err)
+	}
+}
+
+// TestPruneDiskExceptSweepsTemporariesFromKeptCombinations pins the cleanup
+// half of reference-aware prune: a kept combination sheds abandoned partial
+// downloads without its image being touched or reported as pruned.
+func TestPruneDiskExceptSweepsTemporariesFromKeptCombinations(t *testing.T) {
+	root := t.TempDir()
+	cache := New(root)
+
+	archDir := filepath.Join(root, "schematic", "v1.2.3", "amd64")
+	if err := os.MkdirAll(archDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	diskPath := filepath.Join(archDir, "disk.raw")
+	tempPath := filepath.Join(archDir, ".disk.raw-partial")
+	for path, contents := range map[string]string{diskPath: "disk-bytes", tempPath: "partial-bytes"} {
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	result, err := cache.PruneDiskExcept(func(Combination) (bool, error) { return true, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(tempPath); !os.IsNotExist(err) {
+		t.Fatalf("temporary artifact still exists after prune: %v", err)
+	}
+	if _, err := os.Stat(diskPath); err != nil {
+		t.Fatalf("kept disk image missing after prune: %v", err)
+	}
+	if result.ImageCount != 0 {
+		t.Fatalf("ImageCount = %d, want 0", result.ImageCount)
+	}
+	if len(result.Images) != 0 {
+		t.Fatalf("Images = %+v, want none reported for a kept combination", result.Images)
 	}
 }
