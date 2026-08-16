@@ -19,6 +19,7 @@ import (
 	"github.com/randax/talos-box/internal/helper"
 	"github.com/randax/talos-box/internal/hypervisor"
 	"github.com/randax/talos-box/internal/imagecache"
+	"github.com/randax/talos-box/internal/talosversion"
 )
 
 type createArgs struct {
@@ -276,6 +277,11 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if args.Version == "" {
 		args.Version = args.TalosVersion
 	}
+	if args.Version != "" {
+		if err := talosversion.Validate(args.Version); err != nil {
+			return ClusterSummary{}, err
+		}
+	}
 	intent, err := args.Intent()
 	if err != nil {
 		return ClusterSummary{}, err
@@ -351,6 +357,8 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if err != nil {
 		return ClusterSummary{}, err
 	}
+	// One line at create only; startCluster and status never repeat it.
+	talosVersionWarning := talosversion.NewerThanTestedWarning(item.TalosVersion)
 	item.TalosExtensions = args.Extensions
 	cachedDisk, err := s.cache.Ensure(item.Schematic, item.TalosVersion, s.imageArchitecture())
 	if err != nil {
@@ -372,11 +380,11 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	startWarning, err := s.start(item)
 	if err != nil {
 		result := summary(item, false)
-		result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, longhornWarning, longhornCustomSchematicWarning, subnetWarning)
+		result.Warning = joinWarnings(talosVersionWarning, overcommitWarning, hostPressureWarning, longhornWarning, longhornCustomSchematicWarning, subnetWarning)
 		return result, fmt.Errorf("cluster created but failed to start: %w", err)
 	}
 	result := summary(item, true)
-	result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, longhornWarning, longhornCustomSchematicWarning, subnetWarning, startWarning)
+	result.Warning = joinWarnings(talosVersionWarning, overcommitWarning, hostPressureWarning, longhornWarning, longhornCustomSchematicWarning, subnetWarning, startWarning)
 	return result, nil
 }
 
@@ -1279,6 +1287,8 @@ func isHexDigit(character rune) bool {
 func (s *Server) resolveImage(schematic, talosVersion string) (string, string, error) {
 	if talosVersion == "" {
 		talosVersion = DefaultTalosVersion
+	} else if err := talosversion.Validate(talosVersion); err != nil {
+		return "", "", err
 	}
 	if schematic == "" {
 		if s.defaultSchematic == "" {

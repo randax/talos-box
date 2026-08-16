@@ -22,6 +22,7 @@ import (
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/manifests"
 	"github.com/randax/talos-box/internal/shellquote"
+	"github.com/randax/talos-box/internal/talosversion"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
 	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
@@ -309,7 +310,7 @@ func generateMachineConfigs(item cluster.Cluster) (generated, error) {
 	}
 	version := item.TalosVersion
 	if version == "" {
-		version = "v1.13.6"
+		version = talosversion.Default
 	}
 	contract, err := machineryconfig.ParseContractFromVersion(version)
 	if err != nil {

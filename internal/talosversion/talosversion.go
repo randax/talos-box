@@ -1,0 +1,79 @@
+// Package talosversion pins the Talos versions tbx supports and validates
+// requested versions against that window. It sits below both the daemon and
+// the provisioner so each can share the single source of truth.
+package talosversion
+
+import (
+	"fmt"
+	"regexp"
+	"strconv"
+)
+
+// Default is the Talos version tbx boots and CI tests by default.
+const Default = "v1.13.6"
+
+// Min is the oldest Talos version tbx supports: the default's previous
+// minor. Bumping Default to a new minor drags Min up in the same diff.
+const Min = "v1.12.0"
+
+// Machinery's contract parse validates nothing beyond a leading
+// vMAJOR.MINOR, so image resolution needs the full triple checked here.
+var versionShape = regexp.MustCompile(`^v(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?$`)
+
+// Validate refuses malformed versions and versions below Min.
+func Validate(version string) error {
+	requested, err := parse(version)
+	if err != nil {
+		return err
+	}
+	floor, err := parse(Min)
+	if err != nil {
+		return err
+	}
+	if requested.less(floor) {
+		return fmt.Errorf("talos version %s is below the minimum supported %s", version, Min)
+	}
+	return nil
+}
+
+// NewerThanTestedWarning returns the one-line create warning for a version
+// above the tested Default, and "" for anything at or below it (malformed
+// versions included — Validate owns rejecting those).
+func NewerThanTestedWarning(version string) string {
+	requested, err := parse(version)
+	if err != nil {
+		return ""
+	}
+	tested, err := parse(Default)
+	if err != nil {
+		return ""
+	}
+	if tested.less(requested) {
+		return fmt.Sprintf("talos %s is newer than the last tested %s; proceeding", version, Default)
+	}
+	return ""
+}
+
+type triple struct{ major, minor, patch int }
+
+func parse(version string) (triple, error) {
+	matches := versionShape.FindStringSubmatch(version)
+	if matches == nil {
+		return triple{}, fmt.Errorf("invalid talos version %q: expected vMAJOR.MINOR.PATCH, like %s", version, Default)
+	}
+	var parsed triple
+	parsed.major, _ = strconv.Atoi(matches[1])
+	parsed.minor, _ = strconv.Atoi(matches[2])
+	parsed.patch, _ = strconv.Atoi(matches[3])
+	return parsed, nil
+}
+
+func (v triple) less(other triple) bool {
+	if v.major != other.major {
+		return v.major < other.major
+	}
+	if v.minor != other.minor {
+		return v.minor < other.minor
+	}
+	return v.patch < other.patch
+}

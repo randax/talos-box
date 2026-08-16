@@ -11,6 +11,7 @@ import (
 	"github.com/randax/talos-box/internal/config"
 	"github.com/randax/talos-box/internal/daemon"
 	"github.com/randax/talos-box/internal/imagecache"
+	"github.com/randax/talos-box/internal/talosversion"
 	"github.com/randax/talos-box/internal/version"
 )
 
@@ -215,6 +216,9 @@ func (c cli) createCluster(args []string) error {
 	}
 	resolvedSchematic, err := resolveSchematic(*schematic)
 	if err != nil {
+		return err
+	}
+	if err := talosversion.Validate(*talosVersion); err != nil {
 		return err
 	}
 	request := struct {
