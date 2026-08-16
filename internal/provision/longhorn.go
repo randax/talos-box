@@ -279,6 +279,8 @@ defaultSettings:
 // node resource instead. Clearing spec.allowScheduling stops new replicas
 // without evicting copies a worker-less phase already placed there — replica
 // I/O beside etcd is what the taint exists to prevent.
+// LonghornSchedulingConverged is the matching observed-state probe: it gates
+// the fast no-op so an interrupted pass rewrites this on the next tbx up.
 func reconcileLonghornControlPlaneScheduling(ctx context.Context, client dynamic.Interface, item cluster.Cluster, interval time.Duration) error {
 	allowScheduling := !clusterHasWorkers(item)
 	for _, node := range item.Nodes {
@@ -295,6 +297,63 @@ func reconcileLonghornControlPlaneScheduling(ctx context.Context, client dynamic
 	return nil
 }
 
+// LonghornSchedulingConverged observes the Longhorn half of the zero-worker
+// invariant: a control plane carries spec.allowScheduling only while the
+// cluster is worker-less. ControlPlaneSchedulingConverged covers only the
+// Talos half (taint and exclusion label), and longhorn-manager tolerates that
+// taint, so without this probe a mutation pass interrupted before its storage
+// stage would leave replica placement drift no end-state check can see and no
+// rerun of tbx up can repair.
+func LonghornSchedulingConverged(ctx context.Context, kubeconfig []byte, item cluster.Cluster) error {
+	config, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
+	if err != nil {
+		return fmt.Errorf("parse kubeconfig for longhorn scheduling probe: %w", err)
+	}
+	dynamicClient, err := dynamic.NewForConfig(config)
+	if err != nil {
+		return fmt.Errorf("create Kubernetes dynamic client for longhorn scheduling probe: %w", err)
+	}
+	return longhornSchedulingConverged(ctx, dynamicClient, item)
+}
+
+func longhornSchedulingConverged(ctx context.Context, client dynamic.Interface, item cluster.Cluster) error {
+	allowScheduling := !clusterHasWorkers(item)
+	nodes := client.Resource(longhornNodeResource).Namespace(longhornNamespace)
+	for _, node := range item.Nodes {
+		if node.Role != cluster.RoleControlPlane {
+			continue
+		}
+		// A missing node resource is drift, not an absence to skip: the
+		// manager DaemonSet registers every node it runs on, so convergence
+		// cannot be claimed while a control plane has no Longhorn node.
+		live, err := nodes.Get(ctx, node.Name, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("get longhorn node %q: %w", node.Name, err)
+		}
+		current, err := longhornNodeAllowsScheduling(live, node.Name)
+		if err != nil {
+			return err
+		}
+		if current != allowScheduling {
+			return fmt.Errorf("longhorn node %q allowScheduling = %t, want %t", node.Name, current, allowScheduling)
+		}
+	}
+	return nil
+}
+
+// longhornNodeAllowsScheduling reads spec.allowScheduling. An absent field
+// counts as true: Longhorn schedules onto a newly registered node by default.
+func longhornNodeAllowsScheduling(live *unstructured.Unstructured, name string) (bool, error) {
+	current, found, err := unstructured.NestedBool(live.Object, "spec", "allowScheduling")
+	if err != nil {
+		return false, fmt.Errorf("decode longhorn node %q scheduling: %w", name, err)
+	}
+	if !found {
+		return true, nil
+	}
+	return current, nil
+}
+
 func setLonghornNodeScheduling(ctx context.Context, client dynamic.Interface, name string, allowScheduling bool) error {
 	nodes := client.Resource(longhornNodeResource).Namespace(longhornNamespace)
 	// longhorn-manager creates the node resource once its pod registers the
@@ -304,13 +363,9 @@ func setLonghornNodeScheduling(ctx context.Context, client dynamic.Interface, na
 	if err != nil {
 		return fmt.Errorf("get longhorn node %q: %w", name, err)
 	}
-	current, found, err := unstructured.NestedBool(live.Object, "spec", "allowScheduling")
+	current, err := longhornNodeAllowsScheduling(live, name)
 	if err != nil {
-		return terminal(fmt.Errorf("decode longhorn node %q scheduling: %w", name, err))
-	}
-	if !found {
-		// Longhorn schedules onto a newly registered node by default.
-		current = true
+		return terminal(err)
 	}
 	if current == allowScheduling {
 		return nil

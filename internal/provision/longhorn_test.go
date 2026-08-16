@@ -295,6 +295,71 @@ func TestReconcileLonghornControlPlaneSchedulingRetriesUntilTheNodeRegisters(t *
 	}
 }
 
+// The Longhorn node resource is the only barrier once longhorn-manager
+// tolerates the control-plane taint, so a drifted spec.allowScheduling has to
+// fail convergence or the fast no-op would hide it forever.
+func TestLonghornSchedulingConvergedObservesBothDirections(t *testing.T) {
+	tests := []struct {
+		name            string
+		workers         int
+		allowScheduling bool
+		absent          bool
+		wantErr         string
+	}{
+		{name: "worker-ful cluster reserves the control plane", workers: 2},
+		{name: "worker-ful cluster drifted open", workers: 2, allowScheduling: true, wantErr: "allowScheduling = true, want false"},
+		{name: "worker-less cluster hosts replicas", workers: 0, allowScheduling: true},
+		{name: "worker-less cluster defaults to scheduling", workers: 0, absent: true},
+		{name: "worker-less cluster drifted closed", workers: 0, wantErr: "allowScheduling = false, want true"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			item, err := cluster.New("demo", 0, 1, test.workers, cluster.NodeDefaults{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			controlPlane := longhornNodeCR(item.Nodes[0].Name, test.allowScheduling)
+			if test.absent {
+				unstructured.RemoveNestedField(controlPlane.Object, "spec", "allowScheduling")
+			}
+			objects := []runtime.Object{controlPlane}
+			for _, node := range item.Nodes[1:] {
+				objects = append(objects, longhornNodeCR(node.Name, true))
+			}
+			client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+				runtime.NewScheme(),
+				map[schema.GroupVersionResource]string{longhornNodeResource: "NodeList"},
+				objects...,
+			)
+			err = longhornSchedulingConverged(context.Background(), client, item)
+			if test.wantErr == "" {
+				if err != nil {
+					t.Fatalf("longhornSchedulingConverged() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("longhornSchedulingConverged() error = %v, want %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestLonghornSchedulingConvergedRequiresTheNodeResource(t *testing.T) {
+	item, err := cluster.New("demo", 0, 1, 1, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{longhornNodeResource: "NodeList"},
+	)
+	err = longhornSchedulingConverged(context.Background(), client, item)
+	if err == nil || !strings.Contains(err.Error(), item.Nodes[0].Name) {
+		t.Fatalf("longhornSchedulingConverged() error = %v, want the missing control plane node", err)
+	}
+}
+
 func TestRenderLonghornRejectsNonLonghornIntent(t *testing.T) {
 	_, err := renderLonghorn(cluster.Cluster{ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILocalPath}})
 	if err == nil || !strings.Contains(err.Error(), "csi: longhorn") {

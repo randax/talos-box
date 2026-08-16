@@ -439,7 +439,14 @@ func storageConverged(ctx context.Context, item cluster.Cluster, kubeconfig []by
 	case cluster.CSILocalPath:
 		return provision.ProbeLocalPathStorage(ctx, kubeconfig, time.Second)
 	case cluster.CSILonghorn:
-		return provision.ProbeLonghornStorage(ctx, kubeconfig, time.Second)
+		if err := provision.ProbeLonghornStorage(ctx, kubeconfig, time.Second); err != nil {
+			return err
+		}
+		// The write/readback probe passes regardless of where replicas may
+		// land, so storage convergence has to include the control-plane
+		// scheduling posture or a mutation interrupted before the storage
+		// stage would fast no-op forever.
+		return provision.LonghornSchedulingConverged(ctx, kubeconfig, item)
 	default:
 		return nil
 	}
