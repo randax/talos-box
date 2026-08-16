@@ -12,6 +12,10 @@ import (
 
 const nodeVolumeCountTimeout = 10 * time.Second
 
+// nodeVolumeCountFunc counts the storage volumes whose data lives only on one
+// node, weighed against the remaining nodes in the passed cluster model.
+type nodeVolumeCountFunc func(context.Context, cluster.Cluster, string) (int, error)
+
 // gateNodeRemoval observes, best-effort, whether the node holds the only copy
 // of curated storage volumes before node.remove takes the operation lock (the
 // same unlocked-observation shape as dispatchProvisioning). Verified volumes

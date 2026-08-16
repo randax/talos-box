@@ -23,7 +23,9 @@ const (
 // Version 4 volume-gates node.remove and honors its force field.
 // Version 5 honors the per-cluster talos spec on up requests instead of
 // applying the file-level block to every created cluster.
-const ProtocolVersion = 5
+// Version 6 volume-gates snapshot.restore, honors its force field, and returns
+// its snapshots wrapped in a warning-carrying status.
+const ProtocolVersion = 6
 
 // Request is one newline-delimited daemon request.
 type Request struct {

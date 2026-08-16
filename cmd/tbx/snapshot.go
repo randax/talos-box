@@ -60,22 +60,28 @@ func (c cli) snapshotRestore(args []string) error {
 	fs := flag.NewFlagSet("snapshot restore", flag.ContinueOnError)
 	fs.SetOutput(c.err)
 	yes := fs.Bool("yes", false, "skip the running-cluster confirmation")
+	force := fs.Bool("force", false, "restore even when the nodes it deletes hold the only copy of volume data")
 	rest, err := parseInterspersed(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(rest) != 2 {
-		return errors.New("usage: tbx snapshot restore <cluster> <name> [--yes]")
+		return errors.New("usage: tbx snapshot restore <cluster> <name> [--yes] [--force]")
+	}
+	if err := c.ensureSnapshotRestoreSupport(); err != nil {
+		return err
 	}
 	if err := c.confirmIfRunning(rest[0], *yes, "restore over"); err != nil {
 		return err
 	}
-	var snaps []cluster.SnapshotInfo
-	if err := c.call("snapshot.restore", map[string]string{"cluster": rest[0], "name": rest[1]}, &snaps); err != nil {
+	var result daemon.SnapshotRestoreStatus
+	if err := c.call("snapshot.restore", map[string]any{"cluster": rest[0], "name": rest[1], "force": *force}, &result); err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(c.out, "restored %s from snapshot %s\n", rest[0], rest[1])
-	return err
+	if _, err := fmt.Fprintf(c.out, "restored %s from snapshot %s\n", rest[0], rest[1]); err != nil {
+		return err
+	}
+	return printWarning(c.err, result.Warning)
 }
 
 func (c cli) snapshotDelete(args []string) error {

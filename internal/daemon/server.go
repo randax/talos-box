@@ -33,12 +33,12 @@ type Server struct {
 	checkCache          func(context.Context, []string, imagecache.Architecture, bool) (CacheCheckResult, error)
 	boundMirrorGateways func() []string
 
-	// nodeRemoveMu guards nodeRemoveLocks, whose per-cluster mutexes
-	// serialize node.remove's unlocked volume observation with its locked
-	// removal, so concurrent removals cannot gate against each other's
-	// about-to-vanish replicas.
-	nodeRemoveMu    sync.Mutex
-	nodeRemoveLocks map[string]*sync.Mutex
+	// mutationMu guards mutationLocks, whose per-cluster mutexes serialize
+	// every operation that adds or deletes node disks — node.add, node.remove,
+	// snapshot.restore — with the unlocked volume observations that gate them,
+	// so no gate can vouch for a node another operation is about to delete.
+	mutationMu    sync.Mutex
+	mutationLocks map[string]*sync.Mutex
 
 	opMu                  sync.Mutex
 	vms                   map[string]map[string]hypervisor.Machine
@@ -51,7 +51,7 @@ type Server struct {
 	provisionReconcile    provisionReconcileFunc
 	storageProbe          func(context.Context, []byte) error
 	destroyVolumeCount    func(context.Context, cluster.Cluster) (int, error)
-	nodeVolumeCount       func(context.Context, cluster.Cluster, string) (int, error)
+	nodeVolumeCount       nodeVolumeCountFunc
 	storageEngineDelete   func(context.Context, cluster.Cluster) error
 	storageEngineValidate func(context.Context, cluster.Cluster) error
 	nodeIPLookup          func(string, int) string
@@ -352,6 +352,9 @@ func (s *Server) dispatch(request Request) Response {
 	if request.Op == "node.add" || request.Op == "node.remove" {
 		return s.dispatchNodeMutation(request)
 	}
+	if request.Op == "snapshot.restore" {
+		return s.dispatchSnapshotRestore(request)
+	}
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 
@@ -421,19 +424,19 @@ func (s *Server) dispatchProvisioning(request Request) Response {
 }
 
 func (s *Server) dispatchNodeMutation(request Request) Response {
+	var args nodeArgs
+	if err := decodeArgs(request.Args, &args); err != nil {
+		return failure(err)
+	}
+	// Every node mutation takes the cluster's disk-mutation lock, so gate and
+	// operation serialize: two concurrent removals could otherwise each observe
+	// the other's node as the surviving replica holder and delete both copies
+	// of a volume, and a node added between another operation's observation and
+	// its disk deletions would lose its disk unobserved.
+	lock := s.clusterMutationLock(args.Cluster)
+	lock.Lock()
 	var removalWarning string
-	unlockRemoval := func() {}
 	if request.Op == "node.remove" {
-		var args nodeArgs
-		if err := decodeArgs(request.Args, &args); err != nil {
-			return failure(err)
-		}
-		// Gate and removal serialize per cluster: two concurrent removals
-		// could otherwise each observe the other's node as the surviving
-		// replica holder and delete both copies of a volume.
-		lock := s.nodeRemovalLock(args.Cluster)
-		lock.Lock()
-		unlockRemoval = lock.Unlock
 		warning, err := s.gateNodeRemoval(args)
 		if err != nil {
 			lock.Unlock()
@@ -444,7 +447,7 @@ func (s *Server) dispatchNodeMutation(request Request) Response {
 	s.opMu.Lock()
 	data, tasks, err := s.handleNodeMutationLocked(request)
 	s.opMu.Unlock()
-	unlockRemoval()
+	lock.Unlock()
 	if err != nil {
 		if removalWarning != "" {
 			// the removal may have deleted state before failing; the data-loss
@@ -470,19 +473,52 @@ func (s *Server) dispatchNodeMutation(request Request) Response {
 	return success(data)
 }
 
-func (s *Server) nodeRemovalLock(clusterName string) *sync.Mutex {
-	// normalize the key: on a case-insensitive filesystem "Demo" and "demo"
-	// load the same cluster state and must share one removal lock
-	clusterName = strings.ToLower(clusterName)
-	s.nodeRemoveMu.Lock()
-	defer s.nodeRemoveMu.Unlock()
-	if s.nodeRemoveLocks == nil {
-		s.nodeRemoveLocks = make(map[string]*sync.Mutex)
+// dispatchSnapshotRestore gates the restore's node deletions outside the
+// operation lock, like dispatchNodeMutation: a restore drops every live node
+// the snapshot did not capture, disks and all.
+func (s *Server) dispatchSnapshotRestore(request Request) Response {
+	var args snapshotArgs
+	if err := decodeArgs(request.Args, &args); err != nil {
+		return failure(err)
 	}
-	lock, ok := s.nodeRemoveLocks[clusterName]
+	// restore shares the node mutations' per-cluster lock: they all delete or
+	// add node disks, and no gate may observe a node another operation is
+	// about to delete as a copy holder.
+	lock := s.clusterMutationLock(args.Cluster)
+	lock.Lock()
+	warning, err := s.gateSnapshotRestore(args)
+	if err != nil {
+		lock.Unlock()
+		return failure(err)
+	}
+	s.opMu.Lock()
+	snapshots, err := s.snapshotRestore(request.Args)
+	s.opMu.Unlock()
+	lock.Unlock()
+	if err != nil {
+		if warning != "" {
+			// the restore may have deleted disks before failing; the data-loss
+			// note must reach the user alongside the failure
+			return failure(fmt.Errorf("%w (warning: %s)", err, warning))
+		}
+		return failure(err)
+	}
+	return success(SnapshotRestoreStatus{Snapshots: snapshots, Warning: warning})
+}
+
+func (s *Server) clusterMutationLock(clusterName string) *sync.Mutex {
+	// normalize the key: on a case-insensitive filesystem "Demo" and "demo"
+	// load the same cluster state and must share one mutation lock
+	clusterName = strings.ToLower(clusterName)
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	if s.mutationLocks == nil {
+		s.mutationLocks = make(map[string]*sync.Mutex)
+	}
+	lock, ok := s.mutationLocks[clusterName]
 	if !ok {
 		lock = &sync.Mutex{}
-		s.nodeRemoveLocks[clusterName] = lock
+		s.mutationLocks[clusterName] = lock
 	}
 	return lock
 }
@@ -542,7 +578,9 @@ func (s *Server) handle(request Request) (any, error) {
 	case "snapshot.create":
 		return s.snapshotCreate(request.Args)
 	case "snapshot.restore":
-		return s.snapshotRestore(request.Args)
+		// restore flows through dispatchSnapshotRestore, which volume-gates the
+		// nodes it deletes before taking opMu; a locked ungated path must not exist
+		return nil, fmt.Errorf("operation %q must be dispatched as a snapshot restore", request.Op)
 	case "snapshot.list":
 		return s.snapshotList(request.Args)
 	case "snapshot.delete":

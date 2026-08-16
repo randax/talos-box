@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -80,8 +81,16 @@ func RestoreSnapshot(item Cluster, name string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(src); err != nil {
-		return fmt.Errorf("snapshot %q does not exist", name)
+	// validate the captured state and its disks before touching a single file:
+	// the restore deletes live disks and the live state file, and only then
+	// installs the snapshot's — a defect discovered at that point would have
+	// already destroyed the cluster it was supposed to restore
+	captured, err := readSnapshotState(item.Name, name)
+	if err != nil {
+		return err
+	}
+	if err := checkSnapshotDisks(src, name, captured.Nodes); err != nil {
+		return err
 	}
 	live, err := Dir(item.Name)
 	if err != nil {
@@ -132,6 +141,69 @@ func RestoreSnapshot(item Cluster, name string) error {
 		return err
 	}
 	return copyFile(filepath.Join(src, stateFile), liveState)
+}
+
+// SnapshotNodes returns the node set the named snapshot captured, so a caller
+// can tell which live nodes a restore would delete.
+func SnapshotNodes(clusterName, name string) ([]Node, error) {
+	captured, err := readSnapshotState(clusterName, name)
+	if err != nil {
+		return nil, err
+	}
+	return captured.Nodes, nil
+}
+
+// checkSnapshotDisks rejects a snapshot whose captured state and disk images
+// disagree. The restore deletes live disks by which images the snapshot dir
+// holds, while callers reason about which nodes it deletes from the captured
+// state: a node listed without its image would have its live disk deleted
+// ungated, and a stray image would restore a disk for a node no state claims.
+func checkSnapshotDisks(dir, name string, nodes []Node) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	images := map[string]bool{}
+	for _, entry := range entries {
+		if filepath.Ext(entry.Name()) == ".img" {
+			images[entry.Name()] = true
+		}
+	}
+	for _, node := range nodes {
+		image := node.Name + ".img"
+		if !images[image] {
+			return fmt.Errorf("snapshot %q is missing the disk image for node %q", name, node.Name)
+		}
+		delete(images, image)
+	}
+	stray := make([]string, 0, len(images))
+	for image := range images {
+		stray = append(stray, image)
+	}
+	if len(stray) > 0 {
+		sort.Strings(stray)
+		return fmt.Errorf("snapshot %q has disk image %q for no captured node", name, stray[0])
+	}
+	return nil
+}
+
+func readSnapshotState(clusterName, name string) (Cluster, error) {
+	dir, err := snapshotDir(clusterName, name)
+	if err != nil {
+		return Cluster{}, err
+	}
+	if _, err := os.Stat(dir); err != nil {
+		return Cluster{}, fmt.Errorf("snapshot %q does not exist", name)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, stateFile))
+	if err != nil {
+		return Cluster{}, fmt.Errorf("snapshot %q has no readable cluster state: %w", name, err)
+	}
+	var captured Cluster
+	if err := json.Unmarshal(data, &captured); err != nil {
+		return Cluster{}, fmt.Errorf("snapshot %q has unreadable cluster state: %w", name, err)
+	}
+	return captured, nil
 }
 
 // ListSnapshots returns the cluster's snapshots, newest first.

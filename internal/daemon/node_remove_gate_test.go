@@ -275,3 +275,29 @@ func TestNodeRemoveSkipsVolumeObservationWithoutCSI(t *testing.T) {
 		t.Fatalf("node.remove without csi warned %q, want no warning", status.Warning)
 	}
 }
+
+func TestNodeAddSerializesWithDiskDeletingOperations(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 2)
+	stubNodeMutationReconcile(service)
+	// a node added between another operation's volume observation and its disk
+	// deletions would lose its disk unobserved, so node.add takes the same lock
+	lock := service.clusterMutationLock(item.Name)
+	lock.Lock()
+	raw, err := json.Marshal(nodeArgs{Cluster: item.Name, Role: cluster.RoleWorker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan Response, 1)
+	go func() { done <- service.dispatch(Request{Op: "node.add", Args: raw}) }()
+
+	select {
+	case response := <-done:
+		t.Fatalf("node.add completed while the cluster mutation lock was held: %+v", response)
+	case <-time.After(100 * time.Millisecond):
+	}
+	lock.Unlock()
+
+	if response := <-done; !response.OK {
+		t.Fatalf("node.add after releasing the lock failed: %s", response.Error)
+	}
+}
