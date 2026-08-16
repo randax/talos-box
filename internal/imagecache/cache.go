@@ -501,6 +501,9 @@ func planKnownVersionPrune(versionPath string) ([]pruneAction, []string, bool, e
 			archPlan, err := planKnownFiles(archDir, []knownPruneName{
 				{name: "disk.raw", countAsImage: true},
 				{name: fmt.Sprintf("metal-%s.raw.xz", architecture)},
+				// A surviving pin marker would keep the directory alive
+				// and re-pin an image the next pull downloads.
+				{name: pinMarkerName},
 			}, []knownPrunePrefix{
 				{prefix: ".disk.raw-"},
 				{prefix: fmt.Sprintf(".metal-%s.raw.xz-", architecture)},

@@ -25,6 +25,35 @@ func (c *Cache) Schematic(extraArgs ...string) (string, error) {
 	return c.postSchematic(body)
 }
 
+// DefaultSchematic returns talosbox's own schematic id, composing it against
+// the Factory only the first time. The id is recorded like any other
+// composition so a restarted daemon — or an offline one — resolves the default
+// combination from disk instead of posting again.
+func (c *Cache) DefaultSchematic() (string, error) {
+	id, found, err := c.CompositionID("", "", nil)
+	if err != nil {
+		return "", err
+	}
+	if found {
+		return id, nil
+	}
+	id, err = c.Schematic()
+	if err != nil {
+		return "", err
+	}
+	if err := c.RecordDefaultSchematic(id); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+// RecordDefaultSchematic remembers the default schematic id. The record is
+// keyed on no base, no extensions, and no version: the default customization
+// carries no version-dependent field, so one record answers every version.
+func (c *Cache) RecordDefaultSchematic(id string) error {
+	return c.RecordComposition("", "", nil, id)
+}
+
 func (c *Cache) postSchematic(body []byte) (string, error) {
 	request, err := http.NewRequest(http.MethodPost, strings.TrimRight(c.factoryURL, "/")+"/schematics", bytes.NewReader(body))
 	if err != nil {

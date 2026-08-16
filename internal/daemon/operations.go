@@ -74,10 +74,22 @@ type statusArgs struct {
 	Name    string `json:"name"`
 }
 
-type cachePullArgs struct {
-	Schematic    string `json:"schematic"`
-	Version      string `json:"version"`
-	TalosVersion string `json:"talosVersion"`
+// CachePullArgs asks for image combinations to be made available offline.
+// Combinations carries the file-aware form; the scalar fields are the older
+// single-combination wire shape and stay honoured for an older tbx.
+type CachePullArgs struct {
+	Schematic    string                 `json:"schematic,omitempty"`
+	Version      string                 `json:"version,omitempty"`
+	TalosVersion string                 `json:"talosVersion,omitempty"`
+	Combinations []CachePullCombination `json:"combinations,omitempty"`
+}
+
+// CachePullCombination is one cluster's resolved image pin, with inheritance
+// already applied by the client.
+type CachePullCombination struct {
+	Schematic  string   `json:"schematic,omitempty"`
+	Version    string   `json:"version,omitempty"`
+	Extensions []string `json:"extensions,omitempty"`
 }
 
 type CacheWarmArgs struct {
@@ -189,8 +201,19 @@ type CapabilityStatus struct {
 	Reason    string `json:"reason,omitempty"`
 }
 
-// CachePullResult describes the image made ready by cache.pull.
+// CachePullResult describes the images made ready by cache.pull. The scalar
+// fields repeat the first image so a tbx predating Images still reports the
+// single-combination pull it asked for.
 type CachePullResult struct {
+	Schematic    string                  `json:"schematic"`
+	Version      string                  `json:"version"`
+	Architecture hypervisor.Architecture `json:"architecture"`
+	Path         string                  `json:"path"`
+	Images       []CachePullImage        `json:"images,omitempty"`
+}
+
+// CachePullImage is one cached and pinned disk image.
+type CachePullImage struct {
 	Schematic    string                  `json:"schematic"`
 	Version      string                  `json:"version"`
 	Architecture hypervisor.Architecture `json:"architecture"`
@@ -1001,23 +1024,52 @@ func nodeStatusWith(
 }
 
 func (s *Server) pullCache(raw json.RawMessage) (CachePullResult, error) {
-	var args cachePullArgs
+	var args CachePullArgs
 	if err := decodeArgs(raw, &args); err != nil {
 		return CachePullResult{}, err
 	}
 	if args.Version == "" {
 		args.Version = args.TalosVersion
 	}
-	schematic, talosVersion, err := s.resolveImage(args.Schematic, args.Version, nil)
-	if err != nil {
-		return CachePullResult{}, err
+	combinations := args.Combinations
+	if len(combinations) == 0 {
+		combinations = []CachePullCombination{{Schematic: args.Schematic, Version: args.Version}}
 	}
 	architecture := s.hypervisor.Architecture()
-	path, err := s.cache.Ensure(schematic, talosVersion, imagecache.Architecture(architecture))
-	if err != nil {
-		return CachePullResult{}, err
+	var result CachePullResult
+	// Distinct clusters routinely share a pin, and re-composition resolves
+	// spellings apart: dedupe on the resolved combination so each image is
+	// downloaded once.
+	fetched := make(map[CachePullImage]struct{}, len(combinations))
+	for _, combination := range combinations {
+		// Resolution composes while online, which is what makes the same
+		// combination answerable from cache afterwards.
+		schematic, talosVersion, err := s.resolveImage(combination.Schematic, combination.Version, combination.Extensions)
+		if err != nil {
+			return CachePullResult{}, err
+		}
+		image := CachePullImage{Schematic: schematic, Version: talosVersion, Architecture: architecture}
+		if _, duplicate := fetched[image]; duplicate {
+			continue
+		}
+		fetched[image] = struct{}{}
+		image.Path, err = s.cache.Ensure(schematic, talosVersion, imagecache.Architecture(architecture))
+		if err != nil {
+			return CachePullResult{}, err
+		}
+		// An explicit pull is the statement that this combination is
+		// wanted; the pin is what keeps prune off it.
+		if err := s.cache.Pin(schematic, talosVersion, imagecache.Architecture(architecture)); err != nil {
+			return CachePullResult{}, err
+		}
+		result.Images = append(result.Images, image)
 	}
-	return CachePullResult{Schematic: schematic, Version: talosVersion, Architecture: architecture, Path: path}, nil
+	if len(result.Images) > 0 {
+		first := result.Images[0]
+		result.Schematic, result.Version = first.Schematic, first.Version
+		result.Architecture, result.Path = first.Architecture, first.Path
+	}
+	return result, nil
 }
 
 func (s *Server) warmMirrorCache(raw json.RawMessage) (CacheWarmResult, error) {
@@ -1370,7 +1422,9 @@ func (s *Server) imageDefaults(schematic, talosVersion string, requestedExtensio
 	if schematic == "" {
 		if s.defaultSchematic == "" {
 			var err error
-			s.defaultSchematic, err = s.cache.Schematic()
+			// The recorded default id is what an offline daemon
+			// resolves from, so memoizing is only a shortcut.
+			s.defaultSchematic, err = s.cache.DefaultSchematic()
 			if err != nil {
 				return "", "", err
 			}

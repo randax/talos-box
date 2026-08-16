@@ -433,33 +433,7 @@ func (c cli) runCache(args []string) error {
 	}
 	switch args[0] {
 	case "pull":
-		flags := flag.NewFlagSet("cache pull", flag.ContinueOnError)
-		flags.SetOutput(c.err)
-		talosVersion := flags.String("talos-version", daemon.DefaultTalosVersion, "Talos version")
-		schematic := flags.String("schematic", "", "Image Factory schematic")
-		positionals, err := parseInterspersed(flags, args[1:])
-		if err != nil {
-			return err
-		}
-		if len(positionals) != 0 {
-			return errors.New("usage: tbx cache pull [--talos-version VERSION --schematic ID]")
-		}
-		if *talosVersion != "" {
-			if err := talosversion.Validate(*talosVersion); err != nil {
-				return err
-			}
-		}
-		resolvedSchematic, err := resolveSchematic(*schematic)
-		if err != nil {
-			return err
-		}
-		request := map[string]string{"version": *talosVersion, "schematic": resolvedSchematic}
-		var result daemon.CachePullResult
-		if err := c.call("cache.pull", request, &result); err != nil {
-			return err
-		}
-		_, err = fmt.Fprintf(c.out, "cached Talos %s %s schematic %s at %s\n", result.Version, result.Architecture, result.Schematic, result.Path)
-		return err
+		return c.runCachePull(args[1:])
 	case "prune":
 		flags := flag.NewFlagSet("cache prune", flag.ContinueOnError)
 		flags.SetOutput(c.err)
@@ -605,5 +579,7 @@ func resolveSchematic(schematic string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return cache.Schematic()
+	// The recorded default id keeps a create resolvable after `tbx cache
+	// pull`, without the Factory.
+	return cache.DefaultSchematic()
 }
