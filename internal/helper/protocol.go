@@ -5,6 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/randax/talos-box/internal/shellquote"
 )
 
 const (
@@ -15,6 +20,24 @@ const (
 )
 
 var errProtocolMismatch = errors.New("helper protocol mismatch")
+
+// The installed helper binary is pinned at an absolute path by its service
+// definition, so restarting it relaunches the same stale binary; only a
+// reinstall replaces it. The advice names the concrete tbx path because sudo
+// does not resolve a checkout's bin directory: tbx and tbxd sit next to each
+// other, so the running executable's directory locates tbx from either.
+func protocolMismatchAdvice() string {
+	executable, err := os.Executable()
+	return protocolMismatchAdviceFor(executable, err)
+}
+
+func protocolMismatchAdviceFor(executable string, lookupErr error) string {
+	if lookupErr != nil {
+		return "run `sudo tbx system install` from the current checkout to reinstall the helper"
+	}
+	tbxPath := shellquote.Quote(filepath.Join(filepath.Dir(executable), "tbx"))
+	return fmt.Sprintf("run `sudo %s system install` to reinstall the helper", tbxPath)
+}
 
 // Request is one newline-delimited helper request.
 type Request struct {
@@ -38,10 +61,11 @@ type Info struct {
 
 func protocolMismatchError(clientVersion, helperVersion int) error {
 	return fmt.Errorf(
-		"%w (client %d, helper %d): restart the helper",
+		"%w (client %d, helper %d): %s",
 		errProtocolMismatch,
 		clientVersion,
 		helperVersion,
+		protocolMismatchAdvice(),
 	)
 }
 
@@ -49,7 +73,17 @@ func protocolHandshakeFailure(detail string) error {
 	if detail == "" {
 		detail = "helper rejected the version handshake"
 	}
-	return fmt.Errorf("%w: %s; restart the helper", errProtocolMismatch, detail)
+	// A mismatched helper rejects the handshake with its own mismatch message,
+	// whose advice reflects that stale build (any wording, and any path it
+	// resolved for itself). Keep its version facts — everything before the
+	// colon — substitute this build's advice, and wrap once instead of
+	// nesting mismatch inside mismatch.
+	if rest, ok := strings.CutPrefix(detail, errProtocolMismatch.Error()); ok {
+		facts, _, _ := strings.Cut(rest, ":")
+		facts = strings.TrimRight(facts, ";: ")
+		return fmt.Errorf("%w%s: %s", errProtocolMismatch, facts, protocolMismatchAdvice())
+	}
+	return fmt.Errorf("%w: %s; %s", errProtocolMismatch, detail, protocolMismatchAdvice())
 }
 
 func success(data any) Response {

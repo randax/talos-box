@@ -127,7 +127,7 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 	clusters, clusterErr := deps.listClusters()
 	anyRunning := false
 	if isDaemonUnavailable(clusterErr) {
-		detail := fmt.Sprintf("daemon unavailable: %v", clusterErr)
+		detail := daemonUnavailableDetail(clusterErr)
 		if err := writeFindings(
 			doctorFinding{level: "SKIP", check: "system-dns", detail: detail},
 			doctorFinding{level: "SKIP", check: "routes", detail: detail},
@@ -195,7 +195,7 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 	} else {
 		cacheResult, err := deps.listCache()
 		if isDaemonUnavailable(err) {
-			mirrorFinding.level, mirrorFinding.detail = "SKIP", fmt.Sprintf("daemon unavailable: %v", err)
+			mirrorFinding.level, mirrorFinding.detail = "SKIP", daemonUnavailableDetail(err)
 		} else if err != nil {
 			mirrorFinding.level, mirrorFinding.detail = "FAIL", err.Error()
 		} else {
@@ -272,6 +272,10 @@ func stringSlicesEqual(left, right []string) bool {
 		}
 	}
 	return true
+}
+
+func daemonUnavailableDetail(err error) string {
+	return fmt.Sprintf("daemon unavailable: %v", err)
 }
 
 func isDaemonUnavailable(err error) bool {
