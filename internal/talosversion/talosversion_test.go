@@ -16,7 +16,7 @@ func TestValidateAcceptsSupportedVersions(t *testing.T) {
 }
 
 func TestValidateRefusesBelowFloorNamingBothVersions(t *testing.T) {
-	for _, version := range []string{"v0.14.0", "v1.11.9", "v1.0.0"} {
+	for _, version := range []string{"v0.14.0", "v1.11.9", "v1.0.0", "v1.12.0-alpha.1"} {
 		err := Validate(version)
 		if err == nil {
 			t.Fatalf("Validate(%q) = nil, want below-floor refusal", version)
@@ -42,6 +42,9 @@ func TestWarningAboveDefaultOnlyAndNamesBothVersions(t *testing.T) {
 	}
 	if warning := NewerThanTestedWarning("v1.13.7"); warning == "" {
 		t.Error("NewerThanTestedWarning(v1.13.7) = \"\", want a warning for a newer patch")
+	}
+	if warning := NewerThanTestedWarning("v1.13.7-alpha.1"); warning == "" {
+		t.Error("NewerThanTestedWarning(v1.13.7-alpha.1) = \"\", want a warning for a pre-release above the default")
 	}
 	for _, version := range []string{Default, Min, "v1.12.5", "v1.13.6-beta.0"} {
 		if warning := NewerThanTestedWarning(version); warning != "" {

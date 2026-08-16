@@ -147,7 +147,7 @@ func TestAddNodeSurfacesHostPressureProbeFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	item.Schematic = "test-schematic"
-	item.TalosVersion = "v1.12.1"
+	item.TalosVersion = "v1.2.3"
 	if err := cluster.Save(item); err != nil {
 		t.Fatal(err)
 	}

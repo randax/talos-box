@@ -682,7 +682,7 @@ func runningLonghornClusterForNodeMutation(t *testing.T, controlPlanes, workers 
 	}
 	item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILonghorn}
 	item.Schematic = "custom-schematic"
-	item.TalosVersion = "v1.12.1"
+	item.TalosVersion = "v1.2.3"
 	item.ImageArchitecture = string(hypervisor.ArchitectureARM64)
 	if err := cluster.Save(item); err != nil {
 		t.Fatal(err)

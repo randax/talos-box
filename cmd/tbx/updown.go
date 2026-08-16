@@ -8,6 +8,7 @@ import (
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/config"
 	"github.com/randax/talos-box/internal/daemon"
+	"github.com/randax/talos-box/internal/talosversion"
 )
 
 const defaultConfigFile = "talosbox.yaml"
@@ -16,6 +17,16 @@ func (c cli) runUp(args []string) error {
 	cfg, force, quiet, err := loadUpConfigFile(args)
 	if err != nil {
 		return err
+	}
+	// config.Parse already resolved per-cluster inheritance, so each spec
+	// carries its effective version.
+	for _, spec := range cfg.Clusters {
+		if spec.Talos.Version == "" {
+			continue
+		}
+		if err := talosversion.Validate(spec.Talos.Version); err != nil {
+			return fmt.Errorf("cluster %s: %w", spec.Name, err)
+		}
 	}
 	if input, ok := strongestProvisioningIntent(cfg); ok {
 		if err := c.ensureProvisioningIntentSupport(input); err != nil {

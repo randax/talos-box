@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/config"
 	"github.com/randax/talos-box/internal/hostpressure"
 	"github.com/randax/talos-box/internal/hypervisor"
 	"github.com/randax/talos-box/internal/imagecache"
@@ -45,10 +46,10 @@ func TestCreateClusterRefusesMalformedVersionBeforeMutation(t *testing.T) {
 	}
 }
 
-func TestResolveImageGuardsEveryVersionPath(t *testing.T) {
-	// resolveImage is the shared chokepoint behind create, up, cache pull,
-	// and cachedDisk; garbage must never reach image resolution through any
-	// of them.
+func TestResolveImageGuardsEveryRequestPath(t *testing.T) {
+	// resolveImage is the shared request chokepoint behind create, up, and
+	// cache pull; garbage must never reach image resolution through any of
+	// them. Stored cluster state resolves via imageDefaults and stays exempt.
 	service := &Server{}
 	if _, _, err := service.resolveImage("aaa", "v1.11.9"); err == nil {
 		t.Fatal("resolveImage() accepted a below-floor version")
@@ -58,6 +59,48 @@ func TestResolveImageGuardsEveryVersionPath(t *testing.T) {
 	}
 	if _, version, err := service.resolveImage("aaa", ""); err != nil || version != DefaultTalosVersion {
 		t.Fatalf("resolveImage(\"\") = (%q, %v), want the default version", version, err)
+	}
+	// A cluster persisted before the floor existed keeps working.
+	if _, version, err := service.imageDefaults("aaa", "v1.2.3"); err != nil || version != "v1.2.3" {
+		t.Fatalf("imageDefaults(stored v1.2.3) = (%q, %v), want the stored version untouched", version, err)
+	}
+}
+
+func TestUpRefusesUnsupportedVersionsBeforeCreatingAnyCluster(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	service := newVersionTestServer(t, "aaa", DefaultTalosVersion)
+	raw, err := json.Marshal(upArgs{Clusters: []config.ClusterSpec{
+		{Name: "fine", ControlPlanes: 1, Node: cluster.NodeDefaults{MemoryMiB: 1, CPUs: 1, DiskGiB: 1},
+			Talos: config.TalosSpec{Version: DefaultTalosVersion, Schematic: "aaa"}},
+		{Name: "too-old", ControlPlanes: 1, Node: cluster.NodeDefaults{MemoryMiB: 1, CPUs: 1, DiskGiB: 1},
+			Talos: config.TalosSpec{Version: "v1.11.9", Schematic: "aaa"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.up(raw)
+	if err == nil || !strings.Contains(err.Error(), "too-old") || !strings.Contains(err.Error(), "v1.11.9") || !strings.Contains(err.Error(), MinTalosVersion) {
+		t.Fatalf("up() error = %v, want refusal naming the cluster, v1.11.9, and %s", err, MinTalosVersion)
+	}
+	if _, loadErr := cluster.Load("fine"); loadErr == nil {
+		t.Fatal("up() created the first cluster before refusing the below-floor one")
+	}
+}
+
+func TestUpAppliesFileLevelVersionFloorToInheritingClusters(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	service := newVersionTestServer(t, "aaa", DefaultTalosVersion)
+	raw, err := json.Marshal(upArgs{
+		Talos: config.TalosSpec{Version: "v0.14.0", Schematic: "aaa"},
+		Clusters: []config.ClusterSpec{
+			{Name: "inherits", ControlPlanes: 1, Node: cluster.NodeDefaults{MemoryMiB: 1, CPUs: 1, DiskGiB: 1}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.up(raw); err == nil || !strings.Contains(err.Error(), "v0.14.0") {
+		t.Fatalf("up() error = %v, want refusal of the inherited file-level version", err)
 	}
 }
 

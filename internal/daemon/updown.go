@@ -11,6 +11,7 @@ import (
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/config"
 	"github.com/randax/talos-box/internal/provision"
+	"github.com/randax/talos-box/internal/talosversion"
 )
 
 type upArgs struct {
@@ -32,6 +33,9 @@ func (s *Server) upWithMaintenance(raw json.RawMessage, maintenance map[string]m
 func (s *Server) upWithObservations(raw json.RawMessage, maintenance map[string]maintenanceObservation, storage map[string]storageObservation) ([]Action, error) {
 	var args upArgs
 	if err := decodeArgs(raw, &args); err != nil {
+		return nil, err
+	}
+	if err := validateSpecVersions(args.Talos, args.Clusters); err != nil {
 		return nil, err
 	}
 	existing, err := s.existingStates()
@@ -76,12 +80,30 @@ func (s *Server) validateUp(raw json.RawMessage, maintenance map[string]maintena
 	if err := decodeArgs(raw, &args); err != nil {
 		return err
 	}
+	if err := validateSpecVersions(args.Talos, args.Clusters); err != nil {
+		return err
+	}
 	existing, err := s.existingStates()
 	if err != nil {
 		return err
 	}
 	_, err = s.preflightUpWithStorage(args.Clusters, existing, maintenance, storage)
 	return err
+}
+
+// validateSpecVersions refuses an up request whose effective versions fall
+// outside the support window before any cluster is created or updated.
+func validateSpecVersions(fileTalos config.TalosSpec, specs []config.ClusterSpec) error {
+	for _, spec := range specs {
+		version := resolveSpecTalos(spec, fileTalos).Version
+		if version == "" {
+			continue
+		}
+		if err := talosversion.Validate(version); err != nil {
+			return fmt.Errorf("cluster %s: %w", spec.Name, err)
+		}
+	}
+	return nil
 }
 
 type maintenanceObservation struct {

@@ -421,6 +421,9 @@ func (c cli) runCache(args []string) error {
 		if err != nil {
 			return err
 		}
+		if err := talosversion.Validate(*talosVersion); err != nil {
+			return err
+		}
 		request := map[string]string{"version": *talosVersion, "schematic": resolvedSchematic}
 		var result daemon.CachePullResult
 		if err := c.call("cache.pull", request, &result); err != nil {

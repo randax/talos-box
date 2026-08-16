@@ -22,6 +22,10 @@ A storage engine from talosbox's fixed, tested set (`longhorn` or `local-path`).
 
 A Talos system extension from talosbox's fixed, tested set, referenced by bare short name in a `talos.extensions` list and composed into the cluster's schematic by tbx. Arbitrary extension lists are not a supported concept; `talos.schematic` remains the escape hatch.
 
+## Supported version window
+
+The Talos versions a cluster may request: from the pinned floor (`MinTalosVersion`, the tested default's previous minor) up. Below the floor or malformed is refused at every request boundary; between floor and the tested default passes silently; above the default is accepted with a single newer-than-tested warning at create. Both pins live in `internal/talosversion` and move together in one diff. Stored cluster state is exempt — a floor bump never retroactively refuses an existing cluster.
+
 ## Host substrate
 
 The platform-specific VM, networking, DNS, and service-manager implementation beneath the shared talosbox cluster model. A host substrate may have different mechanics without changing the guest-visible contract.

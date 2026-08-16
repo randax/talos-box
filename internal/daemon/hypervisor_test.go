@@ -101,7 +101,7 @@ func TestCachedDiskUsesHypervisorArchitecture(t *testing.T) {
 		hypervisor.ArchitectureAMD64: "amd64 disk",
 		hypervisor.ArchitectureARM64: "arm64 disk",
 	} {
-		path := filepath.Join(root, "test-schematic", "v1.12.1", string(architecture), "disk.raw")
+		path := filepath.Join(root, "test-schematic", "v1.2.3", string(architecture), "disk.raw")
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -114,12 +114,12 @@ func TestCachedDiskUsesHypervisorArchitecture(t *testing.T) {
 		cache:      imagecache.New(root),
 		hypervisor: &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
 	}
-	item := cluster.Cluster{Schematic: "test-schematic", TalosVersion: "v1.12.1", ImageArchitecture: "amd64"}
+	item := cluster.Cluster{Schematic: "test-schematic", TalosVersion: "v1.2.3", ImageArchitecture: "amd64"}
 	path, err := service.cachedDisk(item)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := filepath.Join(root, "test-schematic", "v1.12.1", "amd64", "disk.raw")
+	want := filepath.Join(root, "test-schematic", "v1.2.3", "amd64", "disk.raw")
 	if path != want {
 		t.Fatalf("cachedDisk() = %q, want target hypervisor path %q", path, want)
 	}
@@ -135,7 +135,7 @@ func TestCachedDiskRejectsClusterHypervisorArchitectureMismatch(t *testing.T) {
 	item := cluster.Cluster{
 		Name:              "arm-cluster",
 		Schematic:         "test-schematic",
-		TalosVersion:      "v1.12.1",
+		TalosVersion:      "v1.2.3",
 		ImageArchitecture: "arm64",
 	}
 	_, err := service.cachedDisk(item)

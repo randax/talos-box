@@ -1284,11 +1284,22 @@ func isHexDigit(character rune) bool {
 	return (character >= 'a' && character <= 'f') || (character >= 'A' && character <= 'F') || (character >= '0' && character <= '9')
 }
 
+// resolveImage guards the request boundary: a requested version must be
+// well-formed and inside the support window before it reaches image
+// resolution. Stored cluster state goes through imageDefaults instead —
+// a floor bump must not retroactively refuse clusters that already exist.
 func (s *Server) resolveImage(schematic, talosVersion string) (string, string, error) {
+	if talosVersion != "" {
+		if err := talosversion.Validate(talosVersion); err != nil {
+			return "", "", err
+		}
+	}
+	return s.imageDefaults(schematic, talosVersion)
+}
+
+func (s *Server) imageDefaults(schematic, talosVersion string) (string, string, error) {
 	if talosVersion == "" {
 		talosVersion = DefaultTalosVersion
-	} else if err := talosversion.Validate(talosVersion); err != nil {
-		return "", "", err
 	}
 	if schematic == "" {
 		if s.defaultSchematic == "" {
@@ -1304,7 +1315,7 @@ func (s *Server) resolveImage(schematic, talosVersion string) (string, string, e
 }
 
 func (s *Server) cachedDisk(item cluster.Cluster) (string, error) {
-	schematic, talosVersion, err := s.resolveImage(item.Schematic, item.TalosVersion)
+	schematic, talosVersion, err := s.imageDefaults(item.Schematic, item.TalosVersion)
 	if err != nil {
 		return "", err
 	}

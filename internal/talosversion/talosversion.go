@@ -18,15 +18,16 @@ const Min = "v1.12.0"
 
 // Machinery's contract parse validates nothing beyond a leading
 // vMAJOR.MINOR, so image resolution needs the full triple checked here.
-var versionShape = regexp.MustCompile(`^v(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?$`)
+var versionShape = regexp.MustCompile(`^v(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?$`)
+
+var (
+	floor  = mustParse(Min)
+	tested = mustParse(Default)
+)
 
 // Validate refuses malformed versions and versions below Min.
 func Validate(version string) error {
 	requested, err := parse(version)
-	if err != nil {
-		return err
-	}
-	floor, err := parse(Min)
 	if err != nil {
 		return err
 	}
@@ -44,36 +45,48 @@ func NewerThanTestedWarning(version string) string {
 	if err != nil {
 		return ""
 	}
-	tested, err := parse(Default)
-	if err != nil {
-		return ""
-	}
 	if tested.less(requested) {
 		return fmt.Sprintf("talos %s is newer than the last tested %s; proceeding", version, Default)
 	}
 	return ""
 }
 
-type triple struct{ major, minor, patch int }
+type parsedVersion struct {
+	major, minor, patch int
+	prerelease          bool
+}
 
-func parse(version string) (triple, error) {
+func parse(version string) (parsedVersion, error) {
 	matches := versionShape.FindStringSubmatch(version)
 	if matches == nil {
-		return triple{}, fmt.Errorf("invalid talos version %q: expected vMAJOR.MINOR.PATCH, like %s", version, Default)
+		return parsedVersion{}, fmt.Errorf("invalid talos version %q: expected vMAJOR.MINOR.PATCH, like %s", version, Default)
 	}
-	var parsed triple
+	var parsed parsedVersion
 	parsed.major, _ = strconv.Atoi(matches[1])
 	parsed.minor, _ = strconv.Atoi(matches[2])
 	parsed.patch, _ = strconv.Atoi(matches[3])
+	parsed.prerelease = matches[4] != ""
 	return parsed, nil
 }
 
-func (v triple) less(other triple) bool {
+func mustParse(version string) parsedVersion {
+	parsed, err := parse(version)
+	if err != nil {
+		panic(err)
+	}
+	return parsed
+}
+
+func (v parsedVersion) less(other parsedVersion) bool {
 	if v.major != other.major {
 		return v.major < other.major
 	}
 	if v.minor != other.minor {
 		return v.minor < other.minor
 	}
-	return v.patch < other.patch
+	if v.patch != other.patch {
+		return v.patch < other.patch
+	}
+	// Semver orders a pre-release below its release.
+	return v.prerelease && !other.prerelease
 }
