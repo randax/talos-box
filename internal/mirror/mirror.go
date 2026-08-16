@@ -924,16 +924,25 @@ func (s *Server) negotiateToken(ctx context.Context, challenge bearerChallenge, 
 		return "", fmt.Errorf("token endpoint returned no token")
 	}
 
-	cacheKey := requestScope
-	if cacheKey == "" {
-		cacheKey = scope
+	// Cache under the request-derived scope only: it is the key fetch looks
+	// up, so any other key would be written and never read. A request whose
+	// path yields no scope negotiates per request instead.
+	if requestScope != "" {
+		s.mu.Lock()
+		if s.tokens == nil {
+			s.tokens = make(map[string]token)
+		}
+		now := s.currentTime()
+		// The daemon is long-lived and scopes are guest-controlled; sweep
+		// expired entries here so the map is bounded by live tokens.
+		for key, entry := range s.tokens {
+			if !now.Before(entry.expires) {
+				delete(s.tokens, key)
+			}
+		}
+		s.tokens[requestScope] = token{value: bearer, expires: now.Add(tokenLifetime(payload.ExpiresIn))}
+		s.mu.Unlock()
 	}
-	s.mu.Lock()
-	if s.tokens == nil {
-		s.tokens = make(map[string]token)
-	}
-	s.tokens[cacheKey] = token{value: bearer, expires: s.currentTime().Add(tokenLifetime(payload.ExpiresIn))}
-	s.mu.Unlock()
 	return bearer, nil
 }
 

@@ -324,7 +324,7 @@ tbx cluster suspend|resume <cluster>
 tbx snapshot create <cluster> [name] [--yes]
 tbx snapshot restore <cluster> <name> [--yes] [--force]
 tbx snapshot list <cluster>      tbx snapshot delete <cluster> <name>
-tbx status [cluster]      tbx manifests <cluster> [section|images]
+tbx status [cluster]      tbx manifests <cluster> [section|images] [--cni cilium|flannel]
 tbx console <cluster> <node>
 tbx bgp enable|disable <cluster>
 tbx mirror offline [on|off]

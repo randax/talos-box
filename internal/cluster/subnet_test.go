@@ -339,3 +339,26 @@ func routeByThirdOctet(routes map[byte]HostRoute) func(net.IP) (HostRoute, error
 		return defaultRoute, nil
 	}
 }
+
+// A foreign interface squatting on an attached subnet cannot be resolved by a
+// node mutation, but the operator still needs to hear about it.
+func TestAttachedSubnetWarningSurfacesForeignConflict(t *testing.T) {
+	t.Parallel()
+
+	sources := SubnetSources{
+		Interfaces: func() ([]HostInterface, error) {
+			return []HostInterface{
+				{Name: "bridge101", Addrs: []net.Addr{hostAddress("172.30.0.1/24")}},
+				{Name: "utun7", Addrs: []net.Addr{hostAddress("172.30.0.5/24")}},
+			}, nil
+		},
+		Route: staticRoute("bridge101", "172.30.0.0/24"),
+	}
+	warning, err := AttachedSubnetWarning(0, sources)
+	if err != nil {
+		t.Fatalf("AttachedSubnetWarning() error = %v, want a warning instead", err)
+	}
+	if !strings.Contains(warning, "utun7") || !strings.Contains(warning, "conflicts") {
+		t.Fatalf("warning = %q, want a foreign-conflict warning naming utun7", warning)
+	}
+}

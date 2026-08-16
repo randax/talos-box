@@ -3,8 +3,12 @@ package main
 import (
 	"bytes"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/randax/talos-box/internal/resolverset"
 )
 
 func uidPtr(uid uint32) *uint32 { return &uid }
@@ -34,6 +38,9 @@ func TestRemoveScopedResolverUninstallsThroughHelper(t *testing.T) {
 	for range 2 {
 		if err := command.removeScopedResolver(func() (dnsUninstaller, error) {
 			return client, nil
+		}, func() error {
+			t.Fatal("fallback must not run when the helper is reachable")
+			return nil
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -49,18 +56,42 @@ func TestRemoveScopedResolverUninstallsThroughHelper(t *testing.T) {
 	}
 }
 
-func TestRemoveScopedResolverWarnsWhenHelperIsUnreachable(t *testing.T) {
+func TestRemoveScopedResolverFallsBackWhenHelperIsUnreachable(t *testing.T) {
+	t.Parallel()
+
+	var stderr bytes.Buffer
+	fallbackCalls := 0
+	command := cli{out: &bytes.Buffer{}, err: &stderr}
+	if err := command.removeScopedResolver(func() (dnsUninstaller, error) {
+		return nil, errors.New("connect to helper at /var/run/tbx-helper.sock: no such file")
+	}, func() error {
+		fallbackCalls++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if fallbackCalls != 1 {
+		t.Fatalf("fallback calls = %d, want 1", fallbackCalls)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestRemoveScopedResolverWarnsWhenFallbackFails(t *testing.T) {
 	t.Parallel()
 
 	var stderr bytes.Buffer
 	command := cli{out: &bytes.Buffer{}, err: &stderr}
 	if err := command.removeScopedResolver(func() (dnsUninstaller, error) {
 		return nil, errors.New("connect to helper at /var/run/tbx-helper.sock: no such file")
+	}, func() error {
+		return errors.New("remove /etc/resolver/k8s.test: permission denied")
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(stderr.String(), "warning: skipping resolver removal") {
-		t.Fatalf("stderr = %q, want an unreachable-helper warning", stderr.String())
+	if !strings.Contains(stderr.String(), "warning: could not remove resolver files") {
+		t.Fatalf("stderr = %q, want a fallback-failure warning", stderr.String())
 	}
 }
 
@@ -72,6 +103,9 @@ func TestRemoveScopedResolverWarnsWhenUninstallFails(t *testing.T) {
 	command := cli{out: &bytes.Buffer{}, err: &stderr}
 	if err := command.removeScopedResolver(func() (dnsUninstaller, error) {
 		return client, nil
+	}, func() error {
+		t.Fatal("fallback must not run when the helper is reachable")
+		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -182,5 +216,40 @@ func TestAllowedUIDFromSudoEnv(t *testing.T) {
 				t.Fatalf("allowed uid = %d, want %d", *got, *test.want)
 			}
 		})
+	}
+}
+
+func TestRemoveResolverFilesSweepsOnlyManagedFiles(t *testing.T) {
+	t.Parallel()
+
+	directory := t.TempDir()
+	shared := filepath.Join(directory, "k8s.test")
+	if err := os.WriteFile(shared, []byte("nameserver 127.0.0.1\nport 5399\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "lab.internal"), []byte(resolverset.Content(5399)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "corp.vpn"), []byte("nameserver 10.0.0.1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for i, want := range []bool{true, false} { // second run: already gone, still succeeds
+		removed, err := removeResolverFiles(shared)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if removed != want {
+			t.Fatalf("run %d: removed = %v, want %v", i+1, removed, want)
+		}
+	}
+	if _, err := os.Stat(shared); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("shared resolver still present: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(directory, "lab.internal")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("managed domain resolver still present: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(directory, "corp.vpn")); err != nil {
+		t.Fatalf("unmanaged resolver file was touched: %v", err)
 	}
 }

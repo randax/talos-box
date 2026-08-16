@@ -76,7 +76,7 @@ func LowestUsableSubnetIndex(clusters []Cluster, sources SubnetSources) (int, st
 		if allocated {
 			continue
 		}
-		inspection, err := inspectSubnet(index, interfaces, sources.Route, false)
+		inspection, err := inspectSubnet(index, interfaces, sources.Route, false, false)
 		if err != nil {
 			return 0, "", err
 		}
@@ -96,7 +96,7 @@ func CheckSubnetIndex(index int, sources SubnetSources) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	inspection, err := inspectSubnet(index, interfaces, sources.Route, true)
+	inspection, err := inspectSubnet(index, interfaces, sources.Route, true, false)
 	if err != nil {
 		return "", err
 	}
@@ -107,10 +107,11 @@ func CheckSubnetIndex(index int, sources SubnetSources) (string, error) {
 }
 
 // AttachedSubnetWarning reports advisory host-routing findings for a subnet
-// that is already attached. It never reports a collision: a running cluster's
-// own bridge legitimately occupies its subnet — under whatever name the host
-// gave that bridge — and a genuine foreign collision is not something a node
-// mutation can resolve, since the attachment already exists.
+// that is already attached. It never fails on a collision: a running
+// cluster's own bridge legitimately occupies its subnet — under whatever name
+// the host gave that bridge — and a genuine foreign collision is not
+// something a node mutation can resolve, since the attachment already
+// exists. A foreign collision is still surfaced, as a warning.
 func AttachedSubnetWarning(index int, sources SubnetSources) (string, error) {
 	if index < 0 || index > MaxSubnetIndex {
 		return "", fmt.Errorf("subnet index must be between 0 and %d", MaxSubnetIndex)
@@ -119,9 +120,12 @@ func AttachedSubnetWarning(index int, sources SubnetSources) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	inspection, err := inspectSubnet(index, interfaces, sources.Route, true)
+	inspection, err := inspectSubnet(index, interfaces, sources.Route, true, true)
 	if err != nil {
 		return "", err
+	}
+	if inspection.conflict != "" {
+		return fmt.Sprintf("subnet %s conflicts with %s; the cluster is already attached, continuing", SubnetCIDR(index), inspection.conflict), nil
 	}
 	return inspection.warning, nil
 }
@@ -147,16 +151,23 @@ func readHostInterfaces(sources SubnetSources) ([]HostInterface, error) {
 	return interfaces, nil
 }
 
+// inspectSubnet checks the candidate subnet against host interfaces and
+// routes. allowTalosBoxBridge exempts a tbx-owned bridge recognized by name;
+// attached additionally exempts any interface holding the subnet's gateway
+// address — vmnet names its bridges itself, so an already-attached cluster's
+// bridge can carry any name (#245).
 func inspectSubnet(
 	index int,
 	interfaces []HostInterface,
 	routeSource func(net.IP) (HostRoute, error),
 	allowTalosBoxBridge bool,
+	attached bool,
 ) (subnetInspection, error) {
 	_, candidate, err := net.ParseCIDR(SubnetCIDR(index))
 	if err != nil {
 		return subnetInspection{}, err
 	}
+	ownBridge := ""
 	for _, current := range interfaces {
 		for _, address := range current.Addrs {
 			ip, network, ok := ipv4Network(address)
@@ -164,6 +175,10 @@ func inspectSubnet(
 				continue
 			}
 			if allowTalosBoxBridge && isTalosBoxBridge(current.Name, ip, network, index) {
+				continue
+			}
+			if attached && isOwnBridgeAddress(ip, network, index) {
+				ownBridge = current.Name
 				continue
 			}
 			return subnetInspection{conflict: fmt.Sprintf("interface %s address %s", current.Name, address)}, nil
@@ -188,6 +203,9 @@ func inspectSubnet(
 		return subnetInspection{}, nil
 	}
 	if allowTalosBoxBridge && isTalosBoxBridgeName(route.Interface, index) {
+		return subnetInspection{}, nil
+	}
+	if attached && ownBridge != "" && route.Interface == ownBridge {
 		return subnetInspection{}, nil
 	}
 	ones, bits := route.Network.Mask.Size()
@@ -257,8 +275,14 @@ func selectMostSpecificRoute(destination net.IP, routes []HostRoute, ignoredInte
 }
 
 func isTalosBoxBridge(name string, ip net.IP, network *net.IPNet, index int) bool {
+	return isOwnBridgeAddress(ip, network, index) && isTalosBoxBridgeName(name, index)
+}
+
+// isOwnBridgeAddress reports whether an interface address is the subnet's own
+// gateway attachment, independent of the host-assigned interface name.
+func isOwnBridgeAddress(ip net.IP, network *net.IPNet, index int) bool {
 	ones, bits := network.Mask.Size()
-	return bits == 32 && ones == 24 && ip.Equal(net.ParseIP(Gateway(index))) && isTalosBoxBridgeName(name, index)
+	return bits == 32 && ones == 24 && ip.Equal(net.ParseIP(Gateway(index)))
 }
 
 func isTalosBoxBridgeName(name string, index int) bool {

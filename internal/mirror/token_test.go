@@ -59,12 +59,13 @@ func TestParseBearerChallenge(t *testing.T) {
 // tokenAuthRegistry is a Docker-Hub-shaped upstream: it demands a bearer token
 // scoped to the repository but issues a challenge that carries no scope.
 type tokenAuthRegistry struct {
-	registry  *httptest.Server
-	token     *httptest.Server
-	realm     string // challenge realm, overridable for aliased egress routing
-	tokenHits atomic.Int64
-	scopes    chan string
-	authSeen  chan string
+	registry   *httptest.Server
+	token      *httptest.Server
+	realm      string // challenge realm, overridable for aliased egress routing
+	tokenHits  atomic.Int64
+	failTokens atomic.Bool // when set, the token endpoint answers 500
+	scopes     chan string
+	authSeen   chan string
 
 	mu   sync.Mutex
 	used map[string]bool
@@ -88,6 +89,10 @@ func newTokenAuthRegistry(t *testing.T, options tokenAuthOptions, serve http.Han
 	registry.token = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		registry.tokenHits.Add(1)
 		registry.scopes <- r.URL.Query().Get("scope")
+		if registry.failTokens.Load() {
+			http.Error(w, "token service down", http.StatusInternalServerError)
+			return
+		}
 		if r.URL.Query().Get("service") != "fake-service" {
 			http.Error(w, "wrong service", http.StatusBadRequest)
 			return
@@ -259,6 +264,51 @@ func TestRejectedCachedTokenIsRefreshed(t *testing.T) {
 	}
 	if hits := upstream.tokenHits.Load(); hits != 3 {
 		t.Fatalf("token hits = %d, want 3 (rejected token refreshed each time)", hits)
+	}
+}
+
+// A cached token the upstream rejects must be forgotten even when the
+// renegotiation that follows fails — the next request must not replay it.
+func TestRejectedTokenIsForgottenWhenRenegotiationFails(t *testing.T) {
+	upstream := newTokenAuthRegistry(t, tokenAuthOptions{expiresIn: 300, singleUse: true}, serveTokenTestRepository(t))
+	mirror := httptest.NewServer(newLoopbackMirrorServer(t, upstream.registry.URL, t.TempDir()))
+	defer mirror.Close()
+
+	// Prime the token cache: challenge, token 1, success. The blob below is
+	// deliberately untouched so later requests cannot be served locally.
+	resp, body := get(t, mirror.URL+"/v2/library/pause/manifests/3.10")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("prime = %d %q, want 200", resp.StatusCode, body)
+	}
+
+	// The single-use registry rejects the cached token; renegotiation fails.
+	blobPath := "/v2/library/pause/blobs/sha256:" + sha256Hex([]byte(tokenTestBlob))
+	upstream.failTokens.Store(true)
+	resp, _ = get(t, mirror.URL+blobPath)
+	if resp.StatusCode == http.StatusOK {
+		t.Fatal("request succeeded despite a dead token endpoint")
+	}
+
+	// Recovered: the stale token must be gone, not replayed.
+	upstream.failTokens.Store(false)
+	drain(upstream.authSeen)
+	resp, body = get(t, mirror.URL+blobPath)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("post-recovery = %d %q, want 200", resp.StatusCode, body)
+	}
+	first := <-upstream.authSeen
+	if strings.HasPrefix(first, "Bearer ") {
+		t.Fatalf("post-recovery request replayed a stale token %q, want anonymous first attempt", first)
+	}
+}
+
+func drain(c chan string) {
+	for {
+		select {
+		case <-c:
+		default:
+			return
+		}
 	}
 }
 

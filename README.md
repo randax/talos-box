@@ -105,8 +105,8 @@ render on a substrate-only cluster too, since the machine patch and the catch-al
 mirror are substrate, not CNI. The CNI-derived sections (`values`, `objects`, `extras`, and the
 `lb-pool`/`l2`/`bgp` filters) need a curated CNI: on a substrate-only cluster name the one you
 intend to install by hand with `--cni cilium` or `--cni flannel`, and `tbx` prints exactly what
-it would apply for it. Its `storage` section is also available on substrate-only clusters: it prints the
-required kubelet mounts and Pod Security Admission guidance, then prints exact curated CSI
+it would apply for it. The `storage` section prints the required kubelet mounts and Pod Security
+Admission guidance, then prints exact curated CSI
 inputs when `csi:` is declared. Use `storage-machine`, `storage-values`, `storage-namespaces`,
 `storage-crds`, and `storage-objects` as the hand-application streams described in that output.
 

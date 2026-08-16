@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/randax/talos-box/internal/helper"
+	"github.com/randax/talos-box/internal/resolverset"
 )
 
 const (
@@ -104,15 +105,20 @@ func connectHelperForUninstall() (dnsUninstaller, error) {
 	return helper.Connect()
 }
 
-// removeScopedResolver drops the k8s.test scoped resolver while the helper is
-// still loaded. It is best effort: an unreachable helper (never installed, or
-// already booted out) only warns, and the helper reports a missing resolver
-// file as success, so repeated uninstalls stay idempotent.
-func (c cli) removeScopedResolver(connect func() (dnsUninstaller, error)) error {
+// removeScopedResolver drops the tbx-managed resolver files while the helper
+// is still loaded. An unreachable helper (never installed, or already booted
+// out) falls back to removing the files directly — uninstallSystem only runs
+// as root — so the uninstall promise holds even without a live helper. The
+// helper and the fallback both report missing files as success, so repeated
+// uninstalls stay idempotent.
+func (c cli) removeScopedResolver(connect func() (dnsUninstaller, error), fallback func() error) error {
 	client, err := connect()
 	if err != nil {
-		_, printErr := fmt.Fprintf(c.err, "warning: skipping resolver removal; helper is unreachable: %v\n", err)
-		return printErr
+		if err := fallback(); err != nil {
+			_, printErr := fmt.Fprintf(c.err, "warning: could not remove resolver files: %v\n", err)
+			return printErr
+		}
+		return nil
 	}
 	defer func() { _ = client.Close() }()
 	if err := client.UninstallDNS(); err != nil {
@@ -122,9 +128,54 @@ func (c cli) removeScopedResolver(connect func() (dnsUninstaller, error)) error 
 	return nil
 }
 
+// removeResolverFilesDirectly is the root fallback for an unreachable helper:
+// remove the shared k8s.test resolver plus any marker-managed per-domain
+// files, never touching unmanaged files, then HUP mDNSResponder if anything
+// changed. Missing files and a missing /etc/resolver are success.
+func removeResolverFilesDirectly() error {
+	removed, err := removeResolverFiles(resolverset.SharedPath)
+	if removed {
+		// Best effort: resolver-file pickup is undocumented; a failed HUP
+		// only delays mDNSResponder noticing the removal.
+		_ = exec.Command("/usr/bin/killall", "-HUP", "mDNSResponder").Run()
+	}
+	return err
+}
+
+func removeResolverFiles(sharedPath string) (bool, error) {
+	removed := false
+	if err := os.Remove(sharedPath); err == nil {
+		removed = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("remove %s: %w", sharedPath, err)
+	}
+	directory := filepath.Dir(sharedPath)
+	entries, err := os.ReadDir(directory)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return removed, fmt.Errorf("read resolver directory: %w", err)
+	}
+	var sweepErr error
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() {
+			continue
+		}
+		path := filepath.Join(directory, entry.Name())
+		content, err := os.ReadFile(path)
+		if err != nil || !resolverset.Managed(content) {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			sweepErr = errors.Join(sweepErr, fmt.Errorf("remove resolver file %s: %w", entry.Name(), err))
+			continue
+		}
+		removed = true
+	}
+	return removed, sweepErr
+}
+
 func (c cli) uninstallSystem() error {
 	// Ask before teardown, while the helper can still service the request.
-	if err := c.removeScopedResolver(connectHelperForUninstall); err != nil {
+	if err := c.removeScopedResolver(connectHelperForUninstall, removeResolverFilesDirectly); err != nil {
 		return err
 	}
 	if _, err := os.Stat(helperPlistPath); err == nil {

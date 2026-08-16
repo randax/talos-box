@@ -37,18 +37,44 @@ func installHostResolver(port int) error {
 func uninstallHostResolver() error {
 	resolverSyncMu.Lock()
 	defer resolverSyncMu.Unlock()
+	removed := false
 	err := os.Remove(resolverPath)
-	if errors.Is(err, os.ErrNotExist) {
-		if pendingHUP {
-			return reloadResolverCache()
-		}
-		return nil
-	}
-	if err != nil {
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove resolver file: %w", err)
 	}
-	pendingHUP = true
-	return reloadResolverCache()
+	if err == nil {
+		removed = true
+		pendingHUP = true
+	}
+	// Uninstall is terminal: marker-managed per-domain files (SPEC §11) have
+	// no owner after the helper is gone, so sweep them here too. Unmanaged
+	// files are never touched.
+	directory := filepath.Dir(resolverPath)
+	entries, readErr := os.ReadDir(directory)
+	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+		return fmt.Errorf("read resolver directory: %w", readErr)
+	}
+	var sweepErr error
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() {
+			continue
+		}
+		path := filepath.Join(directory, entry.Name())
+		content, err := os.ReadFile(path)
+		if err != nil || !resolverset.Managed(content) {
+			continue
+		}
+		pendingHUP = true
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			sweepErr = errors.Join(sweepErr, fmt.Errorf("remove resolver file %s: %w", entry.Name(), err))
+			continue
+		}
+		removed = true
+	}
+	if removed || pendingHUP {
+		sweepErr = errors.Join(sweepErr, reloadResolverCache())
+	}
+	return sweepErr
 }
 
 // reloadResolverCache HUPs mDNSResponder (its pickup of resolver-file changes
