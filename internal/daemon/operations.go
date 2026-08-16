@@ -16,6 +16,7 @@ import (
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/dns"
 	"github.com/randax/talos-box/internal/domain"
+	"github.com/randax/talos-box/internal/extensions"
 	"github.com/randax/talos-box/internal/helper"
 	"github.com/randax/talos-box/internal/hypervisor"
 	"github.com/randax/talos-box/internal/imagecache"
@@ -169,8 +170,20 @@ type ClusterStatus struct {
 	VIP             string       `json:"vip,omitempty"`
 	VIPLive         bool         `json:"vipLive"`
 	Nodes           []NodeStatus `json:"nodes"`
-	Hints           []string     `json:"hints,omitempty"`
-	subnetIndex     int
+	// Capabilities reports the host capabilities this cluster's configuration
+	// depends on, so a file stays portable across host substrates and the gate
+	// is visible instead of silently doing nothing.
+	Capabilities []CapabilityStatus `json:"capabilities,omitempty"`
+	Hints        []string           `json:"hints,omitempty"`
+	subnetIndex  int
+}
+
+// CapabilityStatus is one host capability a cluster depends on, with the reason
+// the active hypervisor backend cannot provide it.
+type CapabilityStatus struct {
+	Name      string `json:"name"`
+	Supported bool   `json:"supported"`
+	Reason    string `json:"reason,omitempty"`
 }
 
 // CachePullResult describes the image made ready by cache.pull.
@@ -520,10 +533,21 @@ func (s *Server) launchMachine(item cluster.Cluster, node cluster.Node, restore 
 			}
 			return attachment, err
 		},
-		EFIVarsPath:       filepath.Join(dir, node.Name+".efi"),
-		ConsoleSocketPath: filepath.Join(dir, node.Name+".console.sock"),
-		Restore:           restore,
+		EFIVarsPath:          filepath.Join(dir, node.Name+".efi"),
+		ConsoleSocketPath:    filepath.Join(dir, node.Name+".console.sock"),
+		GuestAgentSocketPath: guestAgentSocketPath(item, dir, node),
+		Restore:              restore,
 	})
+}
+
+// guestAgentSocketPath asks the backend for a guest-agent channel only when the
+// cluster baked the extension. Backends without the capability ignore it, which
+// is what keeps the same file usable on both host substrates.
+func guestAgentSocketPath(item cluster.Cluster, dir string, node cluster.Node) string {
+	if !extensions.Requested(item.TalosExtensions, extensions.GuestAgent) {
+		return ""
+	}
+	return filepath.Join(dir, node.Name+".qga.sock")
 }
 
 func helperInstallError(err error) error {
@@ -857,7 +881,7 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 
 	result := make([]ClusterStatus, 0, len(items))
 	for _, item := range items {
-		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), TalosVersion: item.TalosVersion, Schematic: item.Schematic, TalosExtensions: item.TalosExtensions, ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: s.clusterRunning(item.Name), subnetIndex: item.SubnetIndex}
+		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), TalosVersion: item.TalosVersion, Schematic: item.Schematic, TalosExtensions: item.TalosExtensions, ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: s.clusterRunning(item.Name), Capabilities: s.clusterCapabilities(item), subnetIndex: item.SubnetIndex}
 		for _, node := range item.Nodes {
 			running := s.nodeRunning(item.Name, node.Name)
 			clusterStatus.Nodes = append(clusterStatus.Nodes, NodeStatus{Name: node.Name, Role: node.Role, MAC: node.MAC, Phase: ClassifyPhase(running, ProbeResult{})})
@@ -866,6 +890,20 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 		result = append(result, clusterStatus)
 	}
 	return result, nil
+}
+
+// clusterCapabilities reports only the capabilities this cluster actually asked
+// for, so a status listing stays silent about gates nobody depends on.
+func (s *Server) clusterCapabilities(item cluster.Cluster) []CapabilityStatus {
+	if s.hypervisor == nil || !extensions.Requested(item.TalosExtensions, extensions.GuestAgent) {
+		return nil
+	}
+	guestAgent := s.hypervisor.Capabilities().GuestAgent
+	return []CapabilityStatus{{
+		Name:      extensions.GuestAgent,
+		Supported: guestAgent.Supported,
+		Reason:    guestAgent.Reason,
+	}}
 }
 
 func (s *Server) refreshNodeStatuses(statuses []ClusterStatus) {

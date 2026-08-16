@@ -39,6 +39,7 @@ func validateQEMUProbe(probe qemuProbe, requiredMachine string) error {
 func qemuCapabilities(version qemuVersion) Capabilities {
 	capabilities := Capabilities{
 		BalloonReadback: FeatureStatus{Supported: true},
+		GuestAgent:      FeatureStatus{Supported: true},
 	}
 	if version.Compare(qemuSuspendVersion) >= 0 {
 		capabilities.Suspend.Supported = true

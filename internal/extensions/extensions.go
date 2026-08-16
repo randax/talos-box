@@ -20,6 +20,20 @@ var curated = map[string]string{
 	"qemu-guest-agent": "siderolabs/qemu-guest-agent",
 }
 
+// GuestAgent is the curated extension whose usefulness depends on the host
+// backend exposing a guest-agent channel.
+const GuestAgent = "qemu-guest-agent"
+
+// Requested reports whether a cluster's extension list contains name.
+func Requested(requested []string, name string) bool {
+	for _, item := range requested {
+		if item == name {
+			return true
+		}
+	}
+	return false
+}
+
 // suggestionDistance is the edit distance below which an unknown name is
 // reported as a typo of a curated one.
 const suggestionDistance = 3

@@ -614,7 +614,7 @@ func removeNodeFiles(clusterName, nodeName string) error {
 	if err != nil {
 		return err
 	}
-	for _, suffix := range []string{".img", ".efi", ".console.sock"} {
+	for _, suffix := range []string{".img", ".efi", ".console.sock", ".qga.sock"} {
 		if err := os.Remove(filepath.Join(dir, nodeName+suffix)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("remove node file: %w", err)
 		}

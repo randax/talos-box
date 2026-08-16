@@ -149,6 +149,8 @@ func TestBuildQEMUArgv(t *testing.T) {
 		"-device", "virtio-rng-pci,rng=rng0",
 		"-device", "virtio-balloon-pci,deflate-on-oom=on,free-page-reporting=on",
 		"-chardev", "socket,id=charconsole,fd=7",
+		// Without a guest agent the serial topology stays exactly one port, so
+		// clusters that never requested it keep their existing device graph.
 		"-device", "virtio-serial-pci,id=virtioconsole0,max_ports=1",
 		"-device", "virtconsole,chardev=charconsole",
 		"-qmp", "unix:/run/talos/qmp,,node.sock,server=on,wait=off",
@@ -157,6 +159,50 @@ func TestBuildQEMUArgv(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("buildQEMUArgv() = %#v, want %#v", got, want)
 	}
+}
+
+func TestBuildQEMUArgvAddsGuestAgentPort(t *testing.T) {
+	t.Parallel()
+
+	got, err := buildQEMUArgv(qemuLaunchConfig{
+		Architecture:  ArchitectureAMD64,
+		CPUs:          2,
+		MemoryMiB:     2048,
+		DiskPath:      "/var/lib/talos/node.img",
+		MAC:           "02:00:00:00:00:01",
+		TapFD:         3,
+		ConsoleFD:     4,
+		GuestAgentFD:  5,
+		QMPSocketPath: "/run/talos/node.qmp.sock",
+		Firmware: qemuFirmware{
+			CodePath: "/usr/share/OVMF/OVMF_CODE.fd",
+			VarsPath: "/var/lib/talos/node.VARS.fd",
+		},
+	})
+	if err != nil {
+		t.Fatalf("buildQEMUArgv() error = %v", err)
+	}
+
+	want := []string{
+		"-chardev", "socket,id=charconsole,fd=4",
+		"-chardev", "socket,id=charqga,fd=5,server=on,wait=off",
+		"-device", "virtio-serial-pci,id=virtioconsole0,max_ports=2",
+		"-device", "virtconsole,chardev=charconsole",
+		"-device", "virtserialport,chardev=charqga,name=org.qemu.guest_agent.0",
+		"-qmp", "unix:/run/talos/node.qmp.sock,server=on,wait=off",
+	}
+	if !containsSequence(got, want) {
+		t.Fatalf("buildQEMUArgv() = %#v, want serial block %#v", got, want)
+	}
+}
+
+func containsSequence(got, want []string) bool {
+	for start := 0; start+len(want) <= len(got); start++ {
+		if reflect.DeepEqual(got[start:start+len(want)], want) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestBuildQEMUArgvRejectsUnsafePaths(t *testing.T) {

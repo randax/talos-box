@@ -28,6 +28,9 @@ type FeatureStatus struct {
 type Capabilities struct {
 	Suspend         FeatureStatus
 	BalloonReadback FeatureStatus
+	// GuestAgent reports whether the backend can expose the QEMU guest-agent
+	// channel a machine needs for the qemu-guest-agent extension to do anything.
+	GuestAgent FeatureStatus
 }
 
 // Architecture is the machine architecture produced by a hypervisor backend.
@@ -56,7 +59,11 @@ type Spec struct {
 	Network           func() (*helper.Attachment, error)
 	EFIVarsPath       string
 	ConsoleSocketPath string
-	Restore           *Restore
+	// GuestAgentSocketPath asks the backend to expose the guest-agent channel
+	// on that path. Empty means the cluster did not request qemu-guest-agent;
+	// backends without the capability ignore it, so the config stays portable.
+	GuestAgentSocketPath string
+	Restore              *Restore
 }
 
 // Hypervisor creates machines and reports runtime capabilities.

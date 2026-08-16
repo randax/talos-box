@@ -141,14 +141,53 @@ func (h *qemuHypervisor) newMachine(spec Spec) (*qemuMachine, error) {
 	if err != nil {
 		return nil, err
 	}
-	owned = true
-	return &qemuMachine{
+	machine := &qemuMachine{
 		owner:        h,
 		spec:         spec,
 		attachment:   attachment,
 		console:      console,
 		consoleGuest: consoleGuest,
-	}, nil
+	}
+	if spec.GuestAgentSocketPath != "" {
+		guestAgent, err := newGuestAgentSocket(spec.GuestAgentSocketPath)
+		if err != nil {
+			if console != nil {
+				console.close()
+			}
+			_ = consoleGuest.Close()
+			return nil, err
+		}
+		machine.guestAgent = guestAgent
+	}
+	owned = true
+	return machine, nil
+}
+
+// newGuestAgentSocket binds the guest-agent socket before QEMU starts, so a
+// client can connect the moment the process is up, and hands QEMU the listening
+// descriptor. Unlinking is disabled because the path outlives this listener:
+// the machine owns it and removes it on Close.
+func newGuestAgentSocket(path string) (*os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, fmt.Errorf("create guest-agent socket directory: %w", err)
+	}
+	listener, err := listenUnix(path, "guest-agent")
+	if err != nil {
+		return nil, err
+	}
+	listener.SetUnlinkOnClose(false)
+	file, err := listener.File()
+	closeErr := listener.Close()
+	if err != nil {
+		_ = os.Remove(path)
+		return nil, fmt.Errorf("duplicate guest-agent socket: %w", err)
+	}
+	if closeErr != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return nil, fmt.Errorf("release guest-agent listener: %w", closeErr)
+	}
+	return file, nil
 }
 
 func (h *qemuHypervisor) retain(path string, machine *qemuMachine) error {
@@ -188,6 +227,7 @@ type qemuMachine struct {
 	attachment   *helper.Attachment
 	console      *consoleProxy
 	consoleGuest *os.File
+	guestAgent   *os.File
 
 	opMu    sync.Mutex
 	process *qemuProcess
@@ -219,19 +259,7 @@ func (m *qemuMachine) start(ctx context.Context, incoming string) error {
 	if err := removeStaleQMPSocket(qmpPath); err != nil {
 		return err
 	}
-	argv, err := buildQEMUArgv(qemuLaunchConfig{
-		Architecture:   m.owner.architecture,
-		CPUs:           m.spec.CPUs,
-		MemoryMiB:      m.spec.MemoryMiB,
-		DiskPath:       m.spec.DiskPath,
-		MAC:            m.spec.MAC,
-		TapFD:          3,
-		ConsoleFD:      4,
-		QMPSocketPath:  qmpPath,
-		Firmware:       qemuFirmware{CodePath: m.owner.firmware.CodePath, VarsPath: m.spec.EFIVarsPath},
-		IncomingPath:   incoming,
-		IncomingOffset: qemuSaveOffset,
-	})
+	argv, err := buildQEMUArgv(m.launchConfig(qmpPath, incoming))
 	if err != nil {
 		return fmt.Errorf("build QEMU command: %w", err)
 	}
@@ -240,7 +268,7 @@ func (m *qemuMachine) start(ctx context.Context, incoming string) error {
 		commandFactory = exec.Command
 	}
 	command := commandFactory(m.owner.binary, argv[1:]...)
-	command.ExtraFiles = []*os.File{m.attachment.File, m.consoleGuest}
+	command.ExtraFiles = m.extraFiles()
 	command.Stdout = os.Stderr
 	command.Stderr = os.Stderr
 	process, err := startQEMUProcess(command)
@@ -296,6 +324,36 @@ func (m *qemuMachine) start(ctx context.Context, incoming string) error {
 		return fmt.Errorf("QEMU exited while starting: %w", exitErr)
 	}
 	return nil
+}
+
+// extraFiles is the descriptor table QEMU inherits. The argv addresses these by
+// number, so the order here fixes them: tap 3, console 4, guest agent 5.
+func (m *qemuMachine) extraFiles() []*os.File {
+	files := []*os.File{m.attachment.File, m.consoleGuest}
+	if m.guestAgent != nil {
+		files = append(files, m.guestAgent)
+	}
+	return files
+}
+
+func (m *qemuMachine) launchConfig(qmpPath, incoming string) qemuLaunchConfig {
+	cfg := qemuLaunchConfig{
+		Architecture:   m.owner.architecture,
+		CPUs:           m.spec.CPUs,
+		MemoryMiB:      m.spec.MemoryMiB,
+		DiskPath:       m.spec.DiskPath,
+		MAC:            m.spec.MAC,
+		TapFD:          3,
+		ConsoleFD:      4,
+		QMPSocketPath:  qmpPath,
+		Firmware:       qemuFirmware{CodePath: m.owner.firmware.CodePath, VarsPath: m.spec.EFIVarsPath},
+		IncomingPath:   incoming,
+		IncomingOffset: qemuSaveOffset,
+	}
+	if m.guestAgent != nil {
+		cfg.GuestAgentFD = 5
+	}
+	return cfg
 }
 
 func waitQEMUIncoming(ctx context.Context, client *qmpClient) error {
@@ -520,6 +578,12 @@ func (m *qemuMachine) Close() error {
 	}
 	if m.consoleGuest != nil {
 		_ = m.consoleGuest.Close()
+	}
+	if m.guestAgent != nil {
+		_ = m.guestAgent.Close()
+		// The listener was detached from the path so QEMU could keep serving it;
+		// nothing else will unlink it.
+		_ = os.Remove(m.spec.GuestAgentSocketPath)
 	}
 	if m.attachment != nil {
 		if err := m.attachment.Close(); err != nil {
