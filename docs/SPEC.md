@@ -141,7 +141,10 @@ end-to-end timing and cluster-up gate remains #97. The ISO+install path is dropp
   content-addressed, so the same inputs yield the same id, and a cached composed image creates
   a cluster with no Factory contact at all. Extensions whose usefulness depends on the host
   backend (`qemu-guest-agent` under Virtualization.framework) are capability-gated and reported
-  by `tbx status` and `tbx doctor`, never rejected: the file stays portable.
+  by `tbx status` and `tbx doctor`, never rejected: the file stays portable. On the provisioning
+  path, requesting `gvisor` also sets `user.max_user_namespaces` in the generated machine config
+  (Talos's hardening pins it to 0, which would fail every runsc sandbox); substrate-only clusters
+  bring their own machine config and must apply that sysctl themselves.
 
 ## 5. Networking
 

@@ -20,6 +20,10 @@ var curated = map[string]string{
 	"qemu-guest-agent": "siderolabs/qemu-guest-agent",
 }
 
+// GVisor is the curated extension whose runtime needs unprivileged user
+// namespaces on its nodes, which Talos's KSPP hardening disables by default.
+const GVisor = "gvisor"
+
 // GuestAgent is the curated extension whose usefulness depends on the host
 // backend exposing a guest-agent channel.
 const GuestAgent = "qemu-guest-agent"

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/extensions"
 	"github.com/randax/talos-box/internal/manifests"
 	"github.com/randax/talos-box/internal/shellquote"
 	"github.com/randax/talos-box/internal/talosversion"
@@ -366,6 +367,12 @@ func generateMachineConfigs(item cluster.Cluster) (generated, error) {
 		if err != nil {
 			return generated{}, fmt.Errorf("patch %s config: %w", role, err)
 		}
+		if extensions.Requested(item.TalosExtensions, extensions.GVisor) {
+			bytes, err = withGVisorUserNamespaces(bytes)
+			if err != nil {
+				return generated{}, fmt.Errorf("patch %s config: %w", role, err)
+			}
+		}
 		// A worker-less control plane is also the only node that can announce
 		// LoadBalancer VIPs, so Talos's generated exclusion label goes with
 		// the taint.
@@ -383,6 +390,30 @@ func generateMachineConfigs(item cluster.Cluster) (generated, error) {
 		return generated{}, fmt.Errorf("generate talosconfig: %w", err)
 	}
 	return generated{talosconfig: talosconfig, configs: configs, paths: paths}, nil
+}
+
+// withGVisorUserNamespaces re-opens unprivileged user namespaces on nodes
+// that will run gVisor pods: runsc forks its gofer into new user namespaces,
+// and Talos's KSPP hardening pins user.max_user_namespaces to 0, which
+// surfaces as a misleading ENOSPC at sandbox create. Requesting the curated
+// gvisor extension is the consent to relax that hardening; the value mirrors
+// the extension's documented prerequisite.
+func withGVisorUserNamespaces(config []byte) ([]byte, error) {
+	var document map[string]any
+	if err := yaml.Unmarshal(config, &document); err != nil {
+		return nil, fmt.Errorf("decode generated machine config: %w", err)
+	}
+	machineSection, ok := document["machine"].(map[string]any)
+	if !ok {
+		return nil, errors.New("generated machine config is missing machine settings")
+	}
+	sysctls, ok := machineSection["sysctls"].(map[string]any)
+	if !ok {
+		sysctls = map[string]any{}
+		machineSection["sysctls"] = sysctls
+	}
+	sysctls["user.max_user_namespaces"] = "11255"
+	return yaml.Marshal(document)
 }
 
 func applyProvisioningPrerequisites(config []byte, facts manifests.Facts) ([]byte, error) {

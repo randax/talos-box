@@ -216,6 +216,12 @@ machine:
   # guest UDP/123, so do not make this isolated CI cluster wait on public NTP.
   time:
     disabled: true
+  # gVisor forks its gofer into new user namespaces, and Talos's KSPP
+  # hardening pins user.max_user_namespaces to 0 — runsc then fails at
+  # sandbox create with a misleading ENOSPC ("no space left on device").
+  # The value mirrors the gvisor extension's documented prerequisite.
+  sysctls:
+    user.max_user_namespaces: "11255"
 cluster:
   network:
     cni:
