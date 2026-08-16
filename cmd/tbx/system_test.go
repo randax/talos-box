@@ -277,3 +277,18 @@ func TestRemoveResolverFilesSweepsOnlyManagedFiles(t *testing.T) {
 		t.Fatalf("unmanaged resolver file was touched: %v", err)
 	}
 }
+
+func TestRemoveResolverFilesReportsUnreadableFiles(t *testing.T) {
+	t.Parallel()
+
+	directory := t.TempDir()
+	shared := filepath.Join(directory, "k8s.test")
+	unreadable := filepath.Join(directory, "lab.internal")
+	if err := os.WriteFile(unreadable, []byte(resolverset.Content(5399)), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	_, err := removeResolverFiles(shared)
+	if err == nil || !strings.Contains(err.Error(), "read resolver file lab.internal") {
+		t.Fatalf("error = %v, want an unreadable-file failure so the sweep does not pass silently", err)
+	}
+}

@@ -63,7 +63,16 @@ func uninstallHostResolver() error {
 		}
 		path := filepath.Join(directory, entry.Name())
 		content, err := os.ReadFile(path)
-		if err != nil || !resolverset.Managed(content) {
+		if err != nil {
+			// An unreadable file cannot be classified, so it may be a managed
+			// file left behind — that must fail the sweep, not pass silently.
+			// A file that vanished since ReadDir is simply gone.
+			if !errors.Is(err, os.ErrNotExist) {
+				sweepErr = errors.Join(sweepErr, fmt.Errorf("read resolver file %s: %w", entry.Name(), err))
+			}
+			continue
+		}
+		if !resolverset.Managed(content) {
 			continue
 		}
 		pendingHUP = true
