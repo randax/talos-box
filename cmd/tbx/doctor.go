@@ -278,20 +278,6 @@ func daemonUnavailableDetail(err error) string {
 	return fmt.Sprintf("daemon unavailable: %v", err)
 }
 
-// directDNSDaemonSkip probes the resolver embedded in tbxd; when the
-// on-demand daemon is simply not running, that is the same condition the
-// daemon-dependent checks SKIP on, not a machine fault worth a FAIL.
-func directDNSDaemonSkip(probe func() error, listClusters func() ([]daemon.ClusterSummary, error)) error {
-	err := probe()
-	if err == nil {
-		return nil
-	}
-	if _, daemonErr := listClusters(); isDaemonUnavailable(daemonErr) {
-		return skippedDoctorCheck{detail: daemonUnavailableDetail(daemonErr)}
-	}
-	return err
-}
-
 func isDaemonUnavailable(err error) bool {
 	if err == nil {
 		return false
