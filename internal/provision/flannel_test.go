@@ -42,6 +42,31 @@ type fakeClient struct {
 	readyErrs []error
 	expected  [][]string
 	readyHook func()
+
+	scheduling        []schedulingCall
+	schedulingChanged []bool
+	schedulingErrs    []error
+}
+
+type schedulingCall struct {
+	node       string
+	workerless bool
+}
+
+func (f *fakeClient) ReconcileControlPlaneScheduling(_ context.Context, node string, workerless bool) (bool, error) {
+	f.scheduling = append(f.scheduling, schedulingCall{node: node, workerless: workerless})
+	var changed bool
+	if len(f.schedulingChanged) > 0 {
+		changed, f.schedulingChanged = f.schedulingChanged[0], f.schedulingChanged[1:]
+	}
+	if len(f.schedulingErrs) > 0 {
+		var err error
+		err, f.schedulingErrs = f.schedulingErrs[0], f.schedulingErrs[1:]
+		if err != nil {
+			return false, err
+		}
+	}
+	return changed, nil
 }
 
 type fakeLoadBalancer struct {

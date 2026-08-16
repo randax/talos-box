@@ -38,6 +38,9 @@ type provisionTask struct {
 	ctx        context.Context
 	generation uint64
 	action     int
+	// force skips the fast no-op path: a topology mutation changes the machine
+	// config already-configured nodes need, which no health probe observes.
+	force bool
 }
 
 func (s *Server) handleProvisioningLocked(request Request, maintenance map[string]maintenanceObservation, storage map[string]storageObservation) (any, []provisionTask, error) {
@@ -131,7 +134,11 @@ func (s *Server) beginNodeMutationProvisionLocked(item cluster.Cluster) []provis
 	if !s.clusterRunning(item.Name) {
 		return nil
 	}
-	return s.beginProvisionTasksLocked([]cluster.Cluster{item})
+	tasks := s.beginProvisionTasksLocked([]cluster.Cluster{item})
+	for i := range tasks {
+		tasks[i].force = true
+	}
+	return tasks
 }
 
 func (s *Server) finishProvision(task provisionTask) {
@@ -165,7 +172,7 @@ func (s *Server) cancelAllProvisionsLocked() {
 
 func (s *Server) runProvisionTasks(data any, tasks []provisionTask) error {
 	for i, task := range tasks {
-		narration, phase, err := s.provisionCNI(task.ctx, task.item, false)
+		narration, phase, err := s.provisionCNI(task.ctx, task.item, task.force)
 		if task.item.CSI != "" {
 			s.opMu.Lock()
 			s.recordStoragePhaseLocked(task.item.Name, phase)

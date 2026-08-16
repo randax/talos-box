@@ -148,6 +148,32 @@ assert_default_storage_class() {
   fi
 }
 
+node_name_by_role() {
+  "$root/bin/tbx" status e2es --quiet -o json |
+    jq -r --arg role "$1" 'first(.[0].nodes[] | select(.role == $role) | .name) // empty'
+}
+
+ready_node_count() {
+  [[ "$(kc get nodes -o json |
+    jq -r '[.items[] | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))] | length')" -eq "$1" ]]
+}
+
+# Crossing the zero-worker boundary flips two control-plane settings that Talos
+# re-asserts from machine config: the NoSchedule taint and the load-balancer
+# exclusion label. A worker-less cluster drops both so workloads can schedule
+# at all; the first worker must restore them, and losing it must drop them
+# again. Both are asserted together because tbx sets them in lockstep.
+control_plane_reserved() {
+  local want=$1 node actual
+  node=$(node_name_by_role control-plane) || return 1
+  [[ -n "$node" ]] || return 1
+  actual=$(kc get node "$node" -o json 2>/dev/null | jq -r '
+    [((.spec.taints // []) | any(.key == "node-role.kubernetes.io/control-plane" and .effect == "NoSchedule")),
+     (.metadata.labels | has("node.kubernetes.io/exclude-from-external-load-balancers"))] |
+    map(tostring) | join(",")') || return 1
+  [[ "$actual" == "$want,$want" ]]
+}
+
 pod_succeeded() {
   [[ "$(kc get pod "$1" -n storage-e2e -o jsonpath='{.status.phase}' 2>/dev/null)" == Succeeded ]]
 }
@@ -299,7 +325,23 @@ retry "local-path storage live" 60 5 storage_live
 assert_default_storage_class local-path
 verify_pvc_write_readback
 kc delete namespace storage-e2e --wait
+
+# Both crossings of the zero-worker boundary must reconcile the already
+# configured control plane, not just freshly generated machine configs.
+retry "worker-less control plane schedulable" 12 5 control_plane_reserved false
+"$root/bin/tbx" node add e2es --role worker --force
+retry "worker node registration" 120 5 ready_node_count 2
+retry "storage live after node add" 120 5 storage_live
+retry "control plane reserved after node add" 120 5 control_plane_reserved true
+
+added_worker=$(node_name_by_role worker)
+[[ -n "$added_worker" ]]
+"$root/bin/tbx" node remove e2es "$added_worker" --force
+retry "worker node deregistration" 120 5 ready_node_count 1
+retry "storage live after node remove" 120 5 storage_live
+retry "control plane schedulable after node remove" 120 5 control_plane_reserved false
+
 "$root/bin/tbx" cluster destroy e2es --force
 cluster_cleanup_needed=false
 
-printf 'verified longhorn (1cp+2w, 2 replicas) and local-path (single-node) PVC write/readback through the provisioning path\n'
+printf 'verified longhorn (1cp+2w, 2 replicas) and local-path (single-node) PVC write/readback through the provisioning path, and both crossings of the zero-worker boundary\n'

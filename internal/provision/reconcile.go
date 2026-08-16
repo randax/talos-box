@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cosi-project/runtime/pkg/safe"
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/extensions"
 	"github.com/randax/talos-box/internal/manifests"
@@ -33,6 +34,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/config/machine"
 	v1alpha1 "github.com/siderolabs/talos/pkg/machinery/config/types/v1alpha1"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
+	configresource "github.com/siderolabs/talos/pkg/machinery/resources/config"
 	"go.yaml.in/yaml/v4"
 	"google.golang.org/grpc/codes"
 )
@@ -68,8 +70,12 @@ type Node struct {
 // TalosClient is the subset of the machinery client this reconciliation needs.
 // Apply is intentionally separate from Bootstrap: the former is allowed only
 // while a node is in maintenance mode, while the latter is authenticated.
+// ReconcileControlPlaneScheduling is authenticated as well: it reconciles an
+// already-configured control plane with the cluster's current worker count and
+// reports whether the machine config had drifted.
 type TalosClient interface {
 	Apply(context.Context, string, []byte) error
+	ReconcileControlPlaneScheduling(ctx context.Context, node string, workerless bool) (bool, error)
 	Bootstrap(context.Context, string) error
 	Kubeconfig(context.Context, string) ([]byte, error)
 	KubernetesReady(context.Context, []byte, []string) error
@@ -205,6 +211,26 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 				return Result{}, err
 			}
 			continue
+		}
+		// Machine configs are applied only in maintenance mode, so crossing the
+		// zero-worker boundary on a running cluster (tbx node add/remove) has to
+		// reconcile the worker-less adaptations over the authenticated API.
+		workerless := !clusterHasWorkers(request.Cluster)
+		for _, node := range nodes {
+			if node.Role != cluster.RoleControlPlane {
+				continue
+			}
+			changed, err := schedulingWithRetry(ctx, request.Client, node.IP, workerless, request.PollInterval)
+			if err != nil {
+				return Result{}, fmt.Errorf("reconcile control plane scheduling on %s: %w", node.Name, err)
+			}
+			if !changed {
+				continue
+			}
+			result.Narration = append(result.Narration,
+				fmt.Sprintf("machine config: ≈ talosctl patch mc --talosconfig %s --nodes %[2]s --endpoints %[2]s --patch '[{\"op\":\"replace\",\"path\":\"/cluster/allowSchedulingOnControlPlanes\",\"value\":%[3]t}]'",
+					shellquote.Quote(generated.paths.talosconfig), node.IP, workerless),
+			)
 		}
 		if err := request.Client.Bootstrap(ctx, controlPlane.IP); err != nil && !alreadyBootstrapped(err) {
 			return Result{}, fmt.Errorf("bootstrap Kubernetes: %w", err)
@@ -604,6 +630,59 @@ func withNodeHostname(config []byte, name string) ([]byte, error) {
 	return patched, nil
 }
 
+// loadBalancerExclusionLabel keeps a node out of LoadBalancer announcements;
+// Talos bakes it into control-plane configs and MetalLB and Cilium honor it.
+const loadBalancerExclusionLabel = "node.kubernetes.io/exclude-from-external-load-balancers"
+
+// withControlPlaneScheduling reconciles an already-applied control-plane
+// machine config with the cluster's current worker count. Both adaptations
+// move together: a worker-less control plane must be schedulable and must
+// announce VIPs, and a cluster that regained a worker must return to the
+// stock control-plane posture. It reports whether the config actually drifted
+// so callers can skip a no-op apply.
+func withControlPlaneScheduling(config []byte, workerless bool) ([]byte, bool, error) {
+	// The applied config is multi-document YAML; patch only the first
+	// document and carry the rest through untouched.
+	first, rest, multiDocument := bytes.Cut(config, []byte("\n---\n"))
+	var document map[string]any
+	if err := yaml.Unmarshal(first, &document); err != nil {
+		return nil, false, fmt.Errorf("decode machine config: %w", err)
+	}
+	machineSection, ok := document["machine"].(map[string]any)
+	if !ok {
+		return nil, false, errors.New("machine config is missing machine settings")
+	}
+	clusterSection, ok := document["cluster"].(map[string]any)
+	if !ok {
+		return nil, false, errors.New("machine config is missing cluster settings")
+	}
+	nodeLabels, _ := machineSection["nodeLabels"].(map[string]any)
+	schedulable, _ := clusterSection["allowSchedulingOnControlPlanes"].(bool)
+	_, excluded := nodeLabels[loadBalancerExclusionLabel]
+	if schedulable == workerless && excluded == !workerless {
+		return config, false, nil
+	}
+	clusterSection["allowSchedulingOnControlPlanes"] = workerless
+	if workerless {
+		delete(nodeLabels, loadBalancerExclusionLabel)
+	} else {
+		if nodeLabels == nil {
+			nodeLabels = map[string]any{}
+			machineSection["nodeLabels"] = nodeLabels
+		}
+		nodeLabels[loadBalancerExclusionLabel] = ""
+	}
+	patched, err := yaml.Marshal(document)
+	if err != nil {
+		return nil, false, fmt.Errorf("encode machine config: %w", err)
+	}
+	if multiDocument {
+		patched = append(patched, []byte("---\n")...)
+		patched = append(patched, rest...)
+	}
+	return patched, true, nil
+}
+
 // withoutLoadBalancerExclusion drops the node.kubernetes.io/exclude-from-
 // external-load-balancers label Talos bakes into control-plane configs;
 // MetalLB and Cilium honor it and would otherwise never announce a VIP on a
@@ -621,7 +700,7 @@ func withoutLoadBalancerExclusion(config []byte) ([]byte, error) {
 	if !ok {
 		return config, nil
 	}
-	delete(nodeLabels, "node.kubernetes.io/exclude-from-external-load-balancers")
+	delete(nodeLabels, loadBalancerExclusionLabel)
 	patched, err := yaml.Marshal(document)
 	if err != nil {
 		return nil, fmt.Errorf("encode machine config: %w", err)
@@ -713,6 +792,27 @@ func kubeconfigWithRetry(ctx context.Context, client TalosClient, node string, i
 	}
 }
 
+// schedulingWithRetry tolerates the transient window in which apid is still
+// restarting after a machine config apply, exactly like kubeconfigWithRetry.
+// Permanent failures remain immediate so a pass fails loudly and rerunning
+// tbx up recovers.
+func schedulingWithRetry(ctx context.Context, client TalosClient, node string, workerless bool, interval time.Duration) (bool, error) {
+	for {
+		changed, err := client.ReconcileControlPlaneScheduling(ctx, node, workerless)
+		if err == nil {
+			return changed, nil
+		}
+		switch talosclient.StatusCode(err) {
+		case codes.Unavailable, codes.DeadlineExceeded, codes.Canceled:
+			if err := wait(ctx, interval); err != nil {
+				return false, err
+			}
+		default:
+			return false, err
+		}
+	}
+}
+
 func wait(ctx context.Context, interval time.Duration) error {
 	if interval <= 0 {
 		return nil
@@ -749,6 +849,38 @@ func (client MachineryClient) Apply(ctx context.Context, node string, config []b
 		Mode: machineapi.ApplyConfigurationRequest_AUTO,
 	})
 	return err
+}
+
+// ReconcileControlPlaneScheduling reads the node's active machine config over
+// the authenticated API, reconciles the worker-less adaptations, and applies
+// the result only when it drifted. Mode AUTO suffices: neither the scheduling
+// flag nor the node label needs a reboot.
+func (client MachineryClient) ReconcileControlPlaneScheduling(ctx context.Context, node string, workerless bool) (bool, error) {
+	connection, err := client.secure(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = connection.Close() }()
+	nodeCtx := talosclient.WithNode(ctx, node)
+	active, err := safe.StateGetByID[*configresource.MachineConfig](nodeCtx, connection.COSI, configresource.ActiveID)
+	if err != nil {
+		return false, fmt.Errorf("read active machine config: %w", err)
+	}
+	current, err := active.Provider().Bytes()
+	if err != nil {
+		return false, fmt.Errorf("encode active machine config: %w", err)
+	}
+	patched, changed, err := withControlPlaneScheduling(current, workerless)
+	if err != nil || !changed {
+		return false, err
+	}
+	if _, err := connection.ApplyConfiguration(nodeCtx, &machineapi.ApplyConfigurationRequest{
+		Data: patched,
+		Mode: machineapi.ApplyConfigurationRequest_AUTO,
+	}); err != nil {
+		return false, fmt.Errorf("apply machine config: %w", err)
+	}
+	return true, nil
 }
 
 func (client MachineryClient) Bootstrap(ctx context.Context, node string) error {
