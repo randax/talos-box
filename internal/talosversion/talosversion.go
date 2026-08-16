@@ -62,9 +62,15 @@ func parse(version string) (parsedVersion, error) {
 		return parsedVersion{}, fmt.Errorf("invalid talos version %q: expected vMAJOR.MINOR.PATCH, like %s", version, Default)
 	}
 	var parsed parsedVersion
-	parsed.major, _ = strconv.Atoi(matches[1])
-	parsed.minor, _ = strconv.Atoi(matches[2])
-	parsed.patch, _ = strconv.Atoi(matches[3])
+	var err error
+	for _, field := range []struct {
+		target *int
+		digits string
+	}{{&parsed.major, matches[1]}, {&parsed.minor, matches[2]}, {&parsed.patch, matches[3]}} {
+		if *field.target, err = strconv.Atoi(field.digits); err != nil {
+			return parsedVersion{}, fmt.Errorf("invalid talos version %q: %w", version, err)
+		}
+	}
 	parsed.prerelease = matches[4] != ""
 	return parsed, nil
 }

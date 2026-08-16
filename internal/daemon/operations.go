@@ -381,7 +381,14 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if err != nil {
 		result := summary(item, false)
 		result.Warning = joinWarnings(talosVersionWarning, overcommitWarning, hostPressureWarning, longhornWarning, longhornCustomSchematicWarning, subnetWarning)
-		return result, fmt.Errorf("cluster created but failed to start: %w", err)
+		startErr := fmt.Errorf("cluster created but failed to start: %w", err)
+		if talosVersionWarning != "" {
+			// the failure response drops the summary, and a boot failure on
+			// an untested version is exactly where this warning is the
+			// diagnosis — it must ride the error
+			startErr = fmt.Errorf("%w (warning: %s)", startErr, talosVersionWarning)
+		}
+		return result, startErr
 	}
 	result := summary(item, true)
 	result.Warning = joinWarnings(talosVersionWarning, overcommitWarning, hostPressureWarning, longhornWarning, longhornCustomSchematicWarning, subnetWarning, startWarning)

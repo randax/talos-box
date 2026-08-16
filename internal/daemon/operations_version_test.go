@@ -1,7 +1,9 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -178,6 +180,31 @@ func TestCreateClusterWarnsOnceAboveTestedDefault(t *testing.T) {
 		!strings.Contains(result.Warning, DefaultTalosVersion) ||
 		!strings.Contains(result.Warning, "newer than") {
 		t.Fatalf("create warning = %q, want newer-than-tested line naming v1.14.0 and %s", result.Warning, DefaultTalosVersion)
+	}
+}
+
+func TestVersionWarningReachesUserWhenCreatedClusterFailsToStart(t *testing.T) {
+	// The failure path drops the summary, so the warning must ride the
+	// error — a boot failure on an untested version is exactly the case
+	// where the newer-than-tested line is the diagnosis.
+	t.Setenv("HOME", t.TempDir())
+	service := newVersionTestServer(t, "aaa", "v1.14.0")
+	service.hypervisor = &fakeHypervisor{
+		architecture: hypervisor.ArchitectureARM64,
+		launch: func(context.Context, hypervisor.Spec) (hypervisor.Machine, error) {
+			return nil, errors.New("boot failure")
+		},
+	}
+	raw, err := json.Marshal(createArgs{
+		Name: "canary", Schematic: "aaa", Version: "v1.14.0",
+		Node: cluster.NodeDefaults{MemoryMiB: 1, CPUs: 1, DiskGiB: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.createCluster(raw)
+	if err == nil || !strings.Contains(err.Error(), "failed to start") || !strings.Contains(err.Error(), "newer than") {
+		t.Fatalf("createCluster() error = %v, want the start failure carrying the newer-than-tested warning", err)
 	}
 }
 
