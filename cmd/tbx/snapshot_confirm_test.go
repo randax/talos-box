@@ -2,8 +2,11 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/randax/talos-box/internal/daemon"
 )
 
 // confirmIfRunning must decline on a non-"y" answer. Uses a stopped/absent
@@ -15,6 +18,52 @@ func TestConfirmYesSkips(t *testing.T) {
 	c := cli{out: &bytes.Buffer{}, err: &bytes.Buffer{}, in: strings.NewReader("")}
 	if err := c.confirmIfRunning("demo", true, "snapshot"); err != nil {
 		t.Errorf("--yes should skip confirmation, got %v", err)
+	}
+}
+
+func TestSnapshotCreateConfirmationSaysTheClusterIsStopped(t *testing.T) {
+	requests, command := newDestroyTestCLI(t, []daemon.Response{
+		{OK: true, Data: json.RawMessage(`[{"name":"demo","running":true}]`)},
+		{OK: true, Data: json.RawMessage(`[{"name":"baseline"}]`)},
+	})
+	command.in = strings.NewReader("y\n")
+
+	if err := command.snapshotCreate([]string{"demo", "baseline"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if op := (<-requests).Op; op != "status" {
+		t.Fatalf("first request op = %q, want the running-cluster status check", op)
+	}
+	if op := (<-requests).Op; op != "snapshot.create" {
+		t.Fatalf("second request op = %q, want snapshot.create", op)
+	}
+	prompt := command.err.(*bytes.Buffer).String()
+	for _, want := range []string{"demo is running", "stop and restart it"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("confirmation %q does not mention %q", prompt, want)
+		}
+	}
+}
+
+func TestSnapshotCreateAbortsWhenTheStopIsDeclined(t *testing.T) {
+	requests, command := newDestroyTestCLI(t, []daemon.Response{
+		{OK: true, Data: json.RawMessage(`[{"name":"demo","running":true}]`)},
+	})
+	command.in = strings.NewReader("n\n")
+
+	err := command.snapshotCreate([]string{"demo", "baseline"})
+
+	if err == nil || !strings.Contains(err.Error(), "aborted") {
+		t.Fatalf("snapshot create with a declined stop = %v, want an abort", err)
+	}
+	if op := (<-requests).Op; op != "status" {
+		t.Fatalf("request op = %q, want only the status check", op)
+	}
+	select {
+	case request := <-requests:
+		t.Fatalf("declined confirmation still sent %q", request.Op)
+	default:
 	}
 }
 

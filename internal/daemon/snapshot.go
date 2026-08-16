@@ -34,7 +34,10 @@ func withClusterStopped(running bool, stop, start, body func() error) error {
 		return fmt.Errorf("stop cluster: %w", err)
 	}
 	bodyErr := body()
-	startErr := start()
+	var startErr error
+	if err := start(); err != nil {
+		startErr = fmt.Errorf("restart cluster: %w", err)
+	}
 	return errors.Join(bodyErr, startErr)
 }
 
@@ -43,13 +46,29 @@ func (s *Server) snapshotCreate(raw json.RawMessage) ([]cluster.SnapshotInfo, er
 	if err != nil {
 		return nil, err
 	}
+	// SPEC §7: the disks are cloned as one crash-consistent set, so the VMs are
+	// stopped first — there is no live-snapshot fast path — and a cluster that
+	// was running is restarted afterward, while a stopped one stays stopped.
 	running := s.clusterRunning(item.Name)
+	var created bool
 	err = withClusterStopped(running,
 		func() error { return s.stop(item.Name) },
 		func() error { return s.startAndLogWarning(item) },
-		func() error { return cluster.CreateSnapshot(item, args.Name) },
+		func() error {
+			if err := cluster.CreateSnapshot(item, args.Name); err != nil {
+				return err
+			}
+			created = true
+			return nil
+		},
 	)
 	if err != nil {
+		if created {
+			// the clone is on disk and intact; only the restart failed, and
+			// saying so keeps the operator from re-running a snapshot that
+			// already exists
+			return nil, fmt.Errorf("snapshot %q was created, but %w; start it with tbx cluster start %s", args.Name, err, item.Name)
+		}
 		return nil, err
 	}
 	return cluster.ListSnapshots(item.Name)
