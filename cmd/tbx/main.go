@@ -11,6 +11,7 @@ import (
 	"github.com/randax/talos-box/internal/config"
 	"github.com/randax/talos-box/internal/daemon"
 	"github.com/randax/talos-box/internal/imagecache"
+	"github.com/randax/talos-box/internal/talosversion"
 	"github.com/randax/talos-box/internal/version"
 )
 
@@ -217,6 +218,12 @@ func (c cli) createCluster(args []string) error {
 	if err != nil {
 		return err
 	}
+	// An empty value means "daemon default", matching the daemon boundary.
+	if *talosVersion != "" {
+		if err := talosversion.Validate(*talosVersion); err != nil {
+			return err
+		}
+	}
 	request := struct {
 		Name              string               `json:"name"`
 		ControlPlanes     int                  `json:"controlPlanes"`
@@ -416,6 +423,11 @@ func (c cli) runCache(args []string) error {
 		resolvedSchematic, err := resolveSchematic(*schematic)
 		if err != nil {
 			return err
+		}
+		if *talosVersion != "" {
+			if err := talosversion.Validate(*talosVersion); err != nil {
+				return err
+			}
 		}
 		request := map[string]string{"version": *talosVersion, "schematic": resolvedSchematic}
 		var result daemon.CachePullResult

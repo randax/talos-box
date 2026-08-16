@@ -29,9 +29,9 @@ func TestUserSchematicOverrideReachesDaemonEntryPoints(t *testing.T) {
 		},
 		{
 			name:     "cache pull",
-			response: json.RawMessage(`{"schematic":"user-supplied-schematic","version":"v1.2.3","architecture":"arm64","path":"/cache/disk.raw"}`),
+			response: json.RawMessage(`{"schematic":"user-supplied-schematic","version":"v1.12.1","architecture":"arm64","path":"/cache/disk.raw"}`),
 			run: func(command cli) error {
-				return command.runCache([]string{"pull", "--schematic=" + override, "--talos-version=v1.2.3"})
+				return command.runCache([]string{"pull", "--schematic=" + override, "--talos-version=v1.12.1"})
 			},
 		},
 	}

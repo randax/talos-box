@@ -7,9 +7,16 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+
+	"github.com/randax/talos-box/internal/talosversion"
 )
 
-const DefaultTalosVersion = "v1.13.6"
+// DefaultTalosVersion and MinTalosVersion mirror the pinned support window;
+// internal/talosversion is the single source of truth.
+const (
+	DefaultTalosVersion = talosversion.Default
+	MinTalosVersion     = talosversion.Min
+)
 
 // ProtocolVersion is the daemon wire version understood by this CLI/server
 // pair. New request fields must negotiate support before relying on them.

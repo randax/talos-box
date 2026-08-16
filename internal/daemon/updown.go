@@ -11,6 +11,7 @@ import (
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/config"
 	"github.com/randax/talos-box/internal/provision"
+	"github.com/randax/talos-box/internal/talosversion"
 )
 
 type upArgs struct {
@@ -39,6 +40,9 @@ func (s *Server) upWithObservations(raw json.RawMessage, maintenance map[string]
 		return nil, err
 	}
 	actions := PlanUp(args.Clusters, existing)
+	if err := validateSpecVersions(args.Talos, args.Clusters, actions); err != nil {
+		return nil, err
+	}
 	updates, err := s.preflightUpWithStorage(args.Clusters, existing, maintenance, storage)
 	if err != nil {
 		return nil, err
@@ -80,8 +84,32 @@ func (s *Server) validateUp(raw json.RawMessage, maintenance map[string]maintena
 	if err != nil {
 		return err
 	}
+	if err := validateSpecVersions(args.Talos, args.Clusters, PlanUp(args.Clusters, existing)); err != nil {
+		return err
+	}
 	_, err = s.preflightUpWithStorage(args.Clusters, existing, maintenance, storage)
 	return err
+}
+
+// validateSpecVersions refuses an up request that would create a cluster
+// with an effective version outside the support window, before any cluster
+// is created or updated. Specs for existing clusters stay exempt: tbx echoes
+// the created version into talosbox.yaml, so a floor bump must not stop
+// `up` from starting what already exists.
+func validateSpecVersions(fileTalos config.TalosSpec, specs []config.ClusterSpec, actions []Action) error {
+	for i, spec := range specs {
+		if actions[i].Kind != ActionCreate {
+			continue
+		}
+		version := resolveSpecTalos(spec, fileTalos).Version
+		if version == "" {
+			continue
+		}
+		if err := talosversion.Validate(version); err != nil {
+			return fmt.Errorf("cluster %s: %w", spec.Name, err)
+		}
+	}
+	return nil
 }
 
 type maintenanceObservation struct {
