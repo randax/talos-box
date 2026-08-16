@@ -50,7 +50,8 @@ func (s *Server) upWithObservations(raw json.RawMessage, maintenance map[string]
 		spec := args.Clusters[i]
 		switch action.Kind {
 		case ActionCreate:
-			result, err := s.createFromSpec(spec, args.Talos, args.Force)
+			spec.Talos = resolveSpecTalos(spec, args.Talos)
+			result, err := s.createFromSpec(spec, args.Force)
 			if err != nil {
 				return actions[:i], fmt.Errorf("create %s: %w", spec.Name, err)
 			}
@@ -527,8 +528,8 @@ func clusterReady(item cluster.Cluster, nodeActive func(string) bool) bool {
 }
 
 // createFromSpec provisions and starts one cluster from a config spec.
-func (s *Server) createFromSpec(spec config.ClusterSpec, talos config.TalosSpec, force bool) (ClusterSummary, error) {
-	args := createArgsFromSpec(spec, talos, force)
+func (s *Server) createFromSpec(spec config.ClusterSpec, force bool) (ClusterSummary, error) {
+	args := createArgsFromSpec(spec, force)
 	encoded, err := json.Marshal(args)
 	if err != nil {
 		return ClusterSummary{}, err
@@ -536,7 +537,18 @@ func (s *Server) createFromSpec(spec config.ClusterSpec, talos config.TalosSpec,
 	return s.createCluster(encoded)
 }
 
-func createArgsFromSpec(spec config.ClusterSpec, talos config.TalosSpec, force bool) createArgs {
+// resolveSpecTalos returns the talos spec to create the cluster with. The
+// client resolves per-cluster inheritance, so spec.Talos is authoritative; a
+// fully zero spec comes from an older tbx that only ever sent the file-level
+// block, which then still applies.
+func resolveSpecTalos(spec config.ClusterSpec, fileTalos config.TalosSpec) config.TalosSpec {
+	if spec.Talos.IsZero() {
+		return fileTalos
+	}
+	return spec.Talos
+}
+
+func createArgsFromSpec(spec config.ClusterSpec, force bool) createArgs {
 	return createArgs{
 		Name:                    spec.Name,
 		ControlPlanes:           &spec.ControlPlanes,
@@ -548,7 +560,8 @@ func createArgsFromSpec(spec config.ClusterSpec, talos config.TalosSpec, force b
 		Domain:                  spec.Domain,
 		AllowUnsafeDomain:       spec.AllowUnsafeDomain,
 		Force:                   force,
-		Schematic:               talos.Schematic,
-		Version:                 talos.Version,
+		Schematic:               spec.Talos.Schematic,
+		Version:                 spec.Talos.Version,
+		Extensions:              spec.Talos.Extensions,
 	}
 }

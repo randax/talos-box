@@ -14,7 +14,9 @@ const DefaultTalosVersion = "v1.13.6"
 // ProtocolVersion is the daemon wire version understood by this CLI/server
 // pair. New request fields must negotiate support before relying on them.
 // Version 4 volume-gates node.remove and honors its force field.
-const ProtocolVersion = 4
+// Version 5 honors the per-cluster talos spec on up requests instead of
+// applying the file-level block to every created cluster.
+const ProtocolVersion = 5
 
 // Request is one newline-delimited daemon request.
 type Request struct {

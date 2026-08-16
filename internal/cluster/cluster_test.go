@@ -270,3 +270,24 @@ func TestDomainInUseDetectsExactDuplicate(t *testing.T) {
 		t.Fatal("DomainInUse rejected nested domain; nesting is allowed")
 	}
 }
+
+func TestClusterStatePersistsTalosExtensions(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := New("ext", 0, 1, 0, NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.TalosVersion = "v1.14.0"
+	item.Schematic = "aaa"
+	item.TalosExtensions = []string{"qemu-guest-agent", "gvisor"}
+	if err := Save(item); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load("ext")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.TalosExtensions) != 2 || loaded.TalosExtensions[0] != "qemu-guest-agent" || loaded.TalosExtensions[1] != "gvisor" {
+		t.Fatalf("TalosExtensions = %#v, want the two requested extensions", loaded.TalosExtensions)
+	}
+}

@@ -39,6 +39,9 @@ type createArgs struct {
 	Schematic         string `json:"schematic"`
 	Version           string `json:"version"`
 	TalosVersion      string `json:"talosVersion"`
+	// Extensions are the requested curated Talos extensions. Parsed and
+	// persisted since protocol 5; composed into the schematic by later work.
+	Extensions []string `json:"extensions,omitempty"`
 }
 
 type nameArgs struct {
@@ -147,6 +150,10 @@ type ClusterStatus struct {
 	Subnet string `json:"subnet"`
 	// Domain is the cluster's effective domain (explicit or defaulted).
 	Domain string `json:"domain"`
+	// TalosVersion and Schematic identify the image the cluster was created
+	// from, as persisted at create.
+	TalosVersion string `json:"talosVersion,omitempty"`
+	Schematic    string `json:"schematic,omitempty"`
 	cluster.ProvisioningIntent
 	BGP             bool         `json:"bgp"`
 	Running         bool         `json:"running"`
@@ -342,6 +349,7 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if err != nil {
 		return ClusterSummary{}, err
 	}
+	item.TalosExtensions = args.Extensions
 	cachedDisk, err := s.cache.Ensure(item.Schematic, item.TalosVersion, s.imageArchitecture())
 	if err != nil {
 		return ClusterSummary{}, err
@@ -824,7 +832,7 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 
 	result := make([]ClusterStatus, 0, len(items))
 	for _, item := range items {
-		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: s.clusterRunning(item.Name), subnetIndex: item.SubnetIndex}
+		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), TalosVersion: item.TalosVersion, Schematic: item.Schematic, ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: s.clusterRunning(item.Name), subnetIndex: item.SubnetIndex}
 		for _, node := range item.Nodes {
 			running := s.nodeRunning(item.Name, node.Name)
 			clusterStatus.Nodes = append(clusterStatus.Nodes, NodeStatus{Name: node.Name, Role: node.Role, MAC: node.MAC, Phase: ClassifyPhase(running, ProbeResult{})})
