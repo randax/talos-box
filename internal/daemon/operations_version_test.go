@@ -87,6 +87,37 @@ func TestUpRefusesUnsupportedVersionsBeforeCreatingAnyCluster(t *testing.T) {
 	}
 }
 
+func TestUpStartsExistingClusterPinnedBelowTheFloor(t *testing.T) {
+	// tbx echoes the created version into talosbox.yaml, so a cluster made
+	// before a floor bump has a file pinning a now-below-floor version. The
+	// floor guards creates; starting what already exists must keep working.
+	t.Setenv("HOME", t.TempDir())
+	service := newVersionTestServer(t, "aaa", "v1.11.0")
+	item, err := cluster.New("legacy", 0, 1, 0, cluster.NodeDefaults{MemoryMiB: 1, CPUs: 1, DiskGiB: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.Schematic, item.TalosVersion = "aaa", "v1.11.0"
+	item.ImageArchitecture = "arm64"
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(upArgs{Clusters: []config.ClusterSpec{
+		{Name: "legacy", ControlPlanes: 1, Node: cluster.NodeDefaults{MemoryMiB: 1, CPUs: 1, DiskGiB: 1},
+			Talos: config.TalosSpec{Version: "v1.11.0", Schematic: "aaa"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actions, err := service.up(raw)
+	if err != nil {
+		t.Fatalf("up() on an existing below-floor cluster = %v, want it to start", err)
+	}
+	if len(actions) != 1 || actions[0].Kind == ActionCreate {
+		t.Fatalf("up actions = %+v, want a non-create action for the existing cluster", actions)
+	}
+}
+
 func TestUpAppliesFileLevelVersionFloorToInheritingClusters(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	service := newVersionTestServer(t, "aaa", DefaultTalosVersion)

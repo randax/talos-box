@@ -2,26 +2,20 @@ package main
 
 import (
 	"bytes"
-	"os"
-	"path/filepath"
+	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/randax/talos-box/internal/daemon"
 )
 
-func TestUpRefusesUnsupportedConfigVersionBeforeDialingDaemon(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	path := filepath.Join(t.TempDir(), "talosbox.yaml")
-	yaml := "version: 1\ntalos:\n  version: v1.11.9\nclusters:\n  - name: demo\n"
-	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	command := cli{out: &bytes.Buffer{}, err: &bytes.Buffer{}}
-	err := command.runUp([]string{"-f", path})
-	if err == nil || !strings.Contains(err.Error(), "v1.11.9") || !strings.Contains(err.Error(), daemon.MinTalosVersion) {
-		t.Fatalf("runUp() error = %v, want refusal naming v1.11.9 and %s", err, daemon.MinTalosVersion)
-	}
+func TestEmptyTalosVersionFlagMeansDaemonDefault(t *testing.T) {
+	// An explicit empty value defers to the daemon default, matching the
+	// daemon boundary's own convention — it must not be refused as malformed.
+	response := json.RawMessage(`{"name":"demo","controlPlanes":1,"workers":2,"nodeDefaults":{"memoryMiB":2048,"cpus":2,"diskGiB":20}}`)
+	runWithDaemonResponse(t, response, func(command cli) error {
+		return command.createCluster([]string{"demo", "--talos-version="})
+	})
 }
 
 func TestCachePullRefusesUnsupportedVersionBeforeDialingDaemon(t *testing.T) {
