@@ -122,8 +122,12 @@ func (c cli) removeScopedResolver(connect func() (dnsUninstaller, error), fallba
 	}
 	defer func() { _ = client.Close() }()
 	if err := client.UninstallDNS(); err != nil {
-		_, printErr := fmt.Fprintf(c.err, "warning: could not remove the k8s.test resolver: %v\n", err)
-		return printErr
+		// The helper is about to be booted out, so this is the last chance to
+		// honor the uninstall promise: retry directly as root.
+		if err := fallback(); err != nil {
+			_, printErr := fmt.Fprintf(c.err, "warning: could not remove resolver files: %v\n", err)
+			return printErr
+		}
 	}
 	return nil
 }
@@ -144,17 +148,18 @@ func removeResolverFilesDirectly() error {
 
 func removeResolverFiles(sharedPath string) (bool, error) {
 	removed := false
+	var sweepErr error
 	if err := os.Remove(sharedPath); err == nil {
 		removed = true
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return false, fmt.Errorf("remove %s: %w", sharedPath, err)
+		// Keep sweeping: one stuck file must not strand the others.
+		sweepErr = errors.Join(sweepErr, fmt.Errorf("remove %s: %w", sharedPath, err))
 	}
 	directory := filepath.Dir(sharedPath)
 	entries, err := os.ReadDir(directory)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return removed, fmt.Errorf("read resolver directory: %w", err)
+		return removed, errors.Join(sweepErr, fmt.Errorf("read resolver directory: %w", err))
 	}
-	var sweepErr error
 	for _, entry := range entries {
 		if !entry.Type().IsRegular() {
 			continue

@@ -167,7 +167,7 @@ func inspectSubnet(
 	if err != nil {
 		return subnetInspection{}, err
 	}
-	ownBridge := ""
+	ownBridges := map[string]bool{}
 	for _, current := range interfaces {
 		for _, address := range current.Addrs {
 			ip, network, ok := ipv4Network(address)
@@ -178,7 +178,7 @@ func inspectSubnet(
 				continue
 			}
 			if attached && isOwnBridgeAddress(ip, network, index) {
-				ownBridge = current.Name
+				ownBridges[current.Name] = true
 				continue
 			}
 			return subnetInspection{conflict: fmt.Sprintf("interface %s address %s", current.Name, address)}, nil
@@ -205,7 +205,7 @@ func inspectSubnet(
 	if allowTalosBoxBridge && isTalosBoxBridgeName(route.Interface, index) {
 		return subnetInspection{}, nil
 	}
-	if attached && ownBridge != "" && route.Interface == ownBridge {
+	if attached && ownBridges[route.Interface] {
 		return subnetInspection{}, nil
 	}
 	ones, bits := route.Network.Mask.Size()

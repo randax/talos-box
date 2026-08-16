@@ -419,7 +419,7 @@ func (s *Server) fetch(r *http.Request) (*http.Response, error) {
 	if resp.StatusCode != http.StatusUnauthorized {
 		return resp, nil
 	}
-	challenge, ok := parseBearerChallenge(resp.Header.Get("WWW-Authenticate"))
+	challenge, ok := bearerChallengeFrom(resp.Header.Values("WWW-Authenticate"))
 	if !ok {
 		// no token challenge to answer: the upstream's own response is the
 		// most faithful thing to hand back
@@ -845,6 +845,18 @@ type bearerChallenge struct {
 	realm   string
 	service string
 	scope   string
+}
+
+// bearerChallengeFrom returns the first Bearer challenge among the response's
+// WWW-Authenticate values, so an upstream that leads with another scheme
+// (e.g. Basic on a separate header line) is still answered.
+func bearerChallengeFrom(headers []string) (bearerChallenge, bool) {
+	for _, header := range headers {
+		if challenge, ok := parseBearerChallenge(header); ok {
+			return challenge, true
+		}
+	}
+	return bearerChallenge{}, false
 }
 
 // parseBearerChallenge reports whether header carries a Bearer challenge and,

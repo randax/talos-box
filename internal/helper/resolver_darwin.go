@@ -51,10 +51,12 @@ func uninstallHostResolver() error {
 	// files are never touched.
 	directory := filepath.Dir(resolverPath)
 	entries, readErr := os.ReadDir(directory)
-	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
-		return fmt.Errorf("read resolver directory: %w", readErr)
-	}
 	var sweepErr error
+	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+		// Fall through: the shared file may already be gone and its owed HUP
+		// must still be replayed below.
+		sweepErr = fmt.Errorf("read resolver directory: %w", readErr)
+	}
 	for _, entry := range entries {
 		if !entry.Type().IsRegular() {
 			continue
