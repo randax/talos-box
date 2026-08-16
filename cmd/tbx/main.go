@@ -214,15 +214,17 @@ func (c cli) createCluster(args []string) error {
 	if err := c.ensureProvisioningIntentSupport(intentInput); err != nil {
 		return err
 	}
-	resolvedSchematic, err := resolveSchematic(*schematic)
-	if err != nil {
-		return err
-	}
 	// An empty value means "daemon default", matching the daemon boundary.
+	// Version validation is local; it runs before schematic resolution,
+	// which may contact the Image Factory.
 	if *talosVersion != "" {
 		if err := talosversion.Validate(*talosVersion); err != nil {
 			return err
 		}
+	}
+	resolvedSchematic, err := resolveSchematic(*schematic)
+	if err != nil {
+		return err
 	}
 	request := struct {
 		Name              string               `json:"name"`
@@ -420,14 +422,14 @@ func (c cli) runCache(args []string) error {
 		if len(positionals) != 0 {
 			return errors.New("usage: tbx cache pull [--talos-version VERSION --schematic ID]")
 		}
-		resolvedSchematic, err := resolveSchematic(*schematic)
-		if err != nil {
-			return err
-		}
 		if *talosVersion != "" {
 			if err := talosversion.Validate(*talosVersion); err != nil {
 				return err
 			}
+		}
+		resolvedSchematic, err := resolveSchematic(*schematic)
+		if err != nil {
+			return err
 		}
 		request := map[string]string{"version": *talosVersion, "schematic": resolvedSchematic}
 		var result daemon.CachePullResult
