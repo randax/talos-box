@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -100,5 +101,39 @@ func runWithDaemonResponse(t *testing.T, data json.RawMessage, run func(cli) err
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for daemon request")
 		return daemon.Request{}
+	}
+}
+
+func TestCreateClusterEchoesFileLevelTalosBlock(t *testing.T) {
+	// A file-level pin is semantically identical for a single cluster and the
+	// echoed file replays against daemons predating per-cluster talos.
+	response := json.RawMessage(`{"name":"demo","controlPlanes":1,"workers":2,"nodeDefaults":{"memoryMiB":2048,"cpus":2,"diskGiB":20},"talosVersion":"v1.14.0","schematic":"user-supplied-schematic"}`)
+	var stdout string
+	runWithDaemonResponse(t, response, func(command cli) error {
+		var buffer bytes.Buffer
+		command.out = &buffer
+		err := command.createCluster([]string{"demo", "--schematic=user-supplied-schematic", "--talos-version=v1.14.0"})
+		stdout = buffer.String()
+		return err
+	})
+	if wanted := "talos:\n  version: v1.14.0\n  schematic: user-supplied-schematic\n"; !strings.Contains(stdout, wanted) {
+		t.Fatalf("create echo missing file-level talos block %q:\n%s", wanted, stdout)
+	}
+	if strings.Contains(stdout, "    talos:") {
+		t.Fatalf("create echo emits a per-cluster talos stanza:\n%s", stdout)
+	}
+}
+
+func TestCreateClusterTalosVersionFlagReachesTheWire(t *testing.T) {
+	response := json.RawMessage(`{"name":"demo","controlPlanes":1,"workers":2,"nodeDefaults":{"memoryMiB":2048,"cpus":2,"diskGiB":20}}`)
+	request := runWithDaemonResponse(t, response, func(command cli) error {
+		return command.createCluster([]string{"demo", "--schematic=user-supplied-schematic", "--talos-version=v1.14.0"})
+	})
+	var args map[string]json.RawMessage
+	if err := json.Unmarshal(request.Args, &args); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(args["version"]); got != `"v1.14.0"` {
+		t.Fatalf("version request field = %s, want v1.14.0", got)
 	}
 }

@@ -51,9 +51,14 @@ type Cluster struct {
 	WorkerDefaults       *NodeDefaults `json:"workerDefaults,omitempty"`
 	ProvisioningIntent
 	Nodes             []Node `json:"nodes"`
-	Schematic         string `json:"schematic,omitempty"`
-	TalosVersion      string `json:"talosVersion,omitempty"`
-	ImageArchitecture string `json:"imageArchitecture,omitempty"`
+	Schematic    string `json:"schematic,omitempty"`
+	TalosVersion string `json:"talosVersion,omitempty"`
+	// TalosExtensions records the curated extensions requested at create;
+	// they are persisted here and composed into the schematic by later work.
+	// No omitempty: the explicit [] opt-out must survive a save/load cycle
+	// distinct from the field being absent (nil round-trips as null).
+	TalosExtensions   []string `json:"talosExtensions"`
+	ImageArchitecture string   `json:"imageArchitecture,omitempty"`
 	// Domain is the canonical cluster domain when explicitly chosen at
 	// create; empty means the default, <name>.k8s.test. AllowUnsafeDomain
 	// records the opt-in the user passed for it, so emitted config

@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/hypervisor"
 )
 
 func TestNodeStatusDoesNotProbeStoppedReservedIP(t *testing.T) {
@@ -60,5 +61,41 @@ func TestNodeStatusProbesRunningReservedIP(t *testing.T) {
 	}
 	if !status.APIDReachable || status.Phase != PhaseMaintenance {
 		t.Fatalf("status = %+v, want reachable maintenance node", status)
+	}
+}
+
+func TestStatusReportsPerClusterTalosVersionAndSchematic(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	for _, seed := range []struct {
+		name      string
+		version   string
+		schematic string
+	}{
+		{"stable", "v1.13.6", "aaa"},
+		{"canary", "v1.14.0", "bbb"},
+	} {
+		item, err := cluster.New(seed.name, 0, 1, 0, cluster.NodeDefaults{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		item.TalosVersion = seed.version
+		item.Schematic = seed.schematic
+		if err := cluster.Save(item); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	service := &Server{vms: make(map[string]map[string]hypervisor.Machine)}
+	statuses, err := service.status(mustRawJSON(t, statusArgs{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string][2]string{}
+	for _, status := range statuses {
+		got[status.Name] = [2]string{status.TalosVersion, status.Schematic}
+	}
+	if got["stable"] != [2]string{"v1.13.6", "aaa"} || got["canary"] != [2]string{"v1.14.0", "bbb"} {
+		t.Fatalf("status talos identity = %v", got)
 	}
 }

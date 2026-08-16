@@ -242,3 +242,119 @@ func TestPrintActionsQuietKeepsFinalOutputButSuppressesNarration(t *testing.T) {
 		t.Fatalf("quiet output = %q, want final action only", got)
 	}
 }
+
+func TestRunUpSendsPerClusterTalosAfterProtocolHandshake(t *testing.T) {
+	home, requests := startUpTestDaemon(t,
+		daemon.Response{OK: true, Data: json.RawMessage(fmt.Sprintf(`{"protocolVersion":%d}`, daemon.ProtocolVersion))},
+		daemon.Response{OK: true, Data: json.RawMessage(`[]`)},
+	)
+	path := filepath.Join(home, "talosbox.yaml")
+	contents := `version: 1
+talos:
+  version: v1.13.6
+clusters:
+  - name: stable
+  - name: canary
+    talos:
+      version: v1.14.0
+      schematic: bbb
+      extensions: []
+`
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := (cli{out: &stdout, err: &stderr}).runUp([]string{"-f", path}); err != nil {
+		t.Fatal(err)
+	}
+	if request := <-requests; request.Op != "daemon.info" {
+		t.Fatalf("first operation = %q, want daemon.info handshake", request.Op)
+	}
+	request := <-requests
+	if request.Op != "up" {
+		t.Fatalf("second operation = %q, want up", request.Op)
+	}
+	var args struct {
+		Talos    config.TalosSpec
+		Clusters []config.ClusterSpec
+	}
+	if err := json.Unmarshal(request.Args, &args); err != nil {
+		t.Fatal(err)
+	}
+	if got := args.Clusters[0].Talos; got.Version != "v1.13.6" || got.Schematic != "" {
+		t.Fatalf("stable talos on the wire = %#v, want inherited v1.13.6", got)
+	}
+	if got := args.Clusters[1].Talos; got.Version != "v1.14.0" || got.Schematic != "bbb" {
+		t.Fatalf("canary talos on the wire = %#v, want the override", got)
+	}
+	if args.Clusters[1].Talos.Extensions == nil || len(args.Clusters[1].Talos.Extensions) != 0 {
+		t.Fatalf("canary extensions opt-out lost on the wire: %#v", args.Clusters[1].Talos.Extensions)
+	}
+	if args.Talos.Version != "v1.13.6" {
+		t.Fatalf("file-level talos = %#v, want it kept for older daemons", args.Talos)
+	}
+}
+
+func TestRunUpRejectsOldDaemonWhenPerClusterTalosIsUsed(t *testing.T) {
+	home, requests := startUpTestDaemon(t,
+		daemon.Response{OK: true, Data: json.RawMessage(`{"protocolVersion":4}`)},
+	)
+	path := filepath.Join(home, "talosbox.yaml")
+	contents := "version: 1\ntalos:\n  version: v1.13.6\nclusters:\n  - name: demo\n    talos:\n      version: v1.14.0\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	err := (cli{out: &stdout, err: &stderr}).runUp([]string{"-f", path})
+	if err == nil || !strings.Contains(err.Error(), "tbxd protocol 4 is too old") {
+		t.Fatalf("runUp() error = %v, want per-cluster talos refusal", err)
+	}
+	if request := <-requests; request.Op != "daemon.info" {
+		t.Fatalf("operation = %q, want daemon.info before any mutation", request.Op)
+	}
+}
+
+func TestRunUpSkipsHandshakeWithoutPerClusterTalosOverrides(t *testing.T) {
+	// A file-level talos block alone is understood by every daemon version;
+	// only a per-cluster divergence needs the protocol handshake.
+	home, requests := startUpTestDaemon(t,
+		daemon.Response{OK: true, Data: json.RawMessage(`[]`)},
+	)
+	path := filepath.Join(home, "talosbox.yaml")
+	contents := "version: 1\ntalos:\n  version: v1.13.6\nclusters:\n  - name: demo\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := (cli{out: &stdout, err: &stderr}).runUp([]string{"-f", path}); err != nil {
+		t.Fatal(err)
+	}
+	if request := <-requests; request.Op != "up" {
+		t.Fatalf("first operation = %q, want up without a handshake", request.Op)
+	}
+}
+
+func TestRunUpRejectsOldDaemonWhenFileLevelExtensionsAreUsed(t *testing.T) {
+	// The extensions field is new at protocol 5; even a purely inherited
+	// file-level list would be silently dropped by an older daemon.
+	home, requests := startUpTestDaemon(t,
+		daemon.Response{OK: true, Data: json.RawMessage(`{"protocolVersion":4}`)},
+	)
+	path := filepath.Join(home, "talosbox.yaml")
+	contents := "version: 1\ntalos:\n  extensions: [gvisor]\nclusters:\n  - name: demo\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	err := (cli{out: &stdout, err: &stderr}).runUp([]string{"-f", path})
+	if err == nil || !strings.Contains(err.Error(), "tbxd protocol 4 is too old") {
+		t.Fatalf("runUp() error = %v, want per-cluster talos refusal", err)
+	}
+	if request := <-requests; request.Op != "daemon.info" {
+		t.Fatalf("operation = %q, want daemon.info before any mutation", request.Op)
+	}
+}

@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -12,14 +13,9 @@ import (
 func Marshal(cfg Config) string {
 	var b strings.Builder
 	b.WriteString("version: 1\n")
-	if cfg.Talos.Version != "" || cfg.Talos.Schematic != "" {
+	if !cfg.Talos.IsZero() {
 		b.WriteString("talos:\n")
-		if cfg.Talos.Version != "" {
-			fmt.Fprintf(&b, "  version: %s\n", cfg.Talos.Version)
-		}
-		if cfg.Talos.Schematic != "" {
-			fmt.Fprintf(&b, "  schematic: %s\n", cfg.Talos.Schematic)
-		}
+		writeTalosFields(&b, cfg.Talos, "  ")
 	}
 	b.WriteString("clusters:\n")
 	for _, c := range cfg.Clusters {
@@ -45,6 +41,13 @@ func Marshal(cfg Config) string {
 		if c.AllowUnsafeDomain {
 			b.WriteString("    allowUnsafeDomain: true\n")
 		}
+		// A resolved talos equal to the file-level block is pure inheritance,
+		// and a zero one has nothing to say; only a divergence needs its own
+		// stanza.
+		if !c.Talos.IsZero() && !c.Talos.Equal(cfg.Talos) {
+			b.WriteString("    talos:\n")
+			writeTalosFields(&b, c.Talos, "      ")
+		}
 		writeNode(&b, "node", c.Node)
 		if c.ControlPlane != nil {
 			writeNode(&b, "controlPlane", *c.ControlPlane)
@@ -54,6 +57,24 @@ func Marshal(cfg Config) string {
 		}
 	}
 	return b.String()
+}
+
+func writeTalosFields(b *strings.Builder, t TalosSpec, indent string) {
+	if t.Version != "" {
+		fmt.Fprintf(b, "%sversion: %s\n", indent, t.Version)
+	}
+	if t.Schematic != "" {
+		fmt.Fprintf(b, "%sschematic: %s\n", indent, t.Schematic)
+	}
+	if t.Extensions != nil {
+		quoted := make([]string, len(t.Extensions))
+		for i, extension := range t.Extensions {
+			// Double-quote each element so names carrying YAML flow syntax
+			// (commas, brackets) round-trip through Parse unchanged.
+			quoted[i] = strconv.Quote(extension)
+		}
+		fmt.Fprintf(b, "%sextensions: [%s]\n", indent, strings.Join(quoted, ", "))
+	}
 }
 
 func writeNode(b *strings.Builder, key string, n cluster.NodeDefaults) {

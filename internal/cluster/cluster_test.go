@@ -270,3 +270,42 @@ func TestDomainInUseDetectsExactDuplicate(t *testing.T) {
 		t.Fatal("DomainInUse rejected nested domain; nesting is allowed")
 	}
 }
+
+func TestClusterStatePersistsTalosExtensions(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := New("ext", 0, 1, 0, NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.TalosVersion = "v1.14.0"
+	item.Schematic = "aaa"
+	item.TalosExtensions = []string{"qemu-guest-agent", "gvisor"}
+	if err := Save(item); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load("ext")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.TalosExtensions) != 2 || loaded.TalosExtensions[0] != "qemu-guest-agent" || loaded.TalosExtensions[1] != "gvisor" {
+		t.Fatalf("TalosExtensions = %#v, want the two requested extensions", loaded.TalosExtensions)
+	}
+
+	// The explicit [] opt-out must survive a save/load cycle distinct from
+	// the field being absent.
+	optOut, err := New("opt-out", 1, 1, 0, NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	optOut.TalosExtensions = []string{}
+	if err := Save(optOut); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := Load("opt-out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.TalosExtensions == nil || len(reloaded.TalosExtensions) != 0 {
+		t.Fatalf("opt-out TalosExtensions = %#v, want non-nil empty list", reloaded.TalosExtensions)
+	}
+}

@@ -57,6 +57,7 @@ type Server struct {
 	nodeIPLookup          func(string, int) string
 	nodeProbe             func(string) ProbeResult
 	hostFreeMemory        func() (int, error)
+	helperCheck           func() error
 	maintenanceLoad       func(string) (cluster.Cluster, error)
 	lifecycleContext      context.Context
 	lifecycleCancel       context.CancelFunc

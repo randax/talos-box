@@ -253,6 +253,9 @@ func (c cli) createCluster(args []string) error {
 			}
 		}
 	}
+	// The pin goes in the file-level block: for a single cluster it is
+	// semantically identical to a per-cluster stanza, and the emitted file
+	// replays against daemons older than the per-cluster talos protocol.
 	stanza := config.Marshal(config.Config{
 		Talos: config.TalosSpec{Version: result.TalosVersion, Schematic: result.Schematic},
 		Clusters: []config.ClusterSpec{{

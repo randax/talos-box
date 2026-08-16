@@ -18,6 +18,10 @@ A CNI from talosbox's fixed, tested set (initially `cilium` and `flannel`). Each
 
 A storage engine from talosbox's fixed, tested set (`longhorn` or `local-path`). It is available only through the provisioning path, where talosbox applies its pinned rendered objects and verifies a PersistentVolumeClaim write/readback path on every supported cluster shape. Bring-your-own CSI remains unsupported above the substrate; `tbx manifests <cluster> storage` prints the Talos mounts and PSA guidance needed to prepare a substrate-only cluster, and `talos.schematic` is the escape hatch for engines requiring other image extensions.
 
+## Curated extension
+
+A Talos system extension from talosbox's fixed, tested set, referenced by bare short name in a `talos.extensions` list and composed into the cluster's schematic by tbx. Arbitrary extension lists are not a supported concept; `talos.schematic` remains the escape hatch.
+
 ## Host substrate
 
 The platform-specific VM, networking, DNS, and service-manager implementation beneath the shared talosbox cluster model. A host substrate may have different mechanics without changing the guest-visible contract.

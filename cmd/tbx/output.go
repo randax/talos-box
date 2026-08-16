@@ -38,17 +38,21 @@ func printStatus(output io.Writer, clusters []daemon.ClusterStatus, quiet bool) 
 		return err
 	}
 	table := tabwriter.NewWriter(output, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(table, "CLUSTER\tSUBNET\tDOMAIN\tNODE\tROLE\tMAC\tIP\tPHASE"); err != nil {
+	if _, err := fmt.Fprintln(table, "CLUSTER\tSUBNET\tDOMAIN\tTALOS\tNODE\tROLE\tMAC\tIP\tPHASE"); err != nil {
 		return err
 	}
 	for _, item := range clusters {
+		talos := item.TalosVersion
+		if talos == "" {
+			talos = "-"
+		}
 		for _, node := range item.Nodes {
 			ip := node.IP
 			if ip == "" {
 				ip = "-"
 			}
-			if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-				item.Name, item.Subnet, item.Domain, node.Name, node.Role, node.MAC, ip, node.Phase); err != nil {
+			if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+				item.Name, item.Subnet, item.Domain, talos, node.Name, node.Role, node.MAC, ip, node.Phase); err != nil {
 				return err
 			}
 		}
@@ -65,6 +69,15 @@ func printStatus(output io.Writer, clusters []daemon.ClusterStatus, quiet bool) 
 	}
 	if quiet {
 		return nil
+	}
+	// Every cluster carries a schematic (the daemon default when nothing was
+	// pinned), so the full 64-hex ids stay out of quiet output.
+	for _, item := range clusters {
+		if item.Schematic != "" {
+			if _, err := fmt.Fprintf(output, "cluster %s: schematic %s\n", item.Name, item.Schematic); err != nil {
+				return err
+			}
+		}
 	}
 	printed := false
 	for _, item := range clusters {
