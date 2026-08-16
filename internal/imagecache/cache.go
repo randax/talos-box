@@ -441,6 +441,11 @@ type pruneAction struct {
 type combinationPlan struct {
 	combination Combination
 	actions     []pruneAction
+	// temporariesOnly marks a kept combination whose abandoned partial
+	// downloads are being swept: the space is reclaimed but the combination
+	// must not be reported as pruned, or the itemized list would contradict
+	// the keep decision `cache list` shows.
+	temporariesOnly bool
 }
 
 type mirrorPrunePlan struct {
@@ -509,7 +514,7 @@ func (c *Cache) pruneKnownDiskArtifacts(keep func(Combination) (bool, error)) (C
 			bytes += action.size
 		}
 		result.ImageBytes += bytes
-		if len(combination.actions) != 0 {
+		if len(combination.actions) != 0 && !combination.temporariesOnly {
 			result.Images = append(result.Images, PrunedCombination{Combination: combination.combination, Bytes: bytes})
 		}
 	}
@@ -539,6 +544,22 @@ func planKnownVersionPrune(versionPath, schematic, version string, keep func(Com
 				return nil, nil, false, err
 			}
 			if kept {
+				// A kept combination still sheds abandoned partial
+				// downloads: they are safe to delete regardless of
+				// retention and would otherwise accumulate forever.
+				if err := requireDirectoryPath(archDir); err != nil {
+					return nil, nil, false, err
+				}
+				tempPlan, err := planKnownFiles(archDir, nil, []knownPrunePrefix{
+					{prefix: ".disk.raw-"},
+					{prefix: fmt.Sprintf(".metal-%s.raw.xz-", architecture)},
+				})
+				if err != nil {
+					return nil, nil, false, err
+				}
+				if len(tempPlan) != 0 {
+					plan = append(plan, combinationPlan{combination: combination, actions: tempPlan, temporariesOnly: true})
+				}
 				continue
 			}
 			if err := requireDirectoryPath(archDir); err != nil {

@@ -572,3 +572,40 @@ func TestPruneDiskExceptPropagatesKeepErrors(t *testing.T) {
 		t.Fatalf("disk removed despite a classification failure: %v", err)
 	}
 }
+
+// TestPruneDiskExceptSweepsTemporariesFromKeptCombinations pins the cleanup
+// half of reference-aware prune: a kept combination sheds abandoned partial
+// downloads without its image being touched or reported as pruned.
+func TestPruneDiskExceptSweepsTemporariesFromKeptCombinations(t *testing.T) {
+	root := t.TempDir()
+	cache := New(root)
+
+	archDir := filepath.Join(root, "schematic", "v1.2.3", "amd64")
+	if err := os.MkdirAll(archDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	diskPath := filepath.Join(archDir, "disk.raw")
+	tempPath := filepath.Join(archDir, ".disk.raw-partial")
+	for path, contents := range map[string]string{diskPath: "disk-bytes", tempPath: "partial-bytes"} {
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	result, err := cache.PruneDiskExcept(func(Combination) (bool, error) { return true, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(tempPath); !os.IsNotExist(err) {
+		t.Fatalf("temporary artifact still exists after prune: %v", err)
+	}
+	if _, err := os.Stat(diskPath); err != nil {
+		t.Fatalf("kept disk image missing after prune: %v", err)
+	}
+	if result.ImageCount != 0 {
+		t.Fatalf("ImageCount = %d, want 0", result.ImageCount)
+	}
+	if len(result.Images) != 0 {
+		t.Fatalf("Images = %+v, want none reported for a kept combination", result.Images)
+	}
+}
