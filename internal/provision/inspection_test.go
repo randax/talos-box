@@ -118,18 +118,131 @@ func TestRenderInspectionStoragePrerequisitesAreAvailableWithoutCuratedIntent(t 
 	}
 }
 
-func TestRenderInspectionRejectsNonStorageSectionsWithoutCuratedCNI(t *testing.T) {
+// TestRenderInspectionSubstrateSectionsNeedNoCuratedCNI is the fork surface the
+// inspection exists for: the machine patch and the catch-all registry mirror are
+// substrate, so a hand-bootstrapping user gets them without declaring a CNI.
+func TestRenderInspectionSubstrateSectionsNeedNoCuratedCNI(t *testing.T) {
+	item := cluster.Cluster{Name: "demo", SubnetIndex: 7}
+	for section, wants := range map[string][]string{
+		"machine": {"name: none", "RegistryMirrorConfig", "http://172.30.7.1:5059", "skipFallback: true"},
+		"talos":   {"name: none", "RegistryMirrorConfig"},
+		"mirrors": {"RegistryMirrorConfig", `name: "*"`, "http://172.30.7.1:5059", "skipFallback: true"},
+	} {
+		got, err := RenderInspection(item, section)
+		if err != nil {
+			t.Fatalf("RenderInspection(%q) on a substrate-only cluster: %v", section, err)
+		}
+		for _, want := range wants {
+			if !strings.Contains(got, want) {
+				t.Errorf("substrate-only %s section missing %q:\n%s", section, want, got)
+			}
+		}
+	}
+	machine, err := RenderInspection(item, "machine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(machine, "proxy:") {
+		t.Fatalf("substrate-only machine patch disables kube-proxy without a curated CNI:\n%s", machine)
+	}
+}
+
+// TestRenderInspectionCNIDerivedSectionsNameTheRemedy keeps the refusal for the
+// sections that genuinely come out of a curated CNI's charts, and makes it point
+// at the flag that renders them.
+func TestRenderInspectionCNIDerivedSectionsNameTheRemedy(t *testing.T) {
 	item := cluster.Cluster{Name: "demo"}
-	want := `cluster "demo" does not declare a curated cni`
 	for _, section := range []string{
-		"machine", "values", "objects", "extras", "mirrors",
-		"talos", "cilium-values", "metallb-values", "metallb-extras", "k8s",
-		"balloon", "lb-pool", "bgp", "l2",
+		"values", "objects", "extras", "k8s",
+		"cilium-values", "metallb-values", "metallb-extras",
+		"lb-pool", "bgp", "l2",
 	} {
 		_, err := RenderInspection(item, section)
-		if err == nil || err.Error() != want {
-			t.Errorf("RenderInspection(%q) error = %v, want %q", section, err, want)
+		if err == nil {
+			t.Errorf("RenderInspection(%q) on a substrate-only cluster = nil error", section)
+			continue
 		}
+		for _, want := range []string{`cluster "demo" does not declare a curated cni`, "--cni cilium", "--cni flannel"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("RenderInspection(%q) error = %v, want it to mention %q", section, err, want)
+			}
+		}
+	}
+}
+
+// TestRenderInspectionCNIOverrideRendersTheNamedPath is the "what would tbx
+// apply" question a substrate-only user asks before installing a CNI by hand.
+func TestRenderInspectionCNIOverrideRendersTheNamedPath(t *testing.T) {
+	item := cluster.Cluster{Name: "demo", SubnetIndex: 4}
+	cilium := cluster.Cluster{Name: "demo", SubnetIndex: 4, ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true}}
+	for _, section := range []string{"values", "objects", "extras", "lb-pool", "l2", "machine"} {
+		got, err := RenderInspectionWithCNI(item, section, "cilium")
+		if err != nil {
+			t.Fatalf("RenderInspectionWithCNI(%q, cilium): %v", section, err)
+		}
+		want, err := RenderInspection(cilium, section)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("--cni cilium %s section differs from a declared Cilium cluster", section)
+		}
+	}
+	values, err := RenderInspectionWithCNI(item, "values", "flannel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(values, "l2Announcements") && !strings.Contains(values, "speaker") {
+		t.Fatalf("--cni flannel values do not look like MetalLB values:\n%s", values)
+	}
+	if strings.Contains(values, "kubeProxyReplacement") {
+		t.Fatalf("--cni flannel rendered Cilium values:\n%s", values)
+	}
+}
+
+func TestRenderInspectionCNIOverrideMustMatchADeclaredCNI(t *testing.T) {
+	item := cluster.Cluster{Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true}}
+	if _, err := RenderInspectionWithCNI(item, "objects", "flannel"); err == nil || !strings.Contains(err.Error(), "declares cni cilium") {
+		t.Fatalf("mismatched --cni error = %v, want it to name the declared cni", err)
+	}
+	matched, err := RenderInspectionWithCNI(item, "objects", "cilium")
+	if err != nil {
+		t.Fatal(err)
+	}
+	declared, err := RenderInspection(item, "objects")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if matched != declared {
+		t.Fatalf("--cni naming the declared cni changed the render")
+	}
+	if _, err := RenderInspectionWithCNI(item, "objects", "calico"); err == nil || !strings.Contains(err.Error(), "--cni must be one of cilium or flannel") {
+		t.Fatalf("uncurated --cni error = %v, want the curated-set message", err)
+	}
+}
+
+// TestRenderInspectionAllSubstrateOnlyRendersTheMachinePatchAndNamesTheFlag
+// covers the bundle: it must carry the substrate sections rather than only the
+// storage guidance, and say how to see the CNI-derived ones.
+func TestRenderInspectionAllSubstrateOnlyRendersTheMachinePatchAndNamesTheFlag(t *testing.T) {
+	item := cluster.Cluster{Name: "demo", SubnetIndex: 8}
+	all, err := RenderInspection(item, "all")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"# Machine-config prerequisite patch",
+		"name: none",
+		"RegistryMirrorConfig",
+		"tbx manifests demo objects --cni cilium",
+		"# Storage machine-config prerequisite patch",
+	} {
+		if !strings.Contains(all, want) {
+			t.Fatalf("substrate-only all bundle missing %q:\n%s", want, all)
+		}
+	}
+	if strings.Contains(all, "kubeProxyReplacement") || strings.Contains(all, "kind: DaemonSet") {
+		t.Fatalf("substrate-only all bundle claims curated objects:\n%s", all)
 	}
 }
 
