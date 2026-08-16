@@ -22,6 +22,11 @@ func (c cli) runUp(args []string) error {
 			return err
 		}
 	}
+	if perClusterTalosOverridesPresent(cfg) {
+		if err := c.ensurePerClusterTalosSupport(); err != nil {
+			return err
+		}
+	}
 	var actions []daemon.Action
 	request := struct {
 		config.Config
@@ -52,6 +57,18 @@ func strongestProvisioningIntent(cfg config.Config) (cluster.ProvisioningIntentI
 		}
 	}
 	return strongest, found
+}
+
+// perClusterTalosOverridesPresent reports whether any cluster's resolved
+// talos spec diverges from the file-level block. Pure inheritance needs no
+// handshake: every daemon version applies the file-level block correctly.
+func perClusterTalosOverridesPresent(cfg config.Config) bool {
+	for _, spec := range cfg.Clusters {
+		if !spec.Talos.Equal(cfg.Talos) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c cli) runDown(args []string) error {

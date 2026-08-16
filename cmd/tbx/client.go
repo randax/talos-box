@@ -26,6 +26,7 @@ const (
 	csiProvisioningIntentProtocolVersion    = 2
 	cacheWarmProtocolVersion                = 3
 	nodeRemoveGateProtocolVersion           = 4
+	perClusterTalosProtocolVersion          = 5
 )
 
 func requiresProvisioningIntentHandshake(input cluster.ProvisioningIntentInput) bool {
@@ -75,6 +76,26 @@ func (c cli) ensureNodeRemoveSupport() error {
 	}
 	if info.ProtocolVersion > daemon.ProtocolVersion {
 		return fmt.Errorf("tbx is too old: protocol %d does not support tbxd protocol %d; upgrade tbx before using node remove", daemon.ProtocolVersion, info.ProtocolVersion)
+	}
+	return nil
+}
+
+// ensurePerClusterTalosSupport refuses to send an up request with per-cluster
+// talos overrides to a daemon that would silently apply the file-level block
+// to every created cluster.
+func (c cli) ensurePerClusterTalosSupport() error {
+	var info daemon.Info
+	if err := c.call("daemon.info", struct{}{}, &info); err != nil {
+		if strings.Contains(err.Error(), "unknown operation") {
+			return errors.New("tbxd is too old; restart or upgrade tbxd to use per-cluster talos settings")
+		}
+		return err
+	}
+	if info.ProtocolVersion < perClusterTalosProtocolVersion {
+		return fmt.Errorf("tbxd protocol %d is too old; restart or upgrade tbxd to use per-cluster talos settings", info.ProtocolVersion)
+	}
+	if info.ProtocolVersion > daemon.ProtocolVersion {
+		return fmt.Errorf("tbx is too old: protocol %d does not support tbxd protocol %d; upgrade tbx before using per-cluster talos settings", daemon.ProtocolVersion, info.ProtocolVersion)
 	}
 	return nil
 }

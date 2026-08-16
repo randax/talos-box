@@ -119,8 +119,10 @@ end-to-end timing and cluster-up gate remains #97. The ISO+install path is dropp
   This verifies cache completeness, not a live-cluster pull.
 - Node disks: `~/.talosbox/clusters/<name>/<node>.img`, **20 GB sparse** default.
 - **Talos version matrix**: each tbx release pins one tested default Talos version (initially
-  v1.13.6, the validated one); `talosbox.yaml` may override `talos.version` and
-  `talos.schematic` per file. Only the pinned default is CI-verified.
+  v1.13.6, the validated one); `talosbox.yaml` may override `talos.version`, `talos.schematic`,
+  and `talos.extensions` at file level and per cluster, inheriting field-wise (set fields
+  override, lists override rather than concatenate, `extensions: []` opts out). Only the
+  pinned default is CI-verified.
 
 ## 5. Networking
 
@@ -310,10 +312,14 @@ version: 1
 talos:
   version: v1.13.6        # optional; defaults to the release's pinned version
   schematic: ""           # optional Image Factory schematic id
+  extensions: []          # optional curated Talos extensions
 clusters:
   - name: demo
     controlPlanes: 1
     workers: 2
+    talos: {}              # optional per-cluster override of the file-level talos
+                           # block; unset fields inherit, set fields override,
+                           # extension lists override (extensions: [] = none)
     cni: cilium            # optional curated CNI: cilium|flannel; absent = substrate only
     csi: longhorn          # optional curated storage: longhorn|local-path; requires cni
     lb: true               # LoadBalancer support with the curated CNI

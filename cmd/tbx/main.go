@@ -254,12 +254,12 @@ func (c cli) createCluster(args []string) error {
 		}
 	}
 	stanza := config.Marshal(config.Config{
-		Talos: config.TalosSpec{Version: result.TalosVersion, Schematic: result.Schematic},
 		Clusters: []config.ClusterSpec{{
 			Name: result.Name, ControlPlanes: result.ControlPlanes, Workers: result.Workers,
 			ProvisioningIntent: result.ProvisioningIntent,
 			Domain:             result.Domain, AllowUnsafeDomain: result.AllowUnsafeDomain,
-			Node: result.NodeDefaults,
+			Node:  result.NodeDefaults,
+			Talos: config.TalosSpec{Version: result.TalosVersion, Schematic: result.Schematic},
 		}}})
 	_, err = fmt.Fprintf(c.out, "\nequivalent talosbox.yaml:\n%s", stanza)
 	return err
