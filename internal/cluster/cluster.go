@@ -55,9 +55,9 @@ type Cluster struct {
 	TalosVersion string `json:"talosVersion,omitempty"`
 	// TalosExtensions records the curated extensions requested at create;
 	// they are persisted here and composed into the schematic by later work.
-	// The list is already resolved (inheritance and the [] opt-out applied),
-	// so omitempty folding an empty list into absence loses nothing.
-	TalosExtensions   []string `json:"talosExtensions,omitempty"`
+	// No omitempty: the explicit [] opt-out must survive a save/load cycle
+	// distinct from the field being absent (nil round-trips as null).
+	TalosExtensions   []string `json:"talosExtensions"`
 	ImageArchitecture string   `json:"imageArchitecture,omitempty"`
 	// Domain is the canonical cluster domain when explicitly chosen at
 	// create; empty means the default, <name>.k8s.test. AllowUnsafeDomain
