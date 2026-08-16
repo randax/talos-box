@@ -28,6 +28,72 @@ func TestWarningsDescribeExtremeHostPressure(t *testing.T) {
 	}
 }
 
+func TestWarningsTreatSwapAsSecondaryToMemoryPressure(t *testing.T) {
+	stickySwap := Usage{TotalBytes: 18 << 30, AvailableBytes: 1 << 30} // 94% used
+
+	tests := []struct {
+		name     string
+		snapshot Snapshot
+		want     []string
+	}{
+		{
+			name:     "sticky swap with normal pressure is fine",
+			snapshot: Snapshot{Swap: stickySwap, MemoryPressure: MemoryPressureNormal},
+			want:     nil,
+		},
+		{
+			name:     "full swap with elevated pressure warns",
+			snapshot: Snapshot{Swap: stickySwap, MemoryPressure: MemoryPressureWarning},
+			want:     []string{"swap is 94% used", "memory pressure is warning"},
+		},
+		{
+			name:     "full swap with unknown pressure keeps the conservative warning",
+			snapshot: Snapshot{Swap: stickySwap},
+			want:     []string{"swap is 94% used", "memory pressure could not be measured"},
+		},
+		{
+			name:     "critical pressure warns on its own",
+			snapshot: Snapshot{MemoryPressure: MemoryPressureCritical},
+			want:     []string{"memory pressure is critical", "free memory or reduce the cluster size"},
+		},
+		{
+			name:     "normal pressure without swap trouble is quiet",
+			snapshot: Snapshot{MemoryPressure: MemoryPressureNormal},
+			want:     nil,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			warnings := Warnings(test.snapshot)
+			if len(test.want) == 0 {
+				if len(warnings) != 0 {
+					t.Fatalf("Warnings() = %v, want none", warnings)
+				}
+				return
+			}
+			joined := strings.Join(warnings, "\n")
+			for _, fragment := range test.want {
+				if !strings.Contains(joined, fragment) {
+					t.Errorf("Warnings() = %v, missing %q", warnings, fragment)
+				}
+			}
+		})
+	}
+}
+
+func TestMemoryPressureString(t *testing.T) {
+	for pressure, want := range map[MemoryPressure]string{
+		MemoryPressureUnknown:  "unknown",
+		MemoryPressureNormal:   "normal",
+		MemoryPressureWarning:  "warning",
+		MemoryPressureCritical: "critical",
+	} {
+		if got := pressure.String(); got != want {
+			t.Errorf("MemoryPressure(%d).String() = %q, want %q", pressure, got, want)
+		}
+	}
+}
+
 func TestWarningsUseExtremeThresholds(t *testing.T) {
 	tests := []struct {
 		name     string
