@@ -5,6 +5,7 @@ package config
 import (
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -31,9 +32,25 @@ type Config struct {
 }
 
 // TalosSpec pins the image; empty fields mean "the daemon's pinned default".
+// Extensions distinguishes nil (nothing requested, inheritable) from an
+// explicit empty list (opt-out of the file-level default).
 type TalosSpec struct {
-	Version   string
-	Schematic string
+	Version    string
+	Schematic  string
+	Extensions []string
+}
+
+// Equal reports field-wise equality; a nil extensions list is distinct from
+// an explicit empty one.
+func (t TalosSpec) Equal(other TalosSpec) bool {
+	return t.Version == other.Version && t.Schematic == other.Schematic &&
+		(t.Extensions == nil) == (other.Extensions == nil) &&
+		slices.Equal(t.Extensions, other.Extensions)
+}
+
+// IsZero reports whether nothing is pinned at all.
+func (t TalosSpec) IsZero() bool {
+	return t.Version == "" && t.Schematic == "" && t.Extensions == nil
 }
 
 // ClusterSpec is one desired cluster with all defaults applied.
@@ -51,6 +68,9 @@ type ClusterSpec struct {
 	// ControlPlane/Worker are set only when the file overrides the role.
 	ControlPlane *cluster.NodeDefaults
 	Worker       *cluster.NodeDefaults
+	// Talos is the resolved image pin for this cluster: the file-level block
+	// with any per-cluster overrides applied field-wise.
+	Talos TalosSpec
 }
 
 type rawConfig struct {
@@ -62,6 +82,9 @@ type rawConfig struct {
 type rawTalos struct {
 	Version   string `yaml:"version"`
 	Schematic string `yaml:"schematic"`
+	// Extensions is a pointer so an explicit `extensions: []` (opt-out) can
+	// be told apart from the key being absent (inherit).
+	Extensions *[]string `yaml:"extensions"`
 }
 
 type rawCluster struct {
@@ -71,9 +94,10 @@ type rawCluster struct {
 	cluster.ProvisioningIntentInput `yaml:",inline"`
 	Domain                          string   `yaml:"domain"`
 	AllowUnsafeDomain               bool     `yaml:"allowUnsafeDomain"`
-	Node                            rawNode  `yaml:"node"`
-	ControlPlane                    *rawNode `yaml:"controlPlane"`
-	Worker                          *rawNode `yaml:"worker"`
+	Node                            rawNode   `yaml:"node"`
+	ControlPlane                    *rawNode  `yaml:"controlPlane"`
+	Worker                          *rawNode  `yaml:"worker"`
+	Talos                           *rawTalos `yaml:"talos"`
 }
 
 type rawNode struct {
@@ -97,7 +121,7 @@ func Parse(data []byte) (Config, error) {
 		return Config{}, fmt.Errorf("talosbox.yaml must describe at least one cluster")
 	}
 
-	cfg := Config{Talos: TalosSpec(raw.Talos)}
+	cfg := Config{Talos: resolveTalos(TalosSpec{}, &raw.Talos)}
 	seen := map[string]bool{}
 	seenDomains := map[string]string{}
 	for _, rc := range raw.Clusters {
@@ -117,6 +141,7 @@ func Parse(data []byte) (Config, error) {
 			Name: rc.Name, ControlPlanes: defaultControlPlanes, Workers: defaultWorkers,
 			ProvisioningIntent: intent,
 			AllowUnsafeDomain:  rc.AllowUnsafeDomain,
+			Talos:              resolveTalos(cfg.Talos, rc.Talos),
 		}
 		if rc.Domain != "" {
 			canonical, err := domain.Validate(rc.Domain, rc.AllowUnsafeDomain)
@@ -177,6 +202,26 @@ func Parse(data []byte) (Config, error) {
 		cfg.Clusters = append(cfg.Clusters, spec)
 	}
 	return cfg, nil
+}
+
+// resolveTalos overlays the fields set in raw onto base: unset fields
+// inherit, set fields override, and an extension list overrides wholesale
+// rather than concatenating (`extensions: []` therefore means "none").
+func resolveTalos(base TalosSpec, raw *rawTalos) TalosSpec {
+	out := base
+	if raw == nil {
+		return out
+	}
+	if raw.Version != "" {
+		out.Version = raw.Version
+	}
+	if raw.Schematic != "" {
+		out.Schematic = raw.Schematic
+	}
+	if raw.Extensions != nil {
+		out.Extensions = append([]string{}, *raw.Extensions...)
+	}
+	return out
 }
 
 // resolveNode overlays the fields set in raw onto base.
