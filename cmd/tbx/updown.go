@@ -22,7 +22,7 @@ func (c cli) runUp(args []string) error {
 			return err
 		}
 	}
-	if perClusterTalosOverridesPresent(cfg) {
+	if requiresPerClusterTalosHandshake(cfg) {
 		if err := c.ensurePerClusterTalosSupport(); err != nil {
 			return err
 		}
@@ -59,10 +59,16 @@ func strongestProvisioningIntent(cfg config.Config) (cluster.ProvisioningIntentI
 	return strongest, found
 }
 
-// perClusterTalosOverridesPresent reports whether any cluster's resolved
-// talos spec diverges from the file-level block. Pure inheritance needs no
-// handshake: every daemon version applies the file-level block correctly.
-func perClusterTalosOverridesPresent(cfg config.Config) bool {
+// requiresPerClusterTalosHandshake reports whether the up request depends on
+// protocol-5 talos handling: a cluster whose resolved spec diverges from the
+// file-level block, or any extensions at all — the extensions field is new at
+// protocol 5, so an older daemon would silently drop it even at file level.
+// Pure version/schematic inheritance needs no handshake: every daemon version
+// applies those file-level fields correctly.
+func requiresPerClusterTalosHandshake(cfg config.Config) bool {
+	if cfg.Talos.Extensions != nil {
+		return true
+	}
 	for _, spec := range cfg.Clusters {
 		if !spec.Talos.Equal(cfg.Talos) {
 			return true

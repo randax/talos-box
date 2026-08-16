@@ -41,7 +41,9 @@ type createArgs struct {
 	TalosVersion      string `json:"talosVersion"`
 	// Extensions are the requested curated Talos extensions. Parsed and
 	// persisted since protocol 5; composed into the schematic by later work.
-	Extensions []string `json:"extensions,omitempty"`
+	// No omitempty: an explicit empty list (the config-level opt-out) must
+	// survive the wire distinct from the field being absent.
+	Extensions []string `json:"extensions"`
 }
 
 type nameArgs struct {
@@ -291,7 +293,7 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if err != nil {
 		return ClusterSummary{}, err
 	}
-	if err := requireHelper(); err != nil {
+	if err := s.requireHelper(); err != nil {
 		return ClusterSummary{}, err
 	}
 	addMiB := (controlPlanes + workers) * memoryOr(args.Node.MemoryMiB, cluster.DefaultMemoryMiB)
@@ -510,7 +512,12 @@ func helperInstallError(err error) error {
 	return fmt.Errorf("network helper unavailable; run `sudo tbx system install`: %w", err)
 }
 
-func requireHelper() error {
+// requireHelper checks the network helper is reachable; the injected
+// helperCheck is the test seam.
+func (s *Server) requireHelper() error {
+	if s.helperCheck != nil {
+		return s.helperCheck()
+	}
 	client, err := helper.Connect()
 	if err != nil {
 		return helperInstallError(err)

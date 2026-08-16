@@ -125,3 +125,17 @@ func TestCreateClusterEchoesPerClusterTalosStanza(t *testing.T) {
 		t.Fatalf("create echo still emits a file-level talos block:\n%s", stdout)
 	}
 }
+
+func TestCreateClusterTalosVersionFlagReachesTheWire(t *testing.T) {
+	response := json.RawMessage(`{"name":"demo","controlPlanes":1,"workers":2,"nodeDefaults":{"memoryMiB":2048,"cpus":2,"diskGiB":20}}`)
+	request := runWithDaemonResponse(t, response, func(command cli) error {
+		return command.createCluster([]string{"demo", "--schematic=user-supplied-schematic", "--talos-version=v1.14.0"})
+	})
+	var args map[string]json.RawMessage
+	if err := json.Unmarshal(request.Args, &args); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(args["version"]); got != `"v1.14.0"` {
+		t.Fatalf("version request field = %s, want v1.14.0", got)
+	}
+}

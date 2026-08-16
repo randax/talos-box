@@ -506,3 +506,19 @@ func TestMarshalPerClusterTalosRoundTrip(t *testing.T) {
 		t.Errorf("expected exactly one file-level and one per-cluster talos block:\n%s", out)
 	}
 }
+
+func TestMarshalQuotesExtensionsCarryingFlowSyntax(t *testing.T) {
+	spec := ClusterSpec{
+		Name: "demo", ControlPlanes: 1, Workers: 2,
+		Node:  cluster.NodeDefaults{MemoryMiB: 2048, CPUs: 2, DiskGiB: 20},
+		Talos: TalosSpec{Extensions: []string{"foo,bar", "gvisor"}},
+	}
+	out := Marshal(Config{Clusters: []ClusterSpec{spec}})
+	back, err := Parse([]byte(out))
+	if err != nil {
+		t.Fatalf("re-Parse of marshaled config: %v\n%s", err, out)
+	}
+	if !reflect.DeepEqual(back.Clusters[0].Talos.Extensions, spec.Talos.Extensions) {
+		t.Fatalf("extensions round trip = %#v, want %#v\n%s", back.Clusters[0].Talos.Extensions, spec.Talos.Extensions, out)
+	}
+}

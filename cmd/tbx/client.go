@@ -40,81 +40,47 @@ func minimumProvisioningIntentProtocol(input cluster.ProvisioningIntentInput) in
 	return legacyProvisioningIntentProtocolVersion
 }
 
+// ensureProtocolAtLeast performs the daemon.info handshake and refuses to
+// proceed when either side is too old for the named feature.
+func (c cli) ensureProtocolAtLeast(minimum int, feature string) error {
+	var info daemon.Info
+	if err := c.call("daemon.info", struct{}{}, &info); err != nil {
+		if strings.Contains(err.Error(), "unknown operation") {
+			return fmt.Errorf("tbxd is too old; restart or upgrade tbxd to use %s", feature)
+		}
+		return err
+	}
+	if info.ProtocolVersion < minimum {
+		return fmt.Errorf("tbxd protocol %d is too old; restart or upgrade tbxd to use %s", info.ProtocolVersion, feature)
+	}
+	if info.ProtocolVersion > daemon.ProtocolVersion {
+		return fmt.Errorf("tbx is too old: protocol %d does not support tbxd protocol %d; upgrade tbx to use %s", daemon.ProtocolVersion, info.ProtocolVersion, feature)
+	}
+	return nil
+}
+
 func (c cli) ensureProvisioningIntentSupport(input cluster.ProvisioningIntentInput) error {
 	if !requiresProvisioningIntentHandshake(input) {
 		return nil
 	}
-	var info daemon.Info
-	if err := c.call("daemon.info", struct{}{}, &info); err != nil {
-		if strings.Contains(err.Error(), "unknown operation") {
-			return errors.New("tbxd is too old; restart or upgrade tbxd to use --cni/--csi/--hubble/--lb/--bgp")
-		}
-		return err
-	}
-	minimumProtocol := minimumProvisioningIntentProtocol(input)
-	if info.ProtocolVersion < minimumProtocol {
-		return fmt.Errorf("tbxd protocol %d is too old; restart or upgrade tbxd to use --cni/--csi/--hubble/--lb/--bgp", info.ProtocolVersion)
-	}
-	if info.ProtocolVersion > daemon.ProtocolVersion {
-		return fmt.Errorf("tbx is too old: protocol %d does not support tbxd protocol %d; upgrade tbx before using --cni/--csi/--hubble/--lb/--bgp", daemon.ProtocolVersion, info.ProtocolVersion)
-	}
-	return nil
+	return c.ensureProtocolAtLeast(minimumProvisioningIntentProtocol(input), "--cni/--csi/--hubble/--lb/--bgp")
 }
 
 // ensureNodeRemoveSupport refuses to send node.remove to a daemon that would
 // ignore its force field and delete the node's disk ungated.
 func (c cli) ensureNodeRemoveSupport() error {
-	var info daemon.Info
-	if err := c.call("daemon.info", struct{}{}, &info); err != nil {
-		if strings.Contains(err.Error(), "unknown operation") {
-			return errors.New("tbxd is too old; restart or upgrade tbxd before using node remove")
-		}
-		return err
-	}
-	if info.ProtocolVersion < nodeRemoveGateProtocolVersion {
-		return fmt.Errorf("tbxd protocol %d is too old; restart or upgrade tbxd before using node remove", info.ProtocolVersion)
-	}
-	if info.ProtocolVersion > daemon.ProtocolVersion {
-		return fmt.Errorf("tbx is too old: protocol %d does not support tbxd protocol %d; upgrade tbx before using node remove", daemon.ProtocolVersion, info.ProtocolVersion)
-	}
-	return nil
+	return c.ensureProtocolAtLeast(nodeRemoveGateProtocolVersion, "node remove")
 }
 
 // ensurePerClusterTalosSupport refuses to send an up request with per-cluster
-// talos overrides to a daemon that would silently apply the file-level block
-// to every created cluster.
+// talos settings to a daemon that would silently apply the file-level
+// version/schematic to every created cluster and drop extensions entirely.
 func (c cli) ensurePerClusterTalosSupport() error {
-	var info daemon.Info
-	if err := c.call("daemon.info", struct{}{}, &info); err != nil {
-		if strings.Contains(err.Error(), "unknown operation") {
-			return errors.New("tbxd is too old; restart or upgrade tbxd to use per-cluster talos settings")
-		}
-		return err
-	}
-	if info.ProtocolVersion < perClusterTalosProtocolVersion {
-		return fmt.Errorf("tbxd protocol %d is too old; restart or upgrade tbxd to use per-cluster talos settings", info.ProtocolVersion)
-	}
-	if info.ProtocolVersion > daemon.ProtocolVersion {
-		return fmt.Errorf("tbx is too old: protocol %d does not support tbxd protocol %d; upgrade tbx before using per-cluster talos settings", daemon.ProtocolVersion, info.ProtocolVersion)
-	}
-	return nil
+	return c.ensureProtocolAtLeast(perClusterTalosProtocolVersion, "per-cluster talos settings")
 }
 
 func (c cli) ensureCacheWarmSupport() error {
-	var info daemon.Info
-	if err := c.call("daemon.info", struct{}{}, &info); err != nil {
-		if strings.Contains(err.Error(), "unknown operation") {
-			return errors.New("tbxd is too old; restart or upgrade tbxd before using cache warm/check")
-		}
-		return err
-	}
-	if info.ProtocolVersion < cacheWarmProtocolVersion {
-		return fmt.Errorf("tbxd protocol %d is too old; restart or upgrade tbxd before using cache warm/check", info.ProtocolVersion)
-	}
-	if info.ProtocolVersion > daemon.ProtocolVersion {
-		return fmt.Errorf("tbx is too old: protocol %d does not support tbxd protocol %d; upgrade tbx before using cache warm/check", daemon.ProtocolVersion, info.ProtocolVersion)
-	}
-	return nil
+	return c.ensureProtocolAtLeast(cacheWarmProtocolVersion, "cache warm/check")
 }
 
 func (c cli) call(op string, args, destination any) error {

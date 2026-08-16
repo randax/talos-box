@@ -5,14 +5,16 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"reflect"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/config"
+	"github.com/randax/talos-box/internal/hostpressure"
 	"github.com/randax/talos-box/internal/hypervisor"
+	"github.com/randax/talos-box/internal/imagecache"
 	"github.com/randax/talos-box/internal/provision"
 )
 
@@ -482,5 +484,87 @@ func TestResolveSpecTalosFallsBackToFileTalosForOlderClients(t *testing.T) {
 	optOut := config.ClusterSpec{Name: "demo", Talos: config.TalosSpec{Extensions: []string{}}}
 	if got := resolveSpecTalos(optOut, fileTalos); !got.Equal(optOut.Talos) {
 		t.Errorf("opt-out spec = %#v, want %#v", got, optOut.Talos)
+	}
+}
+
+func TestUpCreatesEachClusterFromItsOwnImage(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	images := map[string]string{"stable": "disk-aaa", "canary": "disk-bbb"}
+	for _, seed := range []struct{ schematic, version, body string }{
+		{"aaa", "v1.13.6", images["stable"]},
+		{"bbb", "v1.14.0", images["canary"]},
+	} {
+		path := filepath.Join(root, seed.schematic, seed.version, "arm64", "disk.raw")
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(seed.body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	service := &Server{
+		cache:        imagecache.New(root),
+		hypervisor:   &fakeHypervisor{architecture: hypervisor.ArchitectureARM64},
+		vms:          make(map[string]map[string]hypervisor.Machine),
+		helperCheck:  func() error { return nil },
+		hostPressure: func(string) (hostpressure.Snapshot, error) { return hostpressure.Snapshot{}, nil },
+	}
+	raw, err := json.Marshal(upArgs{Clusters: []config.ClusterSpec{
+		{Name: "stable", ControlPlanes: 1, Workers: 0, Node: cluster.NodeDefaults{MemoryMiB: 1, CPUs: 1, DiskGiB: 1},
+			Talos: config.TalosSpec{Version: "v1.13.6", Schematic: "aaa"}},
+		{Name: "canary", ControlPlanes: 1, Workers: 0, Node: cluster.NodeDefaults{MemoryMiB: 1, CPUs: 1, DiskGiB: 1},
+			Talos: config.TalosSpec{Version: "v1.14.0", Schematic: "bbb", Extensions: []string{"gvisor"}}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actions, err := service.up(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 2 || actions[0].Kind != ActionCreate || actions[1].Kind != ActionCreate {
+		t.Fatalf("up actions = %+v, want two creates", actions)
+	}
+
+	for name, wantDisk := range images {
+		item, err := cluster.Load(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantVersion, wantSchematic := "v1.13.6", "aaa"
+		if name == "canary" {
+			wantVersion, wantSchematic = "v1.14.0", "bbb"
+		}
+		if item.TalosVersion != wantVersion || item.Schematic != wantSchematic {
+			t.Fatalf("%s state = (%q, %q), want (%q, %q)", name, item.TalosVersion, item.Schematic, wantVersion, wantSchematic)
+		}
+		dir, err := cluster.Dir(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		disk, err := os.Open(filepath.Join(dir, item.Nodes[0].Name+".img"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The node disk is the cached image followed by sparse padding; only
+		// the image-sized prefix identifies which image seeded it.
+		prefix := make([]byte, len(wantDisk))
+		_, err = disk.ReadAt(prefix, 0)
+		_ = disk.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(prefix) != wantDisk {
+			t.Fatalf("%s node disk provisioned from %q, want %q", name, prefix, wantDisk)
+		}
+	}
+	canary, err := cluster.Load("canary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(canary.TalosExtensions) != 1 || canary.TalosExtensions[0] != "gvisor" {
+		t.Fatalf("canary extensions = %#v, want [gvisor]", canary.TalosExtensions)
 	}
 }

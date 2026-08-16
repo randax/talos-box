@@ -336,3 +336,25 @@ func TestRunUpSkipsHandshakeWithoutPerClusterTalosOverrides(t *testing.T) {
 		t.Fatalf("first operation = %q, want up without a handshake", request.Op)
 	}
 }
+
+func TestRunUpRejectsOldDaemonWhenFileLevelExtensionsAreUsed(t *testing.T) {
+	// The extensions field is new at protocol 5; even a purely inherited
+	// file-level list would be silently dropped by an older daemon.
+	home, requests := startUpTestDaemon(t,
+		daemon.Response{OK: true, Data: json.RawMessage(`{"protocolVersion":4}`)},
+	)
+	path := filepath.Join(home, "talosbox.yaml")
+	contents := "version: 1\ntalos:\n  extensions: [gvisor]\nclusters:\n  - name: demo\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	err := (cli{out: &stdout, err: &stderr}).runUp([]string{"-f", path})
+	if err == nil || !strings.Contains(err.Error(), "tbxd protocol 4 is too old") {
+		t.Fatalf("runUp() error = %v, want per-cluster talos refusal", err)
+	}
+	if request := <-requests; request.Op != "daemon.info" {
+		t.Fatalf("operation = %q, want daemon.info before any mutation", request.Op)
+	}
+}

@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -65,7 +66,13 @@ func writeTalosFields(b *strings.Builder, t TalosSpec, indent string) {
 		fmt.Fprintf(b, "%sschematic: %s\n", indent, t.Schematic)
 	}
 	if t.Extensions != nil {
-		fmt.Fprintf(b, "%sextensions: [%s]\n", indent, strings.Join(t.Extensions, ", "))
+		quoted := make([]string, len(t.Extensions))
+		for i, extension := range t.Extensions {
+			// Double-quote each element so names carrying YAML flow syntax
+			// (commas, brackets) round-trip through Parse unchanged.
+			quoted[i] = strconv.Quote(extension)
+		}
+		fmt.Fprintf(b, "%sextensions: [%s]\n", indent, strings.Join(quoted, ", "))
 	}
 }
 
