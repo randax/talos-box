@@ -205,8 +205,12 @@ func factoryAccessError(err error, base, talosVersion string, requested []string
 }
 
 // CompositionID returns the recorded schematic id for a composition, if any.
+// A record that exists but cannot be decoded is an error, not an absence:
+// treating it as absent would silently fall through to the online path and
+// hide local cache corruption behind a confusing Factory failure offline.
 func (c *Cache) CompositionID(base, talosVersion string, requested []string) (string, bool, error) {
-	data, err := os.ReadFile(c.compositionPath(base, talosVersion, requested))
+	path := c.compositionPath(base, talosVersion, requested)
+	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return "", false, nil
 	}
@@ -214,8 +218,11 @@ func (c *Cache) CompositionID(base, talosVersion string, requested []string) (st
 		return "", false, fmt.Errorf("read composed schematic record: %w", err)
 	}
 	var record compositionRecord
-	if err := json.Unmarshal(data, &record); err != nil || record.ID == "" {
-		return "", false, nil
+	if err := json.Unmarshal(data, &record); err != nil {
+		return "", false, fmt.Errorf("parse composed schematic record %s: %w", path, err)
+	}
+	if record.ID == "" {
+		return "", false, fmt.Errorf("composed schematic record %s carries no schematic id", path)
 	}
 	return record.ID, true, nil
 }

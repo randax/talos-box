@@ -5,6 +5,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -409,5 +411,41 @@ func TestComposeSchematicReusesRecordedRecomposition(t *testing.T) {
 	unreachable := unreachableCache(t, root)
 	if _, err := unreachable.ComposeSchematic("other", "v1.13.6", []string{"gvisor"}); err == nil {
 		t.Fatal("ComposeSchematic() reused the recorded id for a different base schematic")
+	}
+}
+
+// TestCompositionIDSurfacesCorruptRecords pins the offline contract's
+// diagnosability: a record that exists but cannot be decoded must fail
+// locally, not silently fall through to the online composition path.
+func TestCompositionIDSurfacesCorruptRecords(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		contents string
+	}{
+		{name: "invalid JSON", contents: "{not json"},
+		{name: "missing id", contents: `{"id":""}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cache := offlineCache(t, t.TempDir())
+			path := cache.compositionPath("", "v1.13.6", []string{"gvisor"})
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(tt.contents), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, _, err := cache.CompositionID("", "v1.13.6", []string{"gvisor"}); err == nil {
+				t.Fatal("CompositionID error = nil, want a corrupt-record error")
+			}
+			if _, err := cache.ComposeSchematic("", "v1.13.6", []string{"gvisor"}); err == nil {
+				t.Fatal("ComposeSchematic error = nil, want a corrupt-record error")
+			}
+		})
 	}
 }
