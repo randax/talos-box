@@ -47,6 +47,7 @@ type fakeMachine struct {
 	stopRemaining time.Duration
 	stopErr       error
 	closeErr      error
+	onClose       func()
 }
 
 func (f *fakeMachine) Active() bool                 { return f.active }
@@ -63,6 +64,9 @@ func (f *fakeMachine) Stop(ctx context.Context) error {
 func (f *fakeMachine) Suspend(context.Context, string) error { return nil }
 func (f *fakeMachine) Close() error {
 	f.calls = append(f.calls, "close")
+	if f.onClose != nil {
+		f.onClose()
+	}
 	return f.closeErr
 }
 
