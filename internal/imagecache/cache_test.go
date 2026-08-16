@@ -21,9 +21,10 @@ func TestSchematicRequestBody(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name  string
-		extra []string
-		want  string
+		name       string
+		extensions []string
+		extra      []string
+		want       string
 	}{
 		{
 			name: "required arguments",
@@ -34,13 +35,18 @@ func TestSchematicRequestBody(t *testing.T) {
 			extra: []string{"talos.platform=metal", "panic=10"},
 			want:  `{"customization":{"extraKernelArgs":["console=tty0","console=hvc0","talos.platform=metal","panic=10"],"systemExtensions":{"officialExtensions":["siderolabs/iscsi-tools","siderolabs/util-linux-tools"]}}}`,
 		},
+		{
+			name:       "requested extensions merge with the always-on set",
+			extensions: []string{"siderolabs/qemu-guest-agent", "siderolabs/iscsi-tools"},
+			want:       `{"customization":{"extraKernelArgs":["console=tty0","console=hvc0"],"systemExtensions":{"officialExtensions":["siderolabs/iscsi-tools","siderolabs/qemu-guest-agent","siderolabs/util-linux-tools"]}}}`,
+		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			body, err := schematicRequestBody(test.extra)
+			body, err := schematicRequestBody(test.extensions, test.extra)
 			if err != nil {
 				t.Fatalf("schematicRequestBody() error = %v", err)
 			}

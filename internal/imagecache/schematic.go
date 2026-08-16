@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 )
 
@@ -17,11 +18,14 @@ var (
 
 // Schematic creates the content-addressed Image Factory schematic used by talosbox.
 func (c *Cache) Schematic(extraArgs ...string) (string, error) {
-	body, err := schematicRequestBody(extraArgs)
+	body, err := schematicRequestBody(nil, extraArgs)
 	if err != nil {
 		return "", err
 	}
+	return c.postSchematic(body)
+}
 
+func (c *Cache) postSchematic(body []byte) (string, error) {
 	request, err := http.NewRequest(http.MethodPost, strings.TrimRight(c.factoryURL, "/")+"/schematics", bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("create schematic request: %w", err)
@@ -61,14 +65,32 @@ type schematicRequest struct {
 	} `json:"customization"`
 }
 
-func schematicRequestBody(extraArgs []string) ([]byte, error) {
+// schematicRequestBody composes the talosbox customization: the required
+// kernel arguments, the always-on storage extensions, and any additional
+// official extension refs, deduplicated and sorted so the same request always
+// content-addresses to the same schematic id.
+func schematicRequestBody(extensionRefs, extraArgs []string) ([]byte, error) {
 	request := schematicRequest{}
 	request.Customization.ExtraKernelArgs = append(append([]string(nil), requiredKernelArgs...), extraArgs...)
-	request.Customization.SystemExtensions.OfficialExtensions = append([]string(nil), requiredExtensions...)
+	request.Customization.SystemExtensions.OfficialExtensions = mergeExtensions(extensionRefs)
 
 	body, err := json.Marshal(request)
 	if err != nil {
 		return nil, fmt.Errorf("encode schematic request: %w", err)
 	}
 	return body, nil
+}
+
+func mergeExtensions(extensionRefs []string) []string {
+	seen := make(map[string]struct{}, len(requiredExtensions)+len(extensionRefs))
+	merged := make([]string, 0, len(requiredExtensions)+len(extensionRefs))
+	for _, ref := range append(append([]string(nil), requiredExtensions...), extensionRefs...) {
+		if _, duplicate := seen[ref]; duplicate {
+			continue
+		}
+		seen[ref] = struct{}{}
+		merged = append(merged, ref)
+	}
+	sort.Strings(merged)
+	return merged
 }

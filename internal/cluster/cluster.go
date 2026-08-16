@@ -54,7 +54,8 @@ type Cluster struct {
 	Schematic    string `json:"schematic,omitempty"`
 	TalosVersion string `json:"talosVersion,omitempty"`
 	// TalosExtensions records the curated extensions requested at create;
-	// they are persisted here and composed into the schematic by later work.
+	// Schematic is the id they were composed into, so re-resolving stored
+	// state never re-composes.
 	// No omitempty: the explicit [] opt-out must survive a save/load cycle
 	// distinct from the field being absent (nil round-trips as null).
 	TalosExtensions   []string `json:"talosExtensions"`

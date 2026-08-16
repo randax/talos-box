@@ -176,6 +176,43 @@ func TestPrintStatusShowsTalosVersionAndSchematic(t *testing.T) {
 	}
 }
 
+func TestPrintStatusShowsCuratedExtensions(t *testing.T) {
+	t.Parallel()
+
+	statuses := []daemon.ClusterStatus{
+		{
+			Name: "sandboxed", Subnet: "172.30.3.0/24", Domain: "sandboxed.k8s.test",
+			TalosVersion: "v1.13.6", Schematic: "aaa111", TalosExtensions: []string{"gvisor", "nfs-utils"},
+			Nodes: []daemon.NodeStatus{{Name: "sandboxed-cp-1", Role: cluster.RoleControlPlane, MAC: "52:54:00:00:00:01", Phase: daemon.PhaseConfigured}},
+		},
+		{
+			Name: "plain", Subnet: "172.30.4.0/24", Domain: "plain.k8s.test",
+			TalosVersion: "v1.13.6", Schematic: "bbb222",
+			Nodes: []daemon.NodeStatus{{Name: "plain-cp-1", Role: cluster.RoleControlPlane, MAC: "52:54:00:00:00:02", Phase: daemon.PhaseConfigured}},
+		},
+	}
+
+	var output bytes.Buffer
+	if err := printStatus(&output, statuses, false); err != nil {
+		t.Fatal(err)
+	}
+	rendered := output.String()
+	if !strings.Contains(rendered, "cluster sandboxed: extensions gvisor, nfs-utils") {
+		t.Fatalf("status output missing the extensions line:\n%s", rendered)
+	}
+	if strings.Contains(rendered, "cluster plain: extensions") {
+		t.Fatalf("status output invented an extensions line for a cluster without any:\n%s", rendered)
+	}
+
+	var quiet bytes.Buffer
+	if err := printStatus(&quiet, statuses, true); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(quiet.String(), "extensions") {
+		t.Fatalf("quiet status unexpectedly included the extensions line:\n%s", quiet.String())
+	}
+}
+
 func TestPrintStatusQuietSuppressesSchematicLines(t *testing.T) {
 	t.Parallel()
 

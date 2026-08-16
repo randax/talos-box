@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/randax/talos-box/internal/daemon"
@@ -75,6 +76,13 @@ func printStatus(output io.Writer, clusters []daemon.ClusterStatus, quiet bool) 
 	for _, item := range clusters {
 		if item.Schematic != "" {
 			if _, err := fmt.Fprintf(output, "cluster %s: schematic %s\n", item.Name, item.Schematic); err != nil {
+				return err
+			}
+		}
+		// The composed id is opaque; the extension names it was composed
+		// from are what the user wrote.
+		if len(item.TalosExtensions) > 0 {
+			if _, err := fmt.Fprintf(output, "cluster %s: extensions %s\n", item.Name, strings.Join(item.TalosExtensions, ", ")); err != nil {
 				return err
 			}
 		}

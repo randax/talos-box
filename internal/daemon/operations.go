@@ -40,10 +40,10 @@ type createArgs struct {
 	Schematic         string `json:"schematic"`
 	Version           string `json:"version"`
 	TalosVersion      string `json:"talosVersion"`
-	// Extensions are the requested curated Talos extensions. Parsed and
-	// persisted since protocol 5; composed into the schematic by later work.
-	// No omitempty: an explicit empty list (the config-level opt-out) must
-	// survive the wire distinct from the field being absent.
+	// Extensions are the requested curated Talos extensions, composed into
+	// the schematic at create. No omitempty: an explicit empty list (the
+	// config-level opt-out) must survive the wire distinct from the field
+	// being absent.
 	Extensions []string `json:"extensions"`
 }
 
@@ -157,6 +157,9 @@ type ClusterStatus struct {
 	// from, as persisted at create.
 	TalosVersion string `json:"talosVersion,omitempty"`
 	Schematic    string `json:"schematic,omitempty"`
+	// TalosExtensions are the curated extensions the schematic was composed
+	// from, as requested at create.
+	TalosExtensions []string `json:"talosExtensions,omitempty"`
 	cluster.ProvisioningIntent
 	BGP             bool         `json:"bgp"`
 	Running         bool         `json:"running"`
@@ -353,7 +356,7 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	item.ImageArchitecture = string(s.hypervisor.Architecture())
 	longhornWarning := s.checkLonghornMemoryWarning(item)
 	longhornCustomSchematicWarning := s.longhornCustomSchematicWarning(item, args.Schematic != "")
-	item.Schematic, item.TalosVersion, err = s.resolveImage(args.Schematic, args.Version)
+	item.Schematic, item.TalosVersion, err = s.resolveImage(args.Schematic, args.Version, args.Extensions)
 	if err != nil {
 		return ClusterSummary{}, err
 	}
@@ -854,7 +857,7 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 
 	result := make([]ClusterStatus, 0, len(items))
 	for _, item := range items {
-		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), TalosVersion: item.TalosVersion, Schematic: item.Schematic, ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: s.clusterRunning(item.Name), subnetIndex: item.SubnetIndex}
+		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), TalosVersion: item.TalosVersion, Schematic: item.Schematic, TalosExtensions: item.TalosExtensions, ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: s.clusterRunning(item.Name), subnetIndex: item.SubnetIndex}
 		for _, node := range item.Nodes {
 			running := s.nodeRunning(item.Name, node.Name)
 			clusterStatus.Nodes = append(clusterStatus.Nodes, NodeStatus{Name: node.Name, Role: node.Role, MAC: node.MAC, Phase: ClassifyPhase(running, ProbeResult{})})
@@ -959,7 +962,7 @@ func (s *Server) pullCache(raw json.RawMessage) (CachePullResult, error) {
 	if args.Version == "" {
 		args.Version = args.TalosVersion
 	}
-	schematic, talosVersion, err := s.resolveImage(args.Schematic, args.Version)
+	schematic, talosVersion, err := s.resolveImage(args.Schematic, args.Version, nil)
 	if err != nil {
 		return CachePullResult{}, err
 	}
@@ -1295,18 +1298,28 @@ func isHexDigit(character rune) bool {
 // well-formed and inside the support window before it reaches image
 // resolution. Stored cluster state goes through imageDefaults instead —
 // a floor bump must not retroactively refuse clusters that already exist.
-func (s *Server) resolveImage(schematic, talosVersion string) (string, string, error) {
+func (s *Server) resolveImage(schematic, talosVersion string, requestedExtensions []string) (string, string, error) {
 	if talosVersion != "" {
 		if err := talosversion.Validate(talosVersion); err != nil {
 			return "", "", err
 		}
 	}
-	return s.imageDefaults(schematic, talosVersion)
+	return s.imageDefaults(schematic, talosVersion, requestedExtensions)
 }
 
-func (s *Server) imageDefaults(schematic, talosVersion string) (string, string, error) {
+func (s *Server) imageDefaults(schematic, talosVersion string, requestedExtensions []string) (string, string, error) {
 	if talosVersion == "" {
 		talosVersion = DefaultTalosVersion
+	}
+	if len(requestedExtensions) > 0 {
+		// Composition owns validation: it is skipped entirely when the
+		// composed id is already recorded, which is what lets a cached
+		// composed image be created from offline.
+		composed, err := s.cache.ComposeSchematic(schematic, talosVersion, requestedExtensions)
+		if err != nil {
+			return "", "", err
+		}
+		return composed, talosVersion, nil
 	}
 	if schematic == "" {
 		if s.defaultSchematic == "" {
@@ -1322,7 +1335,9 @@ func (s *Server) imageDefaults(schematic, talosVersion string) (string, string, 
 }
 
 func (s *Server) cachedDisk(item cluster.Cluster) (string, error) {
-	schematic, talosVersion, err := s.imageDefaults(item.Schematic, item.TalosVersion)
+	// item.Schematic already is the composed id when the cluster requested
+	// extensions, so stored state never re-composes.
+	schematic, talosVersion, err := s.imageDefaults(item.Schematic, item.TalosVersion, nil)
 	if err != nil {
 		return "", err
 	}

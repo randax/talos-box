@@ -53,17 +53,17 @@ func TestResolveImageGuardsEveryRequestPath(t *testing.T) {
 	// cache pull; garbage must never reach image resolution through any of
 	// them. Stored cluster state resolves via imageDefaults and stays exempt.
 	service := &Server{}
-	if _, _, err := service.resolveImage("aaa", "v1.11.9"); err == nil {
+	if _, _, err := service.resolveImage("aaa", "v1.11.9", nil); err == nil {
 		t.Fatal("resolveImage() accepted a below-floor version")
 	}
-	if _, _, err := service.resolveImage("aaa", "not-a-version"); err == nil {
+	if _, _, err := service.resolveImage("aaa", "not-a-version", nil); err == nil {
 		t.Fatal("resolveImage() accepted a malformed version")
 	}
-	if _, version, err := service.resolveImage("aaa", ""); err != nil || version != DefaultTalosVersion {
+	if _, version, err := service.resolveImage("aaa", "", nil); err != nil || version != DefaultTalosVersion {
 		t.Fatalf("resolveImage(\"\") = (%q, %v), want the default version", version, err)
 	}
 	// A cluster persisted before the floor existed keeps working.
-	if _, version, err := service.imageDefaults("aaa", "v1.2.3"); err != nil || version != "v1.2.3" {
+	if _, version, err := service.imageDefaults("aaa", "v1.2.3", nil); err != nil || version != "v1.2.3" {
 		t.Fatalf("imageDefaults(stored v1.2.3) = (%q, %v), want the stored version untouched", version, err)
 	}
 }

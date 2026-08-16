@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/config"
 	"github.com/randax/talos-box/internal/daemon"
+	"github.com/randax/talos-box/internal/extensions"
 	"github.com/randax/talos-box/internal/imagecache"
 	"github.com/randax/talos-box/internal/talosversion"
 	"github.com/randax/talos-box/internal/version"
@@ -179,6 +181,7 @@ func (c cli) createCluster(args []string) error {
 	disk := flags.Int("disk-gib", cluster.DefaultDiskGiB, "disk size per node in GiB")
 	talosVersion := flags.String("talos-version", daemon.DefaultTalosVersion, "Talos version")
 	schematic := flags.String("schematic", "", "Image Factory schematic")
+	extensionList := flags.String("extensions", "", "curated Talos extensions, comma-separated: "+strings.Join(extensions.Names(), "|"))
 	domainFlag := flags.String("domain", "", "cluster domain (default <name>.k8s.test)")
 	allowUnsafeDomain := flags.Bool("allow-unsafe-domain", false, "allow a domain that can shadow real DNS")
 	cni := flags.String("cni", "", "CNI to provision: cilium|flannel")
@@ -211,8 +214,19 @@ func (c cli) createCluster(args []string) error {
 	if _, err := intentInput.Intent(); err != nil {
 		return err
 	}
+	// Set membership is local: a typo must be reported here, before the
+	// daemon is started or the Image Factory is contacted at all.
+	requestedExtensions := parseExtensionList(*extensionList)
+	if _, err := extensions.Resolve(requestedExtensions); err != nil {
+		return err
+	}
 	if err := c.ensureProvisioningIntentSupport(intentInput); err != nil {
 		return err
+	}
+	if len(requestedExtensions) > 0 {
+		if err := c.ensurePerClusterTalosSupport(); err != nil {
+			return err
+		}
 	}
 	// An empty value means "daemon default", matching the daemon boundary.
 	// Version validation is local; it runs before schematic resolution,
@@ -222,9 +236,15 @@ func (c cli) createCluster(args []string) error {
 			return err
 		}
 	}
-	resolvedSchematic, err := resolveSchematic(*schematic)
-	if err != nil {
-		return err
+	// Composing extensions is the daemon's job: it owns the cache that makes
+	// an already-composed schematic resolvable offline. Resolving the
+	// default here would pin the extension-free schematic instead.
+	resolvedSchematic := *schematic
+	if len(requestedExtensions) == 0 {
+		resolvedSchematic, err = resolveSchematic(*schematic)
+		if err != nil {
+			return err
+		}
 	}
 	request := struct {
 		Name              string               `json:"name"`
@@ -234,15 +254,17 @@ func (c cli) createCluster(args []string) error {
 		Domain            string               `json:"domain,omitempty"`
 		AllowUnsafeDomain bool                 `json:"allowUnsafeDomain,omitempty"`
 		cluster.ProvisioningIntentInput
-		Force     bool   `json:"force"`
-		Schematic string `json:"schematic"`
-		Version   string `json:"version"`
+		Force      bool     `json:"force"`
+		Schematic  string   `json:"schematic"`
+		Version    string   `json:"version"`
+		Extensions []string `json:"extensions,omitempty"`
 	}{
 		Name: positionals[0], ControlPlanes: *controlPlanes, Workers: *workers,
 		Node:   cluster.NodeDefaults{MemoryMiB: *memory, CPUs: *cpus, DiskGiB: *disk},
 		Domain: *domainFlag, AllowUnsafeDomain: *allowUnsafeDomain,
 		ProvisioningIntentInput: intentInput,
 		Force:                   *force, Schematic: resolvedSchematic, Version: *talosVersion,
+		Extensions: requestedExtensions,
 	}
 	var result daemon.ClusterSummary
 	if err := c.call("cluster.create", request, &result); err != nil {
@@ -561,6 +583,18 @@ func pastTense(command string) string {
 	default:
 		return "started"
 	}
+}
+
+// parseExtensionList splits the --extensions value; an empty value means no
+// extensions were requested, which is distinct from the config-level opt-out.
+func parseExtensionList(value string) []string {
+	var names []string
+	for _, name := range strings.Split(value, ",") {
+		if trimmed := strings.TrimSpace(name); trimmed != "" {
+			names = append(names, trimmed)
+		}
+	}
+	return names
 }
 
 func resolveSchematic(schematic string) (string, error) {
