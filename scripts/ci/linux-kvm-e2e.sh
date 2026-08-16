@@ -51,6 +51,20 @@ dump_failure_diagnostics() (
     kubectl --kubeconfig "$kubeconfig" get pods -n extensions-e2e -o wide >&2
     kubectl --kubeconfig "$kubeconfig" describe pods -n extensions-e2e >&2
   fi
+  if [[ -n "${home:-}" ]]; then
+    printf '\n===== guest-agent channel =====\n' >&2
+    ls -l "$home"/.talosbox/clusters/e2e/*.qga.sock >&2
+    # Who holds the listening socket, and does QEMU carry it as fd 5?
+    sudo ss -xlp >&2 | grep -F 'qga.sock' >&2 || true
+    for pid in $(pgrep -f qemu-system || true); do
+      printf 'qemu pid %s fd 5: ' "$pid" >&2
+      sudo readlink "/proc/$pid/fd/5" >&2 || true
+    done
+    # One verbose attempt with errors visible, so a connect failure is
+    # distinguishable from an unanswered ping.
+    printf '\xff{"execute":"guest-sync-delimited","arguments":{"id":42}}\n{"execute":"guest-ping"}\n' \
+      | socat -d -d -t 10 -T 10 STDIO,ignoreeof "UNIX-CONNECT:$home/.talosbox/clusters/e2e/e2e-cp-1.qga.sock" >&2 || true
+  fi
   printf '\n===== host network =====\n' >&2
   sudo ip -details address show >&2
   sudo ip route show table all >&2
@@ -277,10 +291,15 @@ qga_socket="$home/.talosbox/clusters/e2e/e2e-cp-1.qga.sock"
 test -S "$qga_socket"
 guest_ping_answered() {
   local response
-  # -t outlasts socat's default half-second half-close, which would otherwise
-  # hang up on the agent before its reply lands.
-  response=$(printf '{"execute":"guest-ping"}' | socat -t 5 -T 5 - "UNIX-CONNECT:$qga_socket" 2>/dev/null) || return 1
-  [[ "$response" == *'"return"'* ]]
+  # Two virtio-serial realities shape this probe: a plain pipe's EOF makes
+  # socat half-close and QEMU tear down the chardev before qemu-ga's reply
+  # lands, so ignoreeof keeps the write half open; and qemu-ga cannot see
+  # client disconnects, so a torn-down earlier attempt leaves its JSON parser
+  # mid-object — the 0xFF sentinel plus guest-sync-delimited resynchronize it
+  # before the ping. Two "return" replies (sync + ping) prove the round trip.
+  response=$(printf '\xff{"execute":"guest-sync-delimited","arguments":{"id":42}}\n{"execute":"guest-ping"}\n' \
+    | socat -t 10 -T 10 STDIO,ignoreeof "UNIX-CONNECT:$qga_socket" 2>/dev/null) || return 1
+  [[ $(grep -c '"return"' <<<"$response") -ge 2 ]]
 }
 retry "qemu-guest-agent guest-ping" 30 5 guest_ping_answered
 
