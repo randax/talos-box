@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -13,6 +14,7 @@ import (
 )
 
 func TestListCacheIncludesMirrorSectionForWarmedLayout(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	root := t.TempDir()
 	diskPath := filepath.Join(root, "test-schematic", "v1.2.3", "amd64", "disk.raw")
 	if err := os.MkdirAll(filepath.Dir(diskPath), 0o755); err != nil {
@@ -155,6 +157,7 @@ func TestPruneCacheScopesReportDeletedBytesAndIsolateDiskFromMirror(t *testing.T
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
 			root := t.TempDir()
 			diskPath := filepath.Join(root, "test-schematic", "v1.2.3", "amd64", "disk.raw")
 			archivePath := filepath.Join(root, "test-schematic", "v1.2.3", "amd64", "metal-amd64.raw.xz")
@@ -204,6 +207,7 @@ func TestPruneCacheScopesReportDeletedBytesAndIsolateDiskFromMirror(t *testing.T
 }
 
 func TestListCacheIncludesMirrorServingStatusFromBindings(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	root := t.TempDir()
 	service := &Server{
 		cache:               imagecache.New(root),
@@ -272,4 +276,300 @@ func mustRawJSON(t *testing.T, value any) json.RawMessage {
 		t.Fatal(err)
 	}
 	return data
+}
+
+func TestListCacheClassifiesInUsePinnedDefaultAndOrphanCombinations(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	service := newCacheReferenceTestServer(t, root)
+
+	item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.Schematic = "in-use-schematic"
+	item.TalosVersion = "v1.2.3"
+	item.ImageArchitecture = "amd64"
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.cache.RecordDefaultSchematic("default-schematic"); err != nil {
+		t.Fatal(err)
+	}
+	for _, schematic := range []string{"in-use-schematic", "pinned-schematic", "orphan-schematic"} {
+		writeCachedDisk(t, root, schematic, "v1.2.3", "amd64")
+	}
+	writeCachedDisk(t, root, "default-schematic", DefaultTalosVersion, "amd64")
+	if err := service.cache.Pin("pinned-schematic", "v1.2.3", imagecache.ArchitectureAMD64); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := service.listCache()
+	if err != nil {
+		t.Fatal(err)
+	}
+	statuses := make(map[string]CacheImageStatus, len(result.Images))
+	clusters := make(map[string][]string, len(result.Images))
+	for _, image := range result.Images {
+		statuses[image.Schematic] = image.Status
+		clusters[image.Schematic] = image.Clusters
+	}
+	want := map[string]CacheImageStatus{
+		"in-use-schematic":  CacheImageStatusInUse,
+		"pinned-schematic":  CacheImageStatusPinned,
+		"default-schematic": CacheImageStatusDefault,
+		"orphan-schematic":  CacheImageStatusOrphan,
+	}
+	for schematic, status := range want {
+		if statuses[schematic] != status {
+			t.Fatalf("status of %s = %q, want %q", schematic, statuses[schematic], status)
+		}
+	}
+	if got := clusters["in-use-schematic"]; len(got) != 1 || got[0] != "demo" {
+		t.Fatalf("in-use clusters = %v, want [demo]", got)
+	}
+	if got := clusters["orphan-schematic"]; len(got) != 0 {
+		t.Fatalf("orphan clusters = %v, want empty", got)
+	}
+}
+
+func TestPruneCacheImagesRemovesOnlyOrphanCombinations(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	service := newCacheReferenceTestServer(t, root)
+
+	item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.Schematic = "in-use-schematic"
+	item.TalosVersion = "v1.2.3"
+	item.ImageArchitecture = "amd64"
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.cache.RecordDefaultSchematic("default-schematic"); err != nil {
+		t.Fatal(err)
+	}
+	for _, schematic := range []string{"in-use-schematic", "pinned-schematic", "orphan-schematic"} {
+		writeCachedDisk(t, root, schematic, "v1.2.3", "amd64")
+	}
+	writeCachedDisk(t, root, "default-schematic", DefaultTalosVersion, "amd64")
+	if err := service.cache.Pin("pinned-schematic", "v1.2.3", imagecache.ArchitectureAMD64); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := service.pruneCache(mustRawJSON(t, CachePruneArgs{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ImageCount != 1 || result.ImageBytes != int64(len("disk")) {
+		t.Fatalf("prune result = %+v, want one image of %d bytes", result, len("disk"))
+	}
+	if len(result.Images) != 1 || result.Images[0].Schematic != "orphan-schematic" {
+		t.Fatalf("removed images = %+v, want only orphan-schematic", result.Images)
+	}
+	if result.Images[0].Size != int64(len("disk")) || result.Images[0].Status != CacheImageStatusOrphan {
+		t.Fatalf("removed image = %+v, want %d bytes and status %q", result.Images[0], len("disk"), CacheImageStatusOrphan)
+	}
+	for _, schematic := range []string{"in-use-schematic", "pinned-schematic", "default-schematic"} {
+		version := "v1.2.3"
+		if schematic == "default-schematic" {
+			version = DefaultTalosVersion
+		}
+		if _, err := os.Stat(filepath.Join(root, schematic, version, "amd64", "disk.raw")); err != nil {
+			t.Fatalf("spared image missing after prune: %s (%v)", schematic, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, "orphan-schematic")); !os.IsNotExist(err) {
+		t.Fatalf("orphan image survived prune: %v", err)
+	}
+}
+
+func TestPruneCacheAllClearsPinsAndSparesNothing(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	service := newCacheReferenceTestServer(t, root)
+
+	item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.Schematic = "in-use-schematic"
+	item.TalosVersion = "v1.2.3"
+	item.ImageArchitecture = "amd64"
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	writeCachedDisk(t, root, "in-use-schematic", "v1.2.3", "amd64")
+	if err := service.cache.Pin("in-use-schematic", "v1.2.3", imagecache.ArchitectureAMD64); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := service.pruneCache(mustRawJSON(t, CachePruneArgs{Scope: CachePruneScopeAll})); err != nil {
+		t.Fatal(err)
+	}
+	pinned, err := service.cache.Pinned("in-use-schematic", "v1.2.3", imagecache.ArchitectureAMD64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pinned {
+		t.Fatal("cache prune --all left the pin marker in place")
+	}
+	if _, err := os.Stat(filepath.Join(root, "in-use-schematic")); !os.IsNotExist(err) {
+		t.Fatalf("cache prune --all spared an image: %v", err)
+	}
+}
+
+func TestDestroyClusterLeavesItsImagePrunableButUntouched(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	service := newCacheReferenceTestServer(t, root)
+	service.vms = make(map[string]map[string]hypervisor.Machine)
+
+	item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.Schematic = "in-use-schematic"
+	item.TalosVersion = "v1.2.3"
+	item.ImageArchitecture = "amd64"
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	diskPath := writeCachedDisk(t, root, "in-use-schematic", "v1.2.3", "amd64")
+
+	if _, err := service.destroyCluster(mustRawJSON(t, map[string]any{"name": "demo", "force": true})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(diskPath); err != nil {
+		t.Fatalf("destroy removed the cached image: %v", err)
+	}
+	listed, err := service.listCache()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Images) != 1 || listed.Images[0].Status != CacheImageStatusOrphan {
+		t.Fatalf("images after destroy = %+v, want a single orphan", listed.Images)
+	}
+
+	result, err := service.pruneCache(mustRawJSON(t, CachePruneArgs{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ImageCount != 1 {
+		t.Fatalf("ImageCount = %d, want 1", result.ImageCount)
+	}
+	if _, err := os.Stat(diskPath); !os.IsNotExist(err) {
+		t.Fatalf("prune left the orphaned image behind: %v", err)
+	}
+}
+
+func TestClusterReferencesResolveDefaultsWithoutTheFactory(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	service := newCacheReferenceTestServer(t, root)
+
+	// A cluster created before per-cluster pinning records neither a
+	// schematic nor a version; it still references the default combination.
+	item, err := cluster.New("legacy", 0, 1, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.ImageArchitecture = "amd64"
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.cache.RecordDefaultSchematic("default-schematic"); err != nil {
+		t.Fatal(err)
+	}
+	writeCachedDisk(t, root, "default-schematic", DefaultTalosVersion, "amd64")
+
+	result, err := service.listCache()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Images) != 1 || result.Images[0].Status != CacheImageStatusInUse {
+		t.Fatalf("images = %+v, want the default combination in use", result.Images)
+	}
+	if got := result.Images[0].Clusters; len(got) != 1 || got[0] != "legacy" {
+		t.Fatalf("clusters = %v, want [legacy]", got)
+	}
+}
+
+func newCacheReferenceTestServer(t *testing.T, root string) *Server {
+	t.Helper()
+	return &Server{
+		cache:      imagecache.New(root),
+		hypervisor: &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
+	}
+}
+
+func writeCachedDisk(t *testing.T, root, schematic, version, architecture string) string {
+	t.Helper()
+	path := filepath.Join(root, schematic, version, architecture, "disk.raw")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("disk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestPruneCacheRemovesExactlyWhatListCallsOrphaned(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	service := newCacheReferenceTestServer(t, root)
+
+	item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.Schematic = "in-use-schematic"
+	item.TalosVersion = "v1.2.3"
+	item.ImageArchitecture = "amd64"
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.cache.RecordDefaultSchematic("default-schematic"); err != nil {
+		t.Fatal(err)
+	}
+	for _, schematic := range []string{"in-use-schematic", "pinned-schematic", "orphan-a", "orphan-b"} {
+		writeCachedDisk(t, root, schematic, "v1.2.3", "amd64")
+	}
+	writeCachedDisk(t, root, "default-schematic", DefaultTalosVersion, "amd64")
+	if err := service.cache.Pin("pinned-schematic", "v1.2.3", imagecache.ArchitectureAMD64); err != nil {
+		t.Fatal(err)
+	}
+
+	listed, err := service.listCache()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var orphans []string
+	for _, image := range listed.Images {
+		if image.Status == CacheImageStatusOrphan {
+			orphans = append(orphans, image.Schematic)
+		}
+	}
+
+	result, err := service.pruneCache(mustRawJSON(t, CachePruneArgs{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var removed []string
+	for _, image := range result.Images {
+		removed = append(removed, image.Schematic)
+	}
+	sort.Strings(orphans)
+	sort.Strings(removed)
+	if len(removed) != len(orphans) || len(removed) != 2 {
+		t.Fatalf("removed = %v, want the listed orphans %v", removed, orphans)
+	}
+	for i := range removed {
+		if removed[i] != orphans[i] {
+			t.Fatalf("removed = %v, want the listed orphans %v", removed, orphans)
+		}
+	}
 }

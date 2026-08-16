@@ -458,6 +458,9 @@ func (c cli) runCache(args []string) error {
 		}
 		switch result.Scope {
 		case daemon.CachePruneScopeImages:
+			if err := printPrunedImages(c.out, result.Images); err != nil {
+				return err
+			}
 			_, err = fmt.Fprintf(c.out, "pruned disk cache: %d image(s), %d bytes; mirror cache untouched\n", result.ImageCount, result.ImageBytes)
 		case daemon.CachePruneScopeMirror:
 			_, err = fmt.Fprintf(c.out, "pruned mirror cache: %d blob(s) %d bytes, %d manifest(s) %d bytes; disk cache untouched\n",
@@ -486,7 +489,7 @@ func (c cli) runCache(args []string) error {
 				return err
 			}
 			for _, entry := range result.Images {
-				if _, err := fmt.Fprintf(c.out, "- %s %s %s %d bytes\n", entry.Schematic, entry.Version, entry.Architecture, entry.Size); err != nil {
+				if _, err := fmt.Fprintf(c.out, "- %s%s\n", cacheImageLine(entry), cacheImageStatusSuffix(entry)); err != nil {
 					return err
 				}
 			}

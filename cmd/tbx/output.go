@@ -117,3 +117,38 @@ func encodeJSON(output io.Writer, value any) error {
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(value)
 }
+
+func cacheImageLine(entry daemon.CacheImageEntry) string {
+	return fmt.Sprintf("%s %s %s %d bytes", entry.Schematic, entry.Version, entry.Architecture, entry.Size)
+}
+
+// cacheImageStatusSuffix names why a combination is kept. An older daemon
+// reports no status at all, which prints as the pre-status line.
+func cacheImageStatusSuffix(entry daemon.CacheImageEntry) string {
+	switch {
+	case entry.Status == "":
+		return ""
+	case entry.Status == daemon.CacheImageStatusInUse && len(entry.Clusters) > 0:
+		return fmt.Sprintf(" in-use (%s)", strings.Join(entry.Clusters, ", "))
+	default:
+		return " " + string(entry.Status)
+	}
+}
+
+// printPrunedImages names every combination a prune removes, with its size,
+// ahead of the summary line: nothing about the default scope is automatic, so
+// the user sees exactly what was unreferenced.
+func printPrunedImages(output io.Writer, images []daemon.CacheImageEntry) error {
+	if len(images) == 0 {
+		return nil
+	}
+	if _, err := fmt.Fprintln(output, "Removing unreferenced disk images:"); err != nil {
+		return err
+	}
+	for _, entry := range images {
+		if _, err := fmt.Fprintf(output, "- %s\n", cacheImageLine(entry)); err != nil {
+			return err
+		}
+	}
+	return nil
+}

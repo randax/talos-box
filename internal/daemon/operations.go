@@ -266,6 +266,10 @@ type CacheImageEntry struct {
 	Version      string `json:"version"`
 	Architecture string `json:"architecture"`
 	Size         int64  `json:"size"`
+	// Status and Clusters explain why the combination is kept; an older
+	// daemon leaves them empty, which the client renders as no status.
+	Status   CacheImageStatus `json:"status,omitempty"`
+	Clusters []string         `json:"clusters,omitempty"`
 }
 
 type MirrorCacheEntry struct {
@@ -291,10 +295,13 @@ type CacheListResult struct {
 }
 
 type CachePruneResult struct {
-	Scope      CachePruneScope   `json:"scope"`
-	ImageCount int               `json:"imageCount"`
-	ImageBytes int64             `json:"imageBytes"`
-	Mirror     MirrorCacheTotals `json:"mirror"`
+	Scope      CachePruneScope `json:"scope"`
+	ImageCount int             `json:"imageCount"`
+	ImageBytes int64           `json:"imageBytes"`
+	// Images is the removal plan the reference-aware scope executed, so the
+	// client can name every combination it lost with its size.
+	Images []CacheImageEntry `json:"images,omitempty"`
+	Mirror MirrorCacheTotals `json:"mirror"`
 }
 
 type MirrorOfflineStatus struct {
@@ -1131,12 +1138,26 @@ func (s *Server) listCache() (CacheListResult, error) {
 	if s.boundMirrorGateways != nil {
 		result.MirrorBoundGatewayIPs = s.boundMirrorGateways()
 	}
+	classifier, err := s.cacheImageClassifier()
+	if err != nil {
+		return CacheListResult{}, err
+	}
 	for _, entry := range entries {
+		status, clusters, err := classifier.status(imagecache.Combination{
+			Schematic:    entry.Schematic,
+			Version:      entry.Version,
+			Architecture: entry.Architecture,
+		})
+		if err != nil {
+			return CacheListResult{}, err
+		}
 		result.Images = append(result.Images, CacheImageEntry{
 			Schematic:    entry.Schematic,
 			Version:      entry.Version,
 			Architecture: string(entry.Architecture),
 			Size:         entry.Size,
+			Status:       status,
+			Clusters:     clusters,
 		})
 	}
 	for _, stat := range mirrorStats {
@@ -1161,11 +1182,23 @@ func (s *Server) pruneCache(raw json.RawMessage) (CachePruneResult, error) {
 	}
 	switch args.Scope {
 	case CachePruneScopeImages:
-		result, err := s.cache.PruneDisk()
+		// The default scope is reference-aware: only combinations no
+		// cluster, no pin, and not the default combination claims go.
+		classifier, err := s.cacheImageClassifier()
 		if err != nil {
 			return CachePruneResult{}, err
 		}
-		return CachePruneResult{Scope: args.Scope, ImageCount: result.ImageCount, ImageBytes: result.ImageBytes, Mirror: MirrorCacheTotals(result.Mirror)}, nil
+		result, err := s.cache.PruneDiskExcept(classifier.keep)
+		if err != nil {
+			return CachePruneResult{}, err
+		}
+		return CachePruneResult{
+			Scope:      args.Scope,
+			ImageCount: result.ImageCount,
+			ImageBytes: result.ImageBytes,
+			Images:     prunedImageEntries(result.Images),
+			Mirror:     MirrorCacheTotals(result.Mirror),
+		}, nil
 	case CachePruneScopeMirror:
 		result, err := s.cache.PruneMirror()
 		if err != nil {
@@ -1181,6 +1214,20 @@ func (s *Server) pruneCache(raw json.RawMessage) (CachePruneResult, error) {
 	default:
 		return CachePruneResult{}, fmt.Errorf("unknown cache prune scope %q", args.Scope)
 	}
+}
+
+func prunedImageEntries(removed []imagecache.PrunedCombination) []CacheImageEntry {
+	entries := make([]CacheImageEntry, 0, len(removed))
+	for _, combination := range removed {
+		entries = append(entries, CacheImageEntry{
+			Schematic:    combination.Schematic,
+			Version:      combination.Version,
+			Architecture: string(combination.Architecture),
+			Size:         combination.Bytes,
+			Status:       CacheImageStatusOrphan,
+		})
+	}
+	return entries
 }
 
 func ValidateWarmRef(ref string) error {

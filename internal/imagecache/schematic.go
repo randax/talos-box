@@ -47,6 +47,13 @@ func (c *Cache) DefaultSchematic() (string, error) {
 	return id, nil
 }
 
+// RecordedDefaultSchematic returns the recorded default schematic id, if the
+// default combination has ever been composed. Unlike DefaultSchematic it never
+// contacts the Factory: retention decisions must not depend on the network.
+func (c *Cache) RecordedDefaultSchematic() (string, bool, error) {
+	return c.CompositionID("", "", nil)
+}
+
 // RecordDefaultSchematic remembers the default schematic id. The record is
 // keyed on no base, no extensions, and no version: the default customization
 // carries no version-dependent field, so one record answers every version.
