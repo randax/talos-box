@@ -110,26 +110,28 @@ func connectHelperForUninstall() (dnsUninstaller, error) {
 // out) falls back to removing the files directly — uninstallSystem only runs
 // as root — so the uninstall promise holds even without a live helper. The
 // helper and the fallback both report missing files as success, so repeated
-// uninstalls stay idempotent.
+// uninstalls stay idempotent. A cleanup failure is returned (after a stderr
+// warning) so the caller can finish the teardown and still exit non-zero.
 func (c cli) removeScopedResolver(connect func() (dnsUninstaller, error), fallback func() error) error {
 	client, err := connect()
 	if err != nil {
-		if err := fallback(); err != nil {
-			_, printErr := fmt.Fprintf(c.err, "warning: could not remove resolver files: %v\n", err)
-			return printErr
-		}
-		return nil
+		return c.warnResolverFailure(fallback())
 	}
 	defer func() { _ = client.Close() }()
 	if err := client.UninstallDNS(); err != nil {
 		// The helper is about to be booted out, so this is the last chance to
 		// honor the uninstall promise: retry directly as root.
-		if err := fallback(); err != nil {
-			_, printErr := fmt.Fprintf(c.err, "warning: could not remove resolver files: %v\n", err)
-			return printErr
-		}
+		return c.warnResolverFailure(fallback())
 	}
 	return nil
+}
+
+func (c cli) warnResolverFailure(err error) error {
+	if err == nil {
+		return nil
+	}
+	_, printErr := fmt.Fprintf(c.err, "warning: could not remove resolver files: %v\n", err)
+	return errors.Join(fmt.Errorf("remove resolver files: %w", err), printErr)
 }
 
 // removeResolverFilesDirectly is the root fallback for an unreachable helper:
@@ -179,10 +181,10 @@ func removeResolverFiles(sharedPath string) (bool, error) {
 }
 
 func (c cli) uninstallSystem() error {
-	// Ask before teardown, while the helper can still service the request.
-	if err := c.removeScopedResolver(connectHelperForUninstall, removeResolverFilesDirectly); err != nil {
-		return err
-	}
+	// Ask before teardown, while the helper can still service the request. A
+	// failure is carried to the end: the helper teardown still runs, and the
+	// command exits non-zero because the cleanup promise was not honored.
+	resolverErr := c.removeScopedResolver(connectHelperForUninstall, removeResolverFilesDirectly)
 	if _, err := os.Stat(helperPlistPath); err == nil {
 		if err := runLaunchctl("bootout", "system", helperPlistPath); err != nil {
 			return err
@@ -195,6 +197,9 @@ func (c cli) uninstallSystem() error {
 	}
 	if err := os.Remove(helperPlistPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove helper plist: %w", err)
+	}
+	if resolverErr != nil {
+		return resolverErr
 	}
 	_, err := fmt.Fprintln(c.out, "uninstalled "+helperLaunchdLabel)
 	return err

@@ -83,12 +83,13 @@ func TestRemoveScopedResolverWarnsWhenFallbackFails(t *testing.T) {
 
 	var stderr bytes.Buffer
 	command := cli{out: &bytes.Buffer{}, err: &stderr}
-	if err := command.removeScopedResolver(func() (dnsUninstaller, error) {
+	err := command.removeScopedResolver(func() (dnsUninstaller, error) {
 		return nil, errors.New("connect to helper at /var/run/tbx-helper.sock: no such file")
 	}, func() error {
 		return errors.New("remove /etc/resolver/k8s.test: permission denied")
-	}); err != nil {
-		t.Fatal(err)
+	})
+	if err == nil || !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("error = %v, want the cleanup failure so uninstall exits non-zero", err)
 	}
 	if !strings.Contains(stderr.String(), "warning: could not remove resolver files") {
 		t.Fatalf("stderr = %q, want a fallback-failure warning", stderr.String())
@@ -102,13 +103,14 @@ func TestRemoveScopedResolverWarnsWhenUninstallFails(t *testing.T) {
 	var stderr bytes.Buffer
 	command := cli{out: &bytes.Buffer{}, err: &stderr}
 	fallbackCalls := 0
-	if err := command.removeScopedResolver(func() (dnsUninstaller, error) {
+	err := command.removeScopedResolver(func() (dnsUninstaller, error) {
 		return client, nil
 	}, func() error {
 		fallbackCalls++
 		return errors.New("remove /etc/resolver/k8s.test: read-only file system")
-	}); err != nil {
-		t.Fatal(err)
+	})
+	if err == nil || !strings.Contains(err.Error(), "read-only file system") {
+		t.Fatalf("error = %v, want the cleanup failure so uninstall exits non-zero", err)
 	}
 	if !client.closed {
 		t.Fatal("helper connection was not closed")
