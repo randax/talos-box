@@ -158,6 +158,9 @@ type ClusterStatus struct {
 	// from, as persisted at create.
 	TalosVersion string `json:"talosVersion,omitempty"`
 	Schematic    string `json:"schematic,omitempty"`
+	// BaseSchematic is the schematic the extensions were re-composed into,
+	// when the cluster brought one.
+	BaseSchematic string `json:"baseSchematic,omitempty"`
 	// TalosExtensions are the curated extensions the schematic was composed
 	// from, as requested at create.
 	TalosExtensions []string `json:"talosExtensions,omitempty"`
@@ -372,6 +375,11 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	item.Schematic, item.TalosVersion, err = s.resolveImage(args.Schematic, args.Version, args.Extensions)
 	if err != nil {
 		return ClusterSummary{}, err
+	}
+	if args.Schematic != "" && item.Schematic != args.Schematic {
+		// The schematic was re-composed: keep the brought id, since the
+		// composed one no longer names anything the user wrote.
+		item.BaseSchematic = args.Schematic
 	}
 	// One line at create only; startCluster and status never repeat it.
 	talosVersionWarning := talosversion.NewerThanTestedWarning(item.TalosVersion)
@@ -881,7 +889,7 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 
 	result := make([]ClusterStatus, 0, len(items))
 	for _, item := range items {
-		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), TalosVersion: item.TalosVersion, Schematic: item.Schematic, TalosExtensions: item.TalosExtensions, ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: s.clusterRunning(item.Name), Capabilities: s.clusterCapabilities(item), subnetIndex: item.SubnetIndex}
+		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), TalosVersion: item.TalosVersion, Schematic: item.Schematic, BaseSchematic: item.BaseSchematic, TalosExtensions: item.TalosExtensions, ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: s.clusterRunning(item.Name), Capabilities: s.clusterCapabilities(item), subnetIndex: item.SubnetIndex}
 		for _, node := range item.Nodes {
 			running := s.nodeRunning(item.Name, node.Name)
 			clusterStatus.Nodes = append(clusterStatus.Nodes, NodeStatus{Name: node.Name, Role: node.Role, MAC: node.MAC, Phase: ClassifyPhase(running, ProbeResult{})})

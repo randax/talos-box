@@ -14,8 +14,14 @@ import (
 	"sort"
 	"strings"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/randax/talos-box/internal/extensions"
 )
+
+// schematicDefinitionLimit caps what a schematic fetch is allowed to read; a
+// customization is a few hundred bytes, so anything larger is not one.
+const schematicDefinitionLimit = 256 << 10
 
 // compositionDirName holds the composed-schematic records, beside the disk
 // images. Its name is not a 64-hex schematic id, so it can never collide with
@@ -38,8 +44,9 @@ type compositionRecord struct {
 	ID         string   `json:"id"`
 }
 
-// ComposeSchematic returns the schematic id for talosbox's base customization
-// plus the curated extensions requested for talosVersion.
+// ComposeSchematic returns the schematic id carrying the curated extensions
+// requested for talosVersion. With no base it composes talosbox's own
+// customization; with one it re-composes the brought schematic's definition.
 //
 // A composition already recorded on disk is reused verbatim: that record is
 // what makes an offline create from a cached composed image possible, so
@@ -59,27 +66,151 @@ func (c *Cache) ComposeSchematic(base, talosVersion string, requested []string) 
 	if err != nil {
 		return "", err
 	}
+	var body []byte
 	if base != "" {
-		// Merging extensions into a brought schematic means re-composing it
-		// through the Factory's schematic API; until that lands the brought
-		// schematic stays sovereign and only the names are validated.
-		return base, nil
-	}
-	if err := c.checkExtensionAvailability(talosVersion, refs); err != nil {
-		return "", err
-	}
-	body, err := schematicRequestBody(refs, nil)
-	if err != nil {
-		return "", err
+		if body, err = c.recomposedRequestBody(base, talosVersion, requested, refs); err != nil {
+			return "", err
+		}
+	} else {
+		if err := c.checkExtensionAvailability(talosVersion, refs); err != nil {
+			return "", err
+		}
+		if body, err = schematicRequestBody(refs, nil); err != nil {
+			return "", err
+		}
 	}
 	id, err := c.postSchematic(body)
 	if err != nil {
+		if base != "" {
+			return "", factoryAccessError(err, base, talosVersion, requested)
+		}
 		return "", err
 	}
 	if err := c.RecordComposition(base, talosVersion, requested, id); err != nil {
 		return "", err
 	}
 	return id, nil
+}
+
+// recomposedRequestBody merges the requested extensions into the definition of
+// a brought schematic. The brought schematic stays sovereign: its own kernel
+// arguments, extensions, and omissions are carried over untouched and nothing
+// talosbox composes by default is injected.
+func (c *Cache) recomposedRequestBody(base, talosVersion string, requested, refs []string) ([]byte, error) {
+	definition, err := c.schematicDefinition(base)
+	if err != nil {
+		return nil, factoryAccessError(err, base, talosVersion, requested)
+	}
+	if err := c.checkExtensionAvailability(talosVersion, refs); err != nil {
+		return nil, err
+	}
+	body, err := mergeSchematicExtensions(definition, refs)
+	if err != nil {
+		return nil, fmt.Errorf("recompose schematic %s: %w", base, err)
+	}
+	return body, nil
+}
+
+// schematicDefinition fetches a schematic's customization from the Factory.
+// Nothing local can reconstruct it, which is why this is the one part of
+// composition that cannot be answered offline.
+func (c *Cache) schematicDefinition(id string) ([]byte, error) {
+	if err := validateComponent("schematic", id); err != nil {
+		return nil, err
+	}
+	response, err := c.schematicClient.Get(strings.TrimRight(c.factoryURL, "/") + "/schematics/" + url.PathEscape(id))
+	if err != nil {
+		return nil, fmt.Errorf("fetch schematic %s: %w", id, err)
+	}
+	defer func() { _ = response.Body.Close() }()
+
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		message, _ := io.ReadAll(io.LimitReader(response.Body, 4<<10))
+		return nil, fmt.Errorf("fetch schematic %s: %s: %s", id, response.Status, strings.TrimSpace(string(message)))
+	}
+	definition, err := io.ReadAll(io.LimitReader(response.Body, schematicDefinitionLimit))
+	if err != nil {
+		return nil, fmt.Errorf("read schematic %s: %w", id, err)
+	}
+	return definition, nil
+}
+
+// mergeSchematicExtensions adds refs to the schematic's officialExtensions and
+// re-encodes the whole document, so fields talosbox knows nothing about survive
+// the round trip. The merged list keeps the schematic's own order and appends
+// only what is missing, which makes the composed id a function of the inputs.
+func mergeSchematicExtensions(definition []byte, refs []string) ([]byte, error) {
+	document := map[string]any{}
+	if err := yaml.Unmarshal(definition, &document); err != nil {
+		return nil, fmt.Errorf("decode schematic definition: %w", err)
+	}
+	customization, err := childMap(document, "customization")
+	if err != nil {
+		return nil, err
+	}
+	systemExtensions, err := childMap(customization, "systemExtensions")
+	if err != nil {
+		return nil, err
+	}
+	existing, err := stringList(systemExtensions["officialExtensions"])
+	if err != nil {
+		return nil, fmt.Errorf("customization.systemExtensions.officialExtensions: %w", err)
+	}
+	seen := make(map[string]struct{}, len(existing)+len(refs))
+	merged := make([]string, 0, len(existing)+len(refs))
+	for _, ref := range append(existing, refs...) {
+		if _, duplicate := seen[ref]; duplicate {
+			continue
+		}
+		seen[ref] = struct{}{}
+		merged = append(merged, ref)
+	}
+	systemExtensions["officialExtensions"] = merged
+	customization["systemExtensions"] = systemExtensions
+	document["customization"] = customization
+
+	body, err := json.Marshal(document)
+	if err != nil {
+		return nil, fmt.Errorf("encode schematic request: %w", err)
+	}
+	return body, nil
+}
+
+func childMap(parent map[string]any, key string) (map[string]any, error) {
+	switch value := parent[key].(type) {
+	case nil:
+		return map[string]any{}, nil
+	case map[string]any:
+		return value, nil
+	default:
+		return nil, fmt.Errorf("schematic field %q is not a mapping", key)
+	}
+}
+
+func stringList(value any) ([]string, error) {
+	switch typed := value.(type) {
+	case nil:
+		return nil, nil
+	case []any:
+		list := make([]string, 0, len(typed))
+		for _, item := range typed {
+			text, ok := item.(string)
+			if !ok {
+				return nil, errors.New("expected a list of strings")
+			}
+			list = append(list, text)
+		}
+		return list, nil
+	default:
+		return nil, errors.New("expected a list of strings")
+	}
+}
+
+// factoryAccessError explains the one combination that cannot be resolved from
+// the cache alone, and points at the command that makes it cacheable.
+func factoryAccessError(err error, base, talosVersion string, requested []string) error {
+	return fmt.Errorf("%w; extensions %s on schematic %s need Image Factory access to compose for Talos %s — run `tbx cache pull` while online first, after which this combination resolves from cache",
+		err, strings.Join(canonicalExtensions(requested), ", "), base, talosVersion)
 }
 
 // CompositionID returns the recorded schematic id for a composition, if any.

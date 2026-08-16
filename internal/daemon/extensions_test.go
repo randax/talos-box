@@ -75,6 +75,69 @@ func TestCreateClusterWithCachedCompositionStaysOffline(t *testing.T) {
 	}
 }
 
+// TestCreateClusterRecordsRecomposedSchematicInputs pins what state a
+// re-composition leaves behind: the composed id the cluster boots from plus the
+// inputs it was composed from, both visible in status.
+func TestCreateClusterRecordsRecomposedSchematicInputs(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	const (
+		base     = "brought-schematic-id"
+		composed = "composed-schematic-id"
+	)
+	root := t.TempDir()
+	cache := imagecache.New(root)
+	if err := cache.RecordComposition(base, DefaultTalosVersion, []string{"gvisor"}, composed); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, composed, DefaultTalosVersion, "arm64", "disk.raw")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("disk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	service := &Server{
+		cache:        cache,
+		hypervisor:   &fakeHypervisor{architecture: hypervisor.ArchitectureARM64},
+		vms:          make(map[string]map[string]hypervisor.Machine),
+		helperCheck:  func() error { return nil },
+		hostPressure: func(string) (hostpressure.Snapshot, error) { return hostpressure.Snapshot{}, nil },
+	}
+	raw, err := json.Marshal(createArgs{
+		Name: "brought", Schematic: base, Extensions: []string{"gvisor"},
+		Node: cluster.NodeDefaults{MemoryMiB: 1, CPUs: 1, DiskGiB: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.createCluster(raw); err != nil {
+		t.Fatalf("createCluster() error = %v", err)
+	}
+
+	item, err := cluster.Load("brought")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.Schematic != composed {
+		t.Fatalf("persisted schematic = %q, want %q", item.Schematic, composed)
+	}
+	if item.BaseSchematic != base {
+		t.Fatalf("persisted base schematic = %q, want %q", item.BaseSchematic, base)
+	}
+
+	statuses, err := service.status(json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 1 {
+		t.Fatalf("status() returned %d clusters, want 1", len(statuses))
+	}
+	if statuses[0].Schematic != composed || statuses[0].BaseSchematic != base {
+		t.Fatalf("status schematics = (%q, %q), want (%q, %q)",
+			statuses[0].Schematic, statuses[0].BaseSchematic, composed, base)
+	}
+}
+
 func TestCreateClusterRefusesUnknownExtensionBeforeMutation(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	service := &Server{

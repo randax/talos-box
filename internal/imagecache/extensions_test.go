@@ -19,9 +19,12 @@ const catalogJSON = `[
 // factoryFake serves the Image Factory endpoints composition needs; every
 // other request fails the test, so an unexpected call is never silent.
 type factoryFake struct {
-	server        *httptest.Server
-	schematicID   string
-	catalog       string
+	server      *httptest.Server
+	schematicID string
+	catalog     string
+	// definitions are the schematics the fake knows by id; anything else is
+	// unknown to it, like an id the Factory never issued.
+	definitions   map[string]string
 	requestedPost string
 	requests      []string
 }
@@ -41,6 +44,14 @@ func newFactoryFake(t *testing.T, schematicID, catalog string) *factoryFake {
 			fake.requestedPost = string(body)
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = fmt.Fprintf(w, `{"id":%q}`, fake.schematicID)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/schematics/"):
+			definition, known := fake.definitions[strings.TrimPrefix(r.URL.Path, "/schematics/")]
+			if !known {
+				http.Error(w, "schematic not found", http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/yaml")
+			_, _ = io.WriteString(w, definition)
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/extensions/official"):
 			if fake.catalog == "" {
 				http.Error(w, "not found", http.StatusNotFound)
@@ -208,20 +219,169 @@ func TestCompositionRecordRoundTrip(t *testing.T) {
 	}
 }
 
-// TestComposeSchematicKeepsCustomSchematicSovereign records the interim
-// contract for a brought schematic: it is used as-is (re-composition is not
-// implemented yet), but the requested names are still validated locally.
-func TestComposeSchematicKeepsCustomSchematicSovereign(t *testing.T) {
-	cache := offlineCache(t, t.TempDir())
+// TestComposeSchematicRecomposesBroughtSchematic pins the merge semantics: a
+// brought schematic stays sovereign, so only the requested extensions are added
+// to whatever it already declares — no kernel args and no always-on storage
+// extensions are injected, and its own omissions survive.
+func TestComposeSchematicRecomposesBroughtSchematic(t *testing.T) {
+	tests := []struct {
+		name       string
+		definition string
+		requested  []string
+		want       string
+	}{
+		{
+			name: "merges into the brought extension list",
+			definition: "customization:\n" +
+				"    extraKernelArgs:\n" +
+				"        - console=ttyS0\n" +
+				"    systemExtensions:\n" +
+				"        officialExtensions:\n" +
+				"            - siderolabs/intel-ucode\n",
+			requested: []string{"gvisor"},
+			want:      `{"customization":{"extraKernelArgs":["console=ttyS0"],"systemExtensions":{"officialExtensions":["siderolabs/intel-ucode","siderolabs/gvisor"]}}}`,
+		},
+		{
+			name: "adds nothing else to a schematic without extensions",
+			definition: "customization:\n" +
+				"    extraKernelArgs:\n" +
+				"        - console=ttyS0\n" +
+				"overlay:\n" +
+				"    name: rpi_generic\n" +
+				"    image: siderolabs/sbc-raspberrypi\n",
+			requested: []string{"gvisor", "nfs-utils"},
+			want:      `{"customization":{"extraKernelArgs":["console=ttyS0"],"systemExtensions":{"officialExtensions":["siderolabs/gvisor","siderolabs/nfs-utils"]}},"overlay":{"image":"siderolabs/sbc-raspberrypi","name":"rpi_generic"}}`,
+		},
+		{
+			name: "keeps an extension the brought schematic already declares",
+			definition: "customization:\n" +
+				"    systemExtensions:\n" +
+				"        officialExtensions:\n" +
+				"            - siderolabs/gvisor\n",
+			requested: []string{"gvisor"},
+			want:      `{"customization":{"systemExtensions":{"officialExtensions":["siderolabs/gvisor"]}}}`,
+		},
+	}
 
-	id, err := cache.ComposeSchematic("aaa111", "v1.13.6", []string{"gvisor"})
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fake := newFactoryFake(t, "composed-id", catalogJSON)
+			fake.definitions = map[string]string{"brought": test.definition}
+			cache := New(t.TempDir())
+			fake.attach(cache)
+
+			id, err := cache.ComposeSchematic("brought", "v1.13.6", test.requested)
+			if err != nil {
+				t.Fatalf("ComposeSchematic() error = %v", err)
+			}
+			if id != "composed-id" {
+				t.Fatalf("ComposeSchematic() = %q, want %q", id, "composed-id")
+			}
+			if fake.requestedPost != test.want {
+				t.Fatalf("schematic request = %s, want %s", fake.requestedPost, test.want)
+			}
+			if want := "GET /schematics/brought"; len(fake.requests) == 0 || fake.requests[0] != want {
+				t.Fatalf("factory requests = %v, want %s first", fake.requests, want)
+			}
+		})
+	}
+}
+
+// TestComposeSchematicRecompositionIsDeterministic guards the content-addressed
+// contract: the same inputs must produce the same request, and therefore the
+// same composed id, from any cache.
+func TestComposeSchematicRecompositionIsDeterministic(t *testing.T) {
+	const definition = "customization:\n" +
+		"    systemExtensions:\n" +
+		"        officialExtensions:\n" +
+		"            - siderolabs/intel-ucode\n"
+	fake := newFactoryFake(t, "composed-id", catalogJSON)
+	fake.definitions = map[string]string{"brought": definition}
+
+	compose := func(requested []string) string {
+		t.Helper()
+
+		cache := New(t.TempDir())
+		fake.attach(cache)
+		if _, err := cache.ComposeSchematic("brought", "v1.13.6", requested); err != nil {
+			t.Fatalf("ComposeSchematic() error = %v", err)
+		}
+		return fake.requestedPost
+	}
+
+	first := compose([]string{"gvisor", "nfs-utils"})
+	second := compose([]string{"nfs-utils", "gvisor", "gvisor"})
+	if first != second {
+		t.Fatalf("schematic request = %s, want %s", second, first)
+	}
+}
+
+func TestComposeSchematicFailsWhenBroughtSchematicCannotBeFetched(t *testing.T) {
+	t.Run("factory unreachable", func(t *testing.T) {
+		cache := unreachableCache(t, t.TempDir())
+
+		_, err := cache.ComposeSchematic("brought", "v1.13.6", []string{"gvisor"})
+		if err == nil {
+			t.Fatal("ComposeSchematic() composed without Factory access")
+		}
+		for _, fragment := range []string{"brought", "Image Factory access", "tbx cache pull"} {
+			if !strings.Contains(err.Error(), fragment) {
+				t.Fatalf("ComposeSchematic() error = %q, want it to contain %q", err, fragment)
+			}
+		}
+	})
+
+	t.Run("unknown schematic id", func(t *testing.T) {
+		fake := newFactoryFake(t, "composed-id", catalogJSON)
+		cache := New(t.TempDir())
+		fake.attach(cache)
+
+		_, err := cache.ComposeSchematic("brought", "v1.13.6", []string{"gvisor"})
+		if err == nil {
+			t.Fatal("ComposeSchematic() composed from an unknown schematic id")
+		}
+		for _, fragment := range []string{"brought", "Image Factory access", "tbx cache pull"} {
+			if !strings.Contains(err.Error(), fragment) {
+				t.Fatalf("ComposeSchematic() error = %q, want it to contain %q", err, fragment)
+			}
+		}
+		for _, request := range fake.requests {
+			if strings.HasPrefix(request, http.MethodPost) {
+				t.Fatalf("factory requests = %v, want no schematic POST", fake.requests)
+			}
+		}
+	})
+
+	t.Run("unknown extension name", func(t *testing.T) {
+		cache := offlineCache(t, t.TempDir())
+
+		if _, err := cache.ComposeSchematic("brought", "v1.13.6", []string{"gvisr"}); err == nil {
+			t.Fatal("ComposeSchematic() accepted an unknown extension on a brought schematic")
+		}
+	})
+}
+
+// TestComposeSchematicReusesRecordedRecomposition keeps the offline path intact
+// for brought schematics too: the recorded id is the whole answer.
+func TestComposeSchematicReusesRecordedRecomposition(t *testing.T) {
+	root := t.TempDir()
+	if err := New(root).RecordComposition("brought", "v1.13.6", []string{"gvisor"}, "composed-id"); err != nil {
+		t.Fatalf("RecordComposition() error = %v", err)
+	}
+
+	offline := offlineCache(t, root)
+	id, err := offline.ComposeSchematic("brought", "v1.13.6", []string{"gvisor"})
 	if err != nil {
 		t.Fatalf("ComposeSchematic() error = %v", err)
 	}
-	if id != "aaa111" {
-		t.Fatalf("ComposeSchematic() = %q, want %q", id, "aaa111")
+	if id != "composed-id" {
+		t.Fatalf("ComposeSchematic() = %q, want %q", id, "composed-id")
 	}
-	if _, err := cache.ComposeSchematic("aaa111", "v1.13.6", []string{"gvisr"}); err == nil {
-		t.Fatal("ComposeSchematic() accepted an unknown extension on a custom schematic")
+
+	// A different base schematic is a different composition and must not
+	// reuse the record.
+	unreachable := unreachableCache(t, root)
+	if _, err := unreachable.ComposeSchematic("other", "v1.13.6", []string{"gvisor"}); err == nil {
+		t.Fatal("ComposeSchematic() reused the recorded id for a different base schematic")
 	}
 }

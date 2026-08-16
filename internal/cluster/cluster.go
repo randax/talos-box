@@ -50,7 +50,7 @@ type Cluster struct {
 	ControlPlaneDefaults *NodeDefaults `json:"controlPlaneDefaults,omitempty"`
 	WorkerDefaults       *NodeDefaults `json:"workerDefaults,omitempty"`
 	ProvisioningIntent
-	Nodes             []Node `json:"nodes"`
+	Nodes        []Node `json:"nodes"`
 	Schematic    string `json:"schematic,omitempty"`
 	TalosVersion string `json:"talosVersion,omitempty"`
 	// TalosExtensions records the curated extensions requested at create;
@@ -58,8 +58,12 @@ type Cluster struct {
 	// state never re-composes.
 	// No omitempty: the explicit [] opt-out must survive a save/load cycle
 	// distinct from the field being absent (nil round-trips as null).
-	TalosExtensions   []string `json:"talosExtensions"`
-	ImageArchitecture string   `json:"imageArchitecture,omitempty"`
+	TalosExtensions []string `json:"talosExtensions"`
+	// BaseSchematic is the schematic the user brought when extensions were
+	// re-composed into it. Schematic is then the composed id, so the original
+	// input would otherwise be lost.
+	BaseSchematic     string `json:"baseSchematic,omitempty"`
+	ImageArchitecture string `json:"imageArchitecture,omitempty"`
 	// Domain is the canonical cluster domain when explicitly chosen at
 	// create; empty means the default, <name>.k8s.test. AllowUnsafeDomain
 	// records the opt-in the user passed for it, so emitted config

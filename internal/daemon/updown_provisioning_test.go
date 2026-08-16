@@ -491,9 +491,16 @@ func TestUpCreatesEachClusterFromItsOwnImage(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	root := t.TempDir()
 	images := map[string]string{"stable": "disk-aaa", "canary": "disk-bbb"}
+	// canary re-composes its brought schematic with an extension: the recorded
+	// composition is what keeps this create offline, and its image lives under
+	// the composed id.
+	const canaryComposed = "bbb-composed"
+	if err := imagecache.New(root).RecordComposition("bbb", "v1.14.0", []string{"gvisor"}, canaryComposed); err != nil {
+		t.Fatal(err)
+	}
 	for _, seed := range []struct{ schematic, version, body string }{
 		{"aaa", "v1.13.6", images["stable"]},
-		{"bbb", "v1.14.0", images["canary"]},
+		{canaryComposed, "v1.14.0", images["canary"]},
 	} {
 		path := filepath.Join(root, seed.schematic, seed.version, "arm64", "disk.raw")
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -535,7 +542,7 @@ func TestUpCreatesEachClusterFromItsOwnImage(t *testing.T) {
 		}
 		wantVersion, wantSchematic := "v1.13.6", "aaa"
 		if name == "canary" {
-			wantVersion, wantSchematic = "v1.14.0", "bbb"
+			wantVersion, wantSchematic = "v1.14.0", canaryComposed
 		}
 		if item.TalosVersion != wantVersion || item.Schematic != wantSchematic {
 			t.Fatalf("%s state = (%q, %q), want (%q, %q)", name, item.TalosVersion, item.Schematic, wantVersion, wantSchematic)
@@ -566,5 +573,8 @@ func TestUpCreatesEachClusterFromItsOwnImage(t *testing.T) {
 	}
 	if len(canary.TalosExtensions) != 1 || canary.TalosExtensions[0] != "gvisor" {
 		t.Fatalf("canary extensions = %#v, want [gvisor]", canary.TalosExtensions)
+	}
+	if canary.BaseSchematic != "bbb" {
+		t.Fatalf("canary base schematic = %q, want %q", canary.BaseSchematic, "bbb")
 	}
 }

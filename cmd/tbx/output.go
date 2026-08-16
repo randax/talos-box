@@ -79,6 +79,13 @@ func printStatus(output io.Writer, clusters []daemon.ClusterStatus, quiet bool) 
 				return err
 			}
 		}
+		// A re-composed schematic boots from an id the user never wrote, so
+		// the brought one is shown beside it.
+		if item.BaseSchematic != "" {
+			if _, err := fmt.Fprintf(output, "cluster %s: composed from schematic %s\n", item.Name, item.BaseSchematic); err != nil {
+				return err
+			}
+		}
 		// The composed id is opaque; the extension names it was composed
 		// from are what the user wrote.
 		if len(item.TalosExtensions) > 0 {

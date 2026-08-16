@@ -213,6 +213,32 @@ func TestPrintStatusShowsCuratedExtensions(t *testing.T) {
 	}
 }
 
+func TestPrintStatusShowsRecomposedSchematicInputs(t *testing.T) {
+	t.Parallel()
+
+	statuses := []daemon.ClusterStatus{{
+		Name: "brought", Subnet: "172.30.3.0/24", Domain: "brought.k8s.test",
+		TalosVersion: "v1.13.6", Schematic: "ccc333", BaseSchematic: "aaa111",
+		TalosExtensions: []string{"gvisor"},
+		Nodes:           []daemon.NodeStatus{{Name: "brought-cp-1", Role: cluster.RoleControlPlane, MAC: "52:54:00:00:00:01", Phase: daemon.PhaseConfigured}},
+	}}
+
+	var output bytes.Buffer
+	if err := printStatus(&output, statuses, false); err != nil {
+		t.Fatal(err)
+	}
+	rendered := output.String()
+	for _, wanted := range []string{
+		"cluster brought: schematic ccc333",
+		"cluster brought: composed from schematic aaa111",
+		"cluster brought: extensions gvisor",
+	} {
+		if !strings.Contains(rendered, wanted) {
+			t.Fatalf("status output missing %q:\n%s", wanted, rendered)
+		}
+	}
+}
+
 func TestPrintStatusQuietSuppressesSchematicLines(t *testing.T) {
 	t.Parallel()
 
