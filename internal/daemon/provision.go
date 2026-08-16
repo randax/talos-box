@@ -445,8 +445,13 @@ func storageConverged(ctx context.Context, item cluster.Cluster, kubeconfig []by
 		// The write/readback probe passes regardless of where replicas may
 		// land, so storage convergence has to include the control-plane
 		// scheduling posture or a mutation interrupted before the storage
-		// stage would fast no-op forever.
-		return provision.LonghornSchedulingConverged(ctx, kubeconfig, item)
+		// stage would fast no-op forever. The scheduling read gets its own
+		// small budget: sharing the probe's context would fail it on
+		// whatever deadline the write/readback left over and force a full
+		// reconcile of a healthy cluster.
+		schedulingCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), controlPlaneSchedulingTimeout)
+		defer cancel()
+		return provision.LonghornSchedulingConverged(schedulingCtx, kubeconfig, item)
 	default:
 		return nil
 	}
