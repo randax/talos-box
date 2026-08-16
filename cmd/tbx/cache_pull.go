@@ -37,12 +37,13 @@ func (c cli) runCachePull(args []string) error {
 	flags.Visit(func(item *flag.Flag) { provided[item.Name] = true })
 
 	var combinations []daemon.CachePullCombination
+	fileBacked := false
 	fromFile := !provided["talos-version"] && !provided["schematic"] && !provided["extensions"]
 	if !fromFile {
 		combinations = []daemon.CachePullCombination{{
 			Schematic: *schematic, Version: *talosVersion, Extensions: parseExtensionList(*extensionList),
 		}}
-	} else if combinations, err = configPullCombinations(*path, provided["f"], *talosVersion); err != nil {
+	} else if combinations, fileBacked, err = configPullCombinations(*path, provided["f"], *talosVersion); err != nil {
 		return err
 	}
 	// Both checks are local: a typo or an out-of-window version must be
@@ -59,7 +60,12 @@ func (c cli) runCachePull(args []string) error {
 		}
 		requiresExtensions = requiresExtensions || len(combination.Extensions) > 0
 	}
-	if requiresExtensions {
+	// Combinations, FromFile, and SkipImages only exist at protocol 5. A
+	// bare pull outside a project and a single extension-free ad-hoc pull
+	// still work against an older daemon through the scalar fields below;
+	// everything else would silently degrade (one default-version pull, no
+	// warm, no strays), so refuse instead.
+	if requiresExtensions || fileBacked || len(combinations) > 1 || *noImages {
 		if err := c.ensurePerClusterTalosSupport(); err != nil {
 			return err
 		}
@@ -103,18 +109,18 @@ func (c cli) runCachePull(args []string) error {
 // configPullCombinations reads the desired combinations from talosbox.yaml.
 // A missing default file is not an error: `tbx cache pull` outside a project
 // still means "the default combination".
-func configPullCombinations(path string, explicit bool, defaultVersion string) ([]daemon.CachePullCombination, error) {
+func configPullCombinations(path string, explicit bool, defaultVersion string) ([]daemon.CachePullCombination, bool, error) {
 	fallback := []daemon.CachePullCombination{{Version: defaultVersion}}
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) && !explicit {
-		return fallback, nil
+		return fallback, false, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", path, err)
+		return nil, false, fmt.Errorf("read %s: %w", path, err)
 	}
 	cfg, err := config.Parse(data)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	var combinations []daemon.CachePullCombination
 	seen := map[string]struct{}{}
@@ -137,7 +143,7 @@ func configPullCombinations(path string, explicit bool, defaultVersion string) (
 		combinations = append(combinations, combination)
 	}
 	if len(combinations) == 0 {
-		return fallback, nil
+		return fallback, true, nil
 	}
-	return combinations, nil
+	return combinations, true, nil
 }

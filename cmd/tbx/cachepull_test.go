@@ -134,6 +134,7 @@ func TestCachePullRejectsBelowFloorVersionBeforeCallingTheDaemon(t *testing.T) {
 // intent travels with its pin, and unclaimed pins are named, not removed.
 func TestFlaglessCachePullWarmsImagesAndReportsStrays(t *testing.T) {
 	home, requests := startUpTestDaemon(t,
+		daemon.Response{OK: true, Data: json.RawMessage(fmt.Sprintf(`{"protocolVersion":%d}`, daemon.ProtocolVersion))},
 		daemon.Response{OK: true, Data: json.RawMessage(`{"schematic":"aaa","version":"v1.13.6","architecture":"arm64","path":"/cache/aaa/disk.raw",
 			"images":[{"schematic":"aaa","version":"v1.13.6","architecture":"arm64","path":"/cache/aaa/disk.raw"}],
 			"warm":{"warmed":12,"alreadyComplete":3,"failed":0},
@@ -154,6 +155,9 @@ clusters:
 	command := cli{out: &stdout, err: &stderr}
 	if err := command.runCache([]string{"pull", "-f", path}); err != nil {
 		t.Fatal(err)
+	}
+	if request := <-requests; request.Op != "daemon.info" {
+		t.Fatalf("first operation = %q, want daemon.info", request.Op)
 	}
 	request := <-requests
 	if request.Op != "cache.pull" {
@@ -183,12 +187,26 @@ clusters:
 
 // TestFlaglessCachePullNoImagesOptsOutOfWarming keeps the opt-out explicit.
 func TestFlaglessCachePullNoImagesOptsOutOfWarming(t *testing.T) {
-	response := json.RawMessage(`{"schematic":"aaa","version":"v1.13.6","architecture":"arm64","path":"/cache/disk.raw"}`)
+	_, requests := startUpTestDaemon(t,
+		daemon.Response{OK: true, Data: json.RawMessage(fmt.Sprintf(`{"protocolVersion":%d}`, daemon.ProtocolVersion))},
+		daemon.Response{OK: true, Data: json.RawMessage(`{"schematic":"aaa","version":"v1.13.6","architecture":"arm64","path":"/cache/disk.raw"}`)},
+	)
 	t.Chdir(t.TempDir())
 
-	request := runWithDaemonResponse(t, response, func(command cli) error {
-		return command.runCache([]string{"pull", "--no-images"})
-	})
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr}
+	if err := command.runCache([]string{"pull", "--no-images"}); err != nil {
+		t.Fatal(err)
+	}
+	// --no-images is a protocol-5 field: an older daemon would ignore the
+	// opt-out, so the handshake comes first.
+	if request := <-requests; request.Op != "daemon.info" {
+		t.Fatalf("first operation = %q, want daemon.info", request.Op)
+	}
+	request := <-requests
+	if request.Op != "cache.pull" {
+		t.Fatalf("second operation = %q, want cache.pull", request.Op)
+	}
 	var args daemon.CachePullArgs
 	if err := json.Unmarshal(request.Args, &args); err != nil {
 		t.Fatal(err)
@@ -202,6 +220,7 @@ func TestFlaglessCachePullNoImagesOptsOutOfWarming(t *testing.T) {
 // honest: the same disk image with two provisioning paths is two combinations.
 func TestCachePullSeparatesClustersThatShareAPinButNotAnIntent(t *testing.T) {
 	home, requests := startUpTestDaemon(t,
+		daemon.Response{OK: true, Data: json.RawMessage(fmt.Sprintf(`{"protocolVersion":%d}`, daemon.ProtocolVersion))},
 		daemon.Response{OK: true, Data: json.RawMessage(`{"schematic":"aaa","version":"v1.13.6","architecture":"arm64","path":"/cache/aaa/disk.raw"}`)},
 	)
 	path := filepath.Join(home, "talosbox.yaml")
@@ -223,6 +242,9 @@ clusters:
 	if err := command.runCache([]string{"pull", "-f", path}); err != nil {
 		t.Fatal(err)
 	}
+	if request := <-requests; request.Op != "daemon.info" {
+		t.Fatalf("first operation = %q, want daemon.info", request.Op)
+	}
 	request := <-requests
 	if request.Op != "cache.pull" {
 		t.Fatalf("operation = %q, want cache.pull", request.Op)
@@ -237,5 +259,43 @@ clusters:
 	}
 	if !reflect.DeepEqual(args.Combinations, want) {
 		t.Fatalf("combinations = %+v, want %+v", args.Combinations, want)
+	}
+}
+
+// TestFileAwareCachePullRefusesAnOldDaemon pins the protocol gate for the
+// file-aware form even without extensions: an older daemon reads only the
+// scalar fields, so a multi-combination pull would silently collapse to one
+// default-version image and the promised offline up would fail later.
+func TestFileAwareCachePullRefusesAnOldDaemon(t *testing.T) {
+	home, requests := startUpTestDaemon(t,
+		daemon.Response{OK: true, Data: json.RawMessage(fmt.Sprintf(`{"protocolVersion":%d}`, perClusterTalosProtocolVersion-1))},
+	)
+	path := filepath.Join(home, "talosbox.yaml")
+	contents := `version: 1
+talos:
+  version: v1.13.6
+clusters:
+  - name: stable
+  - name: canary
+    talos:
+      version: v1.14.0
+`
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr}
+	err := command.runCache([]string{"pull", "-f", path})
+	if err == nil || !strings.Contains(err.Error(), "is too old") {
+		t.Fatalf("file-aware pull error = %v, want a protocol refusal", err)
+	}
+	if request := <-requests; request.Op != "daemon.info" {
+		t.Fatalf("first operation = %q, want daemon.info", request.Op)
+	}
+	select {
+	case request := <-requests:
+		t.Fatalf("unexpected operation %q after the refusal", request.Op)
+	default:
 	}
 }
