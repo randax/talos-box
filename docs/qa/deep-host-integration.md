@@ -43,7 +43,7 @@ Steps (macOS):
 1. `tbx cluster create qa-host --cni cilium` (configured nodes are balloon-managed; maintenance nodes are exempt).
 2. Verify printed config includes the balloon module: `tbx manifests qa-host balloon` (or `machine`) mentions `virtio_balloon`.
 3. Create memory pressure (e.g. run a large `stress`-like allocation or record SKIPPED-if-impractical with reason); watch for balloon inflation evidence in guest free memory (`kubectl top nodes` deltas) — this is an observe-and-attest check, not a hard assertion.
-4. Overcommit guard: attempt `tbx cluster create qa-big --cp 1 --workers 6 --memory-mib 4096` sized to exceed host RAM minus 6 GiB — expect a warning; confirm `--force` overrides; destroy/abort without creating if possible.
+4. Overcommit guard: `cluster create` has no sizing flags — write a minimal `talosbox.yaml` (1 cp + 6 workers, `node.memory: 4GiB`) sized to exceed host RAM minus 6 GiB and run `tbx up -f <file>` — expect refusal with nothing created; confirm `--force` overrides. Note: while #231 is open, the swap-keyed guard may fire first and mask the RAM-sum guard.
 
 Steps (Linux):
 1. `tbx doctor` reports `host-pressure: SKIP` — expected, record it.

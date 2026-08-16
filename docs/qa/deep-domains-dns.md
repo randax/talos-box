@@ -56,11 +56,11 @@ On failure: capture each error text.
 Steps:
 1. `tbx cluster create qa-sub --domain deep.lab.internal --allow-unsafe-domain` if prompted-by-error, otherwise plain (record which was needed — `deep.lab.internal` nests under C1's domain).
 2. Resolve `x.deep.lab.internal` (→ qa-sub's `.200`) and `x.lab.internal` (→ qa-dom's `.200`) — different VIPs.
-3. Stop `qa-sub`; verify `x.deep.lab.internal` now NXDOMAINs (owner answers alone) while `x.lab.internal` still resolves.
+3. Stop `qa-sub`; verify `x.deep.lab.internal` STILL resolves to qa-sub's `.200` (records are tied to cluster existence, not run-state — verified 2026-08-16; SPEC clarification tracked in #241) while `x.lab.internal` resolves to qa-dom's.
 
-Expected observations: longest suffix wins; the owning cluster answers or NXDOMAINs alone; no cross-cluster bleed.
+Expected observations: longest suffix wins; the owning cluster answers alone; no cross-cluster bleed; stopped clusters keep answering (DNS is existence-scoped).
 
-Pass criteria: both wildcards land on their own cluster's VIP; stop isolates correctly.
+Pass criteria: both wildcards land on their own cluster's VIP; records survive stop, vanish on destroy.
 
 On failure: capture both resolutions and the resolver state.
 

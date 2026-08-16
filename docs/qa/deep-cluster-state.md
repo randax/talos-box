@@ -16,7 +16,7 @@ You are running QA, not demos. For every charter: run the steps exactly, compare
 
 ## Preflight
 
-BLOCKED unless: `tbx version` recorded; `tbx doctor` exits 0 — on Linux record the `qemu` doctor line (it states suspend availability; QEMU 6.2–8.1 hosts will legitimately refuse suspend, turning C3 into a capability-refusal check rather than a suspend test); no cluster `qa-sta`; ≥ 10 GiB free RAM and ≥ 40 GiB free disk (snapshots on Linux may be full copies).
+BLOCKED unless: `tbx version` recorded; `tbx doctor` exits 0 — on Linux record the `qemu` doctor line (it states suspend availability; QEMU 6.2–8.1 hosts will legitimately refuse suspend, turning C3 into a capability-refusal check rather than a suspend test); no cluster `qa-sta`; ≥ 10 GiB free RAM; disk: ≥ 40 GiB free on Linux (snapshots may be full copies), ≥ 5 GiB on macOS (APFS clonefile snapshots are copy-on-write).
 
 ## Charters
 
