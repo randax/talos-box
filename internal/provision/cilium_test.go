@@ -2,10 +2,16 @@ package provision
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -835,14 +841,14 @@ func TestWaitForAPIServerFailsFastOnForbidden(t *testing.T) {
 		_, _ = writer.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","code":403}`))
 	}))
 	defer server.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	start := time.Now()
 	err := waitForAPIServer(ctx, &rest.Config{Host: server.URL}, 50*time.Millisecond)
 	if err == nil {
 		t.Fatal("API server wait passed against a forbidden endpoint")
 	}
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("forbidden endpoint burned %v of the deadline, want fail-fast", elapsed)
 	}
 	if !strings.Contains(err.Error(), server.URL) {
@@ -879,14 +885,72 @@ func TestWaitForAPIServerFailsFastOnUntrustedCertificate(t *testing.T) {
 		_, _ = writer.Write([]byte(`{"major":"1","minor":"34"}`))
 	}))
 	defer server.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	start := time.Now()
 	err := waitForAPIServer(ctx, &rest.Config{Host: server.URL}, 50*time.Millisecond)
 	if err == nil {
 		t.Fatal("API server wait trusted a certificate from an unknown authority")
 	}
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("untrusted CA burned %v of the deadline, want fail-fast", elapsed)
+	}
+}
+
+func expiredTestCertificate(t *testing.T) (tls.Certificate, []byte) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := x509.Certificate{
+		SerialNumber:          big.NewInt(2),
+		Subject:               pkix.Name{CommonName: "talos-box expired test"},
+		NotBefore:             time.Now().Add(-2 * time.Hour),
+		NotAfter:              time.Now().Add(-time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificatePEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate, err := tls.X509KeyPair(certificatePEM, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return certificate, certificatePEM
+}
+
+func TestWaitForAPIServerKeepsRetryingAnExpiredCertificate(t *testing.T) {
+	// Guest clock skew right after boot presents as expired/not-yet-valid:
+	// the condition heals by waiting, so it must retry to the deadline
+	// instead of failing terminally like an unknown authority.
+	certificate, certificatePEM := expiredTestCertificate(t)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = writer.Write([]byte(`{"major":"1","minor":"34"}`))
+	}))
+	server.TLS = &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12}
+	server.StartTLS()
+	defer server.Close()
+	const deadline = 500 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), deadline)
+	defer cancel()
+	start := time.Now()
+	config := &rest.Config{Host: server.URL, TLSClientConfig: rest.TLSClientConfig{CAData: certificatePEM}}
+	err := waitForAPIServer(ctx, config, 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("API server wait accepted an expired certificate")
+	}
+	if elapsed := time.Since(start); elapsed < deadline {
+		t.Fatalf("expired certificate failed terminally after %v, want retries to the %v deadline", elapsed, deadline)
 	}
 }

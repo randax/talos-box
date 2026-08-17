@@ -792,13 +792,24 @@ func waitForAPIServer(ctx context.Context, config *rest.Config, interval time.Du
 }
 
 // isUntrustedCertificateError matches only trust-chain failures that cannot
-// heal by waiting: the kubeconfig pins the CA, so an unknown authority is
-// permanent. Expired/not-yet-valid certs (guest clock skew right after boot)
-// and hostname mismatches (serving-cert SANs lagging a fresh control-plane
-// lease) resolve on their own and must stay retryable.
+// heal by waiting: the kubeconfig pins the CA, so an unknown authority or a
+// structurally unusable chain is permanent. Expired/not-yet-valid certs
+// (guest clock skew right after boot) and hostname mismatches (serving-cert
+// SANs lagging a fresh control-plane lease) resolve on their own and must
+// stay retryable.
 func isUntrustedCertificateError(err error) bool {
 	var unknownAuthority x509.UnknownAuthorityError
-	return errors.As(err, &unknownAuthority)
+	if errors.As(err, &unknownAuthority) {
+		return true
+	}
+	var invalid x509.CertificateInvalidError
+	if errors.As(err, &invalid) {
+		switch invalid.Reason {
+		case x509.NotAuthorizedToSign, x509.IncompatibleUsage, x509.CANotAuthorizedForThisName:
+			return true
+		}
+	}
+	return false
 }
 
 func waitForCilium(ctx context.Context, client kubernetes.Interface, interval time.Duration) error {

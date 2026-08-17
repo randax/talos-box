@@ -552,13 +552,9 @@ func planKnownVersionPrune(versionPath, schematic, version string, keep func(Com
 			}
 			if kept {
 				// Count (and dedupe against the legacy layout) only when an
-				// image is actually being kept: cache list keys on disk.raw,
-				// and the kept report must agree with it.
-				diskPresent, err := pathExists(filepath.Join(archDir, "disk.raw"))
-				if err != nil {
-					return nil, nil, 0, false, err
-				}
-				if diskPresent {
+				// image is actually being kept: cache list keys on a ready
+				// disk.raw, and the kept report must agree with it.
+				if fileReady(filepath.Join(archDir, "disk.raw")) {
 					keptCount++
 					if architecture == ArchitectureARM64 {
 						arm64Kept = true
@@ -628,11 +624,7 @@ func planKnownVersionPrune(versionPath, schematic, version string, keep func(Com
 		if len(tempPlan) != 0 {
 			plan = append(plan, combinationPlan{combination: legacy, actions: tempPlan, temporariesOnly: true})
 		}
-		present, err := legacyArtifactsPresent(versionPath)
-		if err != nil {
-			return nil, nil, 0, false, err
-		}
-		if present && !arm64Kept {
+		if legacyArtifactsPresent(versionPath) && !arm64Kept {
 			keptCount++
 		}
 	} else {
@@ -656,10 +648,10 @@ func planKnownVersionPrune(versionPath, schematic, version string, keep func(Com
 
 // legacyArtifactsPresent reports whether the pre-architecture flat layout
 // actually holds an image for this version, so a kept legacy combination is
-// only counted when there is something being kept. It keys on disk.raw, the
-// same file Cache.List keys on, so the kept report and the listing agree.
-func legacyArtifactsPresent(versionPath string) (bool, error) {
-	return pathExists(filepath.Join(versionPath, "disk.raw"))
+// only counted when there is something being kept. It uses the same ready
+// disk.raw predicate as Cache.List, so the kept report and listing agree.
+func legacyArtifactsPresent(versionPath string) bool {
+	return fileReady(filepath.Join(versionPath, "disk.raw"))
 }
 
 func keepCombination(keep func(Combination) (bool, error), combination Combination) (bool, error) {

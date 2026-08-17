@@ -663,9 +663,9 @@ func TestPruneDiskMergesCoexistingLegacyAndArchLayouts(t *testing.T) {
 	root := t.TempDir()
 	cache := New(root)
 	files := map[string]string{
-		filepath.Join(root, "schematic", "v1.13.6", "arm64", "disk.raw"):    "arch-disk",
-		filepath.Join(root, "schematic", "v1.13.6", "disk.raw"):            "legacy-disk",
-		filepath.Join(root, "schematic", "v1.13.6", "metal-arm64.raw.xz"):  "legacy-archive",
+		filepath.Join(root, "schematic", "v1.13.6", "arm64", "disk.raw"):  "arch-disk",
+		filepath.Join(root, "schematic", "v1.13.6", "disk.raw"):           "legacy-disk",
+		filepath.Join(root, "schematic", "v1.13.6", "metal-arm64.raw.xz"): "legacy-archive",
 	}
 	var wantBytes int64
 	for path, body := range files {
@@ -724,5 +724,58 @@ func TestPruneDiskExceptCountsAndSweepsKeptLegacyCombination(t *testing.T) {
 	}
 	if _, err := os.Stat(abandoned); !os.IsNotExist(err) {
 		t.Fatalf("abandoned legacy temporary survived the kept sweep (%v)", err)
+	}
+}
+
+func TestPruneDiskExceptCountsKeptLegacyBesideArchiveOnlyArchDir(t *testing.T) {
+	// arm64 dir holds only the compressed archive (no ready disk.raw), the
+	// legacy flat layout holds the actual image: the kept report must count
+	// the combination exactly once, agreeing with cache list.
+	root := t.TempDir()
+	cache := New(root)
+	files := map[string]string{
+		filepath.Join(root, "schematic", "v1.13.6", "arm64", "metal-arm64.raw.xz"): "arch-archive",
+		filepath.Join(root, "schematic", "v1.13.6", "disk.raw"):                    "legacy-disk",
+	}
+	for path, body := range files {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	result, err := cache.PruneDiskExcept(func(Combination) (bool, error) { return true, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ImageCount != 0 {
+		t.Fatalf("kept combination was pruned: %+v", result)
+	}
+	if result.KeptImages != 1 {
+		t.Fatalf("KeptImages = %d, want the legacy image counted exactly once", result.KeptImages)
+	}
+}
+
+func TestPruneDiskExceptDoesNotCountZeroByteDiskAsKept(t *testing.T) {
+	// cache list hides zero-byte or non-regular disk.raw files; the kept
+	// report must use the same readiness predicate or the two disagree.
+	root := t.TempDir()
+	cache := New(root)
+	empty := filepath.Join(root, "schematic", "v1.13.6", "arm64", "disk.raw")
+	if err := os.MkdirAll(filepath.Dir(empty), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(empty, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := cache.PruneDiskExcept(func(Combination) (bool, error) { return true, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.KeptImages != 0 {
+		t.Fatalf("KeptImages = %d for a zero-byte disk.raw cache list does not show", result.KeptImages)
 	}
 }

@@ -109,6 +109,9 @@ func (c cli) runCluster(args []string) error {
 		if len(positionals) != 0 {
 			return errors.New("usage: tbx cluster list [-o json]")
 		}
+		if err := validateOutputFormat(*outputFormat); err != nil {
+			return err
+		}
 		var result []daemon.ClusterSummary
 		if err := c.call("cluster.list", struct{}{}, &result); err != nil {
 			return err
@@ -408,6 +411,9 @@ func (c cli) runStatus(args []string) error {
 	}
 	if len(positionals) > 1 {
 		return errors.New("usage: tbx status [cluster] [--quiet] [-o json]")
+	}
+	if err := validateOutputFormat(*outputFormat); err != nil {
+		return err
 	}
 	name := ""
 	if len(positionals) == 1 {

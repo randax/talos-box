@@ -50,3 +50,24 @@ func TestSnapshotListJSONOutput(t *testing.T) {
 		t.Fatalf("snapshot list -o json = %+v, want the baseline snapshot", decoded)
 	}
 }
+
+func TestSnapshotListRejectsUnknownOutputFormat(t *testing.T) {
+	c := cli{out: &bytes.Buffer{}, err: &bytes.Buffer{}}
+	err := c.snapshotList([]string{"demo", "-o", "yaml"})
+	if err == nil || !strings.Contains(err.Error(), `unknown output format "yaml"`) {
+		t.Fatalf("snapshot list -o yaml error = %v, want the unknown-format refusal", err)
+	}
+}
+
+func TestSnapshotListJSONEmitsEmptyArrayForNoSnapshots(t *testing.T) {
+	_, command := newDestroyTestCLI(t, []daemon.Response{
+		{OK: true, Data: json.RawMessage(`null`)},
+	})
+
+	if err := command.snapshotList([]string{"demo", "-o", "json"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(command.out.(*bytes.Buffer).String()); got != "[]" {
+		t.Fatalf("empty snapshot list -o json = %q, want []", got)
+	}
+}
