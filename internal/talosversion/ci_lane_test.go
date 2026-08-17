@@ -7,7 +7,7 @@ import (
 )
 
 // The KVM e2e harness pins one talosctl checksum per bootable Talos version and
-// the scheduled lane picks the floor. Both are literals in shell and YAML, so
+// the release-gating lane picks the floor. Both are literals in shell and YAML, so
 // nothing but this test keeps them from drifting when the window moves here.
 func TestCILanesCoverTheSupportedVersionWindow(t *testing.T) {
 	t.Parallel()
@@ -27,7 +27,7 @@ func TestCILanesCoverTheSupportedVersionWindow(t *testing.T) {
 		},
 		{
 			name:    "workflow",
-			path:    "../../.github/workflows/ci.yml",
+			path:    "../../.depot/workflows/floor-e2e.yml",
 			needles: []string{"TBX_E2E_TALOS_VERSION: " + Min},
 		},
 	}

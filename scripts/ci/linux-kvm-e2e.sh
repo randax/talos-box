@@ -32,6 +32,7 @@ cluster_cleanup_needed=false
 # userspace: CI sandboxes have no nfsd in the kernel and no systemd to manage
 # one, so the harness owns the daemon lifecycle directly.
 ganesha_pid_file=""
+ganesha_log=""
 ganesha_running=false
 dump_failure_diagnostics() (
   trap - ERR
@@ -75,6 +76,11 @@ dump_failure_diagnostics() (
   sudo bridge fdb show >&2
   printf '\n===== host firewall =====\n' >&2
   sudo nft list ruleset >&2
+  printf '\n===== NFS server =====\n' >&2
+  showmount -e localhost >&2 || true
+  if [[ -n "${ganesha_log:-}" && -f "$ganesha_log" ]]; then
+    sudo cat "$ganesha_log" >&2 || true
+  fi
   sudo iptables-save >&2
   printf '\n===== QEMU processes =====\n' >&2
   pgrep -a -f qemu-system >&2
@@ -385,6 +391,9 @@ GANESHA
 # script works with or without systemd, and fall back to launching rpcbind
 # directly where no init system manages it.
 sudo mkdir -p /run/sendsigs.omit.d
+# Ganesha's VFS FSAL enumerates filesystems via /etc/mtab, which minimal CI
+# images omit; without it every export fails to create and mounts are denied.
+[[ -e /etc/mtab ]] || sudo ln -s /proc/self/mounts /etc/mtab
 pgrep -x rpcbind >/dev/null || sudo service rpcbind start || sudo rpcbind
 ganesha_running=true
 sudo ganesha.nfsd -f "$ganesha_conf" -p "$ganesha_pid_file" -L "$ganesha_log"
