@@ -541,7 +541,7 @@ Commands:
   cache pull|prune|warm|list
   system install|uninstall
   doctor
-  version
+  version (also --version, -v)
 `
 	_, _ = fmt.Fprint(output, help)
 }

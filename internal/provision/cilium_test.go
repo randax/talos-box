@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -730,55 +731,112 @@ func establishedCRD(name string) *unstructured.Unstructured {
 	}}
 }
 
-func nonBGPCiliumCRDClient() dynamic.Interface {
-	return fake.NewSimpleDynamicClient(runtime.NewScheme(),
-		establishedCRD("ciliumloadbalancerippools.cilium.io"),
-		establishedCRD("ciliuml2announcementpolicies.cilium.io"),
-	)
+// ciliumCRDNamesForIntent mirrors what the cilium-operator registers for the
+// values manifests.CiliumValues renders: LB-IPAM always, l2announcements only
+// on the L2 LB path, the BGP trio only with bgpControlPlane enabled.
+func ciliumCRDNamesForIntent(lb, bgp bool) []string {
+	names := []string{"ciliumloadbalancerippools.cilium.io"}
+	if lb && !bgp {
+		names = append(names, "ciliuml2announcementpolicies.cilium.io")
+	}
+	if bgp {
+		names = append(names,
+			"ciliumbgpclusterconfigs.cilium.io",
+			"ciliumbgppeerconfigs.cilium.io",
+			"ciliumbgpadvertisements.cilium.io",
+		)
+	}
+	return names
 }
 
-func TestWaitForCiliumCRDsSkipsBGPCRDsWhenBGPDisabled(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	if err := waitForCiliumCRDs(ctx, nonBGPCiliumCRDClient(), time.Millisecond, false); err != nil {
-		t.Fatalf("CRD wait demanded BGP CRDs the chart does not install: %v", err)
+func TestWaitForCiliumCRDsMatchesWhatEachIntentInstalls(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		lb, bgp bool
+	}{
+		{name: "default L2 load balancer", lb: true},
+		{name: "bgp load balancer installs no l2 CRD", lb: true, bgp: true},
+		{name: "no load balancer installs no l2 CRD", lb: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			objects := []runtime.Object{}
+			for _, name := range ciliumCRDNamesForIntent(tt.lb, tt.bgp) {
+				objects = append(objects, establishedCRD(name))
+			}
+			client := fake.NewSimpleDynamicClient(runtime.NewScheme(), objects...)
+			item := cluster.Cluster{ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: tt.lb, BGP: tt.bgp}}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := waitForCiliumCRDs(ctx, client, time.Millisecond, item); err != nil {
+				t.Fatalf("CRD wait demanded a CRD this intent's chart never installs: %v", err)
+			}
+		})
 	}
 }
 
-func TestWaitForCiliumCRDsRequiresBGPCRDsWhenBGPEnabled(t *testing.T) {
+func TestWaitForCiliumCRDsStillRequiresTheEnabledSet(t *testing.T) {
+	// Only LB-IPAM present: a BGP intent must keep waiting for its trio.
+	client := fake.NewSimpleDynamicClient(runtime.NewScheme(), establishedCRD("ciliumloadbalancerippools.cilium.io"))
+	item := cluster.Cluster{ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true, BGP: true}}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	if err := waitForCiliumCRDs(ctx, nonBGPCiliumCRDClient(), time.Millisecond, true); err == nil {
+	if err := waitForCiliumCRDs(ctx, client, time.Millisecond, item); err == nil {
 		t.Fatal("BGP-enabled CRD wait passed without the BGP CRDs")
 	}
 }
 
-func TestWaitForAPIServerRetriesUntilVersionAnswers(t *testing.T) {
-	attempts := 0
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		attempts++
-		if attempts < 3 {
-			hijacker, ok := writer.(http.Hijacker)
-			if !ok {
-				t.Fatal("test server does not support hijacking")
-			}
-			conn, _, err := hijacker.Hijack()
-			if err != nil {
-				t.Fatal(err)
-			}
-			_ = conn.Close()
+func TestWaitForAPIServerRetriesRefusedDialsUntilServerListens(t *testing.T) {
+	reserved, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := reserved.Addr().String()
+	_ = reserved.Close() // the port now refuses connections — client-go does not retry ECONNREFUSED itself
+	const listenAfter = 300 * time.Millisecond
+	served := make(chan struct{})
+	go func() {
+		time.Sleep(listenAfter)
+		listener, err := net.Listen("tcp", address)
+		if err != nil {
 			return
 		}
-		_, _ = writer.Write([]byte(`{"major":"1","minor":"34"}`))
+		server := &http.Server{Handler: http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			_, _ = writer.Write([]byte(`{"major":"1","minor":"34"}`))
+		})}
+		defer func() { _ = server.Close() }()
+		close(served)
+		_ = server.Serve(listener)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := waitForAPIServer(ctx, &rest.Config{Host: "http://" + address}, 50*time.Millisecond); err != nil {
+		t.Fatalf("API server wait did not survive refused dials: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < listenAfter {
+		t.Fatalf("API server wait returned in %v, before the server could have been listening", elapsed)
+	}
+	<-served
+}
+
+func TestWaitForAPIServerFailsFastOnForbidden(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusForbidden)
+		_, _ = writer.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","code":403}`))
 	}))
 	defer server.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := waitForAPIServer(ctx, &rest.Config{Host: server.URL}, time.Millisecond); err != nil {
-		t.Fatalf("API server wait did not survive dropped connections: %v", err)
+	start := time.Now()
+	err := waitForAPIServer(ctx, &rest.Config{Host: server.URL}, 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("API server wait passed against a forbidden endpoint")
 	}
-	if attempts < 3 {
-		t.Fatalf("API server wait attempts = %d, want retries until the server answers", attempts)
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("forbidden endpoint burned %v of the deadline, want fail-fast", elapsed)
+	}
+	if !strings.Contains(err.Error(), server.URL) {
+		t.Fatalf("fail-fast error does not name the endpoint: %v", err)
 	}
 }
 

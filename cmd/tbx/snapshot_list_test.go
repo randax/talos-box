@@ -32,3 +32,21 @@ func TestSnapshotListPrintsHeadedTable(t *testing.T) {
 		t.Errorf("snapshot list row = %q, want name and created time", lines[1])
 	}
 }
+
+func TestSnapshotListJSONOutput(t *testing.T) {
+	_, command := newDestroyTestCLI(t, []daemon.Response{
+		{OK: true, Data: json.RawMessage(`[{"name":"baseline","created":"2026-08-17T10:00:00Z"}]`)},
+	})
+
+	if err := command.snapshotList([]string{"demo", "-o", "json"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var decoded []map[string]any
+	if err := json.Unmarshal(command.out.(*bytes.Buffer).Bytes(), &decoded); err != nil {
+		t.Fatalf("snapshot list -o json is not valid JSON: %v", err)
+	}
+	if len(decoded) != 1 || decoded[0]["name"] != "baseline" {
+		t.Fatalf("snapshot list -o json = %+v, want the baseline snapshot", decoded)
+	}
+}

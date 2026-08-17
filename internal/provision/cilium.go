@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	_ "embed"
 	"encoding/json"
 	"errors"
@@ -123,7 +125,7 @@ func (r CiliumReconciler) reconcile(ctx context.Context, item cluster.Cluster, c
 			return LoadBalancerResult{}, err
 		}
 	}
-	if err := waitForCiliumCRDs(ctx, dynamicClient, r.PollInterval, item.BGP); err != nil {
+	if err := waitForCiliumCRDs(ctx, dynamicClient, r.PollInterval, item); err != nil {
 		return LoadBalancerResult{}, err
 	}
 	mapper.Reset()
@@ -323,6 +325,14 @@ func deleteStaleCiliumAnnouncements(ctx context.Context, client dynamic.Interfac
 	resources := make([]dynamic.ResourceInterface, 0, len(candidates))
 	for _, candidate := range candidates {
 		resource, live, found, err := getDynamicObject(ctx, client, mapper, candidate)
+		if meta.IsNoMatchError(err) {
+			// The alternative announcement mode's CRDs were never installed
+			// on this cluster, so no stale object of this kind can exist.
+			// Only this caller may tolerate an unserved kind: the Hubble and
+			// storage paths deal in kinds that must always be mappable.
+			resources = append(resources, nil)
+			continue
+		}
 		if err != nil {
 			return fmt.Errorf("get stale Cilium %s %q: %w", candidate.GetKind(), candidate.GetName(), err)
 		}
@@ -353,11 +363,6 @@ func getDynamicObject(
 	candidate unstructured.Unstructured,
 ) (dynamic.ResourceInterface, *unstructured.Unstructured, bool, error) {
 	mapping, err := mapper.RESTMapping(candidate.GroupVersionKind().GroupKind(), candidate.GroupVersionKind().Version)
-	if meta.IsNoMatchError(err) {
-		// The kind is not served at all — its CRD was never installed — so no
-		// object of it can exist to inspect or delete.
-		return nil, nil, false, nil
-	}
 	if err != nil {
 		return nil, nil, false, fmt.Errorf("map %s %q: %w", candidate.GetKind(), candidate.GetName(), err)
 	}
@@ -764,7 +769,9 @@ func partitionCiliumObjects(objects []unstructured.Unstructured) (namespaces, ch
 
 // waitForAPIServer polls /version until kube-apiserver answers, so the error
 // on expiry names the endpoint that never came up rather than whichever apply
-// happened to dial first.
+// happened to dial first. Only bootstrap-transient failures (refused dials,
+// resets, timeouts, 5xx) are retried: bad credentials or a broken trust chain
+// cannot heal by waiting and must fail as fast as they did before this gate.
 func waitForAPIServer(ctx context.Context, config *rest.Config, interval time.Duration) error {
 	client, err := discovery.NewDiscoveryClientForConfig(config)
 	if err != nil {
@@ -772,11 +779,26 @@ func waitForAPIServer(ctx context.Context, config *rest.Config, interval time.Du
 	}
 	if err := poll(ctx, interval, func(ctx context.Context) error {
 		_, err := client.RESTClient().Get().AbsPath("/version").DoRaw(ctx)
+		if err == nil {
+			return nil
+		}
+		if apierrors.IsUnauthorized(err) || apierrors.IsForbidden(err) || isCertificateError(err) {
+			return terminal(err)
+		}
 		return err
 	}); err != nil {
 		return fmt.Errorf("wait for kube-apiserver at %s: %w", config.Host, err)
 	}
 	return nil
+}
+
+func isCertificateError(err error) bool {
+	var verification *tls.CertificateVerificationError
+	var unknownAuthority x509.UnknownAuthorityError
+	var hostname x509.HostnameError
+	var invalid x509.CertificateInvalidError
+	return errors.As(err, &verification) || errors.As(err, &unknownAuthority) ||
+		errors.As(err, &hostname) || errors.As(err, &invalid)
 }
 
 func waitForCilium(ctx context.Context, client kubernetes.Interface, interval time.Duration) error {
@@ -809,15 +831,18 @@ func waitForHubble(ctx context.Context, client kubernetes.Interface, interval ti
 	})
 }
 
-// waitForCiliumCRDs waits only for CRDs the rendered chart actually creates:
-// the operator installs the BGP CRDs only when bgpControlPlane is enabled, so
-// demanding them on an L2-only cluster would wait out the whole deadline.
-func waitForCiliumCRDs(ctx context.Context, client dynamic.Interface, interval time.Duration, bgp bool) error {
-	names := []string{
-		"ciliumloadbalancerippools.cilium.io",
-		"ciliuml2announcementpolicies.cilium.io",
+// waitForCiliumCRDs waits only for CRDs the rendered chart actually creates.
+// The operator registers a feature's CRDs only when the installed values
+// enable it, so the wait set must mirror manifests.CiliumValues: LB-IPAM is
+// always on, l2announcements only when the LB path is L2 (lb && !bgp), and
+// the BGP trio only when bgpControlPlane is enabled. Waiting for anything
+// else deadlines on a CRD that never appears (#295).
+func waitForCiliumCRDs(ctx context.Context, client dynamic.Interface, interval time.Duration, item cluster.Cluster) error {
+	names := []string{"ciliumloadbalancerippools.cilium.io"}
+	if item.LB && !item.BGP {
+		names = append(names, "ciliuml2announcementpolicies.cilium.io")
 	}
-	if bgp {
+	if item.BGP {
 		names = append(names,
 			"ciliumbgpclusterconfigs.cilium.io",
 			"ciliumbgppeerconfigs.cilium.io",

@@ -535,6 +535,8 @@ func planKnownVersionPrune(versionPath, schematic, version string, keep func(Com
 	var cleanupDirs []string
 	keptCount := 0
 	touched := false
+	arm64Kept := false
+	arm64PlanIndex := -1
 	for _, architecture := range []Architecture{ArchitectureAMD64, ArchitectureARM64} {
 		archDir := filepath.Join(versionPath, string(architecture))
 		exists, err := pathExists(archDir)
@@ -550,6 +552,9 @@ func planKnownVersionPrune(versionPath, schematic, version string, keep func(Com
 			}
 			if kept {
 				keptCount++
+				if architecture == ArchitectureARM64 {
+					arm64Kept = true
+				}
 				// A kept combination still sheds abandoned partial
 				// downloads: they are safe to delete regardless of
 				// retention and would otherwise accumulate forever.
@@ -584,32 +589,73 @@ func planKnownVersionPrune(versionPath, schematic, version string, keep func(Com
 			if err != nil {
 				return nil, nil, 0, false, err
 			}
+			if architecture == ArchitectureARM64 {
+				arm64PlanIndex = len(plan)
+			}
 			plan = append(plan, combinationPlan{combination: combination, actions: archPlan})
 			cleanupDirs = append(cleanupDirs, archDir)
 		}
 	}
-	// The legacy flat layout only ever held arm64 images.
+	// The legacy flat layout only ever held arm64 images. It is the same
+	// combination as the arm64 architecture directory, so keep decisions,
+	// kept counting, and the pruned-combination report must all treat the
+	// two layouts as one.
 	legacy := Combination{Schematic: schematic, Version: version, Architecture: ArchitectureARM64}
 	kept, err := keepCombination(keep, legacy)
 	if err != nil {
 		return nil, nil, 0, false, err
 	}
-	if !kept {
+	legacyPrefixes := []knownPrunePrefix{
+		{prefix: ".disk.raw-"},
+		{prefix: fmt.Sprintf(".metal-%s.raw.xz-", ArchitectureARM64)},
+	}
+	if kept {
+		// A kept legacy combination still sheds abandoned partial downloads,
+		// exactly like the kept architecture-directory branch above.
+		tempPlan, err := planKnownFiles(versionPath, nil, legacyPrefixes)
+		if err != nil {
+			return nil, nil, 0, false, err
+		}
+		if len(tempPlan) != 0 {
+			plan = append(plan, combinationPlan{combination: legacy, actions: tempPlan, temporariesOnly: true})
+		}
+		present, err := legacyArtifactsPresent(versionPath)
+		if err != nil {
+			return nil, nil, 0, false, err
+		}
+		if present && !arm64Kept {
+			keptCount++
+		}
+	} else {
 		legacyPlan, err := planKnownFiles(versionPath, []knownPruneName{
 			{name: "disk.raw", countAsImage: true},
 			{name: fmt.Sprintf("metal-%s.raw.xz", ArchitectureARM64)},
-		}, []knownPrunePrefix{
-			{prefix: ".disk.raw-"},
-			{prefix: fmt.Sprintf(".metal-%s.raw.xz-", ArchitectureARM64)},
-		})
+		}, legacyPrefixes)
 		if err != nil {
 			return nil, nil, 0, false, err
 		}
 		if len(legacyPlan) != 0 {
-			plan = append(plan, combinationPlan{combination: legacy, actions: legacyPlan})
+			if arm64PlanIndex >= 0 {
+				plan[arm64PlanIndex].actions = append(plan[arm64PlanIndex].actions, legacyPlan...)
+			} else {
+				plan = append(plan, combinationPlan{combination: legacy, actions: legacyPlan})
+			}
 		}
 	}
 	return plan, cleanupDirs, keptCount, touched || len(plan) > 0, nil
+}
+
+// legacyArtifactsPresent reports whether the pre-architecture flat layout
+// actually holds an image for this version, so a kept legacy combination is
+// only counted when there is something being kept.
+func legacyArtifactsPresent(versionPath string) (bool, error) {
+	for _, name := range []string{"disk.raw", fmt.Sprintf("metal-%s.raw.xz", ArchitectureARM64)} {
+		exists, err := pathExists(filepath.Join(versionPath, name))
+		if err != nil || exists {
+			return exists, err
+		}
+	}
+	return false, nil
 }
 
 func keepCombination(keep func(Combination) (bool, error), combination Combination) (bool, error) {

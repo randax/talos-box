@@ -102,7 +102,9 @@ func ParseProvisioningIntent(cni, csi string, lb, bgp, hubble *bool) (Provisioni
 		return ProvisioningIntent{}, fmt.Errorf("bgp requires lb: true")
 	}
 	if intent.BGP && intent.CNI != CNICilium {
-		return ProvisioningIntent{}, fmt.Errorf("bgp requires cni: cilium and lb: true")
+		// lb is already true here (checked above), so naming it would tell
+		// the user to set something they already have.
+		return ProvisioningIntent{}, fmt.Errorf("bgp requires cni: cilium")
 	}
 	if intent.Hubble && intent.CNI != CNICilium {
 		return ProvisioningIntent{}, fmt.Errorf("hubble requires cni: cilium")
