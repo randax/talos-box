@@ -730,6 +730,11 @@ func waitForDaemonLock(socketPath string, progress io.Writer) (daemon.Info, int,
 		if daemonLockFree(socketPath) {
 			return daemon.Info{}, 0, nil
 		}
+		// Unlike waitForDaemonExit, dialing here is safe from the socket-
+		// activation respawn hazard: the probe only runs while the flock is
+		// held, so a listener that answers is a daemon that already exists —
+		// and a current-protocol one is the restart's goal met, whoever
+		// spawned it.
 		if info, pid, err := daemonHandshakeProbe(socketPath); err == nil && info.ProtocolVersion == daemon.ProtocolVersion {
 			return info, pid, nil
 		}

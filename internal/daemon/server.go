@@ -420,6 +420,13 @@ func (s *Server) dispatchDestroy(request Request) Response {
 	if err := decodeArgs(request.Args, &args); err != nil {
 		return failure(err)
 	}
+	// The cluster's disk-mutation lock closes the gap between the drain and
+	// the destroy: a concurrent node mutation could otherwise register a fresh
+	// reconcile after the drain and have it write into the directory being
+	// removed.
+	lock := s.clusterMutationLock(args.Name)
+	lock.Lock()
+	defer lock.Unlock()
 	s.drainProvision(args.Name)
 	s.opMu.Lock()
 	defer s.opMu.Unlock()

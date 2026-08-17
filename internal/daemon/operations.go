@@ -600,10 +600,15 @@ func (s *Server) start(item cluster.Cluster) ([]string, error) {
 			// their disks, so their saved memory no longer matches what is on
 			// disk and must not survive for a later `cluster resume` to restore.
 			// The nodes that never launched keep theirs — nothing touched them.
+			// A discard that itself fails must reach the operator: the stale
+			// save resurrects the suspended status and the resume hint.
+			var discardErrs []error
 			for _, name := range started {
-				discardSavedState(dir, name)
+				if _, failure := discardSavedState(dir, name); failure != "" {
+					discardErrs = append(discardErrs, errors.New(failure))
+				}
 			}
-			return nil, errors.Join(fmt.Errorf("create VM %s: %w", node.Name, err), rollbackErr)
+			return nil, errors.Join(append([]error{fmt.Errorf("create VM %s: %w", node.Name, err), rollbackErr}, discardErrs...)...)
 		}
 		nodes[node.Name] = machine
 		started = append(started, node.Name)
