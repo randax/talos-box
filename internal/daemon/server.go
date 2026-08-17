@@ -492,7 +492,7 @@ func (s *Server) dispatchSnapshotRestore(request Request) Response {
 		return failure(err)
 	}
 	s.opMu.Lock()
-	snapshots, err := s.snapshotRestore(request.Args)
+	status, err := s.snapshotRestore(request.Args)
 	s.opMu.Unlock()
 	lock.Unlock()
 	if err != nil {
@@ -503,7 +503,10 @@ func (s *Server) dispatchSnapshotRestore(request Request) Response {
 		}
 		return failure(err)
 	}
-	return success(SnapshotRestoreStatus{Snapshots: snapshots, Warning: warning})
+	// the gate's data-loss note and the restart's host-subnet finding are both
+	// advisory and both belong to this one response
+	status.Warning = joinWarnings(warning, status.Warning)
+	return success(status)
 }
 
 func (s *Server) clusterMutationLock(clusterName string) *sync.Mutex {

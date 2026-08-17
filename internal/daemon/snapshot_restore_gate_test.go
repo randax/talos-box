@@ -63,9 +63,9 @@ func dispatchSnapshotRestoreRequest(t *testing.T, service *Server, clusterName, 
 	return service.dispatch(Request{Op: "snapshot.restore", Args: raw})
 }
 
-func decodeSnapshotRestoreStatus(t *testing.T, response Response) SnapshotRestoreStatus {
+func decodeSnapshotStatus(t *testing.T, response Response) SnapshotStatus {
 	t.Helper()
-	var status SnapshotRestoreStatus
+	var status SnapshotStatus
 	if err := json.Unmarshal(response.Data, &status); err != nil {
 		t.Fatalf("decode snapshot.restore status: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestSnapshotRestoreForceRestoresAndWarnsAboutVolumeData(t *testing.T) {
 	if !response.OK {
 		t.Fatalf("forced snapshot.restore failed: %s", response.Error)
 	}
-	status := decodeSnapshotRestoreStatus(t, response)
+	status := decodeSnapshotStatus(t, response)
 	for _, want := range []string{"demo-worker-2 (1 volume)", "longhorn"} {
 		if !strings.Contains(status.Warning, want) {
 			t.Fatalf("forced-restore warning %q does not mention %q", status.Warning, want)
@@ -278,7 +278,7 @@ func TestSnapshotRestoreProceedsWithWarningWhenVolumesAreUnverifiable(t *testing
 	if !response.OK {
 		t.Fatalf("snapshot.restore with unverifiable volumes failed: %s", response.Error)
 	}
-	status := decodeSnapshotRestoreStatus(t, response)
+	status := decodeSnapshotStatus(t, response)
 	if !strings.Contains(status.Warning, "demo-worker-2") || !strings.Contains(status.Warning, "could not verify") {
 		t.Fatalf("unverifiable-restore warning %q does not state the possible data loss", status.Warning)
 	}
@@ -298,7 +298,7 @@ func TestSnapshotRestoreSkipsVolumeObservationOnStoppedCluster(t *testing.T) {
 	if !response.OK {
 		t.Fatalf("snapshot.restore on stopped cluster failed: %s", response.Error)
 	}
-	status := decodeSnapshotRestoreStatus(t, response)
+	status := decodeSnapshotStatus(t, response)
 	if !strings.Contains(status.Warning, "could not verify") {
 		t.Fatalf("stopped-cluster restore warning %q does not state the possible data loss", status.Warning)
 	}
@@ -317,7 +317,7 @@ func TestSnapshotRestoreSkipsVolumeObservationWhenNoNodeDisappears(t *testing.T)
 	if !response.OK {
 		t.Fatalf("snapshot.restore of the same node set failed: %s", response.Error)
 	}
-	if status := decodeSnapshotRestoreStatus(t, response); status.Warning != "" {
+	if status := decodeSnapshotStatus(t, response); status.Warning != "" {
 		t.Fatalf("same-node-set restore warned %q, want no warning", status.Warning)
 	}
 }
@@ -339,7 +339,7 @@ func TestSnapshotRestoreSkipsVolumeObservationWithoutCSI(t *testing.T) {
 	if !response.OK {
 		t.Fatalf("snapshot.restore without csi failed: %s", response.Error)
 	}
-	if status := decodeSnapshotRestoreStatus(t, response); status.Warning != "" {
+	if status := decodeSnapshotStatus(t, response); status.Warning != "" {
 		t.Fatalf("snapshot.restore without csi warned %q, want no warning", status.Warning)
 	}
 }
@@ -386,7 +386,7 @@ func TestSnapshotRestoreForceWarnsAboutVerifiedAndUnverifiableNodesTogether(t *t
 	if !response.OK {
 		t.Fatalf("forced snapshot.restore failed: %s", response.Error)
 	}
-	status := decodeSnapshotRestoreStatus(t, response)
+	status := decodeSnapshotStatus(t, response)
 	if !strings.Contains(status.Warning, "demo-worker-2 (2 volumes)") {
 		t.Fatalf("forced-restore warning %q lost the verified count", status.Warning)
 	}

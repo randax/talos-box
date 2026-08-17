@@ -28,6 +28,7 @@ const (
 	nodeRemoveGateProtocolVersion           = 4
 	perClusterTalosProtocolVersion          = 5
 	snapshotRestoreGateProtocolVersion      = 6
+	snapshotCreateWarningProtocolVersion    = 7
 )
 
 func requiresProvisioningIntentHandshake(input cluster.ProvisioningIntentInput) bool {
@@ -78,6 +79,12 @@ func (c cli) ensureNodeRemoveSupport() error {
 // captured ungated, and answer with the pre-gate response shape.
 func (c cli) ensureSnapshotRestoreSupport() error {
 	return c.ensureProtocolAtLeast(snapshotRestoreGateProtocolVersion, "snapshot restore")
+}
+
+// ensureSnapshotCreateSupport refuses to send snapshot.create to a daemon that
+// answers with the bare snapshot list, dropping the restart's warning.
+func (c cli) ensureSnapshotCreateSupport() error {
+	return c.ensureProtocolAtLeast(snapshotCreateWarningProtocolVersion, "snapshot create")
 }
 
 // ensurePerClusterTalosSupport refuses to send an up request with per-cluster

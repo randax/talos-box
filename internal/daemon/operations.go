@@ -509,7 +509,11 @@ func (s *Server) longhornCustomSchematicWarning(item cluster.Cluster, custom boo
 }
 
 func (s *Server) start(item cluster.Cluster) (string, error) {
-	subnetWarning, err := cluster.CheckSubnetIndex(item.SubnetIndex, s.hostSubnetSources())
+	// The subnet was decided at create time and belongs to this cluster, so it
+	// is only inspected for advisory routing findings. Re-running the
+	// create-time collision guard would refuse the cluster's own bridge, which
+	// suspend leaves up and an unclean stop can strand (#271).
+	subnetWarning, err := cluster.AttachedSubnetWarning(item.SubnetIndex, s.hostSubnetSources())
 	if err != nil {
 		return "", err
 	}
@@ -541,12 +545,15 @@ func (s *Server) start(item cluster.Cluster) (string, error) {
 	return subnetWarning, nil
 }
 
-func (s *Server) startAndLogWarning(item cluster.Cluster) error {
+// startAndLogWarning starts the cluster on an operation's behalf, logging any
+// advisory finding and returning it so the operation can also carry it back to
+// the operator — the daemon log is not somewhere the CLI user looks.
+func (s *Server) startAndLogWarning(item cluster.Cluster) (string, error) {
 	warning, err := s.start(item)
 	if warning != "" {
 		log.Printf("start %s: %s", item.Name, warning)
 	}
-	return err
+	return warning, err
 }
 
 // hostSubnetSources merges injected sources with system defaults per field, so

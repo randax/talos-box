@@ -32,20 +32,29 @@ import (
 )
 
 type fakeClient struct {
-	applied   []string
-	configs   [][]byte
-	bootstrap int
-	kube      int
-	kubeData  []byte
-	kubeErrs  []error
-	bootErr   error
-	readyErrs []error
-	expected  [][]string
-	readyHook func()
+	applied        []string
+	configs        [][]byte
+	calls          []string
+	bootstrap      int
+	bootstrapNodes []string
+	kube           int
+	kubeNodes      []string
+	kubeData       []byte
+	kubeErrs       []error
+	bootErr        error
+	bootErrs       []error
+	readyErrs      []error
+	expected       [][]string
+	readyHook      func()
 
 	scheduling        []schedulingCall
 	schedulingChanged []bool
-	schedulingErrs    []error
+
+	endpoints       []endpointCall
+	endpointChanged []bool
+
+	// configErrs is one queue for the one composed reconcile call.
+	configErrs []error
 }
 
 type schedulingCall struct {
@@ -53,20 +62,32 @@ type schedulingCall struct {
 	workerless bool
 }
 
-func (f *fakeClient) ReconcileControlPlaneScheduling(_ context.Context, node string, workerless bool) (bool, error) {
-	f.scheduling = append(f.scheduling, schedulingCall{node: node, workerless: workerless})
-	var changed bool
-	if len(f.schedulingChanged) > 0 {
-		changed, f.schedulingChanged = f.schedulingChanged[0], f.schedulingChanged[1:]
+type endpointCall struct {
+	node     string
+	endpoint string
+}
+
+func (f *fakeClient) ReconcileMachineConfig(_ context.Context, node string, target ConfigTarget) (ConfigChanges, error) {
+	f.calls = append(f.calls, "config")
+	f.endpoints = append(f.endpoints, endpointCall{node: node, endpoint: target.Endpoint})
+	if target.ControlPlaneScheduling {
+		f.scheduling = append(f.scheduling, schedulingCall{node: node, workerless: target.Workerless})
 	}
-	if len(f.schedulingErrs) > 0 {
+	var changes ConfigChanges
+	if len(f.endpointChanged) > 0 {
+		changes.Endpoint, f.endpointChanged = f.endpointChanged[0], f.endpointChanged[1:]
+	}
+	if target.ControlPlaneScheduling && len(f.schedulingChanged) > 0 {
+		changes.Scheduling, f.schedulingChanged = f.schedulingChanged[0], f.schedulingChanged[1:]
+	}
+	if len(f.configErrs) > 0 {
 		var err error
-		err, f.schedulingErrs = f.schedulingErrs[0], f.schedulingErrs[1:]
+		err, f.configErrs = f.configErrs[0], f.configErrs[1:]
 		if err != nil {
-			return false, err
+			return ConfigChanges{}, err
 		}
 	}
-	return changed, nil
+	return changes, nil
 }
 
 type fakeLoadBalancer struct {
@@ -115,6 +136,7 @@ func TestCiliumMachineConfigRoutesRuntimeImagesThroughCatchAllMirror(t *testing.
 }
 
 func (f *fakeClient) Apply(_ context.Context, node string, config []byte) error {
+	f.calls = append(f.calls, "apply")
 	if !strings.Contains(string(config), "name: flannel") && !strings.Contains(string(config), "name: none") {
 		return fmt.Errorf("machine config did not select a curated CNI:\n%s", config)
 	}
@@ -123,8 +145,15 @@ func (f *fakeClient) Apply(_ context.Context, node string, config []byte) error 
 	return nil
 }
 
-func (f *fakeClient) Bootstrap(context.Context, string) error {
+func (f *fakeClient) Bootstrap(_ context.Context, node string) error {
+	f.calls = append(f.calls, "bootstrap")
 	f.bootstrap++
+	f.bootstrapNodes = append(f.bootstrapNodes, node)
+	if len(f.bootErrs) > 0 {
+		err := f.bootErrs[0]
+		f.bootErrs = f.bootErrs[1:]
+		return err
+	}
 	return f.bootErr
 }
 
@@ -151,8 +180,10 @@ func TestFlannelReconcileTreatsAlreadyBootstrappedAsSuccess(t *testing.T) {
 	}
 }
 
-func (f *fakeClient) Kubeconfig(context.Context, string) ([]byte, error) {
+func (f *fakeClient) Kubeconfig(_ context.Context, node string) ([]byte, error) {
+	f.calls = append(f.calls, "kubeconfig")
 	f.kube++
+	f.kubeNodes = append(f.kubeNodes, node)
 	if len(f.kubeErrs) > 0 {
 		err := f.kubeErrs[0]
 		f.kubeErrs = f.kubeErrs[1:]

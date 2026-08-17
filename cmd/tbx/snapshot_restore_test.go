@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -70,6 +71,40 @@ func TestSnapshotRestoreDefaultsToUnforcedAndStaysQuietWithoutWarning(t *testing
 	}
 	if got := command.err.(*bytes.Buffer).String(); got != "" {
 		t.Fatalf("stderr = %q, want no warning output", got)
+	}
+}
+
+// snapshot create restarts the cluster, so its response carries the same
+// advisory findings a start does, and the operator must see them.
+func TestSnapshotCreatePrintsTheDaemonWarning(t *testing.T) {
+	_, command := newDestroyTestCLI(t, []daemon.Response{
+		{OK: true, Data: json.RawMessage(fmt.Sprintf(`{"protocolVersion":%d}`, daemon.ProtocolVersion))},
+		{OK: true, Data: json.RawMessage(`{"snapshots":[{"name":"baseline"}],"warning":"subnet 172.30.0.0/24 conflicts with interface docker0 address 172.30.0.1/24"}`)},
+	})
+
+	if err := command.snapshotCreate([]string{"demo", "baseline", "--yes"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := command.out.(*bytes.Buffer).String(); !strings.Contains(got, "created snapshot baseline of demo") {
+		t.Fatalf("stdout = %q, want the create confirmation", got)
+	}
+	if got := command.err.(*bytes.Buffer).String(); !strings.Contains(got, "docker0") {
+		t.Fatalf("stderr = %q, want the daemon warning", got)
+	}
+}
+
+func TestSnapshotCreateRefusesOldDaemonProtocol(t *testing.T) {
+	_, command := newDestroyTestCLI(t, []daemon.Response{
+		{OK: true, Data: json.RawMessage(fmt.Sprintf(`{"protocolVersion":%d}`, snapshotCreateWarningProtocolVersion-1))},
+	})
+
+	err := command.snapshotCreate([]string{"demo", "baseline", "--yes"})
+	if err == nil {
+		t.Fatalf("snapshot create against a protocol-%d daemon succeeded, want handshake refusal", snapshotCreateWarningProtocolVersion-1)
+	}
+	if !strings.Contains(err.Error(), "restart or upgrade tbxd") {
+		t.Fatalf("handshake error = %q, want upgrade guidance", err)
 	}
 }
 
