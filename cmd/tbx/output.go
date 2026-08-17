@@ -21,8 +21,11 @@ func printClusters(output io.Writer, clusters []daemon.ClusterSummary) error {
 	}
 	for _, item := range clusters {
 		state := "stopped"
-		if item.Running {
+		switch {
+		case item.Running:
 			state = "running"
+		case item.Suspended:
+			state = "suspended"
 		}
 		if _, err := fmt.Fprintf(table, "%s\t%d\t%d\t%d MiB\t%d\t%d GiB\t%s\n",
 			item.Name, item.ControlPlanes, item.Workers, item.NodeDefaults.MemoryMiB,
@@ -31,6 +34,17 @@ func printClusters(output io.Writer, clusters []daemon.ClusterSummary) error {
 		}
 	}
 	return table.Flush()
+}
+
+// nodePhase renders a node's phase, promoting the stopped nodes of a suspended
+// cluster to "suspended": their memory is on disk waiting to be resumed, and
+// reading them as plain stopped is what led operators to start — the one verb
+// that throws that memory away (#272).
+func nodePhase(item daemon.ClusterStatus, node daemon.NodeStatus) string {
+	if item.Suspended && node.Phase == daemon.PhaseStopped {
+		return "suspended"
+	}
+	return string(node.Phase)
 }
 
 func printStatus(output io.Writer, clusters []daemon.ClusterStatus, quiet bool) error {
@@ -53,7 +67,7 @@ func printStatus(output io.Writer, clusters []daemon.ClusterStatus, quiet bool) 
 				ip = "-"
 			}
 			if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-				item.Name, item.Subnet, item.Domain, talos, node.Name, node.Role, node.MAC, ip, node.Phase); err != nil {
+				item.Name, item.Subnet, item.Domain, talos, node.Name, node.Role, node.MAC, ip, nodePhase(item, node)); err != nil {
 				return err
 			}
 		}

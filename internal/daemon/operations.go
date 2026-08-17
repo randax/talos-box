@@ -224,8 +224,12 @@ type ClusterStatus struct {
 	// from, as requested at create.
 	TalosExtensions []string `json:"talosExtensions,omitempty"`
 	cluster.ProvisioningIntent
-	BGP             bool         `json:"bgp"`
-	Running         bool         `json:"running"`
+	BGP     bool `json:"bgp"`
+	Running bool `json:"running"`
+	// Suspended reports saved VM memory on disk, the difference between a
+	// cluster that was stopped and one whose memory is waiting to be resumed —
+	// a distinction start would silently erase (#272).
+	Suspended       bool         `json:"suspended,omitempty"`
 	KubernetesReady bool         `json:"kubernetesReady"`
 	StoragePhase    StoragePhase `json:"storagePhase,omitempty"`
 	StorageError    string       `json:"storageError,omitempty"`
@@ -999,7 +1003,11 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 
 	result := make([]ClusterStatus, 0, len(items))
 	for _, item := range items {
-		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), TalosVersion: item.TalosVersion, Schematic: item.Schematic, BaseSchematic: item.BaseSchematic, TalosExtensions: item.TalosExtensions, ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: s.clusterRunning(item.Name), Capabilities: s.clusterCapabilities(item), subnetIndex: item.SubnetIndex}
+		running := s.clusterRunning(item.Name)
+		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), TalosVersion: item.TalosVersion, Schematic: item.Schematic, BaseSchematic: item.BaseSchematic, TalosExtensions: item.TalosExtensions, ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: running,
+			// derived from disk, not from daemon memory, so a restarted
+			// daemon still reports its predecessor's suspension
+			Suspended: !running && clusterHasSavedState(item.Name), Capabilities: s.clusterCapabilities(item), subnetIndex: item.SubnetIndex}
 		for _, node := range item.Nodes {
 			running := s.nodeRunning(item.Name, node.Name)
 			clusterStatus.Nodes = append(clusterStatus.Nodes, NodeStatus{Name: node.Name, Role: node.Role, MAC: node.MAC, Phase: ClassifyPhase(running, ProbeResult{}), StartedAt: s.vmStartedAt(item.Name, node.Name)})
