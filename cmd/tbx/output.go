@@ -68,11 +68,9 @@ func printStatus(output io.Writer, clusters []daemon.ClusterStatus, quiet bool) 
 			}
 		}
 	}
-	if quiet {
-		return nil
-	}
-	// Every cluster carries a schematic (the daemon default when nothing was
-	// pinned), so the full 64-hex ids stay out of quiet output.
+	// The schematic, what it was composed from, and the extensions that went
+	// into it are facts about the cluster, not suggestions: --quiet drops hints
+	// only, so these survive it (#307).
 	for _, item := range clusters {
 		if item.Schematic != "" {
 			if _, err := fmt.Fprintf(output, "cluster %s: schematic %s\n", item.Name, item.Schematic); err != nil {
@@ -93,6 +91,9 @@ func printStatus(output io.Writer, clusters []daemon.ClusterStatus, quiet bool) 
 				return err
 			}
 		}
+	}
+	if quiet {
+		return nil
 	}
 	printed := false
 	for _, item := range clusters {
@@ -118,8 +119,15 @@ func encodeJSON(output io.Writer, value any) error {
 	return encoder.Encode(value)
 }
 
+// cacheImageLine names a cached combination with both sizes: a disk.raw is
+// sparse, so the apparent size alone overstates what the cache costs. An older
+// daemon reports no allocated size, which prints as the pre-allocated line.
 func cacheImageLine(entry daemon.CacheImageEntry) string {
-	return fmt.Sprintf("%s %s %s %d bytes", entry.Schematic, entry.Version, entry.Architecture, entry.Size)
+	line := fmt.Sprintf("%s %s %s %d bytes", entry.Schematic, entry.Version, entry.Architecture, entry.Size)
+	if entry.AllocatedSize > 0 {
+		line += fmt.Sprintf(" (%d bytes on disk)", entry.AllocatedSize)
+	}
+	return line
 }
 
 // cacheImageStatusSuffix names why a combination is kept. An older daemon

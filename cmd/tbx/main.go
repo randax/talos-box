@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/config"
@@ -22,10 +24,12 @@ type cli struct {
 	out io.Writer
 	err io.Writer
 	in  io.Reader
+	// daemon carries the connect-time protocol gate; a nil session skips it
+	daemon *daemonSession
 }
 
 func main() {
-	command := cli{out: os.Stdout, err: os.Stderr, in: os.Stdin}
+	command := cli{out: os.Stdout, err: os.Stderr, in: os.Stdin, daemon: newDaemonSession()}
 	if err := command.run(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "tbx: %v\n", err)
 		os.Exit(1)
@@ -36,6 +40,12 @@ func (c cli) run(args []string) error {
 	if len(args) == 0 {
 		c.printHelp(c.out)
 		return nil
+	}
+	// A multi-verb command's own `--help` is answered here, before dispatch:
+	// each group parses its verb by hand, so the flag would otherwise land as
+	// an unknown verb.
+	if handled, err := c.printGroupUsage(args[0], args[1:]); handled {
+		return err
 	}
 	switch args[0] {
 	case "cluster":
@@ -75,9 +85,37 @@ func (c cli) run(args []string) error {
 	}
 }
 
+// groupUsages is the usage line every multi-verb command prints for both its
+// bare and its `--help` form. Every group reads its line from here — no verb
+// list is spelled out twice — so the two forms cannot drift apart.
+var groupUsages = map[string]string{
+	"cluster":  "usage: tbx cluster create|start|stop|suspend|resume|destroy|list",
+	"node":     "usage: tbx node add|remove <cluster> [node]",
+	"snapshot": "usage: tbx snapshot create|restore|list|delete",
+	"cache":    "usage: tbx cache pull|prune|warm|list",
+	"system":   "usage: tbx system install|uninstall|restart [--force]|status",
+	"mirror":   "usage: tbx mirror offline [on|off]",
+	"bgp":      "usage: tbx bgp enable|disable <cluster>",
+}
+
+// printGroupUsage answers `tbx <group> --help` with the group's usage. It is
+// deliberately narrow: only the help flag alone, so a verb still dispatches and
+// carries its own flag parsing, including its own --help.
+func (c cli) printGroupUsage(command string, args []string) (bool, error) {
+	if len(args) != 1 || (args[0] != "-h" && args[0] != "--help") {
+		return false, nil
+	}
+	usage, ok := groupUsages[command]
+	if !ok {
+		return false, nil
+	}
+	_, err := fmt.Fprintln(c.out, usage)
+	return true, err
+}
+
 func (c cli) runCluster(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tbx cluster create|start|stop|suspend|resume|destroy|list")
+		return errors.New(groupUsages["cluster"])
 	}
 	switch args[0] {
 	case "create":
@@ -95,7 +133,7 @@ func (c cli) runCluster(args []string) error {
 		if _, err := fmt.Fprintf(c.out, "%s cluster %s\n", pastTense(args[0]), result.Name); err != nil {
 			return err
 		}
-		return printWarning(c.err, result.Warning)
+		return printWarnings(c.err, result.Warnings, result.Warning)
 	case "destroy":
 		return c.destroyCluster(args[1:])
 	case "list":
@@ -145,6 +183,59 @@ func parseClusterStartOptions(args []string, output io.Writer) (string, bool, bo
 	return positionals[0], *force, *quiet, nil
 }
 
+// storedClustersQuery reports what the daemon has on disk. It is a var so
+// tests can answer without a daemon.
+var storedClustersQuery = storedClusters
+
+// storedClusters asks the running daemon for the stored clusters. The exchange
+// is deadlined: cluster.list is served under the daemon's operation lock, and
+// this is only a courtesy lookup ahead of the real call.
+func storedClusters() ([]daemon.ClusterSummary, error) {
+	socketPath, err := daemon.SocketPath()
+	if err != nil {
+		return nil, err
+	}
+	response, err := exchangeWithin(socketPath, "cluster.list", struct{}{}, daemonHandshakeTimeout)
+	if err != nil {
+		return nil, err
+	}
+	if !response.OK {
+		if response.Error == "" {
+			return nil, errors.New("cluster.list failed")
+		}
+		return nil, errors.New(response.Error)
+	}
+	var clusters []daemon.ClusterSummary
+	if len(response.Data) > 0 {
+		if err := json.Unmarshal(response.Data, &clusters); err != nil {
+			return nil, err
+		}
+	}
+	return clusters, nil
+}
+
+// startProvisionDeadline reports the budget the daemon will hold this start to:
+// a declared storage engine buys the larger one, exactly as the daemon's own
+// provisionTimeout decides it. The CLI cannot read the stored cluster directly,
+// so it asks the daemon what it has.
+//
+// Any failure — no daemon yet, a busy one, an unknown cluster — falls back to
+// the storage bound. Overstating the budget only makes the heartbeat
+// pessimistic; understating it would advertise a deadline the daemon does not
+// honor, which is the drift the heartbeat exists to avoid (#307).
+func startProvisionDeadline(name string) time.Duration {
+	clusters, err := storedClustersQuery()
+	if err != nil {
+		return storageProvisionDeadline
+	}
+	for _, item := range clusters {
+		if strings.EqualFold(item.Name, name) {
+			return provisionDeadline(item.CSI != "")
+		}
+	}
+	return storageProvisionDeadline
+}
+
 func (c cli) startCluster(args []string) error {
 	name, force, quiet, err := parseClusterStartOptions(args, c.err)
 	if err != nil {
@@ -155,13 +246,17 @@ func (c cli) startCluster(args []string) error {
 		Force bool   `json:"force"`
 	}{Name: name, Force: force}
 	var result daemon.ClusterSummary
-	if err := c.call("cluster.start", request, &result); err != nil {
+	// A start reconciles the cluster's declared CNI/CSI on the same blocking
+	// call as create, so the stated bound must be the one the daemon budgets
+	// this request at (#307).
+	signal := liveness{verb: "starting " + name, deadline: startProvisionDeadline(name), quiet: quiet}
+	if err := c.callWithLiveness(signal, "cluster.start", request, &result); err != nil {
 		return err
 	}
 	if _, err := fmt.Fprintf(c.out, "started cluster %s\n", result.Name); err != nil {
 		return err
 	}
-	if err := printWarning(c.err, result.Warning); err != nil {
+	if err := printWarnings(c.err, result.Warnings, result.Warning); err != nil {
 		return err
 	}
 	if quiet {
@@ -271,14 +366,19 @@ func (c cli) createCluster(args []string) error {
 		Extensions: requestedExtensions,
 	}
 	var result daemon.ClusterSummary
-	if err := c.call("cluster.create", request, &result); err != nil {
+	signal := liveness{
+		verb:     "provisioning " + positionals[0],
+		deadline: provisionDeadline(*csi != ""),
+		quiet:    *quiet,
+	}
+	if err := c.callWithLiveness(signal, "cluster.create", request, &result); err != nil {
 		return err
 	}
 	if _, err := fmt.Fprintf(c.out, "created and started cluster %s (%d control plane, %d workers)\n",
 		result.Name, result.ControlPlanes, result.Workers); err != nil {
 		return err
 	}
-	if err := printWarning(c.err, result.Warning); err != nil {
+	if err := printWarnings(c.err, result.Warnings, result.Warning); err != nil {
 		return err
 	}
 	if !*quiet {
@@ -344,7 +444,7 @@ func (c cli) inspectDestroy(name string, request struct {
 
 func (c cli) runNode(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tbx node add|remove <cluster> [node]")
+		return errors.New(groupUsages["node"])
 	}
 	switch args[0] {
 	case "add":
@@ -371,7 +471,7 @@ func (c cli) runNode(args []string) error {
 		if _, err := fmt.Fprintf(c.out, "added node %s to cluster %s\n", result.Name, positionals[0]); err != nil {
 			return err
 		}
-		return printWarning(c.err, result.Warning)
+		return printWarnings(c.err, result.Warnings, result.Warning)
 	case "remove":
 		flags := flag.NewFlagSet("node remove", flag.ContinueOnError)
 		flags.SetOutput(c.err)
@@ -394,7 +494,7 @@ func (c cli) runNode(args []string) error {
 		if _, err := fmt.Fprintf(c.out, "removed node %s from cluster %s\n", positionals[1], positionals[0]); err != nil {
 			return err
 		}
-		return printWarning(c.err, result.Warning)
+		return printWarnings(c.err, result.Warnings, result.Warning)
 	default:
 		return fmt.Errorf("unknown node command %q", args[0])
 	}
@@ -436,7 +536,7 @@ func (c cli) runStatus(args []string) error {
 
 func (c cli) runCache(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tbx cache pull|prune|warm|list")
+		return errors.New(groupUsages["cache"])
 	}
 	switch args[0] {
 	case "pull":
@@ -450,7 +550,12 @@ func (c cli) runCache(args []string) error {
 		if err != nil {
 			return err
 		}
-		if len(positionals) != 0 || (*pruneMirror && *pruneAll) {
+		// The scopes are alternatives, not a widening pair: naming both is a
+		// conflict the user must resolve, not a usage typo.
+		if *pruneMirror && *pruneAll {
+			return errors.New("--mirror and --all are mutually exclusive: --mirror prunes the mirror cache only, --all prunes disk and mirror")
+		}
+		if len(positionals) != 0 {
 			return errors.New("usage: tbx cache prune [--mirror|--all]")
 		}
 		scope := daemon.CachePruneScopeImages
@@ -545,7 +650,7 @@ Commands:
   bgp enable|disable <cluster>
   mirror offline [on|off]
   cache pull|prune|warm|list
-  system install|uninstall
+  system install|uninstall|restart [--force]|status
   doctor
   version (also --version, -v)
 `
@@ -558,6 +663,22 @@ func printWarning(w io.Writer, warning string) error {
 	}
 	_, err := fmt.Fprintf(w, "warning: %s\n", warning)
 	return err
+}
+
+// printWarnings renders one warning per line. Unrelated findings used to be
+// fused onto a single semicolon-joined line (#291); joined is the legacy
+// single-string field, used only when talking to a daemon that predates the
+// per-warning list.
+func printWarnings(w io.Writer, warnings []string, joined string) error {
+	if len(warnings) == 0 {
+		return printWarning(w, joined)
+	}
+	for _, warning := range warnings {
+		if err := printWarning(w, warning); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func pastTense(command string) string {

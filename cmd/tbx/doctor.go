@@ -117,13 +117,21 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		if err := writeFindings(doctorFinding{level: "SKIP", check: "host-pressure", detail: err.Error()}); err != nil {
 			return err
 		}
-	} else if warnings := hostpressure.Warnings(snapshot); len(warnings) == 0 {
+	} else if findings := hostpressure.Assess(snapshot); len(findings) == 0 {
 		if err := writeFindings(doctorFinding{level: "PASS", check: "host-pressure"}); err != nil {
 			return err
 		}
 	} else {
-		for _, warning := range warnings {
-			if err := writeFindings(doctorFinding{level: "WARN", check: "host-pressure", detail: warning}); err != nil {
+		// Same classification the daemon's start gate uses: a blocking finding
+		// is what makes cluster create refuse, so it fails here too.
+		for _, finding := range findings {
+			level := "WARN"
+			if finding.Severity == hostpressure.SeverityBlock {
+				level = "FAIL"
+			}
+			if err := writeFindings(doctorFinding{
+				level: level, check: "host-pressure", detail: finding.DoctorDetail(),
+			}); err != nil {
 				return err
 			}
 		}

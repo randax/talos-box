@@ -3,7 +3,10 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/config"
@@ -11,6 +14,99 @@ import (
 )
 
 const defaultConfigFile = "talosbox.yaml"
+
+// Provisioning budgets are the daemon's own exported constants, so the stated
+// deadline can never drift from what the request is actually held to.
+const (
+	cniProvisionDeadline     = daemon.CNIProvisionTimeout
+	storageProvisionDeadline = daemon.StorageProvisionTimeout
+)
+
+// livenessInterval is how often a blocking lifecycle call reports it is still
+// alive. Tests shorten it.
+var livenessInterval = time.Minute
+
+// liveness keeps a blocking daemon call distinguishable from a hang. up,
+// cluster create and cluster start all send one request that the daemon answers
+// only after provisioning converges — up to the deadline below — so without a
+// heartbeat the terminal shows nothing at all for the whole pass (#307).
+// Everything it writes goes to stderr: stdout stays the scriptable result.
+type liveness struct {
+	// verb reads as "provisioning demo" in both the preamble and the beat.
+	verb     string
+	deadline time.Duration
+	quiet    bool
+}
+
+// beat starts the heartbeat and returns the function that stops and joins it.
+// The caller must not write to the same stream until it returns.
+func (l liveness) beat(output io.Writer) func() {
+	if l.quiet {
+		// --quiet drops narration, not the fact that this will take a while.
+		_, _ = fmt.Fprintf(output, "%s; up to %s; progress suppressed by --quiet\n", l.verb, formatLivenessDuration(l.deadline))
+	}
+	started := time.Now()
+	ticker := time.NewTicker(livenessInterval)
+	stop := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				_, _ = fmt.Fprintf(output, "still %s (elapsed %s, deadline %s)\n",
+					l.verb, formatLivenessDuration(time.Since(started)), formatLivenessDuration(l.deadline))
+			}
+		}
+	}()
+	return func() {
+		ticker.Stop()
+		close(stop)
+		<-stopped
+	}
+}
+
+// callWithLiveness runs one blocking lifecycle call under a heartbeat. The
+// protocol handshake is settled first — retried, and recorded even when it is
+// skipped — so call() cannot re-handshake mid-call and the heartbeat goroutine
+// is the only writer to stderr while the call is in flight.
+func (c cli) callWithLiveness(signal liveness, op string, args, destination any) error {
+	if err := c.resolveDaemonProtocol(true); err != nil {
+		return err
+	}
+	stop := signal.beat(c.err)
+	defer stop()
+	return c.call(op, args, destination)
+}
+
+// formatLivenessDuration renders a budget the way the runbook states it: whole
+// seconds under a minute, whole minutes above it, hours once it reads better.
+func formatLivenessDuration(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Round(time.Second).Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Truncate(time.Minute).Minutes()))
+	default:
+		hours := int(d.Truncate(time.Minute).Hours())
+		minutes := int(d.Truncate(time.Minute).Minutes()) - hours*60
+		if minutes == 0 {
+			return fmt.Sprintf("%dh", hours)
+		}
+		return fmt.Sprintf("%dh%dm", hours, minutes)
+	}
+}
+
+// provisionDeadline reports the budget the daemon will hold this request to: a
+// declared storage engine buys the larger one.
+func provisionDeadline(storage bool) time.Duration {
+	if storage {
+		return storageProvisionDeadline
+	}
+	return cniProvisionDeadline
+}
 
 func (c cli) runUp(args []string) error {
 	cfg, force, quiet, err := loadUpConfigFile(args)
@@ -32,7 +128,12 @@ func (c cli) runUp(args []string) error {
 		config.Config
 		Force bool `json:"force"`
 	}{Config: cfg, Force: force}
-	if err := c.call("up", request, &actions); err != nil {
+	signal := liveness{
+		verb:     "provisioning " + upSubject(cfg),
+		deadline: provisionDeadline(declaresStorage(cfg)),
+		quiet:    quiet,
+	}
+	if err := c.callWithLiveness(signal, "up", request, &actions); err != nil {
 		return err
 	}
 	return c.printActions(actions, map[daemon.ActionKind]string{
@@ -41,6 +142,30 @@ func (c cli) runUp(args []string) error {
 		daemon.ActionReconcile: "reconciled %s",
 		daemon.ActionNone:      "%s is up to date",
 	}, quiet)
+}
+
+// upSubject names what the up request is about to work on, so the heartbeat
+// says which clusters are still in flight.
+func upSubject(cfg config.Config) string {
+	names := make([]string, 0, len(cfg.Clusters))
+	for _, spec := range cfg.Clusters {
+		names = append(names, spec.Name)
+	}
+	if len(names) == 0 {
+		return "the declared clusters"
+	}
+	return strings.Join(names, ", ")
+}
+
+// declaresStorage reports whether any cluster in the file brings a CSI, which
+// is what widens the daemon's provisioning budget.
+func declaresStorage(cfg config.Config) bool {
+	for _, spec := range cfg.Clusters {
+		if spec.Input().CSI != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func strongestProvisioningIntent(cfg config.Config) (cluster.ProvisioningIntentInput, bool) {
@@ -103,7 +228,7 @@ func (c cli) printActions(actions []daemon.Action, wording map[daemon.ActionKind
 		if _, err := fmt.Fprintf(c.out, format+"\n", action.Cluster); err != nil {
 			return err
 		}
-		if err := printWarning(c.err, action.Warning); err != nil {
+		if err := printWarnings(c.err, action.Warnings, action.Warning); err != nil {
 			return err
 		}
 		if suppressNarration {

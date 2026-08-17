@@ -1,15 +1,47 @@
 package balloon
 
-import "testing"
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
 
 // recordingVM captures SetMemoryTargetMiB calls.
 type recordingVM struct {
 	configured int
 	target     int
+	err        error
 }
 
-func (r *recordingVM) ConfiguredMiB() int             { return r.configured }
-func (r *recordingVM) SetMemoryTargetMiB(m int) error { r.target = m; return nil }
+func (r *recordingVM) ConfiguredMiB() int { return r.configured }
+func (r *recordingVM) SetMemoryTargetMiB(m int) error {
+	if r.err != nil {
+		return r.err
+	}
+	r.target = m
+	return nil
+}
+
+// recordingLog collects the manager's telemetry lines.
+type recordingLog struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *recordingLog) Printf(format string, v ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, fmt.Sprintf(format, v...))
+}
+
+func (l *recordingLog) snapshot() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.lines...)
+}
 
 func TestReconcileInflatesUnderPressure(t *testing.T) {
 	vms := map[string]Balloonable{
@@ -43,5 +75,93 @@ func TestReconcileRespectsFloor(t *testing.T) {
 	Reconcile(vms, 0, 100000, 1024)
 	if v.target != 1024 {
 		t.Errorf("target = %d, want floor 1024", v.target)
+	}
+}
+
+func TestManagerLogsOnTargetChangeAndStaysQuietWhenSteady(t *testing.T) {
+	rec := &recordingLog{}
+	m := NewManager(rec.Printf)
+	v := &recordingVM{configured: 4096}
+	vms := map[string]Balloonable{"a": v}
+
+	m.Reconcile(vms, 4096, 6144, 1024) // deficit 2048 -> target 2048
+	first := rec.snapshot()
+	if len(first) != 1 {
+		t.Fatalf("first reconcile logged %d lines, want 1: %v", len(first), first)
+	}
+	for _, want := range []string{"balloon a:", "target=2048MiB", "configured=4096", "hostFree=4096", "reserve=6144", "deficit=2048"} {
+		if !strings.Contains(first[0], want) {
+			t.Errorf("log line %q missing %q", first[0], want)
+		}
+	}
+
+	// Steady state: identical readings must not log again.
+	m.Reconcile(vms, 4096, 6144, 1024)
+	m.Reconcile(vms, 4096, 6144, 1024)
+	if got := rec.snapshot(); len(got) != 1 {
+		t.Fatalf("steady state logged %d lines, want 1: %v", len(got), got)
+	}
+
+	// Pressure releases: target moves back to configured -> one more line.
+	m.Reconcile(vms, 8000, 6144, 1024)
+	got := rec.snapshot()
+	if len(got) != 2 {
+		t.Fatalf("deflate logged %d lines total, want 2: %v", len(got), got)
+	}
+	if !strings.Contains(got[1], "target=4096MiB") || !strings.Contains(got[1], "deficit=0") {
+		t.Errorf("deflate line = %q, want target=4096MiB deficit=0", got[1])
+	}
+}
+
+func TestManagerLogsErrorAndRelogsAfterRecovery(t *testing.T) {
+	rec := &recordingLog{}
+	m := NewManager(rec.Printf)
+	v := &recordingVM{configured: 4096, err: errors.New("device not active")}
+	vms := map[string]Balloonable{"a": v}
+
+	m.Reconcile(vms, 4096, 6144, 1024)
+	got := rec.snapshot()
+	if len(got) != 1 || !strings.Contains(got[0], "device not active") {
+		t.Fatalf("error reconcile lines = %v, want one error line", got)
+	}
+
+	// Once the node accepts targets again the same target must be re-logged,
+	// so the log shows the recovery rather than staying silent.
+	v.err = nil
+	m.Reconcile(vms, 4096, 6144, 1024)
+	got = rec.snapshot()
+	if len(got) != 2 || !strings.Contains(got[1], "target=2048MiB") {
+		t.Fatalf("recovery lines = %v, want a target line after the error", got)
+	}
+}
+
+func TestManagerRelogsWhenNodeReturns(t *testing.T) {
+	rec := &recordingLog{}
+	m := NewManager(rec.Printf)
+	v := &recordingVM{configured: 4096}
+	vms := map[string]Balloonable{"a": v}
+
+	m.Reconcile(vms, 4096, 6144, 1024)
+	m.Reconcile(map[string]Balloonable{}, 4096, 6144, 1024) // node stops
+	m.Reconcile(vms, 4096, 6144, 1024)                      // node comes back
+	if got := rec.snapshot(); len(got) != 2 {
+		t.Fatalf("lines = %v, want 2 (initial + re-appearance)", got)
+	}
+}
+
+func TestRunLogsStartupLine(t *testing.T) {
+	rec := &recordingLog{}
+	stop := make(chan struct{})
+	close(stop)
+	RunWithLogger(Config{ReserveMiB: 6144, FloorMiB: 1024, PollInterval: time.Hour},
+		func() map[string]Balloonable { return nil }, stop, rec.Printf)
+	got := rec.snapshot()
+	if len(got) != 1 || !strings.Contains(got[0], "balloon: manager started") {
+		t.Fatalf("startup lines = %v, want one manager-started line", got)
+	}
+	for _, want := range []string{"reserve=6144MiB", "floor=1024MiB", "poll=1h0m0s"} {
+		if !strings.Contains(got[0], want) {
+			t.Errorf("startup line %q missing %q", got[0], want)
+		}
 	}
 }

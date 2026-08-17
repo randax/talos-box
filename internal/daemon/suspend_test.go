@@ -286,3 +286,36 @@ func TestSuspendClusterFastFailsWithCapabilityReason(t *testing.T) {
 		t.Fatalf("suspendCluster() touched machine despite unsupported capability: %v", machine.calls)
 	}
 }
+
+// TestSummaryReportsSuspensionFromSavedStateOnDisk pins the signal a restarted
+// daemon can still see: tracked VMs are gone after a restart, so only the saved
+// memory on disk tells a client the cluster is suspended rather than stopped.
+func TestSummaryReportsSuspensionFromSavedStateOnDisk(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("suspended-signal", 0, 1, 0, cluster.NodeDefaults{MemoryMiB: 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+
+	if summary(item, false).Suspended {
+		t.Fatal("a stopped cluster without saved state must not report suspended")
+	}
+
+	dir, err := cluster.Dir(item.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(saveStatePath(dir, item.Nodes[0].Name), []byte("state"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if !summary(item, false).Suspended {
+		t.Fatal("saved state on disk must report the cluster as suspended")
+	}
+	if summary(item, true).Suspended {
+		t.Fatal("a running cluster is never suspended")
+	}
+}

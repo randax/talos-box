@@ -12,11 +12,16 @@ import (
 )
 
 const (
-	cniProvisionTimeout = 10 * time.Minute
+	// CNIProvisionTimeout and StorageProvisionTimeout are exported so the CLI
+	// states the same deadline in its liveness output that the daemon holds
+	// the request to — a mirrored constant would silently drift.
+	CNIProvisionTimeout = 10 * time.Minute
 	// A declared storage engine adds its image pulls (Longhorn alone is
 	// gigabytes across every node) and the write/readback probe to the same
 	// provisioning pass, so it gets a larger budget.
-	storageProvisionTimeout = 25 * time.Minute
+	StorageProvisionTimeout = 25 * time.Minute
+	cniProvisionTimeout     = CNIProvisionTimeout
+	storageProvisionTimeout = StorageProvisionTimeout
 	kubernetesReadyTimeout  = 5 * time.Second
 	// The scheduling posture is one small Nodes read, on the same budget as the
 	// readiness probe it accompanies.

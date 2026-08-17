@@ -29,8 +29,9 @@ bin/tbx doctor
 `make build` produces three binaries in `bin/`: the `tbx` CLI, the `tbxd` daemon
 (started automatically by `tbx` on first use — keep it next to `tbx`), and `tbx-helper`
 (the privileged networking helper). `system install` registers `tbx-helper` as a root launchd
-daemon and installs the `/etc/resolver/k8s.test` resolver. `doctor` verifies the helper, vmnet,
-DNS wiring, forwarding, routes, host pressure, and external image access.
+daemon and installs the `/etc/resolver/k8s.test` resolver. `doctor` verifies the helper, resolver,
+DNS wiring, forwarding, routes, host pressure, mirror health, and external image access
+(the full check table is in `docs/macos.md` and `docs/linux.md`).
 
 #### Linux
 
@@ -97,7 +98,8 @@ tbx manifests demo         # exact machine patch, chart values/objects, and LB/B
 storage provisioning from probe-verified live storage, while
 printing credential exports and the flannel NetworkPolicy limitation. Hints never execute
 anything; suppress them with `--quiet`. `tbx up --quiet` and `tbx cluster create --quiet` keep
-their final result but suppress stage narration. `tbx manifests` is the exact inspection/fork
+their final result and facts, suppress stage narration, state the operation's deadline up
+front, and emit a once-a-minute liveness line on stderr so a long provision never looks hung. `tbx manifests` is the exact inspection/fork
 surface for the curated path: `machine`, `values`, `objects`, and `extras` match the machine
 prerequisite patch, pinned Helm values, rendered chart objects, and LB/BGP resources `tbx`
 applies. The substrate sections — `machine`, `mirrors`, `images`, and the `storage` streams —

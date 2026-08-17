@@ -40,8 +40,22 @@ type Server struct {
 	mutationMu    sync.Mutex
 	mutationLocks map[string]*sync.Mutex
 
-	opMu                  sync.Mutex
-	vms                   map[string]map[string]hypervisor.Machine
+	opMu sync.Mutex
+	vms  map[string]map[string]hypervisor.Machine
+	// vmStarts records when each node's VM was launched, so a node that never
+	// answers can be aged against the boot window it was promised (#288).
+	vmStarts map[string]map[string]time.Time
+	// reachability records when a node that had been answering went quiet, so
+	// a stall is aged from that transition rather than from VM uptime (#288).
+	reachability reachabilityLog
+	stalls       stallLog
+	// stallWatch* drive the daemon-side stall observation: without it a stall
+	// that nobody polls status for never reaches tbxd.log (#288).
+	stallScanInterval time.Duration
+	stallWatchMu      sync.Mutex
+	stallWatchStop    chan struct{}
+	stallWatchDone    chan struct{}
+
 	provisions            map[string]activeProvision
 	storagePhases         map[string]StoragePhase
 	storageStatusProbes   map[string]activeStorageProbe
@@ -250,6 +264,8 @@ func (s *Server) Serve(listener net.Listener) error {
 		_ = listener.Close()
 		return nil
 	}
+	// stalls must reach tbxd.log whether or not anybody polls status (#288)
+	s.startStallWatch()
 
 	for {
 		connection, err := listener.Accept()
@@ -293,6 +309,9 @@ func (s *Server) Shutdown() error {
 		connections = append(connections, connection)
 	}
 	s.listenerMu.Unlock()
+	// stop the stall watch before anything is torn down: it takes opMu and
+	// reads the VM map this shutdown is about to empty
+	s.stopStallWatch()
 	if listener != nil {
 		_ = listener.Close()
 	}
@@ -315,6 +334,7 @@ func (s *Server) Shutdown() error {
 	}
 	err := closeVMs(all)
 	s.vms = make(map[string]map[string]hypervisor.Machine)
+	s.forgetAllNodeTracking()
 	if s.mirrors != nil {
 		s.mirrors.Close()
 	}
@@ -458,7 +478,7 @@ func (s *Server) dispatchNodeMutation(request Request) Response {
 	}
 	if removalWarning != "" {
 		if status, ok := data.(NodeStatus); ok {
-			status.Warning = joinWarnings(status.Warning, removalWarning)
+			status.addWarnings(removalWarning)
 			data = status
 		}
 	}
@@ -505,7 +525,7 @@ func (s *Server) dispatchSnapshotRestore(request Request) Response {
 	}
 	// the gate's data-loss note and the restart's host-subnet finding are both
 	// advisory and both belong to this one response
-	status.Warning = joinWarnings(warning, status.Warning)
+	status.prependWarning(warning)
 	return success(status)
 }
 

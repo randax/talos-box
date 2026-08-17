@@ -112,23 +112,36 @@ func (s *Server) checkOvercommit(addMiB int, force bool) (string, error) {
 	return msg + " (forced — ballooning will reclaim under pressure)", nil
 }
 
-func (s *Server) checkHostPressure(path string, force bool) (string, error) {
+func (s *Server) checkHostPressure(path string, force bool) ([]string, error) {
 	measure := s.hostPressure
 	if measure == nil {
 		measure = hostpressure.SystemSnapshot
 	}
 	snapshot, err := measure(path)
 	if err != nil {
-		return fmt.Sprintf("host-pressure probe failed: %v; proceeding without host-pressure protection", err), nil
+		return []string{fmt.Sprintf("host-pressure probe failed: %v; proceeding without host-pressure protection", err)}, nil
 	}
-	warning := strings.Join(hostpressure.Warnings(snapshot), "; ")
-	if warning == "" {
-		return "", nil
+	// hostpressure.Assess is the shared classification: tbx doctor reports the
+	// same blocking findings as FAIL, so the gate and the diagnostic agree.
+	// Findings stay one warning each so the CLI renders them one per line.
+	var blocking, advisory []string
+	for _, finding := range hostpressure.Assess(snapshot) {
+		if finding.Severity == hostpressure.SeverityBlock {
+			blocking = append(blocking, finding.String())
+			continue
+		}
+		advisory = append(advisory, finding.String())
+	}
+	if len(blocking) == 0 {
+		return advisory, nil
 	}
 	if !force {
-		return "", fmt.Errorf("%s (use --force to override)", warning)
+		return nil, fmt.Errorf("%s (use --force to override)", strings.Join(blocking, "; "))
 	}
-	return warning + " (forced)", nil
+	for i := range blocking {
+		blocking[i] += " (forced)"
+	}
+	return append(blocking, advisory...), nil
 }
 
 func (s *Server) checkLonghornMemoryWarning(item cluster.Cluster) string {

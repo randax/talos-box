@@ -1,0 +1,139 @@
+package daemon
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/hypervisor"
+)
+
+// TestResumeColdBootWarningCarriesTheHypervisorCause pins #291: the daemon
+// already logs why the restore failed, so the CLI-facing warning must say it
+// too instead of leaving the operator with an unexplained cold boot.
+func TestResumeColdBootWarningCarriesTheHypervisorCause(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("fake-cause", 0, 1, 0, cluster.NodeDefaults{CPUs: 1, MemoryMiB: 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := cluster.Dir(item.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	savePath := filepath.Join(dir, item.Nodes[0].Name+".vzstate")
+	if err := os.WriteFile(savePath, []byte("saved"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cause := fmt.Errorf("%w: Error Domain=VZErrorDomain Code=12", hypervisor.ErrIncompatibleSave)
+	backend := &fakeHypervisor{launch: func(_ context.Context, spec hypervisor.Spec) (hypervisor.Machine, error) {
+		spec.Restore.Fallback(cause)
+		return &fakeMachine{active: true}, nil
+	}}
+	service := &Server{
+		hypervisor:    backend,
+		vms:           make(map[string]map[string]hypervisor.Machine),
+		subnetSources: emptySubnetSources(),
+	}
+
+	result, err := service.resumeCluster([]byte(`{"name":"fake-cause"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		item.Nodes[0].Name,
+		"saved state could not be restored; cold-booting instead",
+		"VZErrorDomain Code=12",
+	} {
+		if !strings.Contains(result.Warning, want) {
+			t.Fatalf("resume warning = %q, want substring %q", result.Warning, want)
+		}
+	}
+	if len(result.Warnings) != 1 || result.Warnings[0] != result.Warning {
+		t.Fatalf("resume warnings = %q, want the single warning as its own entry", result.Warnings)
+	}
+}
+
+// TestResumeMissingSaveWarningPointsAtTheDaemonLog keeps the missing-save case
+// distinct and still actionable when there is no hypervisor cause to quote.
+func TestResumeMissingSaveWarningPointsAtTheDaemonLog(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("fake-missing", 0, 1, 0, cluster.NodeDefaults{CPUs: 1, MemoryMiB: 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+
+	backend := &fakeHypervisor{launch: func(_ context.Context, spec hypervisor.Spec) (hypervisor.Machine, error) {
+		spec.Restore.Fallback(os.ErrNotExist)
+		return &fakeMachine{active: true}, nil
+	}}
+	service := &Server{
+		hypervisor:    backend,
+		vms:           make(map[string]map[string]hypervisor.Machine),
+		subnetSources: emptySubnetSources(),
+	}
+
+	result, err := service.resumeCluster([]byte(`{"name":"fake-missing"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result.Warning, "no saved state found; cold-booting instead") {
+		t.Fatalf("resume warning = %q, want the missing-save wording", result.Warning)
+	}
+}
+
+// TestResumeWarningsStayOnePerEntry pins #291's secondary: unrelated warnings
+// must not be fused onto one line for the CLI.
+func TestResumeWarningsStayOnePerEntry(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("fake-multi", 0, 2, 0, cluster.NodeDefaults{CPUs: 1, MemoryMiB: 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := cluster.Dir(item.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, node := range item.Nodes {
+		if err := os.WriteFile(filepath.Join(dir, node.Name+".vzstate"), []byte("saved"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	backend := &fakeHypervisor{launch: func(_ context.Context, spec hypervisor.Spec) (hypervisor.Machine, error) {
+		spec.Restore.Fallback(hypervisor.ErrIncompatibleSave)
+		return &fakeMachine{active: true}, nil
+	}}
+	service := &Server{
+		hypervisor:    backend,
+		vms:           make(map[string]map[string]hypervisor.Machine),
+		subnetSources: emptySubnetSources(),
+	}
+
+	result, err := service.resumeCluster([]byte(`{"name":"fake-multi"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Warnings) != len(item.Nodes) {
+		t.Fatalf("resume warnings = %q, want one per node", result.Warnings)
+	}
+	for _, warning := range result.Warnings {
+		if strings.Contains(warning, "; cold-booting instead; ") {
+			t.Fatalf("warning %q fuses two warnings onto one entry", warning)
+		}
+	}
+}

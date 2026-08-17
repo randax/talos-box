@@ -196,7 +196,7 @@ func TestRunCacheWarmRefusesOldProtocolBeforeCacheRPC(t *testing.T) {
 	command := cli{out: &stdout, err: &stderr, in: bytes.NewBuffer(nil)}
 	err = command.run([]string{"cache", "warm", listPath})
 	<-done
-	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("tbxd protocol %d is too old", cacheWarmProtocolVersion-1)) || !strings.Contains(err.Error(), "restart or upgrade tbxd") {
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("tbxd protocol %d is too old", cacheWarmProtocolVersion-1)) || !strings.Contains(err.Error(), "run: tbx system restart") {
 		t.Fatalf("err = %v, want old-daemon restart/upgrade guidance", err)
 	}
 	if stdout.Len() != 0 {

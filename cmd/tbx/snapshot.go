@@ -15,7 +15,7 @@ import (
 
 func (c cli) runSnapshot(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tbx snapshot create|restore|list|delete")
+		return errors.New(groupUsages["snapshot"])
 	}
 	switch args[0] {
 	case "create":
@@ -59,7 +59,7 @@ func (c cli) snapshotCreate(args []string) error {
 	if _, err := fmt.Fprintf(c.out, "created snapshot %s of %s\n", name, rest[0]); err != nil {
 		return err
 	}
-	return printWarning(c.err, result.Warning)
+	return printWarnings(c.err, result.Warnings, result.Warning)
 }
 
 func (c cli) snapshotRestore(args []string) error {
@@ -87,7 +87,7 @@ func (c cli) snapshotRestore(args []string) error {
 	if _, err := fmt.Fprintf(c.out, "restored %s from snapshot %s\n", rest[0], rest[1]); err != nil {
 		return err
 	}
-	return printWarning(c.err, result.Warning)
+	return printWarnings(c.err, result.Warnings, result.Warning)
 }
 
 func (c cli) snapshotDelete(args []string) error {

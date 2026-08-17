@@ -50,6 +50,9 @@ type Entry struct {
 	Architecture Architecture
 	Path         string
 	Size         int64
+	// AllocatedSize is what the image costs on disk. A disk.raw is sparse,
+	// so Size is its apparent extent, not its footprint.
+	AllocatedSize int64
 }
 
 type MirrorUpstreamStats struct {
@@ -847,11 +850,12 @@ func cacheEntry(schematic, version string, architecture Architecture, path strin
 		return Entry{}, false, nil
 	}
 	return Entry{
-		Schematic:    schematic,
-		Version:      version,
-		Architecture: architecture,
-		Path:         path,
-		Size:         info.Size(),
+		Schematic:     schematic,
+		Version:       version,
+		Architecture:  architecture,
+		Path:          path,
+		Size:          info.Size(),
+		AllocatedSize: allocatedSize(info),
 	}, true, nil
 }
 

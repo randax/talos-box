@@ -5,7 +5,7 @@
 | **Tier** | Deep (one feature area exercised against defaults) |
 | **Platform** | macOS + Linux (port-5000 hazard is macOS-flavored but checks run everywhere) |
 | **Estimated duration** | 45–60 min |
-| **Destructive** | Creates and destroys cluster `qa-mir`; **prunes only what it warmed** (uses `--mirror` prune at the end — do NOT run on a host whose mirror cache you need to keep) |
+| **Destructive** | Creates and destroys cluster `qa-mir`; **prunes the mirror cache and any orphan disk images** (C5 runs an unscoped `cache prune` and then a `--mirror` prune — do NOT run on a host whose cache you need to keep). In-use, pinned, and default disk images survive by design |
 | **Runbook version** | against talos-box main @ the commit recorded in your report |
 
 ## How to execute this runbook (agent instructions)
@@ -16,7 +16,7 @@ You are running QA, not demos. For every charter: run the steps exactly, compare
 
 ## Preflight
 
-BLOCKED unless: `tbx version` recorded; `tbx doctor` exits 0 (egress OK); no cluster `qa-mir`; the host's mirror cache is expendable (see Destructive above); online.
+BLOCKED unless: `tbx version` recorded; `tbx doctor` exits 0 (egress OK); no cluster `qa-mir`; the host's mirror cache and any orphan disk images are expendable (see Destructive above); online.
 
 ## Charters
 
@@ -75,7 +75,7 @@ Steps:
 1. Warm one specific tag-pinned image (C1's list). `tbx mirror offline on`; `tbx mirror offline` reports `on`.
 2. From a test pod, pull the warmed image by tag — succeeds from cache. Pull it by digest — also succeeds (digest/tag parity).
 3. Pull an uncached image — expect a hard failure mentioning offline/not-cached (skipFallback means the node cannot bypass; the pull fails, it does not hang).
-4. Restart the daemon path you can exercise (e.g. `tbx cluster stop qa-mir && tbx cluster start qa-mir`, or note if a real tbxd restart is available); `tbx mirror offline` still reports `on`.
+4. Restart the daemon itself with `tbx system restart --force` (`--force` is required here: `qa-mir` is running, and a plain restart refuses rather than stop it; on a supervised install — packaged Linux units — restart the tbxd service via the service manager instead). If neither is available, exercise the cluster path: `tbx cluster stop qa-mir && tbx cluster start qa-mir`. Afterwards `tbx mirror offline` still reports `on`.
 5. `tbx mirror offline off`; the previously failing pull now succeeds.
 
 Expected observations: cached tag AND digest served offline; miss = clear hard failure, not a hang; mode persists; `off` restores pull-through.
@@ -89,14 +89,14 @@ On failure: capture pod events (`kubectl describe pod`), mirror mode outputs.
 **Goal**: prune scope boundaries hold.
 
 Steps:
-1. `tbx cache list` — record disk images and mirror totals.
-2. `tbx cache prune` (no flag) — disk images gone, mirror intact (`cache list` confirms; output should say mirror untouched).
+1. `tbx cache list` — record disk images and mirror totals, and record each image's label (`in-use`, `pinned`, `default`, `orphan`) — this listing is the prune preview.
+2. `tbx cache prune` (no flag) — reference-aware, so it removes only the `orphan` combinations and keeps every `in-use`, `pinned`, and `default` one; the mirror is untouched. Expect it to name each removed combination with its size, then a summary of the form `pruned disk cache: <n> image(s), <bytes> bytes (kept <m> image(s) in use, pinned, or default); mirror cache untouched`, with `<m>` matching the labels recorded in step 1. On a default cache with nothing orphaned, `<n>` is 0 and the default combination survives — that is the documented outcome, not a failure. Confirm with `cache list` that exactly the `orphan` rows disappeared.
 3. `tbx cache prune --mirror` — mirror content gone, remaining disk images (if any re-pulled) intact.
 4. `tbx cache prune --mirror --all` — expect flag-exclusivity refusal.
 
-Expected observations: scopes exactly as documented; explicit output about what was and wasn't touched.
+Expected observations: scopes exactly as documented; the unscoped prune reports what it kept as well as what it removed, and never deletes an in-use, pinned, or default combination; explicit output about what was and wasn't touched.
 
-Pass criteria: scope boundaries and exclusivity hold.
+Pass criteria: scope boundaries, keep rules, and exclusivity hold.
 
 On failure: capture `cache list` before/after each prune.
 

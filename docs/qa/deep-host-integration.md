@@ -25,7 +25,7 @@ BLOCKED unless: `tbx version` recorded; the platform's install story is already 
 **Goal**: every doctor line is truthful and remediation is copy-pasteable.
 
 Steps:
-1. `tbx doctor` on a healthy host — record every check name and result. Compare the set against the documented platform list (macOS: helper, vmnet, DNS wiring, forwarding, routes, host-pressure, egress; Linux additionally: helper-unit/access/capabilities, kvm, qemu, forwarding, bridge-netfilter, bridge-stp, rp-filter, port-53/67/179, resolver trio, units).
+1. `tbx doctor` on a healthy host — record every check name and result. Compare the set against the documented platform list: [docs/macos.md](../macos.md) (`helper`, `resolver`, `DNS`, `forwarding`, `host-pressure`, `system-dns`, `routes`, `guest-agent`, `mirror-health`, `egress`, `security-inventory`) or [docs/linux.md](../linux.md) (the same daemon- and cluster-scoped checks plus `helper-unit`/`helper-access`/`helper-capabilities`, `kvm`, `qemu`, `bridge-netfilter`, `bridge-stp`, `rp-filter`, and `port-53`/`port-67`/`port-179`). A check the platform doc does not list — or a documented check the build never emits — is the finding.
 2. Break one innocuous thing and confirm doctor catches it: occupy port 179 (`nc -l 179` as root or a high-privilege listener) → doctor `port-179` degrades with a specific message. Release it.
 3. Confirm doctor never *executes* remediation — it prints commands only.
 
@@ -77,9 +77,9 @@ On failure: n/a (this charter's failures are its findings) — but a *silent suc
 Steps:
 1. `tbx status qa-host` — hints present and copy-pasteable; `tbx status qa-host --quiet` — hints gone, facts intact.
 2. `tbx status qa-host -o json` — valid JSON (`| python3 -m json.tool`); `tbx cluster list -o json` — valid JSON.
-3. `tbx cluster create qa-host --quiet` variant already covered implicitly — instead verify `tbx up --quiet` on a matching `talosbox.yaml` stays silent except the final result (write a minimal yaml for qa-host and run it; it should reconcile as up-to-date).
+3. `tbx cluster create qa-host --quiet` variant already covered implicitly — instead verify `tbx up --quiet` on a matching `talosbox.yaml` keeps **stdout** result-only (write a minimal yaml for qa-host and run it; it should reconcile as up-to-date). Stderr is allowed to carry the deadline preamble (`provisioning …; up to Nm; progress suppressed by --quiet`) and, on long runs, a once-a-minute liveness line — that is the contract, not a violation.
 
-Expected observations: quiet suppresses narration/hints but never results; JSON parses; up is idempotent (up-to-date on rerun).
+Expected observations: quiet suppresses narration/hints but never results or facts; stderr may carry the quiet-mode deadline preamble and liveness heartbeat; JSON parses; up is idempotent (up-to-date on rerun).
 
 Pass criteria: all output contracts hold.
 

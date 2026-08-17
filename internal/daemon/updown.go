@@ -60,6 +60,7 @@ func (s *Server) upWithObservations(raw json.RawMessage, maintenance map[string]
 				return actions[:i], fmt.Errorf("create %s: %w", spec.Name, err)
 			}
 			actions[i].Warning = result.Warning
+			actions[i].Warnings = result.Warnings
 		case ActionStart:
 			encoded, err := json.Marshal(startArgs{Name: spec.Name, Force: args.Force})
 			if err != nil {
@@ -70,6 +71,7 @@ func (s *Server) upWithObservations(raw json.RawMessage, maintenance map[string]
 				return actions[:i], fmt.Errorf("start %s: %w", spec.Name, err)
 			}
 			actions[i].Warning = result.Warning
+			actions[i].Warnings = result.Warnings
 		}
 	}
 	return actions, nil

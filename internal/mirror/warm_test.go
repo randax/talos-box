@@ -1693,3 +1693,136 @@ func TestWarmOneBatchSupportsMultipleRegistriesWithIsolatedOfflineServing(t *tes
 		}
 	}
 }
+
+// Re-running a warm while the mirror is offline must answer from the cache the
+// checker reads, not 503 on content that `warm --check` calls complete (#297).
+func TestWarmOfflineRerunServesCachedDigestManifestAndAgreesWithCheck(t *testing.T) {
+	configDigest := "sha256:" + sha256Hex([]byte("config"))
+	layerDigest := "sha256:" + sha256Hex([]byte("layer"))
+	manifestBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%d},"layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"%s","size":%d}]}`,
+		configDigest, len("config"), layerDigest, len("layer"))
+	manifestDigest := "sha256:" + sha256Hex([]byte(manifestBody))
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/pause/manifests/" + manifestDigest:
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", manifestDigest)
+			_, _ = fmt.Fprint(w, manifestBody)
+		case "/v2/pause/blobs/" + configDigest:
+			_, _ = io.WriteString(w, "config")
+		case "/v2/pause/blobs/" + layerDigest:
+			_, _ = io.WriteString(w, "layer")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	manager := newManagerWithPorts(t.TempDir(), nil, freePort(t))
+	manager.baseOverride = aliasedURL(t, upstream.URL, "registry.example")
+	egress := egressForRoutes(aliasRoute(t, upstream.URL, "registry.example", "203.0.113.10"))
+	manager.resolveUpstreamIPs = egress.resolve
+	manager.hostOwnedIPs = egress.hostIPs
+	manager.dialContext = egress.dialContext
+	defer manager.Close()
+
+	ref := "registry.example/pause@" + manifestDigest
+	if _, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64); err != nil {
+		t.Fatal(err)
+	}
+
+	upstream.Close()
+	manager.SetOffline(true)
+
+	check, err := manager.Check(context.Background(), []string{ref}, imagecache.ArchitectureAMD64, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if check.Complete != 1 || check.Failed != 0 {
+		t.Fatalf("check summary = %+v", check)
+	}
+
+	summary, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Failed != 0 || summary.AlreadyComplete != 1 || summary.Warmed != 0 {
+		t.Fatalf("offline warm summary = %+v (results %+v)", summary, summary.Results)
+	}
+}
+
+func TestWarmOfflineRerunServesCachedTagManifest(t *testing.T) {
+	configDigest := "sha256:" + sha256Hex([]byte("config"))
+	manifestBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"%s"},"layers":[]}`, configDigest)
+	manifestDigest := "sha256:" + sha256Hex([]byte(manifestBody))
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/demo/manifests/latest", "/v2/demo/manifests/" + manifestDigest:
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", manifestDigest)
+			_, _ = fmt.Fprint(w, manifestBody)
+		case "/v2/demo/blobs/" + configDigest:
+			_, _ = io.WriteString(w, "config")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	manager := newManagerWithPorts(t.TempDir(), nil, freePort(t))
+	manager.baseOverride = aliasedURL(t, upstream.URL, "registry.example")
+	egress := egressForRoutes(aliasRoute(t, upstream.URL, "registry.example", "203.0.113.10"))
+	manager.resolveUpstreamIPs = egress.resolve
+	manager.hostOwnedIPs = egress.hostIPs
+	manager.dialContext = egress.dialContext
+	defer manager.Close()
+
+	ref := "registry.example/demo:latest"
+	if _, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64); err != nil {
+		t.Fatal(err)
+	}
+
+	upstream.Close()
+	manager.SetOffline(true)
+
+	summary, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Failed != 0 || summary.AlreadyComplete != 1 || summary.Warmed != 0 {
+		t.Fatalf("offline warm summary = %+v (results %+v)", summary, summary.Results)
+	}
+}
+
+// The serving handler must replay a cached digest manifest offline even when
+// the request asks for a manifest refresh, since no upstream can answer.
+func TestOfflineManifestRefreshRequestServesCachedDigestManifest(t *testing.T) {
+	manifestBody := `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:` + sha256Hex([]byte("config")) + `"},"layers":[]}`
+	manifestDigest := "sha256:" + sha256Hex([]byte(manifestBody))
+
+	server := NewServer("https://registry.example", t.TempDir())
+	server.setOfflineMode(true)
+	requestPath := "/v2/pause/manifests/" + manifestDigest
+	if err := server.storeManifest(requestPath, manifestMetadata{
+		ContentType:         "application/vnd.oci.image.manifest.v1+json",
+		ContentLength:       int64(len(manifestBody)),
+		DockerContentDigest: manifestDigest,
+	}, []byte(manifestBody)); err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, requestPath, nil).WithContext(withManifestRefresh(context.Background()))
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("offline refresh request = %d %q, want 200", recorder.Code, strings.TrimSpace(recorder.Body.String()))
+	}
+	if recorder.Body.String() != manifestBody {
+		t.Fatalf("body = %q, want %q", recorder.Body.String(), manifestBody)
+	}
+	if got := recorder.Header().Get("Docker-Content-Digest"); got != manifestDigest {
+		t.Fatalf("Docker-Content-Digest = %q, want %q", got, manifestDigest)
+	}
+}

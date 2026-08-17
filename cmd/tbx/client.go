@@ -9,7 +9,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -48,12 +51,12 @@ func (c cli) ensureProtocolAtLeast(minimum int, feature string) error {
 	var info daemon.Info
 	if err := c.call("daemon.info", struct{}{}, &info); err != nil {
 		if strings.Contains(err.Error(), "unknown operation") {
-			return fmt.Errorf("tbxd is too old; restart or upgrade tbxd to use %s", feature)
+			return fmt.Errorf("tbxd is too old to use %s; run: tbx system restart (add --force if it refuses; on a supervised install restart the tbxd service instead)", feature)
 		}
 		return err
 	}
 	if info.ProtocolVersion < minimum {
-		return fmt.Errorf("tbxd protocol %d is too old; restart or upgrade tbxd to use %s", info.ProtocolVersion, feature)
+		return fmt.Errorf("tbxd protocol %d is too old to use %s; run: tbx system restart (add --force if it refuses; on a supervised install restart the tbxd service instead)", info.ProtocolVersion, feature)
 	}
 	if info.ProtocolVersion > daemon.ProtocolVersion {
 		return fmt.Errorf("tbx is too old: protocol %d does not support tbxd protocol %d; upgrade tbx to use %s", daemon.ProtocolVersion, info.ProtocolVersion, feature)
@@ -98,7 +101,562 @@ func (c cli) ensureCacheWarmSupport() error {
 	return c.ensureProtocolAtLeast(cacheWarmProtocolVersion, "cache warm/check")
 }
 
+// daemonSession memoizes the connect-time protocol handshake for one tbx
+// process, so the gate costs a single extra exchange no matter how many verbs
+// a command sends. A cli without a session skips the gate, which is how tests
+// drive call() against a scripted daemon.
+//
+// Only definitive outcomes are memoized. A transient handshake failure (a
+// draining daemon's EOF, a busy daemon that cannot answer within the handshake
+// deadline) must not freeze the whole process into an error call() would
+// otherwise have retried past, so it skips the gate for that attempt instead —
+// unless the caller settles the session (see resolveDaemonProtocol), which
+// records the skip so a long call cannot re-handshake underneath itself.
+type daemonSession struct {
+	mu       sync.Mutex
+	resolved bool
+	err      error
+}
+
+func newDaemonSession() *daemonSession { return &daemonSession{} }
+
+// transientDaemonError marks a handshake outcome that says nothing about the
+// daemon's protocol: the gate is skipped for this attempt and not remembered.
+type transientDaemonError struct{ err error }
+
+func (e transientDaemonError) Error() string { return e.err.Error() }
+func (e transientDaemonError) Unwrap() error { return e.err }
+
+// busyDaemonError marks a daemon that owns the socket but did not answer
+// daemon.info within the handshake deadline — daemon.info is served under the
+// daemon's operation lock, so a long suspend or destroy blocks it.
+type busyDaemonError struct {
+	pid int
+	err error
+}
+
+func (e busyDaemonError) Error() string {
+	if e.pid > 0 {
+		return fmt.Sprintf("tbxd (pid %d) is busy: %v", e.pid, e.err)
+	}
+	return fmt.Sprintf("tbxd is busy: %v", e.err)
+}
+
+func (e busyDaemonError) Unwrap() error { return e.err }
+
+// ensureDaemonProtocol gates every verb on the daemon speaking this CLI's
+// protocol: a skew that only surfaces on a gated verb lets a stale daemon serve
+// cluster lifecycle all session (#290). A stale daemon that tbx owns is
+// restarted in place; anything else fails with a recovery command.
+func (c cli) ensureDaemonProtocol() error { return c.resolveDaemonProtocol(false) }
+
+// resolveDaemonProtocol runs the gate. A transient outcome is retried once with
+// a longer deadline before the gate is skipped, so a briefly busy daemon does
+// not quietly re-open the skew hole (#290), and the skip is always announced.
+//
+// settle is set by callers that must not hand the verb a second handshake: a
+// long call under a heartbeat would otherwise re-handshake from call() while
+// the ticker writes to stderr. Those callers remember the skip for the process.
+func (c cli) resolveDaemonProtocol(settle bool) error {
+	if c.daemon == nil {
+		return nil
+	}
+	c.daemon.mu.Lock()
+	defer c.daemon.mu.Unlock()
+	if c.daemon.resolved {
+		return c.daemon.err
+	}
+	err := c.handshakeDaemon(daemonHandshakeTimeout)
+	var transient transientDaemonError
+	if errors.As(err, &transient) {
+		err = c.handshakeDaemon(daemonHandshakeRetryTimeout)
+	}
+	if errors.As(err, &transient) {
+		// nothing was learned about the daemon's protocol, so the gate is
+		// skipped for this verb — say so rather than silently proceeding
+		if _, noticeErr := fmt.Fprintf(c.err, "%s (%v)\n", unverifiedProtocolNotice, err); noticeErr != nil {
+			return noticeErr
+		}
+		if settle {
+			c.daemon.resolved, c.daemon.err = true, nil
+		}
+		return nil
+	}
+	c.daemon.resolved, c.daemon.err = true, err
+	return err
+}
+
+// unverifiedProtocolNotice is printed whenever the protocol gate is skipped, so
+// an unverified daemon is never a silent condition.
+const unverifiedProtocolNotice = "warning: tbxd busy; protocol not verified for this command"
+
+func (c cli) handshakeDaemon(timeout time.Duration) error {
+	socketPath, err := daemon.SocketPath()
+	if err != nil {
+		return err
+	}
+	info, pid, err := daemonHandshakeWithin(socketPath, timeout)
+	if err != nil {
+		var connectionError dialError
+		if errors.As(err, &connectionError) {
+			// no daemon is running; call spawns one from this build
+			return nil
+		}
+		return transientDaemonError{err: err}
+	}
+	switch {
+	case info.ProtocolVersion == daemon.ProtocolVersion:
+		return nil
+	case info.ProtocolVersion > daemon.ProtocolVersion:
+		return fmt.Errorf("tbxd protocol %d is newer than tbx protocol %d; upgrade tbx", info.ProtocolVersion, daemon.ProtocolVersion)
+	}
+	skew := fmt.Sprintf("tbxd protocol %d is older than tbx protocol %d", info.ProtocolVersion, daemon.ProtocolVersion)
+	if state, reason := supervisedDaemon(); state != supervisionNone {
+		// supervisionRefusal is shared with tbx system restart, so the gate can
+		// never name a way out the restart itself refuses (or the other way
+		// round)
+		return fmt.Errorf("%s and could not be restarted: %s", skew, supervisionRefusal(state, reason))
+	}
+	// restarting tbxd stops every VM it runs, and suspended memory does not
+	// survive it — never do that behind a read-only verb's back (#290)
+	activity, activityErr := daemonClusterActivity(socketPath)
+	if activityErr != nil {
+		return fmt.Errorf("%s and tbx could not tell whether clusters are running (%v); run: tbx system restart --force to restart anyway", skew, activityErr)
+	}
+	if !activity.empty() {
+		return fmt.Errorf("%s, and %s", skew, restartRefusal(activity))
+	}
+	if _, _, err := replaceDaemon(socketPath, info, pid); err != nil {
+		return fmt.Errorf("%s and could not be restarted (%w); run: tbx system restart", skew, err)
+	}
+	_, err = fmt.Fprintf(c.err, "restarted stale tbxd (protocol %d < %d)\n", info.ProtocolVersion, daemon.ProtocolVersion)
+	return err
+}
+
+// daemonHandshake reports the running daemon's protocol and pid. The pid comes
+// from the socket peer rather than the response, so a daemon too old to answer
+// daemon.info at all can still be identified and replaced.
+func daemonHandshake(socketPath string) (daemon.Info, int, error) {
+	return daemonHandshakeWithin(socketPath, daemonHandshakeTimeout)
+}
+
+func daemonHandshakeWithin(socketPath string, timeout time.Duration) (daemon.Info, int, error) {
+	connection, err := net.DialTimeout("unix", socketPath, 250*time.Millisecond)
+	if err != nil {
+		return daemon.Info{}, 0, dialError{err: err}
+	}
+	defer func() { _ = connection.Close() }()
+	pid, pidErr := daemon.PeerPID(connection)
+	if pidErr != nil {
+		pid = 0
+	}
+	// daemon.info is served under the daemon's operation lock, so a running
+	// suspend or destroy would block the gate forever without a deadline
+	if err := connection.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return daemon.Info{}, pid, fmt.Errorf("set daemon handshake deadline: %w", err)
+	}
+
+	request := daemon.Request{Op: "daemon.info", Args: json.RawMessage(`{}`)}
+	if err := json.NewEncoder(connection).Encode(request); err != nil {
+		return daemon.Info{}, pid, handshakeIOError(pid, "write daemon request", err)
+	}
+	var response daemon.Response
+	if err := json.NewDecoder(connection).Decode(&response); err != nil {
+		return daemon.Info{}, pid, handshakeIOError(pid, "read daemon response", err)
+	}
+	if !response.OK {
+		if strings.Contains(response.Error, "unknown operation") {
+			return daemon.Info{}, pid, nil
+		}
+		return daemon.Info{}, pid, errors.New(response.Error)
+	}
+	var info daemon.Info
+	if len(response.Data) > 0 {
+		if err := json.Unmarshal(response.Data, &info); err != nil {
+			return daemon.Info{}, pid, fmt.Errorf("decode daemon result: %w", err)
+		}
+	}
+	return info, pid, nil
+}
+
+// handshakeIOError classifies a handshake exchange failure. A deadline expiry
+// means the daemon is alive but busy under its operation lock, which is not a
+// protocol answer.
+func handshakeIOError(pid int, stage string, err error) error {
+	if isTimeout(err) {
+		return busyDaemonError{pid: pid, err: err}
+	}
+	return fmt.Errorf("%s: %w", stage, err)
+}
+
+func isTimeout(err error) bool {
+	return os.IsTimeout(err) || errors.Is(err, os.ErrDeadlineExceeded)
+}
+
+// clusterActivity names the clusters a tbxd restart would disturb. Suspended
+// clusters are kept apart from running ones because they lose more than power:
+// their saved memory does not survive the daemon that wrote it.
+type clusterActivity struct {
+	running   []string
+	suspended []string
+}
+
+func (a clusterActivity) empty() bool { return len(a.running)+len(a.suspended) == 0 }
+
+func (a clusterActivity) describe() string {
+	var parts []string
+	if len(a.running) > 0 {
+		parts = append(parts, strings.Join(a.running, ", "))
+	}
+	if len(a.suspended) > 0 {
+		parts = append(parts, "suspended: "+strings.Join(a.suspended, ", ")+
+			" (suspended clusters lose their saved memory)")
+	}
+	return strings.Join(parts, "; ")
+}
+
+// suspendedRecovery names the commands that clear a suspension. It matters most
+// when the suspension is not real: a .vzstate orphaned by a crashed daemon reads
+// exactly like live saved memory, and without a named way out the disk scan
+// dead-ends every automatic restart forever (#284 review round 3).
+func (a clusterActivity) suspendedRecovery() string {
+	if len(a.suspended) == 0 {
+		return ""
+	}
+	resumes := make([]string, 0, len(a.suspended))
+	for _, name := range a.suspended {
+		resumes = append(resumes, "tbx cluster resume "+name)
+	}
+	return "clear the saved state with: " + strings.Join(resumes, ", ") +
+		" (or tbx cluster destroy <name> to discard it)"
+}
+
+// restartRefusal is the one refusal both the protocol gate and `tbx system
+// restart` print when a restart would disturb clusters: it names what was
+// found, how to clear a suspension, and the force that proceeds regardless.
+func restartRefusal(activity clusterActivity) string {
+	message := "restarting tbxd stops these clusters: " + activity.describe()
+	if recovery := activity.suspendedRecovery(); recovery != "" {
+		message += "; " + recovery
+	}
+	return message + "; re-run: tbx system restart --force to restart anyway"
+}
+
+// supervisionRefusal is the one refusal both the protocol gate and `tbx system
+// restart` print for a supervised daemon, so the two can never name different
+// ways out (#290 review round 3).
+//
+// A confirmed supervisor owns the process at any force level, so only its own
+// restart command helps. A merely inferred unit file may be an orphan whose
+// supervisor is absent — that command may then not exist at all — so the escape
+// that always works, `tbx system restart --force`, is named first, with the
+// supervisor's command as the alternative for when a supervisor really owns it.
+func supervisionRefusal(state supervision, reason string) string {
+	switch state {
+	case supervisionConfirmed:
+		return fmt.Sprintf("%s; tbx will not restart a supervised tbxd — run: %s", reason, supervisorRestartCommand())
+	case supervisionInferred:
+		return fmt.Sprintf("%s; re-run: tbx system restart --force to replace it in place, or restart it through its supervisor: %s",
+			reason, supervisorRestartCommand())
+	default:
+		return ""
+	}
+}
+
+// addSuspended merges names the daemon did not report, skipping anything
+// already named.
+func (a *clusterActivity) addSuspended(names ...string) {
+	for _, name := range names {
+		if slices.Contains(a.running, name) || slices.Contains(a.suspended, name) {
+			continue
+		}
+		a.suspended = append(a.suspended, name)
+	}
+}
+
+// daemonClusterActivity asks the daemon what it is running, then adds any
+// suspended clusters found on disk.
+//
+// The disk scan is not redundant: ClusterSummary.Suspended is newer than the
+// daemons this gate exists for, so a stale daemon answers cluster.list without
+// it and suspension is invisible over that protocol. Every caller here is
+// deciding whether to restart a daemon, so an unreported suspension would cost
+// the operator the saved memory outright.
+func daemonClusterActivity(socketPath string) (clusterActivity, error) {
+	activity, err := runningClustersQuery(socketPath)
+	if err != nil {
+		return activity, err
+	}
+	suspended, savedErr := savedStateClustersQuery()
+	if savedErr != nil {
+		// An unreadable scan means suspension state is unknown; treating it
+		// as "none" would risk exactly the saved-memory loss described above.
+		return activity, fmt.Errorf("scan for suspended clusters: %w", savedErr)
+	}
+	activity.addSuspended(suspended...)
+	return activity, nil
+}
+
+// runningClusters reports the clusters the running daemon still has VMs for,
+// plus the ones it reports as suspended. It speaks cluster.list, which every
+// protocol tbx has ever shipped serves, and decodes only the fields it needs so
+// an older result shape still answers.
+//
+// The exchange is deadlined: cluster.list is served under the daemon's
+// operation lock, so a long suspend or destroy would otherwise block every
+// caller — including `tbx system restart` — forever.
+func runningClusters(socketPath string) (clusterActivity, error) {
+	response, err := exchangeWithin(socketPath, "cluster.list", struct{}{}, daemonHandshakeTimeout)
+	if err != nil {
+		if isTimeout(err) {
+			return clusterActivity{}, fmt.Errorf("tbxd did not answer cluster.list within %s", daemonHandshakeTimeout)
+		}
+		return clusterActivity{}, err
+	}
+	if !response.OK {
+		if response.Error == "" {
+			return clusterActivity{}, errors.New("cluster.list failed")
+		}
+		return clusterActivity{}, errors.New(response.Error)
+	}
+	var summaries []struct {
+		Name      string `json:"name"`
+		Running   bool   `json:"running"`
+		Suspended bool   `json:"suspended"`
+	}
+	if len(response.Data) > 0 {
+		if err := json.Unmarshal(response.Data, &summaries); err != nil {
+			return clusterActivity{}, fmt.Errorf("decode cluster list: %w", err)
+		}
+	}
+	var activity clusterActivity
+	for _, summary := range summaries {
+		switch {
+		case summary.Running:
+			activity.running = append(activity.running, summary.Name)
+		case summary.Suspended:
+			activity.suspended = append(activity.suspended, summary.Name)
+		}
+	}
+	return activity, nil
+}
+
+// savedStateClusters names clusters with suspended VM memory on disk, which is
+// the only suspension signal that survives both a daemon restart and a daemon
+// too old to report it.
+func savedStateClusters() ([]string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("find home directory: %w", err)
+	}
+	root := filepath.Join(home, ".talosbox", "clusters")
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read cluster directory: %w", err)
+	}
+	var names []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		matches, err := filepath.Glob(filepath.Join(root, entry.Name(), "*"+savedStateSuffix))
+		if err == nil && len(matches) > 0 {
+			names = append(names, entry.Name())
+		}
+	}
+	return names, nil
+}
+
+// savedStateSuffix mirrors the daemon's suspend artifacts.
+const savedStateSuffix = ".vzstate"
+
+// process-level seams: the restart path signals, inspects and spawns real
+// processes, which tests replace with a scripted daemon.
+var (
+	terminateDaemonProcess  = func(pid int) error { return syscall.Kill(pid, syscall.SIGTERM) }
+	spawnDaemonProcess      = startDaemon
+	supervisedDaemon        = supervisedDaemonUnit
+	daemonProcessAlive      = processAlive
+	runningClustersQuery    = runningClusters
+	savedStateClustersQuery = savedStateClusters
+	runSupervisorCommand    = func(name string, args ...string) error {
+		return exec.Command(name, args...).Run()
+	}
+)
+
+// processAlive reports whether a pid still names a live process. A signal 0
+// that is refused (EPERM) still proves the process exists.
+func processAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+// supervision grades how sure tbx is that a service manager owns tbxd.
+type supervision int
+
+const (
+	supervisionNone supervision = iota
+	// supervisionInferred: a unit file is installed, but no supervisor
+	// confirmed it is running tbxd. Every packaged Linux/Nix install ships
+	// that file, so on its own it must not dead-end the recovery chain —
+	// otherwise the gate says "run tbx system restart" and the restart
+	// refuses, leaving no way forward.
+	supervisionInferred
+	// supervisionConfirmed: the supervisor itself answered that it owns an
+	// active tbxd unit. That daemon is never tbx's to kill.
+	supervisionConfirmed
+)
+
+// supervisedDaemonUnit reports whether a service manager owns tbxd. Such a
+// daemon is not tbx's to replace: the supervisor decides which binary comes
+// back — and under systemd socket activation the supervisor, not tbxd, owns
+// the socket — so tbx reports instead of killing it.
+//
+// The supervisor itself is asked first, because a unit can live anywhere; the
+// installed unit paths are only a weaker, inferred fallback for when the
+// supervisor CLI is missing or unusable.
+func supervisedDaemonUnit() (supervision, string) {
+	if supervised, reason := supervisorOwnsDaemon(); supervised {
+		return supervisionConfirmed, reason
+	}
+	for _, path := range supervisionUnitPaths() {
+		if _, err := os.Stat(path); err == nil {
+			return supervisionInferred, "tbxd may be managed by " + path +
+				" (no supervisor confirmed it is running tbxd)"
+		}
+	}
+	return supervisionNone, ""
+}
+
+// supervisorRestartCommand is the command an operator can actually run to
+// restart a supervised tbxd. `tbx system restart` is not that command: it
+// refuses a supervised daemon by design.
+func supervisorRestartCommand() string {
+	switch runtime.GOOS {
+	case "linux":
+		return "systemctl --user restart tbxd.service"
+	case "darwin":
+		return fmt.Sprintf("launchctl kickstart -k gui/%d/%s", os.Getuid(), daemonLaunchdLabel)
+	}
+	return "tbx system restart"
+}
+
+// supervisorOwnsDaemon asks the platform service manager whether it is running
+// tbxd. A missing or failing supervisor CLI answers "unknown", which falls
+// through to the unit-path scan.
+func supervisorOwnsDaemon() (bool, string) {
+	switch runtime.GOOS {
+	case "linux":
+		for _, unit := range []string{"tbxd.socket", "tbxd.service"} {
+			if err := runSupervisorCommand("systemctl", "--user", "is-active", "--quiet", unit); err == nil {
+				return true, "tbxd is managed by systemd (--user unit " + unit + ")"
+			}
+		}
+	case "darwin":
+		label := fmt.Sprintf("gui/%d/%s", os.Getuid(), daemonLaunchdLabel)
+		if err := runSupervisorCommand("launchctl", "print", label); err == nil {
+			return true, "tbxd is managed by launchd (" + label + ")"
+		}
+	}
+	return false, ""
+}
+
+const daemonLaunchdLabel = "dev.talosbox.tbxd"
+
+// supervisionUnitPaths lists every location a packaged install can put a tbxd
+// unit: the deb/rpm and Nix systemd user units, the system-wide overrides, and
+// the launchd plists.
+func supervisionUnitPaths() []string {
+	paths := []string{
+		"/usr/lib/systemd/user/tbxd.service",
+		"/usr/lib/systemd/user/tbxd.socket",
+		"/usr/local/lib/systemd/user/tbxd.service",
+		"/usr/local/lib/systemd/user/tbxd.socket",
+		"/etc/systemd/user/tbxd.service",
+		"/etc/systemd/user/tbxd.socket",
+		"/etc/systemd/system/tbxd.service",
+		"/etc/systemd/system/tbxd.socket",
+		"/Library/LaunchDaemons/" + daemonLaunchdLabel + ".plist",
+		"/Library/LaunchAgents/" + daemonLaunchdLabel + ".plist",
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		paths = append(paths,
+			filepath.Join(home, "Library", "LaunchAgents", daemonLaunchdLabel+".plist"),
+			filepath.Join(home, ".config", "systemd", "user", "tbxd.service"),
+			filepath.Join(home, ".config", "systemd", "user", "tbxd.socket"))
+	}
+	return paths
+}
+
+// replaceDaemon replaces the running daemon with one spawned from this build
+// and returns the replacement's info and pid. An unidentifiable or supervised
+// daemon is left alone: killing a process tbx cannot prove it owns is worse
+// than reporting the skew.
+func replaceDaemon(socketPath string, info daemon.Info, pid int) (daemon.Info, int, error) {
+	// only a confirmed supervisor is refused here; callers decide what to do
+	// about a merely inferred unit file, which a forced restart may override
+	if state, reason := supervisedDaemon(); state == supervisionConfirmed {
+		return info, pid, errors.New(reason)
+	}
+	if pid <= 0 {
+		return info, pid, errors.New("the running tbxd could not be identified")
+	}
+	if err := terminateDaemonProcess(pid); err != nil {
+		return info, pid, fmt.Errorf("stop tbxd (pid %d): %w", pid, err)
+	}
+	if err := waitForDaemonExit(pid); err != nil {
+		return info, pid, err
+	}
+	if _, err := spawnDaemonProcess(); err != nil {
+		return info, pid, err
+	}
+	return waitForCurrentDaemon(socketPath)
+}
+
+// waitForDaemonExit waits for the daemon process itself to go away. It must
+// never poll the socket: under systemd socket activation the supervisor owns
+// the listener, so every dial would respawn the daemon this call is trying to
+// retire.
+func waitForDaemonExit(pid int) error {
+	deadline := time.Now().Add(daemonWaitTimeout)
+	for {
+		if !daemonProcessAlive(pid) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("tbxd (pid %d) did not exit within %s", pid, daemonWaitTimeout)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func waitForCurrentDaemon(socketPath string) (daemon.Info, int, error) {
+	deadline := time.Now().Add(daemonWaitTimeout)
+	for {
+		info, pid, err := daemonHandshake(socketPath)
+		if err == nil && info.ProtocolVersion == daemon.ProtocolVersion {
+			return info, pid, nil
+		}
+		if time.Now().After(deadline) {
+			if err != nil {
+				return info, pid, fmt.Errorf("the replacement tbxd did not serve %s within %s: %w", socketPath, daemonWaitTimeout, err)
+			}
+			return info, pid, fmt.Errorf("the replacement tbxd still speaks protocol %d, not %d", info.ProtocolVersion, daemon.ProtocolVersion)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 func (c cli) call(op string, args, destination any) error {
+	if err := c.ensureDaemonProtocol(); err != nil {
+		return err
+	}
 	socketPath, err := daemon.SocketPath()
 	if err != nil {
 		return err
@@ -150,11 +708,24 @@ func (c cli) call(op string, args, destination any) error {
 }
 
 func exchange(socketPath, op string, args any) (daemon.Response, error) {
+	// no deadline: a lifecycle verb legitimately runs for minutes
+	return exchangeWithin(socketPath, op, args, 0)
+}
+
+// exchangeWithin runs one request/response with an optional overall deadline,
+// which the restart paths need: their queries are served under the daemon's
+// operation lock and must never outlast a courtesy check.
+func exchangeWithin(socketPath, op string, args any, timeout time.Duration) (daemon.Response, error) {
 	connection, err := net.DialTimeout("unix", socketPath, 250*time.Millisecond)
 	if err != nil {
 		return daemon.Response{}, dialError{err: err}
 	}
 	defer func() { _ = connection.Close() }()
+	if timeout > 0 {
+		if err := connection.SetDeadline(time.Now().Add(timeout)); err != nil {
+			return daemon.Response{}, fmt.Errorf("set daemon deadline: %w", err)
+		}
+	}
 
 	rawArgs, err := json.Marshal(args)
 	if err != nil {
@@ -173,6 +744,16 @@ func exchange(socketPath, op string, args any) (daemon.Response, error) {
 
 // daemonWaitTimeout bounds how long a just-spawned daemon may take to serve.
 const daemonWaitTimeout = 20 * time.Second
+
+// daemonHandshakeTimeout bounds the whole daemon.info exchange. The gate is a
+// courtesy check, so a daemon busy under its operation lock must not hang it.
+// It is a var only so tests can shorten it.
+var daemonHandshakeTimeout = 3 * time.Second
+
+// daemonHandshakeRetryTimeout bounds the single retry the gate makes before it
+// gives up and skips: a daemon that is merely slow must not silently re-open
+// the protocol-skew hole the gate exists to close (#290).
+var daemonHandshakeRetryTimeout = 10 * time.Second
 
 // daemonSpawnFailure explains a daemon that was spawned but never served: the
 // bare dial error hides that tbxd itself crashed, and the cause is in its log.

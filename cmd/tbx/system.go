@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/randax/talos-box/internal/daemon"
 	"github.com/randax/talos-box/internal/helper"
 	"github.com/randax/talos-box/internal/resolverset"
 )
@@ -22,9 +23,23 @@ const (
 
 func (c cli) runSystem(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tbx system install|uninstall")
+		return errors.New(groupUsages["system"])
 	}
 	switch args[0] {
+	// restart and status manage the per-user daemon, so they never need root
+	case "restart":
+		force := false
+		if len(args) == 2 && args[1] == "--force" {
+			force = true
+		} else if len(args) != 1 {
+			return errors.New("usage: tbx system restart [--force]")
+		}
+		return c.restartDaemon(force)
+	case "status":
+		if len(args) != 1 {
+			return errors.New("usage: tbx system status")
+		}
+		return c.daemonStatus()
 	case "install":
 		if len(args) > 2 {
 			return errors.New("usage: tbx system install [absolute-helper-path]")
@@ -50,6 +65,126 @@ func (c cli) runSystem(args []string) error {
 		return c.uninstallSystem()
 	}
 	return c.installSystem(args[1:])
+}
+
+// restartDaemon replaces the running tbxd with one spawned from this build, so
+// a protocol skew has a named recovery command instead of a pid hunt (#290).
+// A restart stops every VM the daemon runs, so running clusters are named and
+// the restart only proceeds with an explicit --force.
+func (c cli) restartDaemon(force bool) error {
+	socketPath, err := daemon.SocketPath()
+	if err != nil {
+		return err
+	}
+	info, pid, err := daemonHandshake(socketPath)
+	if err != nil {
+		var connectionError dialError
+		if !errors.As(err, &connectionError) {
+			var busy busyDaemonError
+			if !errors.As(err, &busy) {
+				return err
+			}
+			// a busy daemon still owns the socket and is still ours to
+			// replace; it just could not answer daemon.info in time
+			info, pid = daemon.Info{}, busy.pid
+		} else {
+			if _, err := spawnDaemonProcess(); err != nil {
+				return err
+			}
+			started, startedPID, err := waitForCurrentDaemon(socketPath)
+			if err != nil {
+				return err
+			}
+			_, err = fmt.Fprintf(c.out, "started tbxd (pid %d, protocol %d)\n", startedPID, started.ProtocolVersion)
+			return err
+		}
+	}
+	if err := refuseSupervisedRestart(force); err != nil {
+		return err
+	}
+	// the cluster query runs only after the supervision and force checks, and
+	// under a deadline: it is served under the daemon's operation lock, so a
+	// long suspend or destroy must never be able to hang --force
+	activity, activityErr := daemonClusterActivity(socketPath)
+	if !force {
+		if activityErr != nil {
+			return fmt.Errorf("tbx could not tell whether clusters are running (%v); restarting tbxd stops every running cluster — re-run: tbx system restart --force", activityErr)
+		}
+		if !activity.empty() {
+			return errors.New(restartRefusal(activity))
+		}
+	}
+	restarted, restartedPID, err := replaceDaemon(socketPath, info, pid)
+	if err != nil {
+		return err
+	}
+	switch {
+	case activityErr != nil:
+		if _, err := fmt.Fprintln(c.out, "stopped clusters: unknown (state query failed)"); err != nil {
+			return err
+		}
+	case !activity.empty():
+		if _, err := fmt.Fprintf(c.out, "stopped clusters: %s\n", activity.describe()); err != nil {
+			return err
+		}
+	}
+	_, err = fmt.Fprintf(c.out, "restarted tbxd (pid %d, protocol %d)\n", restartedPID, restarted.ProtocolVersion)
+	return err
+}
+
+// refuseSupervisedRestart decides whether tbx may replace this daemon. A
+// supervisor that confirms it owns an active tbxd is never overridden. A merely
+// inferred unit file — every packaged install ships one, whether or not it is
+// in use — is refused without --force but yields to it, so the recovery chain
+// does not dead-end on a file that proves nothing.
+func refuseSupervisedRestart(force bool) error {
+	state, reason := supervisedDaemon()
+	if state == supervisionConfirmed || (state == supervisionInferred && !force) {
+		// supervisionRefusal is shared with the protocol gate in client.go, so
+		// the two callers cannot name different ways out of the same state
+		return errors.New(supervisionRefusal(state, reason))
+	}
+	return nil
+}
+
+// daemonStatus reports the running daemon without spawning one, so an operator
+// can see a protocol skew before it bites.
+func (c cli) daemonStatus() error {
+	socketPath, err := daemon.SocketPath()
+	if err != nil {
+		return err
+	}
+	info, pid, err := daemonHandshake(socketPath)
+	if err != nil {
+		var connectionError dialError
+		if errors.As(err, &connectionError) {
+			_, err := fmt.Fprintf(c.out, "tbxd: not running (tbx protocol %d)\n", daemon.ProtocolVersion)
+			return err
+		}
+		var busy busyDaemonError
+		if errors.As(err, &busy) {
+			// daemon.info waits on the operation lock; a long suspend or
+			// destroy must report as busy rather than hang the diagnostic
+			_, err := fmt.Fprintf(c.out, "tbxd: busy (pid %d; tbx protocol %d)\n", busy.pid, daemon.ProtocolVersion)
+			return err
+		}
+		return err
+	}
+	protocol := strconv.Itoa(info.ProtocolVersion)
+	if info.ProtocolVersion == 0 {
+		// pre-daemon.info builds cannot report a version at all
+		protocol = "unknown"
+	}
+	if _, err := fmt.Fprintf(c.out, "tbxd: running (pid %d, protocol %s; tbx protocol %d)\n",
+		pid, protocol, daemon.ProtocolVersion); err != nil {
+		return err
+	}
+	if info.ProtocolVersion == daemon.ProtocolVersion {
+		return nil
+	}
+	_, err = fmt.Fprintf(c.err, "warning: tbxd protocol %s does not match tbx protocol %d; run: tbx system restart\n",
+		protocol, daemon.ProtocolVersion)
+	return err
 }
 
 func (c cli) installSystem(args []string) error {
