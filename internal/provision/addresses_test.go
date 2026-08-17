@@ -290,7 +290,7 @@ func TestSecureClientDialsObservedEndpoint(t *testing.T) {
 // which address never answered.
 func TestMachineConfigWithRetryNamesUnreachableEndpoint(t *testing.T) {
 	unavailable := status.Error(codes.Unavailable, "i/o timeout")
-	client := &fakeClient{schedulingErrs: []error{unavailable, unavailable, unavailable}}
+	client := &fakeClient{configErrs: []error{unavailable, unavailable, unavailable}}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Millisecond)
 	defer cancel()
 	_, err := machineConfigWithRetry(ctx, client, "172.30.0.2", ConfigTarget{Endpoint: "https://172.30.0.2:6443", ControlPlaneScheduling: true}, time.Millisecond)
@@ -352,9 +352,7 @@ func TestReconcileRepairsEndpointAndSchedulingInOneApply(t *testing.T) {
 	}
 }
 
-// withConfigTarget is what makes the single apply carry both repairs.
-func TestWithConfigTargetComposesBothRepairs(t *testing.T) {
-	const config = `version: v1alpha1
+const controlPlaneEndpointConfig = `version: v1alpha1
 machine:
   type: controlplane
   nodeLabels:
@@ -364,8 +362,11 @@ cluster:
     endpoint: https://172.30.0.25:6443
   allowSchedulingOnControlPlanes: false
 `
+
+// withConfigTarget is what makes the single apply carry both repairs.
+func TestWithConfigTargetComposesBothRepairs(t *testing.T) {
 	target := ConfigTarget{Endpoint: "https://172.30.0.26:6443", ControlPlaneScheduling: true, Workerless: true}
-	patched, changes, err := withConfigTarget([]byte(config), target)
+	patched, changes, err := withConfigTarget([]byte(controlPlaneEndpointConfig), target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -377,13 +378,25 @@ cluster:
 		strings.Contains(string(patched), loadBalancerExclusionLabel) {
 		t.Fatalf("composed patch lost a repair:\n%s", patched)
 	}
-	// A worker carries the endpoint but has no scheduling adaptations.
-	_, changes, err = withConfigTarget([]byte(config), ConfigTarget{Endpoint: "https://172.30.0.26:6443"})
+	// A worker carries the endpoint and nothing else: the control-plane
+	// adaptations do not exist in its config, and injecting them would make
+	// every worker announce VIPs and claim a scheduling flag it has no say over.
+	const workerConfig = `version: v1alpha1
+machine:
+  type: worker
+cluster:
+  controlPlane:
+    endpoint: https://172.30.0.25:6443
+`
+	patched, changes, err = withConfigTarget([]byte(workerConfig), ConfigTarget{Endpoint: "https://172.30.0.26:6443", Workerless: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if changes != (ConfigChanges{Endpoint: true}) {
 		t.Fatalf("changes = %+v, want the endpoint only", changes)
+	}
+	if strings.Contains(string(patched), "allowSchedulingOnControlPlanes") || strings.Contains(string(patched), loadBalancerExclusionLabel) {
+		t.Fatalf("worker config gained control-plane adaptations:\n%s", patched)
 	}
 }
 
@@ -407,10 +420,25 @@ func TestReconcileNamesControlPlanesWithoutALease(t *testing.T) {
 }
 
 // Bootstrap runs right after config applies that can take apid away for a
-// moment, so it gets the same tolerance as every other authenticated call.
+// moment, so a whole pass must survive one Unavailable bootstrap.
+func TestReconcileRetriesBootstrapAcrossTransientTalosRestart(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item := leaseCluster(t)
+	client := &fakeClient{kubeData: []byte("kubeconfig"), bootErrs: []error{status.Error(codes.Unavailable, "apid restarting")}}
+	if _, err := Reconcile(context.Background(), Request{Cluster: item, Client: client, PollInterval: time.Millisecond,
+		Observe: func(context.Context) ([]Node, error) {
+			return []Node{{Name: item.Nodes[0].Name, Role: cluster.RoleControlPlane, IP: "172.30.0.25", Phase: PhaseConfigured}}, nil
+		}}); err != nil {
+		t.Fatal(err)
+	}
+	if client.bootstrap != 2 {
+		t.Fatalf("bootstrap calls = %d, want a retry after the transient failure", client.bootstrap)
+	}
+}
+
 func TestBootstrapWithRetryHandlesTransientTalosRestart(t *testing.T) {
 	client := &fakeClient{bootErrs: []error{status.Error(codes.Unavailable, "apid restarting")}}
-	if err := bootstrapWithRetry(context.Background(), client, "172.30.0.25", 0); err != nil {
+	if err := bootstrapWithRetry(context.Background(), client, "172.30.0.25", time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
 	if client.bootstrap != 2 {
@@ -420,7 +448,7 @@ func TestBootstrapWithRetryHandlesTransientTalosRestart(t *testing.T) {
 
 func TestBootstrapWithRetryDoesNotHidePermanentErrors(t *testing.T) {
 	client := &fakeClient{bootErrs: []error{status.Error(codes.PermissionDenied, "bad credential")}}
-	err := bootstrapWithRetry(context.Background(), client, "172.30.0.25", 0)
+	err := bootstrapWithRetry(context.Background(), client, "172.30.0.25", time.Millisecond)
 	if err == nil || !strings.Contains(err.Error(), "bad credential") {
 		t.Fatalf("bootstrapWithRetry() error = %v, want permanent error", err)
 	}

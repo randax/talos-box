@@ -49,11 +49,12 @@ type fakeClient struct {
 
 	scheduling        []schedulingCall
 	schedulingChanged []bool
-	schedulingErrs    []error
 
 	endpoints       []endpointCall
 	endpointChanged []bool
-	endpointErrs    []error
+
+	// configErrs is one queue for the one composed reconcile call.
+	configErrs []error
 }
 
 type schedulingCall struct {
@@ -79,13 +80,11 @@ func (f *fakeClient) ReconcileMachineConfig(_ context.Context, node string, targ
 	if target.ControlPlaneScheduling && len(f.schedulingChanged) > 0 {
 		changes.Scheduling, f.schedulingChanged = f.schedulingChanged[0], f.schedulingChanged[1:]
 	}
-	for _, queue := range []*[]error{&f.endpointErrs, &f.schedulingErrs} {
-		if len(*queue) > 0 {
-			var err error
-			err, *queue = (*queue)[0], (*queue)[1:]
-			if err != nil {
-				return ConfigChanges{}, err
-			}
+	if len(f.configErrs) > 0 {
+		var err error
+		err, f.configErrs = f.configErrs[0], f.configErrs[1:]
+		if err != nil {
+			return ConfigChanges{}, err
 		}
 	}
 	return changes, nil

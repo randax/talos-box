@@ -191,7 +191,7 @@ func TestReconcileStaysSilentWhenControlPlaneSchedulingIsConverged(t *testing.T)
 func TestReconcileFailsWithNodeContextWhenSchedulingReconcileFails(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	refused := errors.New("apid refused the patch")
-	client := &fakeClient{kubeData: []byte("kubeconfig"), schedulingErrs: []error{refused}}
+	client := &fakeClient{kubeData: []byte("kubeconfig"), configErrs: []error{refused}}
 	item, request := schedulingRequest(t, 0, client)
 	_, err := Reconcile(context.Background(), request)
 	if !errors.Is(err, refused) {
