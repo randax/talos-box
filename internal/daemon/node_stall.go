@@ -5,6 +5,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/randax/talos-box/internal/cluster"
 )
 
 // Node stall observability (#288): a node that never answers apid used to be
@@ -248,19 +250,58 @@ func (s *Server) stopStallWatch() {
 	<-done
 }
 
-// observeNodeStalls runs the same observation dispatchStatus runs, and with the
-// same locking: the VM snapshot is taken under opMu, and the apid probes that
-// follow run outside it so a silent node cannot block lifecycle operations. It
-// skips the Kubernetes and storage probes, which no log line depends on.
+// observeNodeStalls runs the same observation dispatchStatus runs, but holds
+// opMu only for the in-memory VM inventory: the filesystem-backed cluster
+// loads and the apid probes both run after the lock is released, so neither a
+// slow disk nor a silent node can delay lifecycle operations. It skips the
+// Kubernetes and storage probes, which no log line depends on, and clusters
+// with no VMs at all — their nodes are stopped, and stop/destroy already
+// forget their stall tracking.
 //
-// A failed status read is dropped silently: it repeats every interval, and a
+// A failed cluster load is dropped silently: it repeats every interval, and a
 // daemon that logged it would fill tbxd.log with the same line forever.
 func (s *Server) observeNodeStalls() {
+	type nodeSnapshot struct {
+		running   bool
+		startedAt *time.Time
+	}
 	s.opMu.Lock()
-	statuses, err := s.status(nil)
+	inventory := make(map[string]map[string]nodeSnapshot, len(s.vms))
+	for clusterName, nodes := range s.vms {
+		snapshot := make(map[string]nodeSnapshot, len(nodes))
+		for nodeName, machine := range nodes {
+			snapshot[nodeName] = nodeSnapshot{
+				running:   machine != nil && machine.Active(),
+				startedAt: s.vmStartedAt(clusterName, nodeName),
+			}
+		}
+		inventory[clusterName] = snapshot
+	}
 	s.opMu.Unlock()
-	if err != nil {
-		return
+
+	statuses := make([]ClusterStatus, 0, len(inventory))
+	for clusterName, nodes := range inventory {
+		item, err := cluster.Load(clusterName)
+		if err != nil {
+			continue
+		}
+		status := ClusterStatus{Name: item.Name, subnetIndex: item.SubnetIndex}
+		for _, node := range item.Nodes {
+			snapshot, tracked := nodes[node.Name]
+			if !tracked {
+				continue
+			}
+			status.Nodes = append(status.Nodes, NodeStatus{
+				Name:      node.Name,
+				Role:      node.Role,
+				MAC:       node.MAC,
+				Phase:     ClassifyPhase(snapshot.running, ProbeResult{}),
+				StartedAt: snapshot.startedAt,
+			})
+		}
+		if len(status.Nodes) > 0 {
+			statuses = append(statuses, status)
+		}
 	}
 	s.refreshNodeStatuses(statuses)
 }
