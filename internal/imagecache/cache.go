@@ -551,9 +551,18 @@ func planKnownVersionPrune(versionPath, schematic, version string, keep func(Com
 				return nil, nil, 0, false, err
 			}
 			if kept {
-				keptCount++
-				if architecture == ArchitectureARM64 {
-					arm64Kept = true
+				// Count (and dedupe against the legacy layout) only when an
+				// image is actually being kept: cache list keys on disk.raw,
+				// and the kept report must agree with it.
+				diskPresent, err := pathExists(filepath.Join(archDir, "disk.raw"))
+				if err != nil {
+					return nil, nil, 0, false, err
+				}
+				if diskPresent {
+					keptCount++
+					if architecture == ArchitectureARM64 {
+						arm64Kept = true
+					}
 				}
 				// A kept combination still sheds abandoned partial
 				// downloads: they are safe to delete regardless of
@@ -647,15 +656,10 @@ func planKnownVersionPrune(versionPath, schematic, version string, keep func(Com
 
 // legacyArtifactsPresent reports whether the pre-architecture flat layout
 // actually holds an image for this version, so a kept legacy combination is
-// only counted when there is something being kept.
+// only counted when there is something being kept. It keys on disk.raw, the
+// same file Cache.List keys on, so the kept report and the listing agree.
 func legacyArtifactsPresent(versionPath string) (bool, error) {
-	for _, name := range []string{"disk.raw", fmt.Sprintf("metal-%s.raw.xz", ArchitectureARM64)} {
-		exists, err := pathExists(filepath.Join(versionPath, name))
-		if err != nil || exists {
-			return exists, err
-		}
-	}
-	return false, nil
+	return pathExists(filepath.Join(versionPath, "disk.raw"))
 }
 
 func keepCombination(keep func(Combination) (bool, error), combination Combination) (bool, error) {

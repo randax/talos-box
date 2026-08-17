@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"crypto/tls"
 	"crypto/x509"
 	_ "embed"
 	"encoding/json"
@@ -782,7 +781,7 @@ func waitForAPIServer(ctx context.Context, config *rest.Config, interval time.Du
 		if err == nil {
 			return nil
 		}
-		if apierrors.IsUnauthorized(err) || apierrors.IsForbidden(err) || isCertificateError(err) {
+		if apierrors.IsUnauthorized(err) || apierrors.IsForbidden(err) || isUntrustedCertificateError(err) {
 			return terminal(err)
 		}
 		return err
@@ -792,13 +791,14 @@ func waitForAPIServer(ctx context.Context, config *rest.Config, interval time.Du
 	return nil
 }
 
-func isCertificateError(err error) bool {
-	var verification *tls.CertificateVerificationError
+// isUntrustedCertificateError matches only trust-chain failures that cannot
+// heal by waiting: the kubeconfig pins the CA, so an unknown authority is
+// permanent. Expired/not-yet-valid certs (guest clock skew right after boot)
+// and hostname mismatches (serving-cert SANs lagging a fresh control-plane
+// lease) resolve on their own and must stay retryable.
+func isUntrustedCertificateError(err error) bool {
 	var unknownAuthority x509.UnknownAuthorityError
-	var hostname x509.HostnameError
-	var invalid x509.CertificateInvalidError
-	return errors.As(err, &verification) || errors.As(err, &unknownAuthority) ||
-		errors.As(err, &hostname) || errors.As(err, &invalid)
+	return errors.As(err, &unknownAuthority)
 }
 
 func waitForCilium(ctx context.Context, client kubernetes.Interface, interval time.Duration) error {

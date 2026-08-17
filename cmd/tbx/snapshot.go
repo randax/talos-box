@@ -110,7 +110,7 @@ func (c cli) snapshotList(args []string) error {
 	if err != nil {
 		return err
 	}
-	if len(positionals) != 1 {
+	if len(positionals) != 1 || (*outputFormat != "table" && *outputFormat != "json") {
 		return errors.New("usage: tbx snapshot list <cluster> [-o json]")
 	}
 	var snaps []cluster.SnapshotInfo
@@ -118,6 +118,9 @@ func (c cli) snapshotList(args []string) error {
 		return err
 	}
 	if *outputFormat == "json" {
+		if snaps == nil {
+			snaps = []cluster.SnapshotInfo{}
+		}
 		return encodeJSON(c.out, snaps)
 	}
 	if len(snaps) == 0 {

@@ -796,7 +796,17 @@ func TestWaitForAPIServerRetriesRefusedDialsUntilServerListens(t *testing.T) {
 	served := make(chan struct{})
 	go func() {
 		time.Sleep(listenAfter)
-		listener, err := net.Listen("tcp", address)
+		var listener net.Listener
+		var err error
+		// Another process can steal the released port; retry the bind briefly
+		// instead of silently leaving the wait to hit its 10 s deadline.
+		for attempt := 0; attempt < 40; attempt++ {
+			listener, err = net.Listen("tcp", address)
+			if err == nil {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
 		if err != nil {
 			return
 		}
@@ -861,5 +871,22 @@ func TestDeleteStaleCiliumAnnouncementsToleratesAbsentBGPCRDs(t *testing.T) {
 	mapper := meta.NewDefaultRESTMapper(nil)
 	if err := deleteStaleCiliumAnnouncements(context.Background(), client, mapper, item); err != nil {
 		t.Fatalf("stale BGP cleanup with absent CRDs = %v, want nil", err)
+	}
+}
+
+func TestWaitForAPIServerFailsFastOnUntrustedCertificate(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = writer.Write([]byte(`{"major":"1","minor":"34"}`))
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	start := time.Now()
+	err := waitForAPIServer(ctx, &rest.Config{Host: server.URL}, 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("API server wait trusted a certificate from an unknown authority")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("untrusted CA burned %v of the deadline, want fail-fast", elapsed)
 	}
 }
