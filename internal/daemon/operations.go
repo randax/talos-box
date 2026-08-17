@@ -583,8 +583,6 @@ func (s *Server) start(item cluster.Cluster) ([]string, error) {
 		s.vms[item.Name] = nodes
 	}
 	var started []string
-	var discarded bool
-	var discardFailures []string
 	for _, node := range item.Nodes {
 		if existing := nodes[node.Name]; existing != nil {
 			if existing.Active() {
@@ -602,14 +600,19 @@ func (s *Server) start(item cluster.Cluster) ([]string, error) {
 		}
 		nodes[node.Name] = machine
 		started = append(started, node.Name)
-		// start is a cold boot: suspended memory left by an earlier suspend is
-		// superseded by this launch and must not outlive it, or status keeps
-		// reporting the cluster Suspended and the hint keeps recommending a
-		// restore onto memory that no longer matches what is running. It only
-		// becomes superseded once the launch succeeds — launchMachine never
-		// reads the save, so discarding first would destroy the memory a
-		// rolled-back start still needs `cluster resume` to be able to use.
-		dropped, failure := discardSavedState(dir, node.Name)
+	}
+	// start is a cold boot: suspended memory left by an earlier suspend is
+	// superseded by these launches and must not outlive them, or status keeps
+	// reporting the cluster Suspended and the hint keeps recommending a restore
+	// onto memory that no longer matches what is running. The saves are only
+	// superseded once EVERY launch has succeeded — launchMachine never reads a
+	// save, and a later node's failure rolls the whole start back, so discarding
+	// inside the loop would leave `cluster resume` a half-suspended set to
+	// restore from (mirrors resumeNodeBatch's batch commit).
+	var discarded bool
+	var discardFailures []string
+	for _, name := range started {
+		dropped, failure := discardSavedState(dir, name)
 		if dropped {
 			discarded = true
 		}
@@ -960,8 +963,13 @@ func (s *Server) addNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTask
 	}
 	status := nodeStatus(node, item.SubnetIndex, s.nodeRunning(item.Name, node.Name))
 	customSchematic := s.defaultSchematic != "" && item.Schematic != "" && item.Schematic != s.defaultSchematic
-	status.setWarnings(append([]string{overcommitWarning}, append(hostPressureWarnings, subnetWarning, s.longhornCustomSchematicWarning(item, customSchematic))...)...)
-	return status, s.beginNodeMutationProvisionLocked(item), nil
+	tasks, deferredReconcile := s.beginNodeMutationProvisionLocked(item)
+	var deferredWarning string
+	if deferredReconcile {
+		deferredWarning = nodeAddDeferredReconcileWarning(node.Name)
+	}
+	status.setWarnings(append([]string{overcommitWarning}, append(hostPressureWarnings, subnetWarning, s.longhornCustomSchematicWarning(item, customSchematic), deferredWarning)...)...)
+	return status, tasks, nil
 }
 
 func (s *Server) removeNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTask, error) {
@@ -992,7 +1000,12 @@ func (s *Server) removeNodeLocked(raw json.RawMessage) (NodeStatus, []provisionT
 	if err := removeNodeFiles(item.Name, node.Name); err != nil {
 		return NodeStatus{}, nil, err
 	}
-	return nodeStatus(node, item.SubnetIndex, false), s.beginNodeMutationProvisionLocked(item), nil
+	tasks, deferredReconcile := s.beginNodeMutationProvisionLocked(item)
+	status := nodeStatus(node, item.SubnetIndex, false)
+	if deferredReconcile {
+		status.setWarnings(nodeRemoveDeferredReconcileWarning(node.Name))
+	}
+	return status, tasks, nil
 }
 
 func (s *Server) handleNodeMutationLocked(request Request) (any, []provisionTask, error) {

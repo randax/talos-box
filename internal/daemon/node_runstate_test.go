@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/randax/talos-box/internal/balloon"
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/hypervisor"
 	"github.com/randax/talos-box/internal/provision"
@@ -299,6 +300,41 @@ func TestNodeAddOverAPartlyStoppedClusterSchedulesNoReconcile(t *testing.T) {
 	if got := atomic.LoadInt32(runs); got != 0 {
 		t.Fatalf("node.add over a partly stopped cluster ran %d reconcile(s), want none", got)
 	}
+	// The skipped reconcile is the whole story for the operator: the VM is up
+	// but unconfigured, and only "added node ..." would otherwise be printed.
+	status := decodeNodeStatus(t, response)
+	joined := strings.Join(status.Warnings, "\n")
+	for _, want := range []string{"cluster members are stopped", "demo-worker-2", "unconfigured"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("node.add warnings = %q, want them to mention %q", status.Warnings, want)
+		}
+	}
+}
+
+// A substrate-only cluster has no reconcile to defer, so warning about one
+// would be a lie the operator cannot act on.
+func TestNodeAddOverAPartlyStoppedSubstrateClusterCarriesNoReconcileWarning(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 1)
+	item.ProvisioningIntent = cluster.ProvisioningIntent{}
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	countingReconcile(service)
+	delete(service.vms[item.Name], "demo-worker-1")
+
+	raw, err := json.Marshal(nodeArgs{Cluster: item.Name, Name: "demo-worker-2", Role: cluster.RoleWorker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := service.dispatch(Request{Op: "node.add", Args: raw})
+
+	if !response.OK {
+		t.Fatalf("node.add failed: %s", response.Error)
+	}
+	status := decodeNodeStatus(t, response)
+	if joined := strings.Join(status.Warnings, "\n"); strings.Contains(joined, "cluster members are stopped") {
+		t.Fatalf("node.add on a substrate-only cluster warned about a reconcile it never runs: %q", status.Warnings)
+	}
 }
 
 func TestNodeRemoveOverAPartlyStoppedClusterSchedulesNoReconcile(t *testing.T) {
@@ -306,6 +342,7 @@ func TestNodeRemoveOverAPartlyStoppedClusterSchedulesNoReconcile(t *testing.T) {
 	runs := countingReconcile(service)
 	service.nodeVolumeCount = func(context.Context, cluster.Cluster, string) (int, error) { return 0, nil }
 	delete(service.vms[item.Name], "demo-worker-1")
+	service.storagePhases[item.Name] = StoragePhaseLive
 
 	response := dispatchNodeRemove(t, service, item.Name, "demo-worker-2", false)
 
@@ -315,6 +352,18 @@ func TestNodeRemoveOverAPartlyStoppedClusterSchedulesNoReconcile(t *testing.T) {
 	service.backgroundProvisions.Wait()
 	if got := atomic.LoadInt32(runs); got != 0 {
 		t.Fatalf("node.remove over a partly stopped cluster ran %d reconcile(s), want none", got)
+	}
+	// A skipped reconcile is not a reason to keep a `live` memo standing:
+	// membership just changed, and refreshStoragePhases short-circuits on it.
+	if phase, ok := service.storagePhases[item.Name]; ok {
+		t.Fatalf("node.remove left storage phase %q recorded; it must be re-probed after a membership change", phase)
+	}
+	status := decodeNodeStatus(t, response)
+	joined := strings.Join(status.Warnings, "\n")
+	for _, want := range []string{"cluster members are stopped", "not reconciled"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("node.remove warnings = %q, want them to mention %q", status.Warnings, want)
+		}
 	}
 }
 
@@ -390,6 +439,52 @@ func TestNodeStartUnderHostPressureWithForceWarns(t *testing.T) {
 	status := decodeNodeStatus(t, response)
 	if !strings.Contains(strings.Join(status.Warnings, "\n"), "host swap is 90% used") {
 		t.Fatalf("forced node.start warnings = %q, want the host-pressure finding", status.Warnings)
+	}
+}
+
+// TestNodeStartDoesNotDoubleCountItsOwnMemory pins the accounting: a running
+// cluster's whole configured memory — the stopped member's share included — is
+// already in the commitment checkOvercommit sums, so charging the started
+// node's memory on top would refuse a member that costs the host nothing new.
+// `cluster start` avoids it by skipping the check for a running cluster; the
+// per-node verb must mirror that.
+func TestNodeStartDoesNotDoubleCountItsOwnMemory(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 2)
+	stubNodeMutationReconcile(service)
+	delete(service.vms[item.Name], "demo-worker-2")
+	// The host fits the cluster exactly: only a double-charged node tips it over.
+	service.hostTotalMemory = func() (int, error) {
+		return balloon.DefaultConfig().ReserveMiB + clusterMemoryMiB(item), nil
+	}
+
+	response := dispatchNodeRunState(t, service, "node.start", item.Name, "demo-worker-2")
+
+	if !response.OK {
+		t.Fatalf("node.start of a stopped member of a running cluster was refused: %s", response.Error)
+	}
+	if !service.nodeRunning(item.Name, "demo-worker-2") {
+		t.Fatal("node.start did not launch the node")
+	}
+}
+
+// The guard is still real where the memory is genuinely new: starting into a
+// stopped cluster commits host memory nothing else has claimed.
+func TestNodeStartOfAStoppedClusterStillRefusesOvercommit(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 1)
+	stubNodeMutationReconcile(service)
+	delete(service.vms, item.Name)
+	service.hostTotalMemory = func() (int, error) { return balloon.DefaultConfig().ReserveMiB, nil }
+
+	response := dispatchNodeRunState(t, service, "node.start", item.Name, "demo-cp-1")
+
+	if response.OK {
+		t.Fatal("node.start into a stopped cluster ignored the overcommit guard")
+	}
+	if !strings.Contains(response.Error, "exceeds host") {
+		t.Fatalf("node.start error = %q, want the overcommit refusal", response.Error)
+	}
+	if service.nodeRunning(item.Name, "demo-cp-1") {
+		t.Fatal("node.start launched the node despite refusing")
 	}
 }
 

@@ -508,20 +508,26 @@ func (c cli) runNodeRunState(verb string, args []string) error {
 	flags := flag.NewFlagSet("node "+verb, flag.ContinueOnError)
 	flags.SetOutput(c.err)
 	// start is gated on host memory and pressure exactly like cluster start and
-	// node add; stop accepts the flag so both verbs share one wire shape, and
-	// the daemon simply has nothing to override for a power-off.
-	force := flags.Bool("force", false, "proceed despite memory overcommit or host pressure")
+	// node add, so it takes --force. stop overrides nothing — a power-off frees
+	// host resources — so the flag is not registered there rather than accepted
+	// and ignored while its help promises an override.
+	var force bool
+	usage := fmt.Sprintf("usage: tbx node %s <cluster> <node>", verb)
+	if verb == "start" {
+		flags.BoolVar(&force, "force", false, "proceed despite memory overcommit or host pressure")
+		usage += " [--force]"
+	}
 	positionals, err := parseInterspersed(flags, args)
 	if err != nil {
 		return err
 	}
 	if len(positionals) != 2 {
-		return fmt.Errorf("usage: tbx node %s <cluster> <node> [--force]", verb)
+		return errors.New(usage)
 	}
 	if err := c.ensureNodeRunStateSupport(verb); err != nil {
 		return err
 	}
-	request := map[string]any{"cluster": positionals[0], "name": positionals[1], "force": *force}
+	request := map[string]any{"cluster": positionals[0], "name": positionals[1], "force": force}
 	var result daemon.NodeStatus
 	if err := c.call("node."+verb, request, &result); err != nil {
 		return err

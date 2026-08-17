@@ -125,6 +125,78 @@ func TestStartClusterKeepsSavedStateWhenLaunchFails(t *testing.T) {
 	}
 }
 
+// TestStartClusterKeepsEverySavedStateWhenALaterLaunchFails is the batch half:
+// an earlier node's launch succeeding does not commit its save, because a later
+// node's failure rolls the whole start back. Discarding as each launch lands
+// would leave `cluster resume` a half-suspended set to restore from — one stale
+// member restored, the rest cold-booted.
+func TestStartClusterKeepsEverySavedStateWhenALaterLaunchFails(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("late-fail-save", 0, 1, 1, cluster.NodeDefaults{CPUs: 1, MemoryMiB: 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	writeSavedState(t, item)
+	if len(item.Nodes) != 2 {
+		t.Fatalf("fixture has %d nodes, want 2", len(item.Nodes))
+	}
+
+	var launches int
+	service := &Server{
+		hypervisor: &fakeHypervisor{launch: func(context.Context, hypervisor.Spec) (hypervisor.Machine, error) {
+			launches++
+			if launches == 1 {
+				return &fakeMachine{active: true}, nil
+			}
+			return nil, errors.New("no hypervisor today")
+		}},
+		vms:           make(map[string]map[string]hypervisor.Machine),
+		hostPressure:  noHostPressure,
+		subnetSources: emptySubnetSources(),
+	}
+	raw, err := json.Marshal(startArgs{Name: item.Name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.startCluster(raw); err == nil {
+		t.Fatal("startCluster() succeeded despite a failing launch")
+	}
+	for _, node := range item.Nodes {
+		if !savedStateExists(t, item.Name, node.Name) {
+			t.Fatalf("a rolled-back start discarded %s's saved state; the suspended set is now inconsistent", node.Name)
+		}
+	}
+	if !clusterHasSavedState(item.Name) {
+		t.Fatal("the cluster stopped reporting saved state after a rolled-back start")
+	}
+}
+
+// TestNodeRemoveDeletesTheNodesSavedState pins the cleanup: clusterHasSavedState
+// only globs the directory, so a save orphaned by a removal keeps the whole
+// cluster reporting Suspended and keeps the hint pushing a resume forever.
+func TestNodeRemoveDeletesTheNodesSavedState(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 1)
+	countingReconcile(service)
+	service.nodeVolumeCount = func(context.Context, cluster.Cluster, string) (int, error) { return 0, nil }
+	writeSavedState(t, item)
+	delete(service.vms, item.Name)
+
+	response := dispatchNodeRemove(t, service, item.Name, "demo-worker-1", false)
+
+	if !response.OK {
+		t.Fatalf("node.remove failed: %s", response.Error)
+	}
+	if savedStateExists(t, item.Name, "demo-worker-1") {
+		t.Fatal("node.remove orphaned the removed node's saved state")
+	}
+	if !savedStateExists(t, item.Name, "demo-cp-1") {
+		t.Fatal("node.remove deleted a saved state for a node it was not asked about")
+	}
+}
+
 // TestNodeStartKeepsSavedStateWhenLaunchFails is the per-node half.
 func TestNodeStartKeepsSavedStateWhenLaunchFails(t *testing.T) {
 	service, item := runningLonghornClusterForNodeMutation(t, 1, 1)

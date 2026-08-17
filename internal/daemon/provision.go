@@ -150,16 +150,50 @@ func (s *Server) beginProvisionTasksLocked(items []cluster.Cluster) []provisionT
 // each of them. A partly-running cluster would spin to the provision timeout —
 // synchronously on `node add`'s request path — and park storage at
 // `provisioning`, so it schedules nothing (#332).
-func (s *Server) beginNodeMutationProvisionLocked(item cluster.Cluster) []provisionTask {
+// It reports whether the reconcile was deferred, so a caller whose operation
+// silently left the cluster unconverged can say so (#333).
+func (s *Server) beginNodeMutationProvisionLocked(item cluster.Cluster) ([]provisionTask, bool) {
 	if !s.allNodesRunning(item) {
 		log.Printf("provision %s: cluster is only partly running, skipping reconcile", item.Name)
-		return nil
+		// Membership or run state just changed, so a recorded `live` phase is
+		// stale whether or not a reconcile follows: refreshStoragePhases
+		// short-circuits on it and would keep reporting storage live over a
+		// topology that no longer matches. Invalidating only drops the memo —
+		// the phase is re-probed, not parked at `provisioning`.
+		s.invalidateStoragePhaseLocked(item.Name)
+		return nil, clusterIsProvisioned(item)
 	}
 	tasks := s.beginProvisionTasksLocked([]cluster.Cluster{item})
 	for i := range tasks {
 		tasks[i].force = true
 	}
-	return tasks
+	return tasks, false
+}
+
+// clusterIsProvisioned reports whether the cluster has a provisioning stage at
+// all. A substrate-only cluster never reconciles, so a deferred reconcile is
+// not something its operator can act on and must not be warned about.
+func clusterIsProvisioned(item cluster.Cluster) bool {
+	return item.CNI == cluster.CNIFlannel || item.CNI == cluster.CNICilium
+}
+
+// nodeAddDeferredReconcileWarning explains the silence: the VM is up but no
+// reconcile ran, so the new node sits in maintenance mode, unconfigured, until
+// the operator brings the rest of the cluster back.
+func nodeAddDeferredReconcileWarning(nodeName string) string {
+	return fmt.Sprintf(
+		"cluster members are stopped; node %s stays unconfigured until every member is running — start them to trigger provisioning",
+		nodeName,
+	)
+}
+
+// nodeRemoveDeferredReconcileWarning is the other half: the member is gone from
+// state and disk, but the running cluster has not been told.
+func nodeRemoveDeferredReconcileWarning(nodeName string) string {
+	return fmt.Sprintf(
+		"cluster members are stopped; the cluster is not reconciled until every member is running — removing %s takes effect once they are started",
+		nodeName,
+	)
 }
 
 func (s *Server) finishProvision(task provisionTask) {

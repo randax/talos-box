@@ -30,14 +30,22 @@ func (s *Server) startNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTa
 		log.Printf("node.start %s/%s: already running", item.Name, node.Name)
 		return nodeStatus(node, item.SubnetIndex, true), nil, nil
 	}
+	firstNode := !s.clusterRunning(item.Name)
 	// Powering a node on commits the same host memory `cluster start` and
 	// `node add` are gated on, so it answers to the same guards: a hard refusal
-	// without --force, an advisory finding with it.
-	overcommitWarning, err := s.checkOvercommit(item.DefaultsFor(node.Role).MemoryMiB, args.Force)
-	if err != nil {
-		return NodeStatus{}, nil, err
+	// without --force, an advisory finding with it. It is only an ADDITION while
+	// the cluster is stopped: checkOvercommit already counts every configured
+	// node of every running cluster, this node included, so charging it again
+	// over a partly-running cluster would double-count it and refuse a member
+	// whose memory is already in the commitment (mirrors startCluster, which
+	// skips the check outright for a running cluster).
+	var overcommitWarning string
+	if firstNode {
+		overcommitWarning, err = s.checkOvercommit(item.DefaultsFor(node.Role).MemoryMiB, args.Force)
+		if err != nil {
+			return NodeStatus{}, nil, err
+		}
 	}
-	firstNode := !s.clusterRunning(item.Name)
 	var subnetWarning string
 	if firstNode {
 		// The subnet was decided at create time and belongs to this cluster, so
@@ -93,7 +101,10 @@ func (s *Server) startNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTa
 	status.setWarnings(append([]string{overcommitWarning}, append(hostPressureWarnings, subnetWarning, discardWarning, discardFailure)...)...)
 	// beginNodeMutationProvisionLocked schedules nothing while members are
 	// still powered off, so only the last stopped one coming back reconciles.
-	return status, s.beginNodeMutationProvisionLocked(item), nil
+	// Bringing members back up is the very act the deferred-reconcile warning
+	// asks for, so node.start does not repeat it back at the operator.
+	tasks, _ := s.beginNodeMutationProvisionLocked(item)
+	return status, tasks, nil
 }
 
 // stopNodeLocked powers one node's VM off, leaving it a cluster member with its

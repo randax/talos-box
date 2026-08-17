@@ -325,7 +325,7 @@ tbx cluster create|start|stop|destroy|list [name] [--cp N --workers N]
                   [--talos-version VERSION] [--schematic ID] [--extensions LIST]
 tbx node add <cluster> [node] [--role worker|control-plane] [--force]
 tbx node remove <cluster> <node> [--force]
-tbx node start|stop <cluster> <node> [--force]
+tbx node start <cluster> <node> [--force]      tbx node stop <cluster> <node>
 tbx cluster suspend|resume <cluster>
 tbx snapshot create <cluster> [name] [--yes]
 tbx snapshot restore <cluster> <name> [--yes] [--force]

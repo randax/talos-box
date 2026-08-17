@@ -73,6 +73,7 @@ type Server struct {
 	nodeIPLookup          func(string, int) string
 	nodeProbe             func(string) ProbeResult
 	hostFreeMemory        func() (int, error)
+	hostTotalMemory       func() (int, error)
 	helperCheck           func() error
 	maintenanceLoad       func(string) (cluster.Cluster, error)
 	lifecycleContext      context.Context
@@ -158,6 +159,7 @@ func NewServer(ctx context.Context) (*Server, error) {
 		subnetSources:         cluster.SystemSubnetSources(),
 		hostPressure:          hostpressure.SystemSnapshot,
 		hostFreeMemory:        balloon.HostFreeMiB,
+		hostTotalMemory:       balloon.HostTotalMiB,
 		destroyVolumeCount:    countDestroyStorageVolumes,
 		nodeVolumeCount:       countNodeRemovalStorageVolumes,
 		storageEngineDelete:   deleteConfiguredStorageEngine,
@@ -712,7 +714,11 @@ func removeNodeFiles(clusterName, nodeName string) error {
 	if err != nil {
 		return err
 	}
-	for _, suffix := range []string{".img", ".efi", ".console.sock", ".qga.sock"} {
+	// saveStateSuffix belongs here too: a removed node's suspended memory has
+	// nothing left to restore into, and clusterHasSavedState only globs the
+	// directory — an orphaned save would keep reporting the whole cluster
+	// Suspended and keep the hint recommending a resume forever.
+	for _, suffix := range []string{".img", ".efi", ".console.sock", ".qga.sock", saveStateSuffix} {
 		if err := os.Remove(filepath.Join(dir, nodeName+suffix)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("remove node file: %w", err)
 		}
