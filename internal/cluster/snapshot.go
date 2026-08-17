@@ -206,20 +206,22 @@ func readSnapshotState(clusterName, name string) (Cluster, error) {
 	return captured, nil
 }
 
-// ListSnapshots returns the cluster's snapshots, newest first.
+// ListSnapshots returns the cluster's snapshots, newest first. The result is
+// never nil on success: every daemon response embedding it must marshal an
+// empty set as [] — one wire contract across list, delete, create, restore.
 func ListSnapshots(clusterName string) ([]SnapshotInfo, error) {
+	out := []SnapshotInfo{}
 	base, err := snapshotsDir(clusterName)
 	if err != nil {
 		return nil, err
 	}
 	entries, err := os.ReadDir(base)
 	if os.IsNotExist(err) {
-		return nil, nil
+		return out, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	var out []SnapshotInfo
 	for _, entry := range entries {
 		if !entry.IsDir() || entry.Name()[0] == '.' {
 			continue

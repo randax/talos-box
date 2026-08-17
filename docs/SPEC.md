@@ -323,7 +323,7 @@ tbx node add|remove|start|stop <cluster> [node]
 tbx cluster suspend|resume <cluster>
 tbx snapshot create <cluster> [name] [--yes]
 tbx snapshot restore <cluster> <name> [--yes] [--force]
-tbx snapshot list <cluster>      tbx snapshot delete <cluster> <name>
+tbx snapshot list <cluster> [-o json]      tbx snapshot delete <cluster> <name>
 tbx status [cluster]      tbx manifests <cluster> [section|images] [--cni cilium|flannel]
 tbx console <cluster> <node>
 tbx bgp enable|disable <cluster>
@@ -334,6 +334,7 @@ tbx cache warm [--check [--deep]] <list-file> [<list-file>...]
 tbx cache list
 tbx cache prune [--mirror|--all]
 tbx doctor      tbx system install|uninstall
+tbx version (also --version, -v)
 ```
 
 `tbx cache list` reports Talos disk images and mirror-cache totals, labelling each disk-image

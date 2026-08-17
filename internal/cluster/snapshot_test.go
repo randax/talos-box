@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"sort"
@@ -301,5 +302,23 @@ func TestRestoreSnapshotRejectsStateAndDiskDisagreement(t *testing.T) {
 				t.Fatalf("live disk image count after a rejected restore = %d, want %d", liveImages, len(item.Nodes))
 			}
 		})
+	}
+}
+
+func TestListSnapshotsEmptyResultMarshalsAsArray(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	snapshots, err := ListSnapshots("no-such-cluster")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshots == nil {
+		t.Fatal("ListSnapshots returned nil; daemon responses embedding it would marshal null instead of []")
+	}
+	encoded, err := json.Marshal(snapshots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(encoded) != "[]" {
+		t.Fatalf("empty snapshot list marshals as %s, want []", encoded)
 	}
 }
