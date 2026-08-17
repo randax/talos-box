@@ -44,8 +44,41 @@ func TestCheckHostPressureAllowsStickySwapWhileMemoryPressureIsNormal(t *testing
 	if err != nil {
 		t.Fatalf("checkHostPressure() = %v, want no refusal for sticky swap with normal pressure", err)
 	}
-	if warning != "" {
-		t.Fatalf("checkHostPressure() warning = %q, want none", warning)
+	if !strings.Contains(warning, "host swap is 90% used") {
+		t.Fatalf("checkHostPressure() warning = %q, want an advisory sticky-swap warning", warning)
+	}
+}
+
+// The gate and tbx doctor read the same classification, so a refusal happens
+// for exactly the snapshots hostpressure.Assess calls blocking (#284).
+func TestCheckHostPressureRefusesExactlyTheBlockingAssessFindings(t *testing.T) {
+	snapshots := []hostpressure.Snapshot{
+		{},
+		{MemoryPressure: hostpressure.MemoryPressureNormal},
+		{MemoryPressure: hostpressure.MemoryPressureCritical},
+		{Swap: hostpressure.Usage{TotalBytes: 10 << 30, AvailableBytes: 1 << 30}},
+		{
+			Swap:           hostpressure.Usage{TotalBytes: 10 << 30, AvailableBytes: 1 << 30},
+			MemoryPressure: hostpressure.MemoryPressureNormal,
+		},
+		{
+			Swap:           hostpressure.Usage{TotalBytes: 10 << 30, AvailableBytes: 1 << 30},
+			MemoryPressure: hostpressure.MemoryPressureWarning,
+		},
+		{DataVolume: hostpressure.Usage{TotalBytes: 100 << 30, AvailableBytes: 5 << 30}},
+	}
+	for index, snapshot := range snapshots {
+		blocking := false
+		for _, finding := range hostpressure.Assess(snapshot) {
+			if finding.Severity == hostpressure.SeverityBlock {
+				blocking = true
+			}
+		}
+		service := &Server{hostPressure: func(string) (hostpressure.Snapshot, error) { return snapshot, nil }}
+		_, err := service.checkHostPressure(t.TempDir(), false)
+		if blocking != (err != nil) {
+			t.Errorf("snapshot %d: checkHostPressure() error = %v, want blocking = %v", index, err, blocking)
+		}
 	}
 }
 

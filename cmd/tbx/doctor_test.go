@@ -609,7 +609,9 @@ func TestRunDoctorReportsRuntimeDependentChecksAsSkipped(t *testing.T) {
 	}
 }
 
-func TestRunDoctorPassesHostPressureForStickySwap(t *testing.T) {
+// Sticky swap blocks nothing, but doctor must not call 90% swap a PASS: the
+// same reading turns into a create refusal the moment pressure ticks up (#284).
+func TestRunDoctorWarnsHostPressureForStickySwap(t *testing.T) {
 	deps := passingDoctorDependencies()
 	deps.hostPressure = func() (hostpressure.Snapshot, error) {
 		return hostpressure.Snapshot{
@@ -621,12 +623,19 @@ func TestRunDoctorPassesHostPressureForStickySwap(t *testing.T) {
 	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
 		t.Fatalf("runDoctorWithDependencies() = %v for sticky swap with normal pressure", err)
 	}
-	if !strings.Contains(output.String(), "PASS host-pressure") {
-		t.Fatalf("output missing host-pressure PASS for sticky swap:\n%s", output.String())
+	for _, fragment := range []string{
+		"WARN host-pressure: host swap is 90% used (9.0 GiB of 10.0 GiB) while memory pressure is normal",
+		"`tbx down`",
+	} {
+		if !strings.Contains(output.String(), fragment) {
+			t.Errorf("output missing %q:\n%s", fragment, output.String())
+		}
 	}
 }
 
-func TestRunDoctorWarnsOnExtremeHostPressure(t *testing.T) {
+// Doctor fails on exactly what the create gate refuses, with the same numbers
+// and a runnable remediation line.
+func TestRunDoctorFailsOnBlockingHostPressure(t *testing.T) {
 	deps := passingDoctorDependencies()
 	deps.hostPressure = func() (hostpressure.Snapshot, error) {
 		return hostpressure.Snapshot{
@@ -635,12 +644,15 @@ func TestRunDoctorWarnsOnExtremeHostPressure(t *testing.T) {
 		}, nil
 	}
 	var output strings.Builder
-	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
-		t.Fatalf("runDoctorWithDependencies() = %v for warning-only host pressure", err)
+	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err == nil {
+		t.Fatal("runDoctorWithDependencies() succeeded despite host pressure that blocks cluster create")
 	}
 	for _, line := range []string{
-		"WARN host-pressure: host swap is 90% used",
-		"WARN host-pressure: talosbox data volume is 95% used",
+		"FAIL host-pressure: host swap is 90% used (9.0 GiB of 10.0 GiB) and memory pressure could not be measured",
+		"FAIL host-pressure: talosbox data volume is 95% used (5.0 GiB free)",
+		"`tbx down`",
+		"`tbx cache prune --all`",
+		"--force",
 	} {
 		if !strings.Contains(output.String(), line) {
 			t.Errorf("output missing %q:\n%s", line, output.String())

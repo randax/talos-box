@@ -121,14 +121,23 @@ func (s *Server) checkHostPressure(path string, force bool) (string, error) {
 	if err != nil {
 		return fmt.Sprintf("host-pressure probe failed: %v; proceeding without host-pressure protection", err), nil
 	}
-	warning := strings.Join(hostpressure.Warnings(snapshot), "; ")
-	if warning == "" {
-		return "", nil
+	// hostpressure.Assess is the shared classification: tbx doctor reports the
+	// same blocking findings as FAIL, so the gate and the diagnostic agree.
+	var blocking, advisory []string
+	for _, finding := range hostpressure.Assess(snapshot) {
+		if finding.Severity == hostpressure.SeverityBlock {
+			blocking = append(blocking, finding.String())
+			continue
+		}
+		advisory = append(advisory, finding.String())
+	}
+	if len(blocking) == 0 {
+		return strings.Join(advisory, "; "), nil
 	}
 	if !force {
-		return "", fmt.Errorf("%s (use --force to override)", warning)
+		return "", fmt.Errorf("%s (use --force to override)", strings.Join(blocking, "; "))
 	}
-	return warning + " (forced)", nil
+	return strings.Join(append(blocking, advisory...), "; ") + " (forced)", nil
 }
 
 func (s *Server) checkLonghornMemoryWarning(item cluster.Cluster) string {
