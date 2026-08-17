@@ -33,6 +33,7 @@ const (
 	perClusterTalosProtocolVersion          = 5
 	snapshotRestoreGateProtocolVersion      = 6
 	snapshotCreateWarningProtocolVersion    = 7
+	nodeRunStateProtocolVersion             = 8
 )
 
 func requiresProvisioningIntentHandshake(input cluster.ProvisioningIntentInput) bool {
@@ -76,6 +77,13 @@ func (c cli) ensureProvisioningIntentSupport(input cluster.ProvisioningIntentInp
 // ignore its force field and delete the node's disk ungated.
 func (c cli) ensureNodeRemoveSupport() error {
 	return c.ensureProtocolAtLeast(nodeRemoveGateProtocolVersion, "node remove")
+}
+
+// ensureNodeRunStateSupport refuses to send node.start/node.stop to a daemon
+// that does not serve them; an older daemon answers "unknown operation", which
+// says nothing about how to fix it.
+func (c cli) ensureNodeRunStateSupport(verb string) error {
+	return c.ensureProtocolAtLeast(nodeRunStateProtocolVersion, "node "+verb)
 }
 
 // ensureSnapshotRestoreSupport refuses to send snapshot.restore to a daemon

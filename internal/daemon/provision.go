@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"time"
@@ -210,6 +211,24 @@ func (s *Server) runProvisionTasks(data any, tasks []provisionTask) error {
 		}
 	}
 	return nil
+}
+
+// runProvisionTasksAsync runs a post-mutation reconcile off the request path.
+// The forced reconcile a node mutation schedules takes minutes against a
+// cluster whose topology just changed, and holding the response for it left
+// `tbx node remove` hanging with nothing to show for it (#314). The tasks were
+// already registered under opMu, so a later mutation still supersedes them.
+func (s *Server) runProvisionTasksAsync(op string, tasks []provisionTask) {
+	if len(tasks) == 0 {
+		return
+	}
+	s.backgroundProvisions.Add(1)
+	go func() {
+		defer s.backgroundProvisions.Done()
+		if err := s.runProvisionTasks(nil, tasks); err != nil {
+			log.Printf("%s: follow-up reconcile failed: %v", op, err)
+		}
+	}()
 }
 
 // provisionTimeout budgets one provisioning pass by what it must converge.

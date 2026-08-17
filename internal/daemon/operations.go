@@ -945,9 +945,11 @@ func (s *Server) removeNodeLocked(raw json.RawMessage) (NodeStatus, []provisionT
 	}
 	if machine := s.vms[item.Name][node.Name]; machine != nil {
 		if err := closeMachine(machine); err != nil {
+			log.Printf("node.remove %s/%s: stop VM failed: %v", item.Name, node.Name, err)
 			return NodeStatus{}, nil, fmt.Errorf("stop node %s: %w", node.Name, err)
 		}
 		delete(s.vms[item.Name], node.Name)
+		log.Printf("node.remove %s/%s: VM stopped", item.Name, node.Name)
 	}
 	s.forgetNode(item.Name, node.Name)
 	if err := cluster.Save(item); err != nil {
@@ -969,6 +971,18 @@ func (s *Server) handleNodeMutationLocked(request Request) (any, []provisionTask
 		return result, tasks, nil
 	case "node.remove":
 		result, tasks, err := s.removeNodeLocked(request.Args)
+		if err != nil {
+			return nil, nil, err
+		}
+		return result, tasks, nil
+	case "node.start":
+		result, tasks, err := s.startNodeLocked(request.Args)
+		if err != nil {
+			return nil, nil, err
+		}
+		return result, tasks, nil
+	case "node.stop":
+		result, tasks, err := s.stopNodeLocked(request.Args)
 		if err != nil {
 			return nil, nil, err
 		}

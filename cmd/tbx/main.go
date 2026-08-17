@@ -90,7 +90,7 @@ func (c cli) run(args []string) error {
 // list is spelled out twice — so the two forms cannot drift apart.
 var groupUsages = map[string]string{
 	"cluster":  "usage: tbx cluster create|start|stop|suspend|resume|destroy|list",
-	"node":     "usage: tbx node add|remove <cluster> [node]",
+	"node":     "usage: tbx node add|remove|start|stop <cluster> [node]",
 	"snapshot": "usage: tbx snapshot create|restore|list|delete",
 	"cache":    "usage: tbx cache pull|prune|warm|list",
 	"system":   "usage: tbx system install|uninstall|restart [--force]|status",
@@ -495,9 +495,38 @@ func (c cli) runNode(args []string) error {
 			return err
 		}
 		return printWarnings(c.err, result.Warnings, result.Warning)
+	case "start", "stop":
+		return c.runNodeRunState(args[0], args[1:])
 	default:
 		return fmt.Errorf("unknown node command %q", args[0])
 	}
+}
+
+// runNodeRunState powers one node up or down; both verbs share a shape, so the
+// only thing that differs is the wire op and the confirmation's verb.
+func (c cli) runNodeRunState(verb string, args []string) error {
+	flags := flag.NewFlagSet("node "+verb, flag.ContinueOnError)
+	flags.SetOutput(c.err)
+	positionals, err := parseInterspersed(flags, args)
+	if err != nil {
+		return err
+	}
+	if len(positionals) != 2 {
+		return fmt.Errorf("usage: tbx node %s <cluster> <node>", verb)
+	}
+	if err := c.ensureNodeRunStateSupport(verb); err != nil {
+		return err
+	}
+	request := map[string]any{"cluster": positionals[0], "name": positionals[1]}
+	var result daemon.NodeStatus
+	if err := c.call("node."+verb, request, &result); err != nil {
+		return err
+	}
+	past := map[string]string{"start": "started", "stop": "stopped"}[verb]
+	if _, err := fmt.Fprintf(c.out, "%s node %s in cluster %s\n", past, positionals[1], positionals[0]); err != nil {
+		return err
+	}
+	return printWarnings(c.err, result.Warnings, result.Warning)
 }
 
 func (c cli) runStatus(args []string) error {
@@ -642,7 +671,7 @@ Commands:
   up [-f talosbox.yaml] [--force]
   down [-f talosbox.yaml]
   cluster create|start|stop|suspend|resume|destroy|list
-  node add|remove
+  node add|remove|start|stop
   snapshot create|restore|list|delete
   status [cluster]
   manifests <cluster> [section] [--cni cilium|flannel]

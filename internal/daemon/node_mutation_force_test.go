@@ -65,6 +65,7 @@ func TestNodeRemoveForcesFullReconcileDespiteConvergedCluster(t *testing.T) {
 	if !response.OK {
 		t.Fatalf("node.remove failed: %s", response.Error)
 	}
+	service.backgroundProvisions.Wait()
 	if reconciledNodes != 1 {
 		t.Fatalf("node.remove reconciled %d nodes, want 1: the worker-less crossing must bypass the fast no-op", reconciledNodes)
 	}
