@@ -122,7 +122,9 @@ func (m *Manager) warmOne(ctx context.Context, reference, hostArch string) (Warm
 			// offline replay answered the listed tag from the cache, so the
 			// entry it would republish is already on disk. Online, an empty
 			// stage means the refresh never reached upstream, which stays a
-			// failure so a stale tag is never reported as re-warmed.
+			// failure so a stale tag is never reported as re-warmed. The
+			// cachedBefore conjunct is defensive: an offline request for an
+			// uncached tag already failed with 503 before reaching here.
 		default:
 			return WarmResult{}, fmt.Errorf("listed ref %q did not produce a staged manifest", reference)
 		}

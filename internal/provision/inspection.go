@@ -172,7 +172,7 @@ func bgpSectionUnavailableError(item cluster.Cluster) error {
 	case item.CNI == cluster.CNIFlannel:
 		return fmt.Errorf("cluster %q uses flannel, which announces LoadBalancer addresses over l2: bgp announcements need a cluster declared with cilium and bgp (tbx cluster create <name> --cni cilium --bgp); see what this cluster announces with: tbx manifests %s l2", item.Name, quoted)
 	case item.CNI == cluster.CNICilium && !item.LB:
-		return fmt.Errorf("cluster %q declares no LoadBalancer support, so it has no bgp path: bgp announcements need cilium with LoadBalancer support and bgp enabled", item.Name)
+		return fmt.Errorf("cluster %q declares no LoadBalancer support, so it has no bgp path: recreate it with LoadBalancer support and bgp announcements (tbx cluster create <name> --cni cilium --bgp; lb defaults to true)", item.Name)
 	case item.CNI == cluster.CNICilium:
 		return fmt.Errorf("cluster %q announces LoadBalancer addresses over l2, not bgp: switch it with `tbx bgp enable %s`, or see what it announces today with `tbx manifests %s l2`", item.Name, quoted, quoted)
 	default:

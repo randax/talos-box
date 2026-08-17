@@ -188,6 +188,7 @@ func TestRenderInspectionBGPSectionNamesTheDeclaredIntent(t *testing.T) {
 		{name: "substrate-only", item: substrate, want: []string{"bgp", "tbx cluster create", "--bgp"}},
 		{name: "substrate-only under the cni override", item: substrate, cni: "cilium", want: []string{"bgp", "tbx cluster create", "--bgp"}},
 		{name: "cilium without bgp", item: cilium, want: []string{"tbx bgp enable qa-a", "l2"}},
+		{name: "cilium without load balancer", item: cluster.Cluster{Name: "qa-a", SubnetIndex: 4, ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium}}, want: []string{"tbx cluster create", "--bgp", "lb defaults to true"}},
 		{name: "flannel", item: flannel, want: []string{"cilium"}},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
