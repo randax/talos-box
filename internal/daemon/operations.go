@@ -509,7 +509,11 @@ func (s *Server) longhornCustomSchematicWarning(item cluster.Cluster, custom boo
 }
 
 func (s *Server) start(item cluster.Cluster) (string, error) {
-	subnetWarning, err := cluster.CheckSubnetIndex(item.SubnetIndex, s.hostSubnetSources())
+	// The subnet was decided at create time and belongs to this cluster, so it
+	// is only inspected for advisory routing findings. Re-running the
+	// create-time collision guard would refuse the cluster's own bridge, which
+	// suspend leaves up and an unclean stop can strand (#271).
+	subnetWarning, err := cluster.AttachedSubnetWarning(item.SubnetIndex, s.hostSubnetSources())
 	if err != nil {
 		return "", err
 	}

@@ -77,7 +77,10 @@ func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if err != nil {
 		return ClusterSummary{}, err
 	}
-	subnetWarning, err := cluster.CheckSubnetIndex(item.SubnetIndex, s.hostSubnetSources())
+	// Suspend deliberately leaves the cluster's bridge up, so its own subnet
+	// occupancy is expected here: inspect for advisory findings only, never
+	// re-decide a subnet the cluster already owns (#271).
+	subnetWarning, err := cluster.AttachedSubnetWarning(item.SubnetIndex, s.hostSubnetSources())
 	if err != nil {
 		return ClusterSummary{}, err
 	}

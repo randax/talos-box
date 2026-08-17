@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -171,6 +172,9 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 		return Result{}, err
 	}
 
+	_, plannedEndpoints := clusterControlPlane(request.Cluster)
+	generatedFor := strings.Join(plannedEndpoints, ",")
+
 	for {
 		nodes, err := request.Observe(ctx)
 		if err != nil {
@@ -178,6 +182,23 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 		}
 		if len(nodes) == 0 {
 			return Result{}, errors.New("observe Talos node state: cluster has no nodes")
+		}
+		// A node is free to hold a lease other than the address tbx planned for
+		// it: some hosts start the vmnet range mid-subnet, and applying a
+		// machine config makes the node take a fresh lease. Regenerate against
+		// the observed addresses whenever they move so the Kubernetes
+		// control-plane endpoint, its certificate SANs, and the talosconfig
+		// endpoints all name an address something answers on.
+		observedCluster := clusterWithObservedAddresses(request.Cluster, nodes)
+		if _, observedEndpoints := clusterControlPlane(observedCluster); strings.Join(observedEndpoints, ",") != generatedFor {
+			regenerated, err := generateMachineConfigs(observedCluster)
+			if err != nil {
+				return Result{}, err
+			}
+			if err := writeTalosconfig(regenerated.paths.talosconfig, regenerated.talosconfig); err != nil {
+				return Result{}, err
+			}
+			generated, generatedFor = regenerated, strings.Join(observedEndpoints, ",")
 		}
 
 		applied := false
@@ -744,6 +765,30 @@ func clusterHasWorkers(item cluster.Cluster) bool {
 	return false
 }
 
+// clusterWithObservedAddresses projects the observed DHCP leases onto a copy of
+// the persisted cluster. Persisted addresses are only the plan made at create
+// time; a node that already answers at a different address is the authority on
+// where it lives, and a node without a lease yet keeps its planned address so
+// generation stays possible before the first boot.
+func clusterWithObservedAddresses(item cluster.Cluster, nodes []Node) cluster.Cluster {
+	observed := make(map[string]string, len(nodes))
+	for _, node := range nodes {
+		if node.IP != "" {
+			observed[node.Name] = node.IP
+		}
+	}
+	if len(observed) == 0 {
+		return item
+	}
+	item.Nodes = slices.Clone(item.Nodes)
+	for i, node := range item.Nodes {
+		if ip, ok := observed[node.Name]; ok {
+			item.Nodes[i].IP = ip
+		}
+	}
+	return item
+}
+
 func clusterControlPlane(item cluster.Cluster) (Node, []string) {
 	var controlPlane Node
 	var endpoints []string
@@ -810,8 +855,8 @@ func kubeconfigWithRetry(ctx context.Context, client TalosClient, node string, i
 		}
 		switch talosclient.StatusCode(err) {
 		case codes.Unavailable, codes.DeadlineExceeded, codes.Canceled:
-			if err := wait(ctx, interval); err != nil {
-				return nil, err
+			if expired := wait(ctx, interval); expired != nil {
+				return nil, unreachable(node, expired, err)
 			}
 		default:
 			return nil, err
@@ -831,13 +876,24 @@ func schedulingWithRetry(ctx context.Context, client TalosClient, node string, w
 		}
 		switch talosclient.StatusCode(err) {
 		case codes.Unavailable, codes.DeadlineExceeded, codes.Canceled:
-			if err := wait(ctx, interval); err != nil {
-				return false, err
+			if expired := wait(ctx, interval); expired != nil {
+				return false, unreachable(node, expired, err)
 			}
 		default:
 			return false, err
 		}
 	}
+}
+
+// unreachable names the address a retry loop kept dialing. Retrying an
+// Unavailable API is right — apid restarts across a config apply — but a
+// provisioning budget that expires while retrying must not surface as a bare
+// deadline: the address, not the elapsed time, is the diagnosis.
+func unreachable(node string, expired, last error) error {
+	if last == nil {
+		return expired
+	}
+	return fmt.Errorf("apid at %s unreachable (last error: %v): %w", node, last, expired)
 }
 
 func wait(ctx context.Context, interval time.Duration) error {
@@ -883,7 +939,7 @@ func (client MachineryClient) Apply(ctx context.Context, node string, config []b
 // the result only when it drifted. Mode AUTO suffices: neither the scheduling
 // flag nor the node label needs a reboot.
 func (client MachineryClient) ReconcileControlPlaneScheduling(ctx context.Context, node string, workerless bool) (bool, error) {
-	connection, err := client.secure(ctx)
+	connection, err := client.secure(ctx, node)
 	if err != nil {
 		return false, err
 	}
@@ -911,7 +967,7 @@ func (client MachineryClient) ReconcileControlPlaneScheduling(ctx context.Contex
 }
 
 func (client MachineryClient) Bootstrap(ctx context.Context, node string) error {
-	connection, err := client.secure(ctx)
+	connection, err := client.secure(ctx, node)
 	if err != nil {
 		return err
 	}
@@ -920,7 +976,7 @@ func (client MachineryClient) Bootstrap(ctx context.Context, node string) error 
 }
 
 func (client MachineryClient) Kubeconfig(ctx context.Context, node string) ([]byte, error) {
-	connection, err := client.secure(ctx)
+	connection, err := client.secure(ctx, node)
 	if err != nil {
 		return nil, err
 	}
@@ -1208,9 +1264,17 @@ func kubeTransport(data []byte) (*http.Transport, string, error) {
 	return &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, Certificates: []tls.Certificate{pair}, MinVersion: tls.VersionTLS12}}, strings.TrimRight(server, "/"), nil
 }
 
-func (client MachineryClient) secure(ctx context.Context) (*talosclient.Client, error) {
-	return talosclient.New(ctx,
+// secure dials the observed node exactly like the insecure apply path does. The
+// talosconfig carries credentials and a generated endpoint list; the endpoint
+// tbx actually observed is the authoritative one, because a node can hold a
+// different DHCP lease than the one its talosconfig was generated from.
+func (client MachineryClient) secure(ctx context.Context, node string) (*talosclient.Client, error) {
+	options := []talosclient.OptionFunc{
 		talosclient.WithConfigFromFile(client.TalosconfigPath),
 		talosclient.WithDefaultGRPCDialOptions(),
-	)
+	}
+	if node != "" {
+		options = append(options, talosclient.WithEndpoints(node))
+	}
+	return talosclient.New(ctx, options...)
 }

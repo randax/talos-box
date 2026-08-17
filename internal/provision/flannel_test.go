@@ -32,10 +32,12 @@ import (
 )
 
 type fakeClient struct {
-	applied   []string
-	configs   [][]byte
-	bootstrap int
-	kube      int
+	applied        []string
+	configs        [][]byte
+	bootstrap      int
+	bootstrapNodes []string
+	kube           int
+	kubeNodes      []string
 	kubeData  []byte
 	kubeErrs  []error
 	bootErr   error
@@ -123,8 +125,9 @@ func (f *fakeClient) Apply(_ context.Context, node string, config []byte) error 
 	return nil
 }
 
-func (f *fakeClient) Bootstrap(context.Context, string) error {
+func (f *fakeClient) Bootstrap(_ context.Context, node string) error {
 	f.bootstrap++
+	f.bootstrapNodes = append(f.bootstrapNodes, node)
 	return f.bootErr
 }
 
@@ -151,8 +154,9 @@ func TestFlannelReconcileTreatsAlreadyBootstrappedAsSuccess(t *testing.T) {
 	}
 }
 
-func (f *fakeClient) Kubeconfig(context.Context, string) ([]byte, error) {
+func (f *fakeClient) Kubeconfig(_ context.Context, node string) ([]byte, error) {
 	f.kube++
+	f.kubeNodes = append(f.kubeNodes, node)
 	if len(f.kubeErrs) > 0 {
 		err := f.kubeErrs[0]
 		f.kubeErrs = f.kubeErrs[1:]

@@ -106,12 +106,13 @@ func CheckSubnetIndex(index int, sources SubnetSources) (string, error) {
 	return inspection.warning, nil
 }
 
-// AttachedSubnetWarning reports advisory host-routing findings for a subnet
-// that is already attached. It never fails on a collision: a running
-// cluster's own bridge legitimately occupies its subnet — under whatever name
-// the host gave that bridge — and a genuine foreign collision is not
-// something a node mutation can resolve, since the attachment already
-// exists. A foreign collision is still surfaced, as a warning.
+// AttachedSubnetWarning reports advisory host-routing findings for a subnet a
+// cluster already owns. It never fails on a collision: the cluster's own
+// bridge legitimately occupies its subnet — under whatever name the host gave
+// that bridge, and even while the cluster is suspended or stopped uncleanly —
+// and a genuine foreign collision is not something starting, resuming, or
+// mutating the cluster can resolve, since the subnet is already fixed. A
+// foreign collision is still surfaced, as a warning.
 func AttachedSubnetWarning(index int, sources SubnetSources) (string, error) {
 	if index < 0 || index > MaxSubnetIndex {
 		return "", fmt.Errorf("subnet index must be between 0 and %d", MaxSubnetIndex)
@@ -125,7 +126,7 @@ func AttachedSubnetWarning(index int, sources SubnetSources) (string, error) {
 		return "", err
 	}
 	if inspection.conflict != "" {
-		return fmt.Sprintf("subnet %s conflicts with %s; the cluster is already attached, continuing", SubnetCIDR(index), inspection.conflict), nil
+		return fmt.Sprintf("subnet %s conflicts with %s; the cluster already owns this subnet, continuing", SubnetCIDR(index), inspection.conflict), nil
 	}
 	return inspection.warning, nil
 }
