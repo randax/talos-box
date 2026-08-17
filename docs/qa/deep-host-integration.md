@@ -25,7 +25,7 @@ BLOCKED unless: `tbx version` recorded; the platform's install story is already 
 **Goal**: every doctor line is truthful and remediation is copy-pasteable.
 
 Steps:
-1. `tbx doctor` on a healthy host — record every check name and result. Compare the set against the documented platform list (macOS: helper, vmnet, DNS wiring, forwarding, routes, host-pressure, egress; Linux additionally: helper-unit/access/capabilities, kvm, qemu, forwarding, bridge-netfilter, bridge-stp, rp-filter, port-53/67/179, resolver trio, units).
+1. `tbx doctor` on a healthy host — record every check name and result. Compare the set against the documented platform list: [docs/macos.md](../macos.md) (`helper`, `resolver`, `DNS`, `forwarding`, `host-pressure`, `system-dns`, `routes`, `guest-agent`, `mirror-health`, `egress`, `security-inventory`) or [docs/linux.md](../linux.md) (the same daemon- and cluster-scoped checks plus `helper-unit`/`helper-access`/`helper-capabilities`, `kvm`, `qemu`, `bridge-netfilter`, `bridge-stp`, `rp-filter`, and `port-53`/`port-67`/`port-179`). A check the platform doc does not list — or a documented check the build never emits — is the finding.
 2. Break one innocuous thing and confirm doctor catches it: occupy port 179 (`nc -l 179` as root or a high-privilege listener) → doctor `port-179` degrades with a specific message. Release it.
 3. Confirm doctor never *executes* remediation — it prints commands only.
 

@@ -26,7 +26,7 @@ Abort the run (report BLOCKED, not FAIL) if any of these don't hold:
 
 1. `tbx version` prints a version; record it.
 2. `git -C <talos-box checkout> rev-parse HEAD` — record the commit if running from source.
-3. `tbx doctor` exits 0. Expected: helper, vmnet, DNS wiring, forwarding all OK; `host-pressure` present (macOS). Record any WARN lines as friction.
+3. `tbx doctor` exits 0. Expected: `helper`, `resolver`, `DNS`, and `forwarding` all PASS, and `host-pressure` present — see the macOS check table in [docs/macos.md](../macos.md) for the full list. Record any WARN lines as friction.
    - Known BLOCKED cause — **helper protocol mismatch**: the LaunchDaemon plist (`/Library/LaunchDaemons/dev.talosbox.helper.plist`) pins the helper at an absolute path, so a moved/renamed checkout leaves an old helper running. Fix: `sudo <checkout>/bin/tbx system install` (full path — tbx may not be on PATH), then rerun doctor.
    - Known artifact: the DNS check may FAIL with `connection refused` on 127.0.0.1:5399 when tbxd simply isn't running yet (it starts on demand); the daemon-dependent siblings SKIP. If DNS is the only FAIL and no tbxd process exists, treat preflight as passed and record the inconsistency as friction.
 4. `tbx status` shows no cluster named `qa-smoke` (destroy leftovers first: `tbx cluster destroy qa-smoke --force`).

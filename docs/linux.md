@@ -181,6 +181,8 @@ configured bridge or running cluster report `SKIP` before one exists.
 | `resolver`, `DNS`, `system-dns` | Guest DNS is listening and systemd-resolved routes `~<cluster>.k8s.test` to the cluster gateway | Run the per-link `resolvectl` command printed by `doctor` when resolved registration is unavailable |
 | `routes` | Host routes to live nodes and cluster subnets use the talosbox bridge | Resolve overlapping VPN or host routes and restart the cluster |
 | `host-pressure` | Currently reports `SKIP` because Linux host-pressure sampling is not implemented | Size the default cluster for at least 16 GB RAM and monitor the host separately |
+| `guest-agent` | Clusters that requested the `qemu-guest-agent` extension have a working host channel | `WARN` only: the config stays valid and portable, the extension is simply inert on this host. `SKIP`s when no cluster requests it |
+| `mirror-health` | Pull-through mirror listeners are bound on exactly the running clusters' gateway IPs, and reports the cache totals | Restart the affected cluster (or `tbxd`) so the bind set is reconverged with cluster lifecycle |
 | `egress`, security inventory | Image Factory access is usable and relevant security/VPN software is visible | Follow the specific warning or failure detail |
 
 `FAIL` makes `tbx doctor` exit non-zero. `WARN` identifies a degraded but usable configuration,

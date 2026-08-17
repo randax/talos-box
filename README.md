@@ -29,8 +29,9 @@ bin/tbx doctor
 `make build` produces three binaries in `bin/`: the `tbx` CLI, the `tbxd` daemon
 (started automatically by `tbx` on first use — keep it next to `tbx`), and `tbx-helper`
 (the privileged networking helper). `system install` registers `tbx-helper` as a root launchd
-daemon and installs the `/etc/resolver/k8s.test` resolver. `doctor` verifies the helper, vmnet,
-DNS wiring, forwarding, routes, host pressure, and external image access.
+daemon and installs the `/etc/resolver/k8s.test` resolver. `doctor` verifies the helper, resolver,
+DNS wiring, forwarding, routes, host pressure, mirror health, and external image access
+(the full check table is in `docs/macos.md` and `docs/linux.md`).
 
 #### Linux
 

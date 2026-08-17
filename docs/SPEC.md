@@ -450,8 +450,8 @@ Local-path has no CRD barrier, so apply `storage-namespaces` before `storage-obj
   notarized with the `com.apple.security.virtualization` entitlement — no restricted
   entitlements needed (bridged networking deliberately unused).
 - **`sudo tbx system install`** (one-time) installs `tbx-helper` as a root launchd daemon and
-  the `/etc/resolver/k8s.test` file; `tbx doctor` verifies helper, vmnet, DNS wiring, and
-  forwarding. Everything else runs unprivileged. The helper's macOS filesystem writes are
+  the `/etc/resolver/k8s.test` file; `tbx doctor` verifies helper, resolver, DNS wiring, and
+  forwarding (full check table: `docs/macos.md` / `docs/linux.md`). Everything else runs unprivileged. The helper's macOS filesystem writes are
   confined to `/etc/resolver/k8s.test` plus `/etc/resolver/<domain>` for canonical validated
   domain names; it refuses non-canonical names, never follows symlinks or touches unmanaged
   files, and only ever deletes files carrying its ownership marker. Like every helper
