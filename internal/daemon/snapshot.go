@@ -16,9 +16,11 @@ type snapshotArgs struct {
 	Force bool `json:"force"`
 }
 
-// SnapshotRestoreStatus is snapshot.restore's response: the cluster's
-// snapshots plus the best-effort storage data-loss warning from its gate.
-type SnapshotRestoreStatus struct {
+// SnapshotStatus is snapshot.create's and snapshot.restore's response: the
+// cluster's snapshots plus any advisory finding raised while the operation ran
+// — restore's storage data-loss gate, and the host-subnet finding from the
+// restart both operations perform.
+type SnapshotStatus struct {
 	Snapshots []cluster.SnapshotInfo `json:"snapshots"`
 	Warning   string                 `json:"warning,omitempty"`
 }
@@ -41,19 +43,24 @@ func withClusterStopped(running bool, stop, start, body func() error) error {
 	return errors.Join(bodyErr, startErr)
 }
 
-func (s *Server) snapshotCreate(raw json.RawMessage) ([]cluster.SnapshotInfo, error) {
+func (s *Server) snapshotCreate(raw json.RawMessage) (SnapshotStatus, error) {
 	args, item, err := s.loadSnapshotTarget(raw)
 	if err != nil {
-		return nil, err
+		return SnapshotStatus{}, err
 	}
 	// SPEC §7: the disks are cloned as one crash-consistent set, so the VMs are
 	// stopped first — there is no live-snapshot fast path — and a cluster that
 	// was running is restarted afterward, while a stopped one stays stopped.
 	running := s.clusterRunning(item.Name)
 	var created bool
+	var restartWarning string
 	err = withClusterStopped(running,
 		func() error { return s.stop(item.Name) },
-		func() error { return s.startAndLogWarning(item) },
+		func() error {
+			warning, startErr := s.startAndLogWarning(item)
+			restartWarning = warning
+			return startErr
+		},
 		func() error {
 			if err := cluster.CreateSnapshot(item, args.Name); err != nil {
 				return err
@@ -67,19 +74,24 @@ func (s *Server) snapshotCreate(raw json.RawMessage) ([]cluster.SnapshotInfo, er
 			// the clone is on disk and intact; only the restart failed, and
 			// saying so keeps the operator from re-running a snapshot that
 			// already exists
-			return nil, fmt.Errorf("snapshot %q was created, but %w; start it with tbx cluster start %s", args.Name, err, item.Name)
+			return SnapshotStatus{}, fmt.Errorf("snapshot %q was created, but %w; start it with tbx cluster start %s", args.Name, err, item.Name)
 		}
-		return nil, err
+		return SnapshotStatus{}, err
 	}
-	return cluster.ListSnapshots(item.Name)
+	snapshots, err := cluster.ListSnapshots(item.Name)
+	if err != nil {
+		return SnapshotStatus{}, err
+	}
+	return SnapshotStatus{Snapshots: snapshots, Warning: restartWarning}, nil
 }
 
-func (s *Server) snapshotRestore(raw json.RawMessage) ([]cluster.SnapshotInfo, error) {
+func (s *Server) snapshotRestore(raw json.RawMessage) (SnapshotStatus, error) {
 	args, item, err := s.loadSnapshotTarget(raw)
 	if err != nil {
-		return nil, err
+		return SnapshotStatus{}, err
 	}
 	running := s.clusterRunning(item.Name)
+	var restartWarning string
 	// restore always ends powered on (SPEC §7: cold boot), even if the cluster
 	// was stopped when restore was invoked
 	err = withClusterStopped(true,
@@ -95,14 +107,20 @@ func (s *Server) snapshotRestore(raw json.RawMessage) ([]cluster.SnapshotInfo, e
 			if loadErr != nil {
 				return loadErr
 			}
-			return s.startAndLogWarning(restored)
+			warning, startErr := s.startAndLogWarning(restored)
+			restartWarning = warning
+			return startErr
 		},
 		func() error { return cluster.RestoreSnapshot(item, args.Name) },
 	)
 	if err != nil {
-		return nil, err
+		return SnapshotStatus{}, err
 	}
-	return cluster.ListSnapshots(item.Name)
+	snapshots, err := cluster.ListSnapshots(item.Name)
+	if err != nil {
+		return SnapshotStatus{}, err
+	}
+	return SnapshotStatus{Snapshots: snapshots, Warning: restartWarning}, nil
 }
 
 func (s *Server) snapshotList(raw json.RawMessage) ([]cluster.SnapshotInfo, error) {

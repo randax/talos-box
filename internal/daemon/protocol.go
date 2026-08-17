@@ -25,7 +25,10 @@ const (
 // applying the file-level block to every created cluster.
 // Version 6 volume-gates snapshot.restore, honors its force field, and returns
 // its snapshots wrapped in a warning-carrying status.
-const ProtocolVersion = 6
+// Version 7 returns snapshot.create's snapshots wrapped in the same
+// warning-carrying status, so the restart's host-subnet finding reaches the
+// operator instead of only the daemon log.
+const ProtocolVersion = 7
 
 // Request is one newline-delimited daemon request.
 type Request struct {

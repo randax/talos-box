@@ -98,10 +98,7 @@ func TestSnapshotCreateLeavesAStoppedClusterStopped(t *testing.T) {
 	if service.clusterRunning(item.Name) {
 		t.Fatal("snapshot of a stopped cluster left it running")
 	}
-	var snapshots []cluster.SnapshotInfo
-	if err := json.Unmarshal(response.Data, &snapshots); err != nil {
-		t.Fatal(err)
-	}
+	snapshots := decodeSnapshotStatus(t, response).Snapshots
 	if len(snapshots) != 1 || snapshots[0].Name != "baseline" {
 		t.Fatalf("snapshots = %+v, want the baseline snapshot", snapshots)
 	}

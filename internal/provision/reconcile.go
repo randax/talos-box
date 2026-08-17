@@ -74,8 +74,13 @@ type Node struct {
 // ReconcileControlPlaneScheduling is authenticated as well: it reconciles an
 // already-configured control plane with the cluster's current worker count and
 // reports whether the machine config had drifted.
+// ReconcileControlPlaneEndpoint is the same kind of authenticated repair for
+// the Kubernetes control-plane endpoint, which goes stale whenever the control
+// plane takes a different DHCP lease than the one its config was applied with.
+// Both report whether the machine config actually drifted.
 type TalosClient interface {
 	Apply(context.Context, string, []byte) error
+	ReconcileControlPlaneEndpoint(ctx context.Context, node string, endpoint string) (bool, error)
 	ReconcileControlPlaneScheduling(ctx context.Context, node string, workerless bool) (bool, error)
 	Bootstrap(context.Context, string) error
 	Kubeconfig(context.Context, string) ([]byte, error)
@@ -183,6 +188,17 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 		if len(nodes) == 0 {
 			return Result{}, errors.New("observe Talos node state: cluster has no nodes")
 		}
+		// Every generated artifact keys on the control-plane addresses, and a
+		// machine config applied to any node carries the Kubernetes
+		// control-plane endpoint. Applying before every control plane holds a
+		// lease would bake a planned address that may never exist into its
+		// peers, so wait for the leases instead of guessing.
+		if !controlPlanesLeased(request.Cluster, nodes) {
+			if err := wait(ctx, request.PollInterval); err != nil {
+				return Result{}, err
+			}
+			continue
+		}
 		// A node is free to hold a lease other than the address tbx planned for
 		// it: some hosts start the vmnet range mid-subnet, and applying a
 		// machine config makes the node take a fresh lease. Regenerate against
@@ -235,6 +251,26 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 				return Result{}, err
 			}
 			continue
+		}
+		// A node keeps the Kubernetes control-plane endpoint that was current
+		// when its config was applied, and the control plane can take a fresh
+		// lease afterwards — the apply itself is one reason it does. Left
+		// alone, kubelets lose the API server and the kubeconfig Talos mints
+		// from that endpoint names an address nothing answers on, so repair it
+		// on every configured node before anything derives credentials from it.
+		endpoint := kubernetesEndpoint(controlPlane.IP)
+		for _, node := range nodes {
+			changed, err := endpointWithRetry(ctx, request.Client, node.IP, endpoint, request.PollInterval)
+			if err != nil {
+				return Result{}, fmt.Errorf("reconcile Kubernetes control plane endpoint on %s: %w", node.Name, err)
+			}
+			if !changed {
+				continue
+			}
+			result.Narration = append(result.Narration,
+				fmt.Sprintf("machine config: ≈ talosctl patch mc --mode auto --talosconfig %s --nodes %[2]s --endpoints %[2]s --patch %[3]s",
+					shellquote.Quote(generated.paths.talosconfig), node.IP, shellquote.Quote(controlPlaneEndpointPatch(endpoint))),
+			)
 		}
 		// Machine configs are applied only in maintenance mode, so crossing the
 		// zero-worker boundary on a running cluster (tbx node add/remove) has to
@@ -396,7 +432,7 @@ func generateMachineConfigs(item cluster.Cluster) (generated, error) {
 	}
 	input, err := generate.NewInput(
 		item.Name,
-		"https://"+controlPlane.IP+":6443",
+		kubernetesEndpoint(controlPlane.IP),
 		constants.DefaultKubernetesVersion,
 		options...,
 	)
@@ -664,6 +700,55 @@ func withNodeHostname(config []byte, name string) ([]byte, error) {
 	return patched, nil
 }
 
+// kubernetesEndpoint is the single spelling of the Kubernetes control-plane
+// endpoint: config generation bakes it in, and the endpoint reconcile compares
+// against it, so they must never drift apart.
+func kubernetesEndpoint(ip string) string {
+	return "https://" + ip + ":6443"
+}
+
+// withControlPlaneEndpoint repoints an applied machine config at the address
+// the control plane actually holds. Only the endpoint moves: Talos derives the
+// API server certificate SANs from it, so nothing else has to be patched, and
+// a whole-config apply would drop the per-node hostname tbx injects.
+func withControlPlaneEndpoint(config []byte, endpoint string) ([]byte, bool, error) {
+	// The applied config is multi-document YAML; patch only the first
+	// document and carry the rest through untouched.
+	first, rest, multiDocument := bytes.Cut(config, []byte("\n---\n"))
+	var document map[string]any
+	if err := yaml.Unmarshal(first, &document); err != nil {
+		return nil, false, fmt.Errorf("decode machine config: %w", err)
+	}
+	clusterSection, ok := document["cluster"].(map[string]any)
+	if !ok {
+		return nil, false, errors.New("machine config is missing cluster settings")
+	}
+	controlPlane, ok := clusterSection["controlPlane"].(map[string]any)
+	if !ok {
+		controlPlane = map[string]any{}
+		clusterSection["controlPlane"] = controlPlane
+	}
+	if current, _ := controlPlane["endpoint"].(string); current == endpoint {
+		return config, false, nil
+	}
+	controlPlane["endpoint"] = endpoint
+	patched, err := yaml.Marshal(document)
+	if err != nil {
+		return nil, false, fmt.Errorf("encode machine config: %w", err)
+	}
+	if multiDocument {
+		patched = append(patched, []byte("---\n")...)
+		patched = append(patched, rest...)
+	}
+	return patched, true, nil
+}
+
+// controlPlaneEndpointPatch narrates the endpoint reconcile as the strategic
+// merge patch a user would apply by hand.
+func controlPlaneEndpointPatch(endpoint string) string {
+	return `{"cluster":{"controlPlane":{"endpoint":"` + endpoint + `"}}}`
+}
+
 // loadBalancerExclusionLabel keeps a node out of LoadBalancer announcements;
 // Talos bakes it into control-plane configs and MetalLB and Cilium honor it.
 const loadBalancerExclusionLabel = "node.kubernetes.io/exclude-from-external-load-balancers"
@@ -777,9 +862,6 @@ func clusterWithObservedAddresses(item cluster.Cluster, nodes []Node) cluster.Cl
 			observed[node.Name] = node.IP
 		}
 	}
-	if len(observed) == 0 {
-		return item
-	}
 	item.Nodes = slices.Clone(item.Nodes)
 	for i, node := range item.Nodes {
 		if ip, ok := observed[node.Name]; ok {
@@ -787,6 +869,23 @@ func clusterWithObservedAddresses(item cluster.Cluster, nodes []Node) cluster.Cl
 		}
 	}
 	return item
+}
+
+// controlPlanesLeased reports whether every control plane has an observed
+// address. Config generation and every applied config key on those addresses,
+// so a pass that runs without them would hand a node an endpoint nothing
+// answers on — and a configured node is never re-applied from maintenance.
+func controlPlanesLeased(item cluster.Cluster, nodes []Node) bool {
+	leased := make(map[string]bool, len(nodes))
+	for _, node := range nodes {
+		leased[node.Name] = node.IP != ""
+	}
+	for _, node := range item.Nodes {
+		if node.Role == cluster.RoleControlPlane && !leased[node.Name] {
+			return false
+		}
+	}
+	return true
 }
 
 func clusterControlPlane(item cluster.Cluster) (Node, []string) {
@@ -864,13 +963,13 @@ func kubeconfigWithRetry(ctx context.Context, client TalosClient, node string, i
 	}
 }
 
-// schedulingWithRetry tolerates the transient window in which apid is still
-// restarting after a machine config apply, exactly like kubeconfigWithRetry.
-// Permanent failures remain immediate so a pass fails loudly and rerunning
-// tbx up recovers.
-func schedulingWithRetry(ctx context.Context, client TalosClient, node string, workerless bool, interval time.Duration) (bool, error) {
+// configReconcileWithRetry tolerates the transient window in which apid is
+// still restarting after a machine config apply, exactly like
+// kubeconfigWithRetry. Permanent failures remain immediate so a pass fails
+// loudly and rerunning tbx up recovers.
+func configReconcileWithRetry(ctx context.Context, node string, interval time.Duration, reconcile func() (bool, error)) (bool, error) {
 	for {
-		changed, err := client.ReconcileControlPlaneScheduling(ctx, node, workerless)
+		changed, err := reconcile()
 		if err == nil {
 			return changed, nil
 		}
@@ -885,14 +984,23 @@ func schedulingWithRetry(ctx context.Context, client TalosClient, node string, w
 	}
 }
 
+func schedulingWithRetry(ctx context.Context, client TalosClient, node string, workerless bool, interval time.Duration) (bool, error) {
+	return configReconcileWithRetry(ctx, node, interval, func() (bool, error) {
+		return client.ReconcileControlPlaneScheduling(ctx, node, workerless)
+	})
+}
+
+func endpointWithRetry(ctx context.Context, client TalosClient, node, endpoint string, interval time.Duration) (bool, error) {
+	return configReconcileWithRetry(ctx, node, interval, func() (bool, error) {
+		return client.ReconcileControlPlaneEndpoint(ctx, node, endpoint)
+	})
+}
+
 // unreachable names the address a retry loop kept dialing. Retrying an
 // Unavailable API is right — apid restarts across a config apply — but a
 // provisioning budget that expires while retrying must not surface as a bare
 // deadline: the address, not the elapsed time, is the diagnosis.
 func unreachable(node string, expired, last error) error {
-	if last == nil {
-		return expired
-	}
 	return fmt.Errorf("apid at %s unreachable (last error: %v): %w", node, last, expired)
 }
 
@@ -934,11 +1042,30 @@ func (client MachineryClient) Apply(ctx context.Context, node string, config []b
 	return err
 }
 
-// ReconcileControlPlaneScheduling reads the node's active machine config over
-// the authenticated API, reconciles the worker-less adaptations, and applies
-// the result only when it drifted. Mode AUTO suffices: neither the scheduling
+// ReconcileControlPlaneScheduling reconciles the worker-less adaptations of an
+// already-configured control plane. Mode AUTO suffices: neither the scheduling
 // flag nor the node label needs a reboot.
 func (client MachineryClient) ReconcileControlPlaneScheduling(ctx context.Context, node string, workerless bool) (bool, error) {
+	return client.reconcileMachineConfig(ctx, node, func(current []byte) ([]byte, bool, error) {
+		return withControlPlaneScheduling(current, workerless)
+	})
+}
+
+// ReconcileControlPlaneEndpoint repoints an already-configured node at the
+// address the control plane actually holds. It is the only repair for a lease
+// that moved after the config was applied: Talos applies machine configs from
+// maintenance mode only, so a configured node would otherwise keep a dead
+// Kubernetes endpoint forever.
+func (client MachineryClient) ReconcileControlPlaneEndpoint(ctx context.Context, node, endpoint string) (bool, error) {
+	return client.reconcileMachineConfig(ctx, node, func(current []byte) ([]byte, bool, error) {
+		return withControlPlaneEndpoint(current, endpoint)
+	})
+}
+
+// reconcileMachineConfig reads the node's active machine config over the
+// authenticated API, patches it, and applies the result only when it drifted.
+// Mode AUTO leaves it to Talos to decide whether the change needs a reboot.
+func (client MachineryClient) reconcileMachineConfig(ctx context.Context, node string, patch func([]byte) ([]byte, bool, error)) (bool, error) {
 	connection, err := client.secure(ctx, node)
 	if err != nil {
 		return false, err
@@ -953,7 +1080,7 @@ func (client MachineryClient) ReconcileControlPlaneScheduling(ctx context.Contex
 	if err != nil {
 		return false, fmt.Errorf("encode active machine config: %w", err)
 	}
-	patched, changed, err := withControlPlaneScheduling(current, workerless)
+	patched, changed, err := patch(current)
 	if err != nil || !changed {
 		return false, err
 	}

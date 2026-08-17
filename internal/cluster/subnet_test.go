@@ -195,6 +195,65 @@ func TestAttachedSubnetWarningIgnoresOwnBridgeUnderAnyName(t *testing.T) {
 	}
 }
 
+// The gateway address alone does not prove ownership: after a clean stop the
+// cluster's own bridge is gone, and a foreign interface may hold exactly that
+// address. Exempting it silently would hide the collision that breaks the
+// cluster, so it is reported — as a warning, never as a refusal.
+func TestAttachedSubnetWarningReportsAForeignGatewaySquatter(t *testing.T) {
+	t.Parallel()
+
+	sources := SubnetSources{
+		Interfaces: func() ([]HostInterface, error) {
+			return []HostInterface{{Name: "docker0", Addrs: []net.Addr{hostAddress("172.30.0.1/24")}}}, nil
+		},
+		Route: staticRoute("docker0", "172.30.0.0/24"),
+	}
+	warning, err := AttachedSubnetWarning(0, sources)
+	if err != nil {
+		t.Fatalf("AttachedSubnetWarning() error = %v, want a warning instead", err)
+	}
+	if !strings.Contains(warning, "docker0") || !strings.Contains(warning, "conflicts") {
+		t.Fatalf("warning = %q, want a conflict warning naming docker0", warning)
+	}
+}
+
+// bridge0 is the user's own Thunderbolt/Ethernet bridge, not a vmnet one.
+func TestAttachedSubnetWarningReportsAUserBridgeHoldingTheGateway(t *testing.T) {
+	t.Parallel()
+
+	sources := SubnetSources{
+		Interfaces: func() ([]HostInterface, error) {
+			return []HostInterface{{Name: "bridge0", Addrs: []net.Addr{hostAddress("172.30.0.1/24")}}}, nil
+		},
+		Route: staticRoute("bridge0", "172.30.0.0/24"),
+	}
+	warning, err := AttachedSubnetWarning(0, sources)
+	if err != nil {
+		t.Fatalf("AttachedSubnetWarning() error = %v, want a warning instead", err)
+	}
+	if !strings.Contains(warning, "bridge0") || !strings.Contains(warning, "conflicts") {
+		t.Fatalf("warning = %q, want a conflict warning naming bridge0", warning)
+	}
+}
+
+func TestAttachedSubnetWarningIgnoresTheLinuxOwnBridgeName(t *testing.T) {
+	t.Parallel()
+
+	sources := SubnetSources{
+		Interfaces: func() ([]HostInterface, error) {
+			return []HostInterface{{Name: LinuxBridgeName(3), Addrs: []net.Addr{hostAddress("172.30.3.1/24")}}}, nil
+		},
+		Route: staticRoute(LinuxBridgeName(3), "172.30.3.0/24"),
+	}
+	warning, err := AttachedSubnetWarning(3, sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if warning != "" {
+		t.Fatalf("warning = %q, want empty", warning)
+	}
+}
+
 func TestAttachedSubnetWarningStillReportsBroadRoute(t *testing.T) {
 	t.Parallel()
 

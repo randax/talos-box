@@ -108,11 +108,12 @@ func CheckSubnetIndex(index int, sources SubnetSources) (string, error) {
 
 // AttachedSubnetWarning reports advisory host-routing findings for a subnet a
 // cluster already owns. It never fails on a collision: the cluster's own
-// bridge legitimately occupies its subnet — under whatever name the host gave
-// that bridge, and even while the cluster is suspended or stopped uncleanly —
+// bridge legitimately occupies its subnet — under whatever bridge name the
+// host gave it, and even while the cluster is suspended or stopped uncleanly —
 // and a genuine foreign collision is not something starting, resuming, or
 // mutating the cluster can resolve, since the subnet is already fixed. A
-// foreign collision is still surfaced, as a warning.
+// foreign collision is still surfaced, as a warning — including one squatting
+// on the gateway address itself, which only a host bridge may hold silently.
 func AttachedSubnetWarning(index int, sources SubnetSources) (string, error) {
 	if index < 0 || index > MaxSubnetIndex {
 		return "", fmt.Errorf("subnet index must be between 0 and %d", MaxSubnetIndex)
@@ -153,10 +154,13 @@ func readHostInterfaces(sources SubnetSources) ([]HostInterface, error) {
 }
 
 // inspectSubnet checks the candidate subnet against host interfaces and
-// routes. allowTalosBoxBridge exempts a tbx-owned bridge recognized by name;
-// attached additionally exempts any interface holding the subnet's gateway
-// address — vmnet names its bridges itself, so an already-attached cluster's
-// bridge can carry any name (#245).
+// routes. allowTalosBoxBridge exempts a tbx-owned bridge recognized by its
+// exact name; attached additionally exempts a host bridge holding the subnet's
+// gateway address — vmnet numbers its bridges itself, so an already-attached
+// cluster's bridge can carry any bridgeN name (#245). The gateway address
+// alone is not proof of ownership: a foreign interface holding it (docker0
+// while the cluster's own bridge is down, say) is reported as a collision,
+// which attached callers downgrade to a warning.
 func inspectSubnet(
 	index int,
 	interfaces []HostInterface,
@@ -178,7 +182,7 @@ func inspectSubnet(
 			if allowTalosBoxBridge && isTalosBoxBridge(current.Name, ip, network, index) {
 				continue
 			}
-			if attached && isOwnBridgeAddress(ip, network, index) {
+			if attached && isOwnBridgeAddress(ip, network, index) && isHostBridgeName(current.Name, index) {
 				ownBridges[current.Name] = true
 				continue
 			}
@@ -284,6 +288,32 @@ func isTalosBoxBridge(name string, ip net.IP, network *net.IPNet, index int) boo
 func isOwnBridgeAddress(ip net.IP, network *net.IPNet, index int) bool {
 	ones, bits := network.Mask.Size()
 	return bits == 32 && ones == 24 && ip.Equal(net.ParseIP(Gateway(index)))
+}
+
+// isHostBridgeName reports whether an interface name is shaped like a bridge
+// this cluster could own: tbx's own deterministic name, or any host-numbered
+// vmnet bridge, whose number tbx does not choose (#245). It deliberately does
+// not match arbitrary interfaces, so a foreign gateway squatter is still
+// reported rather than silently taken for the cluster's own bridge.
+func isHostBridgeName(name string, index int) bool {
+	return isTalosBoxBridgeName(name, index) || isVMNetBridgeName(name)
+}
+
+// isVMNetBridgeName reports whether a name is one vmnet numbers for itself.
+// vmnet allocates from bridge100 up; bridge0 and its neighbours are the user's
+// own Thunderbolt or Ethernet bridges, which are foreign here.
+func isVMNetBridgeName(name string) bool {
+	digits := strings.TrimPrefix(name, "bridge")
+	if digits == name || digits == "" {
+		return false
+	}
+	for _, character := range digits {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	number, err := strconv.Atoi(digits)
+	return err == nil && number >= 100
 }
 
 func isTalosBoxBridgeName(name string, index int) bool {

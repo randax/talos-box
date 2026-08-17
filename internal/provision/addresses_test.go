@@ -46,9 +46,10 @@ func talosconfigEndpoints(t *testing.T, path string) []string {
 
 // A node is free to hold a lease other than the address tbx planned for it:
 // some hosts start the vmnet range mid-subnet, and applying a machine config
-// takes a fresh lease. Every authenticated call has to follow the observed
-// lease, or provisioning dials an address nothing answers on.
-func TestReconcileDialsObservedLeaseAddresses(t *testing.T) {
+// takes a fresh lease. This pins what Reconcile hands the client — the observed
+// lease for every call, and a talosconfig whose endpoints match it.
+// TestSecureClientDialsObservedEndpoint pins that the client then dials it.
+func TestReconcileRoutesObservedLeaseAddressesToEveryCall(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	item := leaseCluster(t)
 	planned := item.Nodes[0].IP
@@ -79,6 +80,9 @@ func TestReconcileDialsObservedLeaseAddresses(t *testing.T) {
 	}
 	if !strings.Contains(narration, "--nodes "+leased+" ") {
 		t.Fatalf("narration does not name the leased address %s:\n%s", leased, narration)
+	}
+	if endpoints := talosconfigEndpoints(t, result.TalosconfigPath); len(endpoints) != 1 || endpoints[0] != leased {
+		t.Fatalf("talosconfig endpoints = %v, want [%s]", endpoints, leased)
 	}
 }
 
@@ -112,6 +116,118 @@ func TestReconcileWritesTalosconfigEndpointsFromObservedLeases(t *testing.T) {
 	}
 }
 
+// A node that already holds its machine config keeps whatever Kubernetes
+// control-plane endpoint was baked in at apply time. When the control plane
+// re-leases, that endpoint is dead: kubelets stop reaching the API and the
+// cluster never converges, so the endpoint has to be reconciled over the
+// authenticated API on every configured node — before bootstrap asks Talos for
+// a kubeconfig derived from it.
+func TestReconcileRepairsControlPlaneEndpointAfterLeaseChange(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("demo", 0, 1, 1, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.TalosVersion = "v1.13.6"
+	item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNIFlannel}
+	controlPlane, worker := item.Nodes[0].Name, item.Nodes[1].Name
+	observations := [][]Node{
+		{
+			{Name: controlPlane, Role: cluster.RoleControlPlane, IP: "172.30.0.25", Phase: PhaseMaintenance},
+			{Name: worker, Role: cluster.RoleWorker, IP: "172.30.0.35", Phase: PhaseMaintenance},
+		},
+		{
+			{Name: controlPlane, Role: cluster.RoleControlPlane, IP: "172.30.0.26", Phase: PhaseConfigured},
+			{Name: worker, Role: cluster.RoleWorker, IP: "172.30.0.35", Phase: PhaseConfigured},
+		},
+	}
+	call := 0
+	client := &fakeClient{kubeData: []byte("kubeconfig"), endpointChanged: []bool{true, true}}
+	result, err := Reconcile(context.Background(), Request{Cluster: item, Client: client, PollInterval: 0,
+		Observe: func(context.Context) ([]Node, error) {
+			index := min(call, len(observations)-1)
+			call++
+			return observations[index], nil
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "https://172.30.0.26:6443"
+	if len(client.endpoints) != 2 {
+		t.Fatalf("endpoint reconcile calls = %+v, want one per configured node", client.endpoints)
+	}
+	for _, call := range client.endpoints {
+		if call.endpoint != want {
+			t.Fatalf("endpoint reconcile %+v, want %s on every node", call, want)
+		}
+	}
+	if got := []string{client.endpoints[0].node, client.endpoints[1].node}; got[0] != "172.30.0.26" || got[1] != "172.30.0.35" {
+		t.Fatalf("endpoint reconcile nodes = %v, want the observed leases", got)
+	}
+	// A kubeconfig fetched before the endpoint is repaired names the dead
+	// address, which only moves the hang from apid to the Kubernetes API.
+	order := strings.Join(client.calls, ",")
+	if !strings.Contains(order, "endpoint,endpoint") ||
+		strings.Index(order, "endpoint") > strings.Index(order, "bootstrap") ||
+		strings.Index(order, "endpoint") > strings.Index(order, "kubeconfig") {
+		t.Fatalf("call order = %s, want the endpoint reconciled before bootstrap and kubeconfig", order)
+	}
+	narration := strings.Join(result.Narration, "\n")
+	if !strings.Contains(narration, want) || !strings.Contains(narration, "patch mc --mode auto") {
+		t.Fatalf("narration does not report the endpoint repair:\n%s", narration)
+	}
+}
+
+// Generation keys on the control-plane addresses, so applying anything before
+// every control plane holds a lease bakes a planned address that may never
+// exist into its peers' configs — permanently, since a configured node is not
+// re-applied.
+func TestReconcileWaitsForEveryControlPlaneLeaseBeforeApplying(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("demo", 0, 3, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.TalosVersion = "v1.13.6"
+	item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNIFlannel}
+	planned := item.Nodes[0].IP
+	leases := []string{"172.30.0.25", "172.30.0.26", "172.30.0.27"}
+	observation := func(firstIP string, phase Phase) []Node {
+		nodes := []Node{{Name: item.Nodes[0].Name, Role: cluster.RoleControlPlane, IP: firstIP, Phase: phase}}
+		for i := 1; i < 3; i++ {
+			nodes = append(nodes, Node{Name: item.Nodes[i].Name, Role: cluster.RoleControlPlane, IP: leases[i], Phase: phase})
+		}
+		return nodes
+	}
+	observations := [][]Node{
+		// The first control plane has no lease yet; its peers are ready to apply.
+		observation("", PhaseMaintenance),
+		observation(leases[0], PhaseMaintenance),
+		observation(leases[0], PhaseConfigured),
+	}
+	call := 0
+	client := &fakeClient{kubeData: []byte("kubeconfig")}
+	if _, err := Reconcile(context.Background(), Request{Cluster: item, Client: client, PollInterval: 0,
+		Observe: func(context.Context) ([]Node, error) {
+			index := min(call, len(observations)-1)
+			call++
+			return observations[index], nil
+		}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.configs) != 3 {
+		t.Fatalf("applied configs = %d, want one per node", len(client.configs))
+	}
+	for i, config := range client.configs {
+		if strings.Contains(string(config), "https://"+planned+":6443") {
+			t.Fatalf("config %d was applied with the planned control-plane endpoint %s", i, planned)
+		}
+		if !strings.Contains(string(config), "https://"+leases[0]+":6443") {
+			t.Fatalf("config %d does not point Kubernetes at the leased control plane %s", i, leases[0])
+		}
+	}
+}
+
 // The apply itself makes the node take a fresh lease, so a later observation
 // has to replace the address the earlier pass generated against.
 func TestReconcileFollowsLeaseChangeAfterConfigApply(t *testing.T) {
@@ -134,6 +250,11 @@ func TestReconcileFollowsLeaseChangeAfterConfigApply(t *testing.T) {
 	}
 	if len(client.applied) != 1 || client.applied[0] != "172.30.0.25" {
 		t.Fatalf("applied nodes = %v, want [172.30.0.25]", client.applied)
+	}
+	// The config was applied at the pre-apply lease, so the endpoint it carries
+	// is stale the moment the node re-leases: it must be repaired, not left.
+	if len(client.endpoints) != 1 || client.endpoints[0].endpoint != "https://172.30.0.26:6443" {
+		t.Fatalf("endpoint reconcile calls = %+v, want the post-apply lease", client.endpoints)
 	}
 	if len(client.bootstrapNodes) != 1 || client.bootstrapNodes[0] != "172.30.0.26" {
 		t.Fatalf("bootstrap nodes = %v, want the post-apply lease [172.30.0.26]", client.bootstrapNodes)
@@ -195,6 +316,55 @@ func TestKubeconfigWithRetryNamesUnreachableEndpoint(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "172.30.0.2") || !strings.Contains(err.Error(), "i/o timeout") {
 		t.Fatalf("kubeconfigWithRetry() error = %v, want the unreachable endpoint and last error", err)
+	}
+}
+
+func TestWithControlPlaneEndpointRepointsOnlyWhenItDrifted(t *testing.T) {
+	const config = `version: v1alpha1
+machine:
+  type: controlplane
+cluster:
+  controlPlane:
+    endpoint: https://172.30.0.25:6443
+`
+	patched, changed, err := withControlPlaneEndpoint([]byte(config), "https://172.30.0.25:6443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed || string(patched) != config {
+		t.Fatalf("converged config was rewritten (changed = %t):\n%s", changed, patched)
+	}
+	trailing := "---\napiVersion: v1alpha1\nkind: RegistryMirrorConfig\nname: \"*\"\n"
+	patched, changed, err = withControlPlaneEndpoint([]byte(config+trailing), "https://172.30.0.26:6443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed || !strings.Contains(string(patched), "https://172.30.0.26:6443") {
+		t.Fatalf("endpoint was not repointed (changed = %t):\n%s", changed, patched)
+	}
+	if !strings.HasSuffix(string(patched), trailing) || strings.Count(string(patched), "kind: RegistryMirrorConfig") != 1 {
+		t.Fatalf("trailing document was not preserved:\n%s", patched)
+	}
+	if _, _, err := withControlPlaneEndpoint([]byte("cluster: [unterminated"), "https://172.30.0.26:6443"); err == nil {
+		t.Fatal("withControlPlaneEndpoint() accepted malformed YAML")
+	}
+}
+
+// The endpoint reconcile has to be spelled the same way generation is, or every
+// pass would see drift and re-apply a config that is already correct.
+func TestGeneratedConfigMatchesTheReconciledEndpoint(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item := leaseCluster(t)
+	generated, err := generateMachineConfigs(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, changed, err := withControlPlaneEndpoint(generated.configs[cluster.RoleControlPlane], kubernetesEndpoint(item.Nodes[0].IP))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed {
+		t.Fatal("a freshly generated config already reads as drifted from its own endpoint")
 	}
 }
 

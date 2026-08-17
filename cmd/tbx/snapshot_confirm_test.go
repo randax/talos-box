@@ -23,8 +23,9 @@ func TestConfirmYesSkips(t *testing.T) {
 
 func TestSnapshotCreateConfirmationSaysTheClusterIsStopped(t *testing.T) {
 	requests, command := newDestroyTestCLI(t, []daemon.Response{
+		{OK: true, Data: json.RawMessage(`{"protocolVersion":7}`)},
 		{OK: true, Data: json.RawMessage(`[{"name":"demo","running":true}]`)},
-		{OK: true, Data: json.RawMessage(`[{"name":"baseline"}]`)},
+		{OK: true, Data: json.RawMessage(`{"snapshots":[{"name":"baseline"}]}`)},
 	})
 	command.in = strings.NewReader("y\n")
 
@@ -32,11 +33,14 @@ func TestSnapshotCreateConfirmationSaysTheClusterIsStopped(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if op := (<-requests).Op; op != "daemon.info" {
+		t.Fatalf("first request op = %q, want daemon.info handshake", op)
+	}
 	if op := (<-requests).Op; op != "status" {
-		t.Fatalf("first request op = %q, want the running-cluster status check", op)
+		t.Fatalf("second request op = %q, want the running-cluster status check", op)
 	}
 	if op := (<-requests).Op; op != "snapshot.create" {
-		t.Fatalf("second request op = %q, want snapshot.create", op)
+		t.Fatalf("third request op = %q, want snapshot.create", op)
 	}
 	prompt := command.err.(*bytes.Buffer).String()
 	for _, want := range []string{"demo is running", "stop and restart it"} {
@@ -48,6 +52,7 @@ func TestSnapshotCreateConfirmationSaysTheClusterIsStopped(t *testing.T) {
 
 func TestSnapshotCreateAbortsWhenTheStopIsDeclined(t *testing.T) {
 	requests, command := newDestroyTestCLI(t, []daemon.Response{
+		{OK: true, Data: json.RawMessage(`{"protocolVersion":7}`)},
 		{OK: true, Data: json.RawMessage(`[{"name":"demo","running":true}]`)},
 	})
 	command.in = strings.NewReader("n\n")
@@ -57,8 +62,11 @@ func TestSnapshotCreateAbortsWhenTheStopIsDeclined(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "aborted") {
 		t.Fatalf("snapshot create with a declined stop = %v, want an abort", err)
 	}
+	if op := (<-requests).Op; op != "daemon.info" {
+		t.Fatalf("first request op = %q, want daemon.info handshake", op)
+	}
 	if op := (<-requests).Op; op != "status" {
-		t.Fatalf("request op = %q, want only the status check", op)
+		t.Fatalf("second request op = %q, want only the status check", op)
 	}
 	select {
 	case request := <-requests:

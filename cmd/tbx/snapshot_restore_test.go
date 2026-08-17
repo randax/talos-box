@@ -73,6 +73,40 @@ func TestSnapshotRestoreDefaultsToUnforcedAndStaysQuietWithoutWarning(t *testing
 	}
 }
 
+// snapshot create restarts the cluster, so its response carries the same
+// advisory findings a start does, and the operator must see them.
+func TestSnapshotCreatePrintsTheDaemonWarning(t *testing.T) {
+	_, command := newDestroyTestCLI(t, []daemon.Response{
+		{OK: true, Data: json.RawMessage(`{"protocolVersion":7}`)},
+		{OK: true, Data: json.RawMessage(`{"snapshots":[{"name":"baseline"}],"warning":"subnet 172.30.0.0/24 conflicts with interface docker0 address 172.30.0.1/24"}`)},
+	})
+
+	if err := command.snapshotCreate([]string{"demo", "baseline", "--yes"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := command.out.(*bytes.Buffer).String(); !strings.Contains(got, "created snapshot baseline of demo") {
+		t.Fatalf("stdout = %q, want the create confirmation", got)
+	}
+	if got := command.err.(*bytes.Buffer).String(); !strings.Contains(got, "docker0") {
+		t.Fatalf("stderr = %q, want the daemon warning", got)
+	}
+}
+
+func TestSnapshotCreateRefusesOldDaemonProtocol(t *testing.T) {
+	_, command := newDestroyTestCLI(t, []daemon.Response{
+		{OK: true, Data: json.RawMessage(`{"protocolVersion":6}`)},
+	})
+
+	err := command.snapshotCreate([]string{"demo", "baseline", "--yes"})
+	if err == nil {
+		t.Fatal("snapshot create against a protocol-6 daemon succeeded, want handshake refusal")
+	}
+	if !strings.Contains(err.Error(), "restart or upgrade tbxd") {
+		t.Fatalf("handshake error = %q, want upgrade guidance", err)
+	}
+}
+
 func TestSnapshotRestoreUsageMentionsForce(t *testing.T) {
 	_, command := newDestroyTestCLI(t, nil)
 

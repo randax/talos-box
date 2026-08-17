@@ -545,12 +545,15 @@ func (s *Server) start(item cluster.Cluster) (string, error) {
 	return subnetWarning, nil
 }
 
-func (s *Server) startAndLogWarning(item cluster.Cluster) error {
+// startAndLogWarning starts the cluster on an operation's behalf, logging any
+// advisory finding and returning it so the operation can also carry it back to
+// the operator — the daemon log is not somewhere the CLI user looks.
+func (s *Server) startAndLogWarning(item cluster.Cluster) (string, error) {
 	warning, err := s.start(item)
 	if warning != "" {
 		log.Printf("start %s: %s", item.Name, warning)
 	}
-	return err
+	return warning, err
 }
 
 // hostSubnetSources merges injected sources with system defaults per field, so

@@ -45,15 +45,20 @@ func (c cli) snapshotCreate(args []string) error {
 	if len(rest) == 2 {
 		name = rest[1]
 	}
+	if err := c.ensureSnapshotCreateSupport(); err != nil {
+		return err
+	}
 	if err := c.confirmIfRunning(rest[0], *yes, "snapshot"); err != nil {
 		return err
 	}
-	var snaps []cluster.SnapshotInfo
-	if err := c.call("snapshot.create", map[string]string{"cluster": rest[0], "name": name}, &snaps); err != nil {
+	var result daemon.SnapshotStatus
+	if err := c.call("snapshot.create", map[string]string{"cluster": rest[0], "name": name}, &result); err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(c.out, "created snapshot %s of %s\n", name, rest[0])
-	return err
+	if _, err := fmt.Fprintf(c.out, "created snapshot %s of %s\n", name, rest[0]); err != nil {
+		return err
+	}
+	return printWarning(c.err, result.Warning)
 }
 
 func (c cli) snapshotRestore(args []string) error {
@@ -74,7 +79,7 @@ func (c cli) snapshotRestore(args []string) error {
 	if err := c.confirmIfRunning(rest[0], *yes, "restore over"); err != nil {
 		return err
 	}
-	var result daemon.SnapshotRestoreStatus
+	var result daemon.SnapshotStatus
 	if err := c.call("snapshot.restore", map[string]any{"cluster": rest[0], "name": rest[1], "force": *force}, &result); err != nil {
 		return err
 	}

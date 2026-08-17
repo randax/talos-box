@@ -46,9 +46,32 @@ func foreignSubnetInterface(t *testing.T) cluster.HostInterface {
 	}
 }
 
-func savedClusterForSubnetTest(t *testing.T, name string, workers int) cluster.Cluster {
+// gatewaySquatterSubnetSources models a host where the cluster's own bridge is
+// gone — a clean stop tears it down — and a foreign interface holds exactly the
+// subnet gateway address the bridge used to own.
+func gatewaySquatterSubnetSources(t *testing.T) cluster.SubnetSources {
 	t.Helper()
-	item, err := cluster.New(name, 0, 1, workers, cluster.NodeDefaults{CPUs: 1, MemoryMiB: 1024})
+	_, network, err := net.ParseCIDR("172.30.0.0/24")
+	if err != nil {
+		t.Fatal(err)
+	}
+	squatter := cluster.HostInterface{
+		Name:  "docker0",
+		Addrs: []net.Addr{&net.IPNet{IP: net.ParseIP("172.30.0.1"), Mask: network.Mask}},
+	}
+	return cluster.SubnetSources{
+		Interfaces: func() ([]cluster.HostInterface, error) {
+			return []cluster.HostInterface{squatter}, nil
+		},
+		Route: func(net.IP) (cluster.HostRoute, error) {
+			return cluster.HostRoute{Interface: "docker0", Network: network}, nil
+		},
+	}
+}
+
+func savedClusterForSubnetTest(t *testing.T, name string) cluster.Cluster {
+	t.Helper()
+	item, err := cluster.New(name, 0, 1, 0, cluster.NodeDefaults{CPUs: 1, MemoryMiB: 1024})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +86,7 @@ func savedClusterForSubnetTest(t *testing.T, name string, workers int) cluster.C
 // unrecoverable except by destroy (#271).
 func TestStartClusterAcceptsOwnBridgeOccupyingTheSubnet(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	item := savedClusterForSubnetTest(t, "own-bridge-start", 0)
+	item := savedClusterForSubnetTest(t, "own-bridge-start")
 
 	service := &Server{
 		hypervisor:    &fakeHypervisor{},
@@ -88,7 +111,7 @@ func TestStartClusterAcceptsOwnBridgeOccupyingTheSubnet(t *testing.T) {
 // already fixed, so it is reported rather than fatal.
 func TestStartClusterWarnsOnForeignSubnetConflict(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	item := savedClusterForSubnetTest(t, "foreign-start", 0)
+	item := savedClusterForSubnetTest(t, "foreign-start")
 
 	service := &Server{
 		hypervisor:    &fakeHypervisor{},
@@ -109,11 +132,37 @@ func TestStartClusterWarnsOnForeignSubnetConflict(t *testing.T) {
 	}
 }
 
+// The gateway address alone is not proof of ownership: a foreign interface
+// holding it while the cluster's own bridge is down must not be exempted in
+// silence, or the operator never learns why the cluster cannot reach its nodes.
+func TestStartClusterWarnsOnForeignGatewaySquatter(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item := savedClusterForSubnetTest(t, "gateway-squatter-start")
+
+	service := &Server{
+		hypervisor:    &fakeHypervisor{},
+		vms:           make(map[string]map[string]hypervisor.Machine),
+		hostPressure:  noHostPressure,
+		subnetSources: gatewaySquatterSubnetSources(t),
+	}
+	raw, err := json.Marshal(startArgs{Name: item.Name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.startCluster(raw)
+	if err != nil {
+		t.Fatalf("startCluster() error = %v, want a warning instead", err)
+	}
+	if !strings.Contains(result.Warning, "docker0") || !strings.Contains(result.Warning, "conflicts") {
+		t.Fatalf("ClusterSummary.Warning = %q, want a conflict warning naming docker0", result.Warning)
+	}
+}
+
 // Resume runs against the bridge suspend deliberately left up, so the strict
 // guard would refuse every suspended cluster (#271).
 func TestResumeClusterAcceptsOwnBridgeOccupyingTheSubnet(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	item := savedClusterForSubnetTest(t, "own-bridge-resume", 0)
+	item := savedClusterForSubnetTest(t, "own-bridge-resume")
 	writeSavedState(t, item)
 
 	service := &Server{
@@ -136,7 +185,7 @@ func TestResumeClusterAcceptsOwnBridgeOccupyingTheSubnet(t *testing.T) {
 
 func TestResumeClusterWarnsOnForeignSubnetConflict(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	item := savedClusterForSubnetTest(t, "foreign-resume", 0)
+	item := savedClusterForSubnetTest(t, "foreign-resume")
 	writeSavedState(t, item)
 
 	service := &Server{
