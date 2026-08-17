@@ -737,36 +737,36 @@ func establishedCRD(name string) *unstructured.Unstructured {
 	}}
 }
 
-// ciliumCRDNamesForIntent mirrors what the cilium-operator registers for the
-// values manifests.CiliumValues renders: LB-IPAM always, l2announcements only
-// on the L2 LB path, the BGP trio only with bgpControlPlane enabled.
-func ciliumCRDNamesForIntent(lb, bgp bool) []string {
-	names := []string{"ciliumloadbalancerippools.cilium.io"}
-	if lb && !bgp {
-		names = append(names, "ciliuml2announcementpolicies.cilium.io")
-	}
-	if bgp {
-		names = append(names,
-			"ciliumbgpclusterconfigs.cilium.io",
-			"ciliumbgppeerconfigs.cilium.io",
-			"ciliumbgpadvertisements.cilium.io",
-		)
-	}
-	return names
-}
-
 func TestWaitForCiliumCRDsMatchesWhatEachIntentInstalls(t *testing.T) {
+	// The installed CRD sets are hardcoded per intent — deliberately not
+	// derived from the production predicate — so a wrong wait set fails here
+	// instead of mirroring the bug.
 	for _, tt := range []struct {
-		name    string
-		lb, bgp bool
+		name      string
+		lb, bgp   bool
+		installed []string
 	}{
-		{name: "default L2 load balancer", lb: true},
-		{name: "bgp load balancer installs no l2 CRD", lb: true, bgp: true},
-		{name: "no load balancer installs no l2 CRD", lb: false},
+		{
+			name: "default L2 load balancer", lb: true,
+			installed: []string{"ciliumloadbalancerippools.cilium.io", "ciliuml2announcementpolicies.cilium.io"},
+		},
+		{
+			name: "bgp load balancer installs no l2 CRD", lb: true, bgp: true,
+			installed: []string{
+				"ciliumloadbalancerippools.cilium.io",
+				"ciliumbgpclusterconfigs.cilium.io",
+				"ciliumbgppeerconfigs.cilium.io",
+				"ciliumbgpadvertisements.cilium.io",
+			},
+		},
+		{
+			name: "no load balancer installs no l2 CRD", lb: false,
+			installed: []string{"ciliumloadbalancerippools.cilium.io"},
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			objects := []runtime.Object{}
-			for _, name := range ciliumCRDNamesForIntent(tt.lb, tt.bgp) {
+			for _, name := range tt.installed {
 				objects = append(objects, establishedCRD(name))
 			}
 			client := fake.NewSimpleDynamicClient(runtime.NewScheme(), objects...)
@@ -952,5 +952,69 @@ func TestWaitForAPIServerKeepsRetryingAnExpiredCertificate(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed < deadline {
 		t.Fatalf("expired certificate failed terminally after %v, want retries to the %v deadline", elapsed, deadline)
+	}
+}
+
+func TestWaitForAPIServerFailsFastOnIncompatibleCertificateUsage(t *testing.T) {
+	// A serving cert whose EKU forbids server auth is fixed at issuance and
+	// cannot heal by waiting — it must be terminal like an unknown authority.
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caTemplate := x509.Certificate{
+		SerialNumber:          big.NewInt(3),
+		Subject:               pkix.Name{CommonName: "talos-box test CA"},
+		NotBefore:             time.Now().Add(-time.Minute),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, &caTemplate, &caTemplate, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafTemplate := x509.Certificate{
+		SerialNumber: big.NewInt(4),
+		Subject:      pkix.Name{CommonName: "talos-box client-only leaf"},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, &leafTemplate, caCert, &leafKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = writer.Write([]byte(`{"major":"1","minor":"34"}`))
+	}))
+	server.TLS = &tls.Config{
+		Certificates: []tls.Certificate{{Certificate: [][]byte{leafDER, caDER}, PrivateKey: leafKey}},
+		MinVersion:   tls.VersionTLS12,
+	}
+	server.StartTLS()
+	defer server.Close()
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	config := &rest.Config{Host: server.URL, TLSClientConfig: rest.TLSClientConfig{CAData: caPEM}}
+	err = waitForAPIServer(ctx, config, 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("API server wait accepted a client-only serving certificate")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("incompatible-usage certificate burned %v of the deadline, want fail-fast", elapsed)
 	}
 }

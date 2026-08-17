@@ -128,7 +128,16 @@ func (s *Server) snapshotList(raw json.RawMessage) ([]cluster.SnapshotInfo, erro
 	if err := decodeArgs(raw, &args); err != nil {
 		return nil, err
 	}
-	return cluster.ListSnapshots(args.Cluster)
+	snapshots, err := cluster.ListSnapshots(args.Cluster)
+	if err != nil {
+		return nil, err
+	}
+	if snapshots == nil {
+		// An empty result must marshal as [] like cluster.list and status do,
+		// so daemon clients get one consistent contract.
+		snapshots = []cluster.SnapshotInfo{}
+	}
+	return snapshots, nil
 }
 
 func (s *Server) snapshotDelete(raw json.RawMessage) ([]cluster.SnapshotInfo, error) {

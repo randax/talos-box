@@ -804,8 +804,10 @@ func isUntrustedCertificateError(err error) bool {
 	}
 	var invalid x509.CertificateInvalidError
 	if errors.As(err, &invalid) {
+		// NotAuthorizedToSign never surfaces here: Go's chain builder folds
+		// it into UnknownAuthorityError, which the branch above catches.
 		switch invalid.Reason {
-		case x509.NotAuthorizedToSign, x509.IncompatibleUsage, x509.CANotAuthorizedForThisName:
+		case x509.IncompatibleUsage, x509.CANotAuthorizedForThisName:
 			return true
 		}
 	}
