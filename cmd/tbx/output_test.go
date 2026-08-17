@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/daemon"
@@ -208,8 +209,9 @@ func TestPrintStatusShowsCuratedExtensions(t *testing.T) {
 	if err := printStatus(&quiet, statuses, true); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(quiet.String(), "extensions") {
-		t.Fatalf("quiet status unexpectedly included the extensions line:\n%s", quiet.String())
+	// Extensions are a fact of the cluster, so --quiet keeps them (#307).
+	if !strings.Contains(quiet.String(), "cluster sandboxed: extensions gvisor, nfs-utils") {
+		t.Fatalf("quiet status dropped the extensions fact:\n%s", quiet.String())
 	}
 }
 
@@ -239,24 +241,44 @@ func TestPrintStatusShowsRecomposedSchematicInputs(t *testing.T) {
 	}
 }
 
-func TestPrintStatusQuietSuppressesSchematicLines(t *testing.T) {
+// The schematic id is a fact, not a hint: --quiet drops hints only (#307).
+func TestPrintStatusQuietKeepsSchematicFactAndDropsHints(t *testing.T) {
 	t.Parallel()
 
+	started := time.Now().Add(-time.Hour)
 	status := daemon.ClusterStatus{
 		Name: "demo", Subnet: "172.30.3.0/24", Domain: "demo.k8s.test",
-		TalosVersion: "v1.13.6", Schematic: "aaa111",
-		Nodes: []daemon.NodeStatus{{Name: "demo-cp-1", Role: cluster.RoleControlPlane, MAC: "52:54:00:00:00:01", Phase: daemon.PhaseConfigured}},
+		TalosVersion: "v1.13.6", Schematic: "aaa111", BaseSchematic: "bbb222",
+		TalosExtensions: []string{"gvisor"},
+		Nodes: []daemon.NodeStatus{{
+			Name: "demo-cp-1", Role: cluster.RoleControlPlane, MAC: "52:54:00:00:00:01",
+			Phase: daemon.PhaseUnreachable, StartedAt: &started,
+		}},
+	}
+	status.Hints = daemon.Hints(status)
+	if len(status.Hints) == 0 {
+		t.Fatal("the stalled node produced no hint to suppress")
 	}
 
 	var output bytes.Buffer
 	if err := printStatus(&output, []daemon.ClusterStatus{status}, true); err != nil {
 		t.Fatal(err)
 	}
-	if rendered := output.String(); strings.Contains(rendered, "schematic") {
-		t.Fatalf("quiet status unexpectedly included the schematic line:\n%s", rendered)
+	rendered := output.String()
+	for _, wanted := range []string{
+		"v1.13.6",
+		"cluster demo: schematic aaa111",
+		"cluster demo: composed from schematic bbb222",
+		"cluster demo: extensions gvisor",
+	} {
+		if !strings.Contains(rendered, wanted) {
+			t.Fatalf("quiet status dropped the fact %q:\n%s", wanted, rendered)
+		}
 	}
-	if rendered := output.String(); !strings.Contains(rendered, "v1.13.6") {
-		t.Fatalf("quiet status lost the TALOS column:\n%s", rendered)
+	for _, unwanted := range []string{"hint [demo]:", "tbx console"} {
+		if strings.Contains(rendered, unwanted) {
+			t.Fatalf("quiet status unexpectedly included the hint %q:\n%s", unwanted, rendered)
+		}
 	}
 }
 

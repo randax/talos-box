@@ -191,7 +191,11 @@ func (c cli) startCluster(args []string) error {
 		Force bool   `json:"force"`
 	}{Name: name, Force: force}
 	var result daemon.ClusterSummary
-	if err := c.call("cluster.start", request, &result); err != nil {
+	// A start reconciles the cluster's declared CNI/CSI on the same blocking
+	// call as create, and the CLI cannot see which the stored cluster declares —
+	// so it states the outer bound.
+	signal := liveness{verb: "starting " + name, deadline: storageProvisionDeadline, quiet: quiet}
+	if err := c.callWithLiveness(signal, "cluster.start", request, &result); err != nil {
 		return err
 	}
 	if _, err := fmt.Fprintf(c.out, "started cluster %s\n", result.Name); err != nil {
@@ -307,7 +311,12 @@ func (c cli) createCluster(args []string) error {
 		Extensions: requestedExtensions,
 	}
 	var result daemon.ClusterSummary
-	if err := c.call("cluster.create", request, &result); err != nil {
+	signal := liveness{
+		verb:     "provisioning " + positionals[0],
+		deadline: provisionDeadline(*csi != ""),
+		quiet:    *quiet,
+	}
+	if err := c.callWithLiveness(signal, "cluster.create", request, &result); err != nil {
 		return err
 	}
 	if _, err := fmt.Fprintf(c.out, "created and started cluster %s (%d control plane, %d workers)\n",

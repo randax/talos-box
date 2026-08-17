@@ -68,11 +68,9 @@ func printStatus(output io.Writer, clusters []daemon.ClusterStatus, quiet bool) 
 			}
 		}
 	}
-	if quiet {
-		return nil
-	}
-	// Every cluster carries a schematic (the daemon default when nothing was
-	// pinned), so the full 64-hex ids stay out of quiet output.
+	// The schematic, what it was composed from, and the extensions that went
+	// into it are facts about the cluster, not suggestions: --quiet drops hints
+	// only, so these survive it (#307).
 	for _, item := range clusters {
 		if item.Schematic != "" {
 			if _, err := fmt.Fprintf(output, "cluster %s: schematic %s\n", item.Name, item.Schematic); err != nil {
@@ -93,6 +91,9 @@ func printStatus(output io.Writer, clusters []daemon.ClusterStatus, quiet bool) 
 				return err
 			}
 		}
+	}
+	if quiet {
+		return nil
 	}
 	printed := false
 	for _, item := range clusters {

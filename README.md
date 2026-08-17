@@ -98,7 +98,8 @@ tbx manifests demo         # exact machine patch, chart values/objects, and LB/B
 storage provisioning from probe-verified live storage, while
 printing credential exports and the flannel NetworkPolicy limitation. Hints never execute
 anything; suppress them with `--quiet`. `tbx up --quiet` and `tbx cluster create --quiet` keep
-their final result but suppress stage narration. `tbx manifests` is the exact inspection/fork
+their final result and facts, suppress stage narration, state the operation's deadline up
+front, and emit a once-a-minute liveness line on stderr so a long provision never looks hung. `tbx manifests` is the exact inspection/fork
 surface for the curated path: `machine`, `values`, `objects`, and `extras` match the machine
 prerequisite patch, pinned Helm values, rendered chart objects, and LB/BGP resources `tbx`
 applies. The substrate sections — `machine`, `mirrors`, `images`, and the `storage` streams —
