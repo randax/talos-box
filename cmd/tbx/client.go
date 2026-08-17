@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -226,7 +227,7 @@ func (c cli) handshakeDaemon(timeout time.Duration) error {
 	if !activity.empty() {
 		return fmt.Errorf("%s, and %s", skew, restartRefusal(activity))
 	}
-	if _, _, err := replaceDaemon(socketPath, info, pid); err != nil {
+	if _, _, err := replaceDaemon(socketPath, info, pid, activity, c.err); err != nil {
 		return fmt.Errorf("%s and could not be restarted (%w); run: tbx system restart", skew, err)
 	}
 	_, err = fmt.Fprintf(c.err, "restarted stale tbxd (protocol %d < %d)\n", info.ProtocolVersion, daemon.ProtocolVersion)
@@ -299,6 +300,10 @@ func isTimeout(err error) bool {
 type clusterActivity struct {
 	running   []string
 	suspended []string
+	// runningVMs is how many VMs the daemon has to power off before it can
+	// exit. Stopping them is what makes a restart slow, so it is what the
+	// stop-wait is scaled against (#319).
+	runningVMs int
 }
 
 func (a clusterActivity) empty() bool { return len(a.running)+len(a.suspended) == 0 }
@@ -420,9 +425,11 @@ func runningClusters(socketPath string) (clusterActivity, error) {
 		return clusterActivity{}, errors.New(response.Error)
 	}
 	var summaries []struct {
-		Name      string `json:"name"`
-		Running   bool   `json:"running"`
-		Suspended bool   `json:"suspended"`
+		Name          string `json:"name"`
+		Running       bool   `json:"running"`
+		Suspended     bool   `json:"suspended"`
+		ControlPlanes int    `json:"controlPlanes"`
+		Workers       int    `json:"workers"`
 	}
 	if len(response.Data) > 0 {
 		if err := json.Unmarshal(response.Data, &summaries); err != nil {
@@ -434,6 +441,7 @@ func runningClusters(socketPath string) (clusterActivity, error) {
 		switch {
 		case summary.Running:
 			activity.running = append(activity.running, summary.Name)
+			activity.runningVMs += summary.ControlPlanes + summary.Workers
 		case summary.Suspended:
 			activity.suspended = append(activity.suspended, summary.Name)
 		}
@@ -480,6 +488,7 @@ var (
 	spawnDaemonProcess      = startDaemon
 	supervisedDaemon        = supervisedDaemonUnit
 	daemonProcessAlive      = processAlive
+	daemonLockFree          = socketLockFree
 	runningClustersQuery    = runningClusters
 	savedStateClustersQuery = savedStateClusters
 	runSupervisorCommand    = func(name string, args ...string) error {
@@ -598,7 +607,12 @@ func supervisionUnitPaths() []string {
 // and returns the replacement's info and pid. An unidentifiable or supervised
 // daemon is left alone: killing a process tbx cannot prove it owns is worse
 // than reporting the skew.
-func replaceDaemon(socketPath string, info daemon.Info, pid int) (daemon.Info, int, error) {
+//
+// The old daemon stops every VM it runs before it exits, so the wait is scaled
+// to that workload and the replacement is only spawned once the socket lock is
+// actually free — otherwise the new daemon dies on "another daemon owns
+// tbxd.sock" while the old one is still cleaning up (#319).
+func replaceDaemon(socketPath string, info daemon.Info, pid int, activity clusterActivity, progress io.Writer) (daemon.Info, int, error) {
 	// only a confirmed supervisor is refused here; callers decide what to do
 	// about a merely inferred unit file, which a forced restart may override
 	if state, reason := supervisedDaemon(); state == supervisionConfirmed {
@@ -610,7 +624,12 @@ func replaceDaemon(socketPath string, info daemon.Info, pid int) (daemon.Info, i
 	if err := terminateDaemonProcess(pid); err != nil {
 		return info, pid, fmt.Errorf("stop tbxd (pid %d): %w", pid, err)
 	}
-	if err := waitForDaemonExit(pid); err != nil {
+	if err := waitForDaemonExit(pid, activity, progress); err != nil {
+		return info, pid, err
+	}
+	// The daemon holds its socket lock deliberately past listener close, so an
+	// observed process exit is not yet permission to bind.
+	if err := waitForDaemonLock(socketPath, progress); err != nil {
 		return info, pid, err
 	}
 	if _, err := spawnDaemonProcess(); err != nil {
@@ -619,21 +638,110 @@ func replaceDaemon(socketPath string, info daemon.Info, pid int) (daemon.Info, i
 	return waitForCurrentDaemon(socketPath)
 }
 
+// daemonExitTimeout is how long the old daemon gets to exit. Stopping a VM is
+// bounded by the daemon's own 30s per-machine timeout and the machines are
+// retired one cluster at a time, so a fixed 20s gives up on the very restarts
+// that need the wait most (#319).
+func daemonExitTimeout(activity clusterActivity) time.Duration {
+	return daemonWaitTimeout + time.Duration(activity.runningVMs)*machineStopBudget
+}
+
+// machineStopBudget mirrors the daemon's per-machine stop timeout. It is a var
+// only so tests can shorten it.
+var machineStopBudget = 30 * time.Second
+
+// daemonExitProgressInterval is how often a long wait says what it is waiting
+// for. It is a var only so tests can shorten it.
+var daemonExitProgressInterval = 5 * time.Second
+
 // waitForDaemonExit waits for the daemon process itself to go away. It must
 // never poll the socket: under systemd socket activation the supervisor owns
 // the listener, so every dial would respawn the daemon this call is trying to
 // retire.
-func waitForDaemonExit(pid int) error {
-	deadline := time.Now().Add(daemonWaitTimeout)
+func waitForDaemonExit(pid int, activity clusterActivity, progress io.Writer) error {
+	timeout := daemonExitTimeout(activity)
+	start := time.Now()
+	deadline := start.Add(timeout)
+	nextReport := start.Add(daemonExitProgressInterval)
 	for {
 		if !daemonProcessAlive(pid) {
 			return nil
 		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("tbxd (pid %d) did not exit within %s", pid, daemonWaitTimeout)
+		now := time.Now()
+		if now.After(deadline) {
+			return fmt.Errorf("tbxd (pid %d) is still stopping %s and did not exit within %s; "+
+				"wait for it to finish and re-run: tbx system restart --force",
+				pid, describeStoppingVMs(activity), timeout)
+		}
+		if !now.Before(nextReport) {
+			reportProgress(progress, "waiting for tbxd (pid %d) to exit; it is still stopping %s (%s elapsed)\n",
+				pid, describeStoppingVMs(activity), now.Sub(start).Round(time.Second))
+			nextReport = now.Add(daemonExitProgressInterval)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+// waitForDaemonLock waits until the socket's flock can be taken, which is the
+// only proof the old daemon has finished with the socket: it keeps the lock
+// until the process is really gone, past listener close.
+func waitForDaemonLock(socketPath string, progress io.Writer) error {
+	start := time.Now()
+	deadline := start.Add(daemonWaitTimeout)
+	nextReport := start.Add(daemonExitProgressInterval)
+	for {
+		if daemonLockFree(socketPath) {
+			return nil
+		}
+		now := time.Now()
+		if now.After(deadline) {
+			return fmt.Errorf("the old tbxd still owns %s after %s; it is finishing its shutdown — re-run: tbx system restart --force",
+				socketPath, daemonWaitTimeout)
+		}
+		if !now.Before(nextReport) {
+			reportProgress(progress, "waiting for the old tbxd to release %s (%s elapsed)\n",
+				socketPath, now.Sub(start).Round(time.Second))
+			nextReport = now.Add(daemonExitProgressInterval)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// socketLockFree reports whether the daemon socket lock can be taken right now.
+// It takes the lock non-blocking and releases it immediately, so it only ever
+// answers the question.
+func socketLockFree(socketPath string) bool {
+	lock, err := os.OpenFile(socketPath+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		// An unopenable lock file is not a daemon holding it; let the spawn
+		// report the real problem instead of stalling here.
+		return true
+	}
+	defer func() { _ = lock.Close() }()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return false
+	}
+	_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	return true
+}
+
+func describeStoppingVMs(activity clusterActivity) string {
+	if activity.runningVMs == 0 {
+		return "its clusters"
+	}
+	if activity.runningVMs == 1 {
+		return "1 VM"
+	}
+	return fmt.Sprintf("%d VMs", activity.runningVMs)
+}
+
+// reportProgress writes one progress line, ignoring a write failure: a restart
+// must not fail because its narration could not be printed.
+func reportProgress(progress io.Writer, format string, args ...any) {
+	if progress == nil {
+		return
+	}
+	_, _ = fmt.Fprintf(progress, format, args...)
 }
 
 func waitForCurrentDaemon(socketPath string) (daemon.Info, int, error) {
@@ -742,8 +850,10 @@ func exchangeWithin(socketPath, op string, args any, timeout time.Duration) (dae
 	return response, nil
 }
 
-// daemonWaitTimeout bounds how long a just-spawned daemon may take to serve.
-const daemonWaitTimeout = 20 * time.Second
+// daemonWaitTimeout bounds how long a just-spawned daemon may take to serve,
+// and is the base a stop-wait is scaled from. It is a var only so tests can
+// shorten it.
+var daemonWaitTimeout = 20 * time.Second
 
 // daemonHandshakeTimeout bounds the whole daemon.info exchange. The gate is a
 // courtesy check, so a daemon busy under its operation lock must not hang it.

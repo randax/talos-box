@@ -114,7 +114,9 @@ func (c cli) restartDaemon(force bool) error {
 			return errors.New(restartRefusal(activity))
 		}
 	}
-	restarted, restartedPID, err := replaceDaemon(socketPath, info, pid)
+	// activity carries the VM count the stop-wait is scaled to; an unknown
+	// activity leaves the base wait, which is the pre-#319 behaviour.
+	restarted, restartedPID, err := replaceDaemon(socketPath, info, pid, activity, c.err)
 	if err != nil {
 		return err
 	}

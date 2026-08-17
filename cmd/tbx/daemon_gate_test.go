@@ -24,7 +24,10 @@ type fakeDaemon struct {
 	ops       []string
 	running   []string
 	suspended []string
-	listener  net.Listener
+	// nodes counts the VMs each running cluster has, which is what scales the
+	// restart's stop-wait (#319).
+	nodes    map[string][2]int
+	listener net.Listener
 }
 
 func newFakeDaemon(t *testing.T, protocol int) *fakeDaemon {
@@ -72,6 +75,10 @@ func (f *fakeDaemon) respond(request daemon.Request) daemon.Response {
 	protocol := f.protocol
 	running := append([]string(nil), f.running...)
 	suspended := append([]string(nil), f.suspended...)
+	nodes := make(map[string][2]int, len(f.nodes))
+	for name, counts := range f.nodes {
+		nodes[name] = counts
+	}
 	f.mu.Unlock()
 	switch request.Op {
 	case "daemon.info":
@@ -80,7 +87,8 @@ func (f *fakeDaemon) respond(request daemon.Request) daemon.Response {
 	case "cluster.list":
 		summaries := make([]daemon.ClusterSummary, 0, len(running)+len(suspended))
 		for _, name := range running {
-			summaries = append(summaries, daemon.ClusterSummary{Name: name, Running: true})
+			counts := nodes[name]
+			summaries = append(summaries, daemon.ClusterSummary{Name: name, Running: true, ControlPlanes: counts[0], Workers: counts[1]})
 		}
 		for _, name := range suspended {
 			summaries = append(summaries, daemon.ClusterSummary{Name: name, Suspended: true})
@@ -97,6 +105,18 @@ func (f *fakeDaemon) runs(names ...string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.running = names
+}
+
+// runsNodes makes the fake daemon report one running cluster of a given size,
+// which is the workload a forced restart has to wait out.
+func (f *fakeDaemon) runsNodes(name string, controlPlanes, workers int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.running = append(f.running, name)
+	if f.nodes == nil {
+		f.nodes = make(map[string][2]int)
+	}
+	f.nodes[name] = [2]int{controlPlanes, workers}
 }
 
 // suspends makes the fake daemon report the named clusters as suspended: not
