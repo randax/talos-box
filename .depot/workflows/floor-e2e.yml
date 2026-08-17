@@ -1,0 +1,50 @@
+name: Floor e2e
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  kvm-floor:
+    name: KVM floor-version e2e
+    # Release-blocking, not merge-blocking: the floor is the bottom of the
+    # supported window, so a break there must stop a release without stopping
+    # everyday work on main. Hence tags and manual dispatch only.
+    runs-on: depot-ubuntu-24.04-8
+    env:
+      TBX_E2E_TALOS_VERSION: v1.12.0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26"
+          cache: false
+      - name: Install QEMU, EFI firmware, and NFS userland
+        run: |
+          sudo apt-get update
+          # socat serves the guest-agent probe; nfs-ganesha serves the NFSv3
+          # export in userspace — Depot CI sandbox kernels have no nfsd.
+          sudo apt-get install --yes qemu-system-x86 qemu-utils ovmf xz-utils curl jq iptables socat nfs-ganesha nfs-ganesha-vfs rpcbind
+          test -w /dev/kvm
+      - name: Allow talosbox routed traffic
+        run: |
+          # Depot CI sandboxes filter guest egress in FORWARD after the bridge
+          # turns packets into routed traffic, so the CI lane must allow traffic
+          # to leave br-tbx and permit return flows back into the guests.
+          if ! sudo iptables -C FORWARD -i 'br-tbx+' -j ACCEPT; then
+            sudo iptables -I FORWARD 1 -i 'br-tbx+' -j ACCEPT
+          fi
+          if ! sudo iptables -C FORWARD -o 'br-tbx+' -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; then
+            sudo iptables -I FORWARD 1 -o 'br-tbx+' -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+          fi
+      - name: Build Linux binaries
+        run: |
+          mkdir -p bin
+          go build -o bin/tbx ./cmd/tbx
+          go build -o bin/tbxd ./cmd/tbxd
+          go build -o bin/tbx-helper ./cmd/tbx-helper
+      - name: Assert CI contract
+        run: scripts/ci/test_linux_kvm_e2e_contract.sh
+      - name: Verify floor-version cluster and curated extensions
+        run: scripts/ci/linux-kvm-e2e.sh

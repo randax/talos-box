@@ -5,6 +5,9 @@ set -Eeuo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 workflow="$root/.github/workflows/ci.yml"
+depot_ci="$root/.depot/workflows/ci.yml"
+depot_e2e="$root/.depot/workflows/e2e.yml"
+depot_floor="$root/.depot/workflows/floor-e2e.yml"
 harness="$root/scripts/ci/linux-kvm-e2e.sh"
 storage_harness="$root/scripts/ci/linux-kvm-storage-e2e.sh"
 lib="$root/scripts/ci/kvm-e2e-lib.sh"
@@ -18,27 +21,37 @@ require() {
   fi
 }
 
-require 'schedule:' "$workflow"
-require 'ubuntu-latest' "$workflow"
+# GitHub Actions keeps only the lanes Depot CI cannot serve.
+require 'macos-15' "$workflow"
 require 'ubuntu-24.04-arm' "$workflow"
-require 'nix flake check' "$workflow"
-require 'linux-kvm-e2e' "$workflow"
-require 'linux-kvm-storage-e2e' "$workflow"
-require 'scripts/ci/linux-kvm-storage-e2e.sh' "$workflow"
-require "if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository" "$workflow"
-require 'linux-kvm-floor-e2e' "$workflow"
-require "if: github.event_name == 'schedule'" "$workflow"
-require 'TBX_E2E_TALOS_VERSION: v1.12.0' "$workflow"
-require 'qemu-system-x86' "$workflow"
-require 'socat nfs-kernel-server' "$workflow"
-require '/etc/udev/rules.d/99-kvm4all.rules' "$workflow"
-require 'MODE="0666"' "$workflow"
-require 'OPTIONS+="static_node=kvm"' "$workflow"
-require 'test -w /dev/kvm' "$workflow"
-require "sudo iptables -C FORWARD -i 'br-tbx+' -j ACCEPT" "$workflow"
-require "sudo iptables -I FORWARD 1 -i 'br-tbx+' -j ACCEPT" "$workflow"
-require "sudo iptables -C FORWARD -o 'br-tbx+' -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" "$workflow"
-require "sudo iptables -I FORWARD 1 -o 'br-tbx+' -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" "$workflow"
+
+# Fast lanes live in the Depot CI workflow.
+require 'depot-ubuntu-24.04-8' "$depot_ci"
+require 'depot-ubuntu-24.04-4' "$depot_ci"
+require 'nix flake check' "$depot_ci"
+require 'depot/cache-mount' "$depot_ci"
+
+# KVM e2e lanes: merge-gating substrate + storage on PRs and main.
+require 'kvm-substrate' "$depot_e2e"
+require 'kvm-storage' "$depot_e2e"
+require 'scripts/ci/linux-kvm-e2e.sh' "$depot_e2e"
+require 'scripts/ci/linux-kvm-storage-e2e.sh' "$depot_e2e"
+require 'qemu-system-x86' "$depot_e2e"
+require 'socat nfs-ganesha nfs-ganesha-vfs rpcbind' "$depot_e2e"
+
+# Floor lane is release-gating: version tags and manual dispatch only.
+require 'tags: ["v*"]' "$depot_floor"
+require 'workflow_dispatch' "$depot_floor"
+require 'TBX_E2E_TALOS_VERSION: v1.12.0' "$depot_floor"
+require 'scripts/ci/linux-kvm-e2e.sh' "$depot_floor"
+
+for kvm_workflow in "$depot_e2e" "$depot_floor"; do
+  require 'test -w /dev/kvm' "$kvm_workflow"
+  require "sudo iptables -C FORWARD -i 'br-tbx+' -j ACCEPT" "$kvm_workflow"
+  require "sudo iptables -I FORWARD 1 -i 'br-tbx+' -j ACCEPT" "$kvm_workflow"
+  require "sudo iptables -C FORWARD -o 'br-tbx+' -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" "$kvm_workflow"
+  require "sudo iptables -I FORWARD 1 -o 'br-tbx+' -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" "$kvm_workflow"
+done
 
 # Shared plumbing lives in the lib; both harnesses must source it.
 require 'retry() {' "$lib"
@@ -95,6 +108,11 @@ require 'retry "runsc pod completion"' "$harness"
 require 'nfsvers=3' "$harness"
 require 'flock /data/probe' "$harness"
 require 'retry "NFSv3 locked write"' "$harness"
+# Ganesha serves the export from userspace; the harness owns the daemon and
+# must never lean on systemd, which CI sandboxes lack.
+require 'ganesha.nfsd -f' "$harness"
+require 'Enable_NLM = true;' "$harness"
+require 'retry "Ganesha NFSv3 registration"' "$harness"
 require 'talos_version=${TBX_E2E_TALOS_VERSION:-v1.13.6}' "$harness"
 require '  v1.12.0)' "$harness"
 
@@ -150,8 +168,14 @@ done
 require 'console e2e' "$harness"
 require 'console e2es' "$storage_harness"
 
-if grep -Fq -- 'setfacl' "$workflow" || grep -Fq -- ' acl' "$workflow"; then
-  printf 'KVM access must come from the udev rule, not ACL setup\n' >&2
+for kvm_workflow in "$depot_e2e" "$depot_floor"; do
+  if grep -Eq -- 'setfacl| acl|udev' "$kvm_workflow"; then
+    printf '/dev/kvm is writable out of the box in CI sandboxes; no ACL or udev setup allowed in %s\n' "$kvm_workflow" >&2
+    exit 1
+  fi
+done
+if grep -Fq -- 'systemctl' "$harness" || grep -Fq -- 'systemctl' "$storage_harness"; then
+  printf 'e2e harnesses must stay init-agnostic: CI sandboxes have no systemd\n' >&2
   exit 1
 fi
 if grep -Eq -- '--(cni|csi|lb|bgp|hubble)([ =]|$)' "$harness"; then
@@ -166,10 +190,16 @@ if grep -Fq -- 'talosctl' "$storage_harness"; then
   printf 'provisioning-path e2e must not manage Talos by hand\n' >&2
   exit 1
 fi
-if grep -Eq 'uses: [^[:space:]]+@v[0-9]' "$workflow"; then
-  printf 'scheduled CI jobs must pin actions to immutable commit SHAs\n' >&2
-  exit 1
-fi
+for pinned_workflow in "$workflow" "$depot_ci" "$depot_e2e" "$depot_floor"; do
+  if grep -Eq 'uses: [^[:space:]]+@v[0-9]' "$pinned_workflow"; then
+    printf 'CI workflows must pin actions to immutable commit SHAs (%s)\n' "$pinned_workflow" >&2
+    exit 1
+  fi
+  if grep -Fq -- 'schedule:' "$pinned_workflow"; then
+    printf 'CI runs on PRs, pushes to main, and release tags only — no cron (%s)\n' "$pinned_workflow" >&2
+    exit 1
+  fi
+done
 
 expect_kvm_gate_failure() {
   local gated_harness=$1 device=$2 workdir
