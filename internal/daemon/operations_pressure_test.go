@@ -212,3 +212,27 @@ func TestAddNodeSurfacesHostPressureProbeFailure(t *testing.T) {
 		t.Fatalf("NodeStatus.Warning = %q, want probe failure", result.Warning)
 	}
 }
+
+func TestCheckHostPressureForcedRendersEachBlockingFindingSeparately(t *testing.T) {
+	// Two independent blocking findings (critical pressure, full data volume)
+	// must stay two warnings, each marked forced, so the CLI renders them one
+	// per line instead of a semicolon run-on (#291).
+	service := &Server{hostPressure: func(string) (hostpressure.Snapshot, error) {
+		return hostpressure.Snapshot{
+			MemoryPressure: hostpressure.MemoryPressureCritical,
+			DataVolume:     hostpressure.Usage{TotalBytes: 100 << 30, AvailableBytes: 1 << 30},
+		}, nil
+	}}
+	warnings, err := service.checkHostPressure(t.TempDir(), true)
+	if err != nil {
+		t.Fatalf("checkHostPressure(force) = %v, want forced warnings", err)
+	}
+	if len(warnings) < 2 {
+		t.Fatalf("checkHostPressure(force) = %q, want each blocking finding as its own warning", warnings)
+	}
+	for _, warning := range warnings {
+		if !strings.Contains(warning, "(forced)") {
+			t.Fatalf("forced warning %q does not carry the forced marker", warning)
+		}
+	}
+}

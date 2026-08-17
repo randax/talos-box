@@ -16,6 +16,12 @@ const (
 	// working set plus margin: below that, a single VM's dirty pages can fill
 	// the remaining swap, which is when guests reset mid-write.
 	lowFreeSwapBytes = 3 * bytesPerGiB / 2
+	// substantialSwapUsedPercent gates the low-free-swap escalation: macOS
+	// grows vm.swapusage on demand, so a small, mostly-free allocation is the
+	// normal reading right when a host merely begins to swap. Requiring
+	// substantial use keeps that state at Warn while both QA-observed
+	// corruption readings (87-88% used) still block.
+	substantialSwapUsedPercent = 75
 )
 
 // Usage describes capacity and immediately available bytes for one resource.
@@ -143,7 +149,7 @@ func memoryFinding(snapshot Snapshot) (Finding, bool) {
 	swapEnabled := snapshot.Swap.TotalBytes > 0
 	swapExhausted := swapEnabled && percentUsed(snapshot.Swap) >= extremeSwapUsedPercent
 	swapNearlyFull := swapEnabled && snapshot.Swap.AvailableBytes < lowFreeSwapBytes &&
-		percentUsed(snapshot.Swap) >= 75
+		percentUsed(snapshot.Swap) >= substantialSwapUsedPercent
 
 	var severity Severity
 	switch snapshot.MemoryPressure {

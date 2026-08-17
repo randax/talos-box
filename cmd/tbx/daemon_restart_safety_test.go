@@ -756,3 +756,38 @@ func TestSystemRestartForceStillRefusesAConfirmedSupervisor(t *testing.T) {
 		t.Fatal("a confirmed supervised daemon must never be terminated")
 	}
 }
+
+func TestCallRefusesToRestartWhenTheSavedStateScanFails(t *testing.T) {
+	fake := newFakeDaemon(t, daemon.ProtocolVersion-1)
+	terminated := stubDaemonRestart(t, fake, unsupervisedDaemon)
+	stubRunningClusters(t, func(string) (clusterActivity, error) { return clusterActivity{}, nil })
+	previous := savedStateClustersQuery
+	t.Cleanup(func() { savedStateClustersQuery = previous })
+	savedStateClustersQuery = func() ([]string, error) { return nil, errors.New("scan failed") }
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr, daemon: newDaemonSession()}
+
+	err := command.call("status", struct{}{}, nil)
+	if err == nil || !strings.Contains(err.Error(), "scan for suspended clusters") {
+		t.Fatalf("error = %v, want a refusal naming the failed suspension scan", err)
+	}
+	if *terminated != 0 {
+		t.Fatal("an unknown suspension state must not be terminated through")
+	}
+}
+
+func TestFeatureGateMessagesNameTheForcedRestartEscape(t *testing.T) {
+	// The per-verb feature gate is the path taken when the connect-time gate
+	// was skipped (busy daemon), so its refusal must name the same escapes.
+	newFakeDaemon(t, daemon.ProtocolVersion)
+	command := cli{out: &bytes.Buffer{}, err: &bytes.Buffer{}}
+	gateErr := command.ensureProtocolAtLeast(daemon.ProtocolVersion+1, "future feature")
+	if gateErr == nil {
+		t.Fatal("gate passed a daemon older than the required protocol")
+	}
+	for _, wanted := range []string{"--force", "supervised install"} {
+		if !strings.Contains(gateErr.Error(), wanted) {
+			t.Fatalf("gate error = %v, want it to name %q", gateErr, wanted)
+		}
+	}
+}

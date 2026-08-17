@@ -221,7 +221,7 @@ func (c cli) handshakeDaemon(timeout time.Duration) error {
 	// survive it — never do that behind a read-only verb's back (#290)
 	activity, activityErr := daemonClusterActivity(socketPath)
 	if activityErr != nil {
-		return fmt.Errorf("%s and tbx could not tell whether clusters are running (%v); run: tbx system restart", skew, activityErr)
+		return fmt.Errorf("%s and tbx could not tell whether clusters are running (%v); run: tbx system restart --force to restart anyway", skew, activityErr)
 	}
 	if !activity.empty() {
 		return fmt.Errorf("%s, and %s", skew, restartRefusal(activity))
