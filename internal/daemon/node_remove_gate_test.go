@@ -93,6 +93,9 @@ func TestNodeRemoveForceDeletesAndWarnsAboutVolumeData(t *testing.T) {
 	}
 }
 
+// The node is off the substrate by the time the follow-up reconcile runs, so a
+// reconcile failure cannot un-remove it: the removal still succeeds and the
+// data-loss note still reaches the operator (#314).
 func TestNodeRemoveKeepsDataLossWarningWhenReconcileFails(t *testing.T) {
 	service, item := runningLonghornClusterForNodeMutation(t, 1, 2)
 	service.provisionReconcile = func(context.Context, provision.Request) (provision.Result, error) {
@@ -103,12 +106,20 @@ func TestNodeRemoveKeepsDataLossWarningWhenReconcileFails(t *testing.T) {
 	}
 
 	response := dispatchNodeRemove(t, service, item.Name, "demo-worker-2", true)
+	service.backgroundProvisions.Wait()
 
-	if response.OK {
-		t.Fatal("node.remove reported success despite a failed reconcile")
+	if !response.OK {
+		t.Fatalf("node.remove failed on a reconcile that runs behind the response: %s", response.Error)
 	}
-	if !strings.Contains(response.Error, "permanently deletes the only copy of 1 longhorn volume") {
-		t.Fatalf("reconcile-failure error %q lost the data-loss warning", response.Error)
+	if status := decodeNodeStatus(t, response); !strings.Contains(status.Warning, "permanently deletes the only copy of 1 longhorn volume") {
+		t.Fatalf("reconcile-failure warning %q lost the data-loss note", status.Warning)
+	}
+	reloaded, err := cluster.Load(item.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded.Nodes) != 2 {
+		t.Fatalf("cluster node count after remove = %d, want 2", len(reloaded.Nodes))
 	}
 }
 

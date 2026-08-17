@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -68,6 +69,7 @@ type Server struct {
 	nodeVolumeCount       nodeVolumeCountFunc
 	storageEngineDelete   func(context.Context, cluster.Cluster) error
 	storageEngineValidate func(context.Context, cluster.Cluster) error
+	deleteKubernetesNode  func(context.Context, cluster.Cluster, string) error
 	nodeIPLookup          func(string, int) string
 	nodeProbe             func(string) ProbeResult
 	hostFreeMemory        func() (int, error)
@@ -80,6 +82,10 @@ type Server struct {
 	defaultSchematic      string
 	subnetSources         cluster.SubnetSources
 	hostPressure          func(string) (hostpressure.Snapshot, error)
+
+	// backgroundProvisions tracks reconciles that were moved off the request
+	// path, so shutdown and tests can wait for them.
+	backgroundProvisions sync.WaitGroup
 
 	listenerMu   sync.Mutex
 	listener     net.Listener
@@ -323,6 +329,9 @@ func (s *Server) Shutdown() error {
 	s.cancelAllProvisionsLocked()
 	s.opMu.Unlock()
 	s.connectionWG.Wait()
+	// the reconciles that outlive their request answer to the cancelled
+	// lifecycle context, so this only waits for them to unwind
+	s.backgroundProvisions.Wait()
 
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
@@ -369,7 +378,7 @@ func (s *Server) dispatch(request Request) Response {
 	if request.Op == "cluster.create" || request.Op == "cluster.start" || request.Op == "up" {
 		return s.dispatchProvisioning(request)
 	}
-	if request.Op == "node.add" || request.Op == "node.remove" {
+	if isNodeMutation(request.Op) {
 		return s.dispatchNodeMutation(request)
 	}
 	if request.Op == "snapshot.restore" {
@@ -443,6 +452,17 @@ func (s *Server) dispatchProvisioning(request Request) Response {
 	return success(data)
 }
 
+// isNodeMutation names the operations that change one node's membership or run
+// state, and so share the per-cluster mutation lock.
+func isNodeMutation(op string) bool {
+	switch op {
+	case "node.add", "node.remove", "node.start", "node.stop":
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Server) dispatchNodeMutation(request Request) Response {
 	var args nodeArgs
 	if err := decodeArgs(request.Args, &args); err != nil {
@@ -457,9 +477,11 @@ func (s *Server) dispatchNodeMutation(request Request) Response {
 	lock.Lock()
 	var removalWarning string
 	if request.Op == "node.remove" {
+		log.Printf("node.remove %s/%s: begin", args.Cluster, args.Name)
 		warning, err := s.gateNodeRemoval(args)
 		if err != nil {
 			lock.Unlock()
+			log.Printf("node.remove %s/%s: refused: %v", args.Cluster, args.Name, err)
 			return failure(err)
 		}
 		removalWarning = warning
@@ -476,19 +498,32 @@ func (s *Server) dispatchNodeMutation(request Request) Response {
 		}
 		return failure(err)
 	}
-	if removalWarning != "" {
-		if status, ok := data.(NodeStatus); ok {
-			status.addWarnings(removalWarning)
-			data = status
-		}
+	warnings := []string{removalWarning}
+	if request.Op == "node.remove" {
+		warnings = append(warnings, s.deleteRemovedKubernetesNode(args.Cluster, args.Name))
 	}
-	if err := s.runProvisionTasks(data, tasks); err != nil {
-		if removalWarning != "" {
-			// the node's disk is already gone; the data-loss note must survive
-			// a failed follow-up reconcile
-			return failure(fmt.Errorf("%w (warning: %s)", err, removalWarning))
+	if status, ok := data.(NodeStatus); ok {
+		status.addWarnings(warnings...)
+		data = status
+	}
+	// node.add keeps its reconcile on the request path: the added node is not a
+	// usable cluster member until it is configured, and the CLI's confirmation
+	// would otherwise outrun it. Every other node mutation answers as soon as
+	// the substrate settled and reconciles behind the response (#314).
+	if request.Op == "node.add" {
+		if err := s.runProvisionTasks(data, tasks); err != nil {
+			if removalWarning != "" {
+				// the node's disk is already gone; the data-loss note must survive
+				// a failed follow-up reconcile
+				return failure(fmt.Errorf("%w (warning: %s)", err, removalWarning))
+			}
+			return failure(err)
 		}
-		return failure(err)
+		return success(data)
+	}
+	s.runProvisionTasksAsync(request.Op, tasks)
+	if request.Op == "node.remove" {
+		log.Printf("node.remove %s/%s: complete", args.Cluster, args.Name)
 	}
 	return success(data)
 }
@@ -588,7 +623,7 @@ func (s *Server) handle(request Request) (any, error) {
 		return s.destroyInspect(request.Args)
 	case "cluster.list":
 		return s.listClusters()
-	case "node.add", "node.remove":
+	case "node.add", "node.remove", "node.start", "node.stop":
 		// node mutations flow through dispatchNodeMutation, which volume-gates
 		// node.remove before taking opMu; a locked ungated path must not exist
 		return nil, fmt.Errorf("operation %q must be dispatched as a node mutation", request.Op)
