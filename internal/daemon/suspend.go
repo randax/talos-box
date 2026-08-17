@@ -108,12 +108,8 @@ func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
 		attempted = append(attempted, node.Name)
 		var nodeWarning string
 		if fallbackErr != nil {
-			warning := "saved state could not be restored; cold-booting instead"
-			if saveErr != nil {
-				warning = "no saved state found; cold-booting instead"
-			}
-			log.Printf("resume %s: %s: %v", node.Name, warning, fallbackErr)
-			nodeWarning = fmt.Sprintf("%s: %s", node.Name, warning)
+			nodeWarning = coldBootWarning(node.Name, saveErr != nil, fallbackErr)
+			log.Printf("resume %s: %v", node.Name, fallbackErr)
 		}
 		return resumedNode{savePath: savePath, warning: nodeWarning}, nil
 	}, func() error {
@@ -124,8 +120,22 @@ func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
 	}
 	go s.bindMirrors(item.SubnetIndex) // resume bypasses start(); rebind the gateway
 	result := summary(item, true)
-	result.Warning = joinWarnings(append([]string{subnetWarning}, warnings...)...)
+	result.setWarnings(append([]string{subnetWarning}, warnings...)...)
 	return result, nil
+}
+
+// coldBootWarning explains a cold boot the way the daemon log already does:
+// with the hypervisor's own reason. A warning that only says the restore
+// failed leaves the operator nothing to act on (#291).
+func coldBootWarning(nodeName string, saveMissing bool, cause error) string {
+	if saveMissing {
+		return fmt.Sprintf("%s: no saved state found; cold-booting instead", nodeName)
+	}
+	warning := fmt.Sprintf("%s: saved state could not be restored; cold-booting instead", nodeName)
+	if cause == nil {
+		return warning + " (details: ~/.talosbox/tbxd.log)"
+	}
+	return fmt.Sprintf("%s: %v (details: ~/.talosbox/tbxd.log)", warning, cause)
 }
 
 type resumedNode struct {

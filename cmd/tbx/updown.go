@@ -103,7 +103,7 @@ func (c cli) printActions(actions []daemon.Action, wording map[daemon.ActionKind
 		if _, err := fmt.Fprintf(c.out, format+"\n", action.Cluster); err != nil {
 			return err
 		}
-		if err := printWarning(c.err, action.Warning); err != nil {
+		if err := printWarnings(c.err, action.Warnings, action.Warning); err != nil {
 			return err
 		}
 		if suppressNarration {

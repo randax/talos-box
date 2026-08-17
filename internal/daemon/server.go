@@ -40,8 +40,12 @@ type Server struct {
 	mutationMu    sync.Mutex
 	mutationLocks map[string]*sync.Mutex
 
-	opMu                  sync.Mutex
-	vms                   map[string]map[string]hypervisor.Machine
+	opMu sync.Mutex
+	vms  map[string]map[string]hypervisor.Machine
+	// vmStarts records when each node's VM was launched, so a node that never
+	// answers can be aged against the boot window it was promised (#288).
+	vmStarts              map[string]map[string]time.Time
+	stalls                stallLog
 	provisions            map[string]activeProvision
 	storagePhases         map[string]StoragePhase
 	storageStatusProbes   map[string]activeStorageProbe

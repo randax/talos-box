@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -76,9 +77,23 @@ func probeHostPort(address string) ProbeResult {
 	return ProbeResult{Dialed: true, TLS: true, MaintenanceCert: maintenance}
 }
 
+// nodeBootWindow is the boot budget the calm unreachable hint promises.
+const nodeBootWindow = time.Minute
+
+// nodeStallThreshold is how far past that promise a node must stay silent
+// before the hint stops counselling patience and starts naming the node: a
+// node still unreachable at 3× the stated window is not booting slowly, it is
+// stuck, and the operator needs evidence instead of reassurance (#288).
+const nodeStallThreshold = 3 * nodeBootWindow
+
 // Hints returns copy-pasteable next steps for a cluster, keyed on its nodes'
 // phases. Hints describe; they never execute (SPEC §10).
 func Hints(status ClusterStatus) []string {
+	return hintsAt(status, time.Now())
+}
+
+// hintsAt is Hints with an injectable observation time.
+func hintsAt(status ClusterStatus, now time.Time) []string {
 	var stopped, unreachable, maintenance, configured []NodeStatus
 	for _, node := range status.Nodes {
 		switch node.Phase {
@@ -158,12 +173,57 @@ func Hints(status ClusterStatus) []string {
 			)
 		}
 	}
-	if len(unreachable) > 0 {
+	booting, stalled := splitStalledNodes(unreachable, now)
+	if len(booting) > 0 {
 		hints = append(hints,
-			fmt.Sprintf("%d node(s) not answering yet — boot takes ~1 minute; if it persists, run: tbx doctor", len(unreachable)),
+			fmt.Sprintf("%d node(s) not answering yet — boot takes ~1 minute; if it persists, run: tbx doctor", len(booting)),
 		)
 	}
+	if hint := stalledNodesHint(status.Name, stalled, now); hint != "" {
+		hints = append(hints, hint)
+	}
 	return hints
+}
+
+// splitStalledNodes separates nodes still inside their boot budget from the
+// ones that have blown well past it. A node whose start time is unknown counts
+// as booting: the daemon cannot prove it is stuck, so it stays calm.
+func splitStalledNodes(unreachable []NodeStatus, now time.Time) (booting, stalled []NodeStatus) {
+	for _, node := range unreachable {
+		if node.UnreachableFor(now) > nodeStallThreshold {
+			stalled = append(stalled, node)
+			continue
+		}
+		booting = append(booting, node)
+	}
+	return booting, stalled
+}
+
+// stalledNodesHint names the stuck nodes, says how long they have been silent,
+// and points at the console — the only live evidence of what a node that never
+// answers apid is actually doing.
+func stalledNodesHint(clusterName string, stalled []NodeStatus, now time.Time) string {
+	switch len(stalled) {
+	case 0:
+		return ""
+	case 1:
+		node := stalled[0]
+		return fmt.Sprintf("%s has not answered for %s since its VM started — watch it boot: tbx console %s %s; then run: tbx doctor",
+			node.Name, formatStallDuration(node.UnreachableFor(now)), clusterName, node.Name)
+	default:
+		descriptions := make([]string, 0, len(stalled))
+		for _, node := range stalled {
+			descriptions = append(descriptions, fmt.Sprintf("%s (%s)", node.Name, formatStallDuration(node.UnreachableFor(now))))
+		}
+		return fmt.Sprintf("%d node(s) have not answered since their VMs started: %s — watch one boot: tbx console %s <node>; then run: tbx doctor",
+			len(stalled), strings.Join(descriptions, ", "), clusterName)
+	}
+}
+
+// formatStallDuration keeps stall ages readable: seconds are noise once a node
+// is minutes past its boot window.
+func formatStallDuration(d time.Duration) string {
+	return d.Round(time.Second).String()
 }
 
 func credentialExports(name string) string {
