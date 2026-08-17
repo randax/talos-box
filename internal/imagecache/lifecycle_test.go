@@ -758,9 +758,9 @@ func TestPruneDiskExceptCountsKeptLegacyBesideArchiveOnlyArchDir(t *testing.T) {
 	}
 }
 
-func TestPruneDiskExceptDoesNotCountZeroByteDiskAsKept(t *testing.T) {
-	// cache list hides zero-byte or non-regular disk.raw files; the kept
-	// report must use the same readiness predicate or the two disagree.
+func TestPruneDiskExceptCountsZeroByteDiskAsKept(t *testing.T) {
+	// cache list shows a zero-byte disk.raw as an incomplete combination, so
+	// the kept report must count it or the two disagree about a survivor.
 	root := t.TempDir()
 	cache := New(root)
 	empty := filepath.Join(root, "schematic", "v1.13.6", "arm64", "disk.raw")
@@ -775,7 +775,7 @@ func TestPruneDiskExceptDoesNotCountZeroByteDiskAsKept(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.KeptImages != 0 {
-		t.Fatalf("KeptImages = %d for a zero-byte disk.raw cache list does not show", result.KeptImages)
+	if result.KeptImages != 1 {
+		t.Fatalf("KeptImages = %d for a zero-byte disk.raw cache list shows as incomplete", result.KeptImages)
 	}
 }

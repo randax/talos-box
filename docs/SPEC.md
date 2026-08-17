@@ -335,7 +335,7 @@ tbx mirror offline [on|off]
 tbx cache pull [-f talosbox.yaml] [--no-images]
                [--talos-version VERSION --schematic ID --extensions LIST]
 tbx cache warm [--check [--deep]] <list-file> [<list-file>...]
-tbx cache list
+tbx cache list [-o json]
 tbx cache prune [--mirror|--all]
 tbx doctor      tbx system install|uninstall|restart [--force]|status
 tbx version (also --version, -v)
@@ -343,6 +343,8 @@ tbx version (also --version, -v)
 
 `tbx cache list` reports Talos disk images and mirror-cache totals, labelling each disk-image
 combination `in-use` (naming the clusters that reference it), `pinned`, `default`, or `orphan`.
+A combination holding only leftovers — a compressed archive, an unusable disk image, or a lone
+pin marker — is listed too, marked `(incomplete)`, so the listing is a complete prune preview.
 Cache pruning is scope-limited: without a flag it removes disk images only and leaves mirror
 content intact; `--mirror` removes mirror content only; `--all` removes both and clears pins.
 These are the only cache-prune scopes. The default scope is additionally **reference-aware**:

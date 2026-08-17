@@ -331,6 +331,9 @@ type CacheImageEntry struct {
 	// daemon leaves them empty, which the client renders as no status.
 	Status   CacheImageStatus `json:"status,omitempty"`
 	Clusters []string         `json:"clusters,omitempty"`
+	// Incomplete marks a combination with prunable leftovers but no usable
+	// image. It is listed so the preview covers everything prune removes.
+	Incomplete bool `json:"incomplete,omitempty"`
 }
 
 type MirrorCacheEntry struct {
@@ -1385,6 +1388,7 @@ func (s *Server) listCache() (CacheListResult, error) {
 			AllocatedSize: entry.AllocatedSize,
 			Status:        status,
 			Clusters:      clusters,
+			Incomplete:    entry.Incomplete,
 		})
 	}
 	for _, stat := range mirrorStats {
