@@ -1,11 +1,14 @@
 package provision
 
 import (
+	"errors"
+	"io"
 	"strings"
 	"testing"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/manifests"
+	"go.yaml.in/yaml/v4"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
@@ -37,7 +40,7 @@ func TestRenderInspectionMatchesCiliumProvisioningInputs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"name: none", "proxy:\n    disabled: true", "RegistryMirrorConfig", "http://172.30.4.1:5059"} {
+	for _, want := range []string{"name: none", "proxy:\n    disabled: true", "- name: virtio_balloon", "RegistryMirrorConfig", "http://172.30.4.1:5059"} {
 		if !strings.Contains(machine, want) {
 			t.Fatalf("machine patch missing %q:\n%s", want, machine)
 		}
@@ -124,7 +127,7 @@ func TestRenderInspectionStoragePrerequisitesAreAvailableWithoutCuratedIntent(t 
 func TestRenderInspectionSubstrateSectionsNeedNoCuratedCNI(t *testing.T) {
 	item := cluster.Cluster{Name: "demo", SubnetIndex: 7}
 	for section, wants := range map[string][]string{
-		"machine": {"name: none", "RegistryMirrorConfig", "http://172.30.7.1:5059", "skipFallback: true"},
+		"machine": {"name: none", "- name: virtio_balloon", "RegistryMirrorConfig", "http://172.30.7.1:5059", "skipFallback: true"},
 		"talos":   {"name: none", "RegistryMirrorConfig"},
 		"mirrors": {"RegistryMirrorConfig", `name: "*"`, "http://172.30.7.1:5059", "skipFallback: true"},
 	} {
@@ -144,6 +147,61 @@ func TestRenderInspectionSubstrateSectionsNeedNoCuratedCNI(t *testing.T) {
 	}
 	if strings.Contains(machine, "proxy:") {
 		t.Fatalf("substrate-only machine patch disables kube-proxy without a curated CNI:\n%s", machine)
+	}
+}
+
+// TestRenderInspectionMachineSectionCarriesBalloonModule pins SPEC §8: the
+// printed config snippets MUST include the virtio_balloon kernel module. The
+// `balloon` section is deprecated and redirects here, so the `machine` section
+// (and the `all` bundle that embeds it) has to carry the snippet itself.
+func TestRenderInspectionMachineSectionCarriesBalloonModule(t *testing.T) {
+	for _, item := range []cluster.Cluster{
+		{Name: "demo", SubnetIndex: 4, ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true}},
+		{Name: "demo", SubnetIndex: 5, ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel}},
+		{Name: "demo", SubnetIndex: 7},
+	} {
+		for _, section := range []string{"machine", "all"} {
+			got, err := RenderInspection(item, section)
+			if err != nil {
+				t.Fatalf("RenderInspection(%q) for cni %q: %v", section, item.CNI, err)
+			}
+			for _, want := range []string{"machine:", "kernel:", "modules:", "- name: virtio_balloon"} {
+				if !strings.Contains(got, want) {
+					t.Errorf("cni %q %s section missing %q:\n%s", item.CNI, section, want, got)
+				}
+			}
+		}
+	}
+
+	// The deprecation redirect stays: `balloon` errors and names `machine`.
+	if _, err := RenderInspection(cluster.Cluster{Name: "demo"}, "balloon"); err == nil || !strings.Contains(err.Error(), "use machine") {
+		t.Fatalf("RenderInspection(balloon) error = %v, want it to redirect to machine", err)
+	}
+}
+
+// TestRenderInspectionMachineSectionIsValidYAML guards the merge of the balloon
+// snippet into the machine patch: every printed document must still parse.
+func TestRenderInspectionMachineSectionIsValidYAML(t *testing.T) {
+	item := cluster.Cluster{Name: "demo", SubnetIndex: 4, ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium}}
+	machine, err := RenderInspection(item, "machine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder := yaml.NewDecoder(strings.NewReader(machine))
+	documents := 0
+	for {
+		var document map[string]any
+		err := decoder.Decode(&document)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("machine section document %d does not parse: %v\n%s", documents, err, machine)
+		}
+		documents++
+	}
+	if documents != 2 {
+		t.Fatalf("machine section = %d documents, want 2 (patch + mirror):\n%s", documents, machine)
 	}
 }
 

@@ -197,7 +197,11 @@ forwarding policy.
 
 **DNS**: every cluster has a **cluster domain** — chosen at create (`--domain` / `domain:`),
 immutable, unique across clusters, defaulting to `<cluster>.k8s.test`. `*.<domain>` → that
-cluster's `.200`; `<node>.<domain>` → node IP; the domain apex itself has no record. Domains
+cluster's `.200`; `<node>.<domain>` → node IP; the domain apex itself has no record. Records
+are substrate tied to the cluster's **existence, not its run-state**: the wildcard and the node
+A records exist for the cluster's lifetime and keep answering authoritatively while it is
+stopped — a stopped cluster's names resolve to addresses that will not respond — and only
+`destroy` withdraws the records and the resolver files. Domains
 may nest across clusters and resolve longest-suffix-wins — the owning cluster answers (or
 NXDOMAINs) alone. Safe domains (`.test`, `.internal`, `home.arpa`) are accepted outright;
 `.local`/`.localhost`/`.invalid`/single-label are always rejected; anything else can shadow
