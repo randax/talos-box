@@ -333,7 +333,7 @@ tbx cache pull [-f talosbox.yaml] [--no-images]
 tbx cache warm [--check [--deep]] <list-file> [<list-file>...]
 tbx cache list
 tbx cache prune [--mirror|--all]
-tbx doctor      tbx system install|uninstall|restart|status
+tbx doctor      tbx system install|uninstall|restart [--force]|status
 tbx version (also --version, -v)
 ```
 

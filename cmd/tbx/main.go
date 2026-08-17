@@ -91,7 +91,7 @@ var groupUsages = map[string]string{
 	"node":     "usage: tbx node add|remove <cluster> [node]",
 	"snapshot": "usage: tbx snapshot create|restore|list|delete",
 	"cache":    "usage: tbx cache pull|prune|warm|list",
-	"system":   "usage: tbx system install|uninstall|restart|status",
+	"system":   "usage: tbx system install|uninstall|restart [--force]|status",
 	"mirror":   "usage: tbx mirror offline [on|off]",
 	"bgp":      "usage: tbx bgp enable|disable <cluster>",
 }
@@ -595,7 +595,7 @@ Commands:
   bgp enable|disable <cluster>
   mirror offline [on|off]
   cache pull|prune|warm|list
-  system install|uninstall|restart|status
+  system install|uninstall|restart [--force]|status
   doctor
   version (also --version, -v)
 `

@@ -22,6 +22,7 @@ type fakeDaemon struct {
 	mu       sync.Mutex
 	protocol int
 	ops      []string
+	running  []string
 	listener net.Listener
 }
 
@@ -68,12 +69,29 @@ func (f *fakeDaemon) respond(request daemon.Request) daemon.Response {
 	f.mu.Lock()
 	f.ops = append(f.ops, request.Op)
 	protocol := f.protocol
+	running := append([]string(nil), f.running...)
 	f.mu.Unlock()
-	if request.Op == "daemon.info" {
+	switch request.Op {
+	case "daemon.info":
 		data, _ := json.Marshal(daemon.Info{ProtocolVersion: protocol})
+		return daemon.Response{OK: true, Data: data}
+	case "cluster.list":
+		summaries := make([]daemon.ClusterSummary, 0, len(running))
+		for _, name := range running {
+			summaries = append(summaries, daemon.ClusterSummary{Name: name, Running: true})
+		}
+		data, _ := json.Marshal(summaries)
 		return daemon.Response{OK: true, Data: data}
 	}
 	return daemon.Response{OK: true, Data: json.RawMessage(`{}`)}
+}
+
+// runs makes the fake daemon report the named clusters as running, which is
+// what the restart paths must refuse to power off.
+func (f *fakeDaemon) runs(names ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.running = names
 }
 
 func (f *fakeDaemon) stop() {
@@ -108,14 +126,19 @@ func stubDaemonRestart(t *testing.T, fake *fakeDaemon, supervised func() (bool, 
 	t.Helper()
 	terminated := 0
 	previousTerminate, previousSpawn, previousSupervised := terminateDaemonProcess, spawnDaemonProcess, supervisedDaemon
+	previousAlive := daemonProcessAlive
 	t.Cleanup(func() {
 		terminateDaemonProcess, spawnDaemonProcess, supervisedDaemon = previousTerminate, previousSpawn, previousSupervised
+		daemonProcessAlive = previousAlive
 	})
 	terminateDaemonProcess = func(int) error {
 		terminated++
 		fake.stop()
 		return nil
 	}
+	// the fake daemon serves from this very process, so its "exit" is the
+	// terminate call rather than the pid going away
+	daemonProcessAlive = func(int) bool { return terminated == 0 }
 	spawnDaemonProcess = func() (int64, error) {
 		fake.relisten(t, daemon.ProtocolVersion)
 		return 0, nil
@@ -331,11 +354,11 @@ func TestSystemUsageAndHelpListRestartAndStatus(t *testing.T) {
 	command := cli{out: &stdout, err: &stderr}
 
 	err := command.runSystem(nil)
-	if err == nil || !strings.Contains(err.Error(), "install|uninstall|restart|status") {
+	if err == nil || !strings.Contains(err.Error(), "install|uninstall|restart [--force]|status") {
 		t.Fatalf("usage = %v, want restart and status", err)
 	}
 	command.printHelp(&stdout)
-	if got := stdout.String(); !strings.Contains(got, "system install|uninstall|restart|status") {
+	if got := stdout.String(); !strings.Contains(got, "system install|uninstall|restart [--force]|status") {
 		t.Fatalf("help = %q, want restart and status", got)
 	}
 }
