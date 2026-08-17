@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  linux-amd64:
+    runs-on: depot-ubuntu-24.04-8
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26"
+          cache: false
+      # Depot cache disks persist GOCACHE/GOMODCACHE across runs; the disk is
+      # org-shared, so nothing secret may be written under /mnt/gocache.
+      - uses: depot/cache-mount@c4ccf77f90f7fa7df6a002813c0b13f6a5943063 # v1.2.1
+        with:
+          name: talos-box-go
+          path: /mnt/gocache
+      - name: Point Go caches at the cache disk
+        run: |
+          echo "GOCACHE=/mnt/gocache/build" >> "$GITHUB_ENV"
+          echo "GOMODCACHE=/mnt/gocache/mod" >> "$GITHUB_ENV"
+      - run: go build ./...
+      - name: lint
+        uses: golangci/golangci-lint-action@4afd733a84b1f43292c63897423277bb7f4313a9 # v8
+        with:
+          version: v2.12
+      - run: make test
+
+  nix:
+    name: Nix flake check
+    runs-on: depot-ubuntu-24.04-4
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: DeterminateSystems/nix-installer-action@786fff0690178f1234e4e1fe9b536e94f5433196 # v20
+        with:
+          # Depot CI sandboxes have no systemd PID 1.
+          planner: linux
+          init: none
+      - run: sudo -i nix flake check "$GITHUB_WORKSPACE"

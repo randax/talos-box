@@ -28,9 +28,11 @@ helper_pid=""
 daemon_pid=""
 cluster_cleanup_needed=false
 # The NFS probe exports a directory from the runner itself, so the export has to
-# go away before the workdir holding it does.
-nfs_exports_file=/etc/exports.d/talosbox-e2e.exports
-nfs_export_active=false
+# go away before the workdir holding it does. NFS-Ganesha serves it from
+# userspace: CI sandboxes have no nfsd in the kernel and no systemd to manage
+# one, so the harness owns the daemon lifecycle directly.
+ganesha_pid_file=""
+ganesha_running=false
 dump_failure_diagnostics() (
   trap - ERR
   set +e
@@ -85,9 +87,8 @@ dump_failure_diagnostics() (
   printf '\n===== end diagnostics =====\n' >&2
 )
 cleanup() {
-  if [[ "$nfs_export_active" == true ]]; then
-    sudo rm -f "$nfs_exports_file" || true
-    sudo exportfs -ra || true
+  if [[ "$ganesha_running" == true && -f "$ganesha_pid_file" ]]; then
+    sudo kill "$(cat "$ganesha_pid_file")" || true
   fi
   if [[ "$cluster_cleanup_needed" == true && -x "$root/bin/tbx" && -n "$home" && -n "$helper_socket" ]]; then
     HOME="$home" TBX_HELPER_SOCKET="$helper_socket" "$root/bin/tbx" cluster destroy e2e --force || true
@@ -354,12 +355,40 @@ gateway="${subnet%.0/24}.1"
 nfs_export="$workdir/nfs"
 mkdir -p "$nfs_export"
 chmod 0777 "$nfs_export"
-sudo mkdir -p /etc/exports.d
-printf '%s %s(rw,sync,no_subtree_check,no_root_squash,insecure)\n' "$nfs_export" "$subnet" |
-  sudo tee "$nfs_exports_file" >/dev/null
-nfs_export_active=true
-sudo systemctl restart nfs-server
-sudo exportfs -ra
+ganesha_conf="$workdir/ganesha.conf"
+ganesha_pid_file="$workdir/ganesha.pid"
+ganesha_log="$workdir/ganesha.log"
+cat > "$ganesha_conf" <<GANESHA
+NFS_CORE_PARAM {
+  Protocols = 3;
+  Enable_NLM = true;
+  Enable_RQUOTA = false;
+}
+NFSV4 {
+  Grace_Period = 5;
+}
+EXPORT {
+  Export_Id = 1;
+  Path = $nfs_export;
+  Pseudo = /e2e;
+  Access_Type = RW;
+  Squash = No_Root_Squash;
+  SecType = sys;
+  Protocols = 3;
+  Transports = TCP, UDP;
+  FSAL { Name = VFS; }
+  CLIENT { Clients = $subnet; Access_Type = RW; }
+}
+GANESHA
+# rpcbind first: NFSv3 clients find Ganesha's NFS/NLM services through the
+# portmapper. The sysv script wants /run/sendsigs.omit.d; create it so the
+# script works with or without systemd, and fall back to launching rpcbind
+# directly where no init system manages it.
+sudo mkdir -p /run/sendsigs.omit.d
+pgrep -x rpcbind >/dev/null || sudo service rpcbind start || sudo rpcbind
+ganesha_running=true
+sudo ganesha.nfsd -f "$ganesha_conf" -p "$ganesha_pid_file" -L "$ganesha_log"
+retry "Ganesha NFSv3 registration" 12 5 sh -c "rpcinfo -p localhost | grep -q ' nfs' && rpcinfo -p localhost | grep -q nlockmgr"
 
 verify_nfsv3_mount_and_lock() {
   kc apply -f - <<EOF
