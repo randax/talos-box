@@ -118,8 +118,15 @@ func encodeJSON(output io.Writer, value any) error {
 	return encoder.Encode(value)
 }
 
+// cacheImageLine names a cached combination with both sizes: a disk.raw is
+// sparse, so the apparent size alone overstates what the cache costs. An older
+// daemon reports no allocated size, which prints as the pre-allocated line.
 func cacheImageLine(entry daemon.CacheImageEntry) string {
-	return fmt.Sprintf("%s %s %s %d bytes", entry.Schematic, entry.Version, entry.Architecture, entry.Size)
+	line := fmt.Sprintf("%s %s %s %d bytes", entry.Schematic, entry.Version, entry.Architecture, entry.Size)
+	if entry.AllocatedSize > 0 {
+		line += fmt.Sprintf(" (%d bytes on disk)", entry.AllocatedSize)
+	}
+	return line
 }
 
 // cacheImageStatusSuffix names why a combination is kept. An older daemon

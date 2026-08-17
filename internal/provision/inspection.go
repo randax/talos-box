@@ -36,9 +36,18 @@ func RenderInspectionWithCNI(item cluster.Cluster, section, cni string) (string,
 	if section == "" {
 		section = "all"
 	}
+	declared := item
 	item, err := applyInspectionCNI(item, cni)
 	if err != nil {
 		return "", err
+	}
+	// BGP announcements are a declared intent, not a CNI choice: the override
+	// stands in for the curated path a cluster is created with, and that path
+	// announces over L2. Recommending --cni here would hand the user a flag
+	// that only dead-ends one command later, so the refusal names the real
+	// requirement against what the cluster actually declares.
+	if section == "bgp" && !declared.BGP {
+		return "", bgpSectionUnavailableError(declared)
 	}
 	if isCNIDerivedInspectionSection(section) && !hasCuratedCNI(item) {
 		return "", fmt.Errorf("cluster %q does not declare a curated cni: section %q is derived from one, so pass --cni cilium or --cni flannel to render what tbx would apply", item.Name, section)
@@ -151,6 +160,24 @@ func applyInspectionCNI(item cluster.Cluster, cni string) (cluster.Cluster, erro
 	item.CNI = requested
 	item.LB = true
 	return item, nil
+}
+
+// bgpSectionUnavailableError explains what the cluster would have to declare
+// for the bgp section to exist, against the intent it declares today. It never
+// names --cni: that flag renders the curated path a cluster is created with,
+// and that path announces over L2 until BGP is asked for explicitly.
+func bgpSectionUnavailableError(item cluster.Cluster) error {
+	quoted := shellquote.Quote(item.Name)
+	switch {
+	case item.CNI == cluster.CNIFlannel:
+		return fmt.Errorf("cluster %q uses flannel, which announces LoadBalancer addresses over l2: bgp announcements need a cluster declared with cilium and bgp (tbx cluster create <name> --cni cilium --bgp); see what this cluster announces with: tbx manifests %s l2", item.Name, quoted)
+	case item.CNI == cluster.CNICilium && !item.LB:
+		return fmt.Errorf("cluster %q declares no LoadBalancer support, so it has no bgp path: bgp announcements need cilium with LoadBalancer support and bgp enabled", item.Name)
+	case item.CNI == cluster.CNICilium:
+		return fmt.Errorf("cluster %q announces LoadBalancer addresses over l2, not bgp: switch it with `tbx bgp enable %s`, or see what it announces today with `tbx manifests %s l2`", item.Name, quoted, quoted)
+	default:
+		return fmt.Errorf("cluster %q declares no curated cni and no bgp: the bgp section renders only for a cluster declared with cilium and bgp announcements (tbx cluster create <name> --cni cilium --bgp). bgp is a declared intent rather than a cni choice, so no flag renders it here", item.Name)
+	}
 }
 
 func inspectionValues(item cluster.Cluster) (string, error) {

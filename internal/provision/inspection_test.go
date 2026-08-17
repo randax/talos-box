@@ -155,7 +155,9 @@ func TestRenderInspectionCNIDerivedSectionsNameTheRemedy(t *testing.T) {
 	for _, section := range []string{
 		"values", "objects", "extras", "k8s",
 		"cilium-values", "metallb-values", "metallb-extras",
-		"lb-pool", "bgp", "l2",
+		// bgp is deliberately absent: --cni cannot render it, so it names
+		// its own remedy (see TestRenderInspectionBGPSectionNamesTheDeclaredIntent).
+		"lb-pool", "l2",
 	} {
 		_, err := RenderInspection(item, section)
 		if err == nil {
@@ -167,6 +169,59 @@ func TestRenderInspectionCNIDerivedSectionsNameTheRemedy(t *testing.T) {
 				t.Errorf("RenderInspection(%q) error = %v, want it to mention %q", section, err, want)
 			}
 		}
+	}
+}
+
+// TestRenderInspectionBGPSectionNamesTheDeclaredIntent: bgp announcements are a
+// declared intent, not a CNI choice, so the refusal must never recommend --cni —
+// the flag it used to recommend dead-ended on the very next command.
+func TestRenderInspectionBGPSectionNamesTheDeclaredIntent(t *testing.T) {
+	substrate := cluster.Cluster{Name: "qa-a", SubnetIndex: 4}
+	cilium := cluster.Cluster{Name: "qa-a", SubnetIndex: 4, ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true}}
+	flannel := cluster.Cluster{Name: "qa-a", SubnetIndex: 4, ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, LB: true}}
+	for _, testCase := range []struct {
+		name string
+		item cluster.Cluster
+		cni  string
+		want []string
+	}{
+		{name: "substrate-only", item: substrate, want: []string{"bgp", "tbx cluster create", "--bgp"}},
+		{name: "substrate-only under the cni override", item: substrate, cni: "cilium", want: []string{"bgp", "tbx cluster create", "--bgp"}},
+		{name: "cilium without bgp", item: cilium, want: []string{"tbx bgp enable qa-a", "l2"}},
+		{name: "flannel", item: flannel, want: []string{"cilium"}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, err := RenderInspectionWithCNI(testCase.item, "bgp", testCase.cni)
+			if err == nil {
+				t.Fatal("bgp section rendered for a cluster that declares no bgp")
+			}
+			// The manifests --cni override renders the curated path a cluster
+			// is created with, which announces over l2: recommending it for
+			// bgp is the dead end this test guards against. Naming create's
+			// own --cni cilium --bgp pair is a different, workable remedy.
+			if strings.Contains(err.Error(), "--cni cilium or --cni flannel") ||
+				strings.Contains(err.Error(), "pass --cni") {
+				t.Fatalf("bgp refusal recommends the manifests --cni override, which cannot render it: %v", err)
+			}
+			for _, want := range testCase.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("bgp refusal = %v, want it to mention %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+// TestRenderInspectionBGPSectionStillRendersForADeclaredBGPCluster guards the
+// refusal against over-reach.
+func TestRenderInspectionBGPSectionStillRendersForADeclaredBGPCluster(t *testing.T) {
+	item := cluster.Cluster{Name: "qa-a", SubnetIndex: 4, ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true, BGP: true}}
+	got, err := RenderInspectionWithCNI(item, "bgp", "cilium")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "CiliumBGPClusterConfig") {
+		t.Fatalf("bgp section = %q, want the BGP cluster config", got)
 	}
 }
 

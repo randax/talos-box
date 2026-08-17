@@ -39,6 +39,12 @@ func (c cli) run(args []string) error {
 		c.printHelp(c.out)
 		return nil
 	}
+	// A multi-verb command's own `--help` is answered here, before dispatch:
+	// each group parses its verb by hand, so the flag would otherwise land as
+	// an unknown verb.
+	if handled, err := c.printGroupUsage(args[0], args[1:]); handled {
+		return err
+	}
 	switch args[0] {
 	case "cluster":
 		return c.runCluster(args[1:])
@@ -77,9 +83,37 @@ func (c cli) run(args []string) error {
 	}
 }
 
+// groupUsages is the usage line every multi-verb command prints for both its
+// bare and its `--help` form. The verbs a group accepts are named in one place
+// so the two cannot drift apart.
+var groupUsages = map[string]string{
+	"cluster":  "usage: tbx cluster create|start|stop|suspend|resume|destroy|list",
+	"node":     "usage: tbx node add|remove <cluster> [node]",
+	"snapshot": "usage: tbx snapshot create|restore|list|delete",
+	"cache":    "usage: tbx cache pull|prune|warm|list",
+	"system":   "usage: tbx system install|uninstall|restart|status",
+	"mirror":   "usage: tbx mirror offline [on|off]",
+	"bgp":      "usage: tbx bgp enable|disable <cluster>",
+}
+
+// printGroupUsage answers `tbx <group> --help` with the group's usage. It is
+// deliberately narrow: only the help flag alone, so a verb still dispatches and
+// carries its own flag parsing, including its own --help.
+func (c cli) printGroupUsage(command string, args []string) (bool, error) {
+	if len(args) != 1 || (args[0] != "-h" && args[0] != "--help") {
+		return false, nil
+	}
+	usage, ok := groupUsages[command]
+	if !ok {
+		return false, nil
+	}
+	_, err := fmt.Fprintln(c.out, usage)
+	return true, err
+}
+
 func (c cli) runCluster(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tbx cluster create|start|stop|suspend|resume|destroy|list")
+		return errors.New(groupUsages["cluster"])
 	}
 	switch args[0] {
 	case "create":
@@ -97,7 +131,7 @@ func (c cli) runCluster(args []string) error {
 		if _, err := fmt.Fprintf(c.out, "%s cluster %s\n", pastTense(args[0]), result.Name); err != nil {
 			return err
 		}
-		return printWarning(c.err, result.Warning)
+		return printWarnings(c.err, result.Warnings, result.Warning)
 	case "destroy":
 		return c.destroyCluster(args[1:])
 	case "list":
@@ -163,7 +197,7 @@ func (c cli) startCluster(args []string) error {
 	if _, err := fmt.Fprintf(c.out, "started cluster %s\n", result.Name); err != nil {
 		return err
 	}
-	if err := printWarning(c.err, result.Warning); err != nil {
+	if err := printWarnings(c.err, result.Warnings, result.Warning); err != nil {
 		return err
 	}
 	if quiet {
@@ -280,7 +314,7 @@ func (c cli) createCluster(args []string) error {
 		result.Name, result.ControlPlanes, result.Workers); err != nil {
 		return err
 	}
-	if err := printWarning(c.err, result.Warning); err != nil {
+	if err := printWarnings(c.err, result.Warnings, result.Warning); err != nil {
 		return err
 	}
 	if !*quiet {
@@ -346,7 +380,7 @@ func (c cli) inspectDestroy(name string, request struct {
 
 func (c cli) runNode(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tbx node add|remove <cluster> [node]")
+		return errors.New(groupUsages["node"])
 	}
 	switch args[0] {
 	case "add":
@@ -438,7 +472,7 @@ func (c cli) runStatus(args []string) error {
 
 func (c cli) runCache(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tbx cache pull|prune|warm|list")
+		return errors.New(groupUsages["cache"])
 	}
 	switch args[0] {
 	case "pull":
@@ -452,7 +486,12 @@ func (c cli) runCache(args []string) error {
 		if err != nil {
 			return err
 		}
-		if len(positionals) != 0 || (*pruneMirror && *pruneAll) {
+		// The scopes are alternatives, not a widening pair: naming both is a
+		// conflict the user must resolve, not a usage typo.
+		if *pruneMirror && *pruneAll {
+			return errors.New("--mirror and --all are mutually exclusive: --mirror prunes the mirror cache only, --all prunes disk and mirror")
+		}
+		if len(positionals) != 0 {
 			return errors.New("usage: tbx cache prune [--mirror|--all]")
 		}
 		scope := daemon.CachePruneScopeImages
@@ -560,6 +599,22 @@ func printWarning(w io.Writer, warning string) error {
 	}
 	_, err := fmt.Fprintf(w, "warning: %s\n", warning)
 	return err
+}
+
+// printWarnings renders one warning per line. Unrelated findings used to be
+// fused onto a single semicolon-joined line (#291); joined is the legacy
+// single-string field, used only when talking to a daemon that predates the
+// per-warning list.
+func printWarnings(w io.Writer, warnings []string, joined string) error {
+	if len(warnings) == 0 {
+		return printWarning(w, joined)
+	}
+	for _, warning := range warnings {
+		if err := printWarning(w, warning); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func pastTense(command string) string {

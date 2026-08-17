@@ -136,11 +136,14 @@ type ClusterSummary struct {
 	cluster.ProvisioningIntent
 	// Domain is the explicitly chosen cluster domain; empty means the
 	// default, <name>.k8s.test.
-	Domain            string   `json:"domain,omitempty"`
-	AllowUnsafeDomain bool     `json:"allowUnsafeDomain,omitempty"`
-	Running           bool     `json:"running"`
-	Warning           string   `json:"warning,omitempty"`
-	Narration         []string `json:"narration,omitempty"`
+	Domain            string `json:"domain,omitempty"`
+	AllowUnsafeDomain bool   `json:"allowUnsafeDomain,omitempty"`
+	Running           bool   `json:"running"`
+	Warning           string `json:"warning,omitempty"`
+	// Warnings is the same advisory set as Warning, one entry per finding.
+	// Warning stays populated for older clients that only read it.
+	Warnings  []string `json:"warnings,omitempty"`
+	Narration []string `json:"narration,omitempty"`
 }
 
 // EffectiveDomain returns the domain the cluster is reachable under.
@@ -160,6 +163,19 @@ type NodeStatus struct {
 	APIDReachable bool         `json:"apidReachable"`
 	Phase         Phase        `json:"phase"`
 	Warning       string       `json:"warning,omitempty"`
+	// StartedAt is when the daemon launched this node's VM, when it knows:
+	// the clock a stalled boot is measured against (#288). Nil means the VM
+	// was not started by this daemon process.
+	StartedAt *time.Time `json:"startedAt,omitempty"`
+}
+
+// UnreachableFor reports how long the node's VM has been running without the
+// node answering. It is zero when the daemon does not know the start time.
+func (n NodeStatus) UnreachableFor(now time.Time) time.Duration {
+	if n.StartedAt == nil {
+		return 0
+	}
+	return now.Sub(*n.StartedAt)
 }
 
 // StoragePhase is the observed storage readiness for a CSI-backed cluster.
@@ -282,6 +298,10 @@ type CacheImageEntry struct {
 	Version      string `json:"version"`
 	Architecture string `json:"architecture"`
 	Size         int64  `json:"size"`
+	// AllocatedSize is the bytes the image occupies on disk; Size is the
+	// apparent extent of a sparse disk.raw, which overstates it. An older
+	// daemon reports no allocated size, which the client renders as before.
+	AllocatedSize int64 `json:"allocatedSize,omitempty"`
 	// Status and Clusters explain why the combination is kept; an older
 	// daemon leaves them empty, which the client renders as no status.
 	Status   CacheImageStatus `json:"status,omitempty"`
@@ -453,7 +473,7 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	startWarning, err := s.start(item)
 	if err != nil {
 		result := summary(item, false)
-		result.Warning = joinWarnings(talosVersionWarning, overcommitWarning, hostPressureWarning, longhornWarning, longhornCustomSchematicWarning, subnetWarning)
+		result.setWarnings(talosVersionWarning, overcommitWarning, hostPressureWarning, longhornWarning, longhornCustomSchematicWarning, subnetWarning)
 		startErr := fmt.Errorf("cluster created but failed to start: %w", err)
 		if talosVersionWarning != "" {
 			// the failure response drops the summary, and a boot failure on
@@ -464,7 +484,7 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 		return result, startErr
 	}
 	result := summary(item, true)
-	result.Warning = joinWarnings(talosVersionWarning, overcommitWarning, hostPressureWarning, longhornWarning, longhornCustomSchematicWarning, subnetWarning, startWarning)
+	result.setWarnings(talosVersionWarning, overcommitWarning, hostPressureWarning, longhornWarning, longhornCustomSchematicWarning, subnetWarning, startWarning)
 	return result, nil
 }
 
@@ -500,7 +520,7 @@ func (s *Server) startCluster(raw json.RawMessage) (ClusterSummary, error) {
 		return ClusterSummary{}, err
 	}
 	result := summary(item, true)
-	result.Warning = joinWarnings(overcommitWarning, hostPressureWarning, longhornWarning, longhornCustomSchematicWarning, subnetWarning)
+	result.setWarnings(overcommitWarning, hostPressureWarning, longhornWarning, longhornCustomSchematicWarning, subnetWarning)
 	return result, nil
 }
 
@@ -585,7 +605,7 @@ func (s *Server) launchMachine(item cluster.Cluster, node cluster.Node, restore 
 		return nil, err
 	}
 	sizing := item.DefaultsFor(node.Role)
-	return s.hypervisor.Launch(context.Background(), hypervisor.Spec{
+	machine, err := s.hypervisor.Launch(context.Background(), hypervisor.Spec{
 		CPUs:      sizing.CPUs,
 		MemoryMiB: sizing.MemoryMiB,
 		DiskPath:  filepath.Join(dir, node.Name+".img"),
@@ -602,6 +622,11 @@ func (s *Server) launchMachine(item cluster.Cluster, node cluster.Node, restore 
 		GuestAgentSocketPath: guestAgentSocketPath(item, dir, node),
 		Restore:              restore,
 	})
+	if err != nil {
+		return nil, err
+	}
+	s.recordVMStart(item.Name, node.Name)
+	return machine, nil
 }
 
 // guestAgentSocketPath asks the backend for a guest-agent channel only when the
@@ -951,7 +976,7 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), TalosVersion: item.TalosVersion, Schematic: item.Schematic, BaseSchematic: item.BaseSchematic, TalosExtensions: item.TalosExtensions, ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: s.clusterRunning(item.Name), Capabilities: s.clusterCapabilities(item), subnetIndex: item.SubnetIndex}
 		for _, node := range item.Nodes {
 			running := s.nodeRunning(item.Name, node.Name)
-			clusterStatus.Nodes = append(clusterStatus.Nodes, NodeStatus{Name: node.Name, Role: node.Role, MAC: node.MAC, Phase: ClassifyPhase(running, ProbeResult{})})
+			clusterStatus.Nodes = append(clusterStatus.Nodes, NodeStatus{Name: node.Name, Role: node.Role, MAC: node.MAC, Phase: ClassifyPhase(running, ProbeResult{}), StartedAt: s.vmStartedAt(item.Name, node.Name)})
 		}
 		clusterStatus.Hints = Hints(clusterStatus)
 		result = append(result, clusterStatus)
@@ -982,13 +1007,17 @@ func (s *Server) refreshNodeStatuses(statuses []ClusterStatus) {
 	if probe == nil {
 		probe = probeAPID
 	}
+	now := time.Now()
 	for i := range statuses {
 		for j, snapshot := range statuses[i].Nodes {
 			node := cluster.Node{Name: snapshot.Name, Role: snapshot.Role, MAC: snapshot.MAC}
-			statuses[i].Nodes[j] = nodeStatusWith(node, statuses[i].subnetIndex, snapshot.Phase != PhaseStopped, lookupIP, probe)
+			refreshed := nodeStatusWith(node, statuses[i].subnetIndex, snapshot.Phase != PhaseStopped, lookupIP, probe)
+			refreshed.StartedAt = snapshot.StartedAt
+			statuses[i].Nodes[j] = refreshed
 		}
-		statuses[i].Hints = Hints(statuses[i])
+		statuses[i].Hints = hintsAt(statuses[i], now)
 	}
+	s.logNodeStalls(statuses, now)
 }
 
 func refreshKubernetesReadiness(statuses []ClusterStatus) {
@@ -1300,12 +1329,13 @@ func (s *Server) listCache() (CacheListResult, error) {
 			return CacheListResult{}, err
 		}
 		result.Images = append(result.Images, CacheImageEntry{
-			Schematic:    entry.Schematic,
-			Version:      entry.Version,
-			Architecture: string(entry.Architecture),
-			Size:         entry.Size,
-			Status:       status,
-			Clusters:     clusters,
+			Schematic:     entry.Schematic,
+			Version:       entry.Version,
+			Architecture:  string(entry.Architecture),
+			Size:          entry.Size,
+			AllocatedSize: entry.AllocatedSize,
+			Status:        status,
+			Clusters:      clusters,
 		})
 	}
 	for _, stat := range mirrorStats {
@@ -1685,6 +1715,13 @@ func summary(item cluster.Cluster, running bool) ClusterSummary {
 }
 
 func joinWarnings(warnings ...string) string {
+	return strings.Join(warningList(warnings...), "; ")
+}
+
+// warningList drops empties and duplicates while keeping each warning a
+// separate item, so the CLI can render one per line instead of scanning a
+// semicolon-joined run-on (#291).
+func warningList(warnings ...string) []string {
 	var result []string
 	seen := make(map[string]bool, len(warnings))
 	for _, warning := range warnings {
@@ -1694,5 +1731,12 @@ func joinWarnings(warnings ...string) string {
 		seen[warning] = true
 		result = append(result, warning)
 	}
-	return strings.Join(result, "; ")
+	return result
+}
+
+// setWarnings fills both the list and the legacy joined string, so a new
+// daemon still speaks to an old CLI that only reads Warning.
+func (s *ClusterSummary) setWarnings(warnings ...string) {
+	s.Warnings = warningList(warnings...)
+	s.Warning = strings.Join(s.Warnings, "; ")
 }
