@@ -24,6 +24,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/fake"
 	kubernetesfake "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 )
 
 type recordingReconciler struct {
@@ -716,4 +717,91 @@ func ciliumTestResource(t *testing.T, client *fake.FakeDynamicClient, mapper met
 		return client.Resource(mapping.Resource).Namespace(object.GetNamespace())
 	}
 	return client.Resource(mapping.Resource)
+}
+
+func establishedCRD(name string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apiextensions.k8s.io/v1",
+		"kind":       "CustomResourceDefinition",
+		"metadata":   map[string]any{"name": name},
+		"status": map[string]any{
+			"conditions": []any{map[string]any{"type": "Established", "status": "True"}},
+		},
+	}}
+}
+
+func nonBGPCiliumCRDClient() dynamic.Interface {
+	return fake.NewSimpleDynamicClient(runtime.NewScheme(),
+		establishedCRD("ciliumloadbalancerippools.cilium.io"),
+		establishedCRD("ciliuml2announcementpolicies.cilium.io"),
+	)
+}
+
+func TestWaitForCiliumCRDsSkipsBGPCRDsWhenBGPDisabled(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := waitForCiliumCRDs(ctx, nonBGPCiliumCRDClient(), time.Millisecond, false); err != nil {
+		t.Fatalf("CRD wait demanded BGP CRDs the chart does not install: %v", err)
+	}
+}
+
+func TestWaitForCiliumCRDsRequiresBGPCRDsWhenBGPEnabled(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := waitForCiliumCRDs(ctx, nonBGPCiliumCRDClient(), time.Millisecond, true); err == nil {
+		t.Fatal("BGP-enabled CRD wait passed without the BGP CRDs")
+	}
+}
+
+func TestWaitForAPIServerRetriesUntilVersionAnswers(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		attempts++
+		if attempts < 3 {
+			hijacker, ok := writer.(http.Hijacker)
+			if !ok {
+				t.Fatal("test server does not support hijacking")
+			}
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = conn.Close()
+			return
+		}
+		_, _ = writer.Write([]byte(`{"major":"1","minor":"34"}`))
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := waitForAPIServer(ctx, &rest.Config{Host: server.URL}, time.Millisecond); err != nil {
+		t.Fatalf("API server wait did not survive dropped connections: %v", err)
+	}
+	if attempts < 3 {
+		t.Fatalf("API server wait attempts = %d, want retries until the server answers", attempts)
+	}
+}
+
+func TestWaitForAPIServerNamesTheEndpointOnDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	err := waitForAPIServer(ctx, &rest.Config{Host: "http://127.0.0.1:1"}, 10*time.Millisecond)
+	if err == nil {
+		t.Fatal("API server wait passed against a closed port")
+	}
+	if !strings.Contains(err.Error(), "127.0.0.1:1") {
+		t.Fatalf("API server wait error does not name the endpoint: %v", err)
+	}
+}
+
+func TestDeleteStaleCiliumAnnouncementsToleratesAbsentBGPCRDs(t *testing.T) {
+	// On an L2-only cluster the BGP CRDs are never installed, so the stale-BGP
+	// candidates cannot exist: an unmapped kind is "nothing to delete", not an
+	// error.
+	item := cluster.Cluster{ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true}}
+	client := fake.NewSimpleDynamicClient(runtime.NewScheme())
+	mapper := meta.NewDefaultRESTMapper(nil)
+	if err := deleteStaleCiliumAnnouncements(context.Background(), client, mapper, item); err != nil {
+		t.Fatalf("stale BGP cleanup with absent CRDs = %v, want nil", err)
+	}
 }

@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -113,12 +114,16 @@ func (c cli) snapshotList(args []string) error {
 		_, err := fmt.Fprintf(c.out, "no snapshots for %s\n", args[0])
 		return err
 	}
+	table := tabwriter.NewWriter(c.out, 0, 4, 2, ' ', 0)
+	if _, err := fmt.Fprintln(table, "NAME\tCREATED"); err != nil {
+		return err
+	}
 	for _, snap := range snaps {
-		if _, err := fmt.Fprintf(c.out, "%s\t%s\n", snap.Name, snap.Created.Format("2006-01-02 15:04")); err != nil {
+		if _, err := fmt.Fprintf(table, "%s\t%s\n", snap.Name, snap.Created.Format("2006-01-02 15:04")); err != nil {
 			return err
 		}
 	}
-	return nil
+	return table.Flush()
 }
 
 // confirmIfRunning prompts before an operation that will stop a running

@@ -77,6 +77,13 @@ func (r CiliumReconciler) reconcile(ctx context.Context, item cluster.Cluster, c
 	if r.PollInterval <= 0 {
 		r.PollInterval = time.Second
 	}
+	// Cilium is reconciled straight after bootstrap, before the Nodes-Ready
+	// wait, and kube-apiserver comes up seconds to minutes later. The
+	// discovery-backed applies below treat a refused dial as fatal, so gate
+	// them on the API server actually answering.
+	if err := waitForAPIServer(ctx, config, r.PollInterval); err != nil {
+		return LoadBalancerResult{}, err
+	}
 	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
 	if err != nil {
 		return LoadBalancerResult{}, fmt.Errorf("create Kubernetes discovery client: %w", err)
@@ -116,7 +123,7 @@ func (r CiliumReconciler) reconcile(ctx context.Context, item cluster.Cluster, c
 			return LoadBalancerResult{}, err
 		}
 	}
-	if err := waitForCiliumCRDs(ctx, dynamicClient, r.PollInterval); err != nil {
+	if err := waitForCiliumCRDs(ctx, dynamicClient, r.PollInterval, item.BGP); err != nil {
 		return LoadBalancerResult{}, err
 	}
 	mapper.Reset()
@@ -346,6 +353,11 @@ func getDynamicObject(
 	candidate unstructured.Unstructured,
 ) (dynamic.ResourceInterface, *unstructured.Unstructured, bool, error) {
 	mapping, err := mapper.RESTMapping(candidate.GroupVersionKind().GroupKind(), candidate.GroupVersionKind().Version)
+	if meta.IsNoMatchError(err) {
+		// The kind is not served at all — its CRD was never installed — so no
+		// object of it can exist to inspect or delete.
+		return nil, nil, false, nil
+	}
 	if err != nil {
 		return nil, nil, false, fmt.Errorf("map %s %q: %w", candidate.GetKind(), candidate.GetName(), err)
 	}
@@ -750,6 +762,23 @@ func partitionCiliumObjects(objects []unstructured.Unstructured) (namespaces, ch
 	return namespaces, chart, extras, probe
 }
 
+// waitForAPIServer polls /version until kube-apiserver answers, so the error
+// on expiry names the endpoint that never came up rather than whichever apply
+// happened to dial first.
+func waitForAPIServer(ctx context.Context, config *rest.Config, interval time.Duration) error {
+	client, err := discovery.NewDiscoveryClientForConfig(config)
+	if err != nil {
+		return fmt.Errorf("create Kubernetes discovery client: %w", err)
+	}
+	if err := poll(ctx, interval, func(ctx context.Context) error {
+		_, err := client.RESTClient().Get().AbsPath("/version").DoRaw(ctx)
+		return err
+	}); err != nil {
+		return fmt.Errorf("wait for kube-apiserver at %s: %w", config.Host, err)
+	}
+	return nil
+}
+
 func waitForCilium(ctx context.Context, client kubernetes.Interface, interval time.Duration) error {
 	return poll(ctx, interval, func(ctx context.Context) error {
 		operator, err := client.AppsV1().Deployments(ciliumNamespace).Get(ctx, "cilium-operator", metav1.GetOptions{})
@@ -780,13 +809,20 @@ func waitForHubble(ctx context.Context, client kubernetes.Interface, interval ti
 	})
 }
 
-func waitForCiliumCRDs(ctx context.Context, client dynamic.Interface, interval time.Duration) error {
+// waitForCiliumCRDs waits only for CRDs the rendered chart actually creates:
+// the operator installs the BGP CRDs only when bgpControlPlane is enabled, so
+// demanding them on an L2-only cluster would wait out the whole deadline.
+func waitForCiliumCRDs(ctx context.Context, client dynamic.Interface, interval time.Duration, bgp bool) error {
 	names := []string{
 		"ciliumloadbalancerippools.cilium.io",
 		"ciliuml2announcementpolicies.cilium.io",
-		"ciliumbgpclusterconfigs.cilium.io",
-		"ciliumbgppeerconfigs.cilium.io",
-		"ciliumbgpadvertisements.cilium.io",
+	}
+	if bgp {
+		names = append(names,
+			"ciliumbgpclusterconfigs.cilium.io",
+			"ciliumbgppeerconfigs.cilium.io",
+			"ciliumbgpadvertisements.cilium.io",
+		)
 	}
 	resource := schema.GroupVersionResource{Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions"}
 	return poll(ctx, interval, func(ctx context.Context) error {

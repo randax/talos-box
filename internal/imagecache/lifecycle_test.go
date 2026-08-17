@@ -609,3 +609,52 @@ func TestPruneDiskExceptSweepsTemporariesFromKeptCombinations(t *testing.T) {
 		t.Fatalf("Images = %+v, want none reported for a kept combination", result.Images)
 	}
 }
+
+func TestPruneDiskReclaimsLegacyLayoutArchive(t *testing.T) {
+	root := t.TempDir()
+	cache := New(root)
+	legacy := filepath.Join(root, "schematic", "v1.13.6", "metal-arm64.raw.xz")
+	if err := os.MkdirAll(filepath.Dir(legacy), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacy, []byte("legacy-archive"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := cache.PruneDisk()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Fatalf("legacy-layout archive still exists after prune (%v)", err)
+	}
+	if want := int64(len("legacy-archive")); result.ImageBytes != want {
+		t.Fatalf("ImageBytes = %d, want %d", result.ImageBytes, want)
+	}
+}
+
+func TestPruneDiskExceptReportsKeptCombinations(t *testing.T) {
+	root := t.TempDir()
+	cache := New(root)
+	kept := filepath.Join(root, "schematic", "v1.13.6", "arm64", "disk.raw")
+	if err := os.MkdirAll(filepath.Dir(kept), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(kept, []byte("in-use-disk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := cache.PruneDiskExcept(func(Combination) (bool, error) { return true, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ImageCount != 0 || result.ImageBytes != 0 {
+		t.Fatalf("kept combination was pruned: %+v", result)
+	}
+	if result.KeptImages != 1 {
+		t.Fatalf("KeptImages = %d, want 1 so callers can explain a zero-prune", result.KeptImages)
+	}
+	if _, err := os.Stat(kept); err != nil {
+		t.Fatalf("kept disk image missing after prune: %v", err)
+	}
+}

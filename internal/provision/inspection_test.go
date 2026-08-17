@@ -471,3 +471,11 @@ func TestProvisioningNarrationQuotesClusterName(t *testing.T) {
 		}
 	}
 }
+
+func TestCiliumValuesRefusalNamesTheRunnableCommand(t *testing.T) {
+	item := cluster.Cluster{Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, LB: true}}
+	_, err := RenderInspection(item, "cilium-values")
+	if err == nil || !strings.Contains(err.Error(), "tbx manifests demo values") {
+		t.Fatalf("cilium-values refusal = %v, want the runnable redirect", err)
+	}
+}
