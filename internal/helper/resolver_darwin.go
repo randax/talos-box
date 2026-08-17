@@ -37,18 +37,55 @@ func installHostResolver(port int) error {
 func uninstallHostResolver() error {
 	resolverSyncMu.Lock()
 	defer resolverSyncMu.Unlock()
+	removed := false
 	err := os.Remove(resolverPath)
-	if errors.Is(err, os.ErrNotExist) {
-		if pendingHUP {
-			return reloadResolverCache()
-		}
-		return nil
-	}
-	if err != nil {
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove resolver file: %w", err)
 	}
-	pendingHUP = true
-	return reloadResolverCache()
+	if err == nil {
+		removed = true
+		pendingHUP = true
+	}
+	// Uninstall is terminal: marker-managed per-domain files (SPEC §11) have
+	// no owner after the helper is gone, so sweep them here too. Unmanaged
+	// files are never touched.
+	directory := filepath.Dir(resolverPath)
+	entries, readErr := os.ReadDir(directory)
+	var sweepErr error
+	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+		// Fall through: the shared file may already be gone and its owed HUP
+		// must still be replayed below.
+		sweepErr = fmt.Errorf("read resolver directory: %w", readErr)
+	}
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() {
+			continue
+		}
+		path := filepath.Join(directory, entry.Name())
+		content, err := os.ReadFile(path)
+		if err != nil {
+			// An unreadable file cannot be classified, so it may be a managed
+			// file left behind — that must fail the sweep, not pass silently.
+			// A file that vanished since ReadDir is simply gone.
+			if !errors.Is(err, os.ErrNotExist) {
+				sweepErr = errors.Join(sweepErr, fmt.Errorf("read resolver file %s: %w", entry.Name(), err))
+			}
+			continue
+		}
+		if !resolverset.Managed(content) {
+			continue
+		}
+		pendingHUP = true
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			sweepErr = errors.Join(sweepErr, fmt.Errorf("remove resolver file %s: %w", entry.Name(), err))
+			continue
+		}
+		removed = true
+	}
+	if removed || pendingHUP {
+		sweepErr = errors.Join(sweepErr, reloadResolverCache())
+	}
+	return sweepErr
 }
 
 // reloadResolverCache HUPs mDNSResponder (its pickup of resolver-file changes

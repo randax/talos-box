@@ -529,7 +529,7 @@ Commands:
   node add|remove
   snapshot create|restore|list|delete
   status [cluster]
-  manifests <cluster> [section]
+  manifests <cluster> [section] [--cni cilium|flannel]
   console <cluster> <node>
   bgp enable|disable <cluster>
   mirror offline [on|off]

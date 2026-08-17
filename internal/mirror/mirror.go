@@ -18,6 +18,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -34,9 +35,10 @@ type Server struct {
 	client           *http.Client
 	offline          *atomic.Bool
 	validateUpstream func(context.Context) error
+	now              func() time.Time // tests only: control token expiry
 
 	mu     sync.Mutex
-	tokens map[string]token // key: auth challenge scope
+	tokens map[string]token // key: pull scope of the request
 }
 
 type token struct {
@@ -406,7 +408,8 @@ func (s *Server) fetch(r *http.Request) (*http.Response, error) {
 			request.Header.Set(header, v)
 		}
 	}
-	if bearer := s.cachedToken(scopeOf(r.URL.Path)); bearer != "" {
+	scope := scopeOf(r.URL.Path)
+	if bearer := s.cachedToken(scope); bearer != "" {
 		request.Header.Set("Authorization", "Bearer "+bearer)
 	}
 	resp, err := s.client.Do(request)
@@ -416,9 +419,16 @@ func (s *Server) fetch(r *http.Request) (*http.Response, error) {
 	if resp.StatusCode != http.StatusUnauthorized {
 		return resp, nil
 	}
-	challenge := resp.Header.Get("WWW-Authenticate")
+	challenge, ok := bearerChallengeFrom(resp.Header.Values("WWW-Authenticate"))
+	if !ok {
+		// no token challenge to answer: the upstream's own response is the
+		// most faithful thing to hand back
+		return resp, nil
+	}
 	_ = resp.Body.Close()
-	bearer, err := s.negotiateToken(r.Context(), challenge)
+	// a cached token that just drew a 401 is stale even if it has not expired
+	s.forgetToken(scope)
+	bearer, err := s.negotiateToken(r.Context(), challenge, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -827,22 +837,131 @@ func (s *Server) blobPath(digest string) string {
 	return filepath.Join(s.cacheDir, "blobs", strings.ReplaceAll(digest, ":", "-"))
 }
 
-var challengeRe = regexp.MustCompile(`(\w+)="([^"]*)"`)
+var challengeRe = regexp.MustCompile(`([A-Za-z0-9_-]+)="([^"]*)"`)
 
-func (s *Server) negotiateToken(ctx context.Context, challenge string) (string, error) {
-	if !strings.HasPrefix(challenge, "Bearer ") {
-		return "", fmt.Errorf("unsupported auth challenge %q", challenge)
+// bearerChallenge is a parsed RFC 6750 style WWW-Authenticate challenge as
+// registries issue it: a token realm plus the service and scope to ask for.
+type bearerChallenge struct {
+	realm   string
+	service string
+	scope   string
+}
+
+// bearerChallengeFrom returns the first Bearer challenge among the response's
+// WWW-Authenticate values, so an upstream that leads with another scheme —
+// on a separate header line or ahead of Bearer inside one value — is still
+// answered.
+func bearerChallengeFrom(headers []string) (bearerChallenge, bool) {
+	for _, header := range headers {
+		for _, single := range splitChallenges(header) {
+			if challenge, ok := parseBearerChallenge(single); ok {
+				return challenge, true
+			}
+		}
+	}
+	return bearerChallenge{}, false
+}
+
+// splitChallenges splits one WWW-Authenticate value into its individual
+// challenges (RFC 7235 allows several per value, comma-separated). A segment
+// opening with a scheme token starts a new challenge; a key=value segment
+// belongs to the current one. Commas inside quoted strings do not split.
+func splitChallenges(header string) []string {
+	var segments []string
+	depth := false // inside a quoted string
+	start := 0
+	for i := 0; i < len(header); i++ {
+		switch header[i] {
+		case '"':
+			depth = !depth
+		case '\\':
+			if depth {
+				i++
+			}
+		case ',':
+			if !depth {
+				segments = append(segments, header[start:i])
+				start = i + 1
+			}
+		}
+	}
+	segments = append(segments, header[start:])
+
+	var challenges []string
+	current := ""
+	for _, segment := range segments {
+		segment = strings.TrimSpace(segment)
+		if segment == "" {
+			continue
+		}
+		// A parameter is "key=..."; anything else (a bare token, or
+		// "Scheme param=...") opens a new challenge.
+		head, _, _ := strings.Cut(segment, "=")
+		if current != "" && !strings.ContainsAny(strings.TrimSpace(head), " \t") && strings.Contains(segment, "=") {
+			current += ", " + segment
+			continue
+		}
+		if current != "" {
+			challenges = append(challenges, current)
+		}
+		current = segment
+	}
+	if current != "" {
+		challenges = append(challenges, current)
+	}
+	return challenges
+}
+
+// parseBearerChallenge reports whether the single challenge carries the
+// Bearer scheme and, if so, its parameters. Nothing here is
+// registry-specific: every value comes from the challenge itself.
+func parseBearerChallenge(header string) (bearerChallenge, bool) {
+	scheme, rest, ok := strings.Cut(strings.TrimSpace(header), " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
+		return bearerChallenge{}, false
 	}
 	params := map[string]string{}
-	for _, m := range challengeRe.FindAllStringSubmatch(challenge, -1) {
-		params[m[1]] = m[2]
+	for _, match := range challengeRe.FindAllStringSubmatch(rest, -1) {
+		params[strings.ToLower(match[1])] = match[2]
 	}
-	realm := params["realm"]
-	if realm == "" {
-		return "", fmt.Errorf("auth challenge without realm: %q", challenge)
+	return bearerChallenge{
+		realm:   params["realm"],
+		service: params["service"],
+		scope:   params["scope"],
+	}, true
+}
+
+// defaultTokenLifetime applies when a token endpoint omits expires_in; a 401
+// on a stale token re-negotiates anyway, so a short default is safe.
+const defaultTokenLifetime = 60 * time.Second
+
+// negotiateToken exchanges an anonymous token at the challenge's realm and
+// caches it under requestScope. Docker Hub answers manifest requests with a
+// challenge that carries no scope, so the scope derived from the request path
+// is the fallback — without it the token comes back with no repository access
+// and the retry 401s again.
+func (s *Server) negotiateToken(ctx context.Context, challenge bearerChallenge, requestScope string) (string, error) {
+	if challenge.realm == "" {
+		return "", fmt.Errorf("auth challenge without realm")
 	}
-	url := fmt.Sprintf("%s?service=%s&scope=%s", realm, params["service"], params["scope"])
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	scope := challenge.scope
+	if scope == "" {
+		scope = requestScope
+	}
+	realm, err := url.Parse(challenge.realm)
+	if err != nil {
+		return "", fmt.Errorf("auth challenge realm %q: %w", challenge.realm, err)
+	}
+	query := realm.Query()
+	if challenge.service != "" {
+		query.Set("service", challenge.service)
+	}
+	if scope != "" {
+		query.Set("scope", scope)
+	}
+	realm.RawQuery = query.Encode()
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, realm.String(), nil)
 	if err != nil {
 		return "", err
 	}
@@ -851,6 +970,9 @@ func (s *Server) negotiateToken(ctx context.Context, challenge string) (string, 
 		return "", err
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("token endpoint %s returned %d", realm.Redacted(), resp.StatusCode)
+	}
 	var payload struct {
 		Token       string `json:"token"`
 		AccessToken string `json:"access_token"`
@@ -866,24 +988,64 @@ func (s *Server) negotiateToken(ctx context.Context, challenge string) (string, 
 	if bearer == "" {
 		return "", fmt.Errorf("token endpoint returned no token")
 	}
-	lifetime := time.Duration(payload.ExpiresIn) * time.Second
-	if lifetime < time.Minute {
-		lifetime = 4 * time.Minute
+
+	// Cache under the request-derived scope only: it is the key fetch looks
+	// up, so any other key would be written and never read. A request whose
+	// path yields no scope negotiates per request instead.
+	if requestScope != "" {
+		s.mu.Lock()
+		if s.tokens == nil {
+			s.tokens = make(map[string]token)
+		}
+		now := s.currentTime()
+		// The daemon is long-lived and scopes are guest-controlled; sweep
+		// expired entries here so the map is bounded by live tokens.
+		for key, entry := range s.tokens {
+			if !now.Before(entry.expires) {
+				delete(s.tokens, key)
+			}
+		}
+		s.tokens[requestScope] = token{value: bearer, expires: now.Add(tokenLifetime(payload.ExpiresIn))}
+		s.mu.Unlock()
 	}
-	s.mu.Lock()
-	s.tokens[params["scope"]] = token{value: bearer, expires: time.Now().Add(lifetime - 30*time.Second)}
-	s.mu.Unlock()
 	return bearer, nil
+}
+
+// tokenLifetime honors the endpoint's expires_in, minus a small skew so a
+// token is never presented in its final moments.
+func tokenLifetime(expiresIn int) time.Duration {
+	lifetime := defaultTokenLifetime
+	if expiresIn > 0 {
+		lifetime = time.Duration(expiresIn) * time.Second
+	}
+	skew := lifetime / 10
+	if skew > 30*time.Second {
+		skew = 30 * time.Second
+	}
+	return lifetime - skew
+}
+
+func (s *Server) currentTime() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
 }
 
 func (s *Server) cachedToken(scope string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	entry, ok := s.tokens[scope]
-	if !ok || time.Now().After(entry.expires) {
+	if !ok || !s.currentTime().Before(entry.expires) {
 		return ""
 	}
 	return entry.value
+}
+
+func (s *Server) forgetToken(scope string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.tokens, scope)
 }
 
 // scopeOf derives the pull scope a request needs, matching the "scope" a

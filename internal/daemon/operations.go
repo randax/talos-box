@@ -829,7 +829,10 @@ func (s *Server) addNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTask
 	running := s.clusterRunning(item.Name)
 	var subnetWarning string
 	if running {
-		subnetWarning, err = cluster.CheckSubnetIndex(item.SubnetIndex, s.hostSubnetSources())
+		// The subnet is already fixed and attached, so it is only inspected for
+		// advisory routing findings — never re-validated for collisions, which
+		// the cluster's own bridge would always trip.
+		subnetWarning, err = cluster.AttachedSubnetWarning(item.SubnetIndex, s.hostSubnetSources())
 		if err != nil {
 			return NodeStatus{}, nil, err
 		}

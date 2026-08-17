@@ -171,6 +171,46 @@ func TestCheckSubnetIndexRejectsDifferentTalosBoxBridgeRoute(t *testing.T) {
 	}
 }
 
+// A vmnet bridge is named by the host, so a cluster's own bridge for subnet
+// index 0 may well be bridge101. An attached subnet must not be re-validated
+// against it, while cluster create still refuses that same collision.
+func TestAttachedSubnetWarningIgnoresOwnBridgeUnderAnyName(t *testing.T) {
+	t.Parallel()
+
+	sources := SubnetSources{
+		Interfaces: func() ([]HostInterface, error) {
+			return []HostInterface{{Name: "bridge101", Addrs: []net.Addr{hostAddress("172.30.0.1/24")}}}, nil
+		},
+		Route: staticRoute("bridge101", "172.30.0.0/24"),
+	}
+	warning, err := AttachedSubnetWarning(0, sources)
+	if err != nil {
+		t.Fatalf("AttachedSubnetWarning() error = %v, want the cluster's own attachment to be accepted", err)
+	}
+	if warning != "" {
+		t.Fatalf("warning = %q, want empty", warning)
+	}
+	if _, err := CheckSubnetIndex(0, sources); err == nil {
+		t.Fatal("CheckSubnetIndex() error = nil, want create to still reject a genuine collision")
+	}
+}
+
+func TestAttachedSubnetWarningStillReportsBroadRoute(t *testing.T) {
+	t.Parallel()
+
+	sources := SubnetSources{
+		Interfaces: func() ([]HostInterface, error) { return nil, nil },
+		Route:      staticRoute("utun4", "172.16.0.0/12"),
+	}
+	warning, err := AttachedSubnetWarning(0, sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(warning, "utun4") {
+		t.Fatalf("warning = %q, want containing %q", warning, "utun4")
+	}
+}
+
 func TestSelectMostSpecificRouteSkipsOwnedBridgeRoute(t *testing.T) {
 	t.Parallel()
 
@@ -297,5 +337,28 @@ func routeByThirdOctet(routes map[byte]HostRoute) func(net.IP) (HostRoute, error
 			return route, nil
 		}
 		return defaultRoute, nil
+	}
+}
+
+// A foreign interface squatting on an attached subnet cannot be resolved by a
+// node mutation, but the operator still needs to hear about it.
+func TestAttachedSubnetWarningSurfacesForeignConflict(t *testing.T) {
+	t.Parallel()
+
+	sources := SubnetSources{
+		Interfaces: func() ([]HostInterface, error) {
+			return []HostInterface{
+				{Name: "bridge101", Addrs: []net.Addr{hostAddress("172.30.0.1/24")}},
+				{Name: "utun7", Addrs: []net.Addr{hostAddress("172.30.0.5/24")}},
+			}, nil
+		},
+		Route: staticRoute("bridge101", "172.30.0.0/24"),
+	}
+	warning, err := AttachedSubnetWarning(0, sources)
+	if err != nil {
+		t.Fatalf("AttachedSubnetWarning() error = %v, want a warning instead", err)
+	}
+	if !strings.Contains(warning, "utun7") || !strings.Contains(warning, "conflicts") {
+		t.Fatalf("warning = %q, want a foreign-conflict warning naming utun7", warning)
 	}
 }

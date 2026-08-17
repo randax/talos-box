@@ -106,7 +106,8 @@ func (c *Client) InstallDNS(port int) error {
 	return err
 }
 
-// UninstallDNS removes the k8s.test scoped resolver.
+// UninstallDNS removes the k8s.test scoped resolver and any remaining
+// marker-managed per-domain resolver files.
 func (c *Client) UninstallDNS() error {
 	_, _, err := c.call("dns.uninstall", struct{}{}, false)
 	return err

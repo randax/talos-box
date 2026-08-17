@@ -82,6 +82,47 @@ func TestRunManifestsSubstrateOnlyIncludesStorageGuidance(t *testing.T) {
 	}
 }
 
+func TestRunManifestsSubstrateOnlyRendersMachineAndMirrors(t *testing.T) {
+	for section, wants := range map[string][]string{
+		"machine": {"name: none", "RegistryMirrorConfig", "http://172.30.5.1:5059"},
+		"mirrors": {"RegistryMirrorConfig", "skipFallback: true"},
+	} {
+		stdout := runCLIWithResponse(t,
+			`[{"name":"demo","subnetIndex":5,"controlPlanes":1,"workers":2}]`,
+			func(command cli) error { return command.runManifests([]string{"demo", section}) },
+		)
+		for _, want := range wants {
+			if !strings.Contains(stdout, want) {
+				t.Errorf("substrate-only %s output missing %q:\n%s", section, want, stdout)
+			}
+		}
+	}
+}
+
+func TestRunManifestsCNIDerivedSectionNamesTheFlag(t *testing.T) {
+	var err error
+	runCLIWithResponse(t,
+		`[{"name":"demo","subnetIndex":5,"controlPlanes":1,"workers":2}]`,
+		func(command cli) error {
+			err = command.runManifests([]string{"demo", "objects"})
+			return nil
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "--cni cilium") {
+		t.Fatalf("substrate-only objects error = %v, want the --cni remedy", err)
+	}
+}
+
+func TestRunManifestsCNIFlagRendersTheNamedCuratedPath(t *testing.T) {
+	stdout := runCLIWithResponse(t,
+		`[{"name":"demo","subnetIndex":5,"controlPlanes":1,"workers":2}]`,
+		func(command cli) error { return command.runManifests([]string{"demo", "values", "--cni", "cilium"}) },
+	)
+	if !strings.Contains(stdout, "kubeProxyReplacement: true") {
+		t.Fatalf("tbx manifests --cni cilium values missing Cilium values:\n%s", stdout)
+	}
+}
+
 // TestRunManifestsImagesRoundTripsThroughTheWarmList is the composability
 // promise: `tbx manifests demo images | tbx cache warm -` must parse, so every
 // emitted line is checked with the warm list's own parser.
