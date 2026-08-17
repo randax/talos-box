@@ -51,12 +51,12 @@ func (c cli) ensureProtocolAtLeast(minimum int, feature string) error {
 	var info daemon.Info
 	if err := c.call("daemon.info", struct{}{}, &info); err != nil {
 		if strings.Contains(err.Error(), "unknown operation") {
-			return fmt.Errorf("tbxd is too old to use %s; run: tbx system restart", feature)
+			return fmt.Errorf("tbxd is too old to use %s; run: tbx system restart (add --force if it refuses; on a supervised install restart the tbxd service instead)", feature)
 		}
 		return err
 	}
 	if info.ProtocolVersion < minimum {
-		return fmt.Errorf("tbxd protocol %d is too old to use %s; run: tbx system restart", info.ProtocolVersion, feature)
+		return fmt.Errorf("tbxd protocol %d is too old to use %s; run: tbx system restart (add --force if it refuses; on a supervised install restart the tbxd service instead)", info.ProtocolVersion, feature)
 	}
 	if info.ProtocolVersion > daemon.ProtocolVersion {
 		return fmt.Errorf("tbx is too old: protocol %d does not support tbxd protocol %d; upgrade tbx to use %s", daemon.ProtocolVersion, info.ProtocolVersion, feature)
@@ -388,9 +388,12 @@ func daemonClusterActivity(socketPath string) (clusterActivity, error) {
 		return activity, err
 	}
 	suspended, savedErr := savedStateClustersQuery()
-	if savedErr == nil {
-		activity.addSuspended(suspended...)
+	if savedErr != nil {
+		// An unreadable scan means suspension state is unknown; treating it
+		// as "none" would risk exactly the saved-memory loss described above.
+		return activity, fmt.Errorf("scan for suspended clusters: %w", savedErr)
 	}
+	activity.addSuspended(suspended...)
 	return activity, nil
 }
 

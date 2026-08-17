@@ -135,13 +135,15 @@ func Assess(snapshot Snapshot) []Finding {
 //     block while pressure is elevated or unmeasurable, advisory while pressure
 //     is normal;
 //   - low absolute free swap only escalates alongside a *measured* elevated
-//     pressure: on its own it says the host is swapping heavily, which the
-//     percentage rule already covers, and unmeasurable pressure has no reading
-//     to corroborate it.
+//     pressure AND substantial swap use: macOS grows vm.swapusage on demand,
+//     so a small, mostly-free allocation is the normal reading right when a
+//     host merely begins to swap — that must not block. The ≥75% floor keeps
+//     both QA-observed corruption readings (87–88% used) blocking.
 func memoryFinding(snapshot Snapshot) (Finding, bool) {
 	swapEnabled := snapshot.Swap.TotalBytes > 0
 	swapExhausted := swapEnabled && percentUsed(snapshot.Swap) >= extremeSwapUsedPercent
-	swapNearlyFull := swapEnabled && snapshot.Swap.AvailableBytes < lowFreeSwapBytes
+	swapNearlyFull := swapEnabled && snapshot.Swap.AvailableBytes < lowFreeSwapBytes &&
+		percentUsed(snapshot.Swap) >= 75
 
 	var severity Severity
 	switch snapshot.MemoryPressure {

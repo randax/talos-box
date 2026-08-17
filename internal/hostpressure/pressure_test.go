@@ -153,9 +153,19 @@ func TestAssessBlocksOnLowFreeSwapWithElevatedPressure(t *testing.T) {
 		wantSeverity Severity
 	}{
 		{
+			// 88% used — under the 90% swapExhausted rule, so only the
+			// low-free-swap escalation can produce this Block.
 			name:         "low free swap with warning pressure blocks",
-			snapshot:     Snapshot{Swap: Usage{TotalBytes: 12 << 30, AvailableBytes: 1 << 30}, MemoryPressure: MemoryPressureWarning},
+			snapshot:     Snapshot{Swap: Usage{TotalBytes: 12 << 30, AvailableBytes: 12 << 30 * 12 / 100}, MemoryPressure: MemoryPressureWarning},
 			wantSeverity: SeverityBlock,
+		},
+		{
+			// A small, mostly-free swap allocation is the normal macOS reading
+			// when a host merely begins to swap: warn (for the pressure), but
+			// never block on the low absolute free bytes alone.
+			name:         "small mostly-free swap with warning pressure only warns",
+			snapshot:     Snapshot{Swap: Usage{TotalBytes: 1 << 30, AvailableBytes: 824 << 20}, MemoryPressure: MemoryPressureWarning},
+			wantSeverity: SeverityWarn,
 		},
 		{
 			name:         "low free swap with normal pressure only warns",
@@ -214,8 +224,11 @@ func TestAssessFlagsTheQAObservedReadings(t *testing.T) {
 			if len(findings) == 0 {
 				t.Fatal("Assess() = none, want the reading reported rather than a silent PASS")
 			}
-			if maxSeverity(findings) < SeverityWarn {
-				t.Fatalf("Assess() = %v, want at least SeverityWarn", findings)
+			// Both readings preceded observed guest corruption, and both sit
+			// under 90% with <1.5 GiB free: only the low-free-swap escalation
+			// makes them Block, so pinning Block pins that rule.
+			if maxSeverity(findings) != SeverityBlock {
+				t.Fatalf("Assess() = %v, want SeverityBlock", findings)
 			}
 			joined := joinFindings(findings)
 			if !strings.Contains(joined, "memory pressure is warning") {

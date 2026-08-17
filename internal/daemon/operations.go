@@ -404,7 +404,7 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return ClusterSummary{}, fmt.Errorf("inspect cluster directory: %w", err)
 	}
-	hostPressureWarning, err := s.checkHostPressure(dir, args.Force)
+	hostPressureWarnings, err := s.checkHostPressure(dir, args.Force)
 	if err != nil {
 		return ClusterSummary{}, err
 	}
@@ -494,7 +494,7 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	startWarning, err := s.start(item)
 	if err != nil {
 		result := summary(item, false)
-		result.setWarnings(talosVersionWarning, overcommitWarning, hostPressureWarning, longhornWarning, longhornCustomSchematicWarning, subnetWarning)
+		result.setWarnings(append([]string{talosVersionWarning, overcommitWarning}, append(hostPressureWarnings, longhornWarning, longhornCustomSchematicWarning, subnetWarning)...)...)
 		startErr := fmt.Errorf("cluster created but failed to start: %w", err)
 		if talosVersionWarning != "" {
 			// the failure response drops the summary, and a boot failure on
@@ -505,7 +505,7 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 		return result, startErr
 	}
 	result := summary(item, true)
-	result.setWarnings(talosVersionWarning, overcommitWarning, hostPressureWarning, longhornWarning, longhornCustomSchematicWarning, subnetWarning, startWarning)
+	result.setWarnings(append([]string{talosVersionWarning, overcommitWarning}, append(hostPressureWarnings, longhornWarning, longhornCustomSchematicWarning, subnetWarning, startWarning)...)...)
 	return result, nil
 }
 
@@ -532,7 +532,7 @@ func (s *Server) startCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if err != nil {
 		return ClusterSummary{}, err
 	}
-	hostPressureWarning, err := s.checkHostPressure(dir, args.Force)
+	hostPressureWarnings, err := s.checkHostPressure(dir, args.Force)
 	if err != nil {
 		return ClusterSummary{}, err
 	}
@@ -541,7 +541,7 @@ func (s *Server) startCluster(raw json.RawMessage) (ClusterSummary, error) {
 		return ClusterSummary{}, err
 	}
 	result := summary(item, true)
-	result.setWarnings(overcommitWarning, hostPressureWarning, longhornWarning, longhornCustomSchematicWarning, subnetWarning)
+	result.setWarnings(append([]string{overcommitWarning}, append(hostPressureWarnings, longhornWarning, longhornCustomSchematicWarning, subnetWarning)...)...)
 	return result, nil
 }
 
@@ -882,7 +882,7 @@ func (s *Server) addNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTask
 	if err != nil {
 		return NodeStatus{}, nil, err
 	}
-	hostPressureWarning, err := s.checkHostPressure(dir, args.Force)
+	hostPressureWarnings, err := s.checkHostPressure(dir, args.Force)
 	if err != nil {
 		return NodeStatus{}, nil, err
 	}
@@ -922,7 +922,7 @@ func (s *Server) addNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTask
 	}
 	status := nodeStatus(node, item.SubnetIndex, s.nodeRunning(item.Name, node.Name))
 	customSchematic := s.defaultSchematic != "" && item.Schematic != "" && item.Schematic != s.defaultSchematic
-	status.setWarnings(overcommitWarning, hostPressureWarning, subnetWarning, s.longhornCustomSchematicWarning(item, customSchematic))
+	status.setWarnings(append([]string{overcommitWarning}, append(hostPressureWarnings, subnetWarning, s.longhornCustomSchematicWarning(item, customSchematic))...)...)
 	return status, s.beginNodeMutationProvisionLocked(item), nil
 }
 

@@ -40,12 +40,12 @@ func TestCheckHostPressureAllowsStickySwapWhileMemoryPressureIsNormal(t *testing
 			MemoryPressure: hostpressure.MemoryPressureNormal,
 		}, nil
 	}}
-	warning, err := service.checkHostPressure(t.TempDir(), false)
+	warnings, err := service.checkHostPressure(t.TempDir(), false)
 	if err != nil {
 		t.Fatalf("checkHostPressure() = %v, want no refusal for sticky swap with normal pressure", err)
 	}
-	if !strings.Contains(warning, "host swap is 90% used") {
-		t.Fatalf("checkHostPressure() warning = %q, want an advisory sticky-swap warning", warning)
+	if !strings.Contains(strings.Join(warnings, "\n"), "host swap is 90% used") {
+		t.Fatalf("checkHostPressure() warnings = %q, want an advisory sticky-swap warning", warnings)
 	}
 }
 
