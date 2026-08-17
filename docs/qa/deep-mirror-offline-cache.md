@@ -75,7 +75,7 @@ Steps:
 1. Warm one specific tag-pinned image (C1's list). `tbx mirror offline on`; `tbx mirror offline` reports `on`.
 2. From a test pod, pull the warmed image by tag — succeeds from cache. Pull it by digest — also succeeds (digest/tag parity).
 3. Pull an uncached image — expect a hard failure mentioning offline/not-cached (skipFallback means the node cannot bypass; the pull fails, it does not hang).
-4. Restart the daemon path you can exercise (e.g. `tbx cluster stop qa-mir && tbx cluster start qa-mir`, or note if a real tbxd restart is available); `tbx mirror offline` still reports `on`.
+4. Restart the daemon itself with `tbx system restart` (or, if that is unavailable, exercise the cluster path: `tbx cluster stop qa-mir && tbx cluster start qa-mir`); `tbx mirror offline` still reports `on`.
 5. `tbx mirror offline off`; the previously failing pull now succeeds.
 
 Expected observations: cached tag AND digest served offline; miss = clear hard failure, not a hang; mode persists; `off` restores pull-through.

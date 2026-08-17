@@ -23,7 +23,7 @@ const (
 
 func (c cli) runSystem(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tbx system install|uninstall|restart [--force]|status")
+		return errors.New(groupUsages["system"])
 	}
 	switch args[0] {
 	// restart and status manage the per-user daemon, so they never need root
@@ -111,8 +111,7 @@ func (c cli) restartDaemon(force bool) error {
 			return fmt.Errorf("tbx could not tell whether clusters are running (%v); restarting tbxd stops every running cluster — re-run: tbx system restart --force", activityErr)
 		}
 		if !activity.empty() {
-			return fmt.Errorf("restarting tbxd stops these clusters: %s; re-run: tbx system restart --force",
-				activity.describe())
+			return errors.New(restartRefusal(activity))
 		}
 	}
 	restarted, restartedPID, err := replaceDaemon(socketPath, info, pid)
@@ -140,12 +139,10 @@ func (c cli) restartDaemon(force bool) error {
 // does not dead-end on a file that proves nothing.
 func refuseSupervisedRestart(force bool) error {
 	state, reason := supervisedDaemon()
-	switch {
-	case state == supervisionConfirmed:
-		return fmt.Errorf("%s; tbx will not restart a supervised tbxd — run: %s", reason, supervisorRestartCommand())
-	case state == supervisionInferred && !force:
-		return fmt.Errorf("%s; run: %s, or re-run: tbx system restart --force to replace it in place",
-			reason, supervisorRestartCommand())
+	if state == supervisionConfirmed || (state == supervisionInferred && !force) {
+		// supervisionRefusal is shared with the protocol gate in client.go, so
+		// the two callers cannot name different ways out of the same state
+		return errors.New(supervisionRefusal(state, reason))
 	}
 	return nil
 }

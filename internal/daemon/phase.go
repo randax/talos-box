@@ -80,6 +80,19 @@ func probeHostPort(address string) ProbeResult {
 // nodeBootWindow is the boot budget the calm unreachable hint promises.
 const nodeBootWindow = time.Minute
 
+// formatBootWindow renders the promised boot budget for the hint that states
+// it, so the prose and the constant it describes cannot desync.
+func formatBootWindow(window time.Duration) string {
+	if window >= time.Minute && window%time.Minute == 0 {
+		minutes := int(window / time.Minute)
+		if minutes == 1 {
+			return "1 minute"
+		}
+		return fmt.Sprintf("%d minutes", minutes)
+	}
+	return fmt.Sprintf("%d seconds", int(window.Round(time.Second).Seconds()))
+}
+
 // nodeStallThreshold is how far past that promise a node must stay silent
 // before the hint stops counselling patience and starts naming the node: a
 // node still unreachable at 3× the stated window is not booting slowly, it is
@@ -176,7 +189,7 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 	booting, stalled := splitStalledNodes(unreachable, now)
 	if len(booting) > 0 {
 		hints = append(hints,
-			fmt.Sprintf("%d node(s) not answering yet — boot takes ~1 minute; if it persists, run: tbx doctor", len(booting)),
+			fmt.Sprintf("%d node(s) not answering yet — boot takes ~%s; if it persists, run: tbx doctor", len(booting), formatBootWindow(nodeBootWindow)),
 		)
 	}
 	if hint := stalledNodesHint(status.Name, stalled, now); hint != "" {

@@ -117,6 +117,117 @@ func TestAssessSwapSeverityIsMonotonicWithinAPressureLevel(t *testing.T) {
 	}
 }
 
+// Elevated memory pressure is the condition that corrupted guest disks, so it
+// is reportable on its own: doctor PASSed at 87-88% swap while pressure was
+// already `warning` because only the 90% swap threshold was consulted (#284).
+func TestAssessReportsElevatedMemoryPressureBelowTheSwapThreshold(t *testing.T) {
+	snapshot := Snapshot{
+		// 50% used, 5 GiB free: no swap trouble by either swap rule
+		Swap:           Usage{TotalBytes: 10 << 30, AvailableBytes: 5 << 30},
+		MemoryPressure: MemoryPressureWarning,
+	}
+
+	findings := Assess(snapshot)
+	if len(findings) != 1 {
+		t.Fatalf("Assess() = %v, want a memory-pressure finding", findings)
+	}
+	if findings[0].Severity != SeverityWarn {
+		t.Errorf("Assess() severity = %v, want SeverityWarn for warning pressure with swap to spare", findings[0].Severity)
+	}
+	for _, fragment := range []string{"memory pressure is warning", "swap is 50% used", "5.0 GiB free", "`tbx "} {
+		if !strings.Contains(findings[0].String(), fragment) {
+			t.Errorf("Assess() = %q, missing %q", findings[0], fragment)
+		}
+	}
+}
+
+// Free swap, not percent-used, is what a guest write needs: a host with 1 GiB
+// left is out of headroom whether that is 88% or 95% of the swap file.
+func TestAssessBlocksOnLowFreeSwapWithElevatedPressure(t *testing.T) {
+	lowFree := Usage{TotalBytes: 20 << 30, AvailableBytes: 1 << 30} // 95% used but, more to the point, 1 GiB free
+	roomy := Usage{TotalBytes: 20 << 30, AvailableBytes: 4 << 30}
+
+	tests := []struct {
+		name         string
+		snapshot     Snapshot
+		wantSeverity Severity
+	}{
+		{
+			name:         "low free swap with warning pressure blocks",
+			snapshot:     Snapshot{Swap: Usage{TotalBytes: 12 << 30, AvailableBytes: 1 << 30}, MemoryPressure: MemoryPressureWarning},
+			wantSeverity: SeverityBlock,
+		},
+		{
+			name:         "low free swap with normal pressure only warns",
+			snapshot:     Snapshot{Swap: lowFree, MemoryPressure: MemoryPressureNormal},
+			wantSeverity: SeverityWarn,
+		},
+		{
+			name:         "roomy swap with warning pressure stays a warning",
+			snapshot:     Snapshot{Swap: roomy, MemoryPressure: MemoryPressureWarning},
+			wantSeverity: SeverityWarn,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			findings := Assess(test.snapshot)
+			if len(findings) != 1 {
+				t.Fatalf("Assess() = %v, want exactly one memory finding", findings)
+			}
+			if findings[0].Severity != test.wantSeverity {
+				t.Fatalf("Assess() = %v (severity %v), want severity %v", findings[0], findings[0].Severity, test.wantSeverity)
+			}
+		})
+	}
+}
+
+// The readings QA observed while guest disks were being corrupted must never
+// classify as "nothing to report" again (#284). Both are taken verbatim from
+// the runs that produced the damage.
+func TestAssessFlagsTheQAObservedReadings(t *testing.T) {
+	tests := []struct {
+		name     string
+		snapshot Snapshot
+	}{
+		{
+			// #288 QA run: doctor PASSed host-pressure at 87% swap used while
+			// the kernel already reported warning memory pressure.
+			name: "qa 288 run: 87% swap used with warning pressure",
+			snapshot: Snapshot{
+				Swap:           Usage{TotalBytes: 11 * bytesPerGiB, AvailableBytes: 11 * bytesPerGiB * 13 / 100},
+				MemoryPressure: MemoryPressureWarning,
+			},
+		},
+		{
+			// deep-storage QA run (#293): swap 8.75 GiB of 10 GiB with warning
+			// pressure, during which a worker kubelet crashlooped on SIGSEGV.
+			name: "deep-storage run: 8.75 GiB of 10 GiB swap with warning pressure",
+			snapshot: Snapshot{
+				Swap:           Usage{TotalBytes: 10 * bytesPerGiB, AvailableBytes: 10*bytesPerGiB - 8_750*bytesPerGiB/1000},
+				MemoryPressure: MemoryPressureWarning,
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			findings := Assess(test.snapshot)
+			if len(findings) == 0 {
+				t.Fatal("Assess() = none, want the reading reported rather than a silent PASS")
+			}
+			if maxSeverity(findings) < SeverityWarn {
+				t.Fatalf("Assess() = %v, want at least SeverityWarn", findings)
+			}
+			joined := joinFindings(findings)
+			if !strings.Contains(joined, "memory pressure is warning") {
+				t.Errorf("Assess() = %q, want the measured pressure named", joined)
+			}
+			if !strings.Contains(joined, "swap is 87% used") {
+				t.Errorf("Assess() = %q, want the measured swap percentage named", joined)
+			}
+		})
+	}
+}
+
 func TestAssessFindingsCarryRunnableRemedies(t *testing.T) {
 	findings := Assess(Snapshot{
 		Swap:       Usage{TotalBytes: 10 << 30, AvailableBytes: 1 << 30},

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/randax/talos-box/internal/cluster"
 )
@@ -23,6 +24,23 @@ type snapshotArgs struct {
 type SnapshotStatus struct {
 	Snapshots []cluster.SnapshotInfo `json:"snapshots"`
 	Warning   string                 `json:"warning,omitempty"`
+	// Warnings is the same advisory set as Warning, one entry per finding.
+	// Warning stays populated for older clients that only read it.
+	Warnings []string `json:"warnings,omitempty"`
+}
+
+// setWarnings fills both the list and the legacy joined string, so the restore
+// gate's data-loss note and the restart's host-subnet finding each get their
+// own line instead of fusing into one (#291).
+func (s *SnapshotStatus) setWarnings(warnings ...string) {
+	s.Warnings = warningList(warnings...)
+	s.Warning = strings.Join(s.Warnings, "; ")
+}
+
+// prependWarning puts a finding ahead of the ones already recorded: the
+// restore gate's note is decided before the status is built, so it reads first.
+func (s *SnapshotStatus) prependWarning(warning string) {
+	s.setWarnings(append([]string{warning}, s.Warnings...)...)
 }
 
 // withClusterStopped runs body with the cluster's VMs stopped, restarting them
@@ -82,7 +100,9 @@ func (s *Server) snapshotCreate(raw json.RawMessage) (SnapshotStatus, error) {
 	if err != nil {
 		return SnapshotStatus{}, err
 	}
-	return SnapshotStatus{Snapshots: snapshots, Warning: restartWarning}, nil
+	status := SnapshotStatus{Snapshots: snapshots}
+	status.setWarnings(restartWarning)
+	return status, nil
 }
 
 func (s *Server) snapshotRestore(raw json.RawMessage) (SnapshotStatus, error) {
@@ -120,7 +140,9 @@ func (s *Server) snapshotRestore(raw json.RawMessage) (SnapshotStatus, error) {
 	if err != nil {
 		return SnapshotStatus{}, err
 	}
-	return SnapshotStatus{Snapshots: snapshots, Warning: restartWarning}, nil
+	status := SnapshotStatus{Snapshots: snapshots}
+	status.setWarnings(restartWarning)
+	return status, nil
 }
 
 func (s *Server) snapshotList(raw json.RawMessage) ([]cluster.SnapshotInfo, error) {

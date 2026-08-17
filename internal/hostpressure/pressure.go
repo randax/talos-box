@@ -8,6 +8,14 @@ const (
 	extremeSwapUsedPercent       = 90
 	extremeDataVolumeUsedPercent = 95
 	bytesPerGiB                  = 1 << 30
+	// lowFreeSwapBytes is the absolute headroom below which swap counts as
+	// exhausted regardless of percentage. Percent-used alone hid the readings
+	// that corrupted guest disks (#284): QA measured 87-88% used — a PASS by the
+	// 90% rule — with only ~1.3 GiB of swap actually free, while the kernel
+	// already reported warning memory pressure. 1.5 GiB is one Talos guest's
+	// working set plus margin: below that, a single VM's dirty pages can fill
+	// the remaining swap, which is when guests reset mid-write.
+	lowFreeSwapBytes = 3 * bytesPerGiB / 2
 )
 
 // Usage describes capacity and immediately available bytes for one resource.
@@ -93,20 +101,13 @@ func (f Finding) DoctorDetail() string {
 //
 // Memory pressure is the primary memory signal: macOS keeps swap allocated
 // long after pressure clears, so a high swap-used percentage alone says
-// nothing about current availability. Swap exhaustion is secondary — it blocks
-// while pressure is elevated or could not be measured, and is advisory only
-// while pressure is normal.
+// nothing about current availability. Elevated pressure is therefore reportable
+// on its own, and swap — measured both as a percentage and as absolute free
+// bytes — decides how far it escalates.
 func Assess(snapshot Snapshot) []Finding {
 	var findings []Finding
-	if snapshot.MemoryPressure == MemoryPressureCritical {
-		findings = append(findings, Finding{
-			Severity: SeverityBlock,
-			Detail:   "host memory pressure is critical; " + memoryConsequence,
-			Remedy:   memoryRemedy,
-		})
-	}
-	if percentUsed(snapshot.Swap) >= extremeSwapUsedPercent {
-		findings = append(findings, swapFinding(snapshot))
+	if finding, ok := memoryFinding(snapshot); ok {
+		findings = append(findings, finding)
 	}
 	if percentUsed(snapshot.DataVolume) >= extremeDataVolumeUsedPercent {
 		findings = append(findings, Finding{
@@ -121,29 +122,76 @@ func Assess(snapshot Snapshot) []Finding {
 	return findings
 }
 
-func swapFinding(snapshot Snapshot) Finding {
-	usage := fmt.Sprintf(
-		"host swap is %d%% used (%.1f GiB of %.1f GiB)",
-		percentUsed(snapshot.Swap), gib(snapshot.Swap.usedBytes()), gib(snapshot.Swap.TotalBytes),
-	)
-	// sticky swap with memory to spare is not a fault, but it is one pressure
-	// tick away from one, so it stays reportable
-	if snapshot.MemoryPressure == MemoryPressureNormal {
-		return Finding{
-			Severity: SeverityWarn,
-			Detail: usage + " while memory pressure is normal; macOS keeps swap allocated after pressure clears," +
-				" but starting more guests from here can push the host back into swapping, where " + memoryConsequence,
-			Remedy: memoryRemedy,
+// memoryFinding classifies the host's memory situation as one finding: pressure
+// and swap are two readings of the same condition, so reporting them separately
+// would only duplicate the remedy.
+//
+// The rules, in the order they were learned:
+//   - critical pressure blocks outright;
+//   - warning pressure is always at least advisory — it is the reading that was
+//     live while guest disks were being corrupted (#284) — and blocks once swap
+//     is exhausted by either measure;
+//   - swap at or past extremeSwapUsedPercent keeps its original verdicts: a
+//     block while pressure is elevated or unmeasurable, advisory while pressure
+//     is normal;
+//   - low absolute free swap only escalates alongside a *measured* elevated
+//     pressure: on its own it says the host is swapping heavily, which the
+//     percentage rule already covers, and unmeasurable pressure has no reading
+//     to corroborate it.
+func memoryFinding(snapshot Snapshot) (Finding, bool) {
+	swapEnabled := snapshot.Swap.TotalBytes > 0
+	swapExhausted := swapEnabled && percentUsed(snapshot.Swap) >= extremeSwapUsedPercent
+	swapNearlyFull := swapEnabled && snapshot.Swap.AvailableBytes < lowFreeSwapBytes
+
+	var severity Severity
+	switch snapshot.MemoryPressure {
+	case MemoryPressureCritical:
+		severity = SeverityBlock
+	case MemoryPressureWarning:
+		severity = SeverityWarn
+		if swapExhausted || swapNearlyFull {
+			severity = SeverityBlock
+		}
+	case MemoryPressureNormal:
+		if swapExhausted {
+			// sticky swap with memory to spare is not a fault, but it is one
+			// pressure tick away from one, so it stays reportable
+			severity = SeverityWarn
+		}
+	default:
+		if swapExhausted {
+			severity = SeverityBlock
 		}
 	}
-	pressureClause := " and memory pressure could not be measured"
-	if snapshot.MemoryPressure != MemoryPressureUnknown {
-		pressureClause = fmt.Sprintf(" while memory pressure is %s", snapshot.MemoryPressure)
+	if severity == 0 {
+		return Finding{}, false
 	}
-	return Finding{
-		Severity: SeverityBlock,
-		Detail:   usage + pressureClause + "; " + memoryConsequence,
-		Remedy:   memoryRemedy,
+	return Finding{Severity: severity, Detail: memoryDetail(snapshot), Remedy: memoryRemedy}, true
+}
+
+// memoryDetail states the condition with every number the gate measured, so an
+// operator can check the same readings by hand.
+func memoryDetail(snapshot Snapshot) string {
+	pressureClause := "memory pressure could not be measured"
+	if snapshot.MemoryPressure != MemoryPressureUnknown {
+		pressureClause = fmt.Sprintf("memory pressure is %s", snapshot.MemoryPressure)
+	}
+	if snapshot.Swap.TotalBytes == 0 {
+		return "host " + pressureClause + "; " + memoryConsequence
+	}
+	usage := fmt.Sprintf(
+		"host swap is %d%% used (%.1f GiB of %.1f GiB, %.1f GiB free)",
+		percentUsed(snapshot.Swap), gib(snapshot.Swap.usedBytes()),
+		gib(snapshot.Swap.TotalBytes), gib(snapshot.Swap.AvailableBytes),
+	)
+	switch snapshot.MemoryPressure {
+	case MemoryPressureNormal:
+		return usage + " while memory pressure is normal; macOS keeps swap allocated after pressure clears," +
+			" but starting more guests from here can push the host back into swapping, where " + memoryConsequence
+	case MemoryPressureUnknown:
+		return usage + " and " + pressureClause + "; " + memoryConsequence
+	default:
+		return usage + " while " + pressureClause + "; " + memoryConsequence
 	}
 }
 

@@ -624,7 +624,7 @@ func TestRunDoctorWarnsHostPressureForStickySwap(t *testing.T) {
 		t.Fatalf("runDoctorWithDependencies() = %v for sticky swap with normal pressure", err)
 	}
 	for _, fragment := range []string{
-		"WARN host-pressure: host swap is 90% used (9.0 GiB of 10.0 GiB) while memory pressure is normal",
+		"WARN host-pressure: host swap is 90% used (9.0 GiB of 10.0 GiB, 1.0 GiB free) while memory pressure is normal",
 		"`tbx down`",
 	} {
 		if !strings.Contains(output.String(), fragment) {
@@ -648,7 +648,7 @@ func TestRunDoctorFailsOnBlockingHostPressure(t *testing.T) {
 		t.Fatal("runDoctorWithDependencies() succeeded despite host pressure that blocks cluster create")
 	}
 	for _, line := range []string{
-		"FAIL host-pressure: host swap is 90% used (9.0 GiB of 10.0 GiB) and memory pressure could not be measured",
+		"FAIL host-pressure: host swap is 90% used (9.0 GiB of 10.0 GiB, 1.0 GiB free) and memory pressure could not be measured",
 		"FAIL host-pressure: talosbox data volume is 95% used (5.0 GiB free)",
 		"`tbx down`",
 		"`tbx cache prune --all`",

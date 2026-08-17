@@ -196,6 +196,75 @@ func (l *stallLog) forgetAll() {
 	l.stalls = nil
 }
 
+// defaultStallScanInterval is how often the daemon observes its own nodes. The
+// stall threshold is minutes, so a 30s cadence records the crossing promptly
+// while costing one apid probe per running node.
+const defaultStallScanInterval = 30 * time.Second
+
+// startStallWatch begins the daemon-side stall observation. logNodeStalls used
+// to run only from dispatchStatus, so a node that stalled while nobody polled
+// left nothing in tbxd.log at all (#288) — the log an operator is told to check.
+// Serve starts the watch; Shutdown stops it.
+func (s *Server) startStallWatch() {
+	s.stallWatchMu.Lock()
+	defer s.stallWatchMu.Unlock()
+	if s.stallWatchStop != nil {
+		return
+	}
+	interval := s.stallScanInterval
+	if interval <= 0 {
+		interval = defaultStallScanInterval
+	}
+	stop, done := make(chan struct{}), make(chan struct{})
+	s.stallWatchStop, s.stallWatchDone = stop, done
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				// one goroutine drives every scan, so a slow probe round
+				// delays the next tick instead of overlapping with it
+				s.observeNodeStalls()
+			}
+		}
+	}()
+}
+
+// stopStallWatch stops the watch and waits for the in-flight scan to finish, so
+// no observation can run against state Shutdown is tearing down.
+func (s *Server) stopStallWatch() {
+	s.stallWatchMu.Lock()
+	stop, done := s.stallWatchStop, s.stallWatchDone
+	s.stallWatchStop, s.stallWatchDone = nil, nil
+	s.stallWatchMu.Unlock()
+	if stop == nil {
+		return
+	}
+	close(stop)
+	<-done
+}
+
+// observeNodeStalls runs the same observation dispatchStatus runs, and with the
+// same locking: the VM snapshot is taken under opMu, and the apid probes that
+// follow run outside it so a silent node cannot block lifecycle operations. It
+// skips the Kubernetes and storage probes, which no log line depends on.
+//
+// A failed status read is dropped silently: it repeats every interval, and a
+// daemon that logged it would fill tbxd.log with the same line forever.
+func (s *Server) observeNodeStalls() {
+	s.opMu.Lock()
+	statuses, err := s.status(nil)
+	s.opMu.Unlock()
+	if err != nil {
+		return
+	}
+	s.refreshNodeStatuses(statuses)
+}
+
 // logNodeStalls records a node crossing the stall threshold, and its later
 // recovery, in the daemon log — the surface an operator is told to check when
 // the CLI hint escalates.

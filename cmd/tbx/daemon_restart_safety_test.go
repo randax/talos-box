@@ -549,6 +549,121 @@ func TestCallRefusesToRestartWhenSavedStateIsOnDisk(t *testing.T) {
 	}
 }
 
+// writeSavedState leaves a .vzstate on disk, which is what a stale suspension
+// orphan looks like to every caller that scans for one.
+func writeSavedState(t *testing.T, clusterName string) {
+	t.Helper()
+	saved := filepath.Join(os.Getenv("HOME"), ".talosbox", "clusters", clusterName)
+	if err := os.MkdirAll(saved, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(saved, "cp1"+savedStateSuffix), []byte("state"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestSavedStateRefusalNamesTheWayOut pins the dead end a stale .vzstate used to
+// create: the scan refuses the automatic restart, so the refusal has to say what
+// was found and every way past it (#284 review round 3).
+func TestSavedStateRefusalNamesTheWayOut(t *testing.T) {
+	fake := newFakeDaemon(t, daemon.ProtocolVersion-1)
+	stubDaemonRestart(t, fake, unsupervisedDaemon)
+	writeSavedState(t, "delta")
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr, daemon: newDaemonSession()}
+
+	err := command.call("status", struct{}{}, nil)
+	if err == nil {
+		t.Fatal("saved memory on disk must not be discarded by an automatic restart")
+	}
+	for _, want := range []string{
+		"delta",
+		"tbx cluster resume delta",
+		"tbx cluster destroy",
+		"tbx system restart --force",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q, want %q", err, want)
+		}
+	}
+}
+
+func TestSystemRestartRefusalNamesTheWayOutOfSavedState(t *testing.T) {
+	fake := newFakeDaemon(t, daemon.ProtocolVersion)
+	stubDaemonRestart(t, fake, unsupervisedDaemon)
+	writeSavedState(t, "delta")
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr}
+
+	err := command.run([]string{"system", "restart"})
+	if err == nil {
+		t.Fatal("an unforced restart must not discard saved memory")
+	}
+	for _, want := range []string{"delta", "tbx cluster resume delta", "tbx system restart --force"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q, want %q", err, want)
+		}
+	}
+}
+
+// TestSystemRestartForceProceedsPastSavedStateOnDisk pins the escape the
+// refusal promises: --force must actually get past a disk-detected suspension,
+// and must say what that cost.
+func TestSystemRestartForceProceedsPastSavedStateOnDisk(t *testing.T) {
+	fake := newFakeDaemon(t, daemon.ProtocolVersion)
+	terminated := stubDaemonRestart(t, fake, unsupervisedDaemon)
+	writeSavedState(t, "delta")
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr}
+
+	if err := command.run([]string{"system", "restart", "--force"}); err != nil {
+		t.Fatalf("forced restart = %v, want it to proceed past saved state on disk", err)
+	}
+	if *terminated != 1 {
+		t.Fatalf("terminate calls = %d, want 1", *terminated)
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "delta") || !strings.Contains(got, "lose their saved memory") {
+		t.Fatalf("stdout = %q, want the discarded saved memory reported", got)
+	}
+}
+
+// TestGateOnInferredSupervisionNamesTheForcedRestart pins that the gate and the
+// restart cannot diverge: `tbx system restart --force` yields on inferred
+// supervision, so the gate must name it — the supervisor's own command may not
+// exist when the unit file is an orphan.
+func TestGateOnInferredSupervisionNamesTheForcedRestart(t *testing.T) {
+	fake := newFakeDaemon(t, daemon.ProtocolVersion-1)
+	reason := "tbxd may be managed by /usr/lib/systemd/user/tbxd.service"
+	terminated := stubDaemonRestart(t, fake, func() (supervision, string) {
+		return supervisionInferred, reason
+	})
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr, daemon: newDaemonSession()}
+
+	err := command.call("status", struct{}{}, nil)
+	if err == nil {
+		t.Fatal("a stale daemon under an inferred supervisor must fail the gated verb")
+	}
+	for _, want := range []string{"tbx system restart --force", supervisorRestartCommand(), reason} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q, want %q", err, want)
+		}
+	}
+	if *terminated != 0 {
+		t.Fatal("a possibly supervised daemon must not be terminated behind a read-only verb")
+	}
+
+	// the same refusal text both callers build, so they cannot drift apart
+	if !strings.Contains(err.Error(), supervisionRefusal(supervisionInferred, reason)) {
+		t.Fatalf("error = %q, want the shared supervision refusal %q", err, supervisionRefusal(supervisionInferred, reason))
+	}
+	restartErr := cli{out: &stdout, err: &stderr}.run([]string{"system", "restart"})
+	if restartErr == nil || !strings.Contains(restartErr.Error(), supervisionRefusal(supervisionInferred, reason)) {
+		t.Fatalf("restart error = %v, want the same shared refusal", restartErr)
+	}
+}
+
 // TestBusyHandshakeRetriesOnceAndWarnsBeforeSkipping pins the busy-skip's cost:
 // the gate tries again with a longer deadline, and never skips silently.
 func TestBusyHandshakeRetriesOnceAndWarnsBeforeSkipping(t *testing.T) {

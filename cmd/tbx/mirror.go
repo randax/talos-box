@@ -9,7 +9,7 @@ import (
 
 func (c cli) runMirror(args []string) error {
 	if len(args) == 0 || args[0] != "offline" || len(args) > 2 {
-		return errors.New("usage: tbx mirror offline [on|off]")
+		return errors.New(groupUsages["mirror"])
 	}
 
 	op := "mirror.offline.get"
@@ -27,7 +27,7 @@ func (c cli) runMirror(args []string) error {
 				Enabled bool `json:"enabled"`
 			}{Enabled: false}
 		default:
-			return errors.New("usage: tbx mirror offline [on|off]")
+			return errors.New(groupUsages["mirror"])
 		}
 	}
 

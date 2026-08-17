@@ -4,8 +4,12 @@ import (
 	"bytes"
 	"log"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/hypervisor"
 )
 
 func unreachableNodeStatus(name string, started time.Time) ClusterStatus {
@@ -307,6 +311,104 @@ func TestLogNodeStallsStaysSilentInsideTheBootWindow(t *testing.T) {
 	if buffer.Len() != 0 {
 		t.Fatalf("log = %q, want silence inside the boot window", buffer.String())
 	}
+}
+
+// captureLog redirects the daemon log into a buffer that is safe to read while
+// the stall watch writes to it.
+type syncBuffer struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.String()
+}
+
+// stallWatchServer builds a daemon with one saved cluster whose single node has
+// been running — and silent — for far longer than the stall threshold.
+func stallWatchServer(t *testing.T, interval time.Duration) *Server {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("qa-stall", 0, 1, 0, cluster.NodeDefaults{MemoryMiB: 2048})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	node := item.Nodes[0].Name
+	return &Server{
+		vms:               map[string]map[string]hypervisor.Machine{item.Name: {node: &fakeMachine{active: true}}},
+		vmStarts:          map[string]map[string]time.Time{item.Name: {node: time.Now().Add(-time.Hour)}},
+		nodeIPLookup:      func(string, int) string { return "192.0.2.10" },
+		nodeProbe:         func(string) ProbeResult { return ProbeResult{} },
+		stallScanInterval: interval,
+	}
+}
+
+// TestStallWatchLogsWithoutAnyStatusDispatch pins the tbxd.log half of #288: a
+// node that stalls while nobody polls status must still reach the daemon log.
+func TestStallWatchLogsWithoutAnyStatusDispatch(t *testing.T) {
+	logged := &syncBuffer{}
+	previous, flags := log.Writer(), log.Flags()
+	log.SetOutput(logged)
+	log.SetFlags(0)
+	t.Cleanup(func() { log.SetOutput(previous); log.SetFlags(flags) })
+
+	service := stallWatchServer(t, 5*time.Millisecond)
+	service.startStallWatch()
+	t.Cleanup(service.stopStallWatch)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(logged.String(), "has not answered on apid") {
+		if time.Now().After(deadline) {
+			t.Fatalf("daemon log = %q, want the stall reported without a status dispatch", logged.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// the crossing is logged once, however many times the ticker fires
+	time.Sleep(50 * time.Millisecond)
+	if got := len(capturedLogLines(logged.String())); got != 1 {
+		t.Fatalf("daemon log = %q, want exactly one stall entry", logged.String())
+	}
+}
+
+func TestShutdownStopsTheStallWatch(t *testing.T) {
+	logged := &syncBuffer{}
+	previous, flags := log.Writer(), log.Flags()
+	log.SetOutput(logged)
+	log.SetFlags(0)
+	t.Cleanup(func() { log.SetOutput(previous); log.SetFlags(flags) })
+
+	service := stallWatchServer(t, 5*time.Millisecond)
+	service.startStallWatch()
+	if err := service.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
+	// Shutdown wiped the trackers; a watch still running would re-log the stall
+	logged.mu.Lock()
+	logged.buffer.Reset()
+	logged.mu.Unlock()
+	time.Sleep(50 * time.Millisecond)
+	if got := logged.String(); got != "" {
+		t.Fatalf("daemon log = %q, want silence after Shutdown stopped the watch", got)
+	}
+}
+
+func TestStartStallWatchIsIdempotent(t *testing.T) {
+	service := stallWatchServer(t, time.Hour)
+	service.startStallWatch()
+	service.startStallWatch()
+	service.stopStallWatch()
+	service.stopStallWatch()
 }
 
 func capturedLogLines(output string) []string {

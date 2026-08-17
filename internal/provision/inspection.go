@@ -125,11 +125,15 @@ func RenderInspectionWithCNI(item cluster.Cluster, section, cni string) (string,
 // of the curated CNI's rendered charts. Everything else — the machine patch,
 // the catch-all registry mirror, the storage prerequisites, the image list —
 // is substrate, and renders for a cluster that declares no CNI at all.
+//
+// "bgp" is deliberately absent: a cluster that does not declare BGP is already
+// refused by the earlier short-circuit, and one that does necessarily declares
+// cilium, so this gate could never be what turns the section down.
 func isCNIDerivedInspectionSection(section string) bool {
 	switch section {
 	case "values", "objects", "extras", "k8s",
 		"cilium-values", "metallb-values", "metallb-extras",
-		"lb-pool", "bgp", "l2":
+		"lb-pool", "l2":
 		return true
 	default:
 		return false

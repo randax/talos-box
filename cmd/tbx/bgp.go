@@ -9,7 +9,7 @@ import (
 
 func (c cli) runBGP(args []string) error {
 	if len(args) != 2 || (args[0] != "enable" && args[0] != "disable") {
-		return errors.New("usage: tbx bgp enable|disable <cluster>")
+		return errors.New(groupUsages["bgp"])
 	}
 	var result daemon.ClusterSummary
 	if err := c.call("bgp."+args[0], map[string]string{"name": args[1]}, &result); err != nil {

@@ -30,6 +30,7 @@ func TestCreateQuietSuppressesProvisioningNarration(t *testing.T) {
 }
 
 func TestStartQuietSuppressesProvisioningNarration(t *testing.T) {
+	stubStoredClusters(t, daemon.ClusterSummary{Name: "demo"})
 	stdout := runCLIWithResponse(t,
 		`{"name":"demo","narration":["Cilium chart: ≈ helm template"]}`,
 		func(command cli) error { return command.startCluster([]string{"demo", "--quiet"}) },

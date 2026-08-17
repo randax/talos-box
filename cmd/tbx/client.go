@@ -212,10 +212,10 @@ func (c cli) handshakeDaemon(timeout time.Duration) error {
 	}
 	skew := fmt.Sprintf("tbxd protocol %d is older than tbx protocol %d", info.ProtocolVersion, daemon.ProtocolVersion)
 	if state, reason := supervisedDaemon(); state != supervisionNone {
-		// the supervisor decides which binary comes back, so the recovery
-		// command has to be the supervisor's own — not tbx system restart,
-		// which refuses a supervised daemon in turn
-		return fmt.Errorf("%s and could not be restarted (%s); run: %s", skew, reason, supervisorRestartCommand())
+		// supervisionRefusal is shared with tbx system restart, so the gate can
+		// never name a way out the restart itself refuses (or the other way
+		// round)
+		return fmt.Errorf("%s and could not be restarted: %s", skew, supervisionRefusal(state, reason))
 	}
 	// restarting tbxd stops every VM it runs, and suspended memory does not
 	// survive it — never do that behind a read-only verb's back (#290)
@@ -224,8 +224,7 @@ func (c cli) handshakeDaemon(timeout time.Duration) error {
 		return fmt.Errorf("%s and tbx could not tell whether clusters are running (%v); run: tbx system restart", skew, activityErr)
 	}
 	if !activity.empty() {
-		return fmt.Errorf("%s, and restarting tbxd stops these clusters: %s — run: tbx system restart --force",
-			skew, activity.describe())
+		return fmt.Errorf("%s, and %s", skew, restartRefusal(activity))
 	}
 	if _, _, err := replaceDaemon(socketPath, info, pid); err != nil {
 		return fmt.Errorf("%s and could not be restarted (%w); run: tbx system restart", skew, err)
@@ -314,6 +313,54 @@ func (a clusterActivity) describe() string {
 			" (suspended clusters lose their saved memory)")
 	}
 	return strings.Join(parts, "; ")
+}
+
+// suspendedRecovery names the commands that clear a suspension. It matters most
+// when the suspension is not real: a .vzstate orphaned by a crashed daemon reads
+// exactly like live saved memory, and without a named way out the disk scan
+// dead-ends every automatic restart forever (#284 review round 3).
+func (a clusterActivity) suspendedRecovery() string {
+	if len(a.suspended) == 0 {
+		return ""
+	}
+	resumes := make([]string, 0, len(a.suspended))
+	for _, name := range a.suspended {
+		resumes = append(resumes, "tbx cluster resume "+name)
+	}
+	return "clear the saved state with: " + strings.Join(resumes, ", ") +
+		" (or tbx cluster destroy <name> to discard it)"
+}
+
+// restartRefusal is the one refusal both the protocol gate and `tbx system
+// restart` print when a restart would disturb clusters: it names what was
+// found, how to clear a suspension, and the force that proceeds regardless.
+func restartRefusal(activity clusterActivity) string {
+	message := "restarting tbxd stops these clusters: " + activity.describe()
+	if recovery := activity.suspendedRecovery(); recovery != "" {
+		message += "; " + recovery
+	}
+	return message + "; re-run: tbx system restart --force to restart anyway"
+}
+
+// supervisionRefusal is the one refusal both the protocol gate and `tbx system
+// restart` print for a supervised daemon, so the two can never name different
+// ways out (#290 review round 3).
+//
+// A confirmed supervisor owns the process at any force level, so only its own
+// restart command helps. A merely inferred unit file may be an orphan whose
+// supervisor is absent — that command may then not exist at all — so the escape
+// that always works, `tbx system restart --force`, is named first, with the
+// supervisor's command as the alternative for when a supervisor really owns it.
+func supervisionRefusal(state supervision, reason string) string {
+	switch state {
+	case supervisionConfirmed:
+		return fmt.Sprintf("%s; tbx will not restart a supervised tbxd — run: %s", reason, supervisorRestartCommand())
+	case supervisionInferred:
+		return fmt.Sprintf("%s; re-run: tbx system restart --force to replace it in place, or restart it through its supervisor: %s",
+			reason, supervisorRestartCommand())
+	default:
+		return ""
+	}
 }
 
 // addSuspended merges names the daemon did not report, skipping anything

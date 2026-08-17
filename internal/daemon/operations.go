@@ -167,6 +167,9 @@ type NodeStatus struct {
 	APIDReachable bool         `json:"apidReachable"`
 	Phase         Phase        `json:"phase"`
 	Warning       string       `json:"warning,omitempty"`
+	// Warnings is the same advisory set as Warning, one entry per finding.
+	// Warning stays populated for older clients that only read it.
+	Warnings []string `json:"warnings,omitempty"`
 	// StartedAt is when the daemon launched this node's VM, when it knows:
 	// the clock a stalled boot is measured against (#288). Nil means the VM
 	// was not started by this daemon process.
@@ -919,7 +922,7 @@ func (s *Server) addNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTask
 	}
 	status := nodeStatus(node, item.SubnetIndex, s.nodeRunning(item.Name, node.Name))
 	customSchematic := s.defaultSchematic != "" && item.Schematic != "" && item.Schematic != s.defaultSchematic
-	status.Warning = joinWarnings(overcommitWarning, hostPressureWarning, subnetWarning, s.longhornCustomSchematicWarning(item, customSchematic))
+	status.setWarnings(overcommitWarning, hostPressureWarning, subnetWarning, s.longhornCustomSchematicWarning(item, customSchematic))
 	return status, s.beginNodeMutationProvisionLocked(item), nil
 }
 
@@ -1741,10 +1744,6 @@ func summary(item cluster.Cluster, running bool) ClusterSummary {
 	}
 }
 
-func joinWarnings(warnings ...string) string {
-	return strings.Join(warningList(warnings...), "; ")
-}
-
 // warningList drops empties and duplicates while keeping each warning a
 // separate item, so the CLI can render one per line instead of scanning a
 // semicolon-joined run-on (#291).
@@ -1766,4 +1765,19 @@ func warningList(warnings ...string) []string {
 func (s *ClusterSummary) setWarnings(warnings ...string) {
 	s.Warnings = warningList(warnings...)
 	s.Warning = strings.Join(s.Warnings, "; ")
+}
+
+// setWarnings mirrors ClusterSummary.setWarnings for a node verb: `node add`
+// and `node remove` collect unrelated findings (overcommit, host pressure, a
+// captured host subnet, a volume-copy loss) that must not fuse onto one line
+// (#291).
+func (n *NodeStatus) setWarnings(warnings ...string) {
+	n.Warnings = warningList(warnings...)
+	n.Warning = strings.Join(n.Warnings, "; ")
+}
+
+// addWarnings records findings the operation only learned after its status was
+// built — the out-of-lock gates — behind the ones already there.
+func (n *NodeStatus) addWarnings(warnings ...string) {
+	n.setWarnings(append(append([]string{}, n.Warnings...), warnings...)...)
 }

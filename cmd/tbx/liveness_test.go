@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/daemon"
 )
 
@@ -61,11 +62,15 @@ func TestClusterCreateQuietStatesTheDeadline(t *testing.T) {
 	}
 }
 
+// A start states the bound the daemon actually budgets it at: the stored
+// cluster declares no storage engine, so it is the CNI budget, not the outer
+// storage one (#307).
 func TestClusterStartQuietStatesTheDeadline(t *testing.T) {
+	stubStoredClusters(t, daemon.ClusterSummary{Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium}})
 	_, stderr := runSlowCLI(t, []string{`{"name":"demo"}`}, func(command cli) error {
 		return command.startCluster([]string{"demo", "--quiet"})
 	})
-	for _, wanted := range []string{"starting demo", "progress suppressed by --quiet", "still starting demo"} {
+	for _, wanted := range []string{"starting demo", "up to 10m", "progress suppressed by --quiet", "still starting demo", "deadline 10m"} {
 		if !strings.Contains(stderr, wanted) {
 			t.Fatalf("quiet start stderr missing %q:\n%s", wanted, stderr)
 		}

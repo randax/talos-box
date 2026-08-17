@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/config"
@@ -84,8 +86,8 @@ func (c cli) run(args []string) error {
 }
 
 // groupUsages is the usage line every multi-verb command prints for both its
-// bare and its `--help` form. The verbs a group accepts are named in one place
-// so the two cannot drift apart.
+// bare and its `--help` form. Every group reads its line from here — no verb
+// list is spelled out twice — so the two forms cannot drift apart.
 var groupUsages = map[string]string{
 	"cluster":  "usage: tbx cluster create|start|stop|suspend|resume|destroy|list",
 	"node":     "usage: tbx node add|remove <cluster> [node]",
@@ -181,6 +183,59 @@ func parseClusterStartOptions(args []string, output io.Writer) (string, bool, bo
 	return positionals[0], *force, *quiet, nil
 }
 
+// storedClustersQuery reports what the daemon has on disk. It is a var so
+// tests can answer without a daemon.
+var storedClustersQuery = storedClusters
+
+// storedClusters asks the running daemon for the stored clusters. The exchange
+// is deadlined: cluster.list is served under the daemon's operation lock, and
+// this is only a courtesy lookup ahead of the real call.
+func storedClusters() ([]daemon.ClusterSummary, error) {
+	socketPath, err := daemon.SocketPath()
+	if err != nil {
+		return nil, err
+	}
+	response, err := exchangeWithin(socketPath, "cluster.list", struct{}{}, daemonHandshakeTimeout)
+	if err != nil {
+		return nil, err
+	}
+	if !response.OK {
+		if response.Error == "" {
+			return nil, errors.New("cluster.list failed")
+		}
+		return nil, errors.New(response.Error)
+	}
+	var clusters []daemon.ClusterSummary
+	if len(response.Data) > 0 {
+		if err := json.Unmarshal(response.Data, &clusters); err != nil {
+			return nil, err
+		}
+	}
+	return clusters, nil
+}
+
+// startProvisionDeadline reports the budget the daemon will hold this start to:
+// a declared storage engine buys the larger one, exactly as the daemon's own
+// provisionTimeout decides it. The CLI cannot read the stored cluster directly,
+// so it asks the daemon what it has.
+//
+// Any failure — no daemon yet, a busy one, an unknown cluster — falls back to
+// the storage bound. Overstating the budget only makes the heartbeat
+// pessimistic; understating it would advertise a deadline the daemon does not
+// honor, which is the drift the heartbeat exists to avoid (#307).
+func startProvisionDeadline(name string) time.Duration {
+	clusters, err := storedClustersQuery()
+	if err != nil {
+		return storageProvisionDeadline
+	}
+	for _, item := range clusters {
+		if strings.EqualFold(item.Name, name) {
+			return provisionDeadline(item.CSI != "")
+		}
+	}
+	return storageProvisionDeadline
+}
+
 func (c cli) startCluster(args []string) error {
 	name, force, quiet, err := parseClusterStartOptions(args, c.err)
 	if err != nil {
@@ -192,9 +247,9 @@ func (c cli) startCluster(args []string) error {
 	}{Name: name, Force: force}
 	var result daemon.ClusterSummary
 	// A start reconciles the cluster's declared CNI/CSI on the same blocking
-	// call as create, and the CLI cannot see which the stored cluster declares —
-	// so it states the outer bound.
-	signal := liveness{verb: "starting " + name, deadline: storageProvisionDeadline, quiet: quiet}
+	// call as create, so the stated bound must be the one the daemon budgets
+	// this request at (#307).
+	signal := liveness{verb: "starting " + name, deadline: startProvisionDeadline(name), quiet: quiet}
 	if err := c.callWithLiveness(signal, "cluster.start", request, &result); err != nil {
 		return err
 	}
@@ -416,7 +471,7 @@ func (c cli) runNode(args []string) error {
 		if _, err := fmt.Fprintf(c.out, "added node %s to cluster %s\n", result.Name, positionals[0]); err != nil {
 			return err
 		}
-		return printWarning(c.err, result.Warning)
+		return printWarnings(c.err, result.Warnings, result.Warning)
 	case "remove":
 		flags := flag.NewFlagSet("node remove", flag.ContinueOnError)
 		flags.SetOutput(c.err)
@@ -439,7 +494,7 @@ func (c cli) runNode(args []string) error {
 		if _, err := fmt.Fprintf(c.out, "removed node %s from cluster %s\n", positionals[1], positionals[0]); err != nil {
 			return err
 		}
-		return printWarning(c.err, result.Warning)
+		return printWarnings(c.err, result.Warnings, result.Warning)
 	default:
 		return fmt.Errorf("unknown node command %q", args[0])
 	}

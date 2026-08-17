@@ -3,6 +3,7 @@ package daemon
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
 )
@@ -366,5 +367,23 @@ func TestCredentialExportsQuoteClusterName(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("credentialExports() missing %q: %s", want, got)
 		}
+	}
+}
+
+// The calm unreachable hint states the boot budget in prose; formatting it
+// from the constant keeps the promise and the clock from desyncing.
+func TestFormatBootWindowRendersTheConstant(t *testing.T) {
+	cases := map[time.Duration]string{
+		time.Minute:      "1 minute",
+		2 * time.Minute:  "2 minutes",
+		90 * time.Second: "90 seconds",
+	}
+	for window, want := range cases {
+		if got := formatBootWindow(window); got != want {
+			t.Fatalf("formatBootWindow(%v) = %q, want %q", window, got, want)
+		}
+	}
+	if got := formatBootWindow(nodeBootWindow); got != "1 minute" {
+		t.Fatalf("formatBootWindow(nodeBootWindow) = %q, want the documented promise", got)
 	}
 }
