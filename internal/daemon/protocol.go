@@ -28,9 +28,10 @@ const (
 // Version 7 returns snapshot.create's snapshots wrapped in the same
 // warning-carrying status, so the restart's host-subnet finding reaches the
 // operator instead of only the daemon log.
-// Version 8 serves node.start and node.stop, and answers node.remove once the
+// Version 8 serves node.start and node.stop, answers node.remove once the
 // node is off the substrate instead of holding the request for the follow-up
-// reconcile.
+// reconcile, and adds the additive suspended (cluster status) and incomplete
+// (cache image entry) fields.
 const ProtocolVersion = 8
 
 // Request is one newline-delimited daemon request.
