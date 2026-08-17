@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"strings"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -63,8 +64,8 @@ func (c cli) run(args []string) error {
 		return c.runSystem(args[1:])
 	case "doctor":
 		return c.runDoctor(args[1:])
-	case "version":
-		_, err := fmt.Fprintln(c.out, version.Version)
+	case "version", "--version", "-v":
+		_, err := fmt.Fprintf(c.out, "tbx %s (%s/%s, daemon protocol %d)\n", version.Version, runtime.GOOS, runtime.GOARCH, daemon.ProtocolVersion)
 		return err
 	case "help", "-h", "--help":
 		c.printHelp(c.out)
@@ -107,6 +108,9 @@ func (c cli) runCluster(args []string) error {
 		}
 		if len(positionals) != 0 {
 			return errors.New("usage: tbx cluster list [-o json]")
+		}
+		if err := validateOutputFormat(*outputFormat); err != nil {
+			return err
 		}
 		var result []daemon.ClusterSummary
 		if err := c.call("cluster.list", struct{}{}, &result); err != nil {
@@ -408,6 +412,9 @@ func (c cli) runStatus(args []string) error {
 	if len(positionals) > 1 {
 		return errors.New("usage: tbx status [cluster] [--quiet] [-o json]")
 	}
+	if err := validateOutputFormat(*outputFormat); err != nil {
+		return err
+	}
 	name := ""
 	if len(positionals) == 1 {
 		name = positionals[0]
@@ -461,7 +468,11 @@ func (c cli) runCache(args []string) error {
 			if err := printPrunedImages(c.out, result.Images); err != nil {
 				return err
 			}
-			_, err = fmt.Fprintf(c.out, "pruned disk cache: %d image(s), %d bytes; mirror cache untouched\n", result.ImageCount, result.ImageBytes)
+			kept := ""
+			if result.KeptCount > 0 {
+				kept = fmt.Sprintf(" (kept %d image(s) in use, pinned, or default)", result.KeptCount)
+			}
+			_, err = fmt.Fprintf(c.out, "pruned disk cache: %d image(s), %d bytes%s; mirror cache untouched\n", result.ImageCount, result.ImageBytes, kept)
 		case daemon.CachePruneScopeMirror:
 			_, err = fmt.Fprintf(c.out, "pruned mirror cache: %d blob(s) %d bytes, %d manifest(s) %d bytes; disk cache untouched\n",
 				result.Mirror.BlobCount, result.Mirror.BlobBytes, result.Mirror.ManifestCount, result.Mirror.ManifestBytes)
@@ -536,7 +547,7 @@ Commands:
   cache pull|prune|warm|list
   system install|uninstall
   doctor
-  version
+  version (also --version, -v)
 `
 	_, _ = fmt.Fprint(output, help)
 }

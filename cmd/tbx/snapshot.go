@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -102,23 +103,43 @@ func (c cli) snapshotDelete(args []string) error {
 }
 
 func (c cli) snapshotList(args []string) error {
-	if len(args) != 1 {
-		return errors.New("usage: tbx snapshot list <cluster>")
-	}
-	var snaps []cluster.SnapshotInfo
-	if err := c.call("snapshot.list", map[string]string{"cluster": args[0]}, &snaps); err != nil {
+	flags := flag.NewFlagSet("snapshot list", flag.ContinueOnError)
+	flags.SetOutput(c.err)
+	outputFormat := flags.String("o", "table", "output format: table|json")
+	positionals, err := parseInterspersed(flags, args)
+	if err != nil {
 		return err
 	}
+	if len(positionals) != 1 {
+		return errors.New("usage: tbx snapshot list <cluster> [-o json]")
+	}
+	if err := validateOutputFormat(*outputFormat); err != nil {
+		return err
+	}
+	var snaps []cluster.SnapshotInfo
+	if err := c.call("snapshot.list", map[string]string{"cluster": positionals[0]}, &snaps); err != nil {
+		return err
+	}
+	if *outputFormat == "json" {
+		if snaps == nil {
+			snaps = []cluster.SnapshotInfo{}
+		}
+		return encodeJSON(c.out, snaps)
+	}
 	if len(snaps) == 0 {
-		_, err := fmt.Fprintf(c.out, "no snapshots for %s\n", args[0])
+		_, err := fmt.Fprintf(c.out, "no snapshots for %s\n", positionals[0])
+		return err
+	}
+	table := tabwriter.NewWriter(c.out, 0, 4, 2, ' ', 0)
+	if _, err := fmt.Fprintln(table, "NAME\tCREATED"); err != nil {
 		return err
 	}
 	for _, snap := range snaps {
-		if _, err := fmt.Fprintf(c.out, "%s\t%s\n", snap.Name, snap.Created.Format("2006-01-02 15:04")); err != nil {
+		if _, err := fmt.Fprintf(table, "%s\t%s\n", snap.Name, snap.Created.Format("2006-01-02 15:04")); err != nil {
 			return err
 		}
 	}
-	return nil
+	return table.Flush()
 }
 
 // confirmIfRunning prompts before an operation that will stop a running

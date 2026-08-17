@@ -183,3 +183,12 @@ func printCacheImageList(output io.Writer, header string, images []daemon.CacheI
 	}
 	return nil
 }
+
+// validateOutputFormat rejects -o values none of the table/json printers
+// understand, so a typo errors instead of silently printing the table.
+func validateOutputFormat(format string) error {
+	if format != "table" && format != "json" {
+		return fmt.Errorf("unknown output format %q: want table or json", format)
+	}
+	return nil
+}

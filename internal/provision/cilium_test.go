@@ -2,10 +2,17 @@ package provision
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/pem"
 	"fmt"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -24,6 +31,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/fake"
 	kubernetesfake "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 )
 
 type recordingReconciler struct {
@@ -716,4 +724,297 @@ func ciliumTestResource(t *testing.T, client *fake.FakeDynamicClient, mapper met
 		return client.Resource(mapping.Resource).Namespace(object.GetNamespace())
 	}
 	return client.Resource(mapping.Resource)
+}
+
+func establishedCRD(name string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apiextensions.k8s.io/v1",
+		"kind":       "CustomResourceDefinition",
+		"metadata":   map[string]any{"name": name},
+		"status": map[string]any{
+			"conditions": []any{map[string]any{"type": "Established", "status": "True"}},
+		},
+	}}
+}
+
+func TestWaitForCiliumCRDsMatchesWhatEachIntentInstalls(t *testing.T) {
+	// The installed CRD sets are hardcoded per intent — deliberately not
+	// derived from the production predicate — so a wrong wait set fails here
+	// instead of mirroring the bug.
+	for _, tt := range []struct {
+		name      string
+		lb, bgp   bool
+		installed []string
+	}{
+		{
+			name: "default L2 load balancer", lb: true,
+			installed: []string{"ciliumloadbalancerippools.cilium.io", "ciliuml2announcementpolicies.cilium.io"},
+		},
+		{
+			name: "bgp load balancer installs no l2 CRD", lb: true, bgp: true,
+			installed: []string{
+				"ciliumloadbalancerippools.cilium.io",
+				"ciliumbgpclusterconfigs.cilium.io",
+				"ciliumbgppeerconfigs.cilium.io",
+				"ciliumbgpadvertisements.cilium.io",
+			},
+		},
+		{
+			name: "no load balancer installs no l2 CRD", lb: false,
+			installed: []string{"ciliumloadbalancerippools.cilium.io"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			objects := []runtime.Object{}
+			for _, name := range tt.installed {
+				objects = append(objects, establishedCRD(name))
+			}
+			client := fake.NewSimpleDynamicClient(runtime.NewScheme(), objects...)
+			item := cluster.Cluster{ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: tt.lb, BGP: tt.bgp}}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := waitForCiliumCRDs(ctx, client, time.Millisecond, item); err != nil {
+				t.Fatalf("CRD wait demanded a CRD this intent's chart never installs: %v", err)
+			}
+		})
+	}
+}
+
+func TestWaitForCiliumCRDsStillRequiresTheEnabledSet(t *testing.T) {
+	// Only LB-IPAM present: a BGP intent must keep waiting for its trio.
+	client := fake.NewSimpleDynamicClient(runtime.NewScheme(), establishedCRD("ciliumloadbalancerippools.cilium.io"))
+	item := cluster.Cluster{ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true, BGP: true}}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := waitForCiliumCRDs(ctx, client, time.Millisecond, item); err == nil {
+		t.Fatal("BGP-enabled CRD wait passed without the BGP CRDs")
+	}
+}
+
+func TestWaitForAPIServerRetriesRefusedDialsUntilServerListens(t *testing.T) {
+	reserved, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := reserved.Addr().String()
+	_ = reserved.Close() // the port now refuses connections — client-go does not retry ECONNREFUSED itself
+	const listenAfter = 300 * time.Millisecond
+	served := make(chan struct{})
+	go func() {
+		time.Sleep(listenAfter)
+		var listener net.Listener
+		var err error
+		// Another process can steal the released port; retry the bind briefly
+		// instead of silently leaving the wait to hit its 10 s deadline.
+		for attempt := 0; attempt < 40; attempt++ {
+			listener, err = net.Listen("tcp", address)
+			if err == nil {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		if err != nil {
+			return
+		}
+		server := &http.Server{Handler: http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			_, _ = writer.Write([]byte(`{"major":"1","minor":"34"}`))
+		})}
+		defer func() { _ = server.Close() }()
+		close(served)
+		_ = server.Serve(listener)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := waitForAPIServer(ctx, &rest.Config{Host: "http://" + address}, 50*time.Millisecond); err != nil {
+		t.Fatalf("API server wait did not survive refused dials: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < listenAfter {
+		t.Fatalf("API server wait returned in %v, before the server could have been listening", elapsed)
+	}
+	<-served
+}
+
+func TestWaitForAPIServerFailsFastOnForbidden(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusForbidden)
+		_, _ = writer.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","code":403}`))
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	err := waitForAPIServer(ctx, &rest.Config{Host: server.URL}, 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("API server wait passed against a forbidden endpoint")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("forbidden endpoint burned %v of the deadline, want fail-fast", elapsed)
+	}
+	if !strings.Contains(err.Error(), server.URL) {
+		t.Fatalf("fail-fast error does not name the endpoint: %v", err)
+	}
+}
+
+func TestWaitForAPIServerNamesTheEndpointOnDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	err := waitForAPIServer(ctx, &rest.Config{Host: "http://127.0.0.1:1"}, 10*time.Millisecond)
+	if err == nil {
+		t.Fatal("API server wait passed against a closed port")
+	}
+	if !strings.Contains(err.Error(), "127.0.0.1:1") {
+		t.Fatalf("API server wait error does not name the endpoint: %v", err)
+	}
+}
+
+func TestDeleteStaleCiliumAnnouncementsToleratesAbsentBGPCRDs(t *testing.T) {
+	// On an L2-only cluster the BGP CRDs are never installed, so the stale-BGP
+	// candidates cannot exist: an unmapped kind is "nothing to delete", not an
+	// error.
+	item := cluster.Cluster{ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true}}
+	client := fake.NewSimpleDynamicClient(runtime.NewScheme())
+	mapper := meta.NewDefaultRESTMapper(nil)
+	if err := deleteStaleCiliumAnnouncements(context.Background(), client, mapper, item); err != nil {
+		t.Fatalf("stale BGP cleanup with absent CRDs = %v, want nil", err)
+	}
+}
+
+func TestWaitForAPIServerFailsFastOnUntrustedCertificate(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = writer.Write([]byte(`{"major":"1","minor":"34"}`))
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	err := waitForAPIServer(ctx, &rest.Config{Host: server.URL}, 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("API server wait trusted a certificate from an unknown authority")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("untrusted CA burned %v of the deadline, want fail-fast", elapsed)
+	}
+}
+
+func expiredTestCertificate(t *testing.T) (tls.Certificate, []byte) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := x509.Certificate{
+		SerialNumber:          big.NewInt(2),
+		Subject:               pkix.Name{CommonName: "talos-box expired test"},
+		NotBefore:             time.Now().Add(-2 * time.Hour),
+		NotAfter:              time.Now().Add(-time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificatePEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate, err := tls.X509KeyPair(certificatePEM, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return certificate, certificatePEM
+}
+
+func TestWaitForAPIServerKeepsRetryingAnExpiredCertificate(t *testing.T) {
+	// Guest clock skew right after boot presents as expired/not-yet-valid:
+	// the condition heals by waiting, so it must retry to the deadline
+	// instead of failing terminally like an unknown authority.
+	certificate, certificatePEM := expiredTestCertificate(t)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = writer.Write([]byte(`{"major":"1","minor":"34"}`))
+	}))
+	server.TLS = &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12}
+	server.StartTLS()
+	defer server.Close()
+	const deadline = 500 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), deadline)
+	defer cancel()
+	start := time.Now()
+	config := &rest.Config{Host: server.URL, TLSClientConfig: rest.TLSClientConfig{CAData: certificatePEM}}
+	err := waitForAPIServer(ctx, config, 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("API server wait accepted an expired certificate")
+	}
+	if elapsed := time.Since(start); elapsed < deadline {
+		t.Fatalf("expired certificate failed terminally after %v, want retries to the %v deadline", elapsed, deadline)
+	}
+}
+
+func TestWaitForAPIServerFailsFastOnIncompatibleCertificateUsage(t *testing.T) {
+	// A serving cert whose EKU forbids server auth is fixed at issuance and
+	// cannot heal by waiting — it must be terminal like an unknown authority.
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caTemplate := x509.Certificate{
+		SerialNumber:          big.NewInt(3),
+		Subject:               pkix.Name{CommonName: "talos-box test CA"},
+		NotBefore:             time.Now().Add(-time.Minute),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, &caTemplate, &caTemplate, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafTemplate := x509.Certificate{
+		SerialNumber: big.NewInt(4),
+		Subject:      pkix.Name{CommonName: "talos-box client-only leaf"},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, &leafTemplate, caCert, &leafKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = writer.Write([]byte(`{"major":"1","minor":"34"}`))
+	}))
+	server.TLS = &tls.Config{
+		Certificates: []tls.Certificate{{Certificate: [][]byte{leafDER, caDER}, PrivateKey: leafKey}},
+		MinVersion:   tls.VersionTLS12,
+	}
+	server.StartTLS()
+	defer server.Close()
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	config := &rest.Config{Host: server.URL, TLSClientConfig: rest.TLSClientConfig{CAData: caPEM}}
+	err = waitForAPIServer(ctx, config, 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("API server wait accepted a client-only serving certificate")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("incompatible-usage certificate burned %v of the deadline, want fail-fast", elapsed)
+	}
 }

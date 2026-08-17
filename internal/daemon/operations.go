@@ -314,6 +314,9 @@ type CachePruneResult struct {
 	Scope      CachePruneScope `json:"scope"`
 	ImageCount int             `json:"imageCount"`
 	ImageBytes int64           `json:"imageBytes"`
+	// KeptCount is how many combinations the reference-aware scope retained
+	// (in use, pinned, or the default), so a zero-prune is explainable.
+	KeptCount int `json:"keptCount,omitempty"`
 	// Images is the removal plan the reference-aware scope executed, so the
 	// client can name every combination it lost with its size.
 	Images []CacheImageEntry `json:"images,omitempty"`
@@ -1341,6 +1344,7 @@ func (s *Server) pruneCache(raw json.RawMessage) (CachePruneResult, error) {
 			Scope:      args.Scope,
 			ImageCount: result.ImageCount,
 			ImageBytes: result.ImageBytes,
+			KeptCount:  result.KeptImages,
 			Images:     prunedImageEntries(result.Images),
 			Mirror:     MirrorCacheTotals(result.Mirror),
 		}, nil

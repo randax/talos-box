@@ -471,3 +471,19 @@ func TestProvisioningNarrationQuotesClusterName(t *testing.T) {
 		}
 	}
 }
+
+func TestCiliumValuesRefusalNamesTheRunnableCommand(t *testing.T) {
+	item := cluster.Cluster{Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, LB: true}}
+	_, err := RenderInspection(item, "cilium-values")
+	if err == nil || !strings.Contains(err.Error(), "tbx manifests demo values") {
+		t.Fatalf("cilium-values refusal = %v, want the runnable redirect", err)
+	}
+
+	// A name with shell metacharacters must arrive quoted, so the printed
+	// command stays copy-pasteable and inert.
+	item.Name = "de mo"
+	_, err = RenderInspection(item, "cilium-values")
+	if err == nil || !strings.Contains(err.Error(), "tbx manifests 'de mo' values") {
+		t.Fatalf("cilium-values refusal with unsafe name = %v, want the quoted redirect", err)
+	}
+}

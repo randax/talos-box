@@ -70,7 +70,7 @@ func ParseProvisioningIntent(cni, csi string, lb, bgp, hubble *bool) (Provisioni
 		case lb != nil:
 			return ProvisioningIntent{}, fmt.Errorf("lb requires cni: cilium or flannel")
 		case bgp != nil:
-			return ProvisioningIntent{}, fmt.Errorf("bgp requires cni: cilium")
+			return ProvisioningIntent{}, fmt.Errorf("bgp requires cni: cilium and lb: true")
 		case hubble != nil:
 			return ProvisioningIntent{}, fmt.Errorf("hubble requires cni: cilium")
 		default:
@@ -102,6 +102,8 @@ func ParseProvisioningIntent(cni, csi string, lb, bgp, hubble *bool) (Provisioni
 		return ProvisioningIntent{}, fmt.Errorf("bgp requires lb: true")
 	}
 	if intent.BGP && intent.CNI != CNICilium {
+		// lb is already true here (checked above), so naming it would tell
+		// the user to set something they already have.
 		return ProvisioningIntent{}, fmt.Errorf("bgp requires cni: cilium")
 	}
 	if intent.Hubble && intent.CNI != CNICilium {

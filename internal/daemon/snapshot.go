@@ -128,6 +128,8 @@ func (s *Server) snapshotList(raw json.RawMessage) ([]cluster.SnapshotInfo, erro
 	if err := decodeArgs(raw, &args); err != nil {
 		return nil, err
 	}
+	// ListSnapshots never returns nil on success, so an empty result
+	// marshals as [] like cluster.list and status do.
 	return cluster.ListSnapshots(args.Cluster)
 }
 

@@ -259,3 +259,16 @@ func TestPrintStatusQuietSuppressesSchematicLines(t *testing.T) {
 		t.Fatalf("quiet status lost the TALOS column:\n%s", rendered)
 	}
 }
+
+func TestClusterListAndStatusRejectUnknownOutputFormat(t *testing.T) {
+	for _, args := range [][]string{
+		{"cluster", "list", "-o", "yaml"},
+		{"status", "-o", "yaml"},
+	} {
+		c := cli{out: &bytes.Buffer{}, err: &bytes.Buffer{}}
+		err := c.run(args)
+		if err == nil || !strings.Contains(err.Error(), `unknown output format "yaml"`) {
+			t.Errorf("tbx %s error = %v, want the unknown-format refusal", strings.Join(args, " "), err)
+		}
+	}
+}

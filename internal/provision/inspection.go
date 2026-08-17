@@ -50,7 +50,7 @@ func RenderInspectionWithCNI(item cluster.Cluster, section, cni string) (string,
 		section = "extras"
 	case "cilium-values":
 		if item.CNI != cluster.CNICilium {
-			return "", fmt.Errorf("cluster %q uses flannel; use values", item.Name)
+			return "", fmt.Errorf("cluster %q uses flannel; run: tbx manifests %s values", item.Name, shellquote.Quote(item.Name))
 		}
 		section = "values"
 	case "metallb-values":
