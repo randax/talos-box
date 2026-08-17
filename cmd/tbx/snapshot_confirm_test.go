@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -23,7 +24,7 @@ func TestConfirmYesSkips(t *testing.T) {
 
 func TestSnapshotCreateConfirmationSaysTheClusterIsStopped(t *testing.T) {
 	requests, command := newDestroyTestCLI(t, []daemon.Response{
-		{OK: true, Data: json.RawMessage(`{"protocolVersion":7}`)},
+		{OK: true, Data: json.RawMessage(fmt.Sprintf(`{"protocolVersion":%d}`, daemon.ProtocolVersion))},
 		{OK: true, Data: json.RawMessage(`[{"name":"demo","running":true}]`)},
 		{OK: true, Data: json.RawMessage(`{"snapshots":[{"name":"baseline"}]}`)},
 	})
@@ -52,7 +53,7 @@ func TestSnapshotCreateConfirmationSaysTheClusterIsStopped(t *testing.T) {
 
 func TestSnapshotCreateAbortsWhenTheStopIsDeclined(t *testing.T) {
 	requests, command := newDestroyTestCLI(t, []daemon.Response{
-		{OK: true, Data: json.RawMessage(`{"protocolVersion":7}`)},
+		{OK: true, Data: json.RawMessage(fmt.Sprintf(`{"protocolVersion":%d}`, daemon.ProtocolVersion))},
 		{OK: true, Data: json.RawMessage(`[{"name":"demo","running":true}]`)},
 	})
 	command.in = strings.NewReader("n\n")

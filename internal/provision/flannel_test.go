@@ -42,6 +42,7 @@ type fakeClient struct {
 	kubeData       []byte
 	kubeErrs       []error
 	bootErr        error
+	bootErrs       []error
 	readyErrs      []error
 	expected       [][]string
 	readyHook      func()
@@ -65,38 +66,29 @@ type endpointCall struct {
 	endpoint string
 }
 
-func (f *fakeClient) ReconcileControlPlaneEndpoint(_ context.Context, node, endpoint string) (bool, error) {
-	f.calls = append(f.calls, "endpoint")
-	f.endpoints = append(f.endpoints, endpointCall{node: node, endpoint: endpoint})
-	var changed bool
+func (f *fakeClient) ReconcileMachineConfig(_ context.Context, node string, target ConfigTarget) (ConfigChanges, error) {
+	f.calls = append(f.calls, "config")
+	f.endpoints = append(f.endpoints, endpointCall{node: node, endpoint: target.Endpoint})
+	if target.ControlPlaneScheduling {
+		f.scheduling = append(f.scheduling, schedulingCall{node: node, workerless: target.Workerless})
+	}
+	var changes ConfigChanges
 	if len(f.endpointChanged) > 0 {
-		changed, f.endpointChanged = f.endpointChanged[0], f.endpointChanged[1:]
+		changes.Endpoint, f.endpointChanged = f.endpointChanged[0], f.endpointChanged[1:]
 	}
-	if len(f.endpointErrs) > 0 {
-		var err error
-		err, f.endpointErrs = f.endpointErrs[0], f.endpointErrs[1:]
-		if err != nil {
-			return false, err
+	if target.ControlPlaneScheduling && len(f.schedulingChanged) > 0 {
+		changes.Scheduling, f.schedulingChanged = f.schedulingChanged[0], f.schedulingChanged[1:]
+	}
+	for _, queue := range []*[]error{&f.endpointErrs, &f.schedulingErrs} {
+		if len(*queue) > 0 {
+			var err error
+			err, *queue = (*queue)[0], (*queue)[1:]
+			if err != nil {
+				return ConfigChanges{}, err
+			}
 		}
 	}
-	return changed, nil
-}
-
-func (f *fakeClient) ReconcileControlPlaneScheduling(_ context.Context, node string, workerless bool) (bool, error) {
-	f.calls = append(f.calls, "scheduling")
-	f.scheduling = append(f.scheduling, schedulingCall{node: node, workerless: workerless})
-	var changed bool
-	if len(f.schedulingChanged) > 0 {
-		changed, f.schedulingChanged = f.schedulingChanged[0], f.schedulingChanged[1:]
-	}
-	if len(f.schedulingErrs) > 0 {
-		var err error
-		err, f.schedulingErrs = f.schedulingErrs[0], f.schedulingErrs[1:]
-		if err != nil {
-			return false, err
-		}
-	}
-	return changed, nil
+	return changes, nil
 }
 
 type fakeLoadBalancer struct {
@@ -158,6 +150,11 @@ func (f *fakeClient) Bootstrap(_ context.Context, node string) error {
 	f.calls = append(f.calls, "bootstrap")
 	f.bootstrap++
 	f.bootstrapNodes = append(f.bootstrapNodes, node)
+	if len(f.bootErrs) > 0 {
+		err := f.bootErrs[0]
+		f.bootErrs = f.bootErrs[1:]
+		return err
+	}
 	return f.bootErr
 }
 

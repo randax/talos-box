@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -77,7 +78,7 @@ func TestSnapshotRestoreDefaultsToUnforcedAndStaysQuietWithoutWarning(t *testing
 // advisory findings a start does, and the operator must see them.
 func TestSnapshotCreatePrintsTheDaemonWarning(t *testing.T) {
 	_, command := newDestroyTestCLI(t, []daemon.Response{
-		{OK: true, Data: json.RawMessage(`{"protocolVersion":7}`)},
+		{OK: true, Data: json.RawMessage(fmt.Sprintf(`{"protocolVersion":%d}`, daemon.ProtocolVersion))},
 		{OK: true, Data: json.RawMessage(`{"snapshots":[{"name":"baseline"}],"warning":"subnet 172.30.0.0/24 conflicts with interface docker0 address 172.30.0.1/24"}`)},
 	})
 
@@ -95,12 +96,12 @@ func TestSnapshotCreatePrintsTheDaemonWarning(t *testing.T) {
 
 func TestSnapshotCreateRefusesOldDaemonProtocol(t *testing.T) {
 	_, command := newDestroyTestCLI(t, []daemon.Response{
-		{OK: true, Data: json.RawMessage(`{"protocolVersion":6}`)},
+		{OK: true, Data: json.RawMessage(fmt.Sprintf(`{"protocolVersion":%d}`, snapshotCreateWarningProtocolVersion-1))},
 	})
 
 	err := command.snapshotCreate([]string{"demo", "baseline", "--yes"})
 	if err == nil {
-		t.Fatal("snapshot create against a protocol-6 daemon succeeded, want handshake refusal")
+		t.Fatalf("snapshot create against a protocol-%d daemon succeeded, want handshake refusal", snapshotCreateWarningProtocolVersion-1)
 	}
 	if !strings.Contains(err.Error(), "restart or upgrade tbxd") {
 		t.Fatalf("handshake error = %q, want upgrade guidance", err)

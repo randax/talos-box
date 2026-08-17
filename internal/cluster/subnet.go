@@ -87,7 +87,11 @@ func LowestUsableSubnetIndex(clusters []Cluster, sources SubnetSources) (int, st
 	return 0, "", errors.New("all cluster subnets overlap existing host interfaces or routes")
 }
 
-// CheckSubnetIndex verifies that an existing cluster's subnet can be attached.
+// CheckSubnetIndex verifies that a subnet is free to be claimed, exempting
+// only a tbx-owned bridge recognized by its exact name. It is the strict
+// create-time guard, used by the Linux helper's preflights before it builds or
+// re-attaches a bridge; a subnet a cluster already owns is inspected with
+// AttachedSubnetWarning instead, which never fails.
 func CheckSubnetIndex(index int, sources SubnetSources) (string, error) {
 	if index < 0 || index > MaxSubnetIndex {
 		return "", fmt.Errorf("subnet index must be between 0 and %d", MaxSubnetIndex)
@@ -296,7 +300,10 @@ func isOwnBridgeAddress(ip net.IP, network *net.IPNet, index int) bool {
 // not match arbitrary interfaces, so a foreign gateway squatter is still
 // reported rather than silently taken for the cluster's own bridge.
 func isHostBridgeName(name string, index int) bool {
-	return isTalosBoxBridgeName(name, index) || isVMNetBridgeName(name)
+	// only the Linux name is checked against the index here: the macOS arm of
+	// isTalosBoxBridgeName (bridge<100+index>) is a strict subset of any
+	// vmnet-numbered bridge, which this path accepts under any number.
+	return name == LinuxBridgeName(index) || isVMNetBridgeName(name)
 }
 
 // isVMNetBridgeName reports whether a name is one vmnet numbers for itself.

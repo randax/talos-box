@@ -58,7 +58,7 @@ func TestReconcileRoutesObservedLeaseAddressesToEveryCall(t *testing.T) {
 		t.Fatalf("planned address %s must differ from the leased address", planned)
 	}
 	client := &fakeClient{kubeData: []byte("kubeconfig")}
-	result, err := Reconcile(context.Background(), Request{Cluster: item, Client: client, PollInterval: 0,
+	result, err := Reconcile(context.Background(), Request{Cluster: item, Client: client, PollInterval: time.Millisecond,
 		Observe: func(context.Context) ([]Node, error) {
 			return []Node{{Name: item.Nodes[0].Name, Role: cluster.RoleControlPlane, IP: leased, Phase: PhaseConfigured}}, nil
 		}})
@@ -95,7 +95,7 @@ func TestReconcileWritesTalosconfigEndpointsFromObservedLeases(t *testing.T) {
 	client := &fakeClient{kubeData: []byte("kubeconfig")}
 	phases := []Phase{PhaseMaintenance, PhaseConfigured}
 	call := 0
-	result, err := Reconcile(context.Background(), Request{Cluster: item, Client: client, PollInterval: 0,
+	result, err := Reconcile(context.Background(), Request{Cluster: item, Client: client, PollInterval: time.Millisecond,
 		Observe: func(context.Context) ([]Node, error) {
 			phase := phases[min(call, len(phases)-1)]
 			call++
@@ -143,7 +143,7 @@ func TestReconcileRepairsControlPlaneEndpointAfterLeaseChange(t *testing.T) {
 	}
 	call := 0
 	client := &fakeClient{kubeData: []byte("kubeconfig"), endpointChanged: []bool{true, true}}
-	result, err := Reconcile(context.Background(), Request{Cluster: item, Client: client, PollInterval: 0,
+	result, err := Reconcile(context.Background(), Request{Cluster: item, Client: client, PollInterval: time.Millisecond,
 		Observe: func(context.Context) ([]Node, error) {
 			index := min(call, len(observations)-1)
 			call++
@@ -167,9 +167,9 @@ func TestReconcileRepairsControlPlaneEndpointAfterLeaseChange(t *testing.T) {
 	// A kubeconfig fetched before the endpoint is repaired names the dead
 	// address, which only moves the hang from apid to the Kubernetes API.
 	order := strings.Join(client.calls, ",")
-	if !strings.Contains(order, "endpoint,endpoint") ||
-		strings.Index(order, "endpoint") > strings.Index(order, "bootstrap") ||
-		strings.Index(order, "endpoint") > strings.Index(order, "kubeconfig") {
+	if !strings.Contains(order, "config,config") ||
+		strings.Index(order, "config") > strings.Index(order, "bootstrap") ||
+		strings.Index(order, "config") > strings.Index(order, "kubeconfig") {
 		t.Fatalf("call order = %s, want the endpoint reconciled before bootstrap and kubeconfig", order)
 	}
 	narration := strings.Join(result.Narration, "\n")
@@ -207,7 +207,7 @@ func TestReconcileWaitsForEveryControlPlaneLeaseBeforeApplying(t *testing.T) {
 	}
 	call := 0
 	client := &fakeClient{kubeData: []byte("kubeconfig")}
-	if _, err := Reconcile(context.Background(), Request{Cluster: item, Client: client, PollInterval: 0,
+	if _, err := Reconcile(context.Background(), Request{Cluster: item, Client: client, PollInterval: time.Millisecond,
 		Observe: func(context.Context) ([]Node, error) {
 			index := min(call, len(observations)-1)
 			call++
@@ -239,7 +239,7 @@ func TestReconcileFollowsLeaseChangeAfterConfigApply(t *testing.T) {
 		{{Name: item.Nodes[0].Name, Role: cluster.RoleControlPlane, IP: "172.30.0.26", Phase: PhaseConfigured}},
 	}
 	call := 0
-	result, err := Reconcile(context.Background(), Request{Cluster: item, Client: client, PollInterval: 0,
+	result, err := Reconcile(context.Background(), Request{Cluster: item, Client: client, PollInterval: time.Millisecond,
 		Observe: func(context.Context) ([]Node, error) {
 			index := min(call, len(observations)-1)
 			call++
@@ -288,20 +288,20 @@ func TestSecureClientDialsObservedEndpoint(t *testing.T) {
 
 // An expired provisioning budget used to surface as a bare deadline, hiding
 // which address never answered.
-func TestSchedulingWithRetryNamesUnreachableEndpoint(t *testing.T) {
+func TestMachineConfigWithRetryNamesUnreachableEndpoint(t *testing.T) {
 	unavailable := status.Error(codes.Unavailable, "i/o timeout")
 	client := &fakeClient{schedulingErrs: []error{unavailable, unavailable, unavailable}}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Millisecond)
 	defer cancel()
-	_, err := schedulingWithRetry(ctx, client, "172.30.0.2", true, time.Millisecond)
+	_, err := machineConfigWithRetry(ctx, client, "172.30.0.2", ConfigTarget{Endpoint: "https://172.30.0.2:6443", ControlPlaneScheduling: true}, time.Millisecond)
 	if err == nil {
-		t.Fatal("schedulingWithRetry() succeeded, want a deadline")
+		t.Fatal("machineConfigWithRetry() succeeded, want a deadline")
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("schedulingWithRetry() error = %v, want a deadline", err)
+		t.Fatalf("machineConfigWithRetry() error = %v, want a deadline", err)
 	}
 	if !strings.Contains(err.Error(), "172.30.0.2") || !strings.Contains(err.Error(), "i/o timeout") {
-		t.Fatalf("schedulingWithRetry() error = %v, want the unreachable endpoint and last error", err)
+		t.Fatalf("machineConfigWithRetry() error = %v, want the unreachable endpoint and last error", err)
 	}
 }
 
@@ -316,6 +316,126 @@ func TestKubeconfigWithRetryNamesUnreachableEndpoint(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "172.30.0.2") || !strings.Contains(err.Error(), "i/o timeout") {
 		t.Fatalf("kubeconfigWithRetry() error = %v, want the unreachable endpoint and last error", err)
+	}
+}
+
+// Both repairs a running node can need have to ride on one read-patch-apply:
+// a second read would see the config Talos had before the first apply landed
+// and revert it, putting the dead endpoint back.
+func TestReconcileRepairsEndpointAndSchedulingInOneApply(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item := leaseCluster(t)
+	client := &fakeClient{kubeData: []byte("kubeconfig"), endpointChanged: []bool{true}, schedulingChanged: []bool{true}}
+	result, err := Reconcile(context.Background(), Request{Cluster: item, Client: client, PollInterval: time.Millisecond,
+		Observe: func(context.Context) ([]Node, error) {
+			return []Node{{Name: item.Nodes[0].Name, Role: cluster.RoleControlPlane, IP: "172.30.0.25", Phase: PhaseConfigured}}, nil
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := 0
+	for _, call := range client.calls {
+		if call == "config" {
+			got++
+		}
+	}
+	if got != 1 {
+		t.Fatalf("machine config reconciles = %d, want a single composed apply per node", got)
+	}
+	if len(client.endpoints) != 1 || len(client.scheduling) != 1 {
+		t.Fatalf("endpoint calls = %+v, scheduling calls = %+v, want one composed call", client.endpoints, client.scheduling)
+	}
+	narration := strings.Join(result.Narration, "\n")
+	if !strings.Contains(narration, `{"cluster":{"controlPlane":{"endpoint":"https://172.30.0.25:6443"}}}`) ||
+		!strings.Contains(narration, `"allowSchedulingOnControlPlanes":true`) {
+		t.Fatalf("narration does not report both repairs:\n%s", narration)
+	}
+}
+
+// withConfigTarget is what makes the single apply carry both repairs.
+func TestWithConfigTargetComposesBothRepairs(t *testing.T) {
+	const config = `version: v1alpha1
+machine:
+  type: controlplane
+  nodeLabels:
+    node.kubernetes.io/exclude-from-external-load-balancers: ""
+cluster:
+  controlPlane:
+    endpoint: https://172.30.0.25:6443
+  allowSchedulingOnControlPlanes: false
+`
+	target := ConfigTarget{Endpoint: "https://172.30.0.26:6443", ControlPlaneScheduling: true, Workerless: true}
+	patched, changes, err := withConfigTarget([]byte(config), target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changes != (ConfigChanges{Endpoint: true, Scheduling: true}) {
+		t.Fatalf("changes = %+v, want both", changes)
+	}
+	if !strings.Contains(string(patched), "https://172.30.0.26:6443") ||
+		!strings.Contains(string(patched), "allowSchedulingOnControlPlanes: true") ||
+		strings.Contains(string(patched), loadBalancerExclusionLabel) {
+		t.Fatalf("composed patch lost a repair:\n%s", patched)
+	}
+	// A worker carries the endpoint but has no scheduling adaptations.
+	_, changes, err = withConfigTarget([]byte(config), ConfigTarget{Endpoint: "https://172.30.0.26:6443"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changes != (ConfigChanges{Endpoint: true}) {
+		t.Fatalf("changes = %+v, want the endpoint only", changes)
+	}
+}
+
+// A budget that expires while control planes have no lease must name them:
+// "context deadline exceeded" alone tells nobody what tbx was waiting for.
+func TestReconcileNamesControlPlanesWithoutALease(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item := leaseCluster(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+	_, err := Reconcile(ctx, Request{Cluster: item, Client: &fakeClient{}, PollInterval: time.Millisecond,
+		Observe: func(context.Context) ([]Node, error) {
+			return []Node{{Name: item.Nodes[0].Name, Role: cluster.RoleControlPlane}}, nil
+		}})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Reconcile() error = %v, want a deadline", err)
+	}
+	if !strings.Contains(err.Error(), item.Nodes[0].Name) || !strings.Contains(err.Error(), "DHCP lease") {
+		t.Fatalf("Reconcile() error = %v, want the unleased control plane named", err)
+	}
+}
+
+// Bootstrap runs right after config applies that can take apid away for a
+// moment, so it gets the same tolerance as every other authenticated call.
+func TestBootstrapWithRetryHandlesTransientTalosRestart(t *testing.T) {
+	client := &fakeClient{bootErrs: []error{status.Error(codes.Unavailable, "apid restarting")}}
+	if err := bootstrapWithRetry(context.Background(), client, "172.30.0.25", 0); err != nil {
+		t.Fatal(err)
+	}
+	if client.bootstrap != 2 {
+		t.Fatalf("bootstrap calls = %d, want a successful second call", client.bootstrap)
+	}
+}
+
+func TestBootstrapWithRetryDoesNotHidePermanentErrors(t *testing.T) {
+	client := &fakeClient{bootErrs: []error{status.Error(codes.PermissionDenied, "bad credential")}}
+	err := bootstrapWithRetry(context.Background(), client, "172.30.0.25", 0)
+	if err == nil || !strings.Contains(err.Error(), "bad credential") {
+		t.Fatalf("bootstrapWithRetry() error = %v, want permanent error", err)
+	}
+	if client.bootstrap != 1 {
+		t.Fatalf("bootstrap calls = %d, want 1", client.bootstrap)
+	}
+}
+
+func TestBootstrapWithRetryTreatsAlreadyBootstrappedAsSuccess(t *testing.T) {
+	client := &fakeClient{bootErr: status.Error(codes.AlreadyExists, "already bootstrapped")}
+	if err := bootstrapWithRetry(context.Background(), client, "172.30.0.25", 0); err != nil {
+		t.Fatal(err)
+	}
+	if client.bootstrap != 1 {
+		t.Fatalf("bootstrap calls = %d, want 1", client.bootstrap)
 	}
 }
 
