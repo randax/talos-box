@@ -24,6 +24,15 @@ func (s *Server) setMirrorOffline(raw json.RawMessage) (MirrorOfflineStatus, err
 	if err != nil {
 		return MirrorOfflineStatus{}, err
 	}
+	// Persist before applying: a mode the daemon reports as on, but would
+	// forget on the next restart, is the bug this guards (#318).
+	if s.settingsPath != "" {
+		if err := updateSettings(s.settingsPath, func(current *settings) {
+			current.MirrorOffline = *args.Enabled
+		}); err != nil {
+			return MirrorOfflineStatus{}, err
+		}
+	}
 	s.mirrorOffline.Store(*args.Enabled)
 	if s.mirrors != nil {
 		s.mirrors.SetOffline(*args.Enabled)

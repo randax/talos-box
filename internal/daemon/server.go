@@ -77,9 +77,13 @@ type Server struct {
 	lifecycleCancel       context.CancelFunc
 	mirrors               *mirror.Manager
 	mirrorOffline         atomic.Bool
-	defaultSchematic      string
-	subnetSources         cluster.SubnetSources
-	hostPressure          func(string) (hostpressure.Snapshot, error)
+	// settingsPath is where daemon-wide modes are persisted so they survive a
+	// restart (#318). An empty path disables persistence, which is what a
+	// hand-built test server wants.
+	settingsPath     string
+	defaultSchematic string
+	subnetSources    cluster.SubnetSources
+	hostPressure     func(string) (hostpressure.Snapshot, error)
 
 	listenerMu   sync.Mutex
 	listener     net.Listener
@@ -153,6 +157,9 @@ func NewServer(ctx context.Context) (*Server, error) {
 		storageEngineDelete:   deleteConfiguredStorageEngine,
 		storageEngineValidate: validateConfiguredStorageEngine,
 	}
+	// A persisted mode is re-applied before the socket exists, so the first
+	// request after a restart already sees it (#318).
+	server.applyPersistedSettings()
 	server.boundMirrorGateways = func() []string {
 		return server.mirrors.BoundGatewayIPs()
 	}

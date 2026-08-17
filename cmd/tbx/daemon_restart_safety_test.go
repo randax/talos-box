@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -121,7 +122,7 @@ func TestWaitForDaemonExitWatchesThePIDNotTheSocket(t *testing.T) {
 		return false
 	}
 
-	if err := waitForDaemonExit(4242); err != nil {
+	if err := waitForDaemonExit(4242, clusterActivity{}, nil); err != nil {
 		t.Fatalf("waitForDaemonExit = %v, want nil once the process is gone", err)
 	}
 	if slices.Contains(fake.recordedOps(), "daemon.info") {
@@ -789,5 +790,215 @@ func TestFeatureGateMessagesNameTheForcedRestartEscape(t *testing.T) {
 		if !strings.Contains(gateErr.Error(), wanted) {
 			t.Fatalf("gate error = %v, want it to name %q", gateErr, wanted)
 		}
+	}
+}
+
+// stubDaemonLock replaces the socket-lock probe, which is the gate that keeps a
+// replacement daemon from binding while the old one still owns the socket.
+func stubDaemonLock(t *testing.T, free func(socketPath string) bool) {
+	t.Helper()
+	previous := daemonLockFree
+	t.Cleanup(func() { daemonLockFree = previous })
+	daemonLockFree = free
+}
+
+// shortenDaemonWaits makes the bounded restart waits observable in a test.
+func shortenDaemonWaits(t *testing.T, wait, progress time.Duration) {
+	t.Helper()
+	previousWait, previousProgress, previousBudget := daemonWaitTimeout, daemonExitProgressInterval, machineStopBudget
+	t.Cleanup(func() {
+		daemonWaitTimeout, daemonExitProgressInterval, machineStopBudget = previousWait, previousProgress, previousBudget
+	})
+	daemonWaitTimeout, daemonExitProgressInterval, machineStopBudget = wait, progress, 10*time.Millisecond
+}
+
+// stubDaemonSpawn wraps the (already stubbed) spawn seam so a test can assert
+// when the replacement was launched.
+func stubDaemonSpawn(t *testing.T, before func()) *int {
+	t.Helper()
+	spawned := 0
+	previous := spawnDaemonProcess
+	t.Cleanup(func() { spawnDaemonProcess = previous })
+	spawnDaemonProcess = func() (int64, error) {
+		spawned++
+		before()
+		return previous()
+	}
+	return &spawned
+}
+
+// TestDaemonExitTimeoutScalesWithRunningVMs pins the fix for the 20s give-up:
+// the old daemon stops each VM under its own 30s budget, so the wait has to
+// grow with the workload rather than stay at the CLI's fixed base (#319).
+func TestDaemonExitTimeoutScalesWithRunningVMs(t *testing.T) {
+	if got := daemonExitTimeout(clusterActivity{}); got != daemonWaitTimeout {
+		t.Fatalf("daemonExitTimeout(idle) = %s, want the base %s", got, daemonWaitTimeout)
+	}
+	got := daemonExitTimeout(clusterActivity{running: []string{"alpha"}, runningVMs: 3})
+	want := daemonWaitTimeout + 3*machineStopBudget
+	if got != want {
+		t.Fatalf("daemonExitTimeout(3 VMs) = %s, want %s", got, want)
+	}
+	if want <= daemonWaitTimeout {
+		t.Fatal("a running cluster must buy more than the base wait")
+	}
+}
+
+// TestRunningClustersCountsTheVMsARestartMustStop keeps the scaled wait fed by
+// the daemon's own node counts.
+func TestRunningClustersCountsTheVMsARestartMustStop(t *testing.T) {
+	fake := newFakeDaemon(t, daemon.ProtocolVersion)
+	fake.runsNodes("alpha", 3, 2)
+	fake.suspends("beta")
+
+	activity, err := runningClusters(fake.socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activity.runningVMs != 5 {
+		t.Fatalf("runningVMs = %d, want 5 (3 control planes + 2 workers)", activity.runningVMs)
+	}
+}
+
+// TestForcedRestartReportsProgressWhileTheDaemonStopsVMs keeps a long, healthy
+// stop from looking hung.
+func TestForcedRestartReportsProgressWhileTheDaemonStopsVMs(t *testing.T) {
+	fake := newFakeDaemon(t, daemon.ProtocolVersion)
+	fake.runsNodes("alpha", 1, 2)
+	stubDaemonRestart(t, fake, unsupervisedDaemon)
+	shortenDaemonWaits(t, 2*time.Second, time.Millisecond)
+	stubDaemonLock(t, func(string) bool { return true })
+	// stay alive for a few polls so the progress narration has something to say
+	previousAlive := daemonProcessAlive
+	t.Cleanup(func() { daemonProcessAlive = previousAlive })
+	polls := 0
+	daemonProcessAlive = func(int) bool {
+		polls++
+		return polls < 3
+	}
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr}
+
+	if err := command.run([]string{"system", "restart", "--force"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"waiting for tbxd", "3 VMs"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr = %q, want it to contain %q", stderr.String(), want)
+		}
+	}
+}
+
+// TestForcedRestartFailsWithoutSpawningWhenTheDaemonKeepsStopping pins the
+// third part of the fix: a daemon that really will not exit must not be raced
+// by a replacement that then dies on the socket lock.
+func TestForcedRestartFailsWithoutSpawningWhenTheDaemonKeepsStopping(t *testing.T) {
+	fake := newFakeDaemon(t, daemon.ProtocolVersion)
+	fake.runsNodes("alpha", 1, 0)
+	stubDaemonRestart(t, fake, unsupervisedDaemon)
+	shortenDaemonWaits(t, 20*time.Millisecond, time.Hour)
+	stubDaemonLock(t, func(string) bool { return true })
+	previousAlive := daemonProcessAlive
+	t.Cleanup(func() { daemonProcessAlive = previousAlive })
+	daemonProcessAlive = func(int) bool { return true }
+	spawned := stubDaemonSpawn(t, func() {})
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr}
+
+	err := command.run([]string{"system", "restart", "--force"})
+	if err == nil {
+		t.Fatal("a daemon that never exits must fail the restart")
+	}
+	for _, want := range []string{"still stopping", "tbx system restart --force"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %v, want it to contain %q", err, want)
+		}
+	}
+	if *spawned != 0 {
+		t.Fatalf("spawned %d replacements, want none while the old daemon is still up", *spawned)
+	}
+}
+
+// TestForcedRestartWaitsForTheSocketLockBeforeSpawning pins the race the issue
+// reported: the old daemon holds its flock past listener close, so an observed
+// process exit is not yet permission to bind (#319).
+func TestForcedRestartWaitsForTheSocketLockBeforeSpawning(t *testing.T) {
+	fake := newFakeDaemon(t, daemon.ProtocolVersion)
+	fake.runsNodes("alpha", 1, 0)
+	stubDaemonRestart(t, fake, unsupervisedDaemon)
+	shortenDaemonWaits(t, 5*time.Second, time.Hour)
+	probes := 0
+	free := false
+	stubDaemonLock(t, func(socketPath string) bool {
+		if socketPath != fake.socket {
+			t.Errorf("probed lock for %q, want the daemon socket %q", socketPath, fake.socket)
+		}
+		probes++
+		free = probes > 2
+		return free
+	})
+	spawned := stubDaemonSpawn(t, func() {
+		if !free {
+			t.Error("the replacement was spawned while the old daemon still owned the socket lock")
+		}
+	})
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr}
+
+	if err := command.run([]string{"system", "restart", "--force"}); err != nil {
+		t.Fatal(err)
+	}
+	if *spawned != 1 {
+		t.Fatalf("spawned %d replacements, want 1", *spawned)
+	}
+	if probes < 3 {
+		t.Fatalf("lock probes = %d, want the spawn to wait for the lock to free", probes)
+	}
+}
+
+// TestForcedRestartFailsWhenTheSocketLockNeverFrees keeps a stuck lock from
+// spawning a replacement that would only die on it.
+func TestForcedRestartFailsWhenTheSocketLockNeverFrees(t *testing.T) {
+	fake := newFakeDaemon(t, daemon.ProtocolVersion)
+	stubDaemonRestart(t, fake, unsupervisedDaemon)
+	shortenDaemonWaits(t, 20*time.Millisecond, time.Hour)
+	stubDaemonLock(t, func(string) bool { return false })
+	spawned := stubDaemonSpawn(t, func() {})
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr}
+
+	err := command.run([]string{"system", "restart", "--force"})
+	if err == nil || !strings.Contains(err.Error(), "still owns") {
+		t.Fatalf("error = %v, want a refusal naming the socket the old daemon still owns", err)
+	}
+	if *spawned != 0 {
+		t.Fatalf("spawned %d replacements, want none while the socket lock is held", *spawned)
+	}
+}
+
+// TestSocketLockFreeReportsAHeldLock exercises the real flock probe, which is
+// what the seam stands in for everywhere else.
+func TestSocketLockFreeReportsAHeldLock(t *testing.T) {
+	home := tempHome(t)
+	socket := filepath.Join(home, "tbxd.sock")
+	if !socketLockFree(socket) {
+		t.Fatal("an unlocked socket must probe as free")
+	}
+	held, err := os.OpenFile(socket+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = held.Close() }()
+	if err := syscall.Flock(int(held.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	if socketLockFree(socket) {
+		t.Fatal("a held lock must probe as taken")
+	}
+	if err := syscall.Flock(int(held.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatal(err)
+	}
+	if !socketLockFree(socket) {
+		t.Fatal("a released lock must probe as free again")
 	}
 }
