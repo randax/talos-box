@@ -113,11 +113,18 @@ func (m *Manager) warmOne(ctx context.Context, reference, hostArch string) (Warm
 		return WarmResult{}, err
 	}
 	if stageListed && staged != nil {
-		if staged.requestPath == "" || len(staged.data) == 0 {
+		switch {
+		case staged.requestPath != "" && len(staged.data) > 0:
+			if err := server.storeManifest(staged.requestPath, staged.metadata, staged.data); err != nil {
+				return WarmResult{}, fmt.Errorf("publish listed manifest: %w", err)
+			}
+		case cachedBefore && server.offlineEnabled():
+			// offline replay answered the listed tag from the cache, so the
+			// entry it would republish is already on disk. Online, an empty
+			// stage means the refresh never reached upstream, which stays a
+			// failure so a stale tag is never reported as re-warmed.
+		default:
 			return WarmResult{}, fmt.Errorf("listed ref %q did not produce a staged manifest", reference)
-		}
-		if err := server.storeManifest(staged.requestPath, staged.metadata, staged.data); err != nil {
-			return WarmResult{}, fmt.Errorf("publish listed manifest: %w", err)
 		}
 	}
 	return result, nil

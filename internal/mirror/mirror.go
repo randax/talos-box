@@ -327,7 +327,11 @@ func (s *Server) serveCacheIfAvailable(w http.ResponseWriter, r *http.Request, d
 		return true, nil
 	}
 	if isManifest {
-		if shouldRefreshManifest(r.Context()) {
+		// A refresh request deliberately bypasses the cache to re-resolve the
+		// reference upstream — but offline there is no upstream to re-resolve
+		// against, so bypassing would 503 on content the cache holds and the
+		// checker calls complete.
+		if shouldRefreshManifest(r.Context()) && !s.offlineEnabled() {
 			return false, nil
 		}
 		reference := manifestReference(r.URL.Path)
