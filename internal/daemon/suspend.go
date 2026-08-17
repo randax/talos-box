@@ -186,6 +186,23 @@ func prepareSavedMachine(machine hypervisor.Machine, savePath string) (retain bo
 	return true, nil
 }
 
+// saveStateSuffix names every file suspend writes, so the presence of saved
+// memory can be detected without knowing the node names.
+const saveStateSuffix = ".vzstate"
+
 func saveStatePath(dir, node string) string {
-	return filepath.Join(dir, node+".vzstate")
+	return filepath.Join(dir, node+saveStateSuffix)
+}
+
+// clusterHasSavedState reports whether a cluster still holds suspended VM
+// memory on disk. Suspension is otherwise invisible after a daemon restart —
+// the tracked VMs are gone — so this on-disk signal is what tells a client that
+// restarting tbxd would discard the cluster's saved memory.
+func clusterHasSavedState(name string) bool {
+	dir, err := cluster.Dir(name)
+	if err != nil {
+		return false
+	}
+	matches, err := filepath.Glob(filepath.Join(dir, "*"+saveStateSuffix))
+	return err == nil && len(matches) > 0
 }

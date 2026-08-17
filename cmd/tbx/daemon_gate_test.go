@@ -18,12 +18,13 @@ import (
 // fakeDaemon answers daemon.info with a chosen protocol and records every op it
 // is asked to serve, so the connect-time gate can be driven without a real tbxd.
 type fakeDaemon struct {
-	socket   string
-	mu       sync.Mutex
-	protocol int
-	ops      []string
-	running  []string
-	listener net.Listener
+	socket    string
+	mu        sync.Mutex
+	protocol  int
+	ops       []string
+	running   []string
+	suspended []string
+	listener  net.Listener
 }
 
 func newFakeDaemon(t *testing.T, protocol int) *fakeDaemon {
@@ -70,15 +71,19 @@ func (f *fakeDaemon) respond(request daemon.Request) daemon.Response {
 	f.ops = append(f.ops, request.Op)
 	protocol := f.protocol
 	running := append([]string(nil), f.running...)
+	suspended := append([]string(nil), f.suspended...)
 	f.mu.Unlock()
 	switch request.Op {
 	case "daemon.info":
 		data, _ := json.Marshal(daemon.Info{ProtocolVersion: protocol})
 		return daemon.Response{OK: true, Data: data}
 	case "cluster.list":
-		summaries := make([]daemon.ClusterSummary, 0, len(running))
+		summaries := make([]daemon.ClusterSummary, 0, len(running)+len(suspended))
 		for _, name := range running {
 			summaries = append(summaries, daemon.ClusterSummary{Name: name, Running: true})
+		}
+		for _, name := range suspended {
+			summaries = append(summaries, daemon.ClusterSummary{Name: name, Suspended: true})
 		}
 		data, _ := json.Marshal(summaries)
 		return daemon.Response{OK: true, Data: data}
@@ -92,6 +97,14 @@ func (f *fakeDaemon) runs(names ...string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.running = names
+}
+
+// suspends makes the fake daemon report the named clusters as suspended: not
+// running, but holding saved memory a restart would discard.
+func (f *fakeDaemon) suspends(names ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.suspended = names
 }
 
 func (f *fakeDaemon) stop() {
@@ -122,7 +135,7 @@ func (f *fakeDaemon) recordedOps() []string {
 
 // stubDaemonRestart replaces the process-level restart seams with a stop/start
 // of the fake daemon, which comes back speaking the CLI's own protocol.
-func stubDaemonRestart(t *testing.T, fake *fakeDaemon, supervised func() (bool, string)) *int {
+func stubDaemonRestart(t *testing.T, fake *fakeDaemon, supervised func() (supervision, string)) *int {
 	t.Helper()
 	terminated := 0
 	previousTerminate, previousSpawn, previousSupervised := terminateDaemonProcess, spawnDaemonProcess, supervisedDaemon
@@ -147,7 +160,7 @@ func stubDaemonRestart(t *testing.T, fake *fakeDaemon, supervised func() (bool, 
 	return &terminated
 }
 
-func unsupervisedDaemon() (bool, string) { return false, "" }
+func unsupervisedDaemon() (supervision, string) { return supervisionNone, "" }
 
 // tempHome keeps the socket path short: unix socket paths are capped well below
 // what t.TempDir() produces for long test names.
@@ -207,8 +220,8 @@ func TestCallHandshakesOnlyOncePerSession(t *testing.T) {
 
 func TestCallFailsEveryVerbWhenAStaleDaemonCannotBeRestarted(t *testing.T) {
 	fake := newFakeDaemon(t, daemon.ProtocolVersion-1)
-	terminated := stubDaemonRestart(t, fake, func() (bool, string) {
-		return true, "tbxd is managed by /Library/LaunchDaemons/dev.talosbox.tbxd.plist"
+	terminated := stubDaemonRestart(t, fake, func() (supervision, string) {
+		return supervisionConfirmed, "tbxd is managed by /Library/LaunchDaemons/dev.talosbox.tbxd.plist"
 	})
 	var stdout, stderr bytes.Buffer
 	command := cli{out: &stdout, err: &stderr, daemon: newDaemonSession()}
@@ -217,8 +230,13 @@ func TestCallFailsEveryVerbWhenAStaleDaemonCannotBeRestarted(t *testing.T) {
 	if err == nil {
 		t.Fatal("a stale daemon that cannot be restarted must fail every verb")
 	}
-	if !strings.Contains(err.Error(), "run: tbx system restart") {
-		t.Fatalf("error = %q, want a real recovery command", err)
+	// tbx system restart refuses a supervised daemon in turn, so the gate must
+	// hand over the supervisor's own command instead of that dead end
+	if !strings.Contains(err.Error(), "run: "+supervisorRestartCommand()) {
+		t.Fatalf("error = %q, want the supervisor's restart command", err)
+	}
+	if strings.Contains(err.Error(), "run: tbx system restart") {
+		t.Fatalf("error = %q, want no dead-end recovery command", err)
 	}
 	if !strings.Contains(err.Error(), "LaunchDaemons") {
 		t.Fatalf("error = %q, want the reason the restart was refused", err)
@@ -299,8 +317,8 @@ func TestSystemRestartStartsADaemonThatIsNotRunning(t *testing.T) {
 
 func TestSystemRestartRefusesASupervisedDaemon(t *testing.T) {
 	fake := newFakeDaemon(t, daemon.ProtocolVersion)
-	stubDaemonRestart(t, fake, func() (bool, string) {
-		return true, "tbxd is managed by /Library/LaunchDaemons/dev.talosbox.tbxd.plist"
+	stubDaemonRestart(t, fake, func() (supervision, string) {
+		return supervisionConfirmed, "tbxd is managed by /Library/LaunchDaemons/dev.talosbox.tbxd.plist"
 	})
 	var stdout, stderr bytes.Buffer
 	command := cli{out: &stdout, err: &stderr}
@@ -424,8 +442,8 @@ func TestSupervisedDaemonDetectsAUnitFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	supervised, reason := supervisedDaemon()
-	if !supervised || !strings.Contains(reason, unit) {
-		t.Fatalf("supervisedDaemon() = %v, %q, want the unit path", supervised, reason)
+	state, reason := supervisedDaemon()
+	if state != supervisionInferred || !strings.Contains(reason, unit) {
+		t.Fatalf("supervisedDaemon() = %v, %q, want inferred supervision naming the unit path", state, reason)
 	}
 }

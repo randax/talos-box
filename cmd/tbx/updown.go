@@ -69,10 +69,11 @@ func (l liveness) beat(output io.Writer) func() {
 }
 
 // callWithLiveness runs one blocking lifecycle call under a heartbeat. The
-// protocol handshake is forced first so the heartbeat goroutine is the only
-// writer to stderr while the call is in flight.
+// protocol handshake is settled first — retried, and recorded even when it is
+// skipped — so call() cannot re-handshake mid-call and the heartbeat goroutine
+// is the only writer to stderr while the call is in flight.
 func (c cli) callWithLiveness(signal liveness, op string, args, destination any) error {
-	if err := c.ensureDaemonProtocol(); err != nil {
+	if err := c.resolveDaemonProtocol(true); err != nil {
 		return err
 	}
 	stop := signal.beat(c.err)

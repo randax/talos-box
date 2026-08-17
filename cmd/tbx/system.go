@@ -99,30 +99,55 @@ func (c cli) restartDaemon(force bool) error {
 			return err
 		}
 	}
-	if supervised, reason := supervisedDaemon(); supervised {
-		return errors.New(reason)
+	if err := refuseSupervisedRestart(force); err != nil {
+		return err
 	}
-	running, runningErr := runningClustersQuery(socketPath)
+	// the cluster query runs only after the supervision and force checks, and
+	// under a deadline: it is served under the daemon's operation lock, so a
+	// long suspend or destroy must never be able to hang --force
+	activity, activityErr := daemonClusterActivity(socketPath)
 	if !force {
-		if runningErr != nil {
-			return fmt.Errorf("tbx could not tell whether clusters are running (%v); restarting tbxd stops every running cluster — re-run: tbx system restart --force", runningErr)
+		if activityErr != nil {
+			return fmt.Errorf("tbx could not tell whether clusters are running (%v); restarting tbxd stops every running cluster — re-run: tbx system restart --force", activityErr)
 		}
-		if len(running) > 0 {
-			return fmt.Errorf("restarting tbxd stops these running clusters: %s; re-run: tbx system restart --force",
-				strings.Join(running, ", "))
+		if !activity.empty() {
+			return fmt.Errorf("restarting tbxd stops these clusters: %s; re-run: tbx system restart --force",
+				activity.describe())
 		}
 	}
 	restarted, restartedPID, err := replaceDaemon(socketPath, info, pid)
 	if err != nil {
 		return err
 	}
-	if len(running) > 0 {
-		if _, err := fmt.Fprintf(c.out, "stopped running clusters: %s\n", strings.Join(running, ", ")); err != nil {
+	switch {
+	case activityErr != nil:
+		if _, err := fmt.Fprintln(c.out, "stopped clusters: unknown (state query failed)"); err != nil {
+			return err
+		}
+	case !activity.empty():
+		if _, err := fmt.Fprintf(c.out, "stopped clusters: %s\n", activity.describe()); err != nil {
 			return err
 		}
 	}
 	_, err = fmt.Fprintf(c.out, "restarted tbxd (pid %d, protocol %d)\n", restartedPID, restarted.ProtocolVersion)
 	return err
+}
+
+// refuseSupervisedRestart decides whether tbx may replace this daemon. A
+// supervisor that confirms it owns an active tbxd is never overridden. A merely
+// inferred unit file — every packaged install ships one, whether or not it is
+// in use — is refused without --force but yields to it, so the recovery chain
+// does not dead-end on a file that proves nothing.
+func refuseSupervisedRestart(force bool) error {
+	state, reason := supervisedDaemon()
+	switch {
+	case state == supervisionConfirmed:
+		return fmt.Errorf("%s; tbx will not restart a supervised tbxd — run: %s", reason, supervisorRestartCommand())
+	case state == supervisionInferred && !force:
+		return fmt.Errorf("%s; run: %s, or re-run: tbx system restart --force to replace it in place",
+			reason, supervisorRestartCommand())
+	}
+	return nil
 }
 
 // daemonStatus reports the running daemon without spawning one, so an operator

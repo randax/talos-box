@@ -139,7 +139,11 @@ type ClusterSummary struct {
 	Domain            string `json:"domain,omitempty"`
 	AllowUnsafeDomain bool   `json:"allowUnsafeDomain,omitempty"`
 	Running           bool   `json:"running"`
-	Warning           string `json:"warning,omitempty"`
+	// Suspended reports saved VM memory on disk. Unlike Running it survives a
+	// daemon restart, which is what lets a client tell a suspended cluster
+	// (whose memory a restart would discard) from a merely stopped one.
+	Suspended bool   `json:"suspended,omitempty"`
+	Warning   string `json:"warning,omitempty"`
 	// Warnings is the same advisory set as Warning, one entry per finding.
 	// Warning stays populated for older clients that only read it.
 	Warnings  []string `json:"warnings,omitempty"`
@@ -1731,6 +1735,9 @@ func summary(item cluster.Cluster, running bool) ClusterSummary {
 		Domain:             item.Domain,
 		AllowUnsafeDomain:  item.AllowUnsafeDomain,
 		Running:            running,
+		// derived from disk, not from daemon memory, so a restarted daemon
+		// still reports the suspension its predecessor performed
+		Suspended: !running && clusterHasSavedState(item.Name),
 	}
 }
 
