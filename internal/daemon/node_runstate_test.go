@@ -488,6 +488,33 @@ func TestNodeStartOfAStoppedClusterStillRefusesOvercommit(t *testing.T) {
 	}
 }
 
+// TestNodeStartOfALastStoppedMemberStillEnforcesTheCeiling pins the other half:
+// skipping the check outright for a partly-running cluster would remove the
+// memory ceiling for every node after the first. The started node's own memory
+// is not charged again — it is already in the commitment — but the commitment
+// itself must still fit the host.
+func TestNodeStartOfALastStoppedMemberStillEnforcesTheCeiling(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 2)
+	stubNodeMutationReconcile(service)
+	delete(service.vms[item.Name], "demo-worker-2")
+	// The host is one MiB short of the cluster it is already running.
+	service.hostTotalMemory = func() (int, error) {
+		return balloon.DefaultConfig().ReserveMiB + clusterMemoryMiB(item) - 1, nil
+	}
+
+	response := dispatchNodeRunState(t, service, "node.start", item.Name, "demo-worker-2")
+
+	if response.OK {
+		t.Fatal("node.start over a running cluster ignored the overcommit ceiling")
+	}
+	if !strings.Contains(response.Error, "exceeds host") {
+		t.Fatalf("node.start error = %q, want the overcommit refusal", response.Error)
+	}
+	if service.nodeRunning(item.Name, "demo-worker-2") {
+		t.Fatal("node.start launched the node despite refusing")
+	}
+}
+
 // TestNodeStopInvalidatesTheStoragePhase pins the regression: a recorded `live`
 // phase short-circuits refreshStoragePhases, so leaving it standing after a
 // worker is powered off keeps reporting storage live over a cluster that just

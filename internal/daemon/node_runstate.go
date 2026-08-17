@@ -33,18 +33,20 @@ func (s *Server) startNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTa
 	firstNode := !s.clusterRunning(item.Name)
 	// Powering a node on commits the same host memory `cluster start` and
 	// `node add` are gated on, so it answers to the same guards: a hard refusal
-	// without --force, an advisory finding with it. It is only an ADDITION while
-	// the cluster is stopped: checkOvercommit already counts every configured
-	// node of every running cluster, this node included, so charging it again
-	// over a partly-running cluster would double-count it and refuse a member
-	// whose memory is already in the commitment (mirrors startCluster, which
-	// skips the check outright for a running cluster).
-	var overcommitWarning string
+	// without --force, an advisory finding with it. The check always runs — the
+	// ceiling must hold for every node, not just the first. Only the ADDITION
+	// differs: checkOvercommit already counts every configured node of every
+	// running cluster, this node included, so charging it again over a
+	// partly-running cluster would double-count it and refuse a member whose
+	// memory is already in the commitment. Passing zero still sums the whole
+	// commitment and still refuses a start that would breach the ceiling.
+	addMiB := 0
 	if firstNode {
-		overcommitWarning, err = s.checkOvercommit(item.DefaultsFor(node.Role).MemoryMiB, args.Force)
-		if err != nil {
-			return NodeStatus{}, nil, err
-		}
+		addMiB = item.DefaultsFor(node.Role).MemoryMiB
+	}
+	overcommitWarning, err := s.checkOvercommit(addMiB, args.Force)
+	if err != nil {
+		return NodeStatus{}, nil, err
 	}
 	var subnetWarning string
 	if firstNode {

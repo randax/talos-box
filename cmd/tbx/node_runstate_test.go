@@ -118,3 +118,15 @@ func TestNodeStartForwardsForce(t *testing.T) {
 		t.Fatalf("node.start args = %s, want force set", request.Args)
 	}
 }
+
+func TestNodeStopRejectsForce(t *testing.T) {
+	_, command := newDestroyTestCLI(t, nil)
+
+	err := command.runNode([]string{"stop", "demo", "demo-worker-2", "--force"})
+	if err == nil {
+		t.Fatal("node stop --force succeeded, want a flag-parse rejection")
+	}
+	if !strings.Contains(err.Error(), "force") {
+		t.Fatalf("error = %q, want it to name the rejected -force flag", err)
+	}
+}

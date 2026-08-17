@@ -29,19 +29,22 @@ func (s *Server) deleteRemovedKubernetesNode(clusterName, nodeName string) strin
 	if item.CNI == "" {
 		return ""
 	}
-	s.opMu.Lock()
-	running := s.clusterRunning(item.Name)
-	s.opMu.Unlock()
-	if !running {
-		// a stopped cluster has no API server to talk to; the next provisioning
-		// pass reconciles the membership when it comes back up
-		return ""
-	}
 	if _, err := clusterKubeconfig(item.Name); err != nil {
 		// no admin credentials means the cluster was never brought up far enough
 		// to have a Node object for this node
 		log.Printf("node.remove %s/%s: no kubeconfig, skipping Kubernetes node deletion", item.Name, nodeName)
 		return ""
+	}
+	s.opMu.Lock()
+	running := s.clusterRunning(item.Name)
+	s.opMu.Unlock()
+	if !running {
+		// A stopped cluster has no API server to talk to, and nothing deletes
+		// the Node object later: the reconcile a start schedules is unforced and
+		// readiness ignores unexpected nodes, so the removed member would sit
+		// NotReady forever. Hand the operator the one command that clears it.
+		log.Printf("node.remove %s/%s: cluster is stopped, Kubernetes node object left in place", item.Name, nodeName)
+		return stoppedClusterKubernetesNodeWarning(nodeName)
 	}
 	log.Printf("node.remove %s/%s: deleting Kubernetes node object", item.Name, nodeName)
 	deleteNode := s.deleteKubernetesNode
@@ -64,6 +67,18 @@ func deleteClusterKubernetesNode(ctx context.Context, item cluster.Cluster, node
 		return fmt.Errorf("read kubeconfig for node deletion: %w", err)
 	}
 	return provision.DeleteKubernetesNode(ctx, kubeconfig, nodeName)
+}
+
+// stoppedClusterKubernetesNodeWarning is the stopped-cluster half: the member
+// left state and disk, but its Kubernetes Node object is still registered and no
+// later operation removes it, so the cleanup is the operator's to run once the
+// cluster answers again.
+func stoppedClusterKubernetesNodeWarning(nodeName string) string {
+	return fmt.Sprintf(
+		"node %s was removed while the cluster was stopped, so its Kubernetes node object still exists and stays NotReady; run `kubectl delete node %s` once the cluster is running again",
+		nodeName,
+		nodeName,
+	)
 }
 
 func kubernetesNodeDeleteWarning(nodeName string, err error) string {

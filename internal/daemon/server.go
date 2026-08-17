@@ -102,6 +102,10 @@ type Server struct {
 type activeProvision struct {
 	generation uint64
 	cancel     context.CancelFunc
+	// done is closed when the task that owns this generation has finished.
+	// Cancelling a reconcile only asks it to stop; an operation that is about
+	// to delete the cluster's files has to wait until it actually has (#334).
+	done chan struct{}
 }
 
 type activeStorageProbe struct {
@@ -393,10 +397,33 @@ func (s *Server) dispatch(request Request) Response {
 	if request.Op == "snapshot.restore" {
 		return s.dispatchSnapshotRestore(request)
 	}
+	if request.Op == "cluster.destroy" {
+		return s.dispatchDestroy(request)
+	}
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 
 	data, err := s.handle(request)
+	if err != nil {
+		return failure(err)
+	}
+	return success(data)
+}
+
+// dispatchDestroy drains the cluster's background reconcile before the
+// destruction takes the operation lock. The reconcile writes into the very
+// directory the destroy removes, and its epilogue re-registers daemon state for
+// the cluster — state a later cluster of the same name would inherit. The wait
+// cannot happen under opMu, which is why it is here and not in destroyCluster.
+func (s *Server) dispatchDestroy(request Request) Response {
+	var args destroyArgs
+	if err := decodeArgs(request.Args, &args); err != nil {
+		return failure(err)
+	}
+	s.drainProvision(args.Name)
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	data, err := s.destroyCluster(request.Args)
 	if err != nil {
 		return failure(err)
 	}

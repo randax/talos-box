@@ -489,6 +489,22 @@ func savedStateClusters() ([]string, error) {
 // savedStateSuffix mirrors the daemon's suspend artifacts.
 const savedStateSuffix = ".vzstate"
 
+// onDiskVMEstimate counts every configured node of every cluster on disk. It
+// answers when the daemon is too busy to serve cluster.list — the restarts
+// whose shutdown is longest — and deliberately over-counts: nodes of stopped
+// clusters inflate the wait budget, never shrink it.
+func onDiskVMEstimate() int {
+	items, err := cluster.List()
+	if err != nil {
+		return 0
+	}
+	total := 0
+	for _, item := range items {
+		total += len(item.Nodes)
+	}
+	return total
+}
+
 // process-level seams: the restart path signals, inspects and spawns real
 // processes, which tests replace with a scripted daemon.
 var (
@@ -497,6 +513,8 @@ var (
 	supervisedDaemon        = supervisedDaemonUnit
 	daemonProcessAlive      = processAlive
 	daemonLockFree          = socketLockFree
+	daemonHandshakeProbe    = daemonHandshake
+	onDiskVMCount           = onDiskVMEstimate
 	runningClustersQuery    = runningClusters
 	savedStateClustersQuery = savedStateClusters
 	runSupervisorCommand    = func(name string, args ...string) error {
@@ -637,8 +655,14 @@ func replaceDaemon(socketPath string, info daemon.Info, pid int, activity cluste
 	}
 	// The daemon holds its socket lock deliberately past listener close, so an
 	// observed process exit is not yet permission to bind.
-	if err := waitForDaemonLock(socketPath, progress); err != nil {
+	serving, servingPID, err := waitForDaemonLock(socketPath, progress)
+	if err != nil {
 		return info, pid, err
+	}
+	if servingPID > 0 {
+		// A concurrent tbx already spawned a current-protocol daemon in the
+		// window between the old exit and our spawn; the restart's goal is met.
+		return serving, servingPID, nil
 	}
 	if _, err := spawnDaemonProcess(); err != nil {
 		return info, pid, err
@@ -693,17 +717,25 @@ func waitForDaemonExit(pid int, activity clusterActivity, progress io.Writer) er
 // waitForDaemonLock waits until the socket's flock can be taken, which is the
 // only proof the old daemon has finished with the socket: it keeps the lock
 // until the process is really gone, past listener close.
-func waitForDaemonLock(socketPath string, progress io.Writer) error {
+//
+// A held lock can also mean a *fresh* daemon: another tbx may auto-spawn one in
+// the window after the old exit. That is not a failure — it is the restart's
+// goal already met — so a lock-holder that answers the handshake with the
+// current protocol is returned (non-zero pid) instead of waited out.
+func waitForDaemonLock(socketPath string, progress io.Writer) (daemon.Info, int, error) {
 	start := time.Now()
 	deadline := start.Add(daemonWaitTimeout)
 	nextReport := start.Add(daemonExitProgressInterval)
 	for {
 		if daemonLockFree(socketPath) {
-			return nil
+			return daemon.Info{}, 0, nil
+		}
+		if info, pid, err := daemonHandshakeProbe(socketPath); err == nil && info.ProtocolVersion == daemon.ProtocolVersion {
+			return info, pid, nil
 		}
 		now := time.Now()
 		if now.After(deadline) {
-			return fmt.Errorf("the old tbxd still owns %s after %s; it is finishing its shutdown — re-run: tbx system restart --force",
+			return daemon.Info{}, 0, fmt.Errorf("the old tbxd still owns %s after %s; it is finishing its shutdown — re-run: tbx system restart --force",
 				socketPath, daemonWaitTimeout)
 		}
 		if !now.Before(nextReport) {
@@ -721,9 +753,11 @@ func waitForDaemonLock(socketPath string, progress io.Writer) error {
 func socketLockFree(socketPath string) bool {
 	lock, err := os.OpenFile(socketPath+".lock", os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		// An unopenable lock file is not a daemon holding it; let the spawn
-		// report the real problem instead of stalling here.
-		return true
+		// A missing parent directory means no daemon can be holding the lock;
+		// the spawn creates it and reports any real problem. Any other open
+		// failure (permissions, I/O) proves nothing about the holder, so it
+		// keeps the wait going rather than racing a daemon that may be there.
+		return os.IsNotExist(err)
 	}
 	defer func() { _ = lock.Close() }()
 	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {

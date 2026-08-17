@@ -111,7 +111,12 @@ func (s *Server) snapshotRestore(raw json.RawMessage) (SnapshotStatus, error) {
 		return SnapshotStatus{}, err
 	}
 	running := s.clusterRunning(item.Name)
+	dir, err := cluster.Dir(item.Name)
+	if err != nil {
+		return SnapshotStatus{}, err
+	}
 	var restartWarnings []string
+	var discardWarnings []string
 	// restore always ends powered on (SPEC §7: cold boot), even if the cluster
 	// was stopped when restore was invoked
 	err = withClusterStopped(true,
@@ -131,7 +136,22 @@ func (s *Server) snapshotRestore(raw json.RawMessage) (SnapshotStatus, error) {
 			restartWarnings = warnings
 			return startErr
 		},
-		func() error { return cluster.RestoreSnapshot(item, args.Name) },
+		func() error {
+			if err := cluster.RestoreSnapshot(item, args.Name); err != nil {
+				return err
+			}
+			// The restore swapped the node disks out from under any suspended
+			// memory, so every save in the directory now describes a machine
+			// state that no longer matches its disk — resuming onto one would
+			// corrupt the restored cluster. They are dropped before anything
+			// starts, and before status can report the cluster Suspended.
+			dropped, failures := discardClusterSavedStates(dir)
+			if dropped {
+				discardWarnings = append(discardWarnings, discardedSaveStateWarning("the cluster"))
+			}
+			discardWarnings = append(discardWarnings, failures...)
+			return nil
+		},
 	)
 	if err != nil {
 		return SnapshotStatus{}, err
@@ -141,7 +161,7 @@ func (s *Server) snapshotRestore(raw json.RawMessage) (SnapshotStatus, error) {
 		return SnapshotStatus{}, err
 	}
 	status := SnapshotStatus{Snapshots: snapshots}
-	status.setWarnings(restartWarnings...)
+	status.setWarnings(append(discardWarnings, restartWarnings...)...)
 	return status, nil
 }
 

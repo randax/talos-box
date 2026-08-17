@@ -927,6 +927,9 @@ func TestForcedRestartWaitsForTheSocketLockBeforeSpawning(t *testing.T) {
 	fake.runsNodes("alpha", 1, 0)
 	stubDaemonRestart(t, fake, unsupervisedDaemon)
 	shortenDaemonWaits(t, 5*time.Second, time.Hour)
+	stubHandshakeProbe(t, func(string) (daemon.Info, int, error) {
+		return daemon.Info{}, 0, errors.New("no daemon on the socket")
+	})
 	probes := 0
 	free := false
 	stubDaemonLock(t, func(socketPath string) bool {
@@ -963,6 +966,9 @@ func TestForcedRestartFailsWhenTheSocketLockNeverFrees(t *testing.T) {
 	stubDaemonRestart(t, fake, unsupervisedDaemon)
 	shortenDaemonWaits(t, 20*time.Millisecond, time.Hour)
 	stubDaemonLock(t, func(string) bool { return false })
+	stubHandshakeProbe(t, func(string) (daemon.Info, int, error) {
+		return daemon.Info{}, 0, errors.New("no daemon on the socket")
+	})
 	spawned := stubDaemonSpawn(t, func() {})
 	var stdout, stderr bytes.Buffer
 	command := cli{out: &stdout, err: &stderr}
@@ -1000,5 +1006,81 @@ func TestSocketLockFreeReportsAHeldLock(t *testing.T) {
 	}
 	if !socketLockFree(socket) {
 		t.Fatal("a released lock must probe as free again")
+	}
+}
+
+// stubHandshakeProbe replaces the lock-wait's liveness probe. The scripted fake
+// daemon keeps its listener alive for the whole test, so tests modelling a dead
+// old daemon must fail the probe explicitly.
+func stubHandshakeProbe(t *testing.T, probe func(string) (daemon.Info, int, error)) {
+	t.Helper()
+	previous := daemonHandshakeProbe
+	t.Cleanup(func() { daemonHandshakeProbe = previous })
+	daemonHandshakeProbe = probe
+}
+
+func stubOnDiskVMCount(t *testing.T, count int) {
+	t.Helper()
+	previous := onDiskVMCount
+	t.Cleanup(func() { onDiskVMCount = previous })
+	onDiskVMCount = func() int { return count }
+}
+
+// TestForcedRestartAdoptsAConcurrentlySpawnedDaemon pins the lock-wait's escape
+// hatch: a held flock can belong to a fresh daemon another tbx auto-spawned in
+// the gap after the old exit, and that is the restart's goal already met — not
+// a 20s spin ending in a wrong "still owns" refusal.
+func TestForcedRestartAdoptsAConcurrentlySpawnedDaemon(t *testing.T) {
+	fake := newFakeDaemon(t, daemon.ProtocolVersion)
+	fake.runsNodes("alpha", 1, 0)
+	stubDaemonRestart(t, fake, unsupervisedDaemon)
+	shortenDaemonWaits(t, 5*time.Second, time.Hour)
+	stubDaemonLock(t, func(string) bool { return false })
+	stubHandshakeProbe(t, func(string) (daemon.Info, int, error) {
+		return daemon.Info{ProtocolVersion: daemon.ProtocolVersion}, 4242, nil
+	})
+	spawned := stubDaemonSpawn(t, func() {})
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr}
+
+	if err := command.run([]string{"system", "restart", "--force"}); err != nil {
+		t.Fatal(err)
+	}
+	if *spawned != 0 {
+		t.Fatalf("spawned %d replacements, want none when a current daemon already serves the socket", *spawned)
+	}
+	if got := stdout.String(); !strings.Contains(got, "pid 4242") {
+		t.Fatalf("stdout = %q, want it to report the adopted daemon's pid", got)
+	}
+}
+
+// TestBusyRestartScalesTheWaitFromOnDiskState pins the #319 fallback: the very
+// daemon whose shutdown takes minutes is the one too busy to answer
+// cluster.list, so the stop-wait must scale from on-disk state instead of
+// collapsing to the base timeout.
+func TestBusyRestartScalesTheWaitFromOnDiskState(t *testing.T) {
+	fake := newFakeDaemon(t, daemon.ProtocolVersion)
+	stubDaemonRestart(t, fake, unsupervisedDaemon)
+	shortenDaemonWaits(t, 20*time.Millisecond, time.Hour)
+	stubRunningClusters(t, func(string) (clusterActivity, error) {
+		return clusterActivity{}, errors.New("tbxd did not answer cluster.list within 3s")
+	})
+	stubOnDiskVMCount(t, 3)
+	previousAlive := daemonProcessAlive
+	t.Cleanup(func() { daemonProcessAlive = previousAlive })
+	daemonProcessAlive = func(int) bool { return true }
+	spawned := stubDaemonSpawn(t, func() {})
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr}
+
+	err := command.run([]string{"system", "restart", "--force"})
+	if err == nil {
+		t.Fatal("a daemon that never exits must fail the restart")
+	}
+	if !strings.Contains(err.Error(), "up to 3 VMs") {
+		t.Fatalf("error = %v, want the wait scaled to the 3 on-disk VMs", err)
+	}
+	if *spawned != 0 {
+		t.Fatalf("spawned %d replacements, want none", *spawned)
 	}
 }

@@ -596,6 +596,13 @@ func (s *Server) start(item cluster.Cluster) ([]string, error) {
 		machine, err := s.launchMachine(item, node, nil)
 		if err != nil {
 			rollbackErr := s.rollbackStarted(item.Name, nodes, started)
+			// The rolled-back nodes did launch: they cold-booted and advanced
+			// their disks, so their saved memory no longer matches what is on
+			// disk and must not survive for a later `cluster resume` to restore.
+			// The nodes that never launched keep theirs — nothing touched them.
+			for _, name := range started {
+				discardSavedState(dir, name)
+			}
 			return nil, errors.Join(fmt.Errorf("create VM %s: %w", node.Name, err), rollbackErr)
 		}
 		nodes[node.Name] = machine
@@ -606,9 +613,10 @@ func (s *Server) start(item cluster.Cluster) ([]string, error) {
 	// reporting the cluster Suspended and the hint keeps recommending a restore
 	// onto memory that no longer matches what is running. The saves are only
 	// superseded once EVERY launch has succeeded — launchMachine never reads a
-	// save, and a later node's failure rolls the whole start back, so discarding
-	// inside the loop would leave `cluster resume` a half-suspended set to
-	// restore from (mirrors resumeNodeBatch's batch commit).
+	// save, so a launch that never happened leaves its save intact. A failure
+	// partway through discards only the saves of the nodes that did launch (see
+	// the rollback above): those cold-booted and advanced their disks, while the
+	// untouched members stay resumable.
 	var discarded bool
 	var discardFailures []string
 	for _, name := range started {

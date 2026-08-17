@@ -125,12 +125,12 @@ func TestStartClusterKeepsSavedStateWhenLaunchFails(t *testing.T) {
 	}
 }
 
-// TestStartClusterKeepsEverySavedStateWhenALaterLaunchFails is the batch half:
-// an earlier node's launch succeeding does not commit its save, because a later
-// node's failure rolls the whole start back. Discarding as each launch lands
-// would leave `cluster resume` a half-suspended set to restore from — one stale
-// member restored, the rest cold-booted.
-func TestStartClusterKeepsEverySavedStateWhenALaterLaunchFails(t *testing.T) {
+// TestStartClusterDiscardsOnlyLaunchedNodesSavedStateWhenALaterLaunchFails is
+// the rollback half: a node that did launch cold-booted and advanced its disk,
+// so its saved memory is stale even though the start was rolled back and must
+// not survive for a later resume to restore onto the moved disk. A node that
+// never launched was not touched, so its save stays resumable.
+func TestStartClusterDiscardsOnlyLaunchedNodesSavedStateWhenALaterLaunchFails(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	item, err := cluster.New("late-fail-save", 0, 1, 1, cluster.NodeDefaults{CPUs: 1, MemoryMiB: 1024})
 	if err != nil {
@@ -164,13 +164,12 @@ func TestStartClusterKeepsEverySavedStateWhenALaterLaunchFails(t *testing.T) {
 	if _, err := service.startCluster(raw); err == nil {
 		t.Fatal("startCluster() succeeded despite a failing launch")
 	}
-	for _, node := range item.Nodes {
-		if !savedStateExists(t, item.Name, node.Name) {
-			t.Fatalf("a rolled-back start discarded %s's saved state; the suspended set is now inconsistent", node.Name)
-		}
+	launched, neverLaunched := item.Nodes[0].Name, item.Nodes[1].Name
+	if savedStateExists(t, item.Name, launched) {
+		t.Fatalf("%s cold-booted but kept its saved state; a resume would restore memory onto a disk that moved", launched)
 	}
-	if !clusterHasSavedState(item.Name) {
-		t.Fatal("the cluster stopped reporting saved state after a rolled-back start")
+	if !savedStateExists(t, item.Name, neverLaunched) {
+		t.Fatalf("a rolled-back start discarded %s's saved state even though it never launched", neverLaunched)
 	}
 }
 

@@ -54,6 +54,19 @@ type provisionTask struct {
 	// force skips the fast no-op path: a topology mutation changes the machine
 	// config already-configured nodes need, which no health probe observes.
 	force bool
+	// done is closed once this task has run its course, so an operation that
+	// destroys the cluster's files can wait the reconcile out instead of racing
+	// it (#334).
+	done chan struct{}
+}
+
+// finish releases everyone waiting on this task. It is the task's own end
+// marker: every task returned by beginProvisionTasksLocked is closed exactly
+// once, whether it ran, failed, or was cancelled before it started.
+func (t provisionTask) finish() {
+	if t.done != nil {
+		close(t.done)
+	}
 }
 
 func (s *Server) handleProvisioningLocked(request Request, maintenance map[string]maintenanceObservation, storage map[string]storageObservation) (any, []provisionTask, error) {
@@ -137,8 +150,9 @@ func (s *Server) beginProvisionTasksLocked(items []cluster.Cluster) []provisionT
 		}
 		s.provisionSequence++
 		ctx, cancel := context.WithCancel(s.lifecycleContext)
-		s.provisions[item.Name] = activeProvision{generation: s.provisionSequence, cancel: cancel}
-		tasks = append(tasks, provisionTask{item: item, ctx: ctx, generation: s.provisionSequence, action: -1})
+		done := make(chan struct{})
+		s.provisions[item.Name] = activeProvision{generation: s.provisionSequence, cancel: cancel, done: done}
+		tasks = append(tasks, provisionTask{item: item, ctx: ctx, generation: s.provisionSequence, action: -1, done: done})
 	}
 	return tasks
 }
@@ -161,7 +175,10 @@ func (s *Server) beginNodeMutationProvisionLocked(item cluster.Cluster) ([]provi
 		// topology that no longer matches. Invalidating only drops the memo —
 		// the phase is re-probed, not parked at `provisioning`.
 		s.invalidateStoragePhaseLocked(item.Name)
-		return nil, clusterIsProvisioned(item)
+		// A cluster with no members left has nothing to start and nothing to
+		// reconcile, so "start the members" would be advice about a cluster that
+		// no longer has any.
+		return nil, clusterIsProvisioned(item) && len(item.Nodes) > 0
 	}
 	tasks := s.beginProvisionTasksLocked([]cluster.Cluster{item})
 	for i := range tasks {
@@ -188,10 +205,13 @@ func nodeAddDeferredReconcileWarning(nodeName string) string {
 }
 
 // nodeRemoveDeferredReconcileWarning is the other half: the member is gone from
-// state and disk, but the running cluster has not been told.
+// state and disk, but the cluster has not been reconciled. It deliberately does
+// not promise that starting the members finishes the job — the reconcile a start
+// schedules is unforced and never deletes the removed member's Kubernetes Node
+// object; that cleanup is named by stoppedClusterKubernetesNodeWarning.
 func nodeRemoveDeferredReconcileWarning(nodeName string) string {
 	return fmt.Sprintf(
-		"cluster members are stopped; the cluster is not reconciled until every member is running — removing %s takes effect once they are started",
+		"cluster members are stopped; %s is gone from the cluster's state and disk, but the cluster is not reconciled until every member is running again",
 		nodeName,
 	)
 }
@@ -202,6 +222,37 @@ func (s *Server) finishProvision(task provisionTask) {
 	if active, ok := s.provisions[task.item.Name]; ok && active.generation == task.generation {
 		active.cancel()
 		delete(s.provisions, task.item.Name)
+	}
+}
+
+// provisionDrainTimeout bounds how long an operation waits for a cancelled
+// reconcile to actually stop. A reconcile that ignores its cancellation must
+// not hang `cluster destroy` forever; the wait is logged if it expires. It is a
+// var only so tests can shorten it.
+var provisionDrainTimeout = 30 * time.Second
+
+// drainProvision cancels a cluster's reconcile and waits for it to finish. It
+// must be called WITHOUT opMu held: the reconcile's epilogue takes opMu to
+// record its phase and retire itself, so waiting under the lock deadlocks.
+//
+// Cancelling alone is not enough for an operation that deletes the cluster's
+// files: the goroutine can still be mid-write into the directory being removed,
+// and its epilogue would re-register state for a cluster that no longer exists.
+func (s *Server) drainProvision(name string) {
+	s.opMu.Lock()
+	active, ok := s.provisions[name]
+	if ok {
+		active.cancel()
+		delete(s.provisions, name)
+	}
+	s.opMu.Unlock()
+	if !ok || active.done == nil {
+		return
+	}
+	select {
+	case <-active.done:
+	case <-time.After(provisionDrainTimeout):
+		log.Printf("provision %s: reconcile did not stop within %s; proceeding", name, provisionDrainTimeout)
 	}
 }
 
@@ -226,14 +277,25 @@ func (s *Server) cancelAllProvisionsLocked() {
 }
 
 func (s *Server) runProvisionTasks(data any, tasks []provisionTask) error {
+	// Every task must release its waiters, including the ones a failure never
+	// gets to: a drain that outlived its task would hang the operation waiting
+	// for it.
+	finished := 0
+	defer func() {
+		for _, pending := range tasks[finished:] {
+			pending.finish()
+		}
+	}()
 	for i, task := range tasks {
 		narration, phase, err := s.provisionCNI(task.ctx, task.item, task.force)
 		if task.item.CSI != "" {
 			s.opMu.Lock()
-			s.recordStoragePhaseLocked(task.item.Name, phase)
+			s.recordStoragePhaseIfCurrentLocked(task.item.Name, task.generation, phase)
 			s.opMu.Unlock()
 		}
 		s.finishProvision(task)
+		finished = i + 1
+		task.finish()
 		if err != nil {
 			s.opMu.Lock()
 			for _, pending := range tasks[i+1:] {
@@ -643,6 +705,21 @@ func (s *Server) invalidateStoragePhaseLocked(name string) {
 		active.cancel()
 		delete(s.storageStatusProbes, name)
 	}
+}
+
+// recordStoragePhaseIfCurrentLocked writes a finished pass's storage phase only
+// while that pass is still the cluster's active one. A superseded task — one a
+// newer reconcile replaced, or one a stop/suspend/destroy cancelled outright —
+// finishes with a phase that describes a cluster state nobody is in any more,
+// and letting it write would park a stale `live` over a fresh `provisioning`, or
+// resurrect an entry for a cluster whose files are already gone (#334).
+func (s *Server) recordStoragePhaseIfCurrentLocked(name string, generation uint64, phase StoragePhase) {
+	active, ok := s.provisions[name]
+	if !ok || active.generation != generation {
+		log.Printf("provision %s: superseded pass, storage phase %q not recorded", name, phase)
+		return
+	}
+	s.recordStoragePhaseLocked(name, phase)
 }
 
 func (s *Server) recordStoragePhaseLocked(name string, phase StoragePhase) {

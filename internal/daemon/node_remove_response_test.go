@@ -131,7 +131,17 @@ func TestNodeRemoveSkipsKubernetesNodeDeletionOnAStoppedCluster(t *testing.T) {
 		return nil
 	}
 
-	if response := dispatchNodeRemove(t, service, item.Name, "demo-worker-2", false); !response.OK {
+	response := dispatchNodeRemove(t, service, item.Name, "demo-worker-2", false)
+	if !response.OK {
 		t.Fatalf("node.remove on a stopped cluster failed: %s", response.Error)
+	}
+	// Nothing deletes the Node object later — the reconcile a start schedules is
+	// unforced and readiness ignores unexpected nodes — so the operator has to be
+	// told it is still there and how to clear it.
+	status := decodeNodeStatus(t, response)
+	for _, want := range []string{"demo-worker-2", "kubectl delete node demo-worker-2"} {
+		if !strings.Contains(status.Warning, want) {
+			t.Fatalf("stopped-cluster removal warning %q does not mention %q", status.Warning, want)
+		}
 	}
 }

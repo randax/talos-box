@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/hypervisor"
@@ -205,7 +206,15 @@ func saveStatePath(dir, node string) string {
 func discardSavedState(dir, nodeName string) (bool, string) {
 	path := saveStatePath(dir, nodeName)
 	if _, err := os.Stat(path); err != nil {
-		return false, ""
+		if errors.Is(err, os.ErrNotExist) {
+			return false, ""
+		}
+		// The save may well be there; a stat that failed for any other reason
+		// (permissions, an unreadable directory) proves nothing, and silently
+		// treating it as absent would leave the survivor to resurrect the
+		// suspended status and the resume hint.
+		log.Printf("discard saved state %s: %v", path, err)
+		return false, undiscardedSaveStateWarning(nodeName, err)
 	}
 	if err := os.Remove(path); err != nil {
 		log.Printf("discard saved state %s: %v", path, err)
@@ -213,6 +222,36 @@ func discardSavedState(dir, nodeName string) (bool, string) {
 	}
 	log.Printf("discarded saved state %s: cold boot", path)
 	return true, ""
+}
+
+// discardClusterSavedStates drops every save in a cluster directory, node names
+// unknown. A snapshot restore rewrites the node disks underneath the saved
+// memory, so every save in the directory is invalid afterwards — including one
+// belonging to a node the snapshot does not even contain. It reports whether
+// anything was discarded plus one warning per save that survived, exactly like
+// the per-node discard.
+func discardClusterSavedStates(dir string) (bool, []string) {
+	matches, err := filepath.Glob(filepath.Join(dir, "*"+saveStateSuffix))
+	if err != nil {
+		log.Printf("discard saved states in %s: %v", dir, err)
+		return false, []string{undiscardedSaveStateWarning("this cluster", err)}
+	}
+	var discarded bool
+	var failures []string
+	for _, path := range matches {
+		if err := os.Remove(path); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			log.Printf("discard saved state %s: %v", path, err)
+			node := strings.TrimSuffix(filepath.Base(path), saveStateSuffix)
+			failures = append(failures, undiscardedSaveStateWarning(node, err))
+			continue
+		}
+		log.Printf("discarded saved state %s: disks were replaced", path)
+		discarded = true
+	}
+	return discarded, failures
 }
 
 // discardedSaveStateWarning tells the operator that a cold boot threw suspended

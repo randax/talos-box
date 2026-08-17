@@ -74,6 +74,10 @@ func saveSettings(path string, current settings) error {
 		_ = tmp.Close()
 		return fmt.Errorf("write daemon settings: %w", err)
 	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync daemon settings: %w", err)
+	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close daemon settings: %w", err)
 	}

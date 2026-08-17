@@ -344,7 +344,6 @@ func TestPruneDiskAccountsForCrashTempArtifacts(t *testing.T) {
 		{filepath.Join(root, "schematic", "v1.2.3", "amd64", ".metal-amd64.raw.xz-stale"), "temp-archive"},
 		{filepath.Join(root, "schematic", "v1.2.3", "amd64", "keep.txt"), "keep"},
 	}
-	var wantBytes int64
 	for _, item := range paths {
 		if err := os.MkdirAll(filepath.Dir(item.path), 0o755); err != nil {
 			t.Fatal(err)
@@ -352,20 +351,20 @@ func TestPruneDiskAccountsForCrashTempArtifacts(t *testing.T) {
 		if err := os.WriteFile(item.path, []byte(item.body), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if filepath.Base(item.path) != "keep.txt" {
-			wantBytes += int64(len(item.body))
-		}
 	}
 
 	result, err := cache.PruneDisk()
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Temporaries are swept silently: they belong to no image the user was ever
+	// shown, so neither the count nor the byte total may claim them — a
+	// "0 image(s), N bytes" summary is the contradiction #320 removed.
 	if result.ImageCount != 0 {
 		t.Fatalf("ImageCount = %d, want 0", result.ImageCount)
 	}
-	if result.ImageBytes != wantBytes {
-		t.Fatalf("ImageBytes = %d, want %d", result.ImageBytes, wantBytes)
+	if result.ImageBytes != 0 {
+		t.Fatalf("ImageBytes = %d, want 0 for a temporaries-only sweep", result.ImageBytes)
 	}
 	for _, path := range []string{
 		filepath.Join(root, "schematic", "v1.2.3", "amd64", ".disk.raw-stale"),

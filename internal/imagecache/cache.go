@@ -522,11 +522,13 @@ func (c *Cache) pruneKnownDiskArtifacts(keep func(Combination) (bool, error)) (C
 			}
 			bytes += action.size
 		}
-		result.ImageBytes += bytes
 		if combination.reportable() {
-			// The count is the number of combinations reported, so the
-			// summary line and the itemized list cannot disagree.
+			// Count and bytes both cover exactly the reported combinations, so
+			// the summary line, the byte total and the itemized list cannot
+			// disagree. Abandoned temporaries are swept silently: their bytes
+			// belong to no image the user was ever shown.
 			result.ImageCount++
+			result.ImageBytes += bytes
 			result.Images = append(result.Images, PrunedCombination{Combination: combination.combination, Bytes: bytes})
 		}
 	}
