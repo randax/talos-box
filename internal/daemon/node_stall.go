@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"log"
+	"strings"
 	"sync"
 	"time"
 )
@@ -24,6 +25,118 @@ func (s *Server) recordVMStart(clusterName, nodeName string) {
 		s.vmStarts[clusterName] = nodes
 	}
 	nodes[nodeName] = time.Now()
+	// A relaunched node has answered nothing yet, so its stall is aged from the
+	// new start time, not from whatever the previous incarnation observed.
+	s.reachability.forget(nodeKey(clusterName, nodeName))
+	s.stalls.forget(nodeKey(clusterName, nodeName))
+}
+
+// nodeKey is the cluster-scoped identity the daemon-side node trackers share.
+func nodeKey(clusterName, nodeName string) string { return clusterName + "/" + nodeName }
+
+// forgetNode drops every daemon-side observation of one node, so a removed node
+// leaves nothing behind that a same-named successor could inherit.
+func (s *Server) forgetNode(clusterName, nodeName string) {
+	if nodes, ok := s.vmStarts[clusterName]; ok {
+		delete(nodes, nodeName)
+		if len(nodes) == 0 {
+			delete(s.vmStarts, clusterName)
+		}
+	}
+	s.reachability.forget(nodeKey(clusterName, nodeName))
+	s.stalls.forget(nodeKey(clusterName, nodeName))
+}
+
+// forgetCluster drops the observations of every node in a cluster.
+func (s *Server) forgetCluster(clusterName string) {
+	delete(s.vmStarts, clusterName)
+	prefix := clusterName + "/"
+	s.reachability.forgetPrefix(prefix)
+	s.stalls.forgetPrefix(prefix)
+}
+
+// forgetAllNodeTracking clears the trackers wholesale — Shutdown closes every
+// VM, so no observation of one survives the daemon.
+func (s *Server) forgetAllNodeTracking() {
+	s.vmStarts = nil
+	s.reachability.forgetAll()
+	s.stalls.forgetAll()
+}
+
+// nodeReachability is what the daemon has observed about one node since its VM
+// was launched: whether it ever answered, and — if it answered and then went
+// quiet — when the silence started.
+type nodeReachability struct {
+	answered bool
+	since    time.Time
+}
+
+// reachabilityLog tracks the transition into PhaseUnreachable. It exists
+// because VM uptime is not unreachability: a node that served for hours before
+// going quiet must be aged from the moment it stopped answering (#288).
+// refreshNodeStatuses runs outside opMu and concurrently per connection, so the
+// log carries its own lock.
+type reachabilityLog struct {
+	mu    sync.Mutex
+	nodes map[string]nodeReachability
+}
+
+// observe records one phase observation and reports when the node stopped
+// answering, or nil when it has never answered since its VM launched — in that
+// case the launch time is the only honest clock, and the caller uses it.
+func (l *reachabilityLog) observe(key string, phase Phase, now time.Time) *time.Time {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.nodes == nil {
+		l.nodes = make(map[string]nodeReachability)
+	}
+	switch phase {
+	case PhaseStopped:
+		// A stopped VM starts over: its next boot is aged from its own launch.
+		delete(l.nodes, key)
+		return nil
+	case PhaseUnreachable:
+		entry := l.nodes[key]
+		if !entry.answered {
+			return nil
+		}
+		if entry.since.IsZero() {
+			entry.since = now
+			l.nodes[key] = entry
+		}
+		since := entry.since
+		return &since
+	default:
+		l.nodes[key] = nodeReachability{answered: true}
+		return nil
+	}
+}
+
+func (l *reachabilityLog) forget(key string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.nodes, key)
+}
+
+func (l *reachabilityLog) forgetPrefix(prefix string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	forgetPrefix(l.nodes, prefix)
+}
+
+func (l *reachabilityLog) forgetAll() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.nodes = nil
+}
+
+// forgetPrefix deletes every cluster-scoped key belonging to one cluster.
+func forgetPrefix[V any](entries map[string]V, prefix string) {
+	for key := range entries {
+		if strings.HasPrefix(key, prefix) {
+			delete(entries, key)
+		}
+	}
 }
 
 // vmStartedAt reports when this daemon launched a node's VM, if it did.
@@ -71,6 +184,18 @@ func (l *stallLog) forget(key string) {
 	delete(l.stalls, key)
 }
 
+func (l *stallLog) forgetPrefix(prefix string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	forgetPrefix(l.stalls, prefix)
+}
+
+func (l *stallLog) forgetAll() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.stalls = nil
+}
+
 // logNodeStalls records a node crossing the stall threshold, and its later
 // recovery, in the daemon log — the surface an operator is told to check when
 // the CLI hint escalates.
@@ -80,14 +205,17 @@ func (s *Server) logNodeStalls(statuses []ClusterStatus, now time.Time) {
 			if node.Phase == PhaseStopped {
 				// A stopped node is not a stalled node; forget it silently
 				// so a later boot reports its own stall from scratch.
-				s.stalls.forget(status.Name + "/" + node.Name)
+				s.stalls.forget(nodeKey(status.Name, node.Name))
 				continue
 			}
 			age := node.UnreachableFor(now)
 			stalled := node.Phase == PhaseUnreachable && age > nodeStallThreshold
-			key := status.Name + "/" + node.Name
+			key := nodeKey(status.Name, node.Name)
 			crossed, recoveredAfter, wasStalled := s.stalls.observe(key, stalled, age)
 			switch {
+			case crossed && node.answeredSinceStart():
+				log.Printf("status %s: node %s stopped answering on apid %s ago; inspect it live: tbx console %s %s",
+					status.Name, node.Name, formatStallDuration(age), status.Name, node.Name)
 			case crossed:
 				log.Printf("status %s: node %s has not answered on apid for %s since its VM started; inspect it live: tbx console %s %s",
 					status.Name, node.Name, formatStallDuration(age), status.Name, node.Name)

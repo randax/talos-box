@@ -208,14 +208,23 @@ func stalledNodesHint(clusterName string, stalled []NodeStatus, now time.Time) s
 		return ""
 	case 1:
 		node := stalled[0]
+		if node.answeredSinceStart() {
+			return fmt.Sprintf("%s stopped answering %s ago — inspect it live: tbx console %s %s; then run: tbx doctor",
+				node.Name, formatStallDuration(node.UnreachableFor(now)), clusterName, node.Name)
+		}
 		return fmt.Sprintf("%s has not answered for %s since its VM started — watch it boot: tbx console %s %s; then run: tbx doctor",
 			node.Name, formatStallDuration(node.UnreachableFor(now)), clusterName, node.Name)
 	default:
 		descriptions := make([]string, 0, len(stalled))
 		for _, node := range stalled {
-			descriptions = append(descriptions, fmt.Sprintf("%s (%s)", node.Name, formatStallDuration(node.UnreachableFor(now))))
+			age := formatStallDuration(node.UnreachableFor(now))
+			if node.answeredSinceStart() {
+				descriptions = append(descriptions, fmt.Sprintf("%s (stopped answering %s ago)", node.Name, age))
+				continue
+			}
+			descriptions = append(descriptions, fmt.Sprintf("%s (%s since its VM started)", node.Name, age))
 		}
-		return fmt.Sprintf("%d node(s) have not answered since their VMs started: %s — watch one boot: tbx console %s <node>; then run: tbx doctor",
+		return fmt.Sprintf("%d node(s) are not answering: %s — inspect one live: tbx console %s <node>; then run: tbx doctor",
 			len(stalled), strings.Join(descriptions, ", "), clusterName)
 	}
 }

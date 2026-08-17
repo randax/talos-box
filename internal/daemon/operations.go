@@ -167,16 +167,30 @@ type NodeStatus struct {
 	// the clock a stalled boot is measured against (#288). Nil means the VM
 	// was not started by this daemon process.
 	StartedAt *time.Time `json:"startedAt,omitempty"`
+	// UnreachableSince is when a node that had been answering stopped: the
+	// clock a stall is aged against once the node has proved it can answer
+	// (#288). Nil means it has not answered since its VM launched, so StartedAt
+	// is the only honest clock — and nil for a node that is answering now.
+	UnreachableSince *time.Time `json:"unreachableSince,omitempty"`
 }
 
-// UnreachableFor reports how long the node's VM has been running without the
-// node answering. It is zero when the daemon does not know the start time.
+// UnreachableFor reports how long the node has been silent: since it stopped
+// answering when it ever answered, otherwise since its VM launched. It is zero
+// when the daemon knows neither — it cannot prove the node is stuck.
 func (n NodeStatus) UnreachableFor(now time.Time) time.Duration {
-	if n.StartedAt == nil {
+	switch {
+	case n.UnreachableSince != nil:
+		return now.Sub(*n.UnreachableSince)
+	case n.StartedAt != nil:
+		return now.Sub(*n.StartedAt)
+	default:
 		return 0
 	}
-	return now.Sub(*n.StartedAt)
 }
+
+// answeredSinceStart reports whether the node answered at least once since its
+// VM launched, which decides how its silence is described.
+func (n NodeStatus) answeredSinceStart() bool { return n.UnreachableSince != nil }
 
 // StoragePhase is the observed storage readiness for a CSI-backed cluster.
 type StoragePhase string
@@ -686,6 +700,7 @@ func (s *Server) stop(name string) error {
 	nodes := s.vms[name]
 	if len(nodes) == 0 {
 		delete(s.vms, name)
+		s.forgetCluster(name)
 		return nil
 	}
 	return s.closeNodes(name, nodes, sortedNodeNames(nodes))
@@ -739,9 +754,11 @@ func (s *Server) closeNodes(clusterName string, nodes map[string]hypervisor.Mach
 			continue
 		}
 		delete(nodes, name)
+		s.forgetNode(clusterName, name)
 	}
 	if len(nodes) == 0 {
 		delete(s.vms, clusterName)
+		s.forgetCluster(clusterName)
 	}
 	return resultErr
 }
@@ -775,6 +792,7 @@ func (s *Server) destroyCluster(raw json.RawMessage) (map[string]string, error) 
 	if err := cluster.Destroy(args.Name); err != nil {
 		return nil, err
 	}
+	s.forgetCluster(args.Name)
 	s.invalidateStoragePhaseLocked(args.Name)
 	if err := SyncResolverFiles(); err != nil {
 		log.Printf("resolver files after destroying %s: %v", args.Name, err)
@@ -920,6 +938,7 @@ func (s *Server) removeNodeLocked(raw json.RawMessage) (NodeStatus, []provisionT
 		}
 		delete(s.vms[item.Name], node.Name)
 	}
+	s.forgetNode(item.Name, node.Name)
 	if err := cluster.Save(item); err != nil {
 		return NodeStatus{}, nil, err
 	}
@@ -1013,6 +1032,7 @@ func (s *Server) refreshNodeStatuses(statuses []ClusterStatus) {
 			node := cluster.Node{Name: snapshot.Name, Role: snapshot.Role, MAC: snapshot.MAC}
 			refreshed := nodeStatusWith(node, statuses[i].subnetIndex, snapshot.Phase != PhaseStopped, lookupIP, probe)
 			refreshed.StartedAt = snapshot.StartedAt
+			refreshed.UnreachableSince = s.reachability.observe(nodeKey(statuses[i].Name, node.Name), refreshed.Phase, now)
 			statuses[i].Nodes[j] = refreshed
 		}
 		statuses[i].Hints = hintsAt(statuses[i], now)

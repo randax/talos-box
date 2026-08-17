@@ -44,7 +44,10 @@ type Server struct {
 	vms  map[string]map[string]hypervisor.Machine
 	// vmStarts records when each node's VM was launched, so a node that never
 	// answers can be aged against the boot window it was promised (#288).
-	vmStarts              map[string]map[string]time.Time
+	vmStarts map[string]map[string]time.Time
+	// reachability records when a node that had been answering went quiet, so
+	// a stall is aged from that transition rather than from VM uptime (#288).
+	reachability          reachabilityLog
 	stalls                stallLog
 	provisions            map[string]activeProvision
 	storagePhases         map[string]StoragePhase
@@ -319,6 +322,7 @@ func (s *Server) Shutdown() error {
 	}
 	err := closeVMs(all)
 	s.vms = make(map[string]map[string]hypervisor.Machine)
+	s.forgetAllNodeTracking()
 	if s.mirrors != nil {
 		s.mirrors.Close()
 	}
