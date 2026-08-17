@@ -103,7 +103,7 @@ func TestSnapshotCreateRefusesOldDaemonProtocol(t *testing.T) {
 	if err == nil {
 		t.Fatalf("snapshot create against a protocol-%d daemon succeeded, want handshake refusal", snapshotCreateWarningProtocolVersion-1)
 	}
-	if !strings.Contains(err.Error(), "restart or upgrade tbxd") {
+	if !strings.Contains(err.Error(), "run: tbx system restart") {
 		t.Fatalf("handshake error = %q, want upgrade guidance", err)
 	}
 }
@@ -129,7 +129,7 @@ func TestSnapshotRestoreRefusesOldDaemonProtocol(t *testing.T) {
 	if err == nil {
 		t.Fatal("snapshot restore against a protocol-5 daemon succeeded, want handshake refusal")
 	}
-	if !strings.Contains(err.Error(), "restart or upgrade tbxd") {
+	if !strings.Contains(err.Error(), "run: tbx system restart") {
 		t.Fatalf("handshake error = %q, want upgrade guidance", err)
 	}
 }

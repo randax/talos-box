@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -48,12 +49,12 @@ func (c cli) ensureProtocolAtLeast(minimum int, feature string) error {
 	var info daemon.Info
 	if err := c.call("daemon.info", struct{}{}, &info); err != nil {
 		if strings.Contains(err.Error(), "unknown operation") {
-			return fmt.Errorf("tbxd is too old; restart or upgrade tbxd to use %s", feature)
+			return fmt.Errorf("tbxd is too old to use %s; run: tbx system restart", feature)
 		}
 		return err
 	}
 	if info.ProtocolVersion < minimum {
-		return fmt.Errorf("tbxd protocol %d is too old; restart or upgrade tbxd to use %s", info.ProtocolVersion, feature)
+		return fmt.Errorf("tbxd protocol %d is too old to use %s; run: tbx system restart", info.ProtocolVersion, feature)
 	}
 	if info.ProtocolVersion > daemon.ProtocolVersion {
 		return fmt.Errorf("tbx is too old: protocol %d does not support tbxd protocol %d; upgrade tbx to use %s", daemon.ProtocolVersion, info.ProtocolVersion, feature)
@@ -98,7 +99,182 @@ func (c cli) ensureCacheWarmSupport() error {
 	return c.ensureProtocolAtLeast(cacheWarmProtocolVersion, "cache warm/check")
 }
 
+// daemonSession memoizes the connect-time protocol handshake for one tbx
+// process, so the gate costs a single extra exchange no matter how many verbs
+// a command sends. A cli without a session skips the gate, which is how tests
+// drive call() against a scripted daemon.
+type daemonSession struct {
+	once sync.Once
+	err  error
+}
+
+func newDaemonSession() *daemonSession { return &daemonSession{} }
+
+// ensureDaemonProtocol gates every verb on the daemon speaking this CLI's
+// protocol: a skew that only surfaces on a gated verb lets a stale daemon serve
+// cluster lifecycle all session (#290). A stale daemon that tbx owns is
+// restarted in place; anything else fails with a recovery command.
+func (c cli) ensureDaemonProtocol() error {
+	if c.daemon == nil {
+		return nil
+	}
+	c.daemon.once.Do(func() { c.daemon.err = c.handshakeDaemon() })
+	return c.daemon.err
+}
+
+func (c cli) handshakeDaemon() error {
+	socketPath, err := daemon.SocketPath()
+	if err != nil {
+		return err
+	}
+	info, pid, err := daemonHandshake(socketPath)
+	if err != nil {
+		var connectionError dialError
+		if errors.As(err, &connectionError) {
+			// no daemon is running; call spawns one from this build
+			return nil
+		}
+		return err
+	}
+	switch {
+	case info.ProtocolVersion == daemon.ProtocolVersion:
+		return nil
+	case info.ProtocolVersion > daemon.ProtocolVersion:
+		return fmt.Errorf("tbxd protocol %d is newer than tbx protocol %d; upgrade tbx", info.ProtocolVersion, daemon.ProtocolVersion)
+	}
+	if _, _, err := replaceDaemon(socketPath, info, pid); err != nil {
+		return fmt.Errorf("tbxd protocol %d is older than tbx protocol %d and could not be restarted (%w); run: tbx system restart",
+			info.ProtocolVersion, daemon.ProtocolVersion, err)
+	}
+	_, err = fmt.Fprintf(c.err, "restarted stale tbxd (protocol %d < %d)\n", info.ProtocolVersion, daemon.ProtocolVersion)
+	return err
+}
+
+// daemonHandshake reports the running daemon's protocol and pid. The pid comes
+// from the socket peer rather than the response, so a daemon too old to answer
+// daemon.info at all can still be identified and replaced.
+func daemonHandshake(socketPath string) (daemon.Info, int, error) {
+	connection, err := net.DialTimeout("unix", socketPath, 250*time.Millisecond)
+	if err != nil {
+		return daemon.Info{}, 0, dialError{err: err}
+	}
+	defer func() { _ = connection.Close() }()
+	pid, pidErr := daemon.PeerPID(connection)
+	if pidErr != nil {
+		pid = 0
+	}
+
+	request := daemon.Request{Op: "daemon.info", Args: json.RawMessage(`{}`)}
+	if err := json.NewEncoder(connection).Encode(request); err != nil {
+		return daemon.Info{}, pid, fmt.Errorf("write daemon request: %w", err)
+	}
+	var response daemon.Response
+	if err := json.NewDecoder(connection).Decode(&response); err != nil {
+		return daemon.Info{}, pid, fmt.Errorf("read daemon response: %w", err)
+	}
+	if !response.OK {
+		if strings.Contains(response.Error, "unknown operation") {
+			return daemon.Info{}, pid, nil
+		}
+		return daemon.Info{}, pid, errors.New(response.Error)
+	}
+	var info daemon.Info
+	if len(response.Data) > 0 {
+		if err := json.Unmarshal(response.Data, &info); err != nil {
+			return daemon.Info{}, pid, fmt.Errorf("decode daemon result: %w", err)
+		}
+	}
+	return info, pid, nil
+}
+
+// process-level seams: the restart path signals and spawns real processes,
+// which tests replace with a scripted daemon.
+var (
+	terminateDaemonProcess = func(pid int) error { return syscall.Kill(pid, syscall.SIGTERM) }
+	spawnDaemonProcess     = startDaemon
+	supervisedDaemon       = supervisedDaemonUnit
+)
+
+// supervisedDaemonUnit reports whether a service manager owns tbxd. Such a
+// daemon is not tbx's to replace: the supervisor decides which binary comes
+// back, so tbx reports instead of killing it.
+func supervisedDaemonUnit() (bool, string) {
+	paths := []string{
+		"/Library/LaunchDaemons/dev.talosbox.tbxd.plist",
+		"/etc/systemd/system/tbxd.service",
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		paths = append(paths,
+			filepath.Join(home, "Library", "LaunchAgents", "dev.talosbox.tbxd.plist"),
+			filepath.Join(home, ".config", "systemd", "user", "tbxd.service"))
+	}
+	for _, path := range paths {
+		if _, err := os.Stat(path); err == nil {
+			return true, "tbxd is managed by " + path
+		}
+	}
+	return false, ""
+}
+
+// replaceDaemon replaces the running daemon with one spawned from this build
+// and returns the replacement's info and pid. An unidentifiable or supervised
+// daemon is left alone: killing a process tbx cannot prove it owns is worse
+// than reporting the skew.
+func replaceDaemon(socketPath string, info daemon.Info, pid int) (daemon.Info, int, error) {
+	if supervised, reason := supervisedDaemon(); supervised {
+		return info, pid, errors.New(reason)
+	}
+	if pid <= 0 {
+		return info, pid, errors.New("the running tbxd could not be identified")
+	}
+	if err := terminateDaemonProcess(pid); err != nil {
+		return info, pid, fmt.Errorf("stop tbxd (pid %d): %w", pid, err)
+	}
+	if err := waitForDaemonExit(socketPath); err != nil {
+		return info, pid, err
+	}
+	if _, err := spawnDaemonProcess(); err != nil {
+		return info, pid, err
+	}
+	return waitForCurrentDaemon(socketPath)
+}
+
+func waitForDaemonExit(socketPath string) error {
+	deadline := time.Now().Add(daemonWaitTimeout)
+	for {
+		connection, err := net.DialTimeout("unix", socketPath, 250*time.Millisecond)
+		if err != nil {
+			return nil
+		}
+		_ = connection.Close()
+		if time.Now().After(deadline) {
+			return fmt.Errorf("tbxd still owns %s after %s", socketPath, daemonWaitTimeout)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func waitForCurrentDaemon(socketPath string) (daemon.Info, int, error) {
+	deadline := time.Now().Add(daemonWaitTimeout)
+	for {
+		info, pid, err := daemonHandshake(socketPath)
+		if err == nil && info.ProtocolVersion == daemon.ProtocolVersion {
+			return info, pid, nil
+		}
+		if time.Now().After(deadline) {
+			if err != nil {
+				return info, pid, fmt.Errorf("the replacement tbxd did not serve %s within %s: %w", socketPath, daemonWaitTimeout, err)
+			}
+			return info, pid, fmt.Errorf("the replacement tbxd still speaks protocol %d, not %d", info.ProtocolVersion, daemon.ProtocolVersion)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 func (c cli) call(op string, args, destination any) error {
+	if err := c.ensureDaemonProtocol(); err != nil {
+		return err
+	}
 	socketPath, err := daemon.SocketPath()
 	if err != nil {
 		return err

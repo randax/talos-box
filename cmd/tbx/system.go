@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/randax/talos-box/internal/daemon"
 	"github.com/randax/talos-box/internal/helper"
 	"github.com/randax/talos-box/internal/resolverset"
 )
@@ -22,9 +23,20 @@ const (
 
 func (c cli) runSystem(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tbx system install|uninstall")
+		return errors.New("usage: tbx system install|uninstall|restart|status")
 	}
 	switch args[0] {
+	// restart and status manage the per-user daemon, so they never need root
+	case "restart":
+		if len(args) != 1 {
+			return errors.New("usage: tbx system restart")
+		}
+		return c.restartDaemon()
+	case "status":
+		if len(args) != 1 {
+			return errors.New("usage: tbx system status")
+		}
+		return c.daemonStatus()
 	case "install":
 		if len(args) > 2 {
 			return errors.New("usage: tbx system install [absolute-helper-path]")
@@ -50,6 +62,70 @@ func (c cli) runSystem(args []string) error {
 		return c.uninstallSystem()
 	}
 	return c.installSystem(args[1:])
+}
+
+// restartDaemon replaces the running tbxd with one spawned from this build, so
+// a protocol skew has a named recovery command instead of a pid hunt (#290).
+func (c cli) restartDaemon() error {
+	socketPath, err := daemon.SocketPath()
+	if err != nil {
+		return err
+	}
+	info, pid, err := daemonHandshake(socketPath)
+	if err != nil {
+		var connectionError dialError
+		if !errors.As(err, &connectionError) {
+			return err
+		}
+		if _, err := spawnDaemonProcess(); err != nil {
+			return err
+		}
+		started, startedPID, err := waitForCurrentDaemon(socketPath)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(c.out, "started tbxd (pid %d, protocol %d)\n", startedPID, started.ProtocolVersion)
+		return err
+	}
+	restarted, restartedPID, err := replaceDaemon(socketPath, info, pid)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(c.out, "restarted tbxd (pid %d, protocol %d)\n", restartedPID, restarted.ProtocolVersion)
+	return err
+}
+
+// daemonStatus reports the running daemon without spawning one, so an operator
+// can see a protocol skew before it bites.
+func (c cli) daemonStatus() error {
+	socketPath, err := daemon.SocketPath()
+	if err != nil {
+		return err
+	}
+	info, pid, err := daemonHandshake(socketPath)
+	if err != nil {
+		var connectionError dialError
+		if !errors.As(err, &connectionError) {
+			return err
+		}
+		_, err := fmt.Fprintf(c.out, "tbxd: not running (tbx protocol %d)\n", daemon.ProtocolVersion)
+		return err
+	}
+	protocol := strconv.Itoa(info.ProtocolVersion)
+	if info.ProtocolVersion == 0 {
+		// pre-daemon.info builds cannot report a version at all
+		protocol = "unknown"
+	}
+	if _, err := fmt.Fprintf(c.out, "tbxd: running (pid %d, protocol %s; tbx protocol %d)\n",
+		pid, protocol, daemon.ProtocolVersion); err != nil {
+		return err
+	}
+	if info.ProtocolVersion == daemon.ProtocolVersion {
+		return nil
+	}
+	_, err = fmt.Fprintf(c.err, "warning: tbxd protocol %s does not match tbx protocol %d; run: tbx system restart\n",
+		protocol, daemon.ProtocolVersion)
+	return err
 }
 
 func (c cli) installSystem(args []string) error {

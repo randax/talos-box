@@ -22,10 +22,12 @@ type cli struct {
 	out io.Writer
 	err io.Writer
 	in  io.Reader
+	// daemon carries the connect-time protocol gate; a nil session skips it
+	daemon *daemonSession
 }
 
 func main() {
-	command := cli{out: os.Stdout, err: os.Stderr, in: os.Stdin}
+	command := cli{out: os.Stdout, err: os.Stderr, in: os.Stdin, daemon: newDaemonSession()}
 	if err := command.run(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "tbx: %v\n", err)
 		os.Exit(1)
@@ -545,7 +547,7 @@ Commands:
   bgp enable|disable <cluster>
   mirror offline [on|off]
   cache pull|prune|warm|list
-  system install|uninstall
+  system install|uninstall|restart|status
   doctor
   version (also --version, -v)
 `

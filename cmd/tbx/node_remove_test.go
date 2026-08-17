@@ -94,7 +94,7 @@ func TestNodeRemoveRefusesOldDaemonProtocol(t *testing.T) {
 	if err == nil {
 		t.Fatal("node remove against a protocol-3 daemon succeeded, want handshake refusal")
 	}
-	if !strings.Contains(err.Error(), "restart or upgrade tbxd") {
+	if !strings.Contains(err.Error(), "run: tbx system restart") {
 		t.Fatalf("handshake error = %q, want upgrade guidance", err)
 	}
 }
