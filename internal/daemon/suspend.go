@@ -194,6 +194,31 @@ func saveStatePath(dir, node string) string {
 	return filepath.Join(dir, node+saveStateSuffix)
 }
 
+// discardSavedState drops a node's suspended memory before it cold-boots. A
+// save is only consumed by a successful resume, so a start that boots the node
+// from disk would otherwise leave a stale save behind: status keeps reporting
+// the cluster Suspended and the resume hint invites a restore onto memory that
+// no longer matches what is running. It reports whether a save was discarded.
+func discardSavedState(dir, nodeName string) bool {
+	path := saveStatePath(dir, nodeName)
+	if _, err := os.Stat(path); err != nil {
+		return false
+	}
+	if err := os.Remove(path); err != nil {
+		log.Printf("discard saved state %s: %v", path, err)
+		return false
+	}
+	log.Printf("discarded saved state %s: cold boot", path)
+	return true
+}
+
+// discardedSaveStateWarning tells the operator that a cold boot threw suspended
+// memory away, because the discard is otherwise invisible: the next status just
+// stops saying Suspended.
+func discardedSaveStateWarning(subject string) string {
+	return fmt.Sprintf("discarded suspended memory state; %s cold-booted", subject)
+}
+
 // clusterHasSavedState reports whether a cluster still holds suspended VM
 // memory on disk. Suspension is otherwise invisible after a daemon restart —
 // the tracked VMs are gone — so this on-disk signal is what tells a client that

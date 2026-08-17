@@ -498,7 +498,7 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 			log.Printf("resolver files for %s: %v", item.Name, err)
 		}
 	}
-	startWarning, err := s.start(item)
+	startWarnings, err := s.start(item)
 	if err != nil {
 		result := summary(item, false)
 		result.setWarnings(append([]string{talosVersionWarning, overcommitWarning}, append(hostPressureWarnings, longhornWarning, longhornCustomSchematicWarning, subnetWarning)...)...)
@@ -512,7 +512,7 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 		return result, startErr
 	}
 	result := summary(item, true)
-	result.setWarnings(append([]string{talosVersionWarning, overcommitWarning}, append(hostPressureWarnings, longhornWarning, longhornCustomSchematicWarning, subnetWarning, startWarning)...)...)
+	result.setWarnings(append([]string{talosVersionWarning, overcommitWarning}, append(hostPressureWarnings, append([]string{longhornWarning, longhornCustomSchematicWarning, subnetWarning}, startWarnings...)...)...)...)
 	return result, nil
 }
 
@@ -543,12 +543,12 @@ func (s *Server) startCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if err != nil {
 		return ClusterSummary{}, err
 	}
-	subnetWarning, err := s.start(item)
+	startWarnings, err := s.start(item)
 	if err != nil {
 		return ClusterSummary{}, err
 	}
 	result := summary(item, true)
-	result.setWarnings(append([]string{overcommitWarning}, append(hostPressureWarnings, longhornWarning, longhornCustomSchematicWarning, subnetWarning)...)...)
+	result.setWarnings(append([]string{overcommitWarning}, append(hostPressureWarnings, append([]string{longhornWarning, longhornCustomSchematicWarning}, startWarnings...)...)...)...)
 	return result, nil
 }
 
@@ -559,14 +559,18 @@ func (s *Server) longhornCustomSchematicWarning(item cluster.Cluster, custom boo
 	return "Longhorn on a custom Talos schematic requires siderolabs/iscsi-tools and siderolabs/util-linux-tools; tbx's default generated schematic already includes them"
 }
 
-func (s *Server) start(item cluster.Cluster) (string, error) {
+func (s *Server) start(item cluster.Cluster) ([]string, error) {
 	// The subnet was decided at create time and belongs to this cluster, so it
 	// is only inspected for advisory routing findings. Re-running the
 	// create-time collision guard would refuse the cluster's own bridge, which
 	// suspend leaves up and an unclean stop can strand (#271).
 	subnetWarning, err := cluster.AttachedSubnetWarning(item.SubnetIndex, s.hostSubnetSources())
 	if err != nil {
-		return "", err
+		return nil, err
+	}
+	dir, err := cluster.Dir(item.Name)
+	if err != nil {
+		return nil, err
 	}
 	nodes := s.vms[item.Name]
 	if nodes == nil {
@@ -574,37 +578,51 @@ func (s *Server) start(item cluster.Cluster) (string, error) {
 		s.vms[item.Name] = nodes
 	}
 	var started []string
+	var discarded bool
 	for _, node := range item.Nodes {
 		if existing := nodes[node.Name]; existing != nil {
 			if existing.Active() {
 				continue
 			}
 			if err := existing.Close(); err != nil {
-				return "", fmt.Errorf("release inactive VM %s: %w", node.Name, err)
+				return nil, fmt.Errorf("release inactive VM %s: %w", node.Name, err)
 			}
 			delete(nodes, node.Name)
+		}
+		// start is a cold boot: suspended memory left by an earlier suspend is
+		// superseded by this launch and must not outlive it, or status keeps
+		// reporting the cluster Suspended and the hint keeps recommending a
+		// restore onto memory that no longer matches what is running.
+		if discardSavedState(dir, node.Name) {
+			discarded = true
 		}
 		machine, err := s.launchMachine(item, node, nil)
 		if err != nil {
 			rollbackErr := s.rollbackStarted(item.Name, nodes, started)
-			return "", errors.Join(fmt.Errorf("create VM %s: %w", node.Name, err), rollbackErr)
+			return nil, errors.Join(fmt.Errorf("create VM %s: %w", node.Name, err), rollbackErr)
 		}
 		nodes[node.Name] = machine
 		started = append(started, node.Name)
 	}
 	go s.bindMirrors(item.SubnetIndex) // async: don't hold opMu across the retry
-	return subnetWarning, nil
+	warnings := []string{subnetWarning}
+	if discarded {
+		warnings = append(warnings, discardedSaveStateWarning("the cluster"))
+	}
+	return warnings, nil
 }
 
 // startAndLogWarning starts the cluster on an operation's behalf, logging any
 // advisory finding and returning it so the operation can also carry it back to
 // the operator — the daemon log is not somewhere the CLI user looks.
-func (s *Server) startAndLogWarning(item cluster.Cluster) (string, error) {
-	warning, err := s.start(item)
-	if warning != "" {
-		log.Printf("start %s: %s", item.Name, warning)
+func (s *Server) startAndLogWarning(item cluster.Cluster) ([]string, error) {
+	warnings, err := s.start(item)
+	for _, warning := range warnings {
+		if warning != "" {
+			log.Printf("start %s: %s", item.Name, warning)
+		}
 	}
-	return warning, err
+	return warnings, err
 }
 
 // hostSubnetSources merges injected sources with system defaults per field, so
@@ -1105,6 +1123,18 @@ func (s *Server) nodeRunning(clusterName, nodeName string) bool {
 	return machine != nil && machine.Active()
 }
 
+// allNodesRunning reports whether every member of the cluster has a running
+// VM, which is what a reconcile needs: its request lists all members and its
+// readiness gates wait on each of them.
+func (s *Server) allNodesRunning(item cluster.Cluster) bool {
+	for _, node := range item.Nodes {
+		if !s.nodeRunning(item.Name, node.Name) {
+			return false
+		}
+	}
+	return len(item.Nodes) > 0
+}
+
 func (s *Server) clusterRunning(name string) bool {
 	for _, machine := range s.vms[name] {
 		if machine.Active() {
@@ -1275,6 +1305,11 @@ func (s *Server) strayPinnedImages(pulled []CachePullImage) ([]CacheImageEntry, 
 	}
 	var strays []CacheImageEntry
 	for _, entry := range entries {
+		// List also reports combinations that hold only prunable leftovers;
+		// they are not usable pinned images and were never strays here.
+		if entry.Incomplete {
+			continue
+		}
 		combination := imagecache.Combination{
 			Schematic:    entry.Schematic,
 			Version:      entry.Version,

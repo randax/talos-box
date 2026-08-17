@@ -882,7 +882,7 @@ func TestForcedRestartReportsProgressWhileTheDaemonStopsVMs(t *testing.T) {
 	if err := command.run([]string{"system", "restart", "--force"}); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"waiting for tbxd", "3 VMs"} {
+	for _, want := range []string{"waiting for tbxd", "up to 3 VMs"} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Fatalf("stderr = %q, want it to contain %q", stderr.String(), want)
 		}

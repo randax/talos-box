@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -122,6 +123,123 @@ func TestNodeStartOfFirstNodeReconcilesTheStoppedCluster(t *testing.T) {
 		}
 	default:
 		t.Fatal("starting the first node of a provisioned cluster did not reconcile it")
+	}
+}
+
+// countingReconcile records every reconcile the service runs, so a test can
+// prove a run-state verb scheduled none.
+func countingReconcile(service *Server) *int32 {
+	var runs int32
+	service.provisionReconcile = func(context.Context, provision.Request) (provision.Result, error) {
+		atomic.AddInt32(&runs, 1)
+		return provision.Result{StoragePhase: provision.StoragePhaseLive, StorageLive: true}, nil
+	}
+	return &runs
+}
+
+// TestNodeStopSchedulesNoReconcile pins the convergence rule: the reconcile's
+// request still lists the node that was just powered off, so a forced run could
+// only spin to the provision timeout and park storage at `provisioning` (#332).
+func TestNodeStopSchedulesNoReconcile(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 2)
+	runs := countingReconcile(service)
+	service.storagePhases[item.Name] = StoragePhaseLive
+
+	response := dispatchNodeRunState(t, service, "node.stop", item.Name, "demo-worker-2")
+
+	if !response.OK {
+		t.Fatalf("node.stop failed: %s", response.Error)
+	}
+	service.backgroundProvisions.Wait()
+	if got := atomic.LoadInt32(runs); got != 0 {
+		t.Fatalf("node.stop ran %d reconcile(s), want none", got)
+	}
+	if _, ok := service.provisions[item.Name]; ok {
+		t.Fatal("node.stop left a provision active")
+	}
+	if phase := service.storagePhases[item.Name]; phase == StoragePhaseProvisioning {
+		t.Fatalf("node.stop moved storage phase to %q", phase)
+	}
+}
+
+// TestNodeStartOfAPartlyStoppedClusterSchedulesNoReconcile keeps the reconcile
+// away from a topology it cannot converge: members are still powered off.
+func TestNodeStartOfAPartlyStoppedClusterSchedulesNoReconcile(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 2)
+	runs := countingReconcile(service)
+	delete(service.vms[item.Name], "demo-worker-1")
+	delete(service.vms[item.Name], "demo-worker-2")
+
+	response := dispatchNodeRunState(t, service, "node.start", item.Name, "demo-worker-1")
+
+	if !response.OK {
+		t.Fatalf("node.start failed: %s", response.Error)
+	}
+	service.backgroundProvisions.Wait()
+	if got := atomic.LoadInt32(runs); got != 0 {
+		t.Fatalf("node.start over a partly stopped cluster ran %d reconcile(s), want none", got)
+	}
+}
+
+// TestNodeStartOfTheLastStoppedMemberReconciles is the other half: the cluster
+// is whole again, so the reconcile can actually converge.
+func TestNodeStartOfTheLastStoppedMemberReconciles(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 2)
+	reconciled := make(chan int, 1)
+	service.provisionReconcile = func(_ context.Context, request provision.Request) (provision.Result, error) {
+		reconciled <- len(request.Cluster.Nodes)
+		return provision.Result{StoragePhase: provision.StoragePhaseLive, StorageLive: true}, nil
+	}
+	delete(service.vms[item.Name], "demo-worker-2")
+
+	response := dispatchNodeRunState(t, service, "node.start", item.Name, "demo-worker-2")
+
+	if !response.OK {
+		t.Fatalf("node.start failed: %s", response.Error)
+	}
+	service.backgroundProvisions.Wait()
+	select {
+	case nodes := <-reconciled:
+		if nodes != 3 {
+			t.Fatalf("reconcile saw %d nodes, want 3", nodes)
+		}
+	default:
+		t.Fatal("starting the last stopped member did not reconcile the whole cluster")
+	}
+}
+
+// TestNodeStopOfAControlPlaneWarnsAboutQuorum pins the advisory: stopping a
+// control-plane node never blocks, but the operator must learn what it costs
+// etcd before the cluster stops answering.
+func TestNodeStopOfAControlPlaneWarnsAboutQuorum(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 3, 1)
+	countingReconcile(service)
+
+	response := dispatchNodeRunState(t, service, "node.stop", item.Name, "demo-cp-2")
+
+	if !response.OK {
+		t.Fatalf("node.stop failed: %s", response.Error)
+	}
+	status := decodeNodeStatus(t, response)
+	joined := strings.Join(status.Warnings, "\n")
+	for _, want := range []string{"demo-cp-2", "2 of 3 control-plane nodes running", "quorum"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("node.stop warnings = %q, want them to mention %q", status.Warnings, want)
+		}
+	}
+}
+
+func TestNodeStopOfAWorkerCarriesNoQuorumWarning(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 3, 1)
+	countingReconcile(service)
+
+	response := dispatchNodeRunState(t, service, "node.stop", item.Name, "demo-worker-1")
+
+	if !response.OK {
+		t.Fatalf("node.stop failed: %s", response.Error)
+	}
+	if status := decodeNodeStatus(t, response); strings.Contains(strings.Join(status.Warnings, "\n"), "quorum") {
+		t.Fatalf("stopping a worker warned about quorum: %q", status.Warnings)
 	}
 }
 

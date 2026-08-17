@@ -682,7 +682,7 @@ func waitForDaemonExit(pid int, activity clusterActivity, progress io.Writer) er
 				pid, describeStoppingVMs(activity), timeout)
 		}
 		if !now.Before(nextReport) {
-			reportProgress(progress, "waiting for tbxd (pid %d) to exit; it is still stopping %s (%s elapsed)\n",
+			reportProgress(progress, "waiting for tbxd (pid %d) to exit (stopping %s) (%s elapsed)\n",
 				pid, describeStoppingVMs(activity), now.Sub(start).Round(time.Second))
 			nextReport = now.Add(daemonExitProgressInterval)
 		}
@@ -733,14 +733,18 @@ func socketLockFree(socketPath string) bool {
 	return true
 }
 
+// describeStoppingVMs counts the configured VMs of every running cluster,
+// which is an upper bound rather than a census: individual nodes can be stopped
+// with `tbx node stop`. The wait budget is happy to over-estimate, but the
+// narration must not claim more VMs are running than there are.
 func describeStoppingVMs(activity clusterActivity) string {
 	if activity.runningVMs == 0 {
 		return "its clusters"
 	}
 	if activity.runningVMs == 1 {
-		return "1 VM"
+		return "up to 1 VM"
 	}
-	return fmt.Sprintf("%d VMs", activity.runningVMs)
+	return fmt.Sprintf("up to %d VMs", activity.runningVMs)
 }
 
 // reportProgress writes one progress line, ignoring a write failure: a restart

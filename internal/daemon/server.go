@@ -519,11 +519,6 @@ func (s *Server) dispatchNodeMutation(request Request) Response {
 	// the substrate settled and reconciles behind the response (#314).
 	if request.Op == "node.add" {
 		if err := s.runProvisionTasks(data, tasks); err != nil {
-			if removalWarning != "" {
-				// the node's disk is already gone; the data-loss note must survive
-				// a failed follow-up reconcile
-				return failure(fmt.Errorf("%w (warning: %s)", err, removalWarning))
-			}
 			return failure(err)
 		}
 		return success(data)

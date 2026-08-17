@@ -71,12 +71,12 @@ func (s *Server) snapshotCreate(raw json.RawMessage) (SnapshotStatus, error) {
 	// was running is restarted afterward, while a stopped one stays stopped.
 	running := s.clusterRunning(item.Name)
 	var created bool
-	var restartWarning string
+	var restartWarnings []string
 	err = withClusterStopped(running,
 		func() error { return s.stop(item.Name) },
 		func() error {
-			warning, startErr := s.startAndLogWarning(item)
-			restartWarning = warning
+			warnings, startErr := s.startAndLogWarning(item)
+			restartWarnings = warnings
 			return startErr
 		},
 		func() error {
@@ -101,7 +101,7 @@ func (s *Server) snapshotCreate(raw json.RawMessage) (SnapshotStatus, error) {
 		return SnapshotStatus{}, err
 	}
 	status := SnapshotStatus{Snapshots: snapshots}
-	status.setWarnings(restartWarning)
+	status.setWarnings(restartWarnings...)
 	return status, nil
 }
 
@@ -111,7 +111,7 @@ func (s *Server) snapshotRestore(raw json.RawMessage) (SnapshotStatus, error) {
 		return SnapshotStatus{}, err
 	}
 	running := s.clusterRunning(item.Name)
-	var restartWarning string
+	var restartWarnings []string
 	// restore always ends powered on (SPEC §7: cold boot), even if the cluster
 	// was stopped when restore was invoked
 	err = withClusterStopped(true,
@@ -127,8 +127,8 @@ func (s *Server) snapshotRestore(raw json.RawMessage) (SnapshotStatus, error) {
 			if loadErr != nil {
 				return loadErr
 			}
-			warning, startErr := s.startAndLogWarning(restored)
-			restartWarning = warning
+			warnings, startErr := s.startAndLogWarning(restored)
+			restartWarnings = warnings
 			return startErr
 		},
 		func() error { return cluster.RestoreSnapshot(item, args.Name) },
@@ -141,7 +141,7 @@ func (s *Server) snapshotRestore(raw json.RawMessage) (SnapshotStatus, error) {
 		return SnapshotStatus{}, err
 	}
 	status := SnapshotStatus{Snapshots: snapshots}
-	status.setWarnings(restartWarning)
+	status.setWarnings(restartWarnings...)
 	return status, nil
 }
 

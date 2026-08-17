@@ -40,6 +40,10 @@ func (s *Server) startNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTa
 			return NodeStatus{}, nil, err
 		}
 	}
+	dir, err := cluster.Dir(item.Name)
+	if err != nil {
+		return NodeStatus{}, nil, err
+	}
 	nodes := s.vms[item.Name]
 	if nodes == nil {
 		nodes = make(map[string]hypervisor.Machine)
@@ -51,6 +55,13 @@ func (s *Server) startNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTa
 			return NodeStatus{}, nil, fmt.Errorf("release inactive VM %s: %w", node.Name, err)
 		}
 		delete(nodes, node.Name)
+	}
+	// node.start is a cold boot: suspended memory for this node is superseded
+	// by the fresh launch and must not be left to poison Suspended status or
+	// the resume hint.
+	var discardWarning string
+	if discardSavedState(dir, node.Name) {
+		discardWarning = discardedSaveStateWarning(node.Name)
 	}
 	machine, err := s.launchMachine(item, node, nil)
 	if err != nil {
@@ -65,7 +76,16 @@ func (s *Server) startNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTa
 	}
 	log.Printf("node.start %s/%s: VM started", item.Name, node.Name)
 	status := nodeStatus(node, item.SubnetIndex, true)
-	status.setWarnings(subnetWarning)
+	status.setWarnings(subnetWarning, discardWarning)
+	// A reconcile can only converge over a fully-running cluster: its request
+	// carries every member, and configuredControlPlane/KubernetesReady wait on
+	// nodes that are powered off. So only the last stopped member coming back
+	// schedules one; a partial topology would spin to the provision timeout and
+	// park storage at `provisioning`.
+	if !s.allNodesRunning(item) {
+		log.Printf("node.start %s/%s: cluster is only partly running, skipping reconcile", item.Name, node.Name)
+		return status, nil, nil
+	}
 	return status, s.beginNodeMutationProvisionLocked(item), nil
 }
 
@@ -89,6 +109,9 @@ func (s *Server) stopNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTas
 		log.Printf("node.stop %s/%s: already stopped", item.Name, node.Name)
 		return nodeStatus(node, item.SubnetIndex, false), nil, nil
 	}
+	quorumWarning := controlPlaneQuorumWarning(item, node, func(name string) bool {
+		return s.nodeRunning(item.Name, name)
+	})
 	log.Printf("node.stop %s/%s: begin", item.Name, node.Name)
 	if err := s.closeNodes(item.Name, s.vms[item.Name], []string{node.Name}); err != nil {
 		log.Printf("node.stop %s/%s: stop VM failed: %v", item.Name, node.Name, err)
@@ -101,7 +124,35 @@ func (s *Server) stopNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTas
 		log.Printf("node.stop %s/%s: last running node, cluster is stopped", item.Name, node.Name)
 	}
 	log.Printf("node.stop %s/%s: VM stopped", item.Name, node.Name)
-	return nodeStatus(node, item.SubnetIndex, false), s.beginNodeMutationProvisionLocked(item), nil
+	status := nodeStatus(node, item.SubnetIndex, false)
+	status.setWarnings(quorumWarning)
+	// No reconcile: stopping a node leaves the cluster short of a member the
+	// reconcile's own request still lists, so provisioning could never converge
+	// and would only burn the provision timeout before parking storage.
+	return status, nil, nil
+}
+
+// controlPlaneQuorumWarning is advisory only — `node stop` never blocks — but
+// an operator who powers off a control-plane node deserves to know what it
+// costs etcd before the cluster stops answering.
+func controlPlaneQuorumWarning(item cluster.Cluster, node cluster.Node, running func(string) bool) string {
+	if node.Role != cluster.RoleControlPlane {
+		return ""
+	}
+	var total, remaining int
+	for _, member := range item.Nodes {
+		if member.Role != cluster.RoleControlPlane {
+			continue
+		}
+		total++
+		if member.Name != node.Name && running(member.Name) {
+			remaining++
+		}
+	}
+	return fmt.Sprintf(
+		"stopping control-plane node %s leaves %d of %d control-plane nodes running; etcd quorum requires a majority",
+		node.Name, remaining, total,
+	)
 }
 
 // clusterNode resolves a node verb's node argument against cluster membership,

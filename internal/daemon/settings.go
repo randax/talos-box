@@ -104,7 +104,8 @@ func (s *Server) applyPersistedSettings() {
 }
 
 // updateSettings applies one change to the stored settings, preserving every
-// field it does not touch.
+// known field it does not touch. The rewrite is from the parsed struct, so a
+// key the current daemon does not know — one a newer daemon wrote — is dropped.
 func updateSettings(path string, apply func(*settings)) error {
 	current, err := loadSettings(path)
 	if err != nil {
