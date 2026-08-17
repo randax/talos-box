@@ -92,7 +92,7 @@ var groupUsages = map[string]string{
 	"cluster":  "usage: tbx cluster create|start|stop|suspend|resume|destroy|list",
 	"node":     "usage: tbx node add|remove <cluster> [node]",
 	"snapshot": "usage: tbx snapshot create|restore|list|delete",
-	"cache":    "usage: tbx cache pull|prune|warm|list",
+	"cache":    "usage: tbx cache pull|prune|warm|list [-o json]",
 	"system":   "usage: tbx system install|uninstall|restart [--force]|status",
 	"mirror":   "usage: tbx mirror offline [on|off]",
 	"bgp":      "usage: tbx bgp enable|disable <cluster>",
@@ -589,12 +589,34 @@ func (c cli) runCache(args []string) error {
 		}
 		return err
 	case "list":
-		if len(args) != 1 {
-			return errors.New("usage: tbx cache list")
+		flags := flag.NewFlagSet("cache list", flag.ContinueOnError)
+		flags.SetOutput(c.err)
+		outputFormat := flags.String("o", "table", "output format: table|json")
+		positionals, err := parseInterspersed(flags, args[1:])
+		if err != nil {
+			return err
+		}
+		if len(positionals) != 0 {
+			return errors.New("usage: tbx cache list [-o json]")
+		}
+		if err := validateOutputFormat(*outputFormat); err != nil {
+			return err
 		}
 		var result daemon.CacheListResult
 		if err := c.call("cache.list", struct{}{}, &result); err != nil {
 			return err
+		}
+		if *outputFormat == "json" {
+			if result.Images == nil {
+				result.Images = []daemon.CacheImageEntry{}
+			}
+			if result.Mirror == nil {
+				result.Mirror = []daemon.MirrorCacheEntry{}
+			}
+			if result.MirrorBoundGatewayIPs == nil {
+				result.MirrorBoundGatewayIPs = []string{}
+			}
+			return encodeJSON(c.out, result)
 		}
 		if len(result.Images) == 0 {
 			if _, err := fmt.Fprintln(c.out, "Talos disk images: empty"); err != nil {
@@ -625,7 +647,7 @@ func (c cli) runCache(args []string) error {
 				}
 			}
 		}
-		_, err := fmt.Fprintf(c.out, "Mirror total: %d blob(s) %d bytes, %d manifest(s) %d bytes\n",
+		_, err = fmt.Fprintf(c.out, "Mirror total: %d blob(s) %d bytes, %d manifest(s) %d bytes\n",
 			result.MirrorTotal.BlobCount, result.MirrorTotal.BlobBytes, result.MirrorTotal.ManifestCount, result.MirrorTotal.ManifestBytes)
 		return err
 	case "warm":

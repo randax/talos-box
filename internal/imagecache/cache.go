@@ -53,6 +53,10 @@ type Entry struct {
 	// AllocatedSize is what the image costs on disk. A disk.raw is sparse,
 	// so Size is its apparent extent, not its footprint.
 	AllocatedSize int64
+	// Incomplete marks a combination that holds prunable artifacts but no
+	// usable disk.raw. Listing it is what makes `cache list` a faithful
+	// prune preview: prune deletes such a combination like any other.
+	Incomplete bool
 }
 
 type MirrorUpstreamStats struct {
@@ -192,7 +196,9 @@ func (c *Cache) Ensure(schematic, version string, architecture Architecture) (st
 	return diskPath, nil
 }
 
-// List returns the complete disk images currently in the cache.
+// List returns the disk-image combinations currently in the cache: the
+// complete images plus the incomplete combinations a prune would remove, so a
+// listing is the prune preview it is documented to be.
 func (c *Cache) List() ([]Entry, error) {
 	schematics, err := os.ReadDir(c.root)
 	if errors.Is(err, os.ErrNotExist) {
@@ -217,25 +223,13 @@ func (c *Cache) List() ([]Entry, error) {
 			}
 			versionDir := filepath.Join(c.root, schematic.Name(), version.Name())
 			for _, architecture := range []Architecture{ArchitectureAMD64, ArchitectureARM64} {
-				path := filepath.Join(versionDir, string(architecture), "disk.raw")
-				entry, ok, err := cacheEntry(schematic.Name(), version.Name(), architecture, path)
+				entry, ok, err := combinationEntry(schematic.Name(), version.Name(), architecture, combinationDirs(versionDir, architecture))
 				if err != nil {
 					return nil, err
 				}
 				if ok {
 					entries = append(entries, entry)
 				}
-			}
-			if fileReady(filepath.Join(versionDir, string(ArchitectureARM64), "disk.raw")) {
-				continue
-			}
-			legacyPath := filepath.Join(versionDir, "disk.raw")
-			entry, ok, err := cacheEntry(schematic.Name(), version.Name(), ArchitectureARM64, legacyPath)
-			if err != nil {
-				return nil, err
-			}
-			if ok {
-				entries = append(entries, entry)
 			}
 		}
 	}
@@ -437,9 +431,13 @@ func validateCacheRoot(root string) error {
 }
 
 type pruneAction struct {
-	path         string
-	size         int64
-	countAsImage bool
+	path string
+	size int64
+	// temporary marks an abandoned partial download. A combination made up
+	// of nothing else is swept silently: the space is reclaimed but the
+	// combination is neither listed nor counted, because `cache list` never
+	// showed it either.
+	temporary bool
 }
 
 // combinationPlan groups the artifacts of one combination so a prune can
@@ -447,11 +445,18 @@ type pruneAction struct {
 type combinationPlan struct {
 	combination Combination
 	actions     []pruneAction
-	// temporariesOnly marks a kept combination whose abandoned partial
-	// downloads are being swept: the space is reclaimed but the combination
-	// must not be reported as pruned, or the itemized list would contradict
-	// the keep decision `cache list` shows.
-	temporariesOnly bool
+}
+
+// reportable answers whether a plan removes a combination a user would
+// recognize from `cache list`, which is both what gets itemized and what the
+// image count counts.
+func (p combinationPlan) reportable() bool {
+	for _, action := range p.actions {
+		if !action.temporary {
+			return true
+		}
+	}
+	return false
 }
 
 type mirrorPrunePlan struct {
@@ -515,13 +520,13 @@ func (c *Cache) pruneKnownDiskArtifacts(keep func(Combination) (bool, error)) (C
 			if err := os.Remove(action.path); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return CachePruneResult{}, err
 			}
-			if action.countAsImage {
-				result.ImageCount++
-			}
 			bytes += action.size
 		}
 		result.ImageBytes += bytes
-		if len(combination.actions) != 0 && !combination.temporariesOnly {
+		if combination.reportable() {
+			// The count is the number of combinations reported, so the
+			// summary line and the itemized list cannot disagree.
+			result.ImageCount++
 			result.Images = append(result.Images, PrunedCombination{Combination: combination.combination, Bytes: bytes})
 		}
 	}
@@ -554,10 +559,14 @@ func planKnownVersionPrune(versionPath, schematic, version string, keep func(Com
 				return nil, nil, 0, false, err
 			}
 			if kept {
-				// Count (and dedupe against the legacy layout) only when an
-				// image is actually being kept: cache list keys on a ready
-				// disk.raw, and the kept report must agree with it.
-				if fileReady(filepath.Join(archDir, "disk.raw")) {
+				// Count (and dedupe against the legacy layout) only when the
+				// combination holds artifacts: cache list shows exactly those,
+				// and the kept report must agree with it.
+				present, err := artifactsPresent(archDir, knownDiskArtifactNames(architecture, true))
+				if err != nil {
+					return nil, nil, 0, false, err
+				}
+				if present {
 					keptCount++
 					if architecture == ArchitectureARM64 {
 						arm64Kept = true
@@ -577,20 +586,16 @@ func planKnownVersionPrune(versionPath, schematic, version string, keep func(Com
 					return nil, nil, 0, false, err
 				}
 				if len(tempPlan) != 0 {
-					plan = append(plan, combinationPlan{combination: combination, actions: tempPlan, temporariesOnly: true})
+					plan = append(plan, combinationPlan{combination: combination, actions: tempPlan})
 				}
 				continue
 			}
 			if err := requireDirectoryPath(archDir); err != nil {
 				return nil, nil, 0, false, err
 			}
-			archPlan, err := planKnownFiles(archDir, []knownPruneName{
-				{name: "disk.raw", countAsImage: true},
-				{name: fmt.Sprintf("metal-%s.raw.xz", architecture)},
-				// A surviving pin marker would keep the directory alive
-				// and re-pin an image the next pull downloads.
-				{name: pinMarkerName},
-			}, []knownPrunePrefix{
+			// The pin marker is in the removal set: a survivor would keep the
+			// directory alive and re-pin an image the next pull downloads.
+			archPlan, err := planKnownFiles(archDir, knownDiskArtifactNames(architecture, true), []knownPrunePrefix{
 				{prefix: ".disk.raw-"},
 				{prefix: fmt.Sprintf(".metal-%s.raw.xz-", architecture)},
 			})
@@ -625,16 +630,17 @@ func planKnownVersionPrune(versionPath, schematic, version string, keep func(Com
 			return nil, nil, 0, false, err
 		}
 		if len(tempPlan) != 0 {
-			plan = append(plan, combinationPlan{combination: legacy, actions: tempPlan, temporariesOnly: true})
+			plan = append(plan, combinationPlan{combination: legacy, actions: tempPlan})
 		}
-		if legacyArtifactsPresent(versionPath) && !arm64Kept {
+		present, err := artifactsPresent(versionPath, knownDiskArtifactNames(ArchitectureARM64, false))
+		if err != nil {
+			return nil, nil, 0, false, err
+		}
+		if present && !arm64Kept {
 			keptCount++
 		}
 	} else {
-		legacyPlan, err := planKnownFiles(versionPath, []knownPruneName{
-			{name: "disk.raw", countAsImage: true},
-			{name: fmt.Sprintf("metal-%s.raw.xz", ArchitectureARM64)},
-		}, legacyPrefixes)
+		legacyPlan, err := planKnownFiles(versionPath, knownDiskArtifactNames(ArchitectureARM64, false), legacyPrefixes)
 		if err != nil {
 			return nil, nil, 0, false, err
 		}
@@ -649,14 +655,6 @@ func planKnownVersionPrune(versionPath, schematic, version string, keep func(Com
 	return plan, cleanupDirs, keptCount, touched || len(plan) > 0, nil
 }
 
-// legacyArtifactsPresent reports whether the pre-architecture flat layout
-// actually holds an image for this version, so a kept legacy combination is
-// only counted when there is something being kept. It uses the same ready
-// disk.raw predicate as Cache.List, so the kept report and listing agree.
-func legacyArtifactsPresent(versionPath string) bool {
-	return fileReady(filepath.Join(versionPath, "disk.raw"))
-}
-
 func keepCombination(keep func(Combination) (bool, error), combination Combination) (bool, error) {
 	if keep == nil {
 		return false, nil
@@ -664,41 +662,40 @@ func keepCombination(keep func(Combination) (bool, error), combination Combinati
 	return keep(combination)
 }
 
-type knownPruneName struct {
-	name         string
-	countAsImage bool
-}
-
 type knownPrunePrefix struct {
 	prefix string
 }
 
-func planKnownFiles(dir string, names []knownPruneName, prefixes []knownPrunePrefix) ([]pruneAction, error) {
+func planKnownFiles(dir string, names []string, prefixes []knownPrunePrefix) ([]pruneAction, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
 	}
-	byName := make(map[string]knownPruneName, len(names))
-	for _, candidate := range names {
-		byName[candidate.name] = candidate
+	byName := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		byName[name] = struct{}{}
 	}
 	var plan []pruneAction
 	for _, entry := range entries {
-		if candidate, ok := byName[entry.Name()]; ok {
-			action, err := planKnownArtifact(filepath.Join(dir, entry.Name()), candidate.countAsImage)
+		if _, ok := byName[entry.Name()]; ok {
+			action, err := planKnownArtifact(filepath.Join(dir, entry.Name()), false)
 			if err != nil {
 				return nil, err
 			}
-			plan = append(plan, action)
+			if action.path != "" {
+				plan = append(plan, action)
+			}
 			continue
 		}
 		for _, prefix := range prefixes {
 			if strings.HasPrefix(entry.Name(), prefix.prefix) {
-				action, err := planKnownArtifact(filepath.Join(dir, entry.Name()), false)
+				action, err := planKnownArtifact(filepath.Join(dir, entry.Name()), true)
 				if err != nil {
 					return nil, err
 				}
-				plan = append(plan, action)
+				if action.path != "" {
+					plan = append(plan, action)
+				}
 				break
 			}
 		}
@@ -706,7 +703,7 @@ func planKnownFiles(dir string, names []knownPruneName, prefixes []knownPrunePre
 	return plan, nil
 }
 
-func planKnownArtifact(path string, countAsImage bool) (pruneAction, error) {
+func planKnownArtifact(path string, temporary bool) (pruneAction, error) {
 	info, exists, err := lstatPath(path)
 	if err != nil {
 		return pruneAction{}, err
@@ -720,7 +717,7 @@ func planKnownArtifact(path string, countAsImage bool) (pruneAction, error) {
 	if !info.Mode().IsRegular() {
 		return pruneAction{}, fmt.Errorf("refusing to prune non-regular path %q", path)
 	}
-	return pruneAction{path: path, size: info.Size(), countAsImage: countAsImage}, nil
+	return pruneAction{path: path, size: info.Size(), temporary: temporary}, nil
 }
 
 func (c *Cache) planMirrorPrune() (mirrorPrunePlan, error) {
@@ -857,6 +854,97 @@ func cacheEntry(schematic, version string, architecture Architecture, path strin
 		Size:          info.Size(),
 		AllocatedSize: allocatedSize(info),
 	}, true, nil
+}
+
+// artifactDir is one on-disk home of a combination: its architecture
+// directory, plus the pre-architecture flat layout for arm64.
+type artifactDir struct {
+	path  string
+	names []string
+}
+
+func combinationDirs(versionDir string, architecture Architecture) []artifactDir {
+	dirs := []artifactDir{{
+		path:  filepath.Join(versionDir, string(architecture)),
+		names: knownDiskArtifactNames(architecture, true),
+	}}
+	if architecture == ArchitectureARM64 {
+		dirs = append(dirs, artifactDir{path: versionDir, names: knownDiskArtifactNames(architecture, false)})
+	}
+	return dirs
+}
+
+// knownDiskArtifactNames are the non-temporary files a prune removes for one
+// combination. List and prune share them, so a listing cannot omit something a
+// prune would delete. The flat legacy layout never carried a pin marker.
+func knownDiskArtifactNames(architecture Architecture, includePin bool) []string {
+	names := []string{"disk.raw", fmt.Sprintf("metal-%s.raw.xz", architecture)}
+	if includePin {
+		names = append(names, pinMarkerName)
+	}
+	return names
+}
+
+// combinationEntry describes one combination: the ready image when there is
+// one, otherwise the incomplete leftovers a prune would reclaim.
+func combinationEntry(schematic, version string, architecture Architecture, dirs []artifactDir) (Entry, bool, error) {
+	for _, dir := range dirs {
+		entry, ok, err := cacheEntry(schematic, version, architecture, filepath.Join(dir.path, "disk.raw"))
+		if err != nil || ok {
+			return entry, ok, err
+		}
+	}
+	var entry Entry
+	for _, dir := range dirs {
+		size, allocated, present, err := artifactStats(dir.path, dir.names)
+		if err != nil {
+			return Entry{}, false, err
+		}
+		if !present {
+			continue
+		}
+		if entry.Path == "" {
+			entry.Path = dir.path
+		}
+		entry.Size += size
+		entry.AllocatedSize += allocated
+	}
+	if entry.Path == "" {
+		return Entry{}, false, nil
+	}
+	entry.Schematic, entry.Version, entry.Architecture, entry.Incomplete = schematic, version, architecture, true
+	return entry, true, nil
+}
+
+// artifactStats sums the named artifacts present in dir. Non-regular files are
+// ignored: a prune refuses them rather than reclaiming them.
+func artifactStats(dir string, names []string) (int64, int64, bool, error) {
+	var size, allocated int64
+	present := false
+	for _, name := range names {
+		path := filepath.Join(dir, name)
+		info, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return 0, 0, false, fmt.Errorf("stat cached artifact %q: %w", path, err)
+		}
+		if !info.Mode().IsRegular() {
+			continue
+		}
+		present = true
+		size += info.Size()
+		allocated += allocatedSize(info)
+	}
+	return size, allocated, present, nil
+}
+
+// artifactsPresent reports whether a combination holds anything a listing
+// shows, so the kept report counts exactly the rows that survive a prune.
+func artifactsPresent(dir string, names []string) (bool, error) {
+	_, _, present, err := artifactStats(dir, names)
+	return present, err
 }
 
 func validateArchitecture(architecture Architecture) error {

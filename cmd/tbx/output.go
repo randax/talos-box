@@ -127,6 +127,11 @@ func cacheImageLine(entry daemon.CacheImageEntry) string {
 	if entry.AllocatedSize > 0 {
 		line += fmt.Sprintf(" (%d bytes on disk)", entry.AllocatedSize)
 	}
+	if entry.Incomplete {
+		// Leftovers with no usable image: listed so an unscoped prune holds
+		// no surprises, marked so they are not mistaken for a warm image.
+		line += " (incomplete)"
+	}
 	return line
 }
 
