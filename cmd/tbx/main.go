@@ -90,7 +90,7 @@ func (c cli) run(args []string) error {
 // list is spelled out twice — so the two forms cannot drift apart.
 var groupUsages = map[string]string{
 	"cluster":  "usage: tbx cluster create|start|stop|suspend|resume|destroy|list",
-	"node":     "usage: tbx node add|remove|start|stop <cluster> [node]",
+	"node":     "usage: tbx node add <cluster> [node] | remove|start|stop <cluster> <node>",
 	"snapshot": "usage: tbx snapshot create|restore|list|delete",
 	"cache":    "usage: tbx cache pull|prune|warm|list [-o json]",
 	"system":   "usage: tbx system install|uninstall|restart [--force]|status",
@@ -507,17 +507,21 @@ func (c cli) runNode(args []string) error {
 func (c cli) runNodeRunState(verb string, args []string) error {
 	flags := flag.NewFlagSet("node "+verb, flag.ContinueOnError)
 	flags.SetOutput(c.err)
+	// start is gated on host memory and pressure exactly like cluster start and
+	// node add; stop accepts the flag so both verbs share one wire shape, and
+	// the daemon simply has nothing to override for a power-off.
+	force := flags.Bool("force", false, "proceed despite memory overcommit or host pressure")
 	positionals, err := parseInterspersed(flags, args)
 	if err != nil {
 		return err
 	}
 	if len(positionals) != 2 {
-		return fmt.Errorf("usage: tbx node %s <cluster> <node>", verb)
+		return fmt.Errorf("usage: tbx node %s <cluster> <node> [--force]", verb)
 	}
 	if err := c.ensureNodeRunStateSupport(verb); err != nil {
 		return err
 	}
-	request := map[string]any{"cluster": positionals[0], "name": positionals[1]}
+	request := map[string]any{"cluster": positionals[0], "name": positionals[1], "force": *force}
 	var result daemon.NodeStatus
 	if err := c.call("node."+verb, request, &result); err != nil {
 		return err
@@ -693,14 +697,14 @@ Commands:
   up [-f talosbox.yaml] [--force]
   down [-f talosbox.yaml]
   cluster create|start|stop|suspend|resume|destroy|list
-  node add|remove|start|stop
+  node add <cluster> [node] | remove|start|stop <cluster> <node>
   snapshot create|restore|list|delete
   status [cluster]
   manifests <cluster> [section] [--cni cilium|flannel]
   console <cluster> <node>
   bgp enable|disable <cluster>
   mirror offline [on|off]
-  cache pull|prune|warm|list
+  cache pull|prune|warm|list [-o json]
   system install|uninstall|restart [--force]|status
   doctor
   version (also --version, -v)

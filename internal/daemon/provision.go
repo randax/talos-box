@@ -143,8 +143,16 @@ func (s *Server) beginProvisionTasksLocked(items []cluster.Cluster) []provisionT
 	return tasks
 }
 
+// beginNodeMutationProvisionLocked schedules the forced reconcile a topology
+// change needs. item is the post-mutation membership, and a reconcile can only
+// converge over a fully-running one: its request lists every member, and
+// configuredControlPlane/KubernetesReady poll DHCP leases and readiness for
+// each of them. A partly-running cluster would spin to the provision timeout —
+// synchronously on `node add`'s request path — and park storage at
+// `provisioning`, so it schedules nothing (#332).
 func (s *Server) beginNodeMutationProvisionLocked(item cluster.Cluster) []provisionTask {
-	if !s.clusterRunning(item.Name) {
+	if !s.allNodesRunning(item) {
+		log.Printf("provision %s: cluster is only partly running, skipping reconcile", item.Name)
 		return nil
 	}
 	tasks := s.beginProvisionTasksLocked([]cluster.Cluster{item})

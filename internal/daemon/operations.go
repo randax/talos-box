@@ -166,7 +166,12 @@ type NodeStatus struct {
 	IP            string       `json:"ip,omitempty"`
 	APIDReachable bool         `json:"apidReachable"`
 	Phase         Phase        `json:"phase"`
-	Warning       string       `json:"warning,omitempty"`
+	// Suspended reports that this node's own memory is saved on disk, which
+	// only suspend writes and only for nodes that were running. A stopped
+	// member of a suspended cluster that has no save is plain stopped — a
+	// resume brings it up cold, not back where it left off.
+	Suspended bool   `json:"suspended,omitempty"`
+	Warning   string `json:"warning,omitempty"`
 	// Warnings is the same advisory set as Warning, one entry per finding.
 	// Warning stays populated for older clients that only read it.
 	Warnings []string `json:"warnings,omitempty"`
@@ -579,6 +584,7 @@ func (s *Server) start(item cluster.Cluster) ([]string, error) {
 	}
 	var started []string
 	var discarded bool
+	var discardFailures []string
 	for _, node := range item.Nodes {
 		if existing := nodes[node.Name]; existing != nil {
 			if existing.Active() {
@@ -589,13 +595,6 @@ func (s *Server) start(item cluster.Cluster) ([]string, error) {
 			}
 			delete(nodes, node.Name)
 		}
-		// start is a cold boot: suspended memory left by an earlier suspend is
-		// superseded by this launch and must not outlive it, or status keeps
-		// reporting the cluster Suspended and the hint keeps recommending a
-		// restore onto memory that no longer matches what is running.
-		if discardSavedState(dir, node.Name) {
-			discarded = true
-		}
 		machine, err := s.launchMachine(item, node, nil)
 		if err != nil {
 			rollbackErr := s.rollbackStarted(item.Name, nodes, started)
@@ -603,13 +602,27 @@ func (s *Server) start(item cluster.Cluster) ([]string, error) {
 		}
 		nodes[node.Name] = machine
 		started = append(started, node.Name)
+		// start is a cold boot: suspended memory left by an earlier suspend is
+		// superseded by this launch and must not outlive it, or status keeps
+		// reporting the cluster Suspended and the hint keeps recommending a
+		// restore onto memory that no longer matches what is running. It only
+		// becomes superseded once the launch succeeds — launchMachine never
+		// reads the save, so discarding first would destroy the memory a
+		// rolled-back start still needs `cluster resume` to be able to use.
+		dropped, failure := discardSavedState(dir, node.Name)
+		if dropped {
+			discarded = true
+		}
+		if failure != "" {
+			discardFailures = append(discardFailures, failure)
+		}
 	}
 	go s.bindMirrors(item.SubnetIndex) // async: don't hold opMu across the retry
 	warnings := []string{subnetWarning}
 	if discarded {
 		warnings = append(warnings, discardedSaveStateWarning("the cluster"))
 	}
-	return warnings, nil
+	return append(warnings, discardFailures...), nil
 }
 
 // startAndLogWarning starts the cluster on an operation's behalf, logging any
@@ -1045,7 +1058,11 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 			Suspended: !running && clusterHasSavedState(item.Name), Capabilities: s.clusterCapabilities(item), subnetIndex: item.SubnetIndex}
 		for _, node := range item.Nodes {
 			running := s.nodeRunning(item.Name, node.Name)
-			clusterStatus.Nodes = append(clusterStatus.Nodes, NodeStatus{Name: node.Name, Role: node.Role, MAC: node.MAC, Phase: ClassifyPhase(running, ProbeResult{}), StartedAt: s.vmStartedAt(item.Name, node.Name)})
+			clusterStatus.Nodes = append(clusterStatus.Nodes, NodeStatus{Name: node.Name, Role: node.Role, MAC: node.MAC, Phase: ClassifyPhase(running, ProbeResult{}), StartedAt: s.vmStartedAt(item.Name, node.Name),
+				// per-node, not per-cluster: suspend saves memory only for
+				// the nodes that were running, and the rest stay plain
+				// stopped rather than inheriting the cluster's flag
+				Suspended: !running && nodeHasSavedState(item.Name, node.Name)})
 		}
 		clusterStatus.Hints = Hints(clusterStatus)
 		result = append(result, clusterStatus)
@@ -1127,12 +1144,9 @@ func (s *Server) nodeRunning(clusterName, nodeName string) bool {
 // VM, which is what a reconcile needs: its request lists all members and its
 // readiness gates wait on each of them.
 func (s *Server) allNodesRunning(item cluster.Cluster) bool {
-	for _, node := range item.Nodes {
-		if !s.nodeRunning(item.Name, node.Name) {
-			return false
-		}
-	}
-	return len(item.Nodes) > 0
+	return clusterReady(item, func(nodeName string) bool {
+		return s.nodeRunning(item.Name, nodeName)
+	})
 }
 
 func (s *Server) clusterRunning(name string) bool {

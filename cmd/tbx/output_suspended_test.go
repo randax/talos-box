@@ -16,11 +16,12 @@ func suspendedStatus() daemon.ClusterStatus {
 		Domain:    "napping.k8s.test",
 		Suspended: true,
 		Nodes: []daemon.NodeStatus{{
-			Name:  "napping-cp-1",
-			Role:  cluster.RoleControlPlane,
-			MAC:   "52:54:00:00:00:01",
-			IP:    "172.30.4.2",
-			Phase: daemon.PhaseStopped,
+			Name:      "napping-cp-1",
+			Role:      cluster.RoleControlPlane,
+			MAC:       "52:54:00:00:00:01",
+			IP:        "172.30.4.2",
+			Phase:     daemon.PhaseStopped,
+			Suspended: true,
 		}},
 	}
 	status.Hints = daemon.Hints(status)
@@ -64,6 +65,35 @@ func TestPrintStatusSuspendedHintNamesResume(t *testing.T) {
 	}
 	if strings.Contains(rendered, "start it with") {
 		t.Fatalf("status output still hints start for a suspended cluster:\n%s", rendered)
+	}
+}
+
+// TestPrintStatusKeepsUnsuspendedMembersStopped pins the per-node accuracy:
+// suspend only saves the memory of nodes that were running, so a member that
+// was already stopped must not inherit the cluster's Suspended flag — a resume
+// cold-boots it, it does not pick up where it left off.
+func TestPrintStatusKeepsUnsuspendedMembersStopped(t *testing.T) {
+	t.Parallel()
+
+	status := suspendedStatus()
+	status.Nodes = append(status.Nodes, daemon.NodeStatus{
+		Name:  "napping-worker-1",
+		Role:  cluster.RoleWorker,
+		MAC:   "52:54:00:00:00:02",
+		Phase: daemon.PhaseStopped,
+	})
+
+	var output bytes.Buffer
+	if err := printStatus(&output, []daemon.ClusterStatus{status}, true); err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(output.String(), "\n") {
+		switch {
+		case strings.Contains(line, "napping-worker-1") && !strings.Contains(line, "stopped"):
+			t.Fatalf("a member without saved memory does not read stopped: %q", line)
+		case strings.Contains(line, "napping-cp-1") && !strings.Contains(line, "suspended"):
+			t.Fatalf("the member holding saved memory does not read suspended: %q", line)
+		}
 	}
 }
 

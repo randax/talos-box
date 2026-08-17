@@ -92,3 +92,29 @@ func TestNodeRunStateUsageRequiresClusterAndNode(t *testing.T) {
 		}
 	}
 }
+
+// TestNodeStartForwardsForce keeps the CLI able to reach the daemon's override:
+// node start is gated on host memory and pressure like cluster start, so
+// without a --force flag a refusal would have no way out.
+func TestNodeStartForwardsForce(t *testing.T) {
+	requests, command := newDestroyTestCLI(t, []daemon.Response{
+		{OK: true, Data: json.RawMessage(`{"protocolVersion":8}`)},
+		{OK: true, Data: json.RawMessage(`{"name":"demo-worker-2","phase":"running"}`)},
+	})
+
+	if err := command.runNode([]string{"start", "demo", "demo-worker-2", "--force"}); err != nil {
+		t.Fatal(err)
+	}
+
+	<-requests
+	request := <-requests
+	var args struct {
+		Force bool `json:"force"`
+	}
+	if err := json.Unmarshal(request.Args, &args); err != nil {
+		t.Fatal(err)
+	}
+	if !args.Force {
+		t.Fatalf("node.start args = %s, want force set", request.Args)
+	}
+}

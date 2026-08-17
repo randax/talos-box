@@ -537,9 +537,7 @@ func (s *Server) existingStates() (map[string]ClusterState, error) {
 		states[item.Name] = ClusterState{
 			Exists:  true,
 			Running: s.clusterRunning(item.Name),
-			Ready: clusterReady(item, func(nodeName string) bool {
-				return s.nodeRunning(item.Name, nodeName)
-			}),
+			Ready:   s.allNodesRunning(item),
 		}
 	}
 	return states, nil

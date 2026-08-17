@@ -30,6 +30,13 @@ func (s *Server) startNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTa
 		log.Printf("node.start %s/%s: already running", item.Name, node.Name)
 		return nodeStatus(node, item.SubnetIndex, true), nil, nil
 	}
+	// Powering a node on commits the same host memory `cluster start` and
+	// `node add` are gated on, so it answers to the same guards: a hard refusal
+	// without --force, an advisory finding with it.
+	overcommitWarning, err := s.checkOvercommit(item.DefaultsFor(node.Role).MemoryMiB, args.Force)
+	if err != nil {
+		return NodeStatus{}, nil, err
+	}
 	firstNode := !s.clusterRunning(item.Name)
 	var subnetWarning string
 	if firstNode {
@@ -41,6 +48,10 @@ func (s *Server) startNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTa
 		}
 	}
 	dir, err := cluster.Dir(item.Name)
+	if err != nil {
+		return NodeStatus{}, nil, err
+	}
+	hostPressureWarnings, err := s.checkHostPressure(dir, args.Force)
 	if err != nil {
 		return NodeStatus{}, nil, err
 	}
@@ -56,18 +67,21 @@ func (s *Server) startNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTa
 		}
 		delete(nodes, node.Name)
 	}
-	// node.start is a cold boot: suspended memory for this node is superseded
-	// by the fresh launch and must not be left to poison Suspended status or
-	// the resume hint.
-	var discardWarning string
-	if discardSavedState(dir, node.Name) {
-		discardWarning = discardedSaveStateWarning(node.Name)
-	}
 	machine, err := s.launchMachine(item, node, nil)
 	if err != nil {
 		return NodeStatus{}, nil, fmt.Errorf("create VM %s: %w", node.Name, err)
 	}
 	nodes[node.Name] = machine
+	// node.start is a cold boot: suspended memory for this node is superseded
+	// by the fresh launch and must not be left to poison Suspended status or
+	// the resume hint. It is only superseded once the launch succeeds —
+	// launchMachine never reads the save — so a failed start leaves the memory
+	// intact and `cluster resume` still works.
+	var discardWarning string
+	dropped, discardFailure := discardSavedState(dir, node.Name)
+	if dropped {
+		discardWarning = discardedSaveStateWarning(node.Name)
+	}
 	if firstNode {
 		go s.bindMirrors(item.SubnetIndex) // async: don't hold opMu across the retry
 		if subnetWarning != "" {
@@ -76,16 +90,9 @@ func (s *Server) startNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTa
 	}
 	log.Printf("node.start %s/%s: VM started", item.Name, node.Name)
 	status := nodeStatus(node, item.SubnetIndex, true)
-	status.setWarnings(subnetWarning, discardWarning)
-	// A reconcile can only converge over a fully-running cluster: its request
-	// carries every member, and configuredControlPlane/KubernetesReady wait on
-	// nodes that are powered off. So only the last stopped member coming back
-	// schedules one; a partial topology would spin to the provision timeout and
-	// park storage at `provisioning`.
-	if !s.allNodesRunning(item) {
-		log.Printf("node.start %s/%s: cluster is only partly running, skipping reconcile", item.Name, node.Name)
-		return status, nil, nil
-	}
+	status.setWarnings(append([]string{overcommitWarning}, append(hostPressureWarnings, subnetWarning, discardWarning, discardFailure)...)...)
+	// beginNodeMutationProvisionLocked schedules nothing while members are
+	// still powered off, so only the last stopped one coming back reconciles.
 	return status, s.beginNodeMutationProvisionLocked(item), nil
 }
 
@@ -117,9 +124,13 @@ func (s *Server) stopNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTas
 		log.Printf("node.stop %s/%s: stop VM failed: %v", item.Name, node.Name, err)
 		return NodeStatus{}, nil, err
 	}
+	// A recorded `live` phase short-circuits refreshStoragePhases, so leaving it
+	// standing would keep reporting storage live over a cluster that just lost a
+	// node. Invalidating only drops the memo — the phase is re-probed, not
+	// parked at `provisioning`, which only beginProvisionTasksLocked does.
+	s.invalidateStoragePhaseLocked(item.Name)
 	if !s.clusterRunning(item.Name) {
 		s.cancelProvisionLocked(item.Name)
-		s.invalidateStoragePhaseLocked(item.Name)
 		s.unbindMirrors(item.SubnetIndex)
 		log.Printf("node.stop %s/%s: last running node, cluster is stopped", item.Name, node.Name)
 	}

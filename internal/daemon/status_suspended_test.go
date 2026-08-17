@@ -78,3 +78,45 @@ func TestStatusStoppedWithoutSavedStateKeepsStartHint(t *testing.T) {
 		t.Fatalf("hints = %q, want the stopped hint", status.Hints)
 	}
 }
+
+// TestStatusMarksOnlyTheNodesHoldingSavedMemory pins the per-node accuracy:
+// suspend writes a save only for the nodes that were running, so a member that
+// was already stopped is plain stopped — a resume cold-boots it rather than
+// restoring it, and the CLI must not render it as suspended.
+func TestStatusMarksOnlyTheNodesHoldingSavedMemory(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("halfnap", 0, 1, 1, cluster.NodeDefaults{CPUs: 1, MemoryMiB: 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := cluster.Dir(item.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(saveStatePath(dir, "halfnap-cp-1"), []byte("saved"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	service := &Server{vms: make(map[string]map[string]hypervisor.Machine)}
+	statuses, err := service.status(mustRawJSON(t, statusArgs{Cluster: item.Name}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := statuses[0]
+	if !status.Suspended {
+		t.Fatal("cluster-level Suspended = false while a node still holds saved memory")
+	}
+	suspended := make(map[string]bool, len(status.Nodes))
+	for _, node := range status.Nodes {
+		suspended[node.Name] = node.Suspended
+	}
+	if !suspended["halfnap-cp-1"] {
+		t.Fatal("the node holding saved memory is not reported suspended")
+	}
+	if suspended["halfnap-worker-1"] {
+		t.Fatal("a node with no saved memory inherited the cluster's suspended flag")
+	}
+}

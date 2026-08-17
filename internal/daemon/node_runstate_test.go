@@ -275,3 +275,146 @@ func TestNodeRunStateRefusesUnknownClusterAndNode(t *testing.T) {
 		}
 	}
 }
+
+// TestNodeAddOverAPartlyStoppedClusterSchedulesNoReconcile pins the gate that
+// keeps `node add` off a topology the reconcile cannot converge: its request
+// lists every member and its readiness gates poll nodes that are powered off,
+// and node add's reconcile runs synchronously on the request path — so the
+// caller would block for the whole provision timeout for nothing (#332).
+func TestNodeAddOverAPartlyStoppedClusterSchedulesNoReconcile(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 1)
+	runs := countingReconcile(service)
+	delete(service.vms[item.Name], "demo-worker-1")
+
+	raw, err := json.Marshal(nodeArgs{Cluster: item.Name, Name: "demo-worker-2", Role: cluster.RoleWorker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := service.dispatch(Request{Op: "node.add", Args: raw})
+
+	if !response.OK {
+		t.Fatalf("node.add failed: %s", response.Error)
+	}
+	service.backgroundProvisions.Wait()
+	if got := atomic.LoadInt32(runs); got != 0 {
+		t.Fatalf("node.add over a partly stopped cluster ran %d reconcile(s), want none", got)
+	}
+}
+
+func TestNodeRemoveOverAPartlyStoppedClusterSchedulesNoReconcile(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 2)
+	runs := countingReconcile(service)
+	service.nodeVolumeCount = func(context.Context, cluster.Cluster, string) (int, error) { return 0, nil }
+	delete(service.vms[item.Name], "demo-worker-1")
+
+	response := dispatchNodeRemove(t, service, item.Name, "demo-worker-2", false)
+
+	if !response.OK {
+		t.Fatalf("node.remove failed: %s", response.Error)
+	}
+	service.backgroundProvisions.Wait()
+	if got := atomic.LoadInt32(runs); got != 0 {
+		t.Fatalf("node.remove over a partly stopped cluster ran %d reconcile(s), want none", got)
+	}
+}
+
+// TestNodeRemoveOverARunningClusterReconciles is the other half: the remaining
+// membership is whole, so the topology change must still be pushed out.
+func TestNodeRemoveOverARunningClusterReconciles(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 2)
+	service.nodeVolumeCount = func(context.Context, cluster.Cluster, string) (int, error) { return 0, nil }
+	reconciled := make(chan int, 1)
+	service.provisionReconcile = func(_ context.Context, request provision.Request) (provision.Result, error) {
+		reconciled <- len(request.Cluster.Nodes)
+		return provision.Result{StoragePhase: provision.StoragePhaseLive, StorageLive: true}, nil
+	}
+
+	response := dispatchNodeRemove(t, service, item.Name, "demo-worker-2", false)
+
+	if !response.OK {
+		t.Fatalf("node.remove failed: %s", response.Error)
+	}
+	service.backgroundProvisions.Wait()
+	select {
+	case nodes := <-reconciled:
+		if nodes != 2 {
+			t.Fatalf("reconcile saw %d nodes, want 2", nodes)
+		}
+	default:
+		t.Fatal("node.remove on a fully running cluster did not reconcile it")
+	}
+}
+
+// TestNodeStartRefusesUnderHostPressureWithoutForce holds `node start` to the
+// same host guards cluster start and node add enforce: powering a node on
+// commits real host memory, so it cannot be the one verb that skips them.
+func TestNodeStartRefusesUnderHostPressureWithoutForce(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 1)
+	stubNodeMutationReconcile(service)
+	delete(service.vms[item.Name], "demo-worker-1")
+	service.hostPressure = extremeSwapPressure
+
+	response := dispatchNodeRunState(t, service, "node.start", item.Name, "demo-worker-1")
+
+	if response.OK {
+		t.Fatal("node.start launched a VM under blocking host pressure")
+	}
+	if !strings.Contains(response.Error, "host swap is 90% used") {
+		t.Fatalf("node.start error = %q, want the host-pressure refusal", response.Error)
+	}
+	if service.nodeRunning(item.Name, "demo-worker-1") {
+		t.Fatal("node.start started the node despite refusing")
+	}
+}
+
+// With --force the same finding is advisory: the node starts and the operator
+// is told what they overrode.
+func TestNodeStartUnderHostPressureWithForceWarns(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 1)
+	stubNodeMutationReconcile(service)
+	delete(service.vms[item.Name], "demo-worker-1")
+	service.hostPressure = extremeSwapPressure
+
+	raw, err := json.Marshal(nodeArgs{Cluster: item.Name, Name: "demo-worker-1", Force: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := service.dispatch(Request{Op: "node.start", Args: raw})
+
+	if !response.OK {
+		t.Fatalf("forced node.start failed: %s", response.Error)
+	}
+	if !service.nodeRunning(item.Name, "demo-worker-1") {
+		t.Fatal("forced node.start did not launch the node")
+	}
+	status := decodeNodeStatus(t, response)
+	if !strings.Contains(strings.Join(status.Warnings, "\n"), "host swap is 90% used") {
+		t.Fatalf("forced node.start warnings = %q, want the host-pressure finding", status.Warnings)
+	}
+}
+
+// TestNodeStopInvalidatesTheStoragePhase pins the regression: a recorded `live`
+// phase short-circuits refreshStoragePhases, so leaving it standing after a
+// worker is powered off keeps reporting storage live over a cluster that just
+// lost a node.
+func TestNodeStopInvalidatesTheStoragePhase(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 2)
+	countingReconcile(service)
+	service.storagePhases[item.Name] = StoragePhaseLive
+
+	response := dispatchNodeRunState(t, service, "node.stop", item.Name, "demo-worker-2")
+
+	if !response.OK {
+		t.Fatalf("node.stop failed: %s", response.Error)
+	}
+	if phase, ok := service.storagePhases[item.Name]; ok {
+		t.Fatalf("node.stop left storage phase %q recorded; it must be re-probed", phase)
+	}
+	statuses, err := service.status(mustRawJSON(t, statusArgs{Cluster: item.Name}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if statuses[0].StoragePhase == StoragePhaseLive {
+		t.Fatal("status still reports storage live after a node was stopped")
+	}
+}

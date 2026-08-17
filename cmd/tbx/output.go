@@ -36,12 +36,14 @@ func printClusters(output io.Writer, clusters []daemon.ClusterSummary) error {
 	return table.Flush()
 }
 
-// nodePhase renders a node's phase, promoting the stopped nodes of a suspended
-// cluster to "suspended": their memory is on disk waiting to be resumed, and
-// reading them as plain stopped is what led operators to start — the one verb
-// that throws that memory away (#272).
-func nodePhase(item daemon.ClusterStatus, node daemon.NodeStatus) string {
-	if item.Suspended && node.Phase == daemon.PhaseStopped {
+// nodePhase renders a node's phase, promoting a stopped node that holds its own
+// saved memory to "suspended": it is on disk waiting to be resumed, and reading
+// it as plain stopped is what led operators to start — the one verb that throws
+// that memory away (#272). The flag is per node, not per cluster: suspend only
+// saves the members that were running, and the ones that were already stopped
+// stay honestly stopped.
+func nodePhase(node daemon.NodeStatus) string {
+	if node.Suspended && node.Phase == daemon.PhaseStopped {
 		return "suspended"
 	}
 	return string(node.Phase)
@@ -67,7 +69,7 @@ func printStatus(output io.Writer, clusters []daemon.ClusterStatus, quiet bool) 
 				ip = "-"
 			}
 			if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-				item.Name, item.Subnet, item.Domain, talos, node.Name, node.Role, node.MAC, ip, nodePhase(item, node)); err != nil {
+				item.Name, item.Subnet, item.Domain, talos, node.Name, node.Role, node.MAC, ip, nodePhase(node)); err != nil {
 				return err
 			}
 		}

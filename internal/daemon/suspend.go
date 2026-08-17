@@ -198,18 +198,21 @@ func saveStatePath(dir, node string) string {
 // save is only consumed by a successful resume, so a start that boots the node
 // from disk would otherwise leave a stale save behind: status keeps reporting
 // the cluster Suspended and the resume hint invites a restore onto memory that
-// no longer matches what is running. It reports whether a save was discarded.
-func discardSavedState(dir, nodeName string) bool {
+// no longer matches what is running. It reports whether a save was discarded,
+// plus an operator-visible warning when a save was found but could not be
+// removed — the cold boot proceeds either way, and the survivor would silently
+// resurrect the suspended status and the resume hint.
+func discardSavedState(dir, nodeName string) (bool, string) {
 	path := saveStatePath(dir, nodeName)
 	if _, err := os.Stat(path); err != nil {
-		return false
+		return false, ""
 	}
 	if err := os.Remove(path); err != nil {
 		log.Printf("discard saved state %s: %v", path, err)
-		return false
+		return false, undiscardedSaveStateWarning(nodeName, err)
 	}
 	log.Printf("discarded saved state %s: cold boot", path)
-	return true
+	return true, ""
 }
 
 // discardedSaveStateWarning tells the operator that a cold boot threw suspended
@@ -217,6 +220,28 @@ func discardSavedState(dir, nodeName string) bool {
 // stops saying Suspended.
 func discardedSaveStateWarning(subject string) string {
 	return fmt.Sprintf("discarded suspended memory state; %s cold-booted", subject)
+}
+
+// undiscardedSaveStateWarning is the other half: the cold boot happened but the
+// save outlived it, so status will keep calling the node suspended and the hint
+// will keep offering a resume onto memory the running VM no longer matches.
+func undiscardedSaveStateWarning(nodeName string, err error) string {
+	return fmt.Sprintf(
+		"could not discard suspended memory state for %s: %v; ignore the suspended status and do not resume",
+		nodeName, err,
+	)
+}
+
+// nodeHasSavedState reports whether one node's own memory is saved on disk.
+// suspend only writes a save for nodes that were running, so this is what
+// separates the members a resume restores from those it cold-boots.
+func nodeHasSavedState(clusterName, nodeName string) bool {
+	dir, err := cluster.Dir(clusterName)
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(saveStatePath(dir, nodeName))
+	return err == nil
 }
 
 // clusterHasSavedState reports whether a cluster still holds suspended VM

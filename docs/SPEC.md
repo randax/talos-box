@@ -323,7 +323,9 @@ tbx up / tbx down
 tbx cluster create|start|stop|destroy|list [name] [--cp N --workers N]
                   [--cni cilium|flannel] [--csi longhorn|local-path] [--lb] [--bgp] [--hubble]
                   [--talos-version VERSION] [--schematic ID] [--extensions LIST]
-tbx node add|remove|start|stop <cluster> [node]
+tbx node add <cluster> [node] [--role worker|control-plane] [--force]
+tbx node remove <cluster> <node> [--force]
+tbx node start|stop <cluster> <node> [--force]
 tbx cluster suspend|resume <cluster>
 tbx snapshot create <cluster> [name] [--yes]
 tbx snapshot restore <cluster> <name> [--yes] [--force]
