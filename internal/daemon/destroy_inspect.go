@@ -28,6 +28,21 @@ func (s *Server) destroyInspect(raw json.RawMessage) (DestroyInspection, error) 
 	if !args.Force {
 		return DestroyInspection{}, errors.New("cluster.destroy.inspect requires force=true")
 	}
+	// A cluster that never existed has no data to lose: say so here, before
+	// the client can print a data-loss warning about nothing (#268).
+	// A name no cluster can carry names no cluster either: refuse it as
+	// missing so the client suppresses the warning here too, keeping the
+	// reason the name was rejected in the message (#268).
+	if err := cluster.ValidateName(args.Name); err != nil {
+		return DestroyInspection{}, fmt.Errorf("%w: %w", ClusterMissingError(args.Name), err)
+	}
+	dir, err := cluster.Dir(args.Name)
+	if err != nil {
+		return DestroyInspection{}, err
+	}
+	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		return DestroyInspection{}, ClusterMissingError(args.Name)
+	}
 	item, err := cluster.Load(args.Name)
 	if err != nil {
 		return DestroyInspection{}, err
@@ -69,6 +84,18 @@ func clusterKubeconfig(name string) ([]byte, error) {
 		return nil, err
 	}
 	return os.ReadFile(filepath.Join(dir, "kubeconfig"))
+}
+
+// ClusterMissingError is the daemon's refusal for a cluster that does not
+// exist. It crosses the wire as a plain string, so IsClusterMissing is how a
+// client tells it apart from an inspection that merely failed.
+func ClusterMissingError(name string) error {
+	return fmt.Errorf("cluster %q does not exist", name)
+}
+
+// IsClusterMissing reports whether err is the missing-cluster refusal for name.
+func IsClusterMissing(err error, name string) bool {
+	return err != nil && strings.Contains(err.Error(), ClusterMissingError(name).Error())
 }
 
 func DestroyInspectionDataLossWarning(name string, engine cluster.CSI) string {

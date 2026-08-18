@@ -19,7 +19,7 @@ func TestStatusRemainsResponsiveDuringProvisioning(t *testing.T) {
 	service, item, task, started := blockedProvision(t)
 	done := make(chan error, 1)
 	go func() {
-		done <- service.runProvisionTasks(&ClusterSummary{Name: item.Name}, []provisionTask{task})
+		done <- service.runProvisionTasks(&ClusterSummary{Name: item.Name}, []provisionTask{task}, nil)
 	}()
 	waitForProvisionStart(t, started)
 
@@ -49,7 +49,7 @@ func TestStopCancelsActiveProvisioning(t *testing.T) {
 	service.storagePhases = map[string]StoragePhase{item.Name: StoragePhaseLive}
 	done := make(chan error, 1)
 	go func() {
-		done <- service.runProvisionTasks(&ClusterSummary{Name: item.Name}, []provisionTask{task})
+		done <- service.runProvisionTasks(&ClusterSummary{Name: item.Name}, []provisionTask{task}, nil)
 	}()
 	waitForProvisionStart(t, started)
 
@@ -74,7 +74,7 @@ func TestShutdownCancelsActiveProvisioning(t *testing.T) {
 	service, item, task, started := blockedProvision(t)
 	done := make(chan error, 1)
 	go func() {
-		done <- service.runProvisionTasks(&ClusterSummary{Name: item.Name}, []provisionTask{task})
+		done <- service.runProvisionTasks(&ClusterSummary{Name: item.Name}, []provisionTask{task}, nil)
 	}()
 	waitForProvisionStart(t, started)
 
@@ -212,7 +212,7 @@ func TestUpMaintenanceGateDoesNotHoldOperationLockWhileProbing(t *testing.T) {
 	}
 	done := make(chan Response, 1)
 	go func() {
-		done <- service.dispatchProvisioning(Request{Op: "up", Args: args})
+		done <- service.dispatchProvisioning(Request{Op: "up", Args: args}, nil)
 	}()
 	waitForProvisionStart(t, started)
 
@@ -314,7 +314,7 @@ func TestUpRejectsMaintenanceEvidenceThatChangesBeforeCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	response := service.dispatchProvisioning(Request{Op: "up", Args: args})
+	response := service.dispatchProvisioning(Request{Op: "up", Args: args}, nil)
 	if response.OK || !strings.Contains(response.Error, "all nodes are in maintenance") {
 		t.Fatalf("up response = %+v, want stale-maintenance rejection", response)
 	}
@@ -360,7 +360,7 @@ func TestUpRejectsVMStateThatChangesAfterMaintenanceConfirmation(t *testing.T) {
 	}
 	done := make(chan Response, 1)
 	go func() {
-		done <- service.dispatchProvisioning(Request{Op: "up", Args: args})
+		done <- service.dispatchProvisioning(Request{Op: "up", Args: args}, nil)
 	}()
 	waitForProvisionStart(t, confirmed)
 

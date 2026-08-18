@@ -70,10 +70,11 @@ On failure: capture both resolutions and the resolver state.
 **Goal**: per-domain host state is created, reconciled, and orphan-removed; unmarked files untouched.
 
 Steps:
-1. **[macOS]** Create an unmarked decoy `/etc/resolver/qa-decoy` (sudo, minimal content, no tbx marker). Destroy `qa-dom`; verify `/etc/resolver/lab.internal` is removed, the decoy untouched, and `/etc/resolver/k8s.test` (shared default file) intact. Remove the decoy.
+1. **[macOS]** Record `md5 /etc/resolver/k8s.test` and `ls -l /etc/resolver/` before. Destroy `qa-dom`; verify `/etc/resolver/lab.internal` (marked, owned) is removed while `/etc/resolver/k8s.test` — the shared default-domain file, which carries **no** tbx marker — survives byte-identical (same md5, same mtime). That unmarked survivor is the marker-gated-deletion evidence this charter needs, and it requires no root.
+   - Optional, human runners with root only: additionally plant an unmarked decoy (`sudo tee /etc/resolver/qa-decoy` with minimal content and no tbx marker) before the destroy and confirm it too is untouched, then `sudo rm` it. Agent runs without sudo record this variant as NOT RUN — the k8s.test evidence above already covers the property; a missing decoy is not a gap in the verdict.
 2. **[Linux]** Destroy `qa-dom`; verify the resolved route-only registration for `lab.internal` is gone and `/etc/resolv.conf` untouched throughout.
 
-Expected observations: marker-gated deletion only; shared default-domain file survives; no foreign state touched.
+Expected observations: marker-gated deletion only — the owned, marked per-domain file goes and every unmarked file (at minimum the shared `k8s.test`, plus the decoy when the root variant ran) stays byte-identical; no foreign state touched.
 
 Pass criteria: exactly the owned state removed, nothing else.
 

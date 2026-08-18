@@ -206,63 +206,7 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		return err
 	}
 
-	mirrorFinding := doctorFinding{check: "mirror-health"}
-	if deps.listCache == nil {
-		mirrorFinding.level, mirrorFinding.detail = "SKIP", "probe unavailable"
-	} else {
-		cacheResult, err := deps.listCache()
-		if isDaemonUnavailable(err) {
-			mirrorFinding.level, mirrorFinding.detail = "SKIP", daemonUnavailableDetail(err)
-		} else if err != nil {
-			mirrorFinding.level, mirrorFinding.detail = "FAIL", err.Error()
-		} else {
-			totalBytes := cacheResult.MirrorTotal.BlobBytes + cacheResult.MirrorTotal.ManifestBytes
-			cacheDetail := fmt.Sprintf(
-				"cache %d bytes (%d blob(s), %d manifest(s))",
-				totalBytes,
-				cacheResult.MirrorTotal.BlobCount,
-				cacheResult.MirrorTotal.ManifestCount,
-			)
-			var expectedGateways []string
-			for _, item := range clusters {
-				if item.Running {
-					expectedGateways = append(expectedGateways, cluster.Gateway(item.SubnetIndex))
-				}
-			}
-			sort.Strings(expectedGateways)
-			actualGateways := append([]string(nil), cacheResult.MirrorBoundGatewayIPs...)
-			sort.Strings(actualGateways)
-			switch {
-			case clusterErr == nil && len(expectedGateways) == 0 && len(actualGateways) > 0:
-				mirrorFinding.level = "FAIL"
-				mirrorFinding.detail = fmt.Sprintf("mirror listeners bound on %v while no clusters are running; %s", actualGateways, cacheDetail)
-			case clusterErr == nil && len(clusters) == 0:
-				mirrorFinding.level = "SKIP"
-				mirrorFinding.detail = fmt.Sprintf("no clusters exist; %s", cacheDetail)
-			case clusterErr == nil && len(expectedGateways) == 0:
-				mirrorFinding.level = "SKIP"
-				mirrorFinding.detail = fmt.Sprintf("no clusters are running; %s", cacheDetail)
-			case clusterErr == nil && stringSlicesEqual(actualGateways, expectedGateways):
-				mirrorFinding.level = "PASS"
-				mirrorFinding.detail = fmt.Sprintf("mirror serving on %d gateway(s) %v, %s", len(actualGateways), actualGateways, cacheDetail)
-			case clusterErr == nil && len(actualGateways) == 0:
-				mirrorFinding.level = "FAIL"
-				mirrorFinding.detail = fmt.Sprintf("no mirror listeners bound for running cluster(s); expected %v; %s", expectedGateways, cacheDetail)
-			case clusterErr == nil:
-				mirrorFinding.level = "FAIL"
-				mirrorFinding.detail = fmt.Sprintf(
-					"mirror listeners bound on %v, expected %v; %s",
-					actualGateways,
-					expectedGateways,
-					cacheDetail,
-				)
-			default:
-				mirrorFinding.level = "SKIP"
-				mirrorFinding.detail = fmt.Sprintf("cluster state unavailable; %s", cacheDetail)
-			}
-		}
-	}
-	if err := writeFindings(mirrorFinding); err != nil {
+	if err := writeFindings(cacheFindings(deps.listCache, clusters, clusterErr)...); err != nil {
 		return err
 	}
 
@@ -277,6 +221,119 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		return errors.New("one or more doctor checks failed")
 	}
 	return nil
+}
+
+// cacheFindings reports the two stores that share the cache root and used to
+// share the bare word "cache": the registry mirror's blob store and the Talos
+// disk-image cache. They are named apart and reported on their own lines, so an
+// empty mirror cache is never read as an empty image cache during offline prep.
+func cacheFindings(
+	listCache func() (daemon.CacheListResult, error),
+	clusters []daemon.ClusterSummary,
+	clusterErr error,
+) []doctorFinding {
+	mirrorFinding := doctorFinding{check: "mirror-health"}
+	imageFinding := doctorFinding{check: "image-cache"}
+	if listCache == nil {
+		mirrorFinding.level, mirrorFinding.detail = "SKIP", "probe unavailable"
+		imageFinding.level, imageFinding.detail = "SKIP", "probe unavailable"
+		return []doctorFinding{mirrorFinding, imageFinding}
+	}
+	cacheResult, err := listCache()
+	if isDaemonUnavailable(err) {
+		mirrorFinding.level, mirrorFinding.detail = "SKIP", daemonUnavailableDetail(err)
+		imageFinding.level, imageFinding.detail = "SKIP", daemonUnavailableDetail(err)
+		return []doctorFinding{mirrorFinding, imageFinding}
+	}
+	if err != nil {
+		// One listing feeds both lines, so a failed listing is one problem,
+		// not two: it fails the mirror line that owns the health verdict and
+		// skips the image line, which is informational and has nothing to
+		// report (#269).
+		mirrorFinding.level, mirrorFinding.detail = "FAIL", err.Error()
+		imageFinding.level, imageFinding.detail = "SKIP", "cache listing unavailable"
+		return []doctorFinding{mirrorFinding, imageFinding}
+	}
+
+	totalBytes := cacheResult.MirrorTotal.BlobBytes + cacheResult.MirrorTotal.ManifestBytes
+	cacheDetail := fmt.Sprintf(
+		"registry-mirror cache %d bytes (%d blob(s), %d manifest(s))",
+		totalBytes,
+		cacheResult.MirrorTotal.BlobCount,
+		cacheResult.MirrorTotal.ManifestCount,
+	)
+	var expectedGateways []string
+	for _, item := range clusters {
+		if item.Running {
+			expectedGateways = append(expectedGateways, cluster.Gateway(item.SubnetIndex))
+		}
+	}
+	sort.Strings(expectedGateways)
+	actualGateways := append([]string(nil), cacheResult.MirrorBoundGatewayIPs...)
+	sort.Strings(actualGateways)
+	switch {
+	case clusterErr == nil && len(expectedGateways) == 0 && len(actualGateways) > 0:
+		mirrorFinding.level = "FAIL"
+		mirrorFinding.detail = fmt.Sprintf("mirror listeners bound on %v while no clusters are running; %s", actualGateways, cacheDetail)
+	case clusterErr == nil && len(clusters) == 0:
+		mirrorFinding.level = "SKIP"
+		mirrorFinding.detail = fmt.Sprintf("no clusters exist; %s", cacheDetail)
+	case clusterErr == nil && len(expectedGateways) == 0:
+		mirrorFinding.level = "SKIP"
+		mirrorFinding.detail = fmt.Sprintf("no clusters are running; %s", cacheDetail)
+	case clusterErr == nil && stringSlicesEqual(actualGateways, expectedGateways):
+		mirrorFinding.level = "PASS"
+		mirrorFinding.detail = fmt.Sprintf("mirror serving on %d gateway(s) %v, %s", len(actualGateways), actualGateways, cacheDetail)
+	case clusterErr == nil && len(actualGateways) == 0:
+		mirrorFinding.level = "FAIL"
+		mirrorFinding.detail = fmt.Sprintf("no mirror listeners bound for running cluster(s); expected %v; %s", expectedGateways, cacheDetail)
+	case clusterErr == nil:
+		mirrorFinding.level = "FAIL"
+		mirrorFinding.detail = fmt.Sprintf(
+			"mirror listeners bound on %v, expected %v; %s",
+			actualGateways,
+			expectedGateways,
+			cacheDetail,
+		)
+	default:
+		mirrorFinding.level = "SKIP"
+		mirrorFinding.detail = fmt.Sprintf("cluster state unavailable; %s", cacheDetail)
+	}
+
+	imageFinding.level, imageFinding.detail = imageCacheFinding(cacheResult.Images)
+	return []doctorFinding{mirrorFinding, imageFinding}
+}
+
+// imageCacheFinding sizes the Talos disk-image cache the way `cache list` does:
+// apparent bytes, plus what the sparse images actually occupy when the daemon
+// reports it. Incomplete combinations — prunable leftovers with no usable
+// disk.raw — are held out of the total and counted apart, because an operator
+// preparing to go offline must never read a half-finished pull as a warm image
+// (#269). A cache holding nothing but leftovers warns for the same reason.
+func imageCacheFinding(images []daemon.CacheImageEntry) (level, detail string) {
+	var imageBytes, allocatedBytes int64
+	usable, incomplete := 0, 0
+	for _, entry := range images {
+		if entry.Incomplete {
+			incomplete++
+			continue
+		}
+		usable++
+		imageBytes += entry.Size
+		allocatedBytes += entry.AllocatedSize
+	}
+	counts := fmt.Sprintf("%d image(s)", usable)
+	if incomplete > 0 {
+		counts += fmt.Sprintf(", %d incomplete", incomplete)
+	}
+	level = "PASS"
+	if usable == 0 && incomplete > 0 {
+		level = "WARN"
+	}
+	if allocatedBytes > 0 {
+		return level, fmt.Sprintf("image cache %d bytes (%d bytes on disk, %s)", imageBytes, allocatedBytes, counts)
+	}
+	return level, fmt.Sprintf("image cache %d bytes (%s)", imageBytes, counts)
 }
 
 // guestAgentFinding reports the capability gate for clusters that baked

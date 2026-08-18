@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -33,7 +34,7 @@ func TestProbeClassifiesListeners(t *testing.T) {
 				_ = c.Close() // plaintext server slams a TLS ClientHello
 			}
 		}()
-		probe := probeHostPort(ln.Addr().String())
+		probe := probeHostPort(context.Background(), ln.Addr().String())
 		if !probe.Dialed || probe.TLS {
 			t.Errorf("probe = %+v, want Dialed && !TLS", probe)
 		}
@@ -47,7 +48,7 @@ func TestProbeClassifiesListeners(t *testing.T) {
 		}
 		defer func() { _ = ln.Close() }()
 		go acceptTLS(ln)
-		probe := probeHostPort(ln.Addr().String())
+		probe := probeHostPort(context.Background(), ln.Addr().String())
 		if !probe.Dialed || !probe.TLS || !probe.MaintenanceCert {
 			t.Errorf("probe = %+v, want Dialed && TLS && MaintenanceCert", probe)
 		}
@@ -61,7 +62,7 @@ func TestProbeClassifiesListeners(t *testing.T) {
 		}
 		defer func() { _ = ln.Close() }()
 		go acceptTLS(ln)
-		probe := probeHostPort(ln.Addr().String())
+		probe := probeHostPort(context.Background(), ln.Addr().String())
 		if !probe.Dialed || !probe.TLS || probe.MaintenanceCert {
 			t.Errorf("probe = %+v, want Dialed && TLS && !MaintenanceCert", probe)
 		}
@@ -71,7 +72,7 @@ func TestProbeClassifiesListeners(t *testing.T) {
 		ln, _ := net.Listen("tcp", "127.0.0.1:0")
 		addr := ln.Addr().String()
 		_ = ln.Close()
-		probe := probeHostPort(addr)
+		probe := probeHostPort(context.Background(), addr)
 		if probe.Dialed {
 			t.Errorf("probe = %+v, want !Dialed", probe)
 		}

@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
@@ -52,27 +53,46 @@ func ClassifyPhase(vmRunning bool, probe ProbeResult) Phase {
 // apidPort is Talos's machine API port.
 const apidPort = "50000"
 
+// probeTimeout bounds one dial. Two of them make up a probe, so a sweep over a
+// large cluster's silent nodes costs this twice per node — which is why a
+// caller on a deadline probes with a context instead.
+const probeTimeout = time.Second
+
 // probeAPID observes a node's apid: reachable? speaking TLS?
 func probeAPID(ip string) ProbeResult {
-	return probeHostPort(net.JoinHostPort(ip, apidPort))
+	return probeAPIDContext(context.Background(), ip)
 }
 
-func probeHostPort(address string) ProbeResult {
-	conn, err := net.DialTimeout("tcp", address, time.Second)
+// probeAPIDContext is probeAPID bounded by the caller's context as well as by
+// its own dial timeouts, so a caller sweeping many nodes under a deadline
+// cannot overrun it by the length of one more dial.
+func probeAPIDContext(ctx context.Context, ip string) ProbeResult {
+	return probeHostPort(ctx, net.JoinHostPort(ip, apidPort))
+}
+
+func probeHostPort(ctx context.Context, address string) ProbeResult {
+	dialer := &net.Dialer{Timeout: probeTimeout}
+	conn, err := dialer.DialContext(ctx, "tcp", address)
 	if err != nil {
 		return ProbeResult{}
 	}
 	_ = conn.Close()
-	tlsConn, err := tls.DialWithDialer(
-		&net.Dialer{Timeout: time.Second},
-		"tcp", address,
-		&tls.Config{InsecureSkipVerify: true}, //nolint:gosec // probing our own local VM
-	)
+	tlsDialer := &tls.Dialer{
+		NetDialer: dialer,
+		Config:    &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // probing our own local VM
+	}
+	tlsConn, err := tlsDialer.DialContext(ctx, "tcp", address)
 	if err != nil {
 		return ProbeResult{Dialed: true, TLS: false}
 	}
 	defer func() { _ = tlsConn.Close() }()
-	certs := tlsConn.ConnectionState().PeerCertificates
+	// tls.Dialer hands back a net.Conn; the handshake state this probe reads
+	// the identity from lives on the concrete connection.
+	state, ok := tlsConn.(*tls.Conn)
+	if !ok {
+		return ProbeResult{Dialed: true, TLS: true}
+	}
+	certs := state.ConnectionState().PeerCertificates
 	maintenance := len(certs) > 0 && certs[0].Subject.CommonName == maintenanceCN
 	return ProbeResult{Dialed: true, TLS: true, MaintenanceCert: maintenance}
 }
@@ -145,7 +165,7 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 		hints = append(hints, hint)
 	}
 	if status.CNI != "" && !status.KubernetesReady {
-		hints = append(hints, fmt.Sprintf("%s provisioning is in progress; tbx will apply machine config, bootstrap, and reconcile the CNI. Rerun: tbx up;%s", status.CNI, credentialExports(status.Name)))
+		hints = append(hints, fmt.Sprintf("%s provisioning is in progress; tbx will apply machine config, bootstrap, and reconcile the CNI. %s;%s", status.CNI, provisioningRecoveryHint(status), credentialExports(status.Name)))
 	}
 	if len(maintenance) > 0 {
 		first := maintenance[0]
@@ -202,6 +222,83 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 		hints = append(hints, hint)
 	}
 	return hints
+}
+
+// provisioningRecoveryHint names the recovery an unfinished provisioning pass
+// can actually take. `tbx up` needs a talosbox.yaml; a cluster created
+// imperatively has none, so pointing at up would dead-end and the honest path
+// is destroy and recreate (#267). A cluster whose origin is unknown — created
+// by a tbx predating the recorded flag — keeps the `tbx up` wording: its file
+// may well be sitting right there, and guessing "imperative" would advise
+// destroying a cluster a later up could simply resume.
+func provisioningRecoveryHint(status ClusterStatus) string {
+	if status.ConfigOrigin != cluster.OriginImperative {
+		return "Rerun: tbx up"
+	}
+	// No concrete `tbx cluster create` line: status carries the intent but not
+	// the node sizing, so a rendered command would rebuild a materially
+	// different cluster after the destroy already happened. The recorded
+	// intent is named as an observation, not as the command to paste.
+	return fmt.Sprintf(
+		"No talosbox.yaml backs this cluster, so tbx up cannot resume it; destroy it with: tbx cluster destroy %s --force, then recreate it with the tbx cluster create flags you used originally (recorded intent: %s; node sizing is not recorded here)",
+		shellquote.Quote(status.Name), recordedIntentFlags(status),
+	)
+}
+
+// recordedIntentFlags renders what the cluster's stored state actually knows
+// about how it was created, so the operator recreating it has the shape in
+// front of them instead of reconstructing it from memory.
+func recordedIntentFlags(status ClusterStatus) string {
+	flags := []string{fmt.Sprintf("--cni %s", status.CNI)}
+	if status.CSI != "" {
+		flags = append(flags, fmt.Sprintf("--csi %s", status.CSI))
+	}
+	if !status.LB {
+		flags = append(flags, "--lb=false")
+	}
+	if status.BGP {
+		flags = append(flags, "--bgp")
+	}
+	if status.Hubble {
+		flags = append(flags, "--hubble")
+	}
+	controlPlanes, workers := 0, 0
+	for _, node := range status.Nodes {
+		if node.Role == cluster.RoleControlPlane {
+			controlPlanes++
+			continue
+		}
+		workers++
+	}
+	flags = append(flags, fmt.Sprintf("--cp %d", controlPlanes), fmt.Sprintf("--workers %d", workers))
+	if status.Domain != "" && status.Domain != status.Name+"."+cluster.DefaultDomainSuffix {
+		flags = append(flags, fmt.Sprintf("--domain %s", status.Domain))
+		// Without the opt-in the create would refuse the very domain this
+		// line names, so the flags stay replayable as printed.
+		if status.AllowUnsafeDomain {
+			flags = append(flags, "--allow-unsafe-domain")
+		}
+	}
+	// The image is as much of the recorded intent as the topology is. Dropping
+	// it would send the operator back to the daemon's current default version
+	// with no extensions at all — a materially different cluster, built after
+	// the destroy already made the original unrecoverable (#267).
+	if status.TalosVersion != "" {
+		flags = append(flags, fmt.Sprintf("--talos-version %s", status.TalosVersion))
+	}
+	if len(status.TalosExtensions) > 0 {
+		flags = append(flags, fmt.Sprintf("--extensions %s", strings.Join(status.TalosExtensions, ",")))
+		// Schematic is the composed id once extensions were folded into it, so
+		// replaying it alongside --extensions would compose them a second time.
+		// The base is the schematic the create actually took, and an empty one
+		// means the create took none.
+		if status.BaseSchematic != "" {
+			flags = append(flags, fmt.Sprintf("--schematic %s", status.BaseSchematic))
+		}
+	} else if status.Schematic != "" {
+		flags = append(flags, fmt.Sprintf("--schematic %s", status.Schematic))
+	}
+	return strings.Join(flags, " ")
 }
 
 // splitStalledNodes separates nodes still inside their boot budget from the

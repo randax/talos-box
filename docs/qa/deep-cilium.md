@@ -49,12 +49,12 @@ On failure: capture `tbx status -o json qa-cil`, `kubectl -n kube-system get pod
 **Goal**: the inspection surface matches what was applied.
 
 Steps:
-1. `tbx manifests qa-cil` (section `all`), then individually: `machine`, `values`, `objects`, `extras`, `cilium-values`, `lb-pool`, `l2`, `mirrors`, `balloon`, `k8s`, `talos`.
-2. Spot-check three claims against the live cluster: the LB pool range in `lb-pool` matches the `.200–.239` convention; `mirrors` shows the single catch-all `http://<gateway>:5059` endpoint with `skipFallback: true`; `balloon` includes `virtio_balloon` in kernel modules.
+1. `tbx manifests qa-cil` (section `all`), then individually: `machine`, `values`, `objects`, `extras`, `cilium-values`, `lb-pool`, `l2`, `mirrors`, `k8s`, `talos`. Also run `tbx manifests qa-cil balloon` once: that section is deprecated and MUST error, pointing at `machine` — record the exact text.
+2. Spot-check three claims against the live cluster: the LB pool range in `lb-pool` matches the `.200–.239` convention; `mirrors` shows the single catch-all `http://<gateway>:5059` endpoint with `skipFallback: true`; `machine` carries the `machine.kernel.modules` entry for `virtio_balloon` (SPEC §8's printed-snippet MUST — the `balloon` alias is gone; whether ballooning is actually running is attested from `~/.talosbox/tbxd.log` lines of the form `balloon <cluster>/<node>: target=<n>MiB (configured=… hostFree=… reserve=… deficit=…)`, macOS only).
 
-Expected observations: every listed section renders without error; `metallb-values`/`metallb-extras` are refused or empty on the cilium path (flannel-only sections — record the exact behavior); rendered values match live objects (`kubectl get ciliumloadbalancerippools -o yaml` vs `lb-pool`).
+Expected observations: every listed section renders without error; `balloon` errors with a redirect to `machine`; `metallb-values`/`metallb-extras` are refused or empty on the cilium path (flannel-only sections — record the exact behavior); rendered values match live objects (`kubectl get ciliumloadbalancerippools -o yaml` vs `lb-pool`).
 
-Pass criteria: all sections render; the three spot-checks match.
+Pass criteria: all listed sections render, `balloon` errors as documented, and the three spot-checks match.
 
 On failure: capture the mismatching section output and the live object.
 
@@ -79,7 +79,9 @@ On failure: capture the validation error text and `tbx status`.
 
 Steps:
 1. On `qa-cil`, identify the node announcing `.200` (`kubectl -n kube-system get leases | grep -i l2announce` or Cilium's l2-announce lease).
-2. `tbx node remove qa-cil <announcing-worker>` (or stop that node's workload path by cordon+drain if removal is disruptive — use node remove; it is the supported verb).
+2. Force the lease to move off that node. Which verb is legitimate depends on the topology — a defaults cluster has ONE control-plane node, and removing it would be cluster-fatal, so check the announcer's role first (`kubectl get node <announcer> -o wide` / the `node-role.kubernetes.io/control-plane` label):
+   - **Announcer is a worker**: `tbx node remove qa-cil <announcing-worker>` (the supported verb; do not improvise cordon+drain). Since #314 the RPC answers as soon as the node is gone and the post-mutation reconcile continues in the background — follow it in `~/.talosbox/tbxd.log` rather than waiting on the CLI.
+   - **Announcer is the sole control-plane node**: do NOT remove it. Hand the lease over instead by bouncing that node's Cilium agent — `kubectl -n kube-system delete pod -l k8s-app=cilium --field-selector spec.nodeName=<announcer>` — and record that this charter ran the handover variant, which measures lease re-announcement rather than node loss. (Alternative, if you want the removal variant on a defaults cluster: `tbx node add qa-cil --role worker`, wait for the lease to land on a worker, then remove that worker.)
 3. Time how long `.200` is unreachable (`while ! curl -s --max-time 1 http://<subnet>.200/ >/dev/null; do date; sleep 2; done`).
 
 Expected observations:

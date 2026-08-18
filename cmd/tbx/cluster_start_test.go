@@ -28,11 +28,11 @@ func TestStartProvisionDeadlineMatchesTheStoredClusterCSI(t *testing.T) {
 			{Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium}},
 		}, nil
 	}
-	if got := startProvisionDeadline("demo"); got != cniProvisionDeadline {
-		t.Fatalf("startProvisionDeadline(cni-only) = %v, want %v", got, cniProvisionDeadline)
+	if got := storedProvisionDeadline("demo"); got != cniProvisionDeadline {
+		t.Fatalf("storedProvisionDeadline(cni-only) = %v, want %v", got, cniProvisionDeadline)
 	}
-	if got := startProvisionDeadline("other"); got != storageProvisionDeadline {
-		t.Fatalf("startProvisionDeadline(csi) = %v, want %v", got, storageProvisionDeadline)
+	if got := storedProvisionDeadline("other"); got != storageProvisionDeadline {
+		t.Fatalf("storedProvisionDeadline(csi) = %v, want %v", got, storageProvisionDeadline)
 	}
 }
 
@@ -42,18 +42,19 @@ func TestStartProvisionDeadlineFallsBackToTheConservativeBound(t *testing.T) {
 	storedClustersQuery = func() ([]daemon.ClusterSummary, error) {
 		return nil, errors.New("no daemon")
 	}
-	if got := startProvisionDeadline("demo"); got != storageProvisionDeadline {
-		t.Fatalf("startProvisionDeadline(query failed) = %v, want the conservative %v", got, storageProvisionDeadline)
+	if got := storedProvisionDeadline("demo"); got != storageProvisionDeadline {
+		t.Fatalf("storedProvisionDeadline(query failed) = %v, want the conservative %v", got, storageProvisionDeadline)
 	}
 	storedClustersQuery = func() ([]daemon.ClusterSummary, error) {
 		return []daemon.ClusterSummary{{Name: "elsewhere"}}, nil
 	}
-	if got := startProvisionDeadline("demo"); got != storageProvisionDeadline {
-		t.Fatalf("startProvisionDeadline(unknown cluster) = %v, want the conservative %v", got, storageProvisionDeadline)
+	if got := storedProvisionDeadline("demo"); got != storageProvisionDeadline {
+		t.Fatalf("storedProvisionDeadline(unknown cluster) = %v, want the conservative %v", got, storageProvisionDeadline)
 	}
 }
 
-// stubStoredClusters answers the start verb's deadline lookup without a
+// stubStoredClusters answers a verb's deadline lookup (cluster start, node
+// add) without a
 // daemon, so a harness that scripts an exact response sequence is not thrown
 // off by the extra query.
 func stubStoredClusters(t *testing.T, clusters ...daemon.ClusterSummary) {

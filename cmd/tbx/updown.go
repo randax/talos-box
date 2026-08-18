@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -16,10 +17,13 @@ import (
 const defaultConfigFile = "talosbox.yaml"
 
 // Provisioning budgets are the daemon's own exported constants, so the stated
-// deadline can never drift from what the request is actually held to.
+// deadline can never drift from what the request is actually held to. A create
+// additionally waits for its nodes to boot before the provisioning budget
+// starts, so its stated deadline carries that wait too (#307).
 const (
 	cniProvisionDeadline     = daemon.CNIProvisionTimeout
 	storageProvisionDeadline = daemon.StorageProvisionTimeout
+	nodeBootDeadline         = daemon.NodeBootTimeout
 )
 
 // livenessInterval is how often a blocking lifecycle call reports it is still
@@ -27,9 +31,10 @@ const (
 var livenessInterval = time.Minute
 
 // liveness keeps a blocking daemon call distinguishable from a hang. up,
-// cluster create and cluster start all send one request that the daemon answers
-// only after provisioning converges — up to the deadline below — so without a
-// heartbeat the terminal shows nothing at all for the whole pass (#307).
+// cluster create, cluster start and node add all send one request that the
+// daemon answers only after provisioning converges — up to the deadline below —
+// so without a heartbeat the terminal shows nothing at all for the whole pass
+// (#307 #273).
 // Everything it writes goes to stderr: stdout stays the scriptable result.
 type liveness struct {
 	// verb reads as "provisioning demo" in both the preamble and the beat.
@@ -38,12 +43,38 @@ type liveness struct {
 	quiet    bool
 }
 
+// narrator serializes the progress stream's two writers: the liveness
+// heartbeat, which beats from its own goroutine, and the daemon's stage
+// narration, which arrives on the call goroutine (#273).
+type narrator struct {
+	mu     sync.Mutex
+	output io.Writer
+}
+
+// line writes one progress line, ignoring a write failure: an operation must
+// not fail because its narration could not be printed.
+func (n *narrator) line(format string, args ...any) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	_, _ = fmt.Fprintf(n.output, format, args...)
+}
+
+// stages returns the sink that prints the daemon's stage lines, or nil when
+// narration is suppressed — a nil sink is also what tells the daemon not to
+// send any.
+func (n *narrator) stages(quiet bool) func(string) {
+	if quiet {
+		return nil
+	}
+	return func(stage string) { n.line("%s\n", stage) }
+}
+
 // beat starts the heartbeat and returns the function that stops and joins it.
-// The caller must not write to the same stream until it returns.
-func (l liveness) beat(output io.Writer) func() {
+// Everything else writing to the same stream must go through the narrator.
+func (l liveness) beat(output *narrator) func() {
 	if l.quiet {
 		// --quiet drops narration, not the fact that this will take a while.
-		_, _ = fmt.Fprintf(output, "%s; up to %s; progress suppressed by --quiet\n", l.verb, formatLivenessDuration(l.deadline))
+		output.line("%s; up to %s; progress suppressed by --quiet\n", l.verb, formatLivenessDuration(l.deadline))
 	}
 	started := time.Now()
 	ticker := time.NewTicker(livenessInterval)
@@ -56,7 +87,7 @@ func (l liveness) beat(output io.Writer) func() {
 			case <-stop:
 				return
 			case <-ticker.C:
-				_, _ = fmt.Fprintf(output, "still %s (elapsed %s, deadline %s)\n",
+				output.line("still %s (elapsed %s, deadline %s)\n",
 					l.verb, formatLivenessDuration(time.Since(started)), formatLivenessDuration(l.deadline))
 			}
 		}
@@ -73,12 +104,21 @@ func (l liveness) beat(output io.Writer) func() {
 // skipped — so call() cannot re-handshake mid-call and the heartbeat goroutine
 // is the only writer to stderr while the call is in flight.
 func (c cli) callWithLiveness(signal liveness, op string, args, destination any) error {
+	return c.callWithLivenessNarrated(signal, op, args, destination, false)
+}
+
+// callWithLivenessNarrated is callWithLiveness with the daemon's stage
+// narration folded into the same stream. The heartbeat proves the call is
+// alive; the stages say what it is doing (#263 #273). --quiet drops the stages
+// and keeps the heartbeat.
+func (c cli) callWithLivenessNarrated(signal liveness, op string, args, destination any, narrate bool) error {
 	if err := c.resolveDaemonProtocol(true); err != nil {
 		return err
 	}
-	stop := signal.beat(c.err)
+	stream := &narrator{output: c.err}
+	stop := signal.beat(stream)
 	defer stop()
-	return c.call(op, args, destination)
+	return c.callNarrated(op, args, destination, stream.stages(!narrate || signal.quiet))
 }
 
 // formatLivenessDuration renders a budget the way the runbook states it: whole
@@ -106,6 +146,14 @@ func provisionDeadline(storage bool) time.Duration {
 		return storageProvisionDeadline
 	}
 	return cniProvisionDeadline
+}
+
+// createProvisionDeadline is provisionDeadline plus the boot wait a create runs
+// ahead of provisioning: the daemon holds a create for both, and a heartbeat
+// stating only the provisioning half reports an elapsed time past its own
+// deadline on any host where a node is slow to lease DHCP.
+func createProvisionDeadline(storage bool) time.Duration {
+	return provisionDeadline(storage) + nodeBootDeadline
 }
 
 func (c cli) runUp(args []string) error {

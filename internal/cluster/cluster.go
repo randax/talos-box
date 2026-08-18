@@ -70,7 +70,27 @@ type Cluster struct {
 	// round-trips regardless of how the safe-TLD policy evolves.
 	Domain            string `json:"domain,omitempty"`
 	AllowUnsafeDomain bool   `json:"allowUnsafeDomain,omitempty"`
+	// ConfigOrigin records how the cluster came to exist, which decides
+	// whether a recovery hint may name `tbx up` (#267).
+	ConfigOrigin ConfigOrigin `json:"configOrigin,omitempty"`
 }
+
+// ConfigOrigin is how a cluster came to exist. It is deliberately tri-state:
+// a cluster.json written by a tbx predating the field decodes as
+// OriginUnknown, and reading that as imperative would tell a long-standing
+// `tbx up` user to destroy a cluster their talosbox.yaml still backs.
+type ConfigOrigin string
+
+const (
+	// OriginUnknown is a cluster created before the origin was recorded.
+	OriginUnknown ConfigOrigin = ""
+	// OriginManaged is a cluster a talosbox.yaml backs: `tbx up` created it,
+	// or a later `tbx up` claimed it.
+	OriginManaged ConfigOrigin = "managed"
+	// OriginImperative is a cluster created by `tbx cluster create`, with no
+	// file to rerun.
+	OriginImperative ConfigOrigin = "imperative"
+)
 
 // DefaultDomainSuffix is the suffix under which default cluster domains live.
 const DefaultDomainSuffix = "k8s.test"

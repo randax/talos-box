@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -135,5 +136,70 @@ func TestResumeWarningsStayOnePerEntry(t *testing.T) {
 		if strings.Contains(warning, "; cold-booting instead; ") {
 			t.Fatalf("warning %q fuses two warnings onto one entry", warning)
 		}
+	}
+}
+
+// TestPlatformErrorSummaryKeepsTheTerminalWarningOnOneLine pins #312: Cocoa
+// hands back a multi-line plist, and three suspended nodes meant three dumps
+// scrolling the warnings away. Only the description belongs in the terminal.
+func TestPlatformErrorSummaryKeepsTheTerminalWarningOnOneLine(t *testing.T) {
+	cocoa := "Error Domain=VZErrorDomain Code=12 \"The virtual machine failed to restore from the saved state.\" " +
+		"UserInfo={NSLocalizedFailure=Internal Virtualization error.,\n" +
+		"    NSUnderlyingError=0x600002a1c0f0 {Error Domain=VZErrorDomain Code=12 UserInfo={\n" +
+		"        NSLocalizedFailureReason = \"incompatible save\";\n" +
+		"    }}}"
+	cause := fmt.Errorf("%w: %s", hypervisor.ErrIncompatibleSave, cocoa)
+
+	summary := platformErrorSummary(cause)
+	if strings.ContainsAny(summary, "\n\r") {
+		t.Fatalf("summary = %q, want a single line", summary)
+	}
+	if strings.Contains(summary, "UserInfo=") {
+		t.Fatalf("summary = %q, want the plist dump dropped", summary)
+	}
+	for _, want := range []string{
+		hypervisor.ErrIncompatibleSave.Error(),
+		"VZErrorDomain Code=12",
+		"The virtual machine failed to restore from the saved state.",
+	} {
+		if !strings.Contains(summary, want) {
+			t.Fatalf("summary = %q, want substring %q", summary, want)
+		}
+	}
+
+	warning := coldBootWarning("qa-sta-cp-1", false, cause)
+	if strings.ContainsAny(warning, "\n\r") {
+		t.Fatalf("warning = %q, want a single line", warning)
+	}
+	if !strings.HasPrefix(warning, "qa-sta-cp-1: saved state could not be restored; cold-booting instead: ") {
+		t.Fatalf("warning = %q, want the lead clause preserved", warning)
+	}
+	if !strings.HasSuffix(warning, "(details: ~/.talosbox/tbxd.log)") {
+		t.Fatalf("warning = %q, want the log pointer kept", warning)
+	}
+}
+
+// TestPlatformErrorSummaryBoundsARunawayCause covers a cause that is one very
+// long line: the terminal gets a bounded form, the daemon log keeps the rest.
+func TestPlatformErrorSummaryBoundsARunawayCause(t *testing.T) {
+	cause := fmt.Errorf("%w: %s", hypervisor.ErrIncompatibleSave, strings.Repeat("x", 4096))
+	summary := platformErrorSummary(cause)
+	if len([]rune(summary)) > maxPlatformErrorSummary+len("...") {
+		t.Fatalf("summary is %d runes, want at most %d", len([]rune(summary)), maxPlatformErrorSummary+3)
+	}
+	if !strings.HasSuffix(summary, "...") {
+		t.Fatalf("summary = %q, want an elision marker", summary)
+	}
+}
+
+// TestPlatformErrorSummaryHandlesAnEmptyCause keeps the no-cause warning on the
+// log-pointer-only wording rather than emitting a dangling colon.
+func TestPlatformErrorSummaryHandlesAnEmptyCause(t *testing.T) {
+	if got := platformErrorSummary(nil); got != "" {
+		t.Fatalf("platformErrorSummary(nil) = %q, want empty", got)
+	}
+	warning := coldBootWarning("qa-sta-cp-1", false, errors.New("\n"))
+	if warning != "qa-sta-cp-1: saved state could not be restored; cold-booting instead (details: ~/.talosbox/tbxd.log)" {
+		t.Fatalf("warning = %q, want the causeless wording", warning)
 	}
 }

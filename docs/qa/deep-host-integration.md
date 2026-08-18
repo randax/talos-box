@@ -25,13 +25,15 @@ BLOCKED unless: `tbx version` recorded; the platform's install story is already 
 **Goal**: every doctor line is truthful and remediation is copy-pasteable.
 
 Steps:
-1. `tbx doctor` on a healthy host — record every check name and result. Compare the set against the documented platform list: [docs/macos.md](../macos.md) (`helper`, `resolver`, `DNS`, `forwarding`, `host-pressure`, `system-dns`, `routes`, `guest-agent`, `mirror-health`, `egress`, `security-inventory`) or [docs/linux.md](../linux.md) (the same daemon- and cluster-scoped checks plus `helper-unit`/`helper-access`/`helper-capabilities`, `kvm`, `qemu`, `bridge-netfilter`, `bridge-stp`, `rp-filter`, and `port-53`/`port-67`/`port-179`). A check the platform doc does not list — or a documented check the build never emits — is the finding.
-2. Break one innocuous thing and confirm doctor catches it: occupy port 179 (`nc -l 179` as root or a high-privilege listener) → doctor `port-179` degrades with a specific message. Release it.
+1. `tbx doctor` on a healthy host — record every check name and result. Compare the set against the documented platform list: [docs/macos.md](../macos.md) (`helper`, `resolver`, `DNS`, `forwarding`, `host-pressure`, `system-dns`, `routes`, `guest-agent`, `mirror-health`, `image-cache`, `egress`, `security-inventory`) or [docs/linux.md](../linux.md) (the same daemon- and cluster-scoped checks plus `helper-unit`/`helper-access`/`helper-capabilities`, `kvm`, `qemu`, `bridge-netfilter`, `bridge-stp`, `rp-filter`, and `port-53`/`port-67`/`port-179`). A check the platform doc does not list — or a documented check the build never emits — is the finding.
+2. Break one innocuous thing and confirm doctor catches it — the induced failure is platform-specific:
+   - **[Linux]** occupy port 179 (`nc -l 179` as root or a high-privilege listener) → doctor `port-179` degrades with a specific message. Release it.
+   - **[macOS]** there are no `port-*` checks and binding 179 needs root, so use `host-pressure` instead: with **no cluster running** (this runbook's `qa-host` is created in C2, so do this first), drive the host into pressure with a bounded allocation — a scratch process holding a few GiB, released the moment doctor has been read — and confirm `host-pressure` moves off PASS to WARN or FAIL with the measured numbers and a runnable remedy (`tbx down` / `tbx cache prune --all`). Never induce pressure while VMs are running: swap exhaustion corrupts guest writes, which is the very thing this check exists to prevent. If pressure cannot be induced safely on this host, fall back to attesting the live reading: quote the `host-pressure` line next to the raw host numbers (`memory_pressure`, `sysctl vm.swapusage`, `df -h /System/Volumes/Data`) and confirm the verdict matches them — a faithful PASS is evidence too; record it as observe-and-attest rather than SKIPPED.
 3. Confirm doctor never *executes* remediation — it prints commands only.
 
-Expected observations: check set matches docs; the induced failure is caught with an exact, runnable remediation line; FAIL exits non-zero, WARN doesn't.
+Expected observations: check set matches docs; the induced (or attested) pressure/port finding is reported with an exact, runnable remediation line and numbers that match the host; FAIL exits non-zero, WARN doesn't.
 
-Pass criteria: set matches, induced failure caught, remediation printed-not-run.
+Pass criteria: set matches, the platform's induced-or-attested finding is faithful, remediation printed-not-run.
 
 On failure: capture the full doctor transcript.
 
@@ -41,15 +43,15 @@ On failure: capture the full doctor transcript.
 
 Steps (macOS):
 1. `tbx cluster create qa-host --cni cilium` (configured nodes are balloon-managed; maintenance nodes are exempt).
-2. Verify printed config includes the balloon module: `tbx manifests qa-host machine` mentions `virtio_balloon` (the `balloon` alias is deprecated and errors, pointing at `machine`).
-3. Create memory pressure (e.g. run a large `stress`-like allocation or record SKIPPED-if-impractical with reason); watch for balloon inflation evidence in guest free memory (`kubectl top nodes` deltas) — this is an observe-and-attest check, not a hard assertion.
+2. Verify printed config includes the balloon module: `tbx manifests qa-host machine` mentions `virtio_balloon` under `machine.kernel.modules` (the `balloon` section is deprecated and errors, pointing at `machine` — run it once and record the error text).
+3. Create memory pressure (e.g. run a large `stress`-like allocation or record SKIPPED-if-impractical with reason); attest balloon activity from `~/.talosbox/tbxd.log`, which logs each target change as `balloon <cluster>/<node>: target=<n>MiB (configured=… hostFree=… reserve=… deficit=…)` — that log line, not `manifests`, is the runtime evidence that ballooning happened (guest-side `kubectl top nodes` deltas are corroboration at best). Observe-and-attest, not a hard assertion. Note that only TLS-configured nodes are balloon-managed on the VZ backend; a maintenance-phase `qa-host` produces no such lines by design.
 4. Overcommit guard: attempt `tbx cluster create qa-big --cp 1 --workers 6 --memory-mib 4096` sized to exceed host RAM minus 6 GiB — expect a warning; confirm `--force` overrides; destroy/abort without creating if possible.
 
 Steps (Linux):
 1. `tbx doctor` reports `host-pressure: SKIP` — expected, record it.
 2. Confirm the overcommit guard does NOT fire on an oversized create (document its absence — expected today, still worth a friction note reminding that nothing protects the host).
 
-Expected observations: macOS — module printed, guard warns, `--force` overrides; Linux — honest SKIP, no guard.
+Expected observations: macOS — module printed by `machine`, `balloon` refused with a redirect, balloon targets visible in `tbxd.log` under pressure, guard warns and `--force` overrides; Linux — honest SKIP, no guard.
 
 Pass criteria: platform-appropriate behavior exactly.
 
@@ -57,18 +59,18 @@ On failure: capture guard output / doctor lines.
 
 ### C3 — Spec-drift charters
 
-**Goal**: pin down the known doc/code divergences so they are consciously resolved, not rediscovered.
+**Goal**: verify the SPEC surfaces that historically drifted from the code, and pin down the one divergence that remains.
 
-Steps and expected current behavior (each records verbatim behavior; the drift itself is the finding):
-1. `tbx node start qa-host qa-host-cp-1` / `tbx node stop ...` — SPEC §9 lists these; CLI expected to reject (unimplemented). Record the error.
-2. `tbx snapshot list qa-host -o json` and `tbx cache list -o json` — SPEC claims `-o json` on all list/status commands; code supports it only on `status` and `cluster list`. Record actual behavior of each.
+Steps (record verbatim output for each):
+1. `tbx node stop qa-host qa-host-worker-1`, then `tbx status qa-host`, then `tbx node start qa-host qa-host-worker-1` — SPEC §9 lists both verbs and both are implemented. Expect: `stopped node ...` / `started node ...` on stdout, the node reported `stopped` in status between them, and the node back on its way up afterwards. A rejection or an "unknown node command" here is the finding.
+2. `tbx status qa-host -o json`, `tbx cluster list -o json`, `tbx cache list -o json`, `tbx snapshot list qa-host -o json` — SPEC claims `-o json` on the list/status commands, and all four support it. Each must print valid JSON (`| python3 -m json.tool`). A rejected flag or non-JSON output is the finding.
 3. **[Linux]** `tbx system install` — docs say never run it on Linux, but the code does not gate it. DO NOT actually complete it: run it WITHOUT sudo rights available and record how far it gets / what error appears (it may attempt sudo re-exec — decline the password prompt and record). If declining is not safely possible, mark SKIPPED-unsafe with reasoning.
 
-Expected observations: each divergence documented with exact output; file/refresh one tracking issue per genuine divergence if none exists yet (search first).
+Expected observations: steps 1 and 2 behave as described above; step 3's divergence documented with exact output. File/refresh one tracking issue per genuine divergence if none exists yet (search first).
 
-Pass criteria: all three drift items have verbatim evidence in the report.
+Pass criteria: steps 1 and 2 behave as stated, and step 3 has verbatim evidence in the report.
 
-On failure: n/a (this charter's failures are its findings) — but a *silent success* of a supposedly-unimplemented verb is a red-flag finding; report it prominently.
+On failure: capture the exact command and output; a SPEC-listed verb that rejects, or a `-o json` that does not parse, is a red-flag finding — report it prominently.
 
 ### C4 — Guided-output and quiet contracts
 

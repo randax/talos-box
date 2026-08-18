@@ -69,10 +69,10 @@ func (t provisionTask) finish() {
 	}
 }
 
-func (s *Server) handleProvisioningLocked(request Request, maintenance map[string]maintenanceObservation, storage map[string]storageObservation) (any, []provisionTask, error) {
+func (s *Server) handleProvisioningLocked(request Request, maintenance map[string]maintenanceObservation, storage map[string]storageObservation, progress stageFunc) (any, []provisionTask, error) {
 	switch request.Op {
 	case "cluster.create":
-		result, err := s.createCluster(request.Args)
+		result, err := s.createCluster(request.Args, progress)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -256,6 +256,18 @@ func (s *Server) drainProvision(name string) {
 	}
 }
 
+// cancelProvisionForHandover cancels a cluster's reconcile without retiring it,
+// so the operation that asked for the handover can still drain it: drainProvision
+// waits on the task's done channel, and a retired entry leaves nothing to wait
+// on — cancelling only asks the goroutine to stop, it does not stop it.
+func (s *Server) cancelProvisionForHandover(name string) {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	if active, ok := s.provisions[name]; ok {
+		active.cancel()
+	}
+}
+
 func (s *Server) cancelProvisionLocked(name string) {
 	if active, ok := s.provisions[name]; ok {
 		active.cancel()
@@ -276,7 +288,7 @@ func (s *Server) cancelAllProvisionsLocked() {
 	}
 }
 
-func (s *Server) runProvisionTasks(data any, tasks []provisionTask) error {
+func (s *Server) runProvisionTasks(data any, tasks []provisionTask, progress stageFunc) error {
 	// Every task must release its waiters, including the ones a failure never
 	// gets to: a drain that outlived its task would hang the operation waiting
 	// for it.
@@ -287,6 +299,14 @@ func (s *Server) runProvisionTasks(data any, tasks []provisionTask) error {
 		}
 	}()
 	for i, task := range tasks {
+		// The reconcile is the longest stretch of any verb that keeps it on the
+		// request path, and it used to run behind a silent socket for its whole
+		// budget (#273). It reports no intermediate progress of its own, so the
+		// stage names the work and the bound the daemon holds the request to.
+		if reconcilesCNI(task.item) {
+			progress.stage("reconciling %s on cluster %s (up to %s)",
+				task.item.CNI, task.item.Name, formatBootWindow(provisionTimeout(task.item)))
+		}
 		narration, phase, err := s.provisionCNI(task.ctx, task.item, task.force)
 		if task.item.CSI != "" {
 			s.opMu.Lock()
@@ -329,10 +349,30 @@ func (s *Server) runProvisionTasksAsync(op string, tasks []provisionTask) {
 	s.backgroundProvisions.Add(1)
 	go func() {
 		defer s.backgroundProvisions.Done()
-		if err := s.runProvisionTasks(nil, tasks); err != nil {
+		// No progress sink: the request it followed has already been answered,
+		// so there is no connection left to narrate onto.
+		if err := s.runProvisionTasks(nil, tasks, nil); err != nil {
 			log.Printf("%s: follow-up reconcile failed: %v", op, err)
 		}
 	}()
+}
+
+// reconcilesCNI reports whether a provisioning pass over this cluster has any
+// work to do at all: only the curated CNIs are reconciled, and a substrate-only
+// cluster must not be narrated as if it were.
+func reconcilesCNI(item cluster.Cluster) bool {
+	return item.CNI == cluster.CNIFlannel || item.CNI == cluster.CNICilium
+}
+
+// tasksReconcile reports whether any of these tasks has a reconcile to run, and
+// so whether the verb that scheduled them still has work ahead of it.
+func tasksReconcile(tasks []provisionTask) bool {
+	for _, task := range tasks {
+		if reconcilesCNI(task.item) {
+			return true
+		}
+	}
+	return false
 }
 
 // provisionTimeout budgets one provisioning pass by what it must converge.
@@ -344,7 +384,7 @@ func provisionTimeout(item cluster.Cluster) time.Duration {
 }
 
 func (s *Server) provisionCNI(parent context.Context, item cluster.Cluster, force bool) ([]string, StoragePhase, error) {
-	if item.CNI != cluster.CNIFlannel && item.CNI != cluster.CNICilium {
+	if !reconcilesCNI(item) {
 		return nil, "", nil
 	}
 	// Once every desired outcome is observed healthy, a rerun is a genuine fast

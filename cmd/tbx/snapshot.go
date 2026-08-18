@@ -35,12 +35,13 @@ func (c cli) snapshotCreate(args []string) error {
 	fs := flag.NewFlagSet("snapshot create", flag.ContinueOnError)
 	fs.SetOutput(c.err)
 	yes := fs.Bool("yes", false, "skip the running-cluster confirmation")
+	quiet := fs.Bool("quiet", false, "suppress stage narration")
 	rest, err := parseInterspersed(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(rest) < 1 || len(rest) > 2 {
-		return errors.New("usage: tbx snapshot create <cluster> [name] [--yes]")
+		return errors.New("usage: tbx snapshot create <cluster> [name] [--yes] [--quiet]")
 	}
 	name := defaultSnapshotName()
 	if len(rest) == 2 {
@@ -53,13 +54,16 @@ func (c cli) snapshotCreate(args []string) error {
 		return err
 	}
 	var result daemon.SnapshotStatus
-	if err := c.call("snapshot.create", map[string]string{"cluster": rest[0], "name": name}, &result); err != nil {
+	// A snapshot stops the whole cluster, clones every node disk and restarts
+	// it; unnarrated that is a silent second of nothing (#273 #244).
+	if err := c.callNarrated("snapshot.create", map[string]string{"cluster": rest[0], "name": name}, &result, c.stages(*quiet)); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(c.out, "created snapshot %s of %s\n", name, rest[0]); err != nil {
+	if err := printWarnings(c.err, result.Warnings, result.Warning); err != nil {
 		return err
 	}
-	return printWarnings(c.err, result.Warnings, result.Warning)
+	_, err = fmt.Fprintf(c.out, "created snapshot %s of %s\n", name, rest[0])
+	return err
 }
 
 func (c cli) snapshotRestore(args []string) error {
@@ -67,12 +71,13 @@ func (c cli) snapshotRestore(args []string) error {
 	fs.SetOutput(c.err)
 	yes := fs.Bool("yes", false, "skip the running-cluster confirmation")
 	force := fs.Bool("force", false, "restore even when the nodes it deletes hold the only copy of volume data")
+	quiet := fs.Bool("quiet", false, "suppress stage narration")
 	rest, err := parseInterspersed(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(rest) != 2 {
-		return errors.New("usage: tbx snapshot restore <cluster> <name> [--yes] [--force]")
+		return errors.New("usage: tbx snapshot restore <cluster> <name> [--yes] [--force] [--quiet]")
 	}
 	if err := c.ensureSnapshotRestoreSupport(); err != nil {
 		return err
@@ -81,13 +86,14 @@ func (c cli) snapshotRestore(args []string) error {
 		return err
 	}
 	var result daemon.SnapshotStatus
-	if err := c.call("snapshot.restore", map[string]any{"cluster": rest[0], "name": rest[1], "force": *force}, &result); err != nil {
+	if err := c.callNarrated("snapshot.restore", map[string]any{"cluster": rest[0], "name": rest[1], "force": *force}, &result, c.stages(*quiet)); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(c.out, "restored %s from snapshot %s\n", rest[0], rest[1]); err != nil {
+	if err := printWarnings(c.err, result.Warnings, result.Warning); err != nil {
 		return err
 	}
-	return printWarnings(c.err, result.Warnings, result.Warning)
+	_, err = fmt.Fprintf(c.out, "restored %s from snapshot %s\n", rest[0], rest[1])
+	return err
 }
 
 func (c cli) snapshotDelete(args []string) error {

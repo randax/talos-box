@@ -813,6 +813,24 @@ func waitForCurrentDaemon(socketPath string) (daemon.Info, int, error) {
 }
 
 func (c cli) call(op string, args, destination any) error {
+	return c.callNarrated(op, args, destination, nil)
+}
+
+// stages is the narration sink for a verb that has no heartbeat to share the
+// stream with: one goroutine writes, so no narrator is needed. A quiet verb
+// gets nil, which also stops the daemon from sending stages at all (#273).
+func (c cli) stages(quiet bool) func(string) {
+	if quiet {
+		return nil
+	}
+	return func(stage string) { _, _ = fmt.Fprintln(c.err, stage) }
+}
+
+// callNarrated is call with a narration sink: a non-nil onStage asks the daemon
+// to report the operation's stages while it runs, and each one is handed over
+// as it arrives. A nil sink is the silent exchange every other verb makes
+// (#273).
+func (c cli) callNarrated(op string, args, destination any, onStage func(string)) error {
 	if err := c.ensureDaemonProtocol(); err != nil {
 		return err
 	}
@@ -820,7 +838,7 @@ func (c cli) call(op string, args, destination any) error {
 	if err != nil {
 		return err
 	}
-	response, err := exchange(socketPath, op, args)
+	response, err := exchangeNarrated(socketPath, op, args, onStage)
 	var connectionError dialError
 	if errors.As(err, &connectionError) {
 		logOffset, startErr := startDaemon()
@@ -832,7 +850,7 @@ func (c cli) call(op string, args, destination any) error {
 		deadline := time.Now().Add(daemonWaitTimeout)
 		backoff := 50 * time.Millisecond
 		for {
-			response, err = exchange(socketPath, op, args)
+			response, err = exchangeNarrated(socketPath, op, args, onStage)
 			if !errors.As(err, &connectionError) || time.Now().After(deadline) {
 				break
 			}
@@ -871,10 +889,19 @@ func exchange(socketPath, op string, args any) (daemon.Response, error) {
 	return exchangeWithin(socketPath, op, args, 0)
 }
 
+// exchangeNarrated is exchange with a narration sink; a nil sink asks for none.
+func exchangeNarrated(socketPath, op string, args any, onStage func(string)) (daemon.Response, error) {
+	return exchangeDeadlined(socketPath, op, args, 0, onStage)
+}
+
 // exchangeWithin runs one request/response with an optional overall deadline,
 // which the restart paths need: their queries are served under the daemon's
 // operation lock and must never outlast a courtesy check.
 func exchangeWithin(socketPath, op string, args any, timeout time.Duration) (daemon.Response, error) {
+	return exchangeDeadlined(socketPath, op, args, timeout, nil)
+}
+
+func exchangeDeadlined(socketPath, op string, args any, timeout time.Duration, onStage func(string)) (daemon.Response, error) {
 	connection, err := net.DialTimeout("unix", socketPath, 250*time.Millisecond)
 	if err != nil {
 		return daemon.Response{}, dialError{err: err}
@@ -890,15 +917,26 @@ func exchangeWithin(socketPath, op string, args any, timeout time.Duration) (dae
 	if err != nil {
 		return daemon.Response{}, fmt.Errorf("encode request arguments: %w", err)
 	}
-	request := daemon.Request{Op: op, Args: rawArgs}
+	request := daemon.Request{Op: op, Args: rawArgs, Progress: onStage != nil}
 	if err := json.NewEncoder(connection).Encode(request); err != nil {
 		return daemon.Response{}, fmt.Errorf("write daemon request: %w", err)
 	}
-	var response daemon.Response
-	if err := json.NewDecoder(connection).Decode(&response); err != nil {
-		return daemon.Response{}, fmt.Errorf("read daemon response: %w", err)
+	// A narrated request is answered by a run of stage responses followed by
+	// the single result; an unnarrated one gets the result straight away.
+	decoder := json.NewDecoder(connection)
+	for {
+		var response daemon.Response
+		if err := decoder.Decode(&response); err != nil {
+			return daemon.Response{}, fmt.Errorf("read daemon response: %w", err)
+		}
+		if response.IsProgress() {
+			if onStage != nil {
+				onStage(response.Stage)
+			}
+			continue
+		}
+		return response, nil
 	}
-	return response, nil
 }
 
 // daemonWaitTimeout bounds how long a just-spawned daemon may take to serve,

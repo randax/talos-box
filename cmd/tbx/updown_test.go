@@ -358,3 +358,15 @@ func TestRunUpRejectsOldDaemonWhenFileLevelExtensionsAreUsed(t *testing.T) {
 		t.Fatalf("operation = %q, want daemon.info before any mutation", request.Op)
 	}
 }
+
+// A create waits for its nodes to boot before the provisioning budget starts,
+// so the deadline the heartbeat states has to carry both halves — otherwise it
+// reports an elapsed time past its own stated deadline (#307).
+func TestCreateProvisionDeadlineIncludesTheNodeBootWait(t *testing.T) {
+	if got, want := createProvisionDeadline(false), daemon.CNIProvisionTimeout+daemon.NodeBootTimeout; got != want {
+		t.Fatalf("createProvisionDeadline(false) = %v, want %v", got, want)
+	}
+	if got, want := createProvisionDeadline(true), daemon.StorageProvisionTimeout+daemon.NodeBootTimeout; got != want {
+		t.Fatalf("createProvisionDeadline(true) = %v, want %v", got, want)
+	}
+}

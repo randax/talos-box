@@ -214,16 +214,17 @@ func storedClusters() ([]daemon.ClusterSummary, error) {
 	return clusters, nil
 }
 
-// startProvisionDeadline reports the budget the daemon will hold this start to:
-// a declared storage engine buys the larger one, exactly as the daemon's own
-// provisionTimeout decides it. The CLI cannot read the stored cluster directly,
-// so it asks the daemon what it has.
+// storedProvisionDeadline reports the budget the daemon will hold a blocking
+// reconcile of this stored cluster to — `cluster start` and `node add` both
+// keep one on the request path. A declared storage engine buys the larger one,
+// exactly as the daemon's own provisionTimeout decides it. The CLI cannot read
+// the stored cluster directly, so it asks the daemon what it has.
 //
 // Any failure — no daemon yet, a busy one, an unknown cluster — falls back to
 // the storage bound. Overstating the budget only makes the heartbeat
 // pessimistic; understating it would advertise a deadline the daemon does not
 // honor, which is the drift the heartbeat exists to avoid (#307).
-func startProvisionDeadline(name string) time.Duration {
+func storedProvisionDeadline(name string) time.Duration {
 	clusters, err := storedClustersQuery()
 	if err != nil {
 		return storageProvisionDeadline
@@ -249,7 +250,7 @@ func (c cli) startCluster(args []string) error {
 	// A start reconciles the cluster's declared CNI/CSI on the same blocking
 	// call as create, so the stated bound must be the one the daemon budgets
 	// this request at (#307).
-	signal := liveness{verb: "starting " + name, deadline: startProvisionDeadline(name), quiet: quiet}
+	signal := liveness{verb: "starting " + name, deadline: storedProvisionDeadline(name), quiet: quiet}
 	if err := c.callWithLiveness(signal, "cluster.start", request, &result); err != nil {
 		return err
 	}
@@ -368,17 +369,19 @@ func (c cli) createCluster(args []string) error {
 	var result daemon.ClusterSummary
 	signal := liveness{
 		verb:     "provisioning " + positionals[0],
-		deadline: provisionDeadline(*csi != ""),
+		deadline: createProvisionDeadline(*csi != ""),
 		quiet:    *quiet,
 	}
-	if err := c.callWithLiveness(signal, "cluster.create", request, &result); err != nil {
+	if err := c.callWithLivenessNarrated(signal, "cluster.create", request, &result, true); err != nil {
+		return err
+	}
+	// Warnings first: they describe the cluster the success line is about to
+	// claim, and printed below it they land where nobody reads them (#263).
+	if err := printWarnings(c.err, result.Warnings, result.Warning); err != nil {
 		return err
 	}
 	if _, err := fmt.Fprintf(c.out, "created and started cluster %s (%d control plane, %d workers)\n",
 		result.Name, result.ControlPlanes, result.Workers); err != nil {
-		return err
-	}
-	if err := printWarnings(c.err, result.Warnings, result.Warning); err != nil {
 		return err
 	}
 	if !*quiet {
@@ -437,6 +440,12 @@ func (c cli) inspectDestroy(name string, request struct {
 }) error {
 	var inspection daemon.DestroyInspection
 	if err := c.call("cluster.destroy.inspect", request, &inspection); err != nil {
+		// A cluster that does not exist fails here rather than warning about
+		// data it cannot have; every other inspection failure still warns,
+		// since a partially-destroyed cluster may still hold volumes (#268).
+		if daemon.IsClusterMissing(err, name) {
+			return err
+		}
 		return printWarning(c.err, daemon.DestroyInspectionDataLossWarning(name, ""))
 	}
 	return printWarning(c.err, inspection.Warning)
@@ -452,12 +461,13 @@ func (c cli) runNode(args []string) error {
 		flags.SetOutput(c.err)
 		role := flags.String("role", string(cluster.RoleWorker), "worker or control-plane")
 		force := flags.Bool("force", false, "proceed despite an overcommit or host-pressure warning")
+		quiet := flags.Bool("quiet", false, "suppress stage narration")
 		positionals, err := parseInterspersed(flags, args[1:])
 		if err != nil {
 			return err
 		}
 		if len(positionals) < 1 || len(positionals) > 2 {
-			return errors.New("usage: tbx node add <cluster> [node] [--role worker|control-plane] [--force]")
+			return errors.New("usage: tbx node add <cluster> [node] [--role worker|control-plane] [--force] [--quiet]")
 		}
 		name := ""
 		if len(positionals) == 2 {
@@ -465,36 +475,48 @@ func (c cli) runNode(args []string) error {
 		}
 		request := map[string]any{"cluster": positionals[0], "name": name, "role": *role, "force": *force}
 		var result daemon.NodeStatus
-		if err := c.call("node.add", request, &result); err != nil {
+		// node add is the one node mutation that keeps its reconcile on the
+		// request path, and that reconcile reports nothing between its opening
+		// stage and its end. Without a heartbeat the terminal is dead for the
+		// whole budget, which is the silence narration exists to remove (#273).
+		signal := liveness{
+			verb:     "adding a node to " + positionals[0],
+			deadline: storedProvisionDeadline(positionals[0]),
+			quiet:    *quiet,
+		}
+		if err := c.callWithLivenessNarrated(signal, "node.add", request, &result, true); err != nil {
 			return err
 		}
-		if _, err := fmt.Fprintf(c.out, "added node %s to cluster %s\n", result.Name, positionals[0]); err != nil {
+		if err := printWarnings(c.err, result.Warnings, result.Warning); err != nil {
 			return err
 		}
-		return printWarnings(c.err, result.Warnings, result.Warning)
+		_, err = fmt.Fprintf(c.out, "added node %s to cluster %s\n", result.Name, positionals[0])
+		return err
 	case "remove":
 		flags := flag.NewFlagSet("node remove", flag.ContinueOnError)
 		flags.SetOutput(c.err)
 		force := flags.Bool("force", false, "remove the node even when it holds the only copy of volume data")
+		quiet := flags.Bool("quiet", false, "suppress stage narration")
 		positionals, err := parseInterspersed(flags, args[1:])
 		if err != nil {
 			return err
 		}
 		if len(positionals) != 2 {
-			return errors.New("usage: tbx node remove <cluster> <node> [--force]")
+			return errors.New("usage: tbx node remove <cluster> <node> [--force] [--quiet]")
 		}
 		if err := c.ensureNodeRemoveSupport(); err != nil {
 			return err
 		}
 		request := map[string]any{"cluster": positionals[0], "name": positionals[1], "force": *force}
 		var result daemon.NodeStatus
-		if err := c.call("node.remove", request, &result); err != nil {
+		if err := c.callNarrated("node.remove", request, &result, c.stages(*quiet)); err != nil {
 			return err
 		}
-		if _, err := fmt.Fprintf(c.out, "removed node %s from cluster %s\n", positionals[1], positionals[0]); err != nil {
+		if err := printWarnings(c.err, result.Warnings, result.Warning); err != nil {
 			return err
 		}
-		return printWarnings(c.err, result.Warnings, result.Warning)
+		_, err = fmt.Fprintf(c.out, "removed node %s from cluster %s\n", positionals[1], positionals[0])
+		return err
 	case "start", "stop":
 		return c.runNodeRunState(args[0], args[1:])
 	default:

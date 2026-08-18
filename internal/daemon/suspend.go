@@ -133,10 +133,39 @@ func coldBootWarning(nodeName string, saveMissing bool, cause error) string {
 		return fmt.Sprintf("%s: no saved state found; cold-booting instead", nodeName)
 	}
 	warning := fmt.Sprintf("%s: saved state could not be restored; cold-booting instead", nodeName)
-	if cause == nil {
+	summary := platformErrorSummary(cause)
+	if summary == "" {
 		return warning + " (details: ~/.talosbox/tbxd.log)"
 	}
-	return fmt.Sprintf("%s: %v (details: ~/.talosbox/tbxd.log)", warning, cause)
+	return fmt.Sprintf("%s: %s (details: ~/.talosbox/tbxd.log)", warning, summary)
+}
+
+// maxPlatformErrorSummary bounds a terminal-facing cause. Anything longer is
+// detail the daemon log holds in full.
+const maxPlatformErrorSummary = 200
+
+// platformErrorSummary reduces a hypervisor cause to one terminal line. Cocoa's
+// NSError renders as a multi-line plist once its UserInfo is expanded, so a
+// three-node resume dumped three plists over the warnings the operator was
+// meant to read. Keep the description, drop the dump: the warning already
+// points at tbxd.log, which still logs the cause verbatim (#312).
+func platformErrorSummary(cause error) string {
+	if cause == nil {
+		return ""
+	}
+	summary := cause.Error()
+	if index := strings.IndexAny(summary, "\n\r"); index >= 0 {
+		summary = summary[:index]
+	}
+	// " UserInfo={" opens the plist dump; everything after it is log material.
+	if index := strings.Index(summary, " UserInfo={"); index >= 0 {
+		summary = summary[:index]
+	}
+	summary = strings.TrimSpace(summary)
+	if runes := []rune(summary); len(runes) > maxPlatformErrorSummary {
+		summary = strings.TrimSpace(string(runes[:maxPlatformErrorSummary])) + "..."
+	}
+	return summary
 }
 
 type resumedNode struct {

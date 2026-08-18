@@ -364,7 +364,7 @@ func TestSnapshotRestoreReportsMissingSnapshotWithoutGating(t *testing.T) {
 func TestSnapshotRestoreHasNoUngatedLockedPath(t *testing.T) {
 	service, _ := runningLonghornClusterForNodeMutation(t, 1, 2)
 
-	_, err := service.handle(Request{Op: "snapshot.restore"})
+	_, err := service.handle(Request{Op: "snapshot.restore"}, nil)
 
 	if err == nil || !strings.Contains(err.Error(), "snapshot.restore") {
 		t.Fatalf("locked handle of snapshot.restore = %v, want a dispatch refusal", err)

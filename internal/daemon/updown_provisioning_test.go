@@ -294,7 +294,7 @@ func TestUpAddsAndSwitchesCSIWithoutChangingMachineConfig(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			response := service.dispatchProvisioning(Request{Op: "up", Args: raw})
+			response := service.dispatchProvisioning(Request{Op: "up", Args: raw}, nil)
 			if !response.OK {
 				t.Fatalf("up failed: %s", response.Error)
 			}
@@ -576,5 +576,98 @@ func TestUpCreatesEachClusterFromItsOwnImage(t *testing.T) {
 	}
 	if canary.BaseSchematic != "bbb" {
 		t.Fatalf("canary base schematic = %q, want %q", canary.BaseSchematic, "bbb")
+	}
+}
+
+// A cluster talosbox.yaml names is config-managed from that up onwards, so a
+// cluster created imperatively (or by a tbx predating the flag) stops being
+// told to destroy and recreate once a file backs it (#267).
+func TestPreflightUpClaimsExistingClusterAsConfigManaged(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true}
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+
+	service := &Server{}
+	updates, err := service.preflightUp(
+		[]config.ClusterSpec{{Name: item.Name, ProvisioningIntent: item.ProvisioningIntent}},
+		map[string]ClusterState{item.Name: {Exists: true}},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := persistIntentUpdates(updates); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := cluster.Load(item.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed.ConfigOrigin != cluster.OriginManaged {
+		t.Fatal("preflightUp() left an up-managed cluster unclaimed")
+	}
+	if claimed.ProvisioningIntent != item.ProvisioningIntent {
+		t.Fatalf("claim changed intent: %+v, want %+v", claimed.ProvisioningIntent, item.ProvisioningIntent)
+	}
+}
+
+func TestCreateFromSpecMarksClusterConfigManaged(t *testing.T) {
+	if !createArgsFromSpec(config.ClusterSpec{Name: "demo"}, false).ConfigManaged {
+		t.Fatal("createArgsFromSpec() did not mark the create as config-managed")
+	}
+	encoded, err := json.Marshal(createArgsFromSpec(config.ClusterSpec{Name: "demo"}, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded createArgs
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if !decoded.ConfigManaged {
+		t.Fatalf("createArgs lost its config-managed provenance on the wire: %s", encoded)
+	}
+}
+
+// `tbx cluster create` sends no origin at all — as does any CLI predating the
+// field — and the daemon must record that create as imperative rather than
+// leaving it indistinguishable from a cluster whose origin is unknown (#267).
+func TestCreateClusterRecordsImperativeOrigin(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	service := newVersionTestServer(t, "aaa", DefaultTalosVersion)
+	service.hostTotalMemory = func() (int, error) { return 1 << 20, nil }
+	createVersionTestCluster(t, service, "manual", "aaa", DefaultTalosVersion)
+
+	item, err := cluster.Load("manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.ConfigOrigin != cluster.OriginImperative {
+		t.Fatalf("persisted origin = %q, want %q", item.ConfigOrigin, cluster.OriginImperative)
+	}
+	statuses, err := service.status(json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 1 || statuses[0].ConfigOrigin != cluster.OriginImperative {
+		t.Fatalf("status origin = %+v, want the imperative origin", statuses)
+	}
+}
+
+// A cluster.json written before the field existed must decode as unknown, not
+// as imperative: guessing would advise destroying a cluster a talosbox.yaml
+// may well still back.
+func TestClusterWithoutRecordedOriginDecodesAsUnknown(t *testing.T) {
+	var item cluster.Cluster
+	if err := json.Unmarshal([]byte(`{"name":"legacy"}`), &item); err != nil {
+		t.Fatal(err)
+	}
+	if item.ConfigOrigin != cluster.OriginUnknown {
+		t.Fatalf("legacy cluster origin = %q, want unknown", item.ConfigOrigin)
 	}
 }

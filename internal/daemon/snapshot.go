@@ -61,7 +61,7 @@ func withClusterStopped(running bool, stop, start, body func() error) error {
 	return errors.Join(bodyErr, startErr)
 }
 
-func (s *Server) snapshotCreate(raw json.RawMessage) (SnapshotStatus, error) {
+func (s *Server) snapshotCreate(raw json.RawMessage, progress stageFunc) (SnapshotStatus, error) {
 	args, item, err := s.loadSnapshotTarget(raw)
 	if err != nil {
 		return SnapshotStatus{}, err
@@ -73,13 +73,18 @@ func (s *Server) snapshotCreate(raw json.RawMessage) (SnapshotStatus, error) {
 	var created bool
 	var restartWarnings []string
 	err = withClusterStopped(running,
-		func() error { return s.stop(item.Name) },
 		func() error {
+			progress.stage("stopping cluster %s", item.Name)
+			return s.stop(item.Name)
+		},
+		func() error {
+			progress.stage("restarting cluster %s", item.Name)
 			warnings, startErr := s.startAndLogWarning(item)
 			restartWarnings = warnings
 			return startErr
 		},
 		func() error {
+			progress.stage("cloning %d node disk(s) as one crash-consistent set", len(item.Nodes))
 			if err := cluster.CreateSnapshot(item, args.Name); err != nil {
 				return err
 			}
@@ -96,6 +101,9 @@ func (s *Server) snapshotCreate(raw json.RawMessage) (SnapshotStatus, error) {
 		}
 		return SnapshotStatus{}, err
 	}
+	if running {
+		progress.stage("%s", convergenceHint(item.Name))
+	}
 	snapshots, err := cluster.ListSnapshots(item.Name)
 	if err != nil {
 		return SnapshotStatus{}, err
@@ -105,7 +113,7 @@ func (s *Server) snapshotCreate(raw json.RawMessage) (SnapshotStatus, error) {
 	return status, nil
 }
 
-func (s *Server) snapshotRestore(raw json.RawMessage) (SnapshotStatus, error) {
+func (s *Server) snapshotRestore(raw json.RawMessage, progress stageFunc) (SnapshotStatus, error) {
 	args, item, err := s.loadSnapshotTarget(raw)
 	if err != nil {
 		return SnapshotStatus{}, err
@@ -122,6 +130,7 @@ func (s *Server) snapshotRestore(raw json.RawMessage) (SnapshotStatus, error) {
 	err = withClusterStopped(true,
 		func() error {
 			if running {
+				progress.stage("stopping cluster %s", item.Name)
 				return s.stop(item.Name)
 			}
 			return nil
@@ -132,11 +141,13 @@ func (s *Server) snapshotRestore(raw json.RawMessage) (SnapshotStatus, error) {
 			if loadErr != nil {
 				return loadErr
 			}
+			progress.stage("starting cluster %s", restored.Name)
 			warnings, startErr := s.startAndLogWarning(restored)
 			restartWarnings = warnings
 			return startErr
 		},
 		func() error {
+			progress.stage("%s", restoreStage(item, args.Name))
 			if err := cluster.RestoreSnapshot(item, args.Name); err != nil {
 				return err
 			}
@@ -156,6 +167,8 @@ func (s *Server) snapshotRestore(raw json.RawMessage) (SnapshotStatus, error) {
 	if err != nil {
 		return SnapshotStatus{}, err
 	}
+	// A restore always ends powered on, so it always leaves nodes converging.
+	progress.stage("%s", convergenceHint(item.Name))
 	snapshots, err := cluster.ListSnapshots(item.Name)
 	if err != nil {
 		return SnapshotStatus{}, err
@@ -163,6 +176,24 @@ func (s *Server) snapshotRestore(raw json.RawMessage) (SnapshotStatus, error) {
 	status := SnapshotStatus{Snapshots: snapshots}
 	status.setWarnings(append(discardWarnings, restartWarnings...)...)
 	return status, nil
+}
+
+// restoreStage narrates what the restore actually does: it restores the disks
+// the snapshot captured — not the live node count, which may have grown since —
+// and names the live nodes it deletes because the snapshot never captured them
+// (#273). A snapshot whose captured state cannot be read is narrated by name
+// alone; cluster.RestoreSnapshot owns reporting why it is unusable.
+func restoreStage(item cluster.Cluster, name string) string {
+	captured, err := cluster.SnapshotNodes(item.Name, name)
+	if err != nil {
+		return fmt.Sprintf("restoring node disks from snapshot %s", name)
+	}
+	stage := fmt.Sprintf("restoring %d node disk(s) from snapshot %s", len(captured), name)
+	vanishing := vanishingRestoreNodes(item.Nodes, captured)
+	if len(vanishing) > 0 {
+		stage += fmt.Sprintf(", deleting %d node(s) it did not capture (%s)", len(vanishing), strings.Join(nodeNames(vanishing), ", "))
+	}
+	return stage
 }
 
 func (s *Server) snapshotList(raw json.RawMessage) ([]cluster.SnapshotInfo, error) {

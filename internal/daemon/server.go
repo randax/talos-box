@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,6 +39,11 @@ type Server struct {
 	// so no gate can vouch for a node another operation is about to delete.
 	mutationMu    sync.Mutex
 	mutationLocks map[string]*sync.Mutex
+
+	// preemptions lets an operation queued on a cluster's mutation lock tell
+	// the current holder that the work it is still doing for that cluster —
+	// a create's boot wait, a reconcile — is not worth finishing.
+	preemptions preemptions
 
 	opMu sync.Mutex
 	vms  map[string]map[string]hypervisor.Machine
@@ -378,24 +382,42 @@ func (s *Server) serveConnection(connection net.Conn) {
 			}
 			return
 		}
-		if err := encoder.Encode(s.dispatch(request)); err != nil {
+		// Narration goes onto this same connection ahead of the result, and
+		// only when the client asked for it; the sink is closed first so the
+		// result is always the last message of the exchange.
+		var progress stageFunc
+		var sink *progressSink
+		if request.Progress {
+			sink = &progressSink{encoder: encoder}
+			progress = sink.emit
+		}
+		response := s.dispatchWithProgress(request, progress)
+		if sink != nil {
+			sink.close()
+		}
+		if err := encoder.Encode(response); err != nil {
 			return
 		}
 	}
 }
 
+// dispatch serves one request without narrating it.
 func (s *Server) dispatch(request Request) Response {
+	return s.dispatchWithProgress(request, nil)
+}
+
+func (s *Server) dispatchWithProgress(request Request, progress stageFunc) Response {
 	if request.Op == "status" {
 		return s.dispatchStatus(request)
 	}
 	if request.Op == "cluster.create" || request.Op == "cluster.start" || request.Op == "up" {
-		return s.dispatchProvisioning(request)
+		return s.dispatchProvisioning(request, progress)
 	}
 	if isNodeMutation(request.Op) {
-		return s.dispatchNodeMutation(request)
+		return s.dispatchNodeMutation(request, progress)
 	}
 	if request.Op == "snapshot.restore" {
-		return s.dispatchSnapshotRestore(request)
+		return s.dispatchSnapshotRestore(request, progress)
 	}
 	if request.Op == "cluster.destroy" {
 		return s.dispatchDestroy(request)
@@ -403,7 +425,7 @@ func (s *Server) dispatch(request Request) Response {
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 
-	data, err := s.handle(request)
+	data, err := s.handle(request, progress)
 	if err != nil {
 		return failure(err)
 	}
@@ -424,8 +446,16 @@ func (s *Server) dispatchDestroy(request Request) Response {
 	// the destroy: a concurrent node mutation could otherwise register a fresh
 	// reconcile after the drain and have it write into the directory being
 	// removed.
+	//
+	// Announce the destroy before queueing on that lock. A create holding it is
+	// in a boot wait, or a reconcile, whose outcome nobody wants any more —
+	// waiting out a budget measured in minutes for a cluster about to be
+	// deleted is time the operator spends for nothing. The announcement only
+	// interrupts; the lock is still what serializes the destruction.
+	releasePreemption := s.preemptions.request(args.Name)
 	lock := s.clusterMutationLock(args.Name)
 	lock.Lock()
+	releasePreemption()
 	defer lock.Unlock()
 	s.drainProvision(args.Name)
 	s.opMu.Lock()
@@ -445,7 +475,56 @@ func (s *Server) lifecycleTimeoutContext(timeout time.Duration) (context.Context
 	return context.WithTimeout(parent, timeout)
 }
 
-func (s *Server) dispatchProvisioning(request Request) Response {
+// dispatchCreate serializes a create against the cluster's other mutations for
+// the whole span it owns the cluster: the launch, the boot wait it answers
+// from, and the reconcile that follows. The wait used to run outside every
+// lock, so a destroy could delete the cluster while the create was still
+// waiting for its nodes — and the create would then report a past-tense success
+// for a cluster that no longer existed (#263).
+//
+// Status stays answerable throughout: neither the wait nor the reconcile holds
+// opMu, and the lock order is the one dispatchDestroy and dispatchNodeMutation
+// use — the cluster's mutation lock first, opMu only inside it, never the
+// reverse.
+func (s *Server) dispatchCreate(request Request, progress stageFunc) Response {
+	var args createArgs
+	if err := decodeArgs(request.Args, &args); err != nil {
+		return failure(err)
+	}
+	lock := s.clusterMutationLock(args.Name)
+	lock.Lock()
+	defer lock.Unlock()
+
+	s.opMu.Lock()
+	data, tasks, err := s.handleProvisioningLocked(request, nil, nil, progress)
+	s.opMu.Unlock()
+	if err != nil {
+		return failure(err)
+	}
+	// Everything left is work a destroy queued behind this lock has no use for.
+	// Offer it up: the reconcile answers to its own context, and the boot wait
+	// registers its own interrupt. Without this the queued destroy would sit
+	// behind a provisioning budget measured in minutes.
+	release := s.preemptions.register(args.Name, func() { s.cancelProvisionForHandover(args.Name) })
+	defer release()
+	// A create answers only once the substrate it promised exists: the VMs are
+	// launched under opMu, but a launched VM is not a booted node, and a
+	// past-tense success printed ahead of the boot is a lie the operator's next
+	// command races (#263). The wait runs outside opMu — it takes minutes, and
+	// status must stay answerable while it runs.
+	if summary, ok := data.(*ClusterSummary); ok {
+		summary.addWarnings(s.waitForNodesBooted(summary.Name, progress))
+	}
+	if err := s.runProvisionTasks(data, tasks, progress); err != nil {
+		return failure(err)
+	}
+	return success(data)
+}
+
+func (s *Server) dispatchProvisioning(request Request, progress stageFunc) Response {
+	if request.Op == "cluster.create" {
+		return s.dispatchCreate(request, progress)
+	}
 	var maintenance map[string]maintenanceObservation
 	if request.Op == "up" {
 		discovered, err := s.observeUpMaintenance(request.Args)
@@ -484,12 +563,12 @@ func (s *Server) dispatchProvisioning(request Request) Response {
 		}
 	}
 	s.opMu.Lock()
-	data, tasks, err := s.handleProvisioningLocked(request, maintenance, storage)
+	data, tasks, err := s.handleProvisioningLocked(request, maintenance, storage, progress)
 	s.opMu.Unlock()
 	if err != nil {
 		return failure(err)
 	}
-	if err := s.runProvisionTasks(data, tasks); err != nil {
+	if err := s.runProvisionTasks(data, tasks, progress); err != nil {
 		return failure(err)
 	}
 	return success(data)
@@ -506,7 +585,7 @@ func isNodeMutation(op string) bool {
 	}
 }
 
-func (s *Server) dispatchNodeMutation(request Request) Response {
+func (s *Server) dispatchNodeMutation(request Request, progress stageFunc) Response {
 	var args nodeArgs
 	if err := decodeArgs(request.Args, &args); err != nil {
 		return failure(err)
@@ -530,7 +609,7 @@ func (s *Server) dispatchNodeMutation(request Request) Response {
 		removalWarning = warning
 	}
 	s.opMu.Lock()
-	data, tasks, err := s.handleNodeMutationLocked(request)
+	data, tasks, err := s.handleNodeMutationLocked(request, progress)
 	s.opMu.Unlock()
 	if err != nil {
 		lock.Unlock()
@@ -558,7 +637,7 @@ func (s *Server) dispatchNodeMutation(request Request) Response {
 	// would otherwise outrun it. Every other node mutation answers as soon as
 	// the substrate settled and reconciles behind the response (#314).
 	if request.Op == "node.add" {
-		if err := s.runProvisionTasks(data, tasks); err != nil {
+		if err := s.runProvisionTasks(data, tasks, progress); err != nil {
 			return failure(err)
 		}
 		return success(data)
@@ -573,7 +652,7 @@ func (s *Server) dispatchNodeMutation(request Request) Response {
 // dispatchSnapshotRestore gates the restore's node deletions outside the
 // operation lock, like dispatchNodeMutation: a restore drops every live node
 // the snapshot did not capture, disks and all.
-func (s *Server) dispatchSnapshotRestore(request Request) Response {
+func (s *Server) dispatchSnapshotRestore(request Request, progress stageFunc) Response {
 	var args snapshotArgs
 	if err := decodeArgs(request.Args, &args); err != nil {
 		return failure(err)
@@ -589,7 +668,7 @@ func (s *Server) dispatchSnapshotRestore(request Request) Response {
 		return failure(err)
 	}
 	s.opMu.Lock()
-	status, err := s.snapshotRestore(request.Args)
+	status, err := s.snapshotRestore(request.Args, progress)
 	s.opMu.Unlock()
 	lock.Unlock()
 	if err != nil {
@@ -607,9 +686,7 @@ func (s *Server) dispatchSnapshotRestore(request Request) Response {
 }
 
 func (s *Server) clusterMutationLock(clusterName string) *sync.Mutex {
-	// normalize the key: on a case-insensitive filesystem "Demo" and "demo"
-	// load the same cluster state and must share one mutation lock
-	clusterName = strings.ToLower(clusterName)
+	clusterName = clusterKey(clusterName)
 	s.mutationMu.Lock()
 	defer s.mutationMu.Unlock()
 	if s.mutationLocks == nil {
@@ -628,7 +705,7 @@ func (s *Server) clusterMutationLock(clusterName string) *sync.Mutex {
 // operations.
 func (s *Server) dispatchStatus(request Request) Response {
 	s.opMu.Lock()
-	data, err := s.handle(request)
+	data, err := s.handle(request, nil)
 	s.opMu.Unlock()
 	if err != nil {
 		return failure(err)
@@ -643,7 +720,7 @@ func (s *Server) dispatchStatus(request Request) Response {
 	return success(statuses)
 }
 
-func (s *Server) handle(request Request) (any, error) {
+func (s *Server) handle(request Request, progress stageFunc) (any, error) {
 	switch request.Op {
 	case "daemon.ping":
 		return map[string]bool{"pong": true}, nil
@@ -654,7 +731,7 @@ func (s *Server) handle(request Request) (any, error) {
 	case "down":
 		return s.down(request.Args)
 	case "cluster.create":
-		return s.createCluster(request.Args)
+		return s.createCluster(request.Args, progress)
 	case "cluster.start":
 		return s.startCluster(request.Args)
 	case "cluster.stop":
@@ -676,7 +753,7 @@ func (s *Server) handle(request Request) (any, error) {
 	case "cluster.resume":
 		return s.resumeCluster(request.Args)
 	case "snapshot.create":
-		return s.snapshotCreate(request.Args)
+		return s.snapshotCreate(request.Args, progress)
 	case "snapshot.restore":
 		// restore flows through dispatchSnapshotRestore, which volume-gates the
 		// nodes it deletes before taking opMu; a locked ungated path must not exist

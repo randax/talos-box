@@ -323,12 +323,12 @@ tbx up / tbx down
 tbx cluster create|start|stop|destroy|list [name] [--cp N --workers N]
                   [--cni cilium|flannel] [--csi longhorn|local-path] [--lb] [--bgp] [--hubble]
                   [--talos-version VERSION] [--schematic ID] [--extensions LIST]
-tbx node add <cluster> [node] [--role worker|control-plane] [--force]
-tbx node remove <cluster> <node> [--force]
+tbx node add <cluster> [node] [--role worker|control-plane] [--force] [--quiet]
+tbx node remove <cluster> <node> [--force] [--quiet]
 tbx node start <cluster> <node> [--force]      tbx node stop <cluster> <node>
 tbx cluster suspend|resume <cluster>
-tbx snapshot create <cluster> [name] [--yes]
-tbx snapshot restore <cluster> <name> [--yes] [--force]
+tbx snapshot create <cluster> [name] [--yes] [--quiet]
+tbx snapshot restore <cluster> <name> [--yes] [--force] [--quiet]
 tbx snapshot list <cluster> [-o json]      tbx snapshot delete <cluster> <name>
 tbx status [cluster]      tbx manifests <cluster> [section|images] [--cni cilium|flannel]
 tbx console <cluster> <node>
@@ -416,10 +416,28 @@ too (§7).
 `tbx status` is **state-aware**: alongside nodes/IPs/DNS names/LB pool/BGP state and the
 storage phase (provisioning → live, gated by the write/readback probe, §9) it appends
 copy-pasteable next-step hints keyed to observed state (maintenance node → the
-`talosctl --insecure` probe; provisioned clusters report convergence progress and a safe `tbx up` rerun; substrate-only clusters retain manual guidance).
+`talosctl --insecure` probe; provisioned clusters report convergence progress and the
+recovery that actually applies — a safe `tbx up` rerun for clusters a `talosbox.yaml` backs,
+and destroy-and-recreate guidance naming the recorded intent, never a fabricated `cluster
+create` line, for imperatively created ones; a cluster created before the origin was recorded
+keeps the `tbx up` wording, because tbx cannot prove no file backs it and advising a destroy on
+a guess is the worse error; substrate-only clusters retain manual guidance).
 Hints **never execute anything**. `--quiet` suppresses hints and narration but keeps facts
 (schematic/extensions lines) and liveness (deadline preamble plus a periodic stderr heartbeat
 during blocking provisioning calls); all list/status commands support `-o json`.
+
+**State-changing verbs narrate their stages.** `cluster create`, `snapshot create|restore` and
+`node add|remove` stream the daemon's stages to stderr as the work proceeds — stopping the
+cluster, cloning disks, restarting, waiting for nodes — closing with a convergence hint where
+the verb left nodes booting, and `--quiet` suppresses the stages while keeping the result and
+its warnings. A verb's success line is past tense because it is true when printed: `cluster
+create` holds its answer until the nodes it started answer on apid (maintenance or configured),
+up to a bounded boot budget — when the budget runs out, or the daemon's lifecycle is cancelled,
+it answers anyway with an advisory naming the nodes that stayed silent, so a successful exit
+never proves the nodes answered. For these narrating verbs warnings print above the success
+line, not after it. Other
+state-changing verbs (`cluster start|stop|suspend|resume`, `node start|stop`) still print their
+warnings below their success line.
 
 **`tbx console <cluster> <node>`** attaches interactively to the node's serial console (hvc0)
 through the `tbxd`-owned socket — Talos renders its console dashboard and logs there, and

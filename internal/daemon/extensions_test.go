@@ -48,7 +48,7 @@ func TestCreateClusterWithCachedCompositionStaysOffline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.createCluster(raw); err != nil {
+	if _, err := service.createCluster(raw, nil); err != nil {
 		t.Fatalf("createCluster() error = %v", err)
 	}
 
@@ -110,7 +110,7 @@ func TestCreateClusterRecordsRecomposedSchematicInputs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.createCluster(raw); err != nil {
+	if _, err := service.createCluster(raw, nil); err != nil {
 		t.Fatalf("createCluster() error = %v", err)
 	}
 
@@ -154,7 +154,7 @@ func TestCreateClusterRefusesUnknownExtensionBeforeMutation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = service.createCluster(raw)
+	_, err = service.createCluster(raw, nil)
 	if err == nil || !strings.Contains(err.Error(), `did you mean "gvisor"`) {
 		t.Fatalf("createCluster() error = %v, want an unknown-extension refusal", err)
 	}
