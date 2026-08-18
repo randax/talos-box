@@ -66,6 +66,37 @@ func TestSnapshotRestoreRendersEachWarningOnItsOwnLine(t *testing.T) {
 	}
 }
 
+// TestNodeAddSurfacesTheBroadRouteWarningLikeCreate: a VPN utun holding a
+// broader route over the cluster subnet is reported by cluster create, and the
+// same finding travels in the node status, so node add must print it too — the
+// operator is otherwise told about the capture only on the verb that happened
+// to be first (#275).
+func TestNodeAddSurfacesTheBroadRouteWarningLikeCreate(t *testing.T) {
+	const broadRoute = "host route for 172.30.5.0/24 goes through utun9, which captures the cluster subnet"
+
+	stubStoredClusters(t, daemon.ClusterSummary{Name: "demo"})
+	_, add := newDestroyTestCLI(t, []daemon.Response{
+		{OK: true, Data: json.RawMessage(`{"name":"demo-worker-3","warnings":["` + broadRoute + `"]}`)},
+	})
+	if err := add.runNode([]string{"add", "demo"}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, create := newDestroyTestCLI(t, []daemon.Response{
+		{OK: true, Data: json.RawMessage(`{"name":"demo","warnings":["` + broadRoute + `"]}`)},
+	})
+	if err := create.runCluster([]string{"start", "demo"}); err != nil {
+		t.Fatal(err)
+	}
+
+	want := "warning: " + broadRoute + "\n"
+	for verb, command := range map[string]cli{"node add": add, "cluster start": create} {
+		if got := command.err.(*bytes.Buffer).String(); got != want {
+			t.Errorf("tbx %s stderr = %q, want %q", verb, got, want)
+		}
+	}
+}
+
 // A daemon that predates the per-finding list still speaks only Warning, and
 // its single joined string must still be printed.
 func TestNodeAndSnapshotVerbsFallBackToTheLegacyJoinedWarning(t *testing.T) {

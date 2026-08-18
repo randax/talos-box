@@ -27,7 +27,7 @@ func (c cli) runSnapshot(args []string) error {
 	case "list":
 		return c.snapshotList(args[1:])
 	default:
-		return fmt.Errorf("unknown snapshot command %q", args[0])
+		return unknownVerbError("snapshot", args[0])
 	}
 }
 

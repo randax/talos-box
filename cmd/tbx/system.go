@@ -52,7 +52,7 @@ func (c cli) runSystem(args []string) error {
 			return errors.New("usage: tbx system uninstall")
 		}
 	default:
-		return fmt.Errorf("unknown system command %q", args[0])
+		return unknownVerbError("system", args[0])
 	}
 
 	if os.Geteuid() != 0 {
