@@ -395,7 +395,7 @@ func TestRunDoctorIncludesMirrorHealth(t *testing.T) {
 	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
 		t.Fatalf("runDoctorWithDependencies() = %v", err)
 	}
-	if !strings.Contains(output.String(), "PASS mirror-health: mirror serving on 1 gateway(s) [172.30.3.1], cache 27 bytes (2 blob(s), 1 manifest(s))") {
+	if !strings.Contains(output.String(), "PASS mirror-health: mirror serving on 1 gateway(s) [172.30.3.1], registry-mirror cache 27 bytes (2 blob(s), 1 manifest(s))") {
 		t.Fatalf("output missing mirror health line:\n%s", output.String())
 	}
 }
@@ -426,7 +426,7 @@ func TestRunDoctorSkipsMirrorHealthWhenNoClustersAreRunning(t *testing.T) {
 	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
 		t.Fatalf("runDoctorWithDependencies() = %v", err)
 	}
-	if !strings.Contains(output.String(), "SKIP mirror-health: no clusters are running; cache 27 bytes (2 blob(s), 1 manifest(s))") {
+	if !strings.Contains(output.String(), "SKIP mirror-health: no clusters are running; registry-mirror cache 27 bytes (2 blob(s), 1 manifest(s))") {
 		t.Fatalf("output missing mirror idle line:\n%s", output.String())
 	}
 }
@@ -465,7 +465,7 @@ func TestRunDoctorFailsMirrorHealthWhenClusterIsRunningButNotBound(t *testing.T)
 	if err == nil {
 		t.Fatal("runDoctorWithDependencies() succeeded despite missing mirror listeners")
 	}
-	if !strings.Contains(output.String(), "FAIL mirror-health: no mirror listeners bound for running cluster(s); expected [172.30.3.1]; cache 27 bytes (2 blob(s), 1 manifest(s))") {
+	if !strings.Contains(output.String(), "FAIL mirror-health: no mirror listeners bound for running cluster(s); expected [172.30.3.1]; registry-mirror cache 27 bytes (2 blob(s), 1 manifest(s))") {
 		t.Fatalf("output missing mirror health line:\n%s", output.String())
 	}
 }
@@ -514,7 +514,7 @@ func TestRunDoctorFailsMirrorHealthWhenOnlySomeRunningClustersAreBound(t *testin
 	if err == nil {
 		t.Fatal("runDoctorWithDependencies() succeeded despite partial mirror listener coverage")
 	}
-	if !strings.Contains(output.String(), "FAIL mirror-health: mirror listeners bound on [172.30.3.1], expected [172.30.3.1 172.30.4.1]; cache 27 bytes (2 blob(s), 1 manifest(s))") {
+	if !strings.Contains(output.String(), "FAIL mirror-health: mirror listeners bound on [172.30.3.1], expected [172.30.3.1 172.30.4.1]; registry-mirror cache 27 bytes (2 blob(s), 1 manifest(s))") {
 		t.Fatalf("output missing partial mirror health line:\n%s", output.String())
 	}
 }
@@ -554,7 +554,7 @@ func TestRunDoctorFailsMirrorHealthWhenBoundGatewayIPIsWrong(t *testing.T) {
 	if err == nil {
 		t.Fatal("runDoctorWithDependencies() succeeded despite wrong mirror binding")
 	}
-	if !strings.Contains(output.String(), "FAIL mirror-health: mirror listeners bound on [172.30.99.1], expected [172.30.3.1]; cache 27 bytes (2 blob(s), 1 manifest(s))") {
+	if !strings.Contains(output.String(), "FAIL mirror-health: mirror listeners bound on [172.30.99.1], expected [172.30.3.1]; registry-mirror cache 27 bytes (2 blob(s), 1 manifest(s))") {
 		t.Fatalf("output missing wrong-ip mirror health line:\n%s", output.String())
 	}
 }
@@ -581,8 +581,87 @@ func TestRunDoctorSkipsMirrorHealthWhenClusterStateIsUnavailableButGatewaysAreBo
 	if err == nil {
 		t.Fatal("runDoctorWithDependencies() succeeded despite unavailable cluster state")
 	}
-	if !strings.Contains(output.String(), "SKIP mirror-health: cluster state unavailable; cache 27 bytes (2 blob(s), 1 manifest(s))") {
+	if !strings.Contains(output.String(), "SKIP mirror-health: cluster state unavailable; registry-mirror cache 27 bytes (2 blob(s), 1 manifest(s))") {
 		t.Fatalf("output missing unavailable-cluster mirror health line:\n%s", output.String())
+	}
+}
+
+// The two stores share a root and used to share the bare word "cache", so an
+// empty mirror cache read as an empty image cache (#269). Both are named and
+// sized on their own lines now.
+func TestRunDoctorReportsImageCacheAlongsideMirrorCache(t *testing.T) {
+	deps := passingDoctorDependencies()
+	deps.listCache = func() (daemon.CacheListResult, error) {
+		return daemon.CacheListResult{
+			Images: []daemon.CacheImageEntry{
+				{Schematic: "abc", Version: "v1.9.0", Architecture: "arm64", Size: 300, AllocatedSize: 120},
+				{Schematic: "def", Version: "v1.9.0", Architecture: "arm64", Size: 200, AllocatedSize: 80},
+			},
+		}, nil
+	}
+
+	var output strings.Builder
+	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
+		t.Fatalf("runDoctorWithDependencies() = %v", err)
+	}
+	if !strings.Contains(output.String(), "SKIP mirror-health: no clusters exist; registry-mirror cache 0 bytes (0 blob(s), 0 manifest(s))") {
+		t.Fatalf("output missing qualified mirror cache line:\n%s", output.String())
+	}
+	if !strings.Contains(output.String(), "PASS image-cache: image cache 500 bytes (200 bytes on disk, 2 image(s))") {
+		t.Fatalf("output missing image cache line:\n%s", output.String())
+	}
+}
+
+func TestRunDoctorReportsEmptyImageCacheWithoutAllocatedSize(t *testing.T) {
+	deps := passingDoctorDependencies()
+
+	var output strings.Builder
+	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
+		t.Fatalf("runDoctorWithDependencies() = %v", err)
+	}
+	if !strings.Contains(output.String(), "PASS image-cache: image cache 0 bytes (0 image(s))") {
+		t.Fatalf("output missing empty image cache line:\n%s", output.String())
+	}
+}
+
+func TestRunDoctorSkipsBothCacheChecksWhenDaemonIsUnavailable(t *testing.T) {
+	deps := passingDoctorDependencies()
+	deps.listCache = func() (daemon.CacheListResult, error) {
+		return daemon.CacheListResult{}, dialError{err: errors.New("connection refused")}
+	}
+
+	var output strings.Builder
+	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
+		t.Fatalf("runDoctorWithDependencies() = %v", err)
+	}
+	for _, want := range []string{
+		"SKIP mirror-health: daemon unavailable: connection refused",
+		"SKIP image-cache: daemon unavailable: connection refused",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("output missing %q:\n%s", want, output.String())
+		}
+	}
+}
+
+func TestRunDoctorFailsBothCacheChecksWhenCacheListFails(t *testing.T) {
+	deps := passingDoctorDependencies()
+	deps.listCache = func() (daemon.CacheListResult, error) {
+		return daemon.CacheListResult{}, errors.New("list cache: permission denied")
+	}
+
+	var output strings.Builder
+	err := (cli{out: &output}).runDoctorWithDependencies(nil, deps)
+	if err == nil {
+		t.Fatal("runDoctorWithDependencies() succeeded despite a failing cache listing")
+	}
+	for _, want := range []string{
+		"FAIL mirror-health: list cache: permission denied",
+		"FAIL image-cache: list cache: permission denied",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("output missing %q:\n%s", want, output.String())
+		}
 	}
 }
 
