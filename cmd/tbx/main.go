@@ -95,7 +95,15 @@ var groupUsages = map[string]string{
 	"cache":    "usage: tbx cache pull|prune|warm|list [-o json]",
 	"system":   "usage: tbx system install|uninstall|restart [--force]|status",
 	"mirror":   "usage: tbx mirror offline [on|off]",
-	"bgp":      "usage: tbx bgp enable|disable <cluster>",
+	"bgp":      "usage: tbx bgp enable|disable <cluster> [--quiet]",
+}
+
+// unknownVerbError refuses an unrecognized verb with the group's verb list
+// attached. Naming only the mistake left the user to guess or re-run with
+// --help to learn what is valid (#274); the list comes from groupUsages, so it
+// cannot drift from the bare and --help forms.
+func unknownVerbError(group, verb string) error {
+	return fmt.Errorf("unknown %s command %q; %s", group, verb, groupUsages[group])
 }
 
 // printGroupUsage answers `tbx <group> --help` with the group's usage. It is
@@ -159,7 +167,7 @@ func (c cli) runCluster(args []string) error {
 		}
 		return printClusters(c.out, result)
 	default:
-		return fmt.Errorf("unknown cluster command %q", args[0])
+		return unknownVerbError("cluster", args[0])
 	}
 }
 
@@ -520,7 +528,7 @@ func (c cli) runNode(args []string) error {
 	case "start", "stop":
 		return c.runNodeRunState(args[0], args[1:])
 	default:
-		return fmt.Errorf("unknown node command %q", args[0])
+		return unknownVerbError("node", args[0])
 	}
 }
 
@@ -714,7 +722,7 @@ func (c cli) runCache(args []string) error {
 	case "warm":
 		return c.runCacheWarm(args[1:])
 	default:
-		return fmt.Errorf("unknown cache command %q", args[0])
+		return unknownVerbError("cache", args[0])
 	}
 }
 
@@ -730,7 +738,7 @@ Commands:
   status [cluster]
   manifests <cluster> [section] [--cni cilium|flannel]
   console <cluster> <node>
-  bgp enable|disable <cluster>
+  bgp enable|disable <cluster> [--quiet]
   mirror offline [on|off]
   cache pull|prune|warm|list [-o json]
   system install|uninstall|restart [--force]|status

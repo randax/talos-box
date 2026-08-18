@@ -37,7 +37,7 @@ func convergedClusterForFastNoop(t *testing.T, name string) {
 		controlPlaneSchedulingProbe = originalScheduling
 	})
 	kubernetesReadyProbe = func(context.Context, []byte, []string) error { return nil }
-	storageConvergenceProbe = func(context.Context, cluster.Cluster, []byte) error { return nil }
+	storageConvergenceProbe = func(context.Context, context.Context, cluster.Cluster, []byte) error { return nil }
 	controlPlaneSchedulingProbe = func(context.Context, []byte, cluster.Cluster) error { return nil }
 }
 
@@ -108,7 +108,7 @@ func TestProvisionCNIKeepsFastNoopWithoutForce(t *testing.T) {
 		return provision.Result{}, nil
 	}
 
-	_, phase, err := service.provisionCNI(context.Background(), item, false)
+	_, _, phase, err := service.provisionCNI(context.Background(), item, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +137,7 @@ func TestProvisionCNIRecoversDriftedControlPlaneSchedulingWithoutForce(t *testin
 		return provision.Result{StoragePhase: provision.StoragePhaseLive, StorageLive: true}, nil
 	}
 
-	if _, _, err := service.provisionCNI(context.Background(), item, false); err != nil {
+	if _, _, _, err := service.provisionCNI(context.Background(), item, false, false); err != nil {
 		t.Fatal(err)
 	}
 	if !reconciled {

@@ -57,6 +57,41 @@ func TestGroupCommandHelpDoesNotSwallowVerbs(t *testing.T) {
 	}
 }
 
+// TestUnknownGroupVerbNamesTheValidVerbs: an unknown verb used to name only
+// itself, which left `tbx node start` (before it existed) and every typo
+// without a single valid verb to try (#274). The refusal now carries the
+// group's usage line, so the verb list is one place away from the mistake.
+func TestUnknownGroupVerbNamesTheValidVerbs(t *testing.T) {
+	for _, group := range []string{"cluster", "node", "cache", "snapshot", "system", "bgp", "mirror"} {
+		var stdout, stderr bytes.Buffer
+		command := cli{out: &stdout, err: &stderr}
+		err := command.run([]string{group, "bogus"})
+		if err == nil {
+			t.Errorf("tbx %s bogus = nil error, want the unknown-verb refusal", group)
+			continue
+		}
+		for _, want := range []string{`unknown ` + group + ` command "bogus"`, groupUsages[group]} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("tbx %s bogus error = %q, want it to contain %q", group, err.Error(), want)
+			}
+		}
+	}
+}
+
+// TestNodeRunStateVerbsDispatch: start and stop are node verbs, not unknown
+// commands (#274). They are gated on the daemon handshake, so the refusal here
+// is about the daemon rather than the verb.
+func TestNodeRunStateVerbsDispatch(t *testing.T) {
+	for _, verb := range []string{"start", "stop"} {
+		var stdout, stderr bytes.Buffer
+		command := cli{out: &stdout, err: &stderr}
+		err := command.run([]string{"node", verb})
+		if err == nil || !strings.Contains(err.Error(), "usage: tbx node "+verb+" <cluster> <node>") {
+			t.Errorf("tbx node %s = %v, want the verb's own usage line", verb, err)
+		}
+	}
+}
+
 // TestCachePruneNamesMutualExclusivity: the refusal explains the conflict
 // instead of printing a bare usage line.
 func TestCachePruneNamesMutualExclusivity(t *testing.T) {

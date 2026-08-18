@@ -113,6 +113,29 @@ func TestRunManifestsCNIDerivedSectionNamesTheFlag(t *testing.T) {
 	}
 }
 
+// TestRunManifestsRefusalsExitNonZero: every manifests refusal has to reach the
+// shell as a failure, because the documented pipe pattern (`tbx manifests <c>
+// objects | kubectl apply --server-side -f -`) otherwise feeds kubectl the
+// error text instead of aborting, and scripted callers cannot detect it (#354).
+func TestRunManifestsRefusalsExitNonZero(t *testing.T) {
+	for _, section := range []string{"values", "objects", "extras", "k8s", "lb-pool", "l2", "cilium-values", "metallb-values", "bgp", "balloon"} {
+		var err error
+		stdout := runCLIWithResponse(t,
+			`[{"name":"demo","subnetIndex":5,"controlPlanes":1,"workers":2}]`,
+			func(command cli) error {
+				err = command.runManifests([]string{"demo", section})
+				return nil
+			},
+		)
+		if err == nil {
+			t.Errorf("tbx manifests demo %s = nil error, want a refusal", section)
+		}
+		if stdout != "" {
+			t.Errorf("tbx manifests demo %s stdout = %q, want nothing for a pipe to consume", section, stdout)
+		}
+	}
+}
+
 func TestRunManifestsCNIFlagRendersTheNamedCuratedPath(t *testing.T) {
 	stdout := runCLIWithResponse(t,
 		`[{"name":"demo","subnetIndex":5,"controlPlanes":1,"workers":2}]`,

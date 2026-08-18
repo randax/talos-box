@@ -43,6 +43,7 @@ const (
 	fieldManager        = "talosbox"
 	metalLBNamespace    = "metallb-system"
 	probeNamespace      = "talosbox-system"
+	frrK8sSubchart      = "frr-k8s"
 )
 
 //go:embed assets/metallb-0.16.1.tgz
@@ -187,6 +188,18 @@ func renderMetalLB(item cluster.Cluster) ([]unstructured.Unstructured, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decode MetalLB values: %w", err)
 	}
+	// Helm's engine renders every subchart it is handed; only dependency
+	// processing evaluates the `condition:` fields in Chart.yaml. Without this
+	// the frr-k8s dependency guarded by `frrk8s.enabled` renders in full — BGP
+	// workloads on an intentionally L2-only cluster (#336).
+	if err := chartutil.ProcessDependenciesWithMerge(chart, values); err != nil {
+		return nil, fmt.Errorf("resolve MetalLB chart dependencies: %w", err)
+	}
+	for _, dependency := range chart.Dependencies() {
+		if dependency.Name() == frrK8sSubchart {
+			return nil, fmt.Errorf("embedded MetalLB chart still enables the %s subchart despite frrk8s.enabled: false", frrK8sSubchart)
+		}
+	}
 	renderValues, err := chartutil.ToRenderValues(chart, values, chartutil.ReleaseOptions{Name: "metallb", Namespace: metalLBNamespace}, chartutil.DefaultCapabilities)
 	if err != nil {
 		return nil, fmt.Errorf("prepare MetalLB render values: %w", err)
@@ -210,19 +223,10 @@ func renderMetalLB(item cluster.Cluster) ([]unstructured.Unstructured, error) {
 		if err != nil {
 			return nil, fmt.Errorf("decode rendered MetalLB %s: %w", manifest.Name, err)
 		}
-		for _, object := range objects {
-			// The packaged chart retains the disabled frr-k8s subchart's CRD
-			// templates. Keeping them would install BGP-only API surface on an
-			// intentionally L2-only cluster.
-			crdGroup, _, _ := unstructured.NestedString(object.Object, "spec", "group")
-			if crdGroup == "frrk8s.metallb.io" {
-				continue
-			}
-			result = append(result, object)
-		}
+		result = append(result, objects...)
 	}
-	// The speaker and frr-k8s DaemonSets need hostNetwork and NET_ADMIN/NET_RAW,
-	// which Talos's default baseline PodSecurity rejects without these labels.
+	// The speaker DaemonSet needs hostNetwork and NET_ADMIN/NET_RAW, which
+	// Talos's default baseline PodSecurity rejects without these labels.
 	result = append([]unstructured.Unstructured{{Object: map[string]any{
 		"apiVersion": "v1",
 		"kind":       "Namespace",

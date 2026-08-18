@@ -110,6 +110,10 @@ type activeProvision struct {
 	// Cancelling a reconcile only asks it to stop; an operation that is about
 	// to delete the cluster's files has to wait until it actually has (#334).
 	done chan struct{}
+	// skipStorage records the scope this pass was registered with, so an
+	// operation that supersedes it can tell whether cancelling it drops storage
+	// work nobody else would resume (see beginBGPProvisionLocked).
+	skipStorage bool
 }
 
 type activeStorageProbe struct {
@@ -117,9 +121,18 @@ type activeStorageProbe struct {
 	cancel     context.CancelFunc
 }
 
+// storageProbeFailure is the last probe pass the daemon has to back off
+// from. It covers both reasons to back off: a pass that failed, and a pass that
+// never ran because the previous one's teardown was still finishing. Only the
+// second is benign, so the record says which — the backoff is the same, the
+// text the operator sees is not.
 type storageProbeFailure struct {
 	message string
 	at      time.Time
+	// pending marks the benign case: nothing is wrong, the daemon is still
+	// clearing the previous pass's objects. Reporting it as StorageError would
+	// tell the operator their storage stack failed a readiness probe.
+	pending bool
 }
 
 type lockedListener struct {
@@ -419,6 +432,9 @@ func (s *Server) dispatchWithProgress(request Request, progress stageFunc) Respo
 	if request.Op == "snapshot.restore" {
 		return s.dispatchSnapshotRestore(request, progress)
 	}
+	if isBGPModeChange(request.Op) {
+		return s.dispatchBGP(request, progress)
+	}
 	if request.Op == "cluster.destroy" {
 		return s.dispatchDestroy(request)
 	}
@@ -467,12 +483,19 @@ func (s *Server) dispatchDestroy(request Request) Response {
 	return success(data)
 }
 
-func (s *Server) lifecycleTimeoutContext(timeout time.Duration) (context.Context, context.CancelFunc) {
-	parent := s.lifecycleContext
-	if parent == nil {
-		parent = context.Background()
+// lifecycle is the daemon's own lifetime, safe to call on a Server a test
+// assembled without one. Work that must stop when the daemon does — but that
+// deliberately outlives the operation that started it, such as a storage
+// probe's teardown — hangs off this rather than off the operation's context.
+func (s *Server) lifecycle() context.Context {
+	if s.lifecycleContext == nil {
+		return context.Background()
 	}
-	return context.WithTimeout(parent, timeout)
+	return s.lifecycleContext
+}
+
+func (s *Server) lifecycleTimeoutContext(timeout time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(s.lifecycle(), timeout)
 }
 
 // dispatchCreate serializes a create against the cluster's other mutations for
@@ -649,6 +672,42 @@ func (s *Server) dispatchNodeMutation(request Request, progress stageFunc) Respo
 	return success(data)
 }
 
+// isBGPModeChange names the operations that change a cluster's announcement
+// mode, and so re-render its CNI.
+func isBGPModeChange(op string) bool {
+	return op == "bgp.enable" || op == "bgp.disable"
+}
+
+// dispatchBGP changes a cluster's announcement mode and keeps the reconcile that
+// realizes it on the request path. That reconcile is the verb: the host speaker
+// alone leaves Cilium announcing the old way, so answering ahead of it is the
+// silent success #344 reported. It also means a failed apply fails the verb
+// instead of surfacing only in the daemon log — the recorded mode stays, so a
+// rerun resumes from it.
+//
+// The cluster's mutation lock is held for the state change only, the way
+// dispatchNodeMutation holds it: the task is already registered under opMu, so a
+// later mutation supersedes it without the reconcile blocking the lock.
+func (s *Server) dispatchBGP(request Request, progress stageFunc) Response {
+	var args nameArgs
+	if err := decodeArgs(request.Args, &args); err != nil {
+		return failure(err)
+	}
+	lock := s.clusterMutationLock(args.Name)
+	lock.Lock()
+	s.opMu.Lock()
+	summary, tasks, err := s.setBGPLocked(request.Args, request.Op == "bgp.enable", progress)
+	s.opMu.Unlock()
+	lock.Unlock()
+	if err != nil {
+		return failure(err)
+	}
+	if err := s.runProvisionTasks(summary, tasks, progress); err != nil {
+		return failure(err)
+	}
+	return success(summary)
+}
+
 // dispatchSnapshotRestore gates the restore's node deletions outside the
 // operation lock, like dispatchNodeMutation: a restore drops every live node
 // the snapshot did not capture, disks and all.
@@ -762,10 +821,11 @@ func (s *Server) handle(request Request, progress stageFunc) (any, error) {
 		return s.snapshotList(request.Args)
 	case "snapshot.delete":
 		return s.snapshotDelete(request.Args)
-	case "bgp.enable":
-		return s.setBGP(request.Args, true)
-	case "bgp.disable":
-		return s.setBGP(request.Args, false)
+	case "bgp.enable", "bgp.disable":
+		// mode changes flow through dispatchBGP, which schedules the Cilium
+		// reconcile that puts the requested mechanism in effect; a locked path
+		// that only moves the host speaker must not exist (#344)
+		return nil, fmt.Errorf("operation %q must be dispatched as a BGP mode change", request.Op)
 	case "cache.pull":
 		return s.pullCache(request.Args)
 	case "cache.warm":

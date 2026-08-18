@@ -79,6 +79,16 @@ socket_ready() {
   [[ -S "$1" ]]
 }
 
+# Talos maintenance mode does not serve the same RPC surface in every supported
+# version: v1.13 answers MachineService/Version, while v1.12 rejects it with
+# Unimplemented ("API is not implemented in maintenance mode"). A rejection at
+# the gRPC level is still proof the maintenance API is up and answering, which
+# is all a readiness wait can ask of it — only transport failures (refused
+# connection, TLS handshake, timeout, no route) mean the node is not there yet.
+maintenance_api_reply_ready() {
+  grep -Eqi 'code = unimplemented|not implemented in maintenance mode' <<<"$1"
+}
+
 wait_for_process_socket() {
   local label=$1 attempts=$2 delay=$3 pid=$4 socket=$5 log_file=$6 attempt status
   for ((attempt = 1; attempt <= attempts; attempt++)); do

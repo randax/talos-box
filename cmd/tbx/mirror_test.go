@@ -96,6 +96,31 @@ func TestRunMirrorOfflineOnSetsAndReportsState(t *testing.T) {
 	}
 }
 
+// A dash-prefixed argument is a flag mistake, not a verb: mirror takes no
+// flags, so it answers with its usage line instead of reporting an unknown
+// mirror command named "--anything" (#274 follow-up).
+func TestRunMirrorAnswersFlagMistakesWithTheUsageLine(t *testing.T) {
+	for _, args := range [][]string{
+		{"mirror", "--anything"},
+		{"mirror", "-x"},
+		{"mirror", "offline", "--anything"},
+	} {
+		var stdout, stderr bytes.Buffer
+		command := cli{out: &stdout, err: &stderr}
+		err := command.run(args)
+		if err == nil {
+			t.Errorf("tbx %v = nil error, want the usage refusal", args)
+			continue
+		}
+		if err.Error() != groupUsages["mirror"] {
+			t.Errorf("tbx %v error = %q, want %q", args, err.Error(), groupUsages["mirror"])
+		}
+		if stdout.Len() != 0 {
+			t.Errorf("tbx %v stdout = %q, want empty", args, stdout.String())
+		}
+	}
+}
+
 func serveSingleDaemonRequest(t *testing.T, listener net.Listener, respond func(daemon.Request) daemon.Response, done chan<- struct{}) {
 	t.Helper()
 	connection, err := listener.Accept()

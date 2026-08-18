@@ -20,6 +20,34 @@ const factoryInstallerRepository = "factory.talos.dev/metal-installer"
 // recorded, which is only stored state predating schematic persistence.
 const vanillaInstallerRepository = "ghcr.io/siderolabs/installer"
 
+// KubernetesSandboxImage is the CRI pod-sandbox ("pause") image the kubelet
+// asks containerd for before it can start any pod, static control-plane pods
+// included. It is pinned by hand because it is coupled to the Kubernetes
+// version tbx generates machine configs with — constants.DefaultKubernetesVersion
+// — yet machinery exports no constant for it, no rendered object references
+// it, and an online node never fetches it through the mirror (Talos seeds it
+// into the rootfs image store), so it would otherwise be absent from the cache
+// exactly when a venue goes offline. Bump it together with
+// constants.DefaultKubernetesVersion, reading the value the matching kubelet
+// defaults to (kubeadm's DefaultPauseImage / the kubelet's
+// --pod-infra-container-image); Kubernetes 1.36 uses pause:3.10.1.
+const KubernetesSandboxImage = "registry.k8s.io/pause:3.10.1"
+
+// sandboxImageKubernetesMinor is the Kubernetes minor the pin above was read
+// from. A machinery bump past it must re-read the kubelet's sandbox default,
+// which TestSandboxImagePinTracksTheBundledKubernetes enforces.
+const sandboxImageKubernetesMinor = "1.36"
+
+// BootstrapRequiredImages is what every node must find in the cache before a
+// single static pod can start, and which no rendered object carries — so no
+// derived warm list can contain it. `cache warm --check --deep` verifies this
+// set on top of whatever list it was handed, so a venue finds out the sandbox
+// image is missing while it can still be pulled rather than from a bootstrap
+// that cannot recover.
+func BootstrapRequiredImages() []string {
+	return []string{KubernetesSandboxImage}
+}
+
 // ClusterImages is every container image the cluster pulls: the images carried
 // by the objects tbx actually renders for its declared provisioning intent,
 // plus the Talos system images for its pinned version. The set is derived from
@@ -116,6 +144,10 @@ func talosSystemImages(item cluster.Cluster) []string {
 	kubernetes := ":v" + constants.DefaultKubernetesVersion
 	images := []string{
 		installerImage(item.Schematic, version),
+		// The kubelet's sandbox image is pulled for every pod on every
+		// node, so it belongs to the system half of every cluster's set
+		// regardless of the declared intent.
+		KubernetesSandboxImage,
 		constants.KubeletImage + kubernetes,
 		constants.KubernetesAPIServerImage + kubernetes,
 		constants.KubernetesControllerManagerImage + kubernetes,

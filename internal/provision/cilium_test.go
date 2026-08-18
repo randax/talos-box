@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
 	"net"
@@ -865,6 +866,66 @@ func TestWaitForAPIServerNamesTheEndpointOnDeadline(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "127.0.0.1:1") {
 		t.Fatalf("API server wait error does not name the endpoint: %v", err)
+	}
+}
+
+// TestAnnotateAPIServerTimeoutExplainsOfflineSandboxPulls covers the only
+// diagnosis available at deadline time: with the mirror offline, a control
+// plane that never answers is nearly always a static pod looping on an
+// uncached sandbox image, and the bare deadline says nothing about it.
+func TestAnnotateAPIServerTimeoutExplainsOfflineSandboxPulls(t *testing.T) {
+	t.Parallel()
+	deadline := fmt.Errorf("wait for kube-apiserver at https://172.30.0.5:6443: %w", context.DeadlineExceeded)
+	tests := []struct {
+		name          string
+		err           error
+		mirrorOffline bool
+		wantHint      bool
+	}{
+		{name: "offline deadline", err: deadline, mirrorOffline: true, wantHint: true},
+		{name: "online deadline", err: deadline, mirrorOffline: false},
+		{name: "offline but not a deadline", err: errors.New("unauthorized"), mirrorOffline: true},
+		{name: "no error", err: nil, mirrorOffline: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			got := annotateAPIServerTimeout(test.err, test.mirrorOffline)
+			if test.err == nil {
+				if got != nil {
+					t.Fatalf("annotateAPIServerTimeout(nil) = %v, want nil", got)
+				}
+				return
+			}
+			if !errors.Is(got, test.err) {
+				t.Fatalf("annotated error dropped the cause: %v", got)
+			}
+			hinted := strings.Contains(got.Error(), KubernetesSandboxImage)
+			if hinted != test.wantHint {
+				t.Fatalf("hint present = %v, want %v (error: %v)", hinted, test.wantHint, got)
+			}
+			if test.wantHint && !strings.Contains(got.Error(), "wait for kube-apiserver") {
+				t.Fatalf("annotated error no longer names the wait: %v", got)
+			}
+		})
+	}
+}
+
+// TestCiliumReconcileSurfacesSandboxHintOnAPIServerDeadline is the wiring: the
+// hint has to reach the create path's error, not just the helper's tests.
+func TestCiliumReconcileSurfacesSandboxHintOnAPIServerDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	reconciler := CiliumReconciler{PollInterval: 10 * time.Millisecond, MirrorOffline: true}
+	_, err := reconciler.reconcile(ctx, cluster.Cluster{
+		Name:               "demo",
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium},
+	}, &rest.Config{Host: "http://127.0.0.1:1"}, nil)
+	if err == nil {
+		t.Fatal("Cilium reconcile passed against a closed API server port")
+	}
+	if !strings.Contains(err.Error(), KubernetesSandboxImage) {
+		t.Fatalf("reconcile error does not mention the sandbox image: %v", err)
 	}
 }
 

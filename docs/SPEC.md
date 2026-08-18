@@ -217,7 +217,12 @@ systemd-resolved is available the helper registers `~<domain>` as a route-only d
 bridge through D-Bus. Hosts without resolved retain guest and by-IP access, and `tbx doctor`
 prints the required `resolvectl` fallback without writing `/etc/resolv.conf`.
 
-**BGP mode** (`tbx bgp enable <cluster>`): "host as ToR" — one embedded GoBGP instance,
+**BGP mode** (`tbx bgp enable <cluster>`): changing the mode on a live cluster reconciles both
+sides — the host speaker, then a forced CNI pass that re-renders Cilium with `bgpControlPlane`
+on (or off), rolls the agents so they read the new `cilium-config`, and applies the matching
+announcement objects. The verb holds its answer for that pass and reports success only after it
+converges; a cluster whose members are stopped records the mode and warns that Cilium still
+announces the old way until every member runs. It is "host as ToR" — one embedded GoBGP instance,
 host **ASN 64512**, listening on each enabled cluster's `.1:179`; cluster *n* nodes speak
 **ASN 64600+n**, eBGP to the host; learned routes are injected into the host FIB via
 `tbx-helper` (PF_ROUTE on macOS, rtnetlink `RTM_NEWROUTE`/`RTM_DELROUTE` on Linux). When
@@ -332,7 +337,7 @@ tbx snapshot restore <cluster> <name> [--yes] [--force] [--quiet]
 tbx snapshot list <cluster> [-o json]      tbx snapshot delete <cluster> <name>
 tbx status [cluster]      tbx manifests <cluster> [section|images] [--cni cilium|flannel]
 tbx console <cluster> <node>
-tbx bgp enable|disable <cluster>
+tbx bgp enable|disable <cluster> [--quiet]
 tbx mirror offline [on|off]
 tbx cache pull [-f talosbox.yaml] [--no-images]
                [--talos-version VERSION --schematic ID --extensions LIST]
@@ -467,6 +472,13 @@ printed PSA labels. Curated CSI namespace streams carry their own PSA labels. Fo
 apply `storage-namespaces`, then `storage-crds`, run the printed Established wait against the
 CRD stream, and only then apply post-CRD `storage-objects`; it is not a one-shot apply.
 Longhorn's `storage-values` stream records the exact values used to render those objects.
+The inspection streams render the cluster's **declared** topology, which is what tbx applies in
+every case but one: a cluster that lost its last worker while control planes still hold Longhorn
+replicas keeps the control-plane toleration in the applied render until those replicas drain,
+because the components serving them cannot be evicted from where the data is. Inspection does not
+reach into a live cluster to observe replica placement, so for that one case `storage-values` and
+`storage-objects` omit a toleration the applied render still carries; it disappears from the
+applied render too once the replicas have moved.
 Local-path has no CRD barrier, so apply `storage-namespaces` before `storage-objects`.
 
 ## 11. Distribution

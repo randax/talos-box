@@ -2,10 +2,12 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -54,6 +56,10 @@ type provisionTask struct {
 	// force skips the fast no-op path: a topology mutation changes the machine
 	// config already-configured nodes need, which no health probe observes.
 	force bool
+	// skipStorage scopes a forced pass to what the change actually re-renders.
+	// A BGP mode change decides CNI/LoadBalancer objects and nothing else, so
+	// forcing it must not drag the storage chart and its probe along (#344).
+	skipStorage bool
 	// done is closed once this task has run its course, so an operation that
 	// destroys the cluster's files can wait the reconcile out instead of racing
 	// it (#334).
@@ -127,6 +133,14 @@ func indexAction(actions []Action, name string) int {
 }
 
 func (s *Server) beginProvisionTasksLocked(items []cluster.Cluster) []provisionTask {
+	return s.beginProvisionTasksScopedLocked(items, false)
+}
+
+// beginProvisionTasksScopedLocked registers the reconciles for these clusters.
+// skipStorage narrows each pass to the CNI/LoadBalancer/BGP stages: the storage
+// memo is then left exactly as it stands, because a pass that never touches
+// storage cannot invalidate what an earlier one established.
+func (s *Server) beginProvisionTasksScopedLocked(items []cluster.Cluster, skipStorage bool) []provisionTask {
 	tasks := make([]provisionTask, 0, len(items))
 	for _, item := range items {
 		if item.CNI != cluster.CNIFlannel && item.CNI != cluster.CNICilium {
@@ -135,7 +149,7 @@ func (s *Server) beginProvisionTasksLocked(items []cluster.Cluster) []provisionT
 		if s.provisions == nil {
 			s.provisions = make(map[string]activeProvision)
 		}
-		if item.CSI != "" {
+		if item.CSI != "" && !skipStorage {
 			s.invalidateStoragePhaseLocked(item.Name)
 			if s.storagePhases == nil {
 				s.storagePhases = make(map[string]StoragePhase)
@@ -151,8 +165,8 @@ func (s *Server) beginProvisionTasksLocked(items []cluster.Cluster) []provisionT
 		s.provisionSequence++
 		ctx, cancel := context.WithCancel(s.lifecycleContext)
 		done := make(chan struct{})
-		s.provisions[item.Name] = activeProvision{generation: s.provisionSequence, cancel: cancel, done: done}
-		tasks = append(tasks, provisionTask{item: item, ctx: ctx, generation: s.provisionSequence, action: -1, done: done})
+		s.provisions[item.Name] = activeProvision{generation: s.provisionSequence, cancel: cancel, done: done, skipStorage: skipStorage}
+		tasks = append(tasks, provisionTask{item: item, ctx: ctx, generation: s.provisionSequence, action: -1, done: done, skipStorage: skipStorage})
 	}
 	return tasks
 }
@@ -307,8 +321,8 @@ func (s *Server) runProvisionTasks(data any, tasks []provisionTask, progress sta
 			progress.stage("reconciling %s on cluster %s (up to %s)",
 				task.item.CNI, task.item.Name, formatBootWindow(provisionTimeout(task.item)))
 		}
-		narration, phase, err := s.provisionCNI(task.ctx, task.item, task.force)
-		if task.item.CSI != "" {
+		narration, warnings, phase, err := s.provisionCNI(task.ctx, task.item, task.force, task.skipStorage)
+		if task.item.CSI != "" && !task.skipStorage {
 			s.opMu.Lock()
 			s.recordStoragePhaseIfCurrentLocked(task.item.Name, task.generation, phase)
 			s.opMu.Unlock()
@@ -327,9 +341,16 @@ func (s *Server) runProvisionTasks(data any, tasks []provisionTask, progress sta
 		switch result := data.(type) {
 		case *ClusterSummary:
 			result.Narration = narration
+			// Advisories the pass converged in spite of: work the daemon
+			// finishes behind the verb, never a reason to fail it (#347).
+			result.addWarnings(warnings...)
 		case []Action:
 			if task.action >= 0 {
 				result[task.action].Narration = narration
+				// The same advisories the summary path reports: `tbx up` renders
+				// Action.Warnings, and dropping them here hid work the daemon
+				// was still finishing behind the verb (#347).
+				result[task.action].Warnings = append(result[task.action].Warnings, warnings...)
 				result[task.action].Kind = actionAfterProvision(result[task.action].Kind, narration)
 			}
 		}
@@ -383,22 +404,22 @@ func provisionTimeout(item cluster.Cluster) time.Duration {
 	return cniProvisionTimeout
 }
 
-func (s *Server) provisionCNI(parent context.Context, item cluster.Cluster, force bool) ([]string, StoragePhase, error) {
+func (s *Server) provisionCNI(parent context.Context, item cluster.Cluster, force, skipStorage bool) (narration, warnings []string, phase StoragePhase, err error) {
 	if !reconcilesCNI(item) {
-		return nil, "", nil
+		return nil, nil, "", nil
 	}
 	// Once every desired outcome is observed healthy, a rerun is a genuine fast
 	// no-op. Cilium additionally probes its optional Hubble deployments: a live
 	// VIP and Ready Nodes alone cannot establish that that desired set converged.
 	if !force && s.tryFastNoopReconcile(item) {
-		if item.CSI != "" {
-			return nil, StoragePhaseLive, nil
+		if item.CSI != "" && !skipStorage {
+			return nil, nil, StoragePhaseLive, nil
 		}
-		return nil, "", nil
+		return nil, nil, "", nil
 	}
 	dir, err := cluster.Dir(item.Name)
 	if err != nil {
-		return nil, "", err
+		return nil, nil, "", err
 	}
 	ctx, cancel := context.WithTimeout(parent, provisionTimeout(item))
 	defer cancel()
@@ -407,7 +428,9 @@ func (s *Server) provisionCNI(parent context.Context, item cluster.Cluster, forc
 	case cluster.CNIFlannel:
 		loadBalancer = provision.MetalLBReconciler{PollInterval: time.Second}
 	case cluster.CNICilium:
-		loadBalancer = provision.CiliumReconciler{PollInterval: time.Second}
+		// Offline mode is passed in so a control plane that never starts can
+		// say why: nothing pulls an image the cache does not hold.
+		loadBalancer = provision.CiliumReconciler{PollInterval: time.Second, MirrorOffline: s.mirrorOffline.Load()}
 	}
 	reconcile := s.provisionReconcile
 	if reconcile == nil {
@@ -418,22 +441,29 @@ func (s *Server) provisionCNI(parent context.Context, item cluster.Cluster, forc
 		Client:       provision.MachineryClient{TalosconfigPath: filepath.Join(dir, "talosconfig")},
 		LoadBalancer: loadBalancer,
 		BGP:          hostBGPReconciler{},
+		SkipStorage:  skipStorage,
+		// Offline mode reaches every CNI's wait path, not only Cilium's: an
+		// offline flannel create hits the same deadline with the same cause
+		// (#348).
+		MirrorOffline: s.mirrorOffline.Load(),
 		Observe: func(context.Context) ([]provision.Node, error) {
 			return s.observeProvisionNodes(item), nil
 		},
 		PollInterval: time.Second,
 	}
-	switch item.CSI {
-	case cluster.CSILocalPath:
-		request.Storage = provision.LocalPathReconciler{PollInterval: time.Second}
-	case cluster.CSILonghorn:
-		request.Storage = provision.LonghornReconciler{PollInterval: time.Second}
+	if !skipStorage {
+		switch item.CSI {
+		case cluster.CSILocalPath:
+			request.Storage = provision.LocalPathReconciler{PollInterval: time.Second, Lifecycle: s.lifecycle()}
+		case cluster.CSILonghorn:
+			request.Storage = provision.LonghornReconciler{PollInterval: time.Second, Lifecycle: s.lifecycle()}
+		}
 	}
 	result, err := reconcile(ctx, request)
 	if err != nil {
-		return nil, "", err
+		return nil, nil, "", err
 	}
-	return result.Narration, storagePhaseFromProvisionResult(result), nil
+	return result.Narration, result.Warnings, storagePhaseFromProvisionResult(result), nil
 }
 
 func (s *Server) observeProvisionNodes(item cluster.Cluster) []provision.Node {
@@ -502,7 +532,7 @@ func (s *Server) provisioningComplete(item cluster.Cluster) bool {
 	if item.CSI != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), storageConvergenceTimeout)
 		defer cancel()
-		if storageConvergenceProbe(ctx, item, kubeconfig) != nil {
+		if storageConvergenceProbe(ctx, s.lifecycle(), item, kubeconfig) != nil {
 			return false
 		}
 	}
@@ -602,12 +632,41 @@ func loadBalancerVIP(item cluster.Cluster) (string, bool) {
 	return provision.LiveVIP(ctx, item, kubeconfig)
 }
 
-func storageConverged(ctx context.Context, item cluster.Cluster, kubeconfig []byte) error {
+// errStorageProbePending marks a probe pass that never ran the data path: the
+// previous pass's teardown is still finishing, so this one skipped rather than
+// measure the teardown. It is neither a converged storage stack nor a fault —
+// callers must tell it apart from both.
+var errStorageProbePending = errors.New("storage probe skipped while the previous probe's cleanup is still finishing")
+
+// storageProbePending turns an unverified pass into that marker, carrying the
+// probe's own advisory so the log says how far the cleanup got.
+func storageProbePending(outcome provision.StorageProbeOutcome) error {
+	if outcome.Verified {
+		return nil
+	}
+	if len(outcome.Warnings) == 0 {
+		return errStorageProbePending
+	}
+	return fmt.Errorf("%w: %s", errStorageProbePending, strings.Join(outcome.Warnings, "; "))
+}
+
+// storageConverged probes the data path for the fast no-op decision. lifecycle
+// is the daemon's own lifetime: the probe's teardown outlives ctx by design, so
+// it needs a lifetime that a daemon shutdown actually cuts short.
+func storageConverged(ctx, lifecycle context.Context, item cluster.Cluster, kubeconfig []byte) error {
 	switch item.CSI {
 	case cluster.CSILocalPath:
-		return provision.ProbeLocalPathStorage(ctx, kubeconfig, time.Second)
+		outcome, err := provision.ProbeLocalPathStorage(ctx, lifecycle, item.Name, kubeconfig, time.Second)
+		if err != nil {
+			return err
+		}
+		return storageProbePending(outcome)
 	case cluster.CSILonghorn:
-		if err := provision.ProbeLonghornStorage(ctx, kubeconfig, time.Second); err != nil {
+		outcome, err := provision.ProbeLonghornStorage(ctx, lifecycle, item.Name, kubeconfig, time.Second)
+		if err != nil {
+			return err
+		}
+		if err := storageProbePending(outcome); err != nil {
 			return err
 		}
 		// The write/readback probe passes regardless of where replicas may
@@ -645,6 +704,7 @@ func (s *Server) refreshStoragePhases(statuses []ClusterStatus) {
 		status := &statuses[index]
 		status.StoragePhase = ""
 		status.StorageError = ""
+		status.StoragePending = ""
 		switch {
 		case status.CSI == "", !status.Running:
 		case known[status.Name] == StoragePhaseLive:
@@ -654,7 +714,11 @@ func (s *Server) refreshStoragePhases(statuses []ClusterStatus) {
 		default:
 			status.StoragePhase = StoragePhaseProvisioning
 			if failure, ok := failures[status.Name]; ok && time.Since(failure.at) < storageProbeRetryBackoff {
-				status.StorageError = failure.message
+				if failure.pending {
+					status.StoragePending = failure.message
+				} else {
+					status.StorageError = failure.message
+				}
 			} else {
 				s.beginStorageStatusProbe(status.Name)
 			}
@@ -696,6 +760,26 @@ func (s *Server) runStorageStatusProbe(ctx context.Context, name string, generat
 	}
 	active.cancel()
 	delete(s.storageStatusProbes, name)
+	if errors.Is(err, errStorageProbePending) {
+		// The pass never touched the data path. Recording it live would claim a
+		// storage stack nothing verified, and recording a failure would report
+		// the daemon's own pending cleanup as a storage fault — so the phase
+		// stays provisioning (#347). It still has to be recorded: without an
+		// entry every status refresh would start another probe with no backoff
+		// at all, each one spending the PVC-wait and residue budgets against
+		// the cluster API to discover the same terminating claim, and the
+		// operator would see a bare `storage-provisioning` with the reason only
+		// in tbxd.log. The record backs the next pass off and carries the
+		// advisory into the status payload as a pending note, not an error.
+		log.Printf("storage probe %s: %v", name, err)
+		if s.clusterRunning(name) {
+			if s.storageProbeFailures == nil {
+				s.storageProbeFailures = make(map[string]storageProbeFailure)
+			}
+			s.storageProbeFailures[name] = storageProbeFailure{message: err.Error(), at: time.Now(), pending: true}
+		}
+		return
+	}
 	if err == nil && s.clusterRunning(name) {
 		delete(s.storageProbeFailures, name)
 		s.recordStoragePhaseLocked(name, StoragePhaseLive)
@@ -727,9 +811,17 @@ func (s *Server) probeStorageStatus(parent context.Context, name string) error {
 		probe = func(ctx context.Context, kubeconfig []byte) error {
 			switch item.CSI {
 			case cluster.CSILocalPath:
-				return provision.ProbeLocalPathStorage(ctx, kubeconfig, time.Second)
+				outcome, err := provision.ProbeLocalPathStorage(ctx, s.lifecycle(), item.Name, kubeconfig, time.Second)
+				if err != nil {
+					return err
+				}
+				return storageProbePending(outcome)
 			case cluster.CSILonghorn:
-				return provision.ProbeLonghornStorage(ctx, kubeconfig, time.Second)
+				outcome, err := provision.ProbeLonghornStorage(ctx, s.lifecycle(), item.Name, kubeconfig, time.Second)
+				if err != nil {
+					return err
+				}
+				return storageProbePending(outcome)
 			default:
 				return nil
 			}

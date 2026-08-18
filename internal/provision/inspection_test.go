@@ -391,7 +391,7 @@ func TestRenderInspectionLonghornStreamsMatchRendererPartitionsAndOrder(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if values != longhornValues(3) {
+	if values != longhornValues(3, 3, true) {
 		t.Fatalf("storage values differ from Longhorn renderer input")
 	}
 	bundle, err := RenderInspection(item, "storage")

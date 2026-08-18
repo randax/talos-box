@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/randax/talos-box/internal/daemon"
+	"github.com/randax/talos-box/internal/provision"
 )
 
 type warmListEntry struct {
@@ -44,10 +45,23 @@ func (c cli) runCacheWarm(args []string) error {
 	if len(refs) == 0 {
 		return errors.New("cache warm list is empty")
 	}
+	// A deep check is the pre-venue verification, so it also answers for the
+	// images no warm list can name: nothing tbx renders references the CRI pod
+	// sandbox image, yet no pod starts without it. Adding it here means the
+	// gap is reported while it can still be pulled.
+	if *checkOnly && *deep {
+		refs = withBootstrapRequiredRefs(refs)
+	}
 	if err := c.ensureCacheWarmSupport(); err != nil {
 		return err
 	}
 	if *checkOnly {
+		bootstrapRequired := make(map[string]bool)
+		if *deep {
+			for _, ref := range provision.BootstrapRequiredImages() {
+				bootstrapRequired[ref] = true
+			}
+		}
 		var complete, failed int
 		for _, ref := range refs {
 			var result daemon.CacheCheckResult
@@ -67,6 +81,17 @@ func (c cli) runCacheWarm(args []string) error {
 			case daemon.CacheCheckStatusFailed:
 				if _, err := fmt.Fprintf(c.out, "\u2717 %s %s\n", entry.Ref, entry.Reason); err != nil {
 					return err
+				}
+				// The bootstrap-required refs are the ones this check adds on
+				// its own, and `cache warm` has no way to close the gap it just
+				// reported: nothing tbx renders references the CRI pod sandbox
+				// image, so no warm list names it and the non-check path never
+				// pulls it. Naming the verb that does is the whole point of
+				// reporting it here (#348).
+				if bootstrapRequired[entry.Ref] {
+					if _, err := fmt.Fprintf(c.out, "  %s is the CRI pod sandbox image every node needs and no warm list names: run `tbx cache pull` online to cache it\n", entry.Ref); err != nil {
+						return err
+					}
 				}
 				failed++
 			}
@@ -114,6 +139,24 @@ func (c cli) runCacheWarm(args []string) error {
 		return fmt.Errorf("cache warm failed for %d ref(s)", failed)
 	}
 	return nil
+}
+
+// withBootstrapRequiredRefs appends the bootstrap-required images the list
+// does not already carry, preserving the list's own order so the appended refs
+// read as the addition they are.
+func withBootstrapRequiredRefs(refs []string) []string {
+	present := make(map[string]struct{}, len(refs))
+	for _, ref := range refs {
+		present[ref] = struct{}{}
+	}
+	for _, ref := range provision.BootstrapRequiredImages() {
+		if _, duplicate := present[ref]; duplicate {
+			continue
+		}
+		present[ref] = struct{}{}
+		refs = append(refs, ref)
+	}
+	return refs
 }
 
 func cacheCheckEntryForRef(ref string, result daemon.CacheCheckResult) (daemon.CacheCheckEntry, error) {

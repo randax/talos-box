@@ -15,7 +15,10 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-var longhornReplicaResource = schema.GroupVersionResource{Group: "longhorn.io", Version: "v1beta2", Resource: "replicas"}
+var (
+	longhornReplicaResource = schema.GroupVersionResource{Group: "longhorn.io", Version: "v1beta2", Resource: "replicas"}
+	longhornVolumeResource  = schema.GroupVersionResource{Group: "longhorn.io", Version: "v1beta2", Resource: "volumes"}
+)
 
 // CountNodeStorageVolumes counts curated-engine volumes whose data lives only
 // on the named node, i.e. the volumes a `tbx node remove` would destroy: every

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -206,7 +207,7 @@ func TestProvisionCNICiliumStorageDriftBypassesFastNoop(t *testing.T) {
 	})
 	kubernetesReadyProbe = func(context.Context, []byte, []string) error { return nil }
 	ciliumConvergenceProbe = func(context.Context, []byte, cluster.Cluster) error { return nil }
-	storageConvergenceProbe = func(context.Context, cluster.Cluster, []byte) error {
+	storageConvergenceProbe = func(context.Context, context.Context, cluster.Cluster, []byte) error {
 		return errors.New("storage probe failed")
 	}
 
@@ -225,7 +226,7 @@ func TestProvisionCNICiliumStorageDriftBypassesFastNoop(t *testing.T) {
 			CSI: cluster.CSILonghorn,
 		},
 	}
-	_, phase, err := service.provisionCNI(context.Background(), item, false)
+	_, _, phase, err := service.provisionCNI(context.Background(), item, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,6 +235,44 @@ func TestProvisionCNICiliumStorageDriftBypassesFastNoop(t *testing.T) {
 	}
 	if phase != StoragePhaseProvisioning {
 		t.Fatalf("storage phase = %q, want %q while reconciliation resumes", phase, StoragePhaseProvisioning)
+	}
+}
+
+// A storage-probe cleanup that outran its bound is work the daemon finishes
+// behind the verb, so the verb answers with an advisory rather than a failure
+// the eventual state contradicts (#347).
+func TestProvisionTasksCarryReconcileWarningsOntoTheSummary(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILonghorn}
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	warning := "storage probe cleanup is still finishing; watch `tbx status`"
+	lifecycle, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	service := &Server{
+		vms:              make(map[string]map[string]hypervisor.Machine),
+		provisions:       make(map[string]activeProvision),
+		lifecycleContext: lifecycle,
+		lifecycleCancel:  cancel,
+		provisionReconcile: func(context.Context, provision.Request) (provision.Result, error) {
+			return provision.Result{StoragePhase: provision.StoragePhaseLive, Warnings: []string{warning}}, nil
+		},
+	}
+	service.opMu.Lock()
+	tasks := service.beginProvisionTasksLocked([]cluster.Cluster{item})
+	service.opMu.Unlock()
+
+	summary := &ClusterSummary{Name: item.Name}
+	if err := service.runProvisionTasks(summary, tasks, nil); err != nil {
+		t.Fatalf("runProvisionTasks() error = %v, want the cleanup advisory to be non-fatal", err)
+	}
+	if !slices.Contains(summary.Warnings, warning) {
+		t.Fatalf("summary warnings = %v, want %q", summary.Warnings, warning)
 	}
 }
 
@@ -312,7 +351,7 @@ func TestProvisionCNIAttachesStorageReconcilerForCilium(t *testing.T) {
 			}
 			return provision.Result{StoragePhase: provision.StoragePhaseLive, StorageLive: true}, nil
 		}}
-		if _, phase, err := service.provisionCNI(context.Background(), item, true); err != nil {
+		if _, _, phase, err := service.provisionCNI(context.Background(), item, true, false); err != nil {
 			t.Fatal(err)
 		} else if phase != StoragePhaseLive {
 			t.Fatalf("csi=%s phase = %q, want %q", test.csi, phase, StoragePhaseLive)
@@ -552,6 +591,134 @@ func TestRefreshStoragePhasesSharesConcurrentRestartProbe(t *testing.T) {
 	}
 }
 
+// A pass that skipped because the previous teardown was still finishing is not
+// a fault, but it is still a reason to back off: without a record every refresh
+// would launch another probe that spends the PVC-wait and residue budgets
+// against the cluster API to rediscover the same terminating claim. The
+// operator has to be able to see why, too — the reason must not live only in
+// tbxd.log — and must not be shown a failed readiness probe for it (#347).
+func TestPendingStorageProbeBacksOffAndSurfacesTheAdvisory(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir, err := cluster.Dir("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "kubeconfig"), []byte("credentials"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	service := &Server{vms: runningStorageVMs("demo"), storageProbe: func(context.Context, []byte) error {
+		calls.Add(1)
+		return fmt.Errorf("%w: probe claim is still terminating", errStorageProbePending)
+	}}
+	newStatuses := func() []ClusterStatus {
+		return []ClusterStatus{{
+			Name: "demo", Running: true, KubernetesReady: true,
+			ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILocalPath},
+		}}
+	}
+
+	service.refreshStoragePhases(newStatuses())
+	eventually(t, func() bool {
+		service.opMu.Lock()
+		defer service.opMu.Unlock()
+		return service.storageProbeFailures["demo"].pending
+	})
+
+	next := newStatuses()
+	service.refreshStoragePhases(next)
+	// Nothing new may start inside the backoff window.
+	time.Sleep(10 * time.Millisecond)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("storage probe calls = %d, want the pending outcome to back the next refresh off", got)
+	}
+	if next[0].StoragePhase != StoragePhaseProvisioning {
+		t.Fatalf("storage phase = %q, want provisioning", next[0].StoragePhase)
+	}
+	if next[0].StorageError != "" {
+		t.Fatalf("storage error = %q, want a pending wait reported as no fault at all", next[0].StorageError)
+	}
+	if !strings.Contains(next[0].StoragePending, "still terminating") {
+		t.Fatalf("storage pending = %q, want the probe's advisory", next[0].StoragePending)
+	}
+	// The hint says the wait once, in status's own voice: the pending note it
+	// stands for is the probe's advisory, which repeats itself and points back
+	// at `tbx status` — the output the reader is already looking at. What it
+	// does keep is the object the wait is on, which status has no other way of
+	// knowing.
+	hint := storageHint(next[0])
+	if !strings.Contains(hint, "still finishing") || !strings.Contains(hint, "retries automatically") {
+		t.Fatalf("storage hint = %q, want the pending wait rendered as work in progress", hint)
+	}
+	if !strings.Contains(hint, "(probe claim is still terminating)") {
+		t.Fatalf("storage hint = %q, want it to name the object that is still terminating", hint)
+	}
+	if strings.Contains(hint, "failed") {
+		t.Fatalf("storage hint = %q, want no failure wording for a benign wait", hint)
+	}
+	if strings.Contains(hint, "tbx status") || strings.Count(hint, "still finishing") != 1 {
+		t.Fatalf("storage hint = %q, want one non-self-referential sentence", hint)
+	}
+}
+
+// The pending note the daemon actually stores is the probe's whole advisory:
+// the marker's sentence, the probe's own repeat of it wrapped around the
+// object, the deadline the wait hit, and a pointer back at `tbx status`. The
+// hint keeps the object and drops the rest.
+func TestStorageHintKeepsOnlyTheTerminatingObjectFromThePendingAdvisory(t *testing.T) {
+	status := ClusterStatus{
+		Name: "demo", Running: true, KubernetesReady: true,
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILocalPath},
+		StoragePhase:       StoragePhaseProvisioning,
+		StoragePending: "storage probe skipped while the previous probe's cleanup is still finishing: " +
+			`storage probe cleanup is still finishing (storage probe PVC "storage-probe" is still terminating: context deadline exceeded);` +
+			" the daemon keeps reconciling it — watch it with: tbx status demo",
+	}
+	hint := storageHint(status)
+	if !strings.Contains(hint, `(storage probe PVC "storage-probe" is still terminating)`) {
+		t.Fatalf("storage hint = %q, want the terminating object named once, without the deadline", hint)
+	}
+	for _, unwanted := range []string{"tbx status", "context deadline exceeded", "`"} {
+		if strings.Contains(hint, unwanted) {
+			t.Fatalf("storage hint = %q, want it to drop %q", hint, unwanted)
+		}
+	}
+	if strings.Count(hint, "still finishing") != 1 {
+		t.Fatalf("storage hint = %q, want one non-repeating sentence", hint)
+	}
+	// A pending note with nothing but the marker's own sentence leaves the hint
+	// as it was rather than trailing an empty parenthetical.
+	bare := status
+	bare.StoragePending = errStorageProbePending.Error()
+	if got := storageHint(bare); !strings.HasSuffix(got, "is still finishing; the daemon retries automatically.") {
+		t.Fatalf("storage hint without a detail = %q, want the plain sentence", got)
+	}
+	// A cleanup whose waits all hit the shared budget joins one observation per
+	// line; the hint folds them into a single line with the deadlines dropped.
+	joined := status
+	joined.StoragePending = "storage probe skipped while the previous probe's cleanup is still finishing: " +
+		"storage probe cleanup is still finishing (" +
+		"storage probe pod \"storage-probe-reader\" is still terminating: context deadline exceeded\n" +
+		"storage probe pod \"storage-probe-writer\" is still terminating: context deadline exceeded\n" +
+		`storage probe PVC "storage-probe" is still terminating: context deadline exceeded);` +
+		" the daemon keeps reconciling it — watch it with: tbx status demo"
+	got := storageHint(joined)
+	if strings.ContainsAny(got, "\n") {
+		t.Fatalf("storage hint = %q, want a single line", got)
+	}
+	for _, unwanted := range []string{"tbx status", "context deadline exceeded"} {
+		if strings.Contains(got, unwanted) {
+			t.Fatalf("storage hint = %q, want it to drop %q", got, unwanted)
+		}
+	}
+	if !strings.Contains(got, `storage probe pod "storage-probe-reader" is still terminating; storage probe pod "storage-probe-writer" is still terminating`) {
+		t.Fatalf("storage hint = %q, want the joined observations folded with semicolons", got)
+	}
+}
+
 func TestRefreshStoragePhasesSkipsProbeUntilKubernetesIsReady(t *testing.T) {
 	called := false
 	service := &Server{storageProbe: func(context.Context, []byte) error {
@@ -712,8 +879,13 @@ func runningLonghornClusterForNodeMutation(t *testing.T, controlPlanes, workers 
 		storageStatusProbes:  make(map[string]activeStorageProbe),
 		storageProbeFailures: make(map[string]storageProbeFailure),
 		hostPressure:         noHostPressure,
-		subnetSources:        emptySubnetSources(),
-		defaultSchematic:     "curated-default",
+		// The start gate is not this fixture's subject, so the host it reads is
+		// pinned rather than measured: a runner short on free RAM must not turn
+		// a topology or schematic test into a headroom refusal.
+		hostFreeMemory:   plentifulHostMemory,
+		hostTotalMemory:  plentifulHostMemory,
+		subnetSources:    emptySubnetSources(),
+		defaultSchematic: "curated-default",
 		// no test reaches a real API server: the Kubernetes node deletion is
 		// stubbed out by default and overridden where it is the subject
 		deleteKubernetesNode: func(context.Context, cluster.Cluster, string) error { return nil },

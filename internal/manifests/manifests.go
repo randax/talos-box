@@ -90,8 +90,19 @@ func CiliumValues(f Facts) string {
 	// The manual Cilium values surface retains its historic L2 default. The
 	// provisioner names Cilium explicitly and turns L2 off with lb: false.
 	l2Enabled := !f.BGP && (f.CNI != "cilium" || f.LB)
+	// The announcement mode is a chart value, not an object: switching it rewrites
+	// cilium-config, and an agent reads that file once at startup. rollOutCiliumPods
+	// stamps the ConfigMap's checksum into the pod templates, so applying the new
+	// render restarts the workloads that must observe it — which is what makes
+	// `tbx bgp enable|disable` take effect on a live cluster instead of landing a
+	// flag the running agents never read (#344). It is idempotent: an unchanged
+	// config renders an unchanged pod template, so a rerun rolls nothing.
 	return fmt.Sprintf(`ipam:
   mode: kubernetes
+# roll the agents when cilium-config changes, e.g. on a BGP mode change
+rollOutCiliumPods: true
+operator:
+  rollOutPods: true
 kubeProxyReplacement: true
 k8sServiceHost: localhost
 k8sServicePort: 7445

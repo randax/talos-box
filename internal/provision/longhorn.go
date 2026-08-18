@@ -11,10 +11,13 @@ import (
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"go.yaml.in/yaml/v4"
 	"helm.sh/helm/v3/pkg/chart/loader"
 	"helm.sh/helm/v3/pkg/chartutil"
 	"helm.sh/helm/v3/pkg/engine"
 	"helm.sh/helm/v3/pkg/releaseutil"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -32,6 +35,7 @@ const (
 	longhornChartSHA256        = "869bb20701b154473606f1e8967b27f34f2448a2dfe6eb8970f1cae6957384f5"
 	longhornNamespace          = "longhorn-system"
 	longhornStorageClass       = "longhorn"
+	longhornProvisioner        = "driver.longhorn.io"
 	longhornManagerName        = "longhorn-manager"
 	longhornDriverDeployerName = "longhorn-driver-deployer"
 	longhornUIName             = "longhorn-ui"
@@ -47,40 +51,45 @@ var longhornNodeResource = schema.GroupVersionResource{Group: "longhorn.io", Ver
 // provisioning.
 type LonghornReconciler struct {
 	PollInterval time.Duration
+	// Lifecycle is the caller's lifetime, and bounds the storage probe's
+	// teardown — which deliberately outlives the reconcile's own context. Nil
+	// leaves the teardown bounded by its own timeout alone.
+	Lifecycle context.Context
 }
 
 func (r LonghornReconciler) Reconcile(ctx context.Context, item cluster.Cluster, kubeconfig []byte) (StorageResult, error) {
-	objects, err := renderLonghorn(item)
-	if err != nil {
-		return StorageResult{}, err
-	}
 	config, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
 	if err != nil {
 		return StorageResult{}, fmt.Errorf("parse kubeconfig for Kubernetes apply: %w", err)
 	}
-	return r.reconcile(ctx, config, item, objects)
+	return r.reconcile(ctx, config, item)
 }
 
 // ProbeLonghornStorage re-runs the shared default-StorageClass write/readback
 // probe without reinstalling Longhorn, keeping storage-live status tied to the
 // actual PVC data path after daemon restarts.
-func ProbeLonghornStorage(ctx context.Context, kubeconfig []byte, interval time.Duration) error {
+//
+// lifecycle is the caller's own lifetime and bounds the probe's teardown, which
+// outlives an *expired* ctx on purpose but still dies with a cancelled one (see
+// storageProbeCleanupContext). It may be nil when the caller has no lifetime to
+// answer to.
+func ProbeLonghornStorage(ctx, lifecycle context.Context, clusterName string, kubeconfig []byte, interval time.Duration) (StorageProbeOutcome, error) {
 	config, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
 	if err != nil {
-		return fmt.Errorf("parse kubeconfig for storage probe: %w", err)
+		return StorageProbeOutcome{}, fmt.Errorf("parse kubeconfig for storage probe: %w", err)
 	}
 	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
 	if err != nil {
-		return fmt.Errorf("create Kubernetes discovery client: %w", err)
+		return StorageProbeOutcome{}, fmt.Errorf("create Kubernetes discovery client: %w", err)
 	}
 	mapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(discoveryClient))
 	dynamicClient, err := dynamic.NewForConfig(config)
 	if err != nil {
-		return fmt.Errorf("create Kubernetes apply client: %w", err)
+		return StorageProbeOutcome{}, fmt.Errorf("create Kubernetes apply client: %w", err)
 	}
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		return fmt.Errorf("create Kubernetes readiness client: %w", err)
+		return StorageProbeOutcome{}, fmt.Errorf("create Kubernetes readiness client: %w", err)
 	}
 	if interval <= 0 {
 		interval = time.Second
@@ -88,10 +97,13 @@ func ProbeLonghornStorage(ctx context.Context, kubeconfig []byte, interval time.
 	return runStorageProbe(ctx, dynamicClient, mapper, clientset, storageProbeSpec{
 		ExpectedStorageClass: longhornStorageClass,
 		ProbeImage:           localPathHelperImage,
+		Engine:               cluster.CSILonghorn,
+		ClusterName:          clusterName,
+		Lifecycle:            lifecycle,
 	}, interval)
 }
 
-func (r LonghornReconciler) reconcile(ctx context.Context, config *rest.Config, item cluster.Cluster, objects []unstructured.Unstructured) (StorageResult, error) {
+func (r LonghornReconciler) reconcile(ctx context.Context, config *rest.Config, item cluster.Cluster) (StorageResult, error) {
 	if r.PollInterval <= 0 {
 		r.PollInterval = time.Second
 	}
@@ -107,6 +119,10 @@ func (r LonghornReconciler) reconcile(ctx context.Context, config *rest.Config, 
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		return StorageResult{}, fmt.Errorf("create Kubernetes readiness client: %w", err)
+	}
+	objects, err := renderLonghornForPlacement(ctx, dynamicClient, item)
+	if err != nil {
+		return StorageResult{}, err
 	}
 
 	namespaces, chartObjects, crds := partitionLonghornObjects(objects)
@@ -132,19 +148,72 @@ func (r LonghornReconciler) reconcile(ctx context.Context, config *rest.Config, 
 	if err := reconcileLonghornControlPlaneScheduling(ctx, dynamicClient, item, r.PollInterval); err != nil {
 		return StorageResult{}, err
 	}
-	if err := runStorageProbe(ctx, dynamicClient, mapper, clientset, storageProbeSpec{
+	outcome, err := runStorageProbe(ctx, dynamicClient, mapper, clientset, storageProbeSpec{
 		ExpectedStorageClass: longhornStorageClass,
 		ProbeImage:           localPathHelperImage,
-	}, r.PollInterval); err != nil {
+		Engine:               cluster.CSILonghorn,
+		ClusterName:          item.Name,
+		Lifecycle:            r.Lifecycle,
+	}, r.PollInterval)
+	if err != nil {
 		return StorageResult{}, err
 	}
-	return StorageResult{Narration: []string{
+	return storageResultFromProbe(outcome, []string{
 		"≈ helm template longhorn longhorn/longhorn --version " + longhornChartVersion + " -n " + longhornNamespace + " | kubectl apply --server-side -f -",
 		"≈ kubectl apply --server-side -f - # storage probe PVC + writer/reader pods",
-	}, Phase: StoragePhaseLive, Live: true}, nil
+	}), nil
 }
 
+// renderLonghorn renders the chart for the cluster's declared topology: a
+// cluster with workers keeps every Longhorn component off its control planes
+// (see longhornValues), a worker-less one has nowhere else to run them.
 func renderLonghorn(item cluster.Cluster) ([]unstructured.Unstructured, error) {
+	return renderLonghornWithTolerations(item, !clusterHasWorkers(item))
+}
+
+// renderLonghornForPlacement renders the chart for what the live cluster holds
+// rather than for its declared shape alone. A cluster that ran worker-less may
+// still hold replicas on a control plane; the components that serve them have
+// to keep tolerating the taint a joining worker returned, even though a
+// cluster that never ran worker-less must keep them off (#339).
+func renderLonghornForPlacement(ctx context.Context, client dynamic.Interface, item cluster.Cluster) ([]unstructured.Unstructured, error) {
+	tolerate := !clusterHasWorkers(item)
+	if !tolerate {
+		holdsReplicas, err := controlPlaneHoldsLonghornReplicas(ctx, client, item)
+		if err != nil {
+			return nil, err
+		}
+		tolerate = holdsReplicas
+	}
+	return renderLonghornWithTolerations(item, tolerate)
+}
+
+// controlPlaneHoldsLonghornReplicas reports whether any control plane still
+// holds a replica. Longhorn's CRDs are absent before the first install, and an
+// absent CRD means no replica anywhere — not a failure to propagate.
+func controlPlaneHoldsLonghornReplicas(ctx context.Context, client dynamic.Interface, item cluster.Cluster) (bool, error) {
+	replicas, err := client.Resource(longhornReplicaResource).Namespace(longhornNamespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("list longhorn replicas: %w", err)
+	}
+	controlPlanes := make(map[string]bool)
+	for _, node := range item.Nodes {
+		if node.Role == cluster.RoleControlPlane {
+			controlPlanes[node.Name] = true
+		}
+	}
+	for i := range replicas.Items {
+		if controlPlanes[nestedString(&replicas.Items[i], "spec", "nodeID")] {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func renderLonghornWithTolerations(item cluster.Cluster, tolerateControlPlane bool) ([]unstructured.Unstructured, error) {
 	if item.CSI != cluster.CSILonghorn {
 		return nil, errors.New("longhorn rendering requires csi: longhorn")
 	}
@@ -158,8 +227,9 @@ func renderLonghorn(item cluster.Cluster) ([]unstructured.Unstructured, error) {
 	if chart.Metadata.Version != longhornChartVersion {
 		return nil, fmt.Errorf("embedded Longhorn chart version = %s, want %s", chart.Metadata.Version, longhornChartVersion)
 	}
-	replicas := longhornReplicaCount(storageNodeCount(item))
-	values, err := chartutil.ReadValues([]byte(longhornValues(replicas)))
+	storageNodes := storageNodeCount(item)
+	replicas := longhornReplicaCount(storageNodes)
+	values, err := chartutil.ReadValues([]byte(longhornValues(replicas, storageNodes, tolerateControlPlane)))
 	if err != nil {
 		return nil, fmt.Errorf("decode Longhorn values: %w", err)
 	}
@@ -245,30 +315,66 @@ func longhornReplicaCount(nodes int) int {
 	}
 }
 
-// longhornValues tolerates controlPlaneTaint in both the DaemonSet/Deployment
-// pod specs (global.tolerations) and the system-managed components
-// (defaultSettings.taintToleration). Crossing the zero-worker boundary by
-// mutation returns that taint to a control plane that still holds replicas
-// written while the cluster was worker-less; without a toleration neither
-// longhorn-manager nor its instance managers could ever be recreated there and
-// those replicas would fault on the next restart. Running there is not the
-// same as being replica-eligible: reconcileLonghornControlPlaneScheduling
-// clears spec.allowScheduling on the control planes of a cluster that has
-// workers, so tolerating the taint never widens replica placement.
-func longhornValues(replicas int) string {
-	return fmt.Sprintf(`global:
-  tolerations:
-    - key: %[1]s
+// longhornValues sizes the stack for the cluster it is going onto. The CSI
+// sidecar Deployments default to three replicas each: on a default 2 GiB
+// control plane, whose allocatable is already mostly etcd, apiserver and CNI,
+// the extra copies plus longhorn-manager churn on the guest OOM killer for as
+// long as the cluster lives (#339). They follow the replica-eligible node
+// count instead — the same set storageNodeCount derives.
+//
+// tolerateControlPlane decides whether any Longhorn component may run beside
+// etcd. A worker-less cluster has nowhere else to run them. A cluster with
+// workers keeps them out, which is what stops the OOM churn: tbx leaves the
+// NoSchedule taint on those control planes, so withholding the toleration —
+// from the DaemonSet/Deployment pod specs (global.tolerations) and from the
+// system-managed components alike (defaultSettings.taintToleration) — pins
+// manager, driver deployer, UI, CSI sidecars and instance managers to workers.
+// The one exception is a cluster that ran worker-less and still holds replicas
+// on a control plane: renderLonghornForPlacement keeps the toleration for it,
+// because otherwise neither longhorn-manager nor its instance managers could
+// be recreated there and those replicas would fault on the next restart.
+// Running there is not the same as being replica-eligible:
+// reconcileLonghornControlPlaneScheduling clears spec.allowScheduling on the
+// control planes of a cluster that has workers, so tolerating the taint never
+// widens replica placement.
+func longhornValues(replicas, storageNodes int, tolerateControlPlane bool) string {
+	tolerations := "  tolerations: []\n"
+	taintToleration := ""
+	if tolerateControlPlane {
+		tolerations = fmt.Sprintf(`  tolerations:
+    - key: %s
       operator: Exists
       effect: NoSchedule
-persistence:
+`, controlPlaneTaint)
+		taintToleration = fmt.Sprintf("  taintToleration: %s:NoSchedule\n", controlPlaneTaint)
+	}
+	return fmt.Sprintf(`global:
+%[3]spersistence:
   defaultClass: true
-  defaultClassReplicaCount: %[2]d
+  defaultClassReplicaCount: %[1]d
+longhornUI:
+  replicas: 1
+csi:
+  attacherReplicaCount: %[2]d
+  provisionerReplicaCount: %[2]d
+  resizerReplicaCount: %[2]d
+  snapshotterReplicaCount: %[2]d
 defaultSettings:
   defaultDataPath: /var/lib/longhorn
-  defaultReplicaCount: "%[2]d"
-  taintToleration: %[1]s:NoSchedule
-`, controlPlaneTaint, replicas)
+  defaultReplicaCount: "%[1]d"
+%[4]s`, replicas, longhornSidecarReplicaCount(storageNodes), tolerations, taintToleration)
+}
+
+// longhornSidecarReplicaCount keeps the CSI sidecars from asking for more
+// copies than there are nodes to spread them over, and never drops below one.
+func longhornSidecarReplicaCount(storageNodes int) int {
+	if storageNodes < 1 {
+		return 1
+	}
+	if storageNodes > 3 {
+		return 3
+	}
+	return storageNodes
 }
 
 // reconcileLonghornControlPlaneScheduling holds the live cluster to the
@@ -379,6 +485,13 @@ func setLonghornNodeScheduling(ctx context.Context, client dynamic.Interface, na
 	return nil
 }
 
+// decodeLonghornStorageClass extracts the StorageClass definitions Longhorn
+// keeps in the longhorn-storageclass ConfigMap so tbx can apply them itself,
+// labeled and annotated as the cluster default. The definitions are written
+// back into the ConfigMap: longhorn-driver-deployer re-creates the class from
+// that yaml verbatim on every start, so a definition without the managed label
+// resurfaces as a user-owned StorageClass and the removal guard then refuses
+// every switch away from longhorn (#338).
 func decodeLonghornStorageClass(configMap *unstructured.Unstructured) ([]unstructured.Unstructured, error) {
 	data, found, err := unstructured.NestedStringMap(configMap.Object, "data")
 	if err != nil || !found {
@@ -400,7 +513,27 @@ func decodeLonghornStorageClass(configMap *unstructured.Unstructured) ([]unstruc
 			ensureAnnotation(object, "storageclass.beta.kubernetes.io/is-default-class", "true")
 		}
 	}
+	if err := setLonghornStorageClassDefinition(configMap, objects); err != nil {
+		return nil, err
+	}
 	return objects, nil
+}
+
+// setLonghornStorageClassDefinition re-encodes the labeled StorageClass
+// definitions into the ConfigMap Longhorn reads them from.
+func setLonghornStorageClassDefinition(configMap *unstructured.Unstructured, objects []unstructured.Unstructured) error {
+	documents := make([]string, 0, len(objects))
+	for i := range objects {
+		encoded, err := yaml.Marshal(objects[i].Object)
+		if err != nil {
+			return fmt.Errorf("encode Longhorn storage class definition: %w", err)
+		}
+		documents = append(documents, string(encoded))
+	}
+	if err := unstructured.SetNestedField(configMap.Object, strings.Join(documents, "---\n"), "data", "storageclass.yaml"); err != nil {
+		return fmt.Errorf("set Longhorn storage class definition: %w", err)
+	}
+	return nil
 }
 
 func partitionLonghornObjects(objects []unstructured.Unstructured) (namespaces, chart, crds []unstructured.Unstructured) {

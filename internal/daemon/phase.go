@@ -365,12 +365,69 @@ func storageHint(status ClusterStatus) string {
 		if status.StorageError != "" {
 			return fmt.Sprintf("storage provisioning: CSI readiness probe failed: %s; retrying after backoff.", status.StorageError)
 		}
+		if status.StoragePending != "" {
+			// Nothing failed: the probe is waiting on its own previous pass to
+			// finish clearing, so the wording stays "still working". The pending
+			// note itself is the probe's advisory, written for the verb that
+			// raised it — it says "cleanup is still finishing" a second time and
+			// sends the reader to `tbx status`, which is where they already are.
+			// The hint says it once, in status's own voice, but keeps the one
+			// fact status cannot derive: which object is still terminating.
+			if detail := storagePendingDetail(status.StoragePending); detail != "" {
+				return fmt.Sprintf("storage provisioning: the storage probe's cleanup from a previous pass is still finishing (%s); the daemon retries automatically.", detail)
+			}
+			return "storage provisioning: the storage probe's cleanup from a previous pass is still finishing; the daemon retries automatically."
+		}
 		return "storage provisioning: waiting for the CSI readiness probe to pass."
 	case StoragePhaseLive:
 		return "storage live: the CSI readiness probe passed."
 	default:
 		return ""
 	}
+}
+
+// storagePendingDetail lifts the one fact out of the probe's pending advisory
+// that status cannot derive for itself: the object whose termination the next
+// pass is waiting on. Everything around it — the repeated "still finishing",
+// the pointer back at `tbx status` — is the advisory talking to the verb that
+// raised it, so the parenthetical the probe wraps the object in is preferred
+// and the deadline the wait finally hit is dropped: it says nothing the "still
+// finishing" lead clause has not already said. An advisory that carries no
+// such detail, or whose detail would repeat the sentence or send the reader
+// back here, yields nothing and the hint stays as it was.
+func storagePendingDetail(pending string) string {
+	detail := pending
+	if _, after, found := strings.Cut(detail, "still finishing: "); found {
+		detail = after
+	}
+	if open := strings.Index(detail, "("); open >= 0 {
+		if width := strings.Index(detail[open:], ")"); width > 0 {
+			detail = detail[open+1 : open+width]
+		}
+	}
+	detail = strings.ReplaceAll(detail, "`", "")
+	// The advisory may carry an errors.Join of several waits that all hit the
+	// same deadline: one observation per line, each ending in the deadline the
+	// lead clause already reports. Fold them into one line and drop every
+	// deadline mention, not just a trailing one.
+	detail = strings.ReplaceAll(detail, ": "+context.DeadlineExceeded.Error(), "")
+	lines := make([]string, 0, 4)
+	for line := range strings.SplitSeq(detail, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line == context.DeadlineExceeded.Error() {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	detail = strings.Join(lines, "; ")
+	const storagePendingDetailMaxLen = 200
+	if len(detail) > storagePendingDetailMaxLen {
+		detail = detail[:storagePendingDetailMaxLen] + "…"
+	}
+	if detail == "" || strings.Contains(detail, "still finishing") || strings.Contains(detail, "tbx ") {
+		return ""
+	}
+	return detail
 }
 
 func longhornSingleNodeHint(status ClusterStatus) string {
