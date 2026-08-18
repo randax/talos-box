@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
@@ -52,27 +53,46 @@ func ClassifyPhase(vmRunning bool, probe ProbeResult) Phase {
 // apidPort is Talos's machine API port.
 const apidPort = "50000"
 
+// probeTimeout bounds one dial. Two of them make up a probe, so a sweep over a
+// large cluster's silent nodes costs this twice per node — which is why a
+// caller on a deadline probes with a context instead.
+const probeTimeout = time.Second
+
 // probeAPID observes a node's apid: reachable? speaking TLS?
 func probeAPID(ip string) ProbeResult {
-	return probeHostPort(net.JoinHostPort(ip, apidPort))
+	return probeAPIDContext(context.Background(), ip)
 }
 
-func probeHostPort(address string) ProbeResult {
-	conn, err := net.DialTimeout("tcp", address, time.Second)
+// probeAPIDContext is probeAPID bounded by the caller's context as well as by
+// its own dial timeouts, so a caller sweeping many nodes under a deadline
+// cannot overrun it by the length of one more dial.
+func probeAPIDContext(ctx context.Context, ip string) ProbeResult {
+	return probeHostPort(ctx, net.JoinHostPort(ip, apidPort))
+}
+
+func probeHostPort(ctx context.Context, address string) ProbeResult {
+	dialer := &net.Dialer{Timeout: probeTimeout}
+	conn, err := dialer.DialContext(ctx, "tcp", address)
 	if err != nil {
 		return ProbeResult{}
 	}
 	_ = conn.Close()
-	tlsConn, err := tls.DialWithDialer(
-		&net.Dialer{Timeout: time.Second},
-		"tcp", address,
-		&tls.Config{InsecureSkipVerify: true}, //nolint:gosec // probing our own local VM
-	)
+	tlsDialer := &tls.Dialer{
+		NetDialer: dialer,
+		Config:    &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // probing our own local VM
+	}
+	tlsConn, err := tlsDialer.DialContext(ctx, "tcp", address)
 	if err != nil {
 		return ProbeResult{Dialed: true, TLS: false}
 	}
 	defer func() { _ = tlsConn.Close() }()
-	certs := tlsConn.ConnectionState().PeerCertificates
+	// tls.Dialer hands back a net.Conn; the handshake state this probe reads
+	// the identity from lives on the concrete connection.
+	state, ok := tlsConn.(*tls.Conn)
+	if !ok {
+		return ProbeResult{Dialed: true, TLS: true}
+	}
+	certs := state.ConnectionState().PeerCertificates
 	maintenance := len(certs) > 0 && certs[0].Subject.CommonName == maintenanceCN
 	return ProbeResult{Dialed: true, TLS: true, MaintenanceCert: maintenance}
 }

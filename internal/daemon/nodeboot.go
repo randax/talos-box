@@ -80,13 +80,25 @@ func (s *Server) waitForNodesBootedContext(ctx context.Context, name string, pro
 	}
 	probe := s.nodeProbe
 	if probe == nil {
-		probe = probeAPID
+		// Bind the real probe to this wait's context so no single dial can
+		// outlive the budget: probing is the sweep's whole cost, and a cluster
+		// large enough to matter has more silent nodes than the budget has dial
+		// timeouts to spend on them.
+		probe = func(ip string) ProbeResult { return probeAPIDContext(ctx, ip) }
 	}
 	progress.stage("waiting for %d node(s) to boot", len(item.Nodes))
 	pending := append([]cluster.Node(nil), item.Nodes...)
 	for {
-		remaining := pending[:0]
-		for _, node := range pending {
+		remaining := make([]cluster.Node, 0, len(pending))
+		for i, node := range pending {
+			// A sweep is not free — every silent node costs a dial timeout — so
+			// the deadline and the shutdown signal are observed between nodes,
+			// not only after the whole pass. The nodes this sweep never reached
+			// are unanswered as far as the operator is concerned.
+			if err := context.Cause(ctx); err != nil {
+				remaining = append(remaining, pending[i:]...)
+				return unansweredNodesWarning(item, remaining, err)
+			}
 			// The VM map is daemon state: read it under the operation lock,
 			// which this wait deliberately does not hold — a boot takes
 			// minutes, and status must stay answerable throughout.
