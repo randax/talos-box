@@ -532,8 +532,8 @@ func (s *Server) dispatchNodeMutation(request Request) Response {
 	s.opMu.Lock()
 	data, tasks, err := s.handleNodeMutationLocked(request)
 	s.opMu.Unlock()
-	lock.Unlock()
 	if err != nil {
+		lock.Unlock()
 		if removalWarning != "" {
 			// the removal may have deleted state before failing; the data-loss
 			// note must reach the user alongside the failure
@@ -543,8 +543,12 @@ func (s *Server) dispatchNodeMutation(request Request) Response {
 	}
 	warnings := []string{removalWarning}
 	if request.Op == "node.remove" {
+		// Still under the cluster mutation lock: a concurrent node.add could
+		// otherwise reuse the removed name before this bounded cleanup runs and
+		// have its freshly registered Kubernetes Node object deleted.
 		warnings = append(warnings, s.deleteRemovedKubernetesNode(args.Cluster, args.Name))
 	}
+	lock.Unlock()
 	if status, ok := data.(NodeStatus); ok {
 		status.addWarnings(warnings...)
 		data = status

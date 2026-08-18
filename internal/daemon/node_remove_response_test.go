@@ -145,3 +145,35 @@ func TestNodeRemoveSkipsKubernetesNodeDeletionOnAStoppedCluster(t *testing.T) {
 		}
 	}
 }
+
+func TestNodeRemoveHoldsTheMutationLockThroughKubernetesNodeDeletion(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 2)
+	stubNodeMutationReconcile(service)
+	writeClusterKubeconfig(t, item.Name)
+	service.nodeVolumeCount = func(context.Context, cluster.Cluster, string) (int, error) { return 0, nil }
+	deleting := make(chan struct{})
+	release := make(chan struct{})
+	service.deleteKubernetesNode = func(context.Context, cluster.Cluster, string) error {
+		close(deleting)
+		<-release
+		return nil
+	}
+
+	done := make(chan Response, 1)
+	go func() { done <- dispatchNodeRemove(t, service, item.Name, "demo-worker-2", false) }()
+
+	<-deleting
+	// A concurrent node.add reusing the removed name must not slip in before
+	// the cleanup deletes the old Kubernetes Node object.
+	if service.clusterMutationLock(item.Name).TryLock() {
+		t.Fatal("the cluster mutation lock was free during Kubernetes node deletion")
+	}
+	close(release)
+	if response := <-done; !response.OK {
+		t.Fatalf("node.remove failed: %s", response.Error)
+	}
+	if !service.clusterMutationLock(item.Name).TryLock() {
+		t.Fatal("the cluster mutation lock was not released after the removal completed")
+	}
+	service.clusterMutationLock(item.Name).Unlock()
+}
