@@ -51,6 +51,12 @@ func (s *Server) setBGPLocked(raw json.RawMessage, enable bool, progress stageFu
 	} else {
 		progress.stage("stopping the host BGP speaker for cluster %s", args.Name)
 	}
+	// The pre-change state decides whether the cluster side has anything to
+	// reconcile at all, and setBGP overwrites it.
+	previous, err := cluster.Load(args.Name)
+	if err != nil {
+		return nil, nil, err
+	}
 	summary, err := s.setBGP(raw, enable)
 	if err != nil {
 		return nil, nil, err
@@ -58,6 +64,14 @@ func (s *Server) setBGPLocked(raw json.RawMessage, enable bool, progress stageFu
 	item, err := cluster.Load(summary.Name)
 	if err != nil {
 		return nil, nil, err
+	}
+	if !enable && !clusterSideBGPWasActive(previous) {
+		// Disabling on a cluster whose Kubernetes side never announced over BGP
+		// is a host-side withdrawal and nothing else: only Cilium renders BGP
+		// objects at all, and a cluster that never had them has none to remove.
+		// Forcing a full reconcile for that would re-render the whole stack —
+		// and fail the verb on anything unrelated that is currently unhealthy.
+		return &summary, nil, nil
 	}
 	tasks, deferred := s.beginBGPProvisionLocked(item)
 	if deferred {
@@ -81,11 +95,23 @@ func (s *Server) beginBGPProvisionLocked(item cluster.Cluster) ([]provisionTask,
 		log.Printf("bgp %s: cluster is only partly running, skipping reconcile", item.Name)
 		return nil, clusterIsProvisioned(item) && len(item.Nodes) > 0
 	}
-	tasks := s.beginProvisionTasksLocked([]cluster.Cluster{item})
+	// Storage is deliberately out of scope: a BGP mode change re-renders the
+	// CNI and its LoadBalancer objects, and nothing else. Dragging the storage
+	// chart and its write/readback probe into the forced pass made `bgp enable`
+	// fail on unrelated storage faults and hold the request for the storage
+	// budget, while the memo storage already established stayed perfectly good.
+	tasks := s.beginProvisionTasksScopedLocked([]cluster.Cluster{item}, true)
 	for i := range tasks {
 		tasks[i].force = true
 	}
 	return tasks, false
+}
+
+// clusterSideBGPWasActive reports whether the cluster's Kubernetes side was
+// announcing over BGP before this change. Only Cilium renders BGP objects, and
+// only while the recorded intent asked for them.
+func clusterSideBGPWasActive(item cluster.Cluster) bool {
+	return item.CNI == cluster.CNICilium && item.BGP
 }
 
 // bgpDeferredReconcileWarning explains the silence: the mode is recorded and the

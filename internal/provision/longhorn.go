@@ -64,33 +64,33 @@ func (r LonghornReconciler) Reconcile(ctx context.Context, item cluster.Cluster,
 // ProbeLonghornStorage re-runs the shared default-StorageClass write/readback
 // probe without reinstalling Longhorn, keeping storage-live status tied to the
 // actual PVC data path after daemon restarts.
-func ProbeLonghornStorage(ctx context.Context, kubeconfig []byte, interval time.Duration) error {
+func ProbeLonghornStorage(ctx context.Context, clusterName string, kubeconfig []byte, interval time.Duration) (StorageProbeOutcome, error) {
 	config, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
 	if err != nil {
-		return fmt.Errorf("parse kubeconfig for storage probe: %w", err)
+		return StorageProbeOutcome{}, fmt.Errorf("parse kubeconfig for storage probe: %w", err)
 	}
 	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
 	if err != nil {
-		return fmt.Errorf("create Kubernetes discovery client: %w", err)
+		return StorageProbeOutcome{}, fmt.Errorf("create Kubernetes discovery client: %w", err)
 	}
 	mapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(discoveryClient))
 	dynamicClient, err := dynamic.NewForConfig(config)
 	if err != nil {
-		return fmt.Errorf("create Kubernetes apply client: %w", err)
+		return StorageProbeOutcome{}, fmt.Errorf("create Kubernetes apply client: %w", err)
 	}
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		return fmt.Errorf("create Kubernetes readiness client: %w", err)
+		return StorageProbeOutcome{}, fmt.Errorf("create Kubernetes readiness client: %w", err)
 	}
 	if interval <= 0 {
 		interval = time.Second
 	}
-	_, err = runStorageProbe(ctx, dynamicClient, mapper, clientset, storageProbeSpec{
+	return runStorageProbe(ctx, dynamicClient, mapper, clientset, storageProbeSpec{
 		ExpectedStorageClass: longhornStorageClass,
 		ProbeImage:           localPathHelperImage,
 		Engine:               cluster.CSILonghorn,
+		ClusterName:          clusterName,
 	}, interval)
-	return err
 }
 
 func (r LonghornReconciler) reconcile(ctx context.Context, config *rest.Config, item cluster.Cluster) (StorageResult, error) {
@@ -138,18 +138,19 @@ func (r LonghornReconciler) reconcile(ctx context.Context, config *rest.Config, 
 	if err := reconcileLonghornControlPlaneScheduling(ctx, dynamicClient, item, r.PollInterval); err != nil {
 		return StorageResult{}, err
 	}
-	warnings, err := runStorageProbe(ctx, dynamicClient, mapper, clientset, storageProbeSpec{
+	outcome, err := runStorageProbe(ctx, dynamicClient, mapper, clientset, storageProbeSpec{
 		ExpectedStorageClass: longhornStorageClass,
 		ProbeImage:           localPathHelperImage,
 		Engine:               cluster.CSILonghorn,
+		ClusterName:          item.Name,
 	}, r.PollInterval)
 	if err != nil {
 		return StorageResult{}, err
 	}
-	return StorageResult{Warnings: warnings, Narration: []string{
+	return storageResultFromProbe(outcome, []string{
 		"≈ helm template longhorn longhorn/longhorn --version " + longhornChartVersion + " -n " + longhornNamespace + " | kubectl apply --server-side -f -",
 		"≈ kubectl apply --server-side -f - # storage probe PVC + writer/reader pods",
-	}, Phase: StoragePhaseLive, Live: true}, nil
+	}), nil
 }
 
 // renderLonghorn renders the chart for the cluster's declared topology: a

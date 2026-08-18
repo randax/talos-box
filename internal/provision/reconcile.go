@@ -150,6 +150,17 @@ type Request struct {
 	Storage      StorageReconciler
 	BGP          BGPReconciler
 	PollInterval time.Duration
+	// SkipStorage leaves the cluster's storage engine alone. A pass forced only
+	// to re-render what an intent change decides — `tbx bgp enable/disable`
+	// re-rendering Cilium — has no storage work in it, and re-applying the
+	// chart plus its write/readback probe would make an unrelated storage fault
+	// fail the mode change and hold the request for the storage budget (#344).
+	SkipStorage bool
+	// MirrorOffline records that the registry mirror is serving from cache
+	// only. It changes nothing about what this pass does; it is the one piece
+	// of context that makes a control plane which never comes up diagnosable,
+	// on every CNI rather than only the Cilium one (#348).
+	MirrorOffline bool
 }
 
 // Result contains derived credential paths and manual-equivalent narration.
@@ -319,14 +330,14 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 			}
 		}
 		if err := bootstrapWithRetry(ctx, request.Client, controlPlane.IP, request.PollInterval); err != nil {
-			return Result{}, fmt.Errorf("bootstrap Kubernetes: %w", err)
+			return Result{}, annotateAPIServerTimeout(fmt.Errorf("bootstrap Kubernetes: %w", err), request.MirrorOffline)
 		}
 		result.Narration = append(result.Narration,
 			fmt.Sprintf("bootstrap: ≈ talosctl bootstrap --talosconfig %s --nodes %[2]s --endpoints %[2]s", shellquote.Quote(generated.paths.talosconfig), controlPlane.IP),
 		)
 		kubeconfig, err := kubeconfigWithRetry(ctx, request.Client, controlPlane.IP, request.PollInterval)
 		if err != nil {
-			return Result{}, fmt.Errorf("retrieve kubeconfig: %w", err)
+			return Result{}, annotateAPIServerTimeout(fmt.Errorf("retrieve kubeconfig: %w", err), request.MirrorOffline)
 		}
 		if err := writeSecure(generated.paths.kubeconfig, kubeconfig); err != nil {
 			return Result{}, fmt.Errorf("write kubeconfig: %w", err)
@@ -375,7 +386,7 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 				break
 			}
 			if err := wait(ctx, request.PollInterval); err != nil {
-				return Result{}, err
+				return Result{}, annotateAPIServerTimeout(err, request.MirrorOffline)
 			}
 		}
 		result.Narration = append(result.Narration,
@@ -394,7 +405,7 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 			result.VIP = loadBalancer.VIP
 			result.Narration = append(result.Narration, loadBalancer.Narration...)
 		}
-		if request.Cluster.CSI != "" {
+		if request.Cluster.CSI != "" && !request.SkipStorage {
 			if request.Storage == nil {
 				return Result{}, errors.New("storage provisioning requires a Kubernetes reconciler")
 			}

@@ -242,17 +242,148 @@ func TestRunStorageProbeReturnsContextAndCleansUp(t *testing.T) {
 // head of its next probe. Failing the verb here contradicted the state the
 // cluster converged to minutes later (#347).
 func TestRunStorageProbeReportsUnfinishedCleanupAsWarning(t *testing.T) {
-	previous := storageProbeCleanupTimeout
-	storageProbeCleanupTimeout = 20 * time.Millisecond
-	t.Cleanup(func() { storageProbeCleanupTimeout = previous })
+	shortenStorageProbeCleanup(t)
+	fixture := newStorageProbeStallFixture(t, false)
 
+	outcome, err := runStorageProbe(context.Background(), fixture.dynamicClient, fixture.mapper, fixture.clientset, storageProbeSpec{
+		ExpectedStorageClass: localPathStorageClass,
+		ProbeImage:           localPathHelperImage,
+		Engine:               cluster.CSILocalPath,
+		ClusterName:          "demo",
+	}, time.Millisecond)
+	if err != nil {
+		t.Fatalf("runStorageProbe() error = %v, want the unfinished cleanup reported as a warning", err)
+	}
+	if !outcome.Verified {
+		t.Fatal("runStorageProbe() reported the data path as unverified, but the probe read its payload back")
+	}
+	if len(outcome.Warnings) != 1 || !strings.Contains(outcome.Warnings[0], "storage probe cleanup is still finishing") {
+		t.Fatalf("runStorageProbe() warnings = %v, want an unfinished-cleanup advisory", outcome.Warnings)
+	}
+	if !strings.Contains(outcome.Warnings[0], "tbx status demo") {
+		t.Fatalf("warning %q does not name the cluster whose status the operator can watch", outcome.Warnings[0])
+	}
+}
+
+// The head cleanup answers to the same rule as the trailing one, and it is the
+// path the previous warning sends the operator down: the status probe reruns
+// against the very PVC that is still terminating. Hard-failing there reported
+// the daemon's own pending work as a storage fault (#347).
+func TestRunStorageProbeSkipsPassWhilePreviousCleanupIsPending(t *testing.T) {
+	shortenStorageProbeCleanup(t)
+	fixture := newStorageProbeStallFixture(t, true)
+
+	outcome, err := runStorageProbe(context.Background(), fixture.dynamicClient, fixture.mapper, fixture.clientset, storageProbeSpec{
+		ExpectedStorageClass: localPathStorageClass,
+		ProbeImage:           localPathHelperImage,
+		Engine:               cluster.CSILocalPath,
+		ClusterName:          "demo",
+	}, time.Millisecond)
+	if err != nil {
+		t.Fatalf("runStorageProbe() error = %v, want the pending cleanup reported as a warning", err)
+	}
+	if outcome.Verified {
+		t.Fatal("runStorageProbe() claimed a verified data path without probing one")
+	}
+	if len(outcome.Warnings) != 1 || !strings.Contains(outcome.Warnings[0], "storage probe cleanup is still finishing") {
+		t.Fatalf("runStorageProbe() warnings = %v, want a pending-cleanup advisory", outcome.Warnings)
+	}
+	if *fixture.applies != 0 {
+		t.Fatalf("runStorageProbe() applied %d object(s) on top of a still-terminating PVC", *fixture.applies)
+	}
+}
+
+// A deadline is only benign on its own. Joined with a real API failure it is
+// the least interesting half of the error, and downgrading the pair to an
+// advisory would hide a storage fault behind the daemon's own pending work.
+func TestRunStorageProbeFailsWhenHeadCleanupHitsARealError(t *testing.T) {
+	shortenStorageProbeCleanup(t)
+	fixture := newStorageProbeStallFixture(t, true)
+	fixture.clientset.PrependReactor("list", "persistentvolumes", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewInternalError(errors.New("etcd is unavailable"))
+	})
+
+	outcome, err := runStorageProbe(context.Background(), fixture.dynamicClient, fixture.mapper, fixture.clientset, storageProbeSpec{
+		ExpectedStorageClass: localPathStorageClass,
+		ProbeImage:           localPathHelperImage,
+		Engine:               cluster.CSILocalPath,
+		ClusterName:          "demo",
+	}, time.Millisecond)
+	if err == nil {
+		t.Fatalf("runStorageProbe() error = nil (outcome %+v), want the API failure reported", outcome)
+	}
+	if !strings.Contains(err.Error(), "clear stale storage probe") || !strings.Contains(err.Error(), "etcd is unavailable") {
+		t.Fatalf("runStorageProbe() error = %v, want it to name the failed cleanup", err)
+	}
+}
+
+// The residue sweep is what releases a claim that will not finish terminating,
+// so the wait that claim exhausted must not starve it (#347).
+func TestCleanupStorageProbeSweepsResidueAfterAStuckClaim(t *testing.T) {
+	shortenStorageProbeCleanup(t)
+	fixture := newStorageProbeStallFixture(t, true)
+	if _, err := fixture.clientset.CoreV1().PersistentVolumes().Create(context.Background(), &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-probe"},
+		Spec: corev1.PersistentVolumeSpec{
+			StorageClassName: localPathStorageClass,
+			ClaimRef:         &corev1.ObjectReference{Namespace: probeNamespace, Name: storageProbePVCName},
+		},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), storageProbeCleanupTimeout)
+	defer cancel()
+	err := cleanupStorageProbe(cleanupCtx, fixture.clientset, fixture.dynamicClient, storageProbeSpec{
+		ExpectedStorageClass: localPathStorageClass,
+		Engine:               cluster.CSILocalPath,
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("cleanupStorageProbe() error = %v, want the stuck claim's deadline", err)
+	}
+	if _, err := fixture.clientset.CoreV1().PersistentVolumes().Get(context.Background(), "pvc-probe", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("probe PersistentVolume get error = %v, want NotFound: a stuck claim starved the residue sweep", err)
+	}
+}
+
+func shortenStorageProbeCleanup(t *testing.T) {
+	t.Helper()
+	previousCleanup := storageProbeCleanupTimeout
+	previousResidue := storageProbeResidueTimeout
+	storageProbeCleanupTimeout = 20 * time.Millisecond
+	storageProbeResidueTimeout = 20 * time.Millisecond
+	t.Cleanup(func() {
+		storageProbeCleanupTimeout = previousCleanup
+		storageProbeResidueTimeout = previousResidue
+	})
+}
+
+// storageProbeStallFixture serves a probe PVC that never finishes terminating:
+// from the very first cleanup when stallFromStart is set — the state the next
+// pass finds after a teardown outran its bound — or only once the data path has
+// verified otherwise.
+type storageProbeStallFixture struct {
+	dynamicClient *dynamicfake.FakeDynamicClient
+	mapper        meta.RESTMapper
+	clientset     *kubernetesfake.Clientset
+	// applies counts the probe objects that reached the cluster, so a skipped
+	// pass can be told from one that ran.
+	applies *int
+}
+
+func newStorageProbeStallFixture(t *testing.T, stallFromStart bool) storageProbeStallFixture {
+	t.Helper()
 	dynamicClient := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
 	reactor := recordApplyReactor(t)
 	dynamicClient.PrependReactor("patch", "namespaces", reactor)
 	dynamicClient.PrependReactor("patch", "persistentvolumeclaims", reactor)
 	dynamicClient.PrependReactor("patch", "pods", reactor)
+	applies := 0
+	dynamicClient.PrependReactor("patch", "*", func(k8stesting.Action) (bool, runtime.Object, error) {
+		applies++
+		return false, nil, nil
+	})
 
-	mapper := storageProbeRESTMapper()
 	clientset := kubernetesfake.NewClientset()
 	probed := false
 	deleted := map[string]bool{}
@@ -262,9 +393,9 @@ func TestRunStorageProbeReportsUnfinishedCleanupAsWarning(t *testing.T) {
 			Spec:       corev1.PersistentVolumeClaimSpec{StorageClassName: stringPointer(localPathStorageClass)},
 			Status:     corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
 		}
-		// Once the probe has read its payload back, the claim never finishes
-		// terminating: the provisioner is behind and cleanup runs out of time.
-		if probed {
+		// The claim never finishes terminating: the provisioner is behind and
+		// cleanup runs out of time.
+		if stallFromStart || probed {
 			return true, claim, nil
 		}
 		if deleted["pvc/"+storageProbePVCName] {
@@ -292,21 +423,7 @@ func TestRunStorageProbeReportsUnfinishedCleanupAsWarning(t *testing.T) {
 		deleted["pvc/"+action.(k8stesting.DeleteAction).GetName()] = true
 		return true, nil, nil
 	})
-
-	warnings, err := runStorageProbe(context.Background(), dynamicClient, mapper, clientset, storageProbeSpec{
-		ExpectedStorageClass: localPathStorageClass,
-		ProbeImage:           localPathHelperImage,
-		Engine:               cluster.CSILocalPath,
-	}, time.Millisecond)
-	if err != nil {
-		t.Fatalf("runStorageProbe() error = %v, want the unfinished cleanup reported as a warning", err)
-	}
-	if len(warnings) != 1 || !strings.Contains(warnings[0], "storage probe cleanup is still finishing") {
-		t.Fatalf("runStorageProbe() warnings = %v, want an unfinished-cleanup advisory", warnings)
-	}
-	if !strings.Contains(warnings[0], "tbx status") {
-		t.Fatalf("warning %q does not name where the operator can watch it converge", warnings[0])
-	}
+	return storageProbeStallFixture{dynamicClient: dynamicClient, mapper: storageProbeRESTMapper(), clientset: clientset, applies: &applies}
 }
 
 // The probe PVC eventually deletes, but its Longhorn volume can survive it —

@@ -223,3 +223,89 @@ func TestBGPEnableNarratesTheSpeakerAndTheReconcile(t *testing.T) {
 		t.Fatalf("bgp.enable narration = %q, want the speaker stage before the reconcile", *stages)
 	}
 }
+
+// A mode change re-renders Cilium and nothing else. Dragging the storage chart
+// and its write/readback probe into the forced pass made `bgp enable` fail on
+// unrelated storage faults and hold the request for the storage budget, while
+// the memo storage had already established stayed perfectly good (#344).
+func TestBGPEnableLeavesStorageAlone(t *testing.T) {
+	service, item, _ := runningCiliumClusterForBGP(t, false)
+	service.storagePhases[item.Name] = StoragePhaseLive
+	var requests []provision.Request
+	service.provisionReconcile = func(_ context.Context, request provision.Request) (provision.Result, error) {
+		requests = append(requests, request)
+		return provision.Result{}, nil
+	}
+	storageProbes := 0
+	originalStorage := storageConvergenceProbe
+	t.Cleanup(func() { storageConvergenceProbe = originalStorage })
+	storageConvergenceProbe = func(context.Context, cluster.Cluster, []byte) error {
+		storageProbes++
+		return nil
+	}
+
+	response := dispatchBGPRequest(t, service, "bgp.enable", item.Name)
+	if !response.OK {
+		t.Fatalf("bgp.enable failed: %s", response.Error)
+	}
+
+	if len(requests) != 1 {
+		t.Fatalf("reconciles after bgp.enable = %d, want 1", len(requests))
+	}
+	if !requests[0].SkipStorage || requests[0].Storage != nil {
+		t.Fatalf("bgp.enable reconcile = %+v, want the storage stage skipped", requests[0])
+	}
+	if storageProbes != 0 {
+		t.Fatalf("bgp.enable ran the storage probe %d time(s), want none while storage is already live", storageProbes)
+	}
+	if service.storagePhases[item.Name] != StoragePhaseLive {
+		t.Fatalf("storage phase after bgp.enable = %q, want it untouched at %q", service.storagePhases[item.Name], StoragePhaseLive)
+	}
+}
+
+// Disabling on a cluster whose Kubernetes side never announced over BGP is a
+// host-side withdrawal and nothing else: there are no BGP objects to remove, so
+// forcing a full reconcile only exposes the verb to unrelated failures.
+func TestBGPDisableWithoutAClusterSideToUndoSkipsTheReconcile(t *testing.T) {
+	tests := []struct {
+		name string
+		cni  cluster.CNI
+		bgp  bool
+	}{
+		{name: "flannel cluster carrying legacy bgp state", cni: cluster.CNIFlannel, bgp: true},
+		{name: "cilium cluster that never enabled bgp", cni: cluster.CNICilium, bgp: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service, item := runningLonghornClusterForNodeMutation(t, 1, 1)
+			item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: test.cni, LB: true, BGP: test.bgp}
+			if err := cluster.Save(item); err != nil {
+				t.Fatal(err)
+			}
+			client := &recordingBGPHelper{active: test.bgp}
+			originalConnect := connectBGPHelper
+			connectBGPHelper = func() (bgpHelperClient, error) { return client, nil }
+			t.Cleanup(func() { connectBGPHelper = originalConnect })
+			reconciled := recordCiliumReconciles(service)
+
+			response := dispatchBGPRequest(t, service, "bgp.disable", item.Name)
+			if !response.OK {
+				t.Fatalf("bgp.disable failed: %s", response.Error)
+			}
+
+			if len(*reconciled) != 0 {
+				t.Fatalf("reconciles after bgp.disable = %d, want none", len(*reconciled))
+			}
+			if strings.Join(client.disabled, ",") != item.Name {
+				t.Fatalf("host speaker disables = %q, want %q", client.disabled, item.Name)
+			}
+			saved, err := cluster.Load(item.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if saved.BGP {
+				t.Fatal("bgp.disable did not record the mode change")
+			}
+		})
+	}
+}

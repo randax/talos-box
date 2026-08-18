@@ -580,10 +580,13 @@ func (s *Server) startCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if err != nil {
 		return ClusterSummary{}, err
 	}
-	if !s.clusterRunning(item.Name) {
-		// Same projected-start gate as create: bringing a stopped cluster up
-		// beside a running one is the same concurrent-bringup risk (#334).
-		provisionStartWarnings, err := s.checkProvisionStart(dir, clusterMemoryMiB(item), args.Force)
+	// Same projected-start gate as create: bringing stopped nodes up beside
+	// running guests is the same concurrent-bringup risk (#334). It is charged
+	// for the nodes this start actually boots, so a partly-running cluster —
+	// which start also boots the stopped half of — is gated too, and the
+	// members already running are not counted twice.
+	if bootingMiB := s.stoppedNodeMemoryMiB(item); bootingMiB > 0 {
+		provisionStartWarnings, err := s.checkProvisionStart(dir, bootingMiB, args.Force)
 		if err != nil {
 			return ClusterSummary{}, err
 		}
@@ -982,6 +985,17 @@ func (s *Server) addNodeLocked(raw json.RawMessage, progress stageFunc) (NodeSta
 		return NodeStatus{}, nil, err
 	}
 	running := s.clusterRunning(item.Name)
+	if running {
+		// A node added to a running cluster boots immediately, which is the
+		// very allocation the projected-start gate exists for. A node added to
+		// a stopped cluster starts nothing, so there is nothing to project
+		// (#334).
+		provisionStartWarnings, err := s.checkProvisionStart(dir, addMiB, args.Force)
+		if err != nil {
+			return NodeStatus{}, nil, err
+		}
+		hostPressureWarnings = append(hostPressureWarnings, provisionStartWarnings...)
+	}
 	var subnetWarning string
 	if running {
 		// The subnet is already fixed and attached, so it is only inspected for

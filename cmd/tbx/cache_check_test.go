@@ -448,3 +448,55 @@ func TestRunCacheWarmCheckReportsEveryRefBeforeFailing(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 }
+
+// The deep check reports a gap in an image no warm list names, and `cache warm`
+// itself never pulls it — so the report has to name the verb that does (#348).
+func TestRunCacheWarmCheckDeepNamesTheRemedyForTheSandboxImage(t *testing.T) {
+	t.Setenv("HOME", shortTestHome(t))
+	socketPath, err := daemon.SocketPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	listPath := filepath.Join(t.TempDir(), "images.txt")
+	ref := "docker.io/library/pause:3.10"
+	if err := os.WriteFile(listPath, []byte(ref+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wantRefs := append([]string{ref}, provision.BootstrapRequiredImages()...)
+	done := make(chan struct{})
+	go serveDaemonRequests(t, listener, len(wantRefs), func(index int, _ daemon.Request) daemon.Response {
+		if index == 0 {
+			return daemon.Response{OK: true, Data: mustJSON(t, daemon.CacheCheckResult{
+				Entries:  []daemon.CacheCheckEntry{{Ref: wantRefs[index], Status: daemon.CacheCheckStatusComplete}},
+				Complete: 1,
+			})}
+		}
+		return daemon.Response{OK: true, Data: mustJSON(t, daemon.CacheCheckResult{
+			Entries: []daemon.CacheCheckEntry{{Ref: wantRefs[index], Status: daemon.CacheCheckStatusFailed, Reason: "not cached"}},
+			Failed:  1,
+		})}
+	}, done)
+
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr, in: bytes.NewBuffer(nil)}
+	err = command.run([]string{"cache", "warm", "--check", "--deep", listPath})
+	<-done
+	if err == nil {
+		t.Fatal("cache warm --check --deep succeeded despite the missing sandbox image")
+	}
+	if !strings.Contains(stdout.String(), "tbx cache pull") {
+		t.Fatalf("stdout = %q, want it to name `tbx cache pull` as the remedy", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), provision.KubernetesSandboxImage+" is the CRI pod sandbox image") {
+		t.Fatalf("stdout = %q, want it to explain the sandbox image gap", stdout.String())
+	}
+}

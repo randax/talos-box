@@ -36,6 +36,10 @@ type ProvisionStart struct {
 	// ReserveMiB is the balloon controller's host-memory reserve: the headroom
 	// it tries to keep free once it can act at all.
 	ReserveMiB int
+	// MemoryPressure is the kernel's own verdict on the host right now. It is
+	// what separates a swap file that is merely sticky from one the host is
+	// actively leaning on.
+	MemoryPressure MemoryPressure
 	// Swap is the host swap file's capacity and free bytes. A zero TotalBytes
 	// means swap is disabled or unmeasurable, and the swap rule is skipped.
 	Swap Usage
@@ -55,8 +59,15 @@ type ProvisionStart struct {
 //   - Headroom: the binding constraint is measured free memory, not the
 //     configured ceiling. Starting NewVMMiB must leave at least the balloon
 //     reserve free.
-//   - Swap: a host already deep into its swap file cannot absorb the allocation
-//     burst of a second bringup.
+//   - Swap: a host already deep into its swap file, *and* not reporting normal
+//     memory pressure, cannot absorb the allocation burst of a second bringup.
+//     Both halves are needed: macOS grows a swap file on demand and keeps it
+//     allocated long after the pressure that filled it cleared, so a small
+//     sticky swapfile at 82% on a host with tens of gigabytes free and normal
+//     pressure says nothing about capacity (#231, #284) — while the #334
+//     reading (91% used, pressure degraded during a concurrent bringup) says
+//     everything. An unmeasurable pressure reading counts as not-normal, the
+//     same way memoryFinding treats it.
 //
 // Both rules apply only while guests are already running, which is deliberate.
 // A lone cluster on an otherwise idle host is the case the balloon reserve and
@@ -84,17 +95,28 @@ func AssessProvisionStart(in ProvisionStart) []Finding {
 			})
 		}
 	}
-	if in.Swap.TotalBytes > 0 && percentUsed(in.Swap) >= provisionStartSwapUsedPercent {
+	if in.Swap.TotalBytes > 0 && percentUsed(in.Swap) >= provisionStartSwapUsedPercent &&
+		in.MemoryPressure != MemoryPressureNormal {
 		findings = append(findings, Finding{
 			Severity: SeverityBlock,
 			Detail: fmt.Sprintf(
-				"host swap is %d%% used (%.1f GiB free of %.1f GiB) with %d MiB of guests already running;"+
+				"host swap is %d%% used (%.1f GiB free of %.1f GiB) and memory pressure is %s, with %d MiB of guests already running;"+
 					" the %d MiB about to boot has nowhere to go, and %s",
-				percentUsed(in.Swap), gib(in.Swap.AvailableBytes), gib(in.Swap.TotalBytes),
+				percentUsed(in.Swap), gib(in.Swap.AvailableBytes), gib(in.Swap.TotalBytes), provisionStartPressureLabel(in.MemoryPressure),
 				in.RunningVMMiB, in.NewVMMiB, memoryConsequence,
 			),
 			Remedy: memoryRemedy,
 		})
 	}
 	return findings
+}
+
+// provisionStartPressureLabel names the pressure reading in the refusal. An
+// unmeasurable one is reported as such rather than silently omitted: it is part
+// of why the rule fired.
+func provisionStartPressureLabel(pressure MemoryPressure) string {
+	if pressure == MemoryPressureUnknown {
+		return "unmeasurable"
+	}
+	return pressure.String()
 }

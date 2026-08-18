@@ -56,6 +56,12 @@ func (c cli) runCacheWarm(args []string) error {
 		return err
 	}
 	if *checkOnly {
+		bootstrapRequired := make(map[string]bool)
+		if *deep {
+			for _, ref := range provision.BootstrapRequiredImages() {
+				bootstrapRequired[ref] = true
+			}
+		}
 		var complete, failed int
 		for _, ref := range refs {
 			var result daemon.CacheCheckResult
@@ -75,6 +81,17 @@ func (c cli) runCacheWarm(args []string) error {
 			case daemon.CacheCheckStatusFailed:
 				if _, err := fmt.Fprintf(c.out, "\u2717 %s %s\n", entry.Ref, entry.Reason); err != nil {
 					return err
+				}
+				// The bootstrap-required refs are the ones this check adds on
+				// its own, and `cache warm` has no way to close the gap it just
+				// reported: nothing tbx renders references the CRI pod sandbox
+				// image, so no warm list names it and the non-check path never
+				// pulls it. Naming the verb that does is the whole point of
+				// reporting it here (#348).
+				if bootstrapRequired[entry.Ref] {
+					if _, err := fmt.Fprintf(c.out, "  %s is the CRI pod sandbox image every node needs and no warm list names: run `tbx cache pull` online to cache it\n", entry.Ref); err != nil {
+						return err
+					}
 				}
 				failed++
 			}

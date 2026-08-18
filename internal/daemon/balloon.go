@@ -146,17 +146,34 @@ func (s *Server) checkProvisionStart(path string, addMiB int, force bool) ([]str
 		freeMiB = measured
 	}
 	var swap hostpressure.Usage
+	pressure := hostpressure.MemoryPressureUnknown
 	if snapshot, err := s.pressureSnapshot(path); err == nil {
 		swap = snapshot.Swap
+		pressure = snapshot.MemoryPressure
 	}
 	findings := hostpressure.AssessProvisionStart(hostpressure.ProvisionStart{
-		RunningVMMiB: s.runningVMMemoryMiB(),
-		NewVMMiB:     addMiB,
-		HostFreeMiB:  freeMiB,
-		ReserveMiB:   balloon.DefaultConfig().ReserveMiB,
-		Swap:         swap,
+		RunningVMMiB:   s.runningVMMemoryMiB(),
+		NewVMMiB:       addMiB,
+		HostFreeMiB:    freeMiB,
+		ReserveMiB:     balloon.DefaultConfig().ReserveMiB,
+		Swap:           swap,
+		MemoryPressure: pressure,
 	})
 	return applyPressureFindings(findings, force)
+}
+
+// stoppedNodeMemoryMiB sums the configured memory of the cluster's nodes that
+// are not running: exactly what a start is about to commit. A fully stopped
+// cluster sums to its whole configured memory; a partly-running one to the half
+// that is still to boot.
+func (s *Server) stoppedNodeMemoryMiB(item cluster.Cluster) int {
+	total := 0
+	for _, node := range item.Nodes {
+		if !s.nodeRunning(item.Name, node.Name) {
+			total += item.DefaultsFor(node.Role).MemoryMiB
+		}
+	}
+	return total
 }
 
 // runningVMMemoryMiB sums the configured memory of every cluster whose guests

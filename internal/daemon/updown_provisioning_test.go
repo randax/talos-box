@@ -671,3 +671,31 @@ func TestClusterWithoutRecordedOriginDecodesAsUnknown(t *testing.T) {
 		t.Fatalf("legacy cluster origin = %q, want unknown", item.ConfigOrigin)
 	}
 }
+
+// `tbx up` renders Action.Warnings, and the advisories a provisioning pass
+// converged in spite of belong there as much as on a cluster summary: dropping
+// them hid work the daemon was still finishing behind the verb (#347).
+func TestUpActionsCarryProvisioningWarnings(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 1)
+	service.provisionReconcile = func(context.Context, provision.Request) (provision.Result, error) {
+		return provision.Result{
+			Warnings:     []string{"storage probe cleanup is still finishing (30s); the daemon keeps reconciling it — watch it with: tbx status demo"},
+			StoragePhase: provision.StoragePhaseLive,
+			StorageLive:  true,
+		}, nil
+	}
+	actions := []Action{{Cluster: item.Name, Kind: ActionStart}}
+	tasks := service.beginProvisionTasksLocked([]cluster.Cluster{item})
+	if len(tasks) != 1 {
+		t.Fatalf("provision tasks = %d, want 1", len(tasks))
+	}
+	tasks[0].action = 0
+
+	if err := service.runProvisionTasks(actions, tasks, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(actions[0].Warnings) != 1 || !strings.Contains(actions[0].Warnings[0], "storage probe cleanup is still finishing") {
+		t.Fatalf("up action warnings = %v, want the pass's advisory", actions[0].Warnings)
+	}
+}

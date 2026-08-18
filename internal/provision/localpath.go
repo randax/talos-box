@@ -47,6 +47,17 @@ type StorageResult struct {
 	Warnings []string
 }
 
+// storageResultFromProbe turns a finished probe pass into the engine's result.
+// A pass the previous teardown was still blocking never touched the data path,
+// so it cannot report storage live: the phase stays provisioning and the
+// advisory says who is still working on it (#347).
+func storageResultFromProbe(outcome StorageProbeOutcome, narration []string) StorageResult {
+	if !outcome.Verified {
+		return StorageResult{Warnings: outcome.Warnings, Narration: narration, Phase: StoragePhaseProvisioning}
+	}
+	return StorageResult{Warnings: outcome.Warnings, Narration: narration, Phase: StoragePhaseLive, Live: true}
+}
+
 // LocalPathReconciler installs and verifies the pinned local-path
 // provisioner through the host-side render/apply path.
 type LocalPathReconciler struct {
@@ -62,42 +73,46 @@ func (r LocalPathReconciler) Reconcile(ctx context.Context, item cluster.Cluster
 	if err != nil {
 		return StorageResult{}, fmt.Errorf("parse kubeconfig for Kubernetes apply: %w", err)
 	}
-	return r.reconcile(ctx, config, objects)
+	return r.reconcile(ctx, item.Name, config, objects)
 }
 
 // ProbeLocalPathStorage re-derives storage readiness without reinstalling the
 // provisioner. The classless PVC keeps status tied to the default-class data
 // path after daemon restarts without persisting observational progress.
-func ProbeLocalPathStorage(ctx context.Context, kubeconfig []byte, interval time.Duration) error {
+//
+// The outcome is returned rather than folded into an error: a pass the previous
+// teardown is still blocking is pending work, not a storage fault, and the
+// caller must be able to tell the two apart (#347).
+func ProbeLocalPathStorage(ctx context.Context, clusterName string, kubeconfig []byte, interval time.Duration) (StorageProbeOutcome, error) {
 	config, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
 	if err != nil {
-		return fmt.Errorf("parse kubeconfig for storage probe: %w", err)
+		return StorageProbeOutcome{}, fmt.Errorf("parse kubeconfig for storage probe: %w", err)
 	}
 	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
 	if err != nil {
-		return fmt.Errorf("create Kubernetes discovery client: %w", err)
+		return StorageProbeOutcome{}, fmt.Errorf("create Kubernetes discovery client: %w", err)
 	}
 	mapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(discoveryClient))
 	dynamicClient, err := dynamic.NewForConfig(config)
 	if err != nil {
-		return fmt.Errorf("create Kubernetes apply client: %w", err)
+		return StorageProbeOutcome{}, fmt.Errorf("create Kubernetes apply client: %w", err)
 	}
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		return fmt.Errorf("create Kubernetes readiness client: %w", err)
+		return StorageProbeOutcome{}, fmt.Errorf("create Kubernetes readiness client: %w", err)
 	}
 	if interval <= 0 {
 		interval = time.Second
 	}
-	_, err = runStorageProbe(ctx, dynamicClient, mapper, clientset, storageProbeSpec{
+	return runStorageProbe(ctx, dynamicClient, mapper, clientset, storageProbeSpec{
 		ExpectedStorageClass: localPathStorageClass,
 		ProbeImage:           localPathHelperImage,
 		Engine:               cluster.CSILocalPath,
+		ClusterName:          clusterName,
 	}, interval)
-	return err
 }
 
-func (r LocalPathReconciler) reconcile(ctx context.Context, config *rest.Config, objects []unstructured.Unstructured) (StorageResult, error) {
+func (r LocalPathReconciler) reconcile(ctx context.Context, clusterName string, config *rest.Config, objects []unstructured.Unstructured) (StorageResult, error) {
 	if r.PollInterval <= 0 {
 		r.PollInterval = time.Second
 	}
@@ -125,18 +140,19 @@ func (r LocalPathReconciler) reconcile(ctx context.Context, config *rest.Config,
 	if err := waitForLocalPath(ctx, clientset, r.PollInterval); err != nil {
 		return StorageResult{}, err
 	}
-	warnings, err := runStorageProbe(ctx, dynamicClient, mapper, clientset, storageProbeSpec{
+	outcome, err := runStorageProbe(ctx, dynamicClient, mapper, clientset, storageProbeSpec{
 		ExpectedStorageClass: localPathStorageClass,
 		ProbeImage:           localPathHelperImage,
 		Engine:               cluster.CSILocalPath,
+		ClusterName:          clusterName,
 	}, r.PollInterval)
 	if err != nil {
 		return StorageResult{}, err
 	}
-	return StorageResult{Warnings: warnings, Narration: []string{
+	return storageResultFromProbe(outcome, []string{
 		"≈ kubectl apply --server-side -f - # local-path-provisioner v" + localPathVersion,
 		"≈ kubectl apply --server-side -f - # storage probe PVC + writer/reader pods",
-	}, Phase: StoragePhaseLive, Live: true}, nil
+	}), nil
 }
 
 func renderLocalPath(item cluster.Cluster) ([]unstructured.Unstructured, error) {

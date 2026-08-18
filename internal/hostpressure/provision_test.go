@@ -60,27 +60,50 @@ func TestAssessProvisionStart(t *testing.T) {
 			},
 		},
 		{
-			name: "nearly full swap refuses a second bringup",
+			name: "nearly full swap under degraded pressure refuses a second bringup",
 			in: ProvisionStart{
 				RunningVMMiB: 18432, NewVMMiB: 6144, HostFreeMiB: 24576, ReserveMiB: reserve,
-				// the #334 reading: 7.3 GiB of 8 GiB used
-				Swap: Usage{TotalBytes: 8 << 30, AvailableBytes: 7 << 30 / 10},
+				// the #334 reading: 7.3 GiB of 8 GiB used while the concurrent
+				// bringup had already pushed the kernel off normal
+				Swap:           Usage{TotalBytes: 8 << 30, AvailableBytes: 7 << 30 / 10},
+				MemoryPressure: MemoryPressureWarning,
 			},
 			wantBlocks:  1,
-			wantDetails: []string{"host swap is 91% used", "already running"},
+			wantDetails: []string{"host swap is 91% used", "memory pressure is warning", "already running"},
+		},
+		{
+			name: "a small sticky swapfile at normal pressure admits (#231)",
+			in: ProvisionStart{
+				// 64 GiB Mac, 30 GiB free, a 2 GiB dynamic swapfile 82% used:
+				// macOS keeps swap allocated long after the pressure clears
+				RunningVMMiB: 18432, NewVMMiB: 6144, HostFreeMiB: 30720, ReserveMiB: reserve,
+				Swap:           Usage{TotalBytes: 2 << 30, AvailableBytes: 2 << 30 * 18 / 100},
+				MemoryPressure: MemoryPressureNormal,
+			},
+		},
+		{
+			name: "an unmeasurable pressure reading keeps the swap rule armed",
+			in: ProvisionStart{
+				RunningVMMiB: 6144, NewVMMiB: 6144, HostFreeMiB: 24576, ReserveMiB: reserve,
+				Swap: Usage{TotalBytes: 10 << 30, AvailableBytes: 1 << 30},
+			},
+			wantBlocks:  1,
+			wantDetails: []string{"memory pressure is unmeasurable"},
 		},
 		{
 			name: "sticky swap on an idle host is not this gate's business (#231)",
 			in: ProvisionStart{
 				NewVMMiB: 6144, HostFreeMiB: 24576, ReserveMiB: reserve,
-				Swap: Usage{TotalBytes: 10 << 30, AvailableBytes: 1 << 30},
+				Swap:           Usage{TotalBytes: 10 << 30, AvailableBytes: 1 << 30},
+				MemoryPressure: MemoryPressureWarning,
 			},
 		},
 		{
 			name: "swap exactly at the ceiling refuses",
 			in: ProvisionStart{
 				RunningVMMiB: 6144, NewVMMiB: 6144, HostFreeMiB: 24576, ReserveMiB: reserve,
-				Swap: Usage{TotalBytes: 10 << 30, AvailableBytes: 2 << 30},
+				Swap:           Usage{TotalBytes: 10 << 30, AvailableBytes: 2 << 30},
+				MemoryPressure: MemoryPressureCritical,
 			},
 			wantBlocks: 1,
 		},
@@ -88,7 +111,8 @@ func TestAssessProvisionStart(t *testing.T) {
 			name: "swap just under the ceiling admits",
 			in: ProvisionStart{
 				RunningVMMiB: 6144, NewVMMiB: 6144, HostFreeMiB: 24576, ReserveMiB: reserve,
-				Swap: Usage{TotalBytes: 100 << 30, AvailableBytes: 21 << 30},
+				Swap:           Usage{TotalBytes: 100 << 30, AvailableBytes: 21 << 30},
+				MemoryPressure: MemoryPressureWarning,
 			},
 		},
 		{
@@ -101,7 +125,8 @@ func TestAssessProvisionStart(t *testing.T) {
 			name: "both rules report separately",
 			in: ProvisionStart{
 				RunningVMMiB: 6144, NewVMMiB: 6144, HostFreeMiB: 6144, ReserveMiB: reserve,
-				Swap: Usage{TotalBytes: 8 << 30, AvailableBytes: 1 << 30},
+				Swap:           Usage{TotalBytes: 8 << 30, AvailableBytes: 1 << 30},
+				MemoryPressure: MemoryPressureWarning,
 			},
 			wantBlocks: 2,
 		},
@@ -147,7 +172,20 @@ func TestAssessProvisionStartSwapCeilingIsNotSteadyState(t *testing.T) {
 			t.Fatalf("Assess() blocked at 80%% swap use with normal pressure: %s", finding)
 		}
 	}
-	got := AssessProvisionStart(ProvisionStart{RunningVMMiB: 6144, NewVMMiB: 6144, HostFreeMiB: 1 << 20, ReserveMiB: 4096, Swap: snapshot.Swap})
+	// The bringup gate agrees with Assess while the kernel reports normal
+	// pressure — sticky swap alone is not a verdict on either path — and parts
+	// company with it as soon as pressure is anything else.
+	admitted := AssessProvisionStart(ProvisionStart{
+		RunningVMMiB: 6144, NewVMMiB: 6144, HostFreeMiB: 1 << 20, ReserveMiB: 4096,
+		Swap: snapshot.Swap, MemoryPressure: snapshot.MemoryPressure,
+	})
+	if len(admitted) != 0 {
+		t.Fatalf("AssessProvisionStart() = %v, want no finding at 80%% swap use with normal pressure", admitted)
+	}
+	got := AssessProvisionStart(ProvisionStart{
+		RunningVMMiB: 6144, NewVMMiB: 6144, HostFreeMiB: 1 << 20, ReserveMiB: 4096,
+		Swap: snapshot.Swap, MemoryPressure: MemoryPressureWarning,
+	})
 	if len(got) != 1 || got[0].Severity != SeverityBlock {
 		t.Fatalf("AssessProvisionStart() = %v, want one blocking swap finding", got)
 	}

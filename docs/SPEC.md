@@ -472,6 +472,13 @@ printed PSA labels. Curated CSI namespace streams carry their own PSA labels. Fo
 apply `storage-namespaces`, then `storage-crds`, run the printed Established wait against the
 CRD stream, and only then apply post-CRD `storage-objects`; it is not a one-shot apply.
 Longhorn's `storage-values` stream records the exact values used to render those objects.
+The inspection streams render the cluster's **declared** topology, which is what tbx applies in
+every case but one: a cluster that lost its last worker while control planes still hold Longhorn
+replicas keeps the control-plane toleration in the applied render until those replicas drain,
+because the components serving them cannot be evicted from where the data is. Inspection does not
+reach into a live cluster to observe replica placement, so for that one case `storage-values` and
+`storage-objects` omit a toleration the applied render still carries; it disappears from the
+applied render too once the replicas have moved.
 Local-path has no CRD barrier, so apply `storage-namespaces` before `storage-objects`.
 
 ## 11. Distribution

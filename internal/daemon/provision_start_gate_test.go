@@ -11,12 +11,23 @@ import (
 	"github.com/randax/talos-box/internal/hostpressure"
 )
 
-// nearlyFullSwap is the #334 reading: 7.3 GiB of an 8 GiB swap file used while
-// the kernel still reports no elevated pressure, which is why the steady-state
-// guard passed.
+// nearlyFullSwap is the #334 reading: 7.3 GiB of an 8 GiB swap file used with
+// the kernel reporting degraded pressure under the concurrent bringup, which
+// the steady-state guard still passed because it judges the host as it stands.
 func nearlyFullSwap(string) (hostpressure.Snapshot, error) {
 	return hostpressure.Snapshot{
 		Swap:           hostpressure.Usage{TotalBytes: 8 << 30, AvailableBytes: 7 << 30 / 10},
+		MemoryPressure: hostpressure.MemoryPressureWarning,
+	}, nil
+}
+
+// smallStickySwapfile is the everyday macOS reading: a 2 GiB dynamic swapfile
+// mostly used, memory pressure normal, tens of gigabytes of RAM free. macOS
+// keeps swap allocated long after the pressure that filled it cleared, so this
+// says nothing about the host's capacity to boot another guest.
+func smallStickySwapfile(string) (hostpressure.Snapshot, error) {
+	return hostpressure.Snapshot{
+		Swap:           hostpressure.Usage{TotalBytes: 2 << 30, AvailableBytes: 2 << 30 * 18 / 100},
 		MemoryPressure: hostpressure.MemoryPressureNormal,
 	}, nil
 }
@@ -60,12 +71,19 @@ func TestCheckProvisionStart(t *testing.T) {
 			pressure:       noHostPressure,
 		},
 		{
-			name:           "nearly full swap refuses a second bringup with memory to spare",
+			name:           "nearly full swap under degraded pressure refuses a second bringup with memory to spare",
 			clusterRunning: true,
 			addMiB:         2048,
 			freeMiB:        1 << 20,
 			pressure:       nearlyFullSwap,
 			wantErr:        "host swap is 91% used",
+		},
+		{
+			name:           "a small sticky swapfile at normal pressure admits (#231)",
+			clusterRunning: true,
+			addMiB:         2048,
+			freeMiB:        1 << 20,
+			pressure:       smallStickySwapfile,
 		},
 		{
 			name:           "sticky swap on an idle host still admits (#231)",
@@ -168,5 +186,102 @@ func TestCreateClusterForcedConcurrentBringupWarns(t *testing.T) {
 	joined := strings.Join(warnings, "\n")
 	if !strings.Contains(joined, "guests are already running") || !strings.Contains(joined, "(forced)") {
 		t.Fatalf("forced checkProvisionStart() warnings = %q, want the forced projected-start finding", warnings)
+	}
+}
+
+// The projected-start gate belongs to every verb that boots a guest, not only
+// to create and whole-cluster start: `node add` on a running cluster and `node
+// start` each commit a nominal allocation the host must actually have.
+func TestNodeMutationVerbsAnswerToTheProvisionStartGate(t *testing.T) {
+	reserve := balloon.DefaultConfig().ReserveMiB
+	tests := []struct {
+		name    string
+		freeMiB int
+		wantErr string
+	}{
+		{name: "admitted with headroom to spare", freeMiB: reserve + 4096},
+		{name: "refused without headroom", freeMiB: reserve, wantErr: "guests are already running"},
+	}
+	for _, verb := range []string{"node.add", "node.start"} {
+		for _, test := range tests {
+			t.Run(verb+"/"+test.name, func(t *testing.T) {
+				service, item := runningLonghornClusterForNodeMutation(t, 1, 2)
+				stubNodeMutationReconcile(service)
+				service.hostPressure = noHostPressure
+				service.hostTotalMemory = plentifulHostMemory
+				service.hostFreeMemory = func() (int, error) { return test.freeMiB, nil }
+
+				var err error
+				if verb == "node.add" {
+					raw, marshalErr := json.Marshal(nodeArgs{Cluster: item.Name, Role: cluster.RoleWorker})
+					if marshalErr != nil {
+						t.Fatal(marshalErr)
+					}
+					_, _, err = service.addNodeLocked(raw, nil)
+				} else {
+					// A stopped member is what node.start boots, and its memory
+					// is entirely new to the free memory the gate measures.
+					delete(service.vms[item.Name], "demo-worker-2")
+					raw, marshalErr := json.Marshal(nodeArgs{Cluster: item.Name, Name: "demo-worker-2"})
+					if marshalErr != nil {
+						t.Fatal(marshalErr)
+					}
+					_, _, err = service.startNodeLocked(raw)
+				}
+
+				if test.wantErr == "" {
+					if err != nil {
+						t.Fatalf("%s error = %v, want admission", verb, err)
+					}
+					return
+				}
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("%s error = %v, want the projected-start refusal", verb, err)
+				}
+			})
+		}
+	}
+}
+
+// `cluster start` boots the stopped members of a partly-running cluster too, so
+// the gate follows what it actually starts rather than whether the cluster as a
+// whole is down.
+func TestStartClusterGatesThePartlyStoppedMembersItBoots(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 2)
+	stubNodeMutationReconcile(service)
+	service.hostPressure = noHostPressure
+	service.hostTotalMemory = plentifulHostMemory
+	service.hostFreeMemory = func() (int, error) { return balloon.DefaultConfig().ReserveMiB, nil }
+	delete(service.vms[item.Name], "demo-worker-2")
+
+	raw, err := json.Marshal(startArgs{Name: item.Name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.startCluster(raw)
+
+	if err == nil || !strings.Contains(err.Error(), "guests are already running") {
+		t.Fatalf("startCluster() error = %v, want the projected-start refusal for the stopped member", err)
+	}
+}
+
+// The same start with nothing left to boot has no allocation to project, so the
+// gate must not fire on memory that is already resident.
+func TestStartClusterSkipsTheGateWhenEveryMemberIsRunning(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 2)
+	stubNodeMutationReconcile(service)
+	service.hostPressure = noHostPressure
+	service.hostTotalMemory = plentifulHostMemory
+	service.hostFreeMemory = func() (int, error) { return 0, errors.New("unmeasurable") }
+	if got := service.stoppedNodeMemoryMiB(item); got != 0 {
+		t.Fatalf("stoppedNodeMemoryMiB() = %d, want 0 for a fully running cluster", got)
+	}
+
+	raw, err := json.Marshal(startArgs{Name: item.Name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.startCluster(raw); err != nil {
+		t.Fatalf("startCluster() error = %v, want admission", err)
 	}
 }

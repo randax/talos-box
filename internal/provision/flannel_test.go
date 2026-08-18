@@ -913,3 +913,41 @@ func equalTalosExtraMounts(got, want []talosExtraMount) bool {
 	}
 	return true
 }
+
+// The offline hint is not Cilium's: an offline flannel create hits the same
+// deadline on the same missing sandbox image, and used to hit it with nothing
+// but a timeout to show for it (#348).
+func TestReconcileNamesTheOfflineSandboxImageOnASharedWaitDeadline(t *testing.T) {
+	tests := []struct {
+		name          string
+		mirrorOffline bool
+		wantHint      bool
+	}{
+		{name: "offline mirror names the image", mirrorOffline: true, wantHint: true},
+		{name: "online mirror stays silent about it", mirrorOffline: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			item := leaseCluster(t)
+			client := &fakeClient{kubeData: []byte("kubeconfig"), bootErr: status.Error(codes.Unavailable, "connection refused")}
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			defer cancel()
+
+			_, err := Reconcile(ctx, Request{
+				Cluster: item, Client: client, PollInterval: time.Millisecond, MirrorOffline: test.mirrorOffline,
+				Observe: func(context.Context) ([]Node, error) {
+					return []Node{{Name: item.Nodes[0].Name, Role: cluster.RoleControlPlane, IP: "172.30.0.25", Phase: PhaseConfigured}}, nil
+				},
+			})
+
+			if err == nil {
+				t.Fatal("Reconcile() error = nil, want the wait deadline")
+			}
+			hinted := strings.Contains(err.Error(), KubernetesSandboxImage) && strings.Contains(err.Error(), "tbx cache pull")
+			if hinted != test.wantHint {
+				t.Fatalf("Reconcile() error = %v, want sandbox-image hint = %t", err, test.wantHint)
+			}
+		})
+	}
+}

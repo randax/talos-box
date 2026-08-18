@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/shellquote"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -31,6 +32,20 @@ type storageProbeSpec struct {
 	// Engine names the curated engine behind the default StorageClass, so
 	// cleanup can reclaim the engine-specific residue a deleted claim leaves.
 	Engine cluster.CSI
+	// ClusterName is only ever reported, never applied: the advisories this
+	// probe raises name the cluster whose status the operator should watch.
+	ClusterName string
+}
+
+// StorageProbeOutcome reports what one probe pass established.
+type StorageProbeOutcome struct {
+	// Verified is false when the pass never ran the data path at all: the
+	// previous pass's residue was still terminating, so probing on top of it
+	// would have measured the teardown rather than the storage engine.
+	Verified bool
+	// Warnings carry work the daemon keeps finishing behind the verb — never a
+	// reason to fail it (#347).
+	Warnings []string
 }
 
 // storageProbeCleanupTimeout bounds one teardown attempt. Exceeding it is not a
@@ -38,28 +53,42 @@ type storageProbeSpec struct {
 // whatever is left. A variable so tests can exercise that bound.
 var storageProbeCleanupTimeout = 30 * time.Second
 
+// storageProbeResidueTimeout bounds the residue sweep on its own. The sweep is
+// the step most likely to release a claim that will not finish terminating, so
+// it must not be starved by the very wait that claim exhausted.
+var storageProbeResidueTimeout = 15 * time.Second
+
 // runStorageProbe writes and reads back through the cluster's default
 // StorageClass, then tears its objects down. It returns the advisories the
 // caller should report without failing: a teardown that outran its bound is
 // one, since the substrate converges behind the verb (#347, following #314).
-func runStorageProbe(ctx context.Context, dynamicClient dynamic.Interface, mapper meta.RESTMapper, client kubernetes.Interface, spec storageProbeSpec, interval time.Duration) (warnings []string, err error) {
+//
+// The head cleanup answers to the same rule as the trailing one. A pass whose
+// teardown outran its bound leaves a claim that is still terminating, and the
+// next pass — the status probe the previous warning sent the operator to
+// included — must not fail on residue the daemon already promised to converge.
+// It skips its own run instead, so nothing probes on top of a terminating PVC.
+func runStorageProbe(ctx context.Context, dynamicClient dynamic.Interface, mapper meta.RESTMapper, client kubernetes.Interface, spec storageProbeSpec, interval time.Duration) (outcome StorageProbeOutcome, err error) {
 	cleanup := func() error {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), storageProbeCleanupTimeout)
 		defer cleanupCancel()
 		return cleanupStorageProbe(cleanupCtx, client, dynamicClient, spec)
 	}
-	if err := cleanup(); err != nil {
-		return nil, fmt.Errorf("clear stale storage probe: %w", err)
+	if cleanupErr := cleanup(); cleanupErr != nil {
+		if !onlyCleanupDeadline(cleanupErr) {
+			return StorageProbeOutcome{}, fmt.Errorf("clear stale storage probe: %w", cleanupErr)
+		}
+		return StorageProbeOutcome{Warnings: []string{storageProbeCleanupPendingWarning(spec.ClusterName, cleanupErr)}}, nil
 	}
 	defer func() {
 		cleanupErr := cleanup()
 		switch {
 		case cleanupErr == nil:
-		case err == nil && errors.Is(cleanupErr, context.DeadlineExceeded):
+		case err == nil && onlyCleanupDeadline(cleanupErr):
 			// The data path verified; only the teardown is still running. The
 			// daemon reruns this cleanup at the head of its next probe, so
 			// failing the verb here would contradict the state it converges to.
-			warnings = append(warnings, fmt.Sprintf("storage probe cleanup is still finishing (%v); the daemon keeps reconciling it — watch `tbx status`", cleanupErr))
+			outcome.Warnings = append(outcome.Warnings, storageProbeCleanupPendingWarning(spec.ClusterName, cleanupErr))
 		case err != nil:
 			err = errors.Join(err, fmt.Errorf("cleanup storage probe: %w", cleanupErr))
 		default:
@@ -69,27 +98,68 @@ func runStorageProbe(ctx context.Context, dynamicClient dynamic.Interface, mappe
 
 	objects, err := renderStorageProbe(spec)
 	if err != nil {
-		return nil, err
+		return StorageProbeOutcome{}, err
 	}
 	if err := applyAll(ctx, dynamicClient, mapper, objects[:3]); err != nil {
-		return nil, fmt.Errorf("apply storage probe writer: %w", err)
+		return StorageProbeOutcome{}, fmt.Errorf("apply storage probe writer: %w", err)
 	}
 	if err := waitForBoundPersistentVolumeClaim(ctx, client, probeNamespace, storageProbePVCName, spec.ExpectedStorageClass, interval); err != nil {
-		return nil, err
+		return StorageProbeOutcome{}, err
 	}
 	if err := waitForProbePod(ctx, client, probeNamespace, storageProbeWriterPodName, interval); err != nil {
-		return nil, err
+		return StorageProbeOutcome{}, err
 	}
 	if err := deleteStorageProbePod(ctx, client, probeNamespace, storageProbeWriterPodName); err != nil {
-		return nil, err
+		return StorageProbeOutcome{}, err
 	}
 	if err := applyAll(ctx, dynamicClient, mapper, objects[3:]); err != nil {
-		return nil, fmt.Errorf("apply storage probe reader: %w", err)
+		return StorageProbeOutcome{}, fmt.Errorf("apply storage probe reader: %w", err)
 	}
 	if err := waitForProbePod(ctx, client, probeNamespace, storageProbeReaderPodName, interval); err != nil {
-		return nil, err
+		return StorageProbeOutcome{}, err
 	}
-	return nil, nil
+	return StorageProbeOutcome{Verified: true}, nil
+}
+
+// storageProbeCleanupPendingWarning names the one state a probe cleanup can be
+// left in without anything being wrong: still running. The cluster is named
+// because that is what `tbx status` needs, and quoted because the line invites
+// a paste (SPEC §10).
+func storageProbeCleanupPendingWarning(clusterName string, err error) string {
+	hint := "watch it with: tbx status"
+	if clusterName != "" {
+		hint += " " + shellquote.Quote(clusterName)
+	}
+	return fmt.Sprintf("storage probe cleanup is still finishing (%v); the daemon keeps reconciling it — %s", err, hint)
+}
+
+// errStorageProbeTerminating marks the benign half of a cleanup wait's outcome:
+// the object is deleting and has not gone yet. The polling helper joins that
+// last observation with the deadline it finally hits, so it carries no more
+// information than the deadline does.
+var errStorageProbeTerminating = errors.New("still terminating")
+
+// onlyCleanupDeadline reports whether the cleanup budget running out is the
+// *sole* cause of err. A deadline joined with a real API error is not a
+// teardown that merely needs more time: something else failed, and downgrading
+// that to an advisory would hide it.
+func onlyCleanupDeadline(err error) bool {
+	return err != nil && errors.Is(err, context.DeadlineExceeded) && cleanupCausesAreBenign(err)
+}
+
+func cleanupCausesAreBenign(err error) bool {
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, cause := range joined.Unwrap() {
+			if !cleanupCausesAreBenign(cause) {
+				return false
+			}
+		}
+		return true
+	}
+	if wrapped := errors.Unwrap(err); wrapped != nil {
+		return cleanupCausesAreBenign(wrapped)
+	}
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, errStorageProbeTerminating)
 }
 
 func renderStorageProbe(spec storageProbeSpec) ([]unstructured.Unstructured, error) {
@@ -225,9 +295,14 @@ func cleanupStorageProbe(ctx context.Context, client kubernetes.Interface, dynam
 	if err := deleteStorageProbePVCAndWait(ctx, client, probeNamespace, storageProbePVCName); err != nil {
 		errs = append(errs, err)
 	}
-	// The claim is gone by here, so anything still naming it is residue no
-	// other object accounts for — and residue that keeps holding disk.
-	if err := deleteStorageProbeVolumeResidue(ctx, client, dynamicClient, spec); err != nil {
+	// Anything still naming the claim is residue no other object accounts for —
+	// and residue that keeps holding disk. The sweep gets its own budget and
+	// runs even when the wait above spent theirs: a claim that will not finish
+	// terminating is the case where releasing its volume matters most, so it
+	// must not be the case that starves it.
+	residueCtx, residueCancel := context.WithTimeout(context.WithoutCancel(ctx), storageProbeResidueTimeout)
+	defer residueCancel()
+	if err := deleteStorageProbeVolumeResidue(residueCtx, client, dynamicClient, spec); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
@@ -307,7 +382,7 @@ func deleteStorageProbePodAndWait(ctx context.Context, client kubernetes.Interfa
 		if err != nil {
 			return fmt.Errorf("observe storage probe pod %q deletion: %w", name, err)
 		}
-		return fmt.Errorf("storage probe pod %q is still terminating", name)
+		return fmt.Errorf("storage probe pod %q is %w", name, errStorageProbeTerminating)
 	})
 }
 
@@ -323,7 +398,7 @@ func deleteStorageProbePVCAndWait(ctx context.Context, client kubernetes.Interfa
 		if err != nil {
 			return fmt.Errorf("observe storage probe PVC %q deletion: %w", name, err)
 		}
-		return fmt.Errorf("storage probe PVC %q is still terminating", name)
+		return fmt.Errorf("storage probe PVC %q is %w", name, errStorageProbeTerminating)
 	})
 }
 
