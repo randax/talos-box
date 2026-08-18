@@ -160,6 +160,9 @@ type Result struct {
 	VIP             string
 	StoragePhase    StoragePhase
 	StorageLive     bool
+	// Warnings are advisories the pass converged in spite of — work the daemon
+	// finishes behind the verb rather than failures the verb should report.
+	Warnings []string
 }
 
 type generated struct {
@@ -393,15 +396,19 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 		}
 		if request.Cluster.CSI != "" {
 			if request.Storage == nil {
-				return Result{}, errors.New("flannel storage provisioning requires a Kubernetes reconciler")
+				return Result{}, errors.New("storage provisioning requires a Kubernetes reconciler")
 			}
 			storage, err := request.Storage.Reconcile(ctx, request.Cluster, kubeconfig)
 			if err != nil {
-				return Result{}, fmt.Errorf("reconcile flannel storage: %w", err)
+				// Storage is reconciled the same way behind either CNI, so the
+				// failure names the engine that failed rather than the CNI the
+				// shared path was first written for (#347).
+				return Result{}, fmt.Errorf("reconcile %s storage: %w", request.Cluster.CSI, err)
 			}
 			result.StoragePhase = storage.Phase
 			result.StorageLive = storage.Live
 			result.Narration = append(result.Narration, storage.Narration...)
+			result.Warnings = append(result.Warnings, storage.Warnings...)
 		}
 		return result, nil
 	}

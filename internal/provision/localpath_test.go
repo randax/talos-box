@@ -160,7 +160,7 @@ func TestRunStorageProbeWritesReadsAndCleansUp(t *testing.T) {
 		return true, nil, nil
 	})
 
-	if err := runStorageProbe(context.Background(), dynamicClient, mapper, clientset, storageProbeSpec{
+	if _, err := runStorageProbe(context.Background(), dynamicClient, mapper, clientset, storageProbeSpec{
 		ExpectedStorageClass: localPathStorageClass,
 		ProbeImage:           localPathHelperImage,
 	}, time.Millisecond); err != nil {
@@ -222,7 +222,7 @@ func TestRunStorageProbeReturnsContextAndCleansUp(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
 	defer cancel()
-	err := runStorageProbe(ctx, dynamicClient, mapper, clientset, storageProbeSpec{
+	_, err := runStorageProbe(ctx, dynamicClient, mapper, clientset, storageProbeSpec{
 		ExpectedStorageClass: localPathStorageClass,
 		ProbeImage:           localPathHelperImage,
 	}, time.Millisecond)
@@ -235,6 +235,146 @@ func TestRunStorageProbeReturnsContextAndCleansUp(t *testing.T) {
 	if !slices.Contains(deleteKeys, "pod/"+storageProbeWriterPodName) || !slices.Contains(deleteKeys, "pvc/"+storageProbePVCName) {
 		t.Fatalf("cleanup deletes = %v", deleteKeys)
 	}
+}
+
+// A teardown that outran its bound is not a failed probe: the data path
+// verified, the objects are deleting, and the daemon reruns this cleanup at the
+// head of its next probe. Failing the verb here contradicted the state the
+// cluster converged to minutes later (#347).
+func TestRunStorageProbeReportsUnfinishedCleanupAsWarning(t *testing.T) {
+	previous := storageProbeCleanupTimeout
+	storageProbeCleanupTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { storageProbeCleanupTimeout = previous })
+
+	dynamicClient := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
+	reactor := recordApplyReactor(t)
+	dynamicClient.PrependReactor("patch", "namespaces", reactor)
+	dynamicClient.PrependReactor("patch", "persistentvolumeclaims", reactor)
+	dynamicClient.PrependReactor("patch", "pods", reactor)
+
+	mapper := storageProbeRESTMapper()
+	clientset := kubernetesfake.NewClientset()
+	probed := false
+	deleted := map[string]bool{}
+	clientset.PrependReactor("get", "persistentvolumeclaims", func(k8stesting.Action) (bool, runtime.Object, error) {
+		claim := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: storageProbePVCName, Namespace: probeNamespace},
+			Spec:       corev1.PersistentVolumeClaimSpec{StorageClassName: stringPointer(localPathStorageClass)},
+			Status:     corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
+		}
+		// Once the probe has read its payload back, the claim never finishes
+		// terminating: the provisioner is behind and cleanup runs out of time.
+		if probed {
+			return true, claim, nil
+		}
+		if deleted["pvc/"+storageProbePVCName] {
+			deleted["pvc/"+storageProbePVCName] = false
+			return true, nil, apierrors.NewNotFound(schema.GroupResource{Resource: "persistentvolumeclaims"}, storageProbePVCName)
+		}
+		return true, claim, nil
+	})
+	clientset.PrependReactor("get", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		get := action.(k8stesting.GetAction)
+		if deleted["pod/"+get.GetName()] {
+			deleted["pod/"+get.GetName()] = false
+			return true, nil, apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, get.GetName())
+		}
+		if get.GetName() == storageProbeReaderPodName {
+			probed = true
+		}
+		return true, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: get.GetName(), Namespace: probeNamespace}, Status: corev1.PodStatus{Phase: corev1.PodSucceeded}}, nil
+	})
+	clientset.PrependReactor("delete", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		deleted["pod/"+action.(k8stesting.DeleteAction).GetName()] = true
+		return true, nil, nil
+	})
+	clientset.PrependReactor("delete", "persistentvolumeclaims", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		deleted["pvc/"+action.(k8stesting.DeleteAction).GetName()] = true
+		return true, nil, nil
+	})
+
+	warnings, err := runStorageProbe(context.Background(), dynamicClient, mapper, clientset, storageProbeSpec{
+		ExpectedStorageClass: localPathStorageClass,
+		ProbeImage:           localPathHelperImage,
+		Engine:               cluster.CSILocalPath,
+	}, time.Millisecond)
+	if err != nil {
+		t.Fatalf("runStorageProbe() error = %v, want the unfinished cleanup reported as a warning", err)
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "storage probe cleanup is still finishing") {
+		t.Fatalf("runStorageProbe() warnings = %v, want an unfinished-cleanup advisory", warnings)
+	}
+	if !strings.Contains(warnings[0], "tbx status") {
+		t.Fatalf("warning %q does not name where the operator can watch it converge", warnings[0])
+	}
+}
+
+// The probe PVC eventually deletes, but its Longhorn volume can survive it —
+// attached and healthy with nothing bound to it, holding disk no object accounts
+// for (#347). Cleanup reclaims both the released PersistentVolume and the volume
+// behind it, and touches nothing a workload claims.
+func TestCleanupStorageProbeReclaimsVolumeResidue(t *testing.T) {
+	clientset := kubernetesfake.NewClientset(
+		&corev1.PersistentVolume{
+			ObjectMeta: metav1.ObjectMeta{Name: "pvc-probe"},
+			Spec: corev1.PersistentVolumeSpec{
+				StorageClassName:       longhornStorageClass,
+				ClaimRef:               &corev1.ObjectReference{Namespace: probeNamespace, Name: storageProbePVCName},
+				PersistentVolumeSource: corev1.PersistentVolumeSource{CSI: &corev1.CSIPersistentVolumeSource{VolumeHandle: "pvc-probe-handle"}},
+			},
+		},
+		&corev1.PersistentVolume{
+			ObjectMeta: metav1.ObjectMeta{Name: "pvc-workload"},
+			Spec: corev1.PersistentVolumeSpec{
+				StorageClassName: longhornStorageClass,
+				ClaimRef:         &corev1.ObjectReference{Namespace: "app", Name: "data"},
+			},
+		},
+	)
+	dynamicClient := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{longhornVolumeResource: "VolumeList"},
+		longhornVolumeCR("pvc-probe-handle", "", ""),
+		longhornVolumeCR("pvc-detached-probe", probeNamespace, storageProbePVCName),
+		longhornVolumeCR("pvc-workload-handle", "app", "data"),
+	)
+
+	if err := cleanupStorageProbe(context.Background(), clientset, dynamicClient, storageProbeSpec{
+		ExpectedStorageClass: longhornStorageClass,
+		Engine:               cluster.CSILonghorn,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := clientset.CoreV1().PersistentVolumes().Get(context.Background(), "pvc-probe", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("probe PersistentVolume get error = %v, want NotFound", err)
+	}
+	if _, err := clientset.CoreV1().PersistentVolumes().Get(context.Background(), "pvc-workload", metav1.GetOptions{}); err != nil {
+		t.Fatalf("workload PersistentVolume was deleted: %v", err)
+	}
+	volumes := dynamicClient.Resource(longhornVolumeResource).Namespace(longhornNamespace)
+	for _, name := range []string{"pvc-probe-handle", "pvc-detached-probe"} {
+		if _, err := volumes.Get(context.Background(), name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("longhorn volume %q get error = %v, want NotFound", name, err)
+		}
+	}
+	if _, err := volumes.Get(context.Background(), "pvc-workload-handle", metav1.GetOptions{}); err != nil {
+		t.Fatalf("workload longhorn volume was deleted: %v", err)
+	}
+}
+
+func longhornVolumeCR(name, claimNamespace, claimName string) *unstructured.Unstructured {
+	volume := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "longhorn.io/v1beta2",
+		"kind":       "Volume",
+		"metadata":   map[string]any{"name": name, "namespace": longhornNamespace},
+	}}
+	if claimName != "" {
+		volume.Object["status"] = map[string]any{
+			"kubernetesStatus": map[string]any{"namespace": claimNamespace, "pvcName": claimName},
+		}
+	}
+	return volume
 }
 
 func storageProbeRESTMapper() meta.RESTMapper {
@@ -482,7 +622,7 @@ func TestStorageProbeCleanupJoinsDeleteErrors(t *testing.T) {
 		deleteAction := action.(k8stesting.DeleteAction)
 		return true, nil, fmt.Errorf("delete pod %s", deleteAction.GetName())
 	})
-	err := cleanupStorageProbe(context.Background(), clientset, storageProbeSpec{})
+	err := cleanupStorageProbe(context.Background(), clientset, dynamicfake.NewSimpleDynamicClient(runtime.NewScheme()), storageProbeSpec{})
 	if err == nil || !strings.Contains(err.Error(), storageProbeWriterPodName) {
 		t.Fatalf("cleanupStorageProbe() error = %v", err)
 	}

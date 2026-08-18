@@ -41,6 +41,10 @@ type StorageResult struct {
 	Narration []string
 	Phase     StoragePhase
 	Live      bool
+	// Warnings carry work the engine converged without, and that the daemon
+	// keeps finishing after the verb answered — a probe cleanup that outran its
+	// bound, for instance (#347).
+	Warnings []string
 }
 
 // LocalPathReconciler installs and verifies the pinned local-path
@@ -85,10 +89,12 @@ func ProbeLocalPathStorage(ctx context.Context, kubeconfig []byte, interval time
 	if interval <= 0 {
 		interval = time.Second
 	}
-	return runStorageProbe(ctx, dynamicClient, mapper, clientset, storageProbeSpec{
+	_, err = runStorageProbe(ctx, dynamicClient, mapper, clientset, storageProbeSpec{
 		ExpectedStorageClass: localPathStorageClass,
 		ProbeImage:           localPathHelperImage,
+		Engine:               cluster.CSILocalPath,
 	}, interval)
+	return err
 }
 
 func (r LocalPathReconciler) reconcile(ctx context.Context, config *rest.Config, objects []unstructured.Unstructured) (StorageResult, error) {
@@ -119,13 +125,15 @@ func (r LocalPathReconciler) reconcile(ctx context.Context, config *rest.Config,
 	if err := waitForLocalPath(ctx, clientset, r.PollInterval); err != nil {
 		return StorageResult{}, err
 	}
-	if err := runStorageProbe(ctx, dynamicClient, mapper, clientset, storageProbeSpec{
+	warnings, err := runStorageProbe(ctx, dynamicClient, mapper, clientset, storageProbeSpec{
 		ExpectedStorageClass: localPathStorageClass,
 		ProbeImage:           localPathHelperImage,
-	}, r.PollInterval); err != nil {
+		Engine:               cluster.CSILocalPath,
+	}, r.PollInterval)
+	if err != nil {
 		return StorageResult{}, err
 	}
-	return StorageResult{Narration: []string{
+	return StorageResult{Warnings: warnings, Narration: []string{
 		"≈ kubectl apply --server-side -f - # local-path-provisioner v" + localPathVersion,
 		"≈ kubectl apply --server-side -f - # storage probe PVC + writer/reader pods",
 	}, Phase: StoragePhaseLive, Live: true}, nil

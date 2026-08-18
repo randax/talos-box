@@ -307,7 +307,7 @@ func (s *Server) runProvisionTasks(data any, tasks []provisionTask, progress sta
 			progress.stage("reconciling %s on cluster %s (up to %s)",
 				task.item.CNI, task.item.Name, formatBootWindow(provisionTimeout(task.item)))
 		}
-		narration, phase, err := s.provisionCNI(task.ctx, task.item, task.force)
+		narration, warnings, phase, err := s.provisionCNI(task.ctx, task.item, task.force)
 		if task.item.CSI != "" {
 			s.opMu.Lock()
 			s.recordStoragePhaseIfCurrentLocked(task.item.Name, task.generation, phase)
@@ -327,6 +327,9 @@ func (s *Server) runProvisionTasks(data any, tasks []provisionTask, progress sta
 		switch result := data.(type) {
 		case *ClusterSummary:
 			result.Narration = narration
+			// Advisories the pass converged in spite of: work the daemon
+			// finishes behind the verb, never a reason to fail it (#347).
+			result.addWarnings(warnings...)
 		case []Action:
 			if task.action >= 0 {
 				result[task.action].Narration = narration
@@ -383,22 +386,22 @@ func provisionTimeout(item cluster.Cluster) time.Duration {
 	return cniProvisionTimeout
 }
 
-func (s *Server) provisionCNI(parent context.Context, item cluster.Cluster, force bool) ([]string, StoragePhase, error) {
+func (s *Server) provisionCNI(parent context.Context, item cluster.Cluster, force bool) (narration, warnings []string, phase StoragePhase, err error) {
 	if !reconcilesCNI(item) {
-		return nil, "", nil
+		return nil, nil, "", nil
 	}
 	// Once every desired outcome is observed healthy, a rerun is a genuine fast
 	// no-op. Cilium additionally probes its optional Hubble deployments: a live
 	// VIP and Ready Nodes alone cannot establish that that desired set converged.
 	if !force && s.tryFastNoopReconcile(item) {
 		if item.CSI != "" {
-			return nil, StoragePhaseLive, nil
+			return nil, nil, StoragePhaseLive, nil
 		}
-		return nil, "", nil
+		return nil, nil, "", nil
 	}
 	dir, err := cluster.Dir(item.Name)
 	if err != nil {
-		return nil, "", err
+		return nil, nil, "", err
 	}
 	ctx, cancel := context.WithTimeout(parent, provisionTimeout(item))
 	defer cancel()
@@ -433,9 +436,9 @@ func (s *Server) provisionCNI(parent context.Context, item cluster.Cluster, forc
 	}
 	result, err := reconcile(ctx, request)
 	if err != nil {
-		return nil, "", err
+		return nil, nil, "", err
 	}
-	return result.Narration, storagePhaseFromProvisionResult(result), nil
+	return result.Narration, result.Warnings, storagePhaseFromProvisionResult(result), nil
 }
 
 func (s *Server) observeProvisionNodes(item cluster.Cluster) []provision.Node {

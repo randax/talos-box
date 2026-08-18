@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -225,7 +226,7 @@ func TestProvisionCNICiliumStorageDriftBypassesFastNoop(t *testing.T) {
 			CSI: cluster.CSILonghorn,
 		},
 	}
-	_, phase, err := service.provisionCNI(context.Background(), item, false)
+	_, _, phase, err := service.provisionCNI(context.Background(), item, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,6 +235,44 @@ func TestProvisionCNICiliumStorageDriftBypassesFastNoop(t *testing.T) {
 	}
 	if phase != StoragePhaseProvisioning {
 		t.Fatalf("storage phase = %q, want %q while reconciliation resumes", phase, StoragePhaseProvisioning)
+	}
+}
+
+// A storage-probe cleanup that outran its bound is work the daemon finishes
+// behind the verb, so the verb answers with an advisory rather than a failure
+// the eventual state contradicts (#347).
+func TestProvisionTasksCarryReconcileWarningsOntoTheSummary(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILonghorn}
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	warning := "storage probe cleanup is still finishing; watch `tbx status`"
+	lifecycle, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	service := &Server{
+		vms:              make(map[string]map[string]hypervisor.Machine),
+		provisions:       make(map[string]activeProvision),
+		lifecycleContext: lifecycle,
+		lifecycleCancel:  cancel,
+		provisionReconcile: func(context.Context, provision.Request) (provision.Result, error) {
+			return provision.Result{StoragePhase: provision.StoragePhaseLive, Warnings: []string{warning}}, nil
+		},
+	}
+	service.opMu.Lock()
+	tasks := service.beginProvisionTasksLocked([]cluster.Cluster{item})
+	service.opMu.Unlock()
+
+	summary := &ClusterSummary{Name: item.Name}
+	if err := service.runProvisionTasks(summary, tasks, nil); err != nil {
+		t.Fatalf("runProvisionTasks() error = %v, want the cleanup advisory to be non-fatal", err)
+	}
+	if !slices.Contains(summary.Warnings, warning) {
+		t.Fatalf("summary warnings = %v, want %q", summary.Warnings, warning)
 	}
 }
 
@@ -312,7 +351,7 @@ func TestProvisionCNIAttachesStorageReconcilerForCilium(t *testing.T) {
 			}
 			return provision.Result{StoragePhase: provision.StoragePhaseLive, StorageLive: true}, nil
 		}}
-		if _, phase, err := service.provisionCNI(context.Background(), item, true); err != nil {
+		if _, _, phase, err := service.provisionCNI(context.Background(), item, true); err != nil {
 			t.Fatal(err)
 		} else if phase != StoragePhaseLive {
 			t.Fatalf("csi=%s phase = %q, want %q", test.csi, phase, StoragePhaseLive)

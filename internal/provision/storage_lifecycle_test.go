@@ -337,6 +337,44 @@ func TestReplaceDriftedStorageClassWaitsOutAsynchronousDeletion(t *testing.T) {
 	}
 }
 
+// longhorn-driver-deployer re-creates the `longhorn` StorageClass from the
+// longhorn-storageclass ConfigMap, and clusters provisioned before #338 hold a
+// definition without the managed label. The class is still tbx-installed, so
+// its provisioner — not its labels — decides ownership when the engine being
+// removed is the one that wrote it.
+func TestValidateRenderedStorageObjectsAdoptsUnlabeledEngineStorageClass(t *testing.T) {
+	tests := []struct {
+		name        string
+		provisioner string
+		wantErr     bool
+	}{
+		{name: "longhorn re-created its own class", provisioner: longhornProvisioner},
+		{name: "foreign provisioner stays user-owned", provisioner: "csi.example.com", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rendered := storageClassFixture(longhornStorageClass, map[string]any{"numberOfReplicas": "3"}, true)
+			live := storageClassFixture(longhornStorageClass, map[string]any{"numberOfReplicas": "3"}, false)
+			live.Object["provisioner"] = tt.provisioner
+			objects := []unstructured.Unstructured{*rendered}
+			client := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
+			mapper := storageLifecycleTestMapper(objects)
+			createStorageLifecycleObjects(t, client, mapper, []unstructured.Unstructured{*live})
+
+			err := validateRenderedStorageObjects(context.Background(), client, mapper, objects)
+			if tt.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "unmanaged storage") {
+					t.Fatalf("validateRenderedStorageObjects() error = %v, want unmanaged storage", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validateRenderedStorageObjects() error = %v, want the re-created class adopted", err)
+			}
+		})
+	}
+}
+
 func storageClassFixture(name string, parameters map[string]any, owned bool) *unstructured.Unstructured {
 	object := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "storage.k8s.io/v1",

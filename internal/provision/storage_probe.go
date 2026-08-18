@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/randax/talos-box/internal/cluster"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -27,51 +28,68 @@ const (
 type storageProbeSpec struct {
 	ExpectedStorageClass string
 	ProbeImage           string
+	// Engine names the curated engine behind the default StorageClass, so
+	// cleanup can reclaim the engine-specific residue a deleted claim leaves.
+	Engine cluster.CSI
 }
 
-func runStorageProbe(ctx context.Context, dynamicClient dynamic.Interface, mapper meta.RESTMapper, client kubernetes.Interface, spec storageProbeSpec, interval time.Duration) (err error) {
-	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	if err := cleanupStorageProbe(cleanupCtx, client, spec); err != nil {
-		cleanupCancel()
-		return fmt.Errorf("clear stale storage probe: %w", err)
+// storageProbeCleanupTimeout bounds one teardown attempt. Exceeding it is not a
+// failed probe: the objects are already deleting and the next pass collects
+// whatever is left. A variable so tests can exercise that bound.
+var storageProbeCleanupTimeout = 30 * time.Second
+
+// runStorageProbe writes and reads back through the cluster's default
+// StorageClass, then tears its objects down. It returns the advisories the
+// caller should report without failing: a teardown that outran its bound is
+// one, since the substrate converges behind the verb (#347, following #314).
+func runStorageProbe(ctx context.Context, dynamicClient dynamic.Interface, mapper meta.RESTMapper, client kubernetes.Interface, spec storageProbeSpec, interval time.Duration) (warnings []string, err error) {
+	cleanup := func() error {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), storageProbeCleanupTimeout)
+		defer cleanupCancel()
+		return cleanupStorageProbe(cleanupCtx, client, dynamicClient, spec)
 	}
-	cleanupCancel()
+	if err := cleanup(); err != nil {
+		return nil, fmt.Errorf("clear stale storage probe: %w", err)
+	}
 	defer func() {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		cleanupErr := cleanupStorageProbe(cleanupCtx, client, spec)
-		cleanupCancel()
-		if cleanupErr != nil {
-			if err != nil {
-				err = errors.Join(err, fmt.Errorf("cleanup storage probe: %w", cleanupErr))
-			} else {
-				err = fmt.Errorf("cleanup storage probe: %w", cleanupErr)
-			}
+		cleanupErr := cleanup()
+		switch {
+		case cleanupErr == nil:
+		case err == nil && errors.Is(cleanupErr, context.DeadlineExceeded):
+			// The data path verified; only the teardown is still running. The
+			// daemon reruns this cleanup at the head of its next probe, so
+			// failing the verb here would contradict the state it converges to.
+			warnings = append(warnings, fmt.Sprintf("storage probe cleanup is still finishing (%v); the daemon keeps reconciling it — watch `tbx status`", cleanupErr))
+		case err != nil:
+			err = errors.Join(err, fmt.Errorf("cleanup storage probe: %w", cleanupErr))
+		default:
+			err = fmt.Errorf("cleanup storage probe: %w", cleanupErr)
 		}
 	}()
 
 	objects, err := renderStorageProbe(spec)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := applyAll(ctx, dynamicClient, mapper, objects[:3]); err != nil {
-		return fmt.Errorf("apply storage probe writer: %w", err)
+		return nil, fmt.Errorf("apply storage probe writer: %w", err)
 	}
 	if err := waitForBoundPersistentVolumeClaim(ctx, client, probeNamespace, storageProbePVCName, spec.ExpectedStorageClass, interval); err != nil {
-		return err
+		return nil, err
 	}
 	if err := waitForProbePod(ctx, client, probeNamespace, storageProbeWriterPodName, interval); err != nil {
-		return err
+		return nil, err
 	}
 	if err := deleteStorageProbePod(ctx, client, probeNamespace, storageProbeWriterPodName); err != nil {
-		return err
+		return nil, err
 	}
 	if err := applyAll(ctx, dynamicClient, mapper, objects[3:]); err != nil {
-		return fmt.Errorf("apply storage probe reader: %w", err)
+		return nil, fmt.Errorf("apply storage probe reader: %w", err)
 	}
 	if err := waitForProbePod(ctx, client, probeNamespace, storageProbeReaderPodName, interval); err != nil {
-		return err
+		return nil, err
 	}
-	return nil
+	return nil, nil
 }
 
 func renderStorageProbe(spec storageProbeSpec) ([]unstructured.Unstructured, error) {
@@ -196,7 +214,7 @@ func waitForProbePod(ctx context.Context, client kubernetes.Interface, namespace
 	})
 }
 
-func cleanupStorageProbe(ctx context.Context, client kubernetes.Interface, _ storageProbeSpec) error {
+func cleanupStorageProbe(ctx context.Context, client kubernetes.Interface, dynamicClient dynamic.Interface, spec storageProbeSpec) error {
 	var errs []error
 	if err := deleteStorageProbePodAndWait(ctx, client, probeNamespace, storageProbeReaderPodName); err != nil {
 		errs = append(errs, err)
@@ -207,7 +225,74 @@ func cleanupStorageProbe(ctx context.Context, client kubernetes.Interface, _ sto
 	if err := deleteStorageProbePVCAndWait(ctx, client, probeNamespace, storageProbePVCName); err != nil {
 		errs = append(errs, err)
 	}
+	// The claim is gone by here, so anything still naming it is residue no
+	// other object accounts for — and residue that keeps holding disk.
+	if err := deleteStorageProbeVolumeResidue(ctx, client, dynamicClient, spec); err != nil {
+		errs = append(errs, err)
+	}
 	return errors.Join(errs...)
+}
+
+// deleteStorageProbeVolumeResidue reclaims what a deleted probe claim can leave
+// behind: a Released PersistentVolume whose provisioner never caught up, and —
+// on Longhorn — a volume that stays attached and healthy with nothing bound to
+// it (#347). Both name the probe claim, so neither can belong to a workload.
+func deleteStorageProbeVolumeResidue(ctx context.Context, client kubernetes.Interface, dynamicClient dynamic.Interface, spec storageProbeSpec) error {
+	list, err := client.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("list storage probe persistent volumes: %w", err)
+	}
+	var errs []error
+	handles := make(map[string]bool)
+	for i := range list.Items {
+		persistentVolume := &list.Items[i]
+		if !storageProbePVResidue(persistentVolume) {
+			continue
+		}
+		if persistentVolume.Spec.CSI != nil {
+			handles[persistentVolume.Spec.CSI.VolumeHandle] = true
+		}
+		if err := client.CoreV1().PersistentVolumes().Delete(ctx, persistentVolume.Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			errs = append(errs, fmt.Errorf("delete storage probe PersistentVolume %q: %w", persistentVolume.Name, err))
+		}
+	}
+	if spec.Engine == cluster.CSILonghorn {
+		if err := deleteLonghornProbeVolumes(ctx, dynamicClient, handles); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// deleteLonghornProbeVolumes removes the probe's Longhorn volumes, whether they
+// are still reachable through a PersistentVolume handle or only through the
+// claim reference Longhorn records on the volume itself.
+func deleteLonghornProbeVolumes(ctx context.Context, client dynamic.Interface, handles map[string]bool) error {
+	volumes := client.Resource(longhornVolumeResource).Namespace(longhornNamespace)
+	list, err := volumes.List(ctx, metav1.ListOptions{})
+	if err != nil {
+		// An absent CRD means Longhorn is not installed, and so holds nothing.
+		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+			return nil
+		}
+		return fmt.Errorf("list longhorn volumes for storage probe cleanup: %w", err)
+	}
+	var errs []error
+	for i := range list.Items {
+		volume := &list.Items[i]
+		if !handles[volume.GetName()] && !longhornVolumeClaimsStorageProbe(volume) {
+			continue
+		}
+		if err := volumes.Delete(ctx, volume.GetName(), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			errs = append(errs, fmt.Errorf("delete storage probe longhorn volume %q: %w", volume.GetName(), err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func longhornVolumeClaimsStorageProbe(volume *unstructured.Unstructured) bool {
+	return nestedString(volume, "status", "kubernetesStatus", "namespace") == probeNamespace &&
+		nestedString(volume, "status", "kubernetesStatus", "pvcName") == storageProbePVCName
 }
 
 func deleteStorageProbePodAndWait(ctx context.Context, client kubernetes.Interface, namespace, name string) error {

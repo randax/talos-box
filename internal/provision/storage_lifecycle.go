@@ -263,7 +263,27 @@ func storageObjectOwnedByTalosbox(object *unstructured.Unstructured) bool {
 			return true
 		}
 	}
-	return false
+	return storageEngineOwnedStorageClass(object)
+}
+
+// storageEngineOwnedStorageClass recognizes a StorageClass the curated engine
+// re-creates for itself. longhorn-driver-deployer rewrites the `longhorn`
+// class from the longhorn-storageclass ConfigMap, and until #338 that
+// definition carried no managed label — so a class tbx installed comes back
+// looking user-owned and every switch away from longhorn is refused. Only
+// classes rendered for the engine being removed are ever checked here, so a
+// class carrying Longhorn's own provisioner belongs to that engine and never
+// to a user: a user-owned class would have to answer to a different name, and
+// a different name is not a candidate for removal in the first place.
+func storageEngineOwnedStorageClass(object *unstructured.Unstructured) bool {
+	if object.GetKind() != "StorageClass" {
+		return false
+	}
+	provisioner, _, err := unstructured.NestedString(object.Object, "provisioner")
+	if err != nil {
+		return false
+	}
+	return provisioner == longhornProvisioner
 }
 
 func storageDeletionOrder(objects []unstructured.Unstructured) []unstructured.Unstructured {
