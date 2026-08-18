@@ -57,7 +57,7 @@ func TestSnapshotCreateNarratesStopBeforeCloneBeforeRestart(t *testing.T) {
 	if stop < 0 || clone < 0 || restart < 0 || hint < 0 {
 		t.Fatalf("snapshot.create narration = %q, want stop, clone, restart and a convergence hint", *stages)
 	}
-	if !(stop < clone && clone < restart && restart < hint) {
+	if stop >= clone || clone >= restart || restart >= hint {
 		t.Fatalf("snapshot.create narration = %q, want the stop before the clone before the restart", *stages)
 	}
 }
@@ -109,7 +109,7 @@ func TestSnapshotRestoreNarratesStopRestoreAndStart(t *testing.T) {
 	if stop < 0 || restore < 0 || start < 0 {
 		t.Fatalf("snapshot.restore narration = %q, want stop, restore and start", *stages)
 	}
-	if !(stop < restore && restore < start) {
+	if stop >= restore || restore >= start {
 		t.Fatalf("snapshot.restore narration = %q, want the stop before the restore before the start", *stages)
 	}
 }
@@ -163,6 +163,13 @@ func TestNodeAddNarratesTheDiskCloneAndTheLaunch(t *testing.T) {
 	if !strings.Contains((*stages)[reconcile], "up to 25 minutes") {
 		t.Fatalf("reconcile stage = %q, want the storage budget the daemon holds it to", (*stages)[reconcile])
 	}
+	// The convergence hint closes a verb that left nodes booting. This one
+	// blocks on its own reconcile and returns with the node configured, so
+	// sending the operator to `tbx status` would point them away from a call
+	// that still owns their terminal (#273).
+	if indexOfStage(*stages, "tbx status") >= 0 {
+		t.Fatalf("node.add narration = %q, want no convergence hint from a verb that waits for the reconcile", *stages)
+	}
 }
 
 // A substrate-only cluster reconciles nothing, so the reconcile must not be
@@ -188,6 +195,12 @@ func TestNodeAddOnASubstrateOnlyClusterDoesNotNarrateAReconcile(t *testing.T) {
 	}
 	if indexOfStage(*stages, "reconciling") >= 0 {
 		t.Fatalf("node.add narration = %q, want no reconcile announced for a substrate-only cluster", *stages)
+	}
+	// Nothing follows the launch here, so the hint is genuinely the closing
+	// line: the verb is done and the node it started is still booting.
+	hint := indexOfStage(*stages, "tbx status demo")
+	if hint < 0 || hint != len(*stages)-1 {
+		t.Fatalf("node.add narration = %q, want the convergence hint as the closing stage", *stages)
 	}
 }
 
@@ -365,7 +378,7 @@ func TestClusterCreateDispatchHoldsItsAnswerForTheBootWait(t *testing.T) {
 	launch := indexOfStage(*stages, "starting 1 node(s)")
 	wait := indexOfStage(*stages, "waiting for 1 node(s) to boot")
 	booted := indexOfStage(*stages, "all 1 node(s) booted")
-	if launch < 0 || wait < 0 || booted < 0 || !(launch < wait && wait < booted) {
+	if launch < 0 || wait < 0 || booted < 0 || launch >= wait || wait >= booted {
 		t.Fatalf("cluster.create narration = %q, want the boot wait between the launch and the answer", *stages)
 	}
 	var summary ClusterSummary

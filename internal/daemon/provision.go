@@ -352,6 +352,17 @@ func reconcilesCNI(item cluster.Cluster) bool {
 	return item.CNI == cluster.CNIFlannel || item.CNI == cluster.CNICilium
 }
 
+// tasksReconcile reports whether any of these tasks has a reconcile to run, and
+// so whether the verb that scheduled them still has work ahead of it.
+func tasksReconcile(tasks []provisionTask) bool {
+	for _, task := range tasks {
+		if reconcilesCNI(task.item) {
+			return true
+		}
+	}
+	return false
+}
+
 // provisionTimeout budgets one provisioning pass by what it must converge.
 func provisionTimeout(item cluster.Cluster) time.Duration {
 	if item.CSI != "" {

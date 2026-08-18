@@ -1000,7 +1000,6 @@ func (s *Server) addNodeLocked(raw json.RawMessage, progress stageFunc) (NodeSta
 			return nodeStatus(node, item.SubnetIndex, false), nil, fmt.Errorf("node added but failed to create VM: %w", err)
 		}
 		s.vms[item.Name][node.Name] = machine
-		progress.stage("%s", convergenceHint(item.Name))
 	}
 	status := nodeStatus(node, item.SubnetIndex, s.nodeRunning(item.Name, node.Name))
 	customSchematic := s.defaultSchematic != "" && item.Schematic != "" && item.Schematic != s.defaultSchematic
@@ -1008,6 +1007,14 @@ func (s *Server) addNodeLocked(raw json.RawMessage, progress stageFunc) (NodeSta
 	var deferredWarning string
 	if deferredReconcile {
 		deferredWarning = nodeAddDeferredReconcileWarning(node.Name)
+	}
+	// The hint closes a verb that left work outstanding, so it only belongs
+	// here when nothing else follows: a node.add that keeps its reconcile on
+	// the request path blocks until the node is configured, and sending the
+	// operator to `tbx status` mid-stream would promise an answer this very
+	// call is still holding (#273).
+	if running && !tasksReconcile(tasks) {
+		progress.stage("%s", convergenceHint(item.Name))
 	}
 	status.setWarnings(append([]string{overcommitWarning}, append(hostPressureWarnings, subnetWarning, s.longhornCustomSchematicWarning(item, customSchematic), deferredWarning)...)...)
 	return status, tasks, nil
