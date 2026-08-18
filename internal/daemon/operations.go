@@ -250,11 +250,12 @@ type ClusterStatus struct {
 	// depends on, so a file stays portable across host substrates and the gate
 	// is visible instead of silently doing nothing.
 	Capabilities []CapabilityStatus `json:"capabilities,omitempty"`
-	// ConfigManaged reports that a talosbox.yaml backs this cluster, which
-	// decides whether a recovery hint may name `tbx up` (#267).
-	ConfigManaged bool     `json:"configManaged,omitempty"`
-	Hints         []string `json:"hints,omitempty"`
-	subnetIndex   int
+	// ConfigOrigin reports how the cluster came to exist, which decides
+	// whether a recovery hint may name `tbx up` (#267). Absent for clusters
+	// created before the origin was recorded.
+	ConfigOrigin cluster.ConfigOrigin `json:"configOrigin,omitempty"`
+	Hints        []string             `json:"hints,omitempty"`
+	subnetIndex  int
 }
 
 // CapabilityStatus is one host capability a cluster depends on, with the reason
@@ -480,7 +481,13 @@ func (s *Server) createCluster(raw json.RawMessage, progress stageFunc) (Cluster
 	item.Domain = canonicalDomain
 	item.AllowUnsafeDomain = canonicalDomain != "" && args.AllowUnsafeDomain
 	item.ImageArchitecture = string(s.hypervisor.Architecture())
-	item.ConfigManaged = args.ConfigManaged
+	// A create that names no talosbox.yaml is imperative — including one from
+	// a CLI predating the flag, which is exactly what `tbx cluster create`
+	// sends.
+	item.ConfigOrigin = cluster.OriginImperative
+	if args.ConfigManaged {
+		item.ConfigOrigin = cluster.OriginManaged
+	}
 	longhornWarning := s.checkLonghornMemoryWarning(item)
 	longhornCustomSchematicWarning := s.longhornCustomSchematicWarning(item, args.Schematic != "")
 	item.Schematic, item.TalosVersion, err = s.resolveImage(args.Schematic, args.Version, args.Extensions)
@@ -1100,7 +1107,7 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), TalosVersion: item.TalosVersion, Schematic: item.Schematic, BaseSchematic: item.BaseSchematic, TalosExtensions: item.TalosExtensions, ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: running,
 			// derived from disk, not from daemon memory, so a restarted
 			// daemon still reports its predecessor's suspension
-			Suspended: !running && clusterHasSavedState(item.Name), Capabilities: s.clusterCapabilities(item), ConfigManaged: item.ConfigManaged, subnetIndex: item.SubnetIndex}
+			Suspended: !running && clusterHasSavedState(item.Name), Capabilities: s.clusterCapabilities(item), ConfigOrigin: item.ConfigOrigin, subnetIndex: item.SubnetIndex}
 		for _, node := range item.Nodes {
 			running := s.nodeRunning(item.Name, node.Name)
 			clusterStatus.Nodes = append(clusterStatus.Nodes, NodeStatus{Name: node.Name, Role: node.Role, MAC: node.MAC, Phase: ClassifyPhase(running, ProbeResult{}), StartedAt: s.vmStartedAt(item.Name, node.Name),

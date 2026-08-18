@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+
+	"github.com/randax/talos-box/internal/shellquote"
 )
 
 // stageFunc narrates one stage of an in-flight operation to the client that
@@ -48,7 +50,8 @@ func (p *progressSink) close() {
 
 // convergenceHint is the closing narration of a verb that left the cluster
 // booting: the operation is done, the nodes are not, and status is where that
-// is watched (#273).
+// is watched (#273). The name is quoted: the line is meant to be pasted, and a
+// cluster name may carry shell metacharacters.
 func convergenceHint(clusterName string) string {
-	return fmt.Sprintf("nodes are booting; watch them converge with: tbx status %s", clusterName)
+	return fmt.Sprintf("nodes are booting; watch them converge with: tbx status %s", shellquote.Quote(clusterName))
 }

@@ -17,10 +17,13 @@ import (
 const defaultConfigFile = "talosbox.yaml"
 
 // Provisioning budgets are the daemon's own exported constants, so the stated
-// deadline can never drift from what the request is actually held to.
+// deadline can never drift from what the request is actually held to. A create
+// additionally waits for its nodes to boot before the provisioning budget
+// starts, so its stated deadline carries that wait too (#307).
 const (
 	cniProvisionDeadline     = daemon.CNIProvisionTimeout
 	storageProvisionDeadline = daemon.StorageProvisionTimeout
+	nodeBootDeadline         = daemon.NodeBootTimeout
 )
 
 // livenessInterval is how often a blocking lifecycle call reports it is still
@@ -142,6 +145,14 @@ func provisionDeadline(storage bool) time.Duration {
 		return storageProvisionDeadline
 	}
 	return cniProvisionDeadline
+}
+
+// createProvisionDeadline is provisionDeadline plus the boot wait a create runs
+// ahead of provisioning: the daemon holds a create for both, and a heartbeat
+// stating only the provisioning half reports an elapsed time past its own
+// deadline on any host where a node is slow to lease DHCP.
+func createProvisionDeadline(storage bool) time.Duration {
+	return provisionDeadline(storage) + nodeBootDeadline
 }
 
 func (c cli) runUp(args []string) error {

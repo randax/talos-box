@@ -59,18 +59,18 @@ On failure: capture guard output / doctor lines.
 
 ### C3 — Spec-drift charters
 
-**Goal**: pin down the known doc/code divergences so they are consciously resolved, not rediscovered.
+**Goal**: verify the SPEC surfaces that historically drifted from the code, and pin down the one divergence that remains.
 
-Steps and expected current behavior (each records verbatim behavior; the drift itself is the finding):
-1. `tbx node start qa-host qa-host-cp-1` / `tbx node stop ...` — SPEC §9 lists these; CLI expected to reject (unimplemented). Record the error.
-2. `tbx snapshot list qa-host -o json` and `tbx cache list -o json` — SPEC claims `-o json` on all list/status commands; code supports it only on `status` and `cluster list`. Record actual behavior of each.
+Steps (record verbatim output for each):
+1. `tbx node stop qa-host qa-host-worker-1`, then `tbx status qa-host`, then `tbx node start qa-host qa-host-worker-1` — SPEC §9 lists both verbs and both are implemented. Expect: `stopped node ...` / `started node ...` on stdout, the node reported `stopped` in status between them, and the node back on its way up afterwards. A rejection or an "unknown node command" here is the finding.
+2. `tbx status qa-host -o json`, `tbx cluster list -o json`, `tbx cache list -o json`, `tbx snapshot list qa-host -o json` — SPEC claims `-o json` on the list/status commands, and all four support it. Each must print valid JSON (`| python3 -m json.tool`). A rejected flag or non-JSON output is the finding.
 3. **[Linux]** `tbx system install` — docs say never run it on Linux, but the code does not gate it. DO NOT actually complete it: run it WITHOUT sudo rights available and record how far it gets / what error appears (it may attempt sudo re-exec — decline the password prompt and record). If declining is not safely possible, mark SKIPPED-unsafe with reasoning.
 
-Expected observations: each divergence documented with exact output; file/refresh one tracking issue per genuine divergence if none exists yet (search first).
+Expected observations: steps 1 and 2 behave as described above; step 3's divergence documented with exact output. File/refresh one tracking issue per genuine divergence if none exists yet (search first).
 
-Pass criteria: all three drift items have verbatim evidence in the report.
+Pass criteria: steps 1 and 2 behave as stated, and step 3 has verbatim evidence in the report.
 
-On failure: n/a (this charter's failures are its findings) — but a *silent success* of a supposedly-unimplemented verb is a red-flag finding; report it prominently.
+On failure: capture the exact command and output; a SPEC-listed verb that rejects, or a `-o json` that does not parse, is a red-flag finding — report it prominently.
 
 ### C4 — Guided-output and quiet contracts
 

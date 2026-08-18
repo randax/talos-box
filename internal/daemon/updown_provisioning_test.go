@@ -609,7 +609,7 @@ func TestPreflightUpClaimsExistingClusterAsConfigManaged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !claimed.ConfigManaged {
+	if claimed.ConfigOrigin != cluster.OriginManaged {
 		t.Fatal("preflightUp() left an up-managed cluster unclaimed")
 	}
 	if claimed.ProvisioningIntent != item.ProvisioningIntent {
@@ -631,5 +631,43 @@ func TestCreateFromSpecMarksClusterConfigManaged(t *testing.T) {
 	}
 	if !decoded.ConfigManaged {
 		t.Fatalf("createArgs lost its config-managed provenance on the wire: %s", encoded)
+	}
+}
+
+// `tbx cluster create` sends no origin at all — as does any CLI predating the
+// field — and the daemon must record that create as imperative rather than
+// leaving it indistinguishable from a cluster whose origin is unknown (#267).
+func TestCreateClusterRecordsImperativeOrigin(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	service := newVersionTestServer(t, "aaa", DefaultTalosVersion)
+	service.hostTotalMemory = func() (int, error) { return 1 << 20, nil }
+	createVersionTestCluster(t, service, "manual", "aaa", DefaultTalosVersion)
+
+	item, err := cluster.Load("manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.ConfigOrigin != cluster.OriginImperative {
+		t.Fatalf("persisted origin = %q, want %q", item.ConfigOrigin, cluster.OriginImperative)
+	}
+	statuses, err := service.status(json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 1 || statuses[0].ConfigOrigin != cluster.OriginImperative {
+		t.Fatalf("status origin = %+v, want the imperative origin", statuses)
+	}
+}
+
+// A cluster.json written before the field existed must decode as unknown, not
+// as imperative: guessing would advise destroying a cluster a talosbox.yaml
+// may well still back.
+func TestClusterWithoutRecordedOriginDecodesAsUnknown(t *testing.T) {
+	var item cluster.Cluster
+	if err := json.Unmarshal([]byte(`{"name":"legacy"}`), &item); err != nil {
+		t.Fatal(err)
+	}
+	if item.ConfigOrigin != cluster.OriginUnknown {
+		t.Fatalf("legacy cluster origin = %q, want unknown", item.ConfigOrigin)
 	}
 }

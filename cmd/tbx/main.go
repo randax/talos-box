@@ -368,7 +368,7 @@ func (c cli) createCluster(args []string) error {
 	var result daemon.ClusterSummary
 	signal := liveness{
 		verb:     "provisioning " + positionals[0],
-		deadline: provisionDeadline(*csi != ""),
+		deadline: createProvisionDeadline(*csi != ""),
 		quiet:    *quiet,
 	}
 	if err := c.callWithLivenessNarrated(signal, "cluster.create", request, &result, true); err != nil {

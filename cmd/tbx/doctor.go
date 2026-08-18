@@ -246,8 +246,12 @@ func cacheFindings(
 		return []doctorFinding{mirrorFinding, imageFinding}
 	}
 	if err != nil {
+		// One listing feeds both lines, so a failed listing is one problem,
+		// not two: it fails the mirror line that owns the health verdict and
+		// skips the image line, which is informational and has nothing to
+		// report (#269).
 		mirrorFinding.level, mirrorFinding.detail = "FAIL", err.Error()
-		imageFinding.level, imageFinding.detail = "FAIL", err.Error()
+		imageFinding.level, imageFinding.detail = "SKIP", "cache listing unavailable"
 		return []doctorFinding{mirrorFinding, imageFinding}
 	}
 
@@ -296,23 +300,40 @@ func cacheFindings(
 		mirrorFinding.detail = fmt.Sprintf("cluster state unavailable; %s", cacheDetail)
 	}
 
-	imageFinding.level, imageFinding.detail = "PASS", imageCacheDetail(cacheResult.Images)
+	imageFinding.level, imageFinding.detail = imageCacheFinding(cacheResult.Images)
 	return []doctorFinding{mirrorFinding, imageFinding}
 }
 
-// imageCacheDetail sizes the Talos disk-image cache the way `cache list` does:
+// imageCacheFinding sizes the Talos disk-image cache the way `cache list` does:
 // apparent bytes, plus what the sparse images actually occupy when the daemon
-// reports it.
-func imageCacheDetail(images []daemon.CacheImageEntry) string {
+// reports it. Incomplete combinations — prunable leftovers with no usable
+// disk.raw — are held out of the total and counted apart, because an operator
+// preparing to go offline must never read a half-finished pull as a warm image
+// (#269). A cache holding nothing but leftovers warns for the same reason.
+func imageCacheFinding(images []daemon.CacheImageEntry) (level, detail string) {
 	var imageBytes, allocatedBytes int64
+	usable, incomplete := 0, 0
 	for _, entry := range images {
+		if entry.Incomplete {
+			incomplete++
+			continue
+		}
+		usable++
 		imageBytes += entry.Size
 		allocatedBytes += entry.AllocatedSize
 	}
-	if allocatedBytes > 0 {
-		return fmt.Sprintf("image cache %d bytes (%d bytes on disk, %d image(s))", imageBytes, allocatedBytes, len(images))
+	counts := fmt.Sprintf("%d image(s)", usable)
+	if incomplete > 0 {
+		counts += fmt.Sprintf(", %d incomplete", incomplete)
 	}
-	return fmt.Sprintf("image cache %d bytes (%d image(s))", imageBytes, len(images))
+	level = "PASS"
+	if usable == 0 && incomplete > 0 {
+		level = "WARN"
+	}
+	if allocatedBytes > 0 {
+		return level, fmt.Sprintf("image cache %d bytes (%d bytes on disk, %s)", imageBytes, allocatedBytes, counts)
+	}
+	return level, fmt.Sprintf("image cache %d bytes (%s)", imageBytes, counts)
 }
 
 // guestAgentFinding reports the capability gate for clusters that baked

@@ -348,8 +348,8 @@ func TestHintsDoNotInferFlannelKubernetesReadiness(t *testing.T) {
 func TestHintsDescribeProvisioningInProgressAndExports(t *testing.T) {
 	status := ClusterStatus{
 		Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true},
-		ConfigManaged: true,
-		Nodes:         []NodeStatus{{Name: "demo-cp-1", Role: cluster.RoleControlPlane, Phase: PhaseConfigured}},
+		ConfigOrigin: cluster.OriginManaged,
+		Nodes:        []NodeStatus{{Name: "demo-cp-1", Role: cluster.RoleControlPlane, Phase: PhaseConfigured}},
 	}
 	joined := strings.Join(Hints(status), "\n")
 	for _, want := range []string{"provisioning is in progress", "tbx up; export TALOSCONFIG=~/.talosbox/clusters/demo/talosconfig", "KUBECONFIG=~/.talosbox/clusters/demo/kubeconfig"} {
@@ -364,12 +364,14 @@ func TestHintsDescribeProvisioningInProgressAndExports(t *testing.T) {
 func TestHintsRecoverImperativeProvisioningWithDestroyAndRecreate(t *testing.T) {
 	status := ClusterStatus{
 		Name: "qa-cil", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, CSI: cluster.CSILonghorn, LB: true},
-		Nodes: []NodeStatus{{Name: "qa-cil-cp-1", Role: cluster.RoleControlPlane, Phase: PhaseConfigured}},
+		ConfigOrigin: cluster.OriginImperative,
+		Nodes:        []NodeStatus{{Name: "qa-cil-cp-1", Role: cluster.RoleControlPlane, Phase: PhaseConfigured}},
 	}
 	joined := strings.Join(Hints(status), "\n")
 	for _, want := range []string{
 		"No talosbox.yaml backs this cluster",
-		"tbx cluster destroy qa-cil --force && tbx cluster create qa-cil --cni cilium --csi longhorn",
+		"tbx cluster destroy qa-cil --force",
+		"--cni cilium --csi longhorn",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("provisioning hint missing %q:\n%s", want, joined)
@@ -407,5 +409,87 @@ func TestFormatBootWindowRendersTheConstant(t *testing.T) {
 	}
 	if got := formatBootWindow(nodeBootWindow); got != "1 minute" {
 		t.Fatalf("formatBootWindow(nodeBootWindow) = %q, want the documented promise", got)
+	}
+}
+
+// A cluster.json written before the origin was recorded says nothing about
+// whether a talosbox.yaml backs it, so the hint must keep the `tbx up` wording
+// rather than telling a long-standing up user to destroy their cluster (#267).
+func TestProvisioningRecoveryHintKeepsUpWordingForUnknownOrigin(t *testing.T) {
+	status := ClusterStatus{
+		Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true},
+		Nodes: []NodeStatus{{Name: "demo-cp-1", Role: cluster.RoleControlPlane, Phase: PhaseConfigured}},
+	}
+	if got := provisioningRecoveryHint(status); got != "Rerun: tbx up" {
+		t.Fatalf("provisioningRecoveryHint(unknown origin) = %q, want the tbx up rerun", got)
+	}
+}
+
+// The imperative hint must not print a `tbx cluster create` line: status does
+// not carry node sizing, so a rendered command would rebuild a materially
+// different cluster after the destroy already happened (#267).
+func TestProvisioningRecoveryHintNamesRecordedIntentWithoutACreateCommand(t *testing.T) {
+	status := ClusterStatus{
+		Name:   "qa-cil",
+		Domain: "qa-cil.k8s.test",
+		ProvisioningIntent: cluster.ProvisioningIntent{
+			CNI: cluster.CNICilium, CSI: cluster.CSILonghorn, LB: false, Hubble: true,
+		},
+		BGP:          true,
+		ConfigOrigin: cluster.OriginImperative,
+		Nodes: []NodeStatus{
+			{Name: "qa-cil-cp-1", Role: cluster.RoleControlPlane},
+			{Name: "qa-cil-cp-2", Role: cluster.RoleControlPlane},
+			{Name: "qa-cil-cp-3", Role: cluster.RoleControlPlane},
+			{Name: "qa-cil-worker-1", Role: cluster.RoleWorker},
+			{Name: "qa-cil-worker-2", Role: cluster.RoleWorker},
+		},
+	}
+	got := provisioningRecoveryHint(status)
+	if strings.Contains(got, "tbx cluster create qa-cil") {
+		t.Fatalf("provisioningRecoveryHint() printed a lossy recreate command: %s", got)
+	}
+	for _, want := range []string{
+		"tbx cluster destroy qa-cil --force",
+		"--cni cilium", "--csi longhorn", "--lb=false", "--bgp", "--hubble",
+		"--cp 3", "--workers 2",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("provisioningRecoveryHint() missing %q: %s", want, got)
+		}
+	}
+	if strings.Contains(got, "--domain") {
+		t.Fatalf("provisioningRecoveryHint() named the default domain: %s", got)
+	}
+}
+
+// An explicit domain is part of the shape a recreate has to reproduce.
+func TestProvisioningRecoveryHintNamesAnExplicitDomain(t *testing.T) {
+	status := ClusterStatus{
+		Name: "demo", Domain: "demo.lab.internal",
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, LB: true},
+		ConfigOrigin:       cluster.OriginImperative,
+	}
+	if got := provisioningRecoveryHint(status); !strings.Contains(got, "--domain demo.lab.internal") {
+		t.Fatalf("provisioningRecoveryHint() missing the explicit domain: %s", got)
+	}
+}
+
+// The hint is written to be pasted, so a cluster name carrying shell
+// metacharacters must not escape into the destroy command.
+func TestProvisioningRecoveryHintQuotesClusterName(t *testing.T) {
+	status := ClusterStatus{
+		Name:               "demo; rm -rf ~",
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true},
+		ConfigOrigin:       cluster.OriginImperative,
+	}
+	if got := provisioningRecoveryHint(status); !strings.Contains(got, "tbx cluster destroy 'demo; rm -rf ~' --force") {
+		t.Fatalf("provisioningRecoveryHint() left the cluster name unquoted: %s", got)
+	}
+}
+
+func TestConvergenceHintQuotesClusterName(t *testing.T) {
+	if got := convergenceHint("demo; rm -rf ~"); !strings.Contains(got, "tbx status 'demo; rm -rf ~'") {
+		t.Fatalf("convergenceHint() left the cluster name unquoted: %s", got)
 	}
 }

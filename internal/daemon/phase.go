@@ -207,19 +207,54 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 // provisioningRecoveryHint names the recovery an unfinished provisioning pass
 // can actually take. `tbx up` needs a talosbox.yaml; a cluster created
 // imperatively has none, so pointing at up would dead-end and the honest path
-// is destroy and recreate (#267).
+// is destroy and recreate (#267). A cluster whose origin is unknown — created
+// by a tbx predating the recorded flag — keeps the `tbx up` wording: its file
+// may well be sitting right there, and guessing "imperative" would advise
+// destroying a cluster a later up could simply resume.
 func provisioningRecoveryHint(status ClusterStatus) string {
-	if status.ConfigManaged {
+	if status.ConfigOrigin != cluster.OriginImperative {
 		return "Rerun: tbx up"
 	}
-	recreate := fmt.Sprintf("tbx cluster create %s --cni %s", status.Name, status.CNI)
-	if status.CSI != "" {
-		recreate += fmt.Sprintf(" --csi %s", status.CSI)
-	}
+	// No concrete `tbx cluster create` line: status carries the intent but not
+	// the node sizing, so a rendered command would rebuild a materially
+	// different cluster after the destroy already happened. The recorded
+	// intent is named as an observation, not as the command to paste.
 	return fmt.Sprintf(
-		"No talosbox.yaml backs this cluster, so tbx up cannot resume it; recover with: tbx cluster destroy %s --force && %s",
-		status.Name, recreate,
+		"No talosbox.yaml backs this cluster, so tbx up cannot resume it; destroy it with: tbx cluster destroy %s --force, then recreate it with the tbx cluster create flags you used originally (recorded intent: %s; node sizing is not recorded here)",
+		shellquote.Quote(status.Name), recordedIntentFlags(status),
 	)
+}
+
+// recordedIntentFlags renders what the cluster's stored state actually knows
+// about how it was created, so the operator recreating it has the shape in
+// front of them instead of reconstructing it from memory.
+func recordedIntentFlags(status ClusterStatus) string {
+	flags := []string{fmt.Sprintf("--cni %s", status.CNI)}
+	if status.CSI != "" {
+		flags = append(flags, fmt.Sprintf("--csi %s", status.CSI))
+	}
+	if !status.LB {
+		flags = append(flags, "--lb=false")
+	}
+	if status.BGP {
+		flags = append(flags, "--bgp")
+	}
+	if status.Hubble {
+		flags = append(flags, "--hubble")
+	}
+	controlPlanes, workers := 0, 0
+	for _, node := range status.Nodes {
+		if node.Role == cluster.RoleControlPlane {
+			controlPlanes++
+			continue
+		}
+		workers++
+	}
+	flags = append(flags, fmt.Sprintf("--cp %d", controlPlanes), fmt.Sprintf("--workers %d", workers))
+	if status.Domain != "" && status.Domain != status.Name+"."+cluster.DefaultDomainSuffix {
+		flags = append(flags, fmt.Sprintf("--domain %s", status.Domain))
+	}
+	return strings.Join(flags, " ")
 }
 
 // splitStalledNodes separates nodes still inside their boot budget from the

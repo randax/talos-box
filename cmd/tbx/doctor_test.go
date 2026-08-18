@@ -644,7 +644,10 @@ func TestRunDoctorSkipsBothCacheChecksWhenDaemonIsUnavailable(t *testing.T) {
 	}
 }
 
-func TestRunDoctorFailsBothCacheChecksWhenCacheListFails(t *testing.T) {
+// A failed cache listing is one problem, not two: the mirror line owns the
+// health verdict and fails, and the informational image line skips rather than
+// repeating the same error as a second blocking failure (#269).
+func TestRunDoctorFailsOnlyMirrorHealthWhenCacheListFails(t *testing.T) {
 	deps := passingDoctorDependencies()
 	deps.listCache = func() (daemon.CacheListResult, error) {
 		return daemon.CacheListResult{}, errors.New("list cache: permission denied")
@@ -657,7 +660,7 @@ func TestRunDoctorFailsBothCacheChecksWhenCacheListFails(t *testing.T) {
 	}
 	for _, want := range []string{
 		"FAIL mirror-health: list cache: permission denied",
-		"FAIL image-cache: list cache: permission denied",
+		"SKIP image-cache: cache listing unavailable",
 	} {
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("output missing %q:\n%s", want, output.String())
@@ -967,5 +970,49 @@ func TestCheckRoutesDetectsCapturedSubnet(t *testing.T) {
 		if !strings.Contains(err.Error(), fragment) {
 			t.Errorf("error %q missing %q", err, fragment)
 		}
+	}
+}
+
+// `cache list` marks incomplete combinations so they are not mistaken for warm
+// images; doctor must draw the same line, or an interrupted pull reads as a
+// cached image right before the operator goes offline (#269).
+func TestRunDoctorCountsIncompleteImagesApart(t *testing.T) {
+	deps := passingDoctorDependencies()
+	deps.listCache = func() (daemon.CacheListResult, error) {
+		return daemon.CacheListResult{
+			Images: []daemon.CacheImageEntry{
+				{Schematic: "abc", Version: "v1.9.0", Architecture: "arm64", Size: 300, AllocatedSize: 120},
+				{Schematic: "def", Version: "v1.9.0", Architecture: "arm64", Size: 1900000000, Incomplete: true},
+			},
+		}, nil
+	}
+
+	var output strings.Builder
+	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
+		t.Fatalf("runDoctorWithDependencies() = %v", err)
+	}
+	if !strings.Contains(output.String(), "PASS image-cache: image cache 300 bytes (120 bytes on disk, 1 image(s), 1 incomplete)") {
+		t.Fatalf("output missing image cache line holding the incomplete entry apart:\n%s", output.String())
+	}
+}
+
+// Nothing bootable is cached, only leftovers a prune would reclaim: reporting
+// that as PASS is exactly the misreading #269 exists to prevent.
+func TestRunDoctorWarnsWhenOnlyIncompleteImagesAreCached(t *testing.T) {
+	deps := passingDoctorDependencies()
+	deps.listCache = func() (daemon.CacheListResult, error) {
+		return daemon.CacheListResult{
+			Images: []daemon.CacheImageEntry{
+				{Schematic: "def", Version: "v1.9.0", Architecture: "arm64", Size: 1900000000, Incomplete: true},
+			},
+		}, nil
+	}
+
+	var output strings.Builder
+	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
+		t.Fatalf("runDoctorWithDependencies() = %v", err)
+	}
+	if !strings.Contains(output.String(), "WARN image-cache: image cache 0 bytes (0 image(s), 1 incomplete)") {
+		t.Fatalf("output missing the incomplete-only warning:\n%s", output.String())
 	}
 }

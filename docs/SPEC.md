@@ -416,7 +416,10 @@ too (§7).
 `tbx status` is **state-aware**: alongside nodes/IPs/DNS names/LB pool/BGP state and the
 storage phase (provisioning → live, gated by the write/readback probe, §9) it appends
 copy-pasteable next-step hints keyed to observed state (maintenance node → the
-`talosctl --insecure` probe; provisioned clusters report convergence progress and a safe `tbx up` rerun; substrate-only clusters retain manual guidance).
+`talosctl --insecure` probe; provisioned clusters report convergence progress and the
+recovery that actually applies — a safe `tbx up` rerun for clusters a `talosbox.yaml` backs,
+and destroy-and-recreate guidance naming the recorded intent, never a fabricated `cluster
+create` line, for imperatively created ones; substrate-only clusters retain manual guidance).
 Hints **never execute anything**. `--quiet` suppresses hints and narration but keeps facts
 (schematic/extensions lines) and liveness (deadline preamble plus a periodic stderr heartbeat
 during blocking provisioning calls); all list/status commands support `-o json`.

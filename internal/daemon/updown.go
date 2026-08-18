@@ -413,8 +413,8 @@ func (s *Server) preflightUpWithStorage(
 		// this up onwards, whether it was created imperatively or by a tbx
 		// predating the flag: the file can rerun it, so its hints may say so
 		// (#267).
-		claimed := !item.ConfigManaged
-		item.ConfigManaged = true
+		claimed := item.ConfigOrigin != cluster.OriginManaged
+		item.ConfigOrigin = cluster.OriginManaged
 		if changed || claimed {
 			item.ProvisioningIntent = intent
 			updates = append(updates, intentUpdate{next: item})

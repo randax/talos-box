@@ -6,14 +6,21 @@ import (
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/shellquote"
 )
 
+// NodeBootTimeout bounds how long a create waits for the nodes it started to
+// answer. It is the stall observer's own threshold: a node still silent at 3×
+// the promised boot window is stuck, not slow (#288), and holding the request
+// past that point only trades one silence for another. It is exported because
+// the CLI states a create's deadline up front, and this wait runs before the
+// provisioning budget starts (#307).
+const NodeBootTimeout = nodeStallThreshold
+
 var (
-	// nodeBootTimeout bounds how long a create waits for the nodes it started
-	// to answer. It is the stall observer's own threshold: a node still silent
-	// at 3× the promised boot window is stuck, not slow (#288), and holding
-	// the request past that point only trades one silence for another.
-	nodeBootTimeout = nodeStallThreshold
+	// nodeBootTimeout is the budget the wait actually honours. A var so tests
+	// do not have to sleep through a real boot.
+	nodeBootTimeout = NodeBootTimeout
 	// nodeBootPollInterval is how often the wait re-probes. A var so tests do
 	// not have to sleep through a real boot.
 	nodeBootPollInterval = 2 * time.Second
@@ -72,8 +79,10 @@ func (s *Server) waitForNodesBooted(name string, progress stageFunc) string {
 			for _, node := range pending {
 				names = append(names, node.Name)
 			}
+			// The name is quoted: a cluster name may contain shell
+			// metacharacters, and this line invites a paste (SPEC §10).
 			return fmt.Sprintf("%d of %d node(s) had not answered after %s (%s); watch them with: tbx status %s",
-				len(pending), len(item.Nodes), formatBootWindow(nodeBootTimeout), strings.Join(names, ", "), item.Name)
+				len(pending), len(item.Nodes), formatBootWindow(nodeBootTimeout), strings.Join(names, ", "), shellquote.Quote(item.Name))
 		}
 		time.Sleep(nodeBootPollInterval)
 	}
