@@ -210,8 +210,16 @@ for disk in "$home/.talosbox/clusters/e2e"/*.img; do
   [[ $allocated -lt $apparent ]]
 done
 
+# The probe RPC is only a knock on the door: whether the node answers it or
+# rejects it as unimplemented, the maintenance API is serving and the harness
+# can move on to apply-config. See maintenance_api_reply_ready in the lib.
 maintenance_api_ready() {
-  talosctl version --nodes "$1" --insecure >/dev/null 2>&1
+  local output status=0
+  output=$(talosctl version --nodes "$1" --insecure 2>&1) || status=$?
+  if ((status == 0)); then
+    return 0
+  fi
+  maintenance_api_reply_ready "$output"
 }
 for node_ip in "${node_ips[@]}"; do
   retry "Talos maintenance API at $node_ip" 120 5 maintenance_api_ready "$node_ip"
