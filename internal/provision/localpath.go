@@ -62,6 +62,10 @@ func storageResultFromProbe(outcome StorageProbeOutcome, narration []string) Sto
 // provisioner through the host-side render/apply path.
 type LocalPathReconciler struct {
 	PollInterval time.Duration
+	// Lifecycle is the caller's lifetime, and bounds the storage probe's
+	// teardown — which deliberately outlives the reconcile's own context. Nil
+	// leaves the teardown bounded by its own timeout alone.
+	Lifecycle context.Context
 }
 
 func (r LocalPathReconciler) Reconcile(ctx context.Context, item cluster.Cluster, kubeconfig []byte) (StorageResult, error) {
@@ -83,7 +87,11 @@ func (r LocalPathReconciler) Reconcile(ctx context.Context, item cluster.Cluster
 // The outcome is returned rather than folded into an error: a pass the previous
 // teardown is still blocking is pending work, not a storage fault, and the
 // caller must be able to tell the two apart (#347).
-func ProbeLocalPathStorage(ctx context.Context, clusterName string, kubeconfig []byte, interval time.Duration) (StorageProbeOutcome, error) {
+//
+// lifecycle is the caller's own lifetime and bounds the probe's teardown, which
+// otherwise outlives ctx on purpose (see storageProbeCleanupContext). It may be
+// nil when the caller has no lifetime to answer to.
+func ProbeLocalPathStorage(ctx, lifecycle context.Context, clusterName string, kubeconfig []byte, interval time.Duration) (StorageProbeOutcome, error) {
 	config, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
 	if err != nil {
 		return StorageProbeOutcome{}, fmt.Errorf("parse kubeconfig for storage probe: %w", err)
@@ -109,6 +117,7 @@ func ProbeLocalPathStorage(ctx context.Context, clusterName string, kubeconfig [
 		ProbeImage:           localPathHelperImage,
 		Engine:               cluster.CSILocalPath,
 		ClusterName:          clusterName,
+		Lifecycle:            lifecycle,
 	}, interval)
 }
 
@@ -145,6 +154,7 @@ func (r LocalPathReconciler) reconcile(ctx context.Context, clusterName string, 
 		ProbeImage:           localPathHelperImage,
 		Engine:               cluster.CSILocalPath,
 		ClusterName:          clusterName,
+		Lifecycle:            r.Lifecycle,
 	}, r.PollInterval)
 	if err != nil {
 		return StorageResult{}, err

@@ -20,7 +20,12 @@ func (c cli) runBGP(args []string) error {
 	if err != nil {
 		return err
 	}
-	if len(positionals) != 2 || (positionals[0] != "enable" && positionals[0] != "disable") {
+	if len(positionals) > 0 && positionals[0] != "enable" && positionals[0] != "disable" {
+		// A mistyped verb is named rather than answered with the bare usage, the
+		// same way every other group answers one (#274).
+		return unknownVerbError("bgp", positionals[0])
+	}
+	if len(positionals) != 2 {
 		return errors.New(groupUsages["bgp"])
 	}
 	verb, name := positionals[0], positionals[1]

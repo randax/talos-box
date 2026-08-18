@@ -24,10 +24,11 @@ const (
 	// host was 7.3 GiB into an 8 GiB file. A swap footprint this large *is* the
 	// #84 corruption precondition: the pages are already out on disk and a
 	// second bringup's boot-time faults have to compete with paging them back.
-	// So it arms the rule on its own, without waiting for the kernel to still
-	// be reporting pressure — macOS drops back to normal as soon as the burst
-	// that filled the file ends, which is exactly the state #334 recorded at
-	// preflight.
+	// So it arms the rule without waiting for the kernel to still be reporting
+	// pressure — macOS drops back to normal as soon as the burst that filled the
+	// file ends, which is exactly the state #334 recorded at preflight. It does
+	// still ask one thing of the present: that RAM is scarce now too, see
+	// swapBlocksProvisionStart.
 	provisionStartSwapUsedBytes = 4 << 30
 )
 
@@ -47,6 +48,11 @@ type ProvisionStart struct {
 	// HostFreeMiB is host memory available right now. Zero means it could not
 	// be measured, and the headroom rule is then skipped rather than guessed.
 	HostFreeMiB int
+	// HostTotalMiB is the host's physical memory, the scale HostFreeMiB is read
+	// against: 8 GiB free is roomy on a 32 GiB host and nearly nothing on a
+	// 128 GiB one. Zero means it could not be measured, and the swap rule then
+	// stays armed rather than assume there is room.
+	HostTotalMiB int
 	// ReserveMiB is the balloon controller's host-memory reserve: the headroom
 	// it tries to keep free once it can act at all.
 	ReserveMiB int
@@ -77,15 +83,15 @@ type ProvisionStart struct {
 //     allocation burst of a second bringup. "Deep" is two readings, not one:
 //     the file must be at least provisionStartSwapUsedPercent full *and* the
 //     host must either still be off normal memory pressure or be carrying at
-//     least provisionStartSwapUsedBytes of swapped-out pages. macOS grows a
-//     swap file on demand and keeps it allocated long after the pressure that
-//     filled it cleared, so a small sticky swapfile at 82% of 2 GiB on a host
-//     with tens of gigabytes free and normal pressure says nothing about
-//     capacity (#231, #284) — but #334's 7.3 GiB of an 8 GiB file said
-//     everything even though the preflight host-pressure read came back PASS,
-//     which is why the absolute rule exists alongside the pressure one. An
-//     unmeasurable pressure reading counts as not-normal, the same way
-//     memoryFinding treats it.
+//     least provisionStartSwapUsedBytes of swapped-out pages while its free
+//     memory is scarce (provisionStartMemoryIsScarce). macOS grows a swap file
+//     on demand and keeps it allocated long after the pressure that filled it
+//     cleared, so a sticky swapfile on a host with tens of gigabytes free and
+//     normal pressure says nothing about capacity, at 2 GiB or at 8 (#231,
+//     #284) — but #334's 7.3 GiB of an 8 GiB file said everything even though
+//     the preflight host-pressure read came back PASS, which is why the
+//     absolute rule exists alongside the pressure one. An unmeasurable pressure
+//     reading counts as not-normal, the same way memoryFinding treats it.
 //
 // Both rules apply only while guests are already running, which is deliberate.
 // A lone cluster on an otherwise idle host is the case the balloon reserve and
@@ -137,7 +143,31 @@ func swapBlocksProvisionStart(in ProvisionStart) bool {
 	if in.Swap.TotalBytes == 0 || percentUsed(in.Swap) < provisionStartSwapUsedPercent {
 		return false
 	}
-	return in.MemoryPressure != MemoryPressureNormal || in.Swap.usedBytes() >= provisionStartSwapUsedBytes
+	if in.MemoryPressure != MemoryPressureNormal {
+		return true
+	}
+	return in.Swap.usedBytes() >= provisionStartSwapUsedBytes && provisionStartMemoryIsScarce(in)
+}
+
+// provisionStartMemoryIsScarce reads the absolute swap arm's second half. A
+// multi-GiB swap file next to mostly-free RAM and normal pressure is a macOS
+// artifact — the file was grown by some burst, never returned, and nothing is
+// competing for memory now — so refusing on it alone re-runs #231's false
+// positive at a larger file size: 8 GiB swapped out on a 64 GiB host with
+// 40 GiB free says nothing about whether the next guest can boot. The same
+// footprint while RAM is *also* scarce is live #84 pressure, which is the state
+// #334 recorded. Half the host is the line: below it the host has less memory
+// free than it has committed elsewhere, which is where a bringup's boot-time
+// faults start competing with the pages already out on disk.
+//
+// A host whose free or total memory could not be measured keeps the arm active:
+// the swap footprint alone is the older, blunter reading, and falling back to it
+// is the fail-safe direction.
+func provisionStartMemoryIsScarce(in ProvisionStart) bool {
+	if in.HostFreeMiB <= 0 || in.HostTotalMiB <= 0 {
+		return true
+	}
+	return in.HostFreeMiB*2 < in.HostTotalMiB
 }
 
 // provisionStartSwapArmedBy names which half of the swap rule fired, so the
@@ -147,7 +177,7 @@ func provisionStartSwapArmedBy(in ProvisionStart) string {
 		return "pressure is off normal, so"
 	}
 	return fmt.Sprintf(
-		"a swapped-out footprint at or past %.0f GiB only happens after sustained real pressure even when the kernel has since returned to normal, so",
+		"a swapped-out footprint at or past %.0f GiB with host memory this scarce only happens after sustained real pressure even when the kernel has since returned to normal, so",
 		gib(provisionStartSwapUsedBytes),
 	)
 }

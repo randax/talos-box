@@ -375,27 +375,81 @@ func TestStorageProbeWaitContextReservesTheResidueSlice(t *testing.T) {
 
 // A teardown must outlive the probe's own deadline — the objects it is deleting
 // are exactly what the next pass would otherwise trip over — but must not
-// outlive a cancelled lifecycle.
-func TestStorageProbeCleanupContextOutlivesADeadlineButNotACancel(t *testing.T) {
+// outlive a cancelled lifecycle. The two together are the case that used to
+// escape: a probe whose deadline had already latched left the teardown with no
+// path back to the lifecycle, so a shutdown had to wait the whole budget out.
+func TestStorageProbeCleanupContextOutlivesADeadlineButNotTheLifecycle(t *testing.T) {
 	shortenStorageProbeCleanup(t)
 
 	expired, expireCancel := context.WithTimeout(context.Background(), time.Nanosecond)
 	defer expireCancel()
 	<-expired.Done()
-	cleanupCtx, cleanupCancel := storageProbeCleanupContext(expired)
+
+	lifecycle, stopLifecycle := context.WithCancel(context.Background())
+	defer stopLifecycle()
+	cleanupCtx, cleanupCancel := storageProbeCleanupContext(expired, lifecycle)
 	defer cleanupCancel()
 	if err := cleanupCtx.Err(); err != nil {
 		t.Fatalf("cleanup context after an expired probe = %v, want a fresh teardown budget", err)
 	}
-
-	cancelled, cancel := context.WithCancel(context.Background())
-	cancelledCleanup, cancelledCleanupCancel := storageProbeCleanupContext(cancelled)
-	defer cancelledCleanupCancel()
-	cancel()
+	stopLifecycle()
 	select {
-	case <-cancelledCleanup.Done():
+	case <-cleanupCtx.Done():
 	case <-time.After(time.Second):
-		t.Fatal("cleanup context survived a cancelled lifecycle, so shutdown cannot stop the sweep")
+		t.Fatal("cleanup context survived a cancelled lifecycle, so shutdown cannot stop the teardown")
+	}
+
+	// No lifecycle to answer to: the teardown is bounded by its own timeout and
+	// nothing else, which is all a caller without a lifetime can offer.
+	detached, detachedCancel := storageProbeCleanupContext(expired, nil)
+	defer detachedCancel()
+	if err := detached.Err(); err != nil {
+		t.Fatalf("lifecycle-less cleanup context = %v, want a fresh teardown budget", err)
+	}
+	if _, ok := detached.Deadline(); !ok {
+		t.Fatal("lifecycle-less cleanup context has no deadline, so a stuck teardown never ends")
+	}
+}
+
+// The end-to-end shape of the same guarantee: a teardown running on a probe
+// context whose deadline has already expired still stops when the lifecycle is
+// cancelled, instead of holding a shutdown for the rest of its own budget.
+func TestStorageProbeTeardownStopsOnLifecycleCancelAfterTheProbeDeadline(t *testing.T) {
+	previousCleanup := storageProbeCleanupTimeout
+	previousResidue := storageProbeResidueTimeout
+	// Long enough that finishing inside the assertion window can only be the
+	// cancellation, never the budget running out.
+	storageProbeCleanupTimeout = 30 * time.Second
+	storageProbeResidueTimeout = 15 * time.Second
+	t.Cleanup(func() {
+		storageProbeCleanupTimeout = previousCleanup
+		storageProbeResidueTimeout = previousResidue
+	})
+	fixture := newStorageProbeStallFixture(t, true)
+
+	expired, expireCancel := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer expireCancel()
+	<-expired.Done()
+	lifecycle, stopLifecycle := context.WithCancel(context.Background())
+	defer stopLifecycle()
+	cleanupCtx, cleanupCancel := storageProbeCleanupContext(expired, lifecycle)
+	defer cleanupCancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- cleanupStorageProbe(cleanupCtx, fixture.clientset, fixture.dynamicClient, storageProbeSpec{
+			ExpectedStorageClass: localPathStorageClass,
+			Engine:               cluster.CSILocalPath,
+		})
+	}()
+	stopLifecycle()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cleanupStorageProbe() error = %v, want the cancelled lifecycle", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("teardown ignored the cancelled lifecycle, so shutdown waits out the whole cleanup budget")
 	}
 }
 

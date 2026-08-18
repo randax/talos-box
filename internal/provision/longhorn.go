@@ -51,6 +51,10 @@ var longhornNodeResource = schema.GroupVersionResource{Group: "longhorn.io", Ver
 // provisioning.
 type LonghornReconciler struct {
 	PollInterval time.Duration
+	// Lifecycle is the caller's lifetime, and bounds the storage probe's
+	// teardown — which deliberately outlives the reconcile's own context. Nil
+	// leaves the teardown bounded by its own timeout alone.
+	Lifecycle context.Context
 }
 
 func (r LonghornReconciler) Reconcile(ctx context.Context, item cluster.Cluster, kubeconfig []byte) (StorageResult, error) {
@@ -64,7 +68,11 @@ func (r LonghornReconciler) Reconcile(ctx context.Context, item cluster.Cluster,
 // ProbeLonghornStorage re-runs the shared default-StorageClass write/readback
 // probe without reinstalling Longhorn, keeping storage-live status tied to the
 // actual PVC data path after daemon restarts.
-func ProbeLonghornStorage(ctx context.Context, clusterName string, kubeconfig []byte, interval time.Duration) (StorageProbeOutcome, error) {
+//
+// lifecycle is the caller's own lifetime and bounds the probe's teardown, which
+// otherwise outlives ctx on purpose (see storageProbeCleanupContext). It may be
+// nil when the caller has no lifetime to answer to.
+func ProbeLonghornStorage(ctx, lifecycle context.Context, clusterName string, kubeconfig []byte, interval time.Duration) (StorageProbeOutcome, error) {
 	config, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
 	if err != nil {
 		return StorageProbeOutcome{}, fmt.Errorf("parse kubeconfig for storage probe: %w", err)
@@ -90,6 +98,7 @@ func ProbeLonghornStorage(ctx context.Context, clusterName string, kubeconfig []
 		ProbeImage:           localPathHelperImage,
 		Engine:               cluster.CSILonghorn,
 		ClusterName:          clusterName,
+		Lifecycle:            lifecycle,
 	}, interval)
 }
 
@@ -143,6 +152,7 @@ func (r LonghornReconciler) reconcile(ctx context.Context, config *rest.Config, 
 		ProbeImage:           localPathHelperImage,
 		Engine:               cluster.CSILonghorn,
 		ClusterName:          item.Name,
+		Lifecycle:            r.Lifecycle,
 	}, r.PollInterval)
 	if err != nil {
 		return StorageResult{}, err

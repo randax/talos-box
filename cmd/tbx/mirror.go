@@ -8,7 +8,12 @@ import (
 )
 
 func (c cli) runMirror(args []string) error {
-	if len(args) == 0 || args[0] != "offline" || len(args) > 2 {
+	if len(args) > 0 && args[0] != "offline" {
+		// A mistyped verb is named rather than answered with the bare usage, the
+		// same way every other group answers one (#274).
+		return unknownVerbError("mirror", args[0])
+	}
+	if len(args) == 0 || len(args) > 2 {
 		return errors.New(groupUsages["mirror"])
 	}
 

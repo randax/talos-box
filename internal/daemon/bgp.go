@@ -101,16 +101,29 @@ func (s *Server) beginBGPProvisionLocked(item cluster.Cluster) ([]provisionTask,
 	// fail on unrelated storage faults and hold the request for the storage
 	// budget, while the memo storage already established stayed perfectly good.
 	//
-	// Except when a provision is already in flight. Registering this pass
-	// cancels that one (beginProvisionTasksScopedLocked), and a scoped pass
-	// neither re-drives storage nor invalidates the memo — so a `tbx up`
-	// cancelled mid storage-install would never be resumed and the install
-	// would be stranded with nothing scheduled to finish it. Taking the full
-	// pass instead costs nothing on a cluster whose storage is already live,
-	// because that stage fast no-ops; the cost is borne exactly when storage
-	// work was genuinely running.
-	_, provisionInFlight := s.provisions[item.Name]
-	tasks := s.beginProvisionTasksScopedLocked([]cluster.Cluster{item}, !provisionInFlight)
+	// Except when the provision this one cancels was itself driving storage.
+	// Registering this pass cancels the in-flight one
+	// (beginProvisionTasksScopedLocked), and a scoped pass neither re-drives
+	// storage nor invalidates the memo — so a `tbx up` cancelled mid
+	// storage-install would never be resumed and the install would be stranded
+	// with nothing scheduled to finish it. Taking the full scope resumes it.
+	//
+	// That is the only case worth the widening, because the full scope is not
+	// free: this task is forced, and force bypasses tryFastNoopReconcile
+	// entirely (provisionCNI), so the storage reconciler re-renders, re-applies
+	// and re-probes unconditionally — on the request path, with the verb
+	// failing on any unrelated storage fault. A cancelled pass that was itself
+	// scoped (another BGP change) has no storage work to inherit, so this one
+	// stays scoped too.
+	//
+	// A full-scope pass that then fails at the CNI stage leaves storage exactly
+	// where any other failed provision does: the memo was invalidated at
+	// registration and the phase parked at `provisioning`, and once the task
+	// retires, refreshStoragePhases starts a status probe that can re-establish
+	// `live` on its own.
+	active, provisionInFlight := s.provisions[item.Name]
+	skipStorage := !provisionInFlight || active.skipStorage
+	tasks := s.beginProvisionTasksScopedLocked([]cluster.Cluster{item}, skipStorage)
 	for i := range tasks {
 		tasks[i].force = true
 	}

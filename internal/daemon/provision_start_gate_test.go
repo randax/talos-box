@@ -15,7 +15,8 @@ import (
 // GiB of an 8 GiB swap file used, and host pressure back to *normal* by the
 // time preflight read it — macOS keeps the file allocated long after the burst
 // that filled it ends, which is why the steady-state guard reported PASS and
-// the second create was admitted. The gate must refuse on the footprint alone.
+// the second create was admitted. The gate must refuse on the footprint plus a
+// scarce free-memory reading, without waiting for the kernel to agree.
 func nearlyFullSwap(string) (hostpressure.Snapshot, error) {
 	return hostpressure.Snapshot{
 		Swap:           hostpressure.Usage{TotalBytes: 8 << 30, AvailableBytes: 7 << 30 / 10},
@@ -84,12 +85,25 @@ func TestCheckProvisionStart(t *testing.T) {
 			pressure:       noHostPressure,
 		},
 		{
-			name:           "the #334 swap footprint refuses a second bringup with memory to spare (#334)",
+			// The incident shape: the footprint is out on disk *and* the host has
+			// less than half its RAM free, which is what separates live pressure
+			// from a swap file macOS never returned. plentifulHostMemory is the
+			// stubbed host total, so just under half of it is the scarce reading.
+			name:           "the #334 swap footprint refuses a second bringup while RAM is scarce (#334)",
+			clusterRunning: true,
+			addMiB:         2048,
+			freeMiB:        1<<19 - 1,
+			pressure:       nearlyFullSwap,
+			wantErr:        "host swap is 91% used",
+		},
+		{
+			// The same footprint with most of the host's RAM free is #231's stale
+			// swapfile at a larger size, and must not refuse a healthy create.
+			name:           "the same footprint alongside free RAM admits (#231)",
 			clusterRunning: true,
 			addMiB:         2048,
 			freeMiB:        1 << 20,
 			pressure:       nearlyFullSwap,
-			wantErr:        "host swap is 91% used",
 		},
 		{
 			name:           "a small sticky swapfile at normal pressure admits (#231)",

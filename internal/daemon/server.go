@@ -110,6 +110,10 @@ type activeProvision struct {
 	// Cancelling a reconcile only asks it to stop; an operation that is about
 	// to delete the cluster's files has to wait until it actually has (#334).
 	done chan struct{}
+	// skipStorage records the scope this pass was registered with, so an
+	// operation that supersedes it can tell whether cancelling it drops storage
+	// work nobody else would resume (see beginBGPProvisionLocked).
+	skipStorage bool
 }
 
 type activeStorageProbe struct {
@@ -117,7 +121,7 @@ type activeStorageProbe struct {
 	cancel     context.CancelFunc
 }
 
-// storageProbeOutcomeRecord is the last probe pass the daemon has to back off
+// storageProbeFailure is the last probe pass the daemon has to back off
 // from. It covers both reasons to back off: a pass that failed, and a pass that
 // never ran because the previous one's teardown was still finishing. Only the
 // second is benign, so the record says which — the backoff is the same, the
@@ -479,12 +483,19 @@ func (s *Server) dispatchDestroy(request Request) Response {
 	return success(data)
 }
 
-func (s *Server) lifecycleTimeoutContext(timeout time.Duration) (context.Context, context.CancelFunc) {
-	parent := s.lifecycleContext
-	if parent == nil {
-		parent = context.Background()
+// lifecycle is the daemon's own lifetime, safe to call on a Server a test
+// assembled without one. Work that must stop when the daemon does — but that
+// deliberately outlives the operation that started it, such as a storage
+// probe's teardown — hangs off this rather than off the operation's context.
+func (s *Server) lifecycle() context.Context {
+	if s.lifecycleContext == nil {
+		return context.Background()
 	}
-	return context.WithTimeout(parent, timeout)
+	return s.lifecycleContext
+}
+
+func (s *Server) lifecycleTimeoutContext(timeout time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(s.lifecycle(), timeout)
 }
 
 // dispatchCreate serializes a create against the cluster's other mutations for

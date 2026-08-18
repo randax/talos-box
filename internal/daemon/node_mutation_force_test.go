@@ -37,7 +37,7 @@ func convergedClusterForFastNoop(t *testing.T, name string) {
 		controlPlaneSchedulingProbe = originalScheduling
 	})
 	kubernetesReadyProbe = func(context.Context, []byte, []string) error { return nil }
-	storageConvergenceProbe = func(context.Context, cluster.Cluster, []byte) error { return nil }
+	storageConvergenceProbe = func(context.Context, context.Context, cluster.Cluster, []byte) error { return nil }
 	controlPlaneSchedulingProbe = func(context.Context, []byte, cluster.Cluster) error { return nil }
 }
 

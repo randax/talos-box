@@ -39,7 +39,9 @@ const (
 // Version 10 reconciles the CNI on bgp.enable/bgp.disable: the mode change
 // re-renders Cilium with the BGP control plane on or off, rolls its agents and
 // applies the matching announcement objects before answering, instead of moving
-// only the host speaker (#344).
+// only the host speaker (#344). It also adds the additive storagePending field
+// to cluster status, which separates a readiness probe the daemon's own cleanup
+// has not let run yet from one that failed (#347).
 const ProtocolVersion = 10
 
 // Request is one newline-delimited daemon request.

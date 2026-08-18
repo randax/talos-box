@@ -165,7 +165,7 @@ func (s *Server) beginProvisionTasksScopedLocked(items []cluster.Cluster, skipSt
 		s.provisionSequence++
 		ctx, cancel := context.WithCancel(s.lifecycleContext)
 		done := make(chan struct{})
-		s.provisions[item.Name] = activeProvision{generation: s.provisionSequence, cancel: cancel, done: done}
+		s.provisions[item.Name] = activeProvision{generation: s.provisionSequence, cancel: cancel, done: done, skipStorage: skipStorage}
 		tasks = append(tasks, provisionTask{item: item, ctx: ctx, generation: s.provisionSequence, action: -1, done: done, skipStorage: skipStorage})
 	}
 	return tasks
@@ -454,9 +454,9 @@ func (s *Server) provisionCNI(parent context.Context, item cluster.Cluster, forc
 	if !skipStorage {
 		switch item.CSI {
 		case cluster.CSILocalPath:
-			request.Storage = provision.LocalPathReconciler{PollInterval: time.Second}
+			request.Storage = provision.LocalPathReconciler{PollInterval: time.Second, Lifecycle: s.lifecycle()}
 		case cluster.CSILonghorn:
-			request.Storage = provision.LonghornReconciler{PollInterval: time.Second}
+			request.Storage = provision.LonghornReconciler{PollInterval: time.Second, Lifecycle: s.lifecycle()}
 		}
 	}
 	result, err := reconcile(ctx, request)
@@ -532,7 +532,7 @@ func (s *Server) provisioningComplete(item cluster.Cluster) bool {
 	if item.CSI != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), storageConvergenceTimeout)
 		defer cancel()
-		if storageConvergenceProbe(ctx, item, kubeconfig) != nil {
+		if storageConvergenceProbe(ctx, s.lifecycle(), item, kubeconfig) != nil {
 			return false
 		}
 	}
@@ -650,16 +650,19 @@ func storageProbePending(outcome provision.StorageProbeOutcome) error {
 	return fmt.Errorf("%w: %s", errStorageProbePending, strings.Join(outcome.Warnings, "; "))
 }
 
-func storageConverged(ctx context.Context, item cluster.Cluster, kubeconfig []byte) error {
+// storageConverged probes the data path for the fast no-op decision. lifecycle
+// is the daemon's own lifetime: the probe's teardown outlives ctx by design, so
+// it needs a lifetime that a daemon shutdown actually cuts short.
+func storageConverged(ctx, lifecycle context.Context, item cluster.Cluster, kubeconfig []byte) error {
 	switch item.CSI {
 	case cluster.CSILocalPath:
-		outcome, err := provision.ProbeLocalPathStorage(ctx, item.Name, kubeconfig, time.Second)
+		outcome, err := provision.ProbeLocalPathStorage(ctx, lifecycle, item.Name, kubeconfig, time.Second)
 		if err != nil {
 			return err
 		}
 		return storageProbePending(outcome)
 	case cluster.CSILonghorn:
-		outcome, err := provision.ProbeLonghornStorage(ctx, item.Name, kubeconfig, time.Second)
+		outcome, err := provision.ProbeLonghornStorage(ctx, lifecycle, item.Name, kubeconfig, time.Second)
 		if err != nil {
 			return err
 		}
@@ -808,13 +811,13 @@ func (s *Server) probeStorageStatus(parent context.Context, name string) error {
 		probe = func(ctx context.Context, kubeconfig []byte) error {
 			switch item.CSI {
 			case cluster.CSILocalPath:
-				outcome, err := provision.ProbeLocalPathStorage(ctx, item.Name, kubeconfig, time.Second)
+				outcome, err := provision.ProbeLocalPathStorage(ctx, s.lifecycle(), item.Name, kubeconfig, time.Second)
 				if err != nil {
 					return err
 				}
 				return storageProbePending(outcome)
 			case cluster.CSILonghorn:
-				outcome, err := provision.ProbeLonghornStorage(ctx, item.Name, kubeconfig, time.Second)
+				outcome, err := provision.ProbeLonghornStorage(ctx, s.lifecycle(), item.Name, kubeconfig, time.Second)
 				if err != nil {
 					return err
 				}

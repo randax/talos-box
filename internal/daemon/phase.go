@@ -367,8 +367,12 @@ func storageHint(status ClusterStatus) string {
 		}
 		if status.StoragePending != "" {
 			// Nothing failed: the probe is waiting on its own previous pass to
-			// finish clearing, so the wording stays "still working".
-			return fmt.Sprintf("storage provisioning: the CSI readiness probe has not run yet: %s; retrying after backoff.", status.StoragePending)
+			// finish clearing, so the wording stays "still working". The pending
+			// note itself is the probe's advisory, written for the verb that
+			// raised it — it says "cleanup is still finishing" a second time and
+			// sends the reader to `tbx status`, which is where they already are.
+			// The hint says it once, in status's own voice.
+			return "storage provisioning: the storage probe's cleanup from a previous pass is still finishing; the daemon retries automatically."
 		}
 		return "storage provisioning: waiting for the CSI readiness probe to pass."
 	case StoragePhaseLive:

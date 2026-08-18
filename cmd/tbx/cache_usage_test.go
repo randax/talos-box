@@ -62,7 +62,7 @@ func TestGroupCommandHelpDoesNotSwallowVerbs(t *testing.T) {
 // without a single valid verb to try (#274). The refusal now carries the
 // group's usage line, so the verb list is one place away from the mistake.
 func TestUnknownGroupVerbNamesTheValidVerbs(t *testing.T) {
-	for _, group := range []string{"cluster", "node", "cache", "snapshot", "system"} {
+	for _, group := range []string{"cluster", "node", "cache", "snapshot", "system", "bgp", "mirror"} {
 		var stdout, stderr bytes.Buffer
 		command := cli{out: &stdout, err: &stderr}
 		err := command.run([]string{group, "bogus"})

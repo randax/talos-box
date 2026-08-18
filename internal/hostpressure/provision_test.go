@@ -78,12 +78,48 @@ func TestAssessProvisionStart(t *testing.T) {
 			// state the incident was reported from.
 			name: "the #334 footprint refuses even after pressure returns to normal",
 			in: ProvisionStart{
-				RunningVMMiB: 18432, NewVMMiB: 6144, HostFreeMiB: 24576, ReserveMiB: reserve,
+				// The incident host: 32 GiB, 18 GiB of guests already resident and
+				// 7.3 GiB out on disk, which leaves about 10 GiB free at preflight
+				// — under half the host, so RAM is scarce alongside the swap.
+				RunningVMMiB: 18432, NewVMMiB: 6144, HostFreeMiB: 10240, HostTotalMiB: 32768, ReserveMiB: reserve,
 				Swap:           Usage{TotalBytes: 8 << 30, AvailableBytes: 7 << 30 / 10},
 				MemoryPressure: MemoryPressureNormal,
 			},
 			wantBlocks:  1,
 			wantDetails: []string{"host swap is 91% used", "7.3 GiB of 8.0 GiB", "sustained real pressure"},
+		},
+		{
+			// The same absolute footprint on a host with RAM to spare is the #231
+			// artifact at a larger file size: macOS grew the file during some past
+			// burst and never returned it, and nothing is competing for memory now.
+			name: "a large stale swapfile at normal pressure with free RAM admits (#231)",
+			in: ProvisionStart{
+				// 64 GiB host, 40 GiB free, an 8 GiB swapfile 85% used.
+				RunningVMMiB: 18432, NewVMMiB: 6144, HostFreeMiB: 40960, HostTotalMiB: 65536, ReserveMiB: reserve,
+				Swap:           Usage{TotalBytes: 8 << 30, AvailableBytes: 8 << 30 * 15 / 100},
+				MemoryPressure: MemoryPressureNormal,
+			},
+		},
+		{
+			// Fail-safe: without a free/total reading to contradict it, the
+			// footprint is the only evidence there is and it keeps the arm live.
+			name: "an unmeasurable free reading keeps the absolute swap arm armed",
+			in: ProvisionStart{
+				RunningVMMiB: 18432, NewVMMiB: 6144, HostFreeMiB: 0, HostTotalMiB: 65536, ReserveMiB: reserve,
+				Swap:           Usage{TotalBytes: 8 << 30, AvailableBytes: 8 << 30 * 15 / 100},
+				MemoryPressure: MemoryPressureNormal,
+			},
+			wantBlocks:  1,
+			wantDetails: []string{"host swap is 85% used"},
+		},
+		{
+			name: "an unmeasurable host total keeps the absolute swap arm armed",
+			in: ProvisionStart{
+				RunningVMMiB: 18432, NewVMMiB: 6144, HostFreeMiB: 40960, ReserveMiB: reserve,
+				Swap:           Usage{TotalBytes: 8 << 30, AvailableBytes: 8 << 30 * 15 / 100},
+				MemoryPressure: MemoryPressureNormal,
+			},
+			wantBlocks: 1,
 		},
 		{
 			name: "a small sticky swapfile under elevated pressure still refuses",

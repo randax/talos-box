@@ -207,7 +207,7 @@ func TestProvisionCNICiliumStorageDriftBypassesFastNoop(t *testing.T) {
 	})
 	kubernetesReadyProbe = func(context.Context, []byte, []string) error { return nil }
 	ciliumConvergenceProbe = func(context.Context, []byte, cluster.Cluster) error { return nil }
-	storageConvergenceProbe = func(context.Context, cluster.Cluster, []byte) error {
+	storageConvergenceProbe = func(context.Context, context.Context, cluster.Cluster, []byte) error {
 		return errors.New("storage probe failed")
 	}
 
@@ -644,12 +644,18 @@ func TestPendingStorageProbeBacksOffAndSurfacesTheAdvisory(t *testing.T) {
 	if !strings.Contains(next[0].StoragePending, "still terminating") {
 		t.Fatalf("storage pending = %q, want the probe's advisory", next[0].StoragePending)
 	}
+	// The hint says the wait once, in status's own voice: the pending note it
+	// stands for is the probe's advisory, which repeats itself and points back
+	// at `tbx status` — the output the reader is already looking at.
 	hint := storageHint(next[0])
-	if !strings.Contains(hint, "has not run yet") || !strings.Contains(hint, "still terminating") {
-		t.Fatalf("storage hint = %q, want the pending advisory rendered as work in progress", hint)
+	if !strings.Contains(hint, "still finishing") || !strings.Contains(hint, "retries automatically") {
+		t.Fatalf("storage hint = %q, want the pending wait rendered as work in progress", hint)
 	}
 	if strings.Contains(hint, "failed") {
 		t.Fatalf("storage hint = %q, want no failure wording for a benign wait", hint)
+	}
+	if strings.Contains(hint, "tbx status") || strings.Count(hint, "still finishing") != 1 {
+		t.Fatalf("storage hint = %q, want one non-self-referential sentence", hint)
 	}
 }
 

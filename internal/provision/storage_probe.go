@@ -35,6 +35,13 @@ type storageProbeSpec struct {
 	// ClusterName is only ever reported, never applied: the advisories this
 	// probe raises name the cluster whose status the operator should watch.
 	ClusterName string
+	// Lifecycle is the daemon's own lifetime, and it is what the teardown
+	// answers to instead of the probe's context. A teardown must survive the
+	// probe spending its budget — the objects are still there either way — but
+	// it must not survive the daemon being shut down. A nil Lifecycle (tests,
+	// any caller with no lifetime of its own) means the teardown simply detaches
+	// from the probe's cancellation.
+	Lifecycle context.Context
 }
 
 // StorageProbeOutcome reports what one probe pass established.
@@ -76,7 +83,7 @@ var storageProbeResidueTimeout = 15 * time.Second
 // It skips its own run instead, so nothing probes on top of a terminating PVC.
 func runStorageProbe(ctx context.Context, dynamicClient dynamic.Interface, mapper meta.RESTMapper, client kubernetes.Interface, spec storageProbeSpec, interval time.Duration) (outcome StorageProbeOutcome, err error) {
 	cleanup := func() error {
-		cleanupCtx, cleanupCancel := storageProbeCleanupContext(ctx)
+		cleanupCtx, cleanupCancel := storageProbeCleanupContext(ctx, spec.Lifecycle)
 		defer cleanupCancel()
 		return cleanupStorageProbe(cleanupCtx, client, dynamicClient, spec)
 	}
@@ -291,22 +298,21 @@ func waitForProbePod(ctx context.Context, client kubernetes.Interface, namespace
 }
 
 // storageProbeCleanupContext gives one teardown attempt its own
-// storageProbeCleanupTimeout while staying cancellable. It does not inherit
-// ctx's deadline — a probe that spent its own budget still has objects to tear
-// down, and the next pass would otherwise find residue it must skip over — but
-// an actually cancelled ctx (daemon shutdown, a superseded reconcile) cancels
-// the teardown with it, so no sweep outlives the lifecycle that started it.
-func storageProbeCleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), storageProbeCleanupTimeout)
-	stop := context.AfterFunc(ctx, func() {
-		if errors.Is(ctx.Err(), context.Canceled) {
-			cancel()
-		}
-	})
-	return cleanupCtx, func() {
-		stop()
-		cancel()
+// storageProbeCleanupTimeout, hung off the lifecycle rather than off the probe.
+// The teardown deliberately does not inherit ctx's cancellation or deadline: a
+// probe that spent its own budget, or one a newer reconcile superseded, still
+// has objects to tear down and the next pass would otherwise find residue it
+// must skip over. What it does answer to is the caller's lifecycle — the daemon
+// stopping — so a teardown never keeps a shutdown waiting out its full budget,
+// whichever way the probe itself ended. Without a lifecycle the teardown is
+// bounded only by its own timeout, which is the most a caller with no lifetime
+// to answer to can offer.
+func storageProbeCleanupContext(ctx context.Context, lifecycle context.Context) (context.Context, context.CancelFunc) {
+	parent := lifecycle
+	if parent == nil {
+		parent = context.WithoutCancel(ctx)
 	}
+	return context.WithTimeout(parent, storageProbeCleanupTimeout)
 }
 
 func cleanupStorageProbe(ctx context.Context, client kubernetes.Interface, dynamicClient dynamic.Interface, spec storageProbeSpec) error {

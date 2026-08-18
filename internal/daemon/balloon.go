@@ -145,6 +145,17 @@ func (s *Server) checkProvisionStart(path string, addMiB int, force bool) ([]str
 	if measured, err := measureFree(); err == nil {
 		freeMiB = measured
 	}
+	// The free reading only means something against the host's size, which is
+	// what tells a stale swap file on a roomy host from live pressure on a full
+	// one. An unreadable total leaves the swap rule armed on the footprint alone.
+	totalMiB := 0
+	measureTotal := s.hostTotalMemory
+	if measureTotal == nil {
+		measureTotal = balloon.HostTotalMiB
+	}
+	if measured, err := measureTotal(); err == nil {
+		totalMiB = measured
+	}
 	var swap hostpressure.Usage
 	pressure := hostpressure.MemoryPressureUnknown
 	if snapshot, err := s.pressureSnapshot(path); err == nil {
@@ -155,6 +166,7 @@ func (s *Server) checkProvisionStart(path string, addMiB int, force bool) ([]str
 		RunningVMMiB:   s.runningVMMemoryMiB(),
 		NewVMMiB:       addMiB,
 		HostFreeMiB:    freeMiB,
+		HostTotalMiB:   totalMiB,
 		ReserveMiB:     balloon.DefaultConfig().ReserveMiB,
 		Swap:           swap,
 		MemoryPressure: pressure,

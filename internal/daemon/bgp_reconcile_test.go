@@ -239,7 +239,7 @@ func TestBGPEnableLeavesStorageAlone(t *testing.T) {
 	storageProbes := 0
 	originalStorage := storageConvergenceProbe
 	t.Cleanup(func() { storageConvergenceProbe = originalStorage })
-	storageConvergenceProbe = func(context.Context, cluster.Cluster, []byte) error {
+	storageConvergenceProbe = func(context.Context, context.Context, cluster.Cluster, []byte) error {
 		storageProbes++
 		return nil
 	}
@@ -275,8 +275,8 @@ func TestBGPEnableDuringAnActiveProvisionKeepsStorageInScope(t *testing.T) {
 		requests = append(requests, request)
 		return provision.Result{}, nil
 	}
-	// A `tbx up` pass mid storage-install: registered, cancellable, nothing
-	// waiting on it yet.
+	// A `tbx up` pass mid storage-install: registered with storage in scope,
+	// cancellable, nothing waiting on it yet.
 	cancelled := false
 	service.opMu.Lock()
 	if service.provisions == nil {
@@ -302,6 +302,49 @@ func TestBGPEnableDuringAnActiveProvisionKeepsStorageInScope(t *testing.T) {
 	}
 	if requests[0].SkipStorage {
 		t.Fatalf("bgp.enable reconcile = %+v, want the storage stage back in scope after cancelling an active provision", requests[0])
+	}
+}
+
+// The widening is only for storage work nobody else would resume. A scoped
+// pass in flight — another BGP change — carries no storage stage to inherit,
+// and a forced full pass would re-render, re-apply and re-probe the storage
+// chart on the request path for nothing (#344).
+func TestBGPEnableDuringAScopedProvisionStillSkipsStorage(t *testing.T) {
+	service, item, _ := runningCiliumClusterForBGP(t, false)
+	service.storagePhases[item.Name] = StoragePhaseLive
+	var requests []provision.Request
+	service.provisionReconcile = func(_ context.Context, request provision.Request) (provision.Result, error) {
+		requests = append(requests, request)
+		return provision.Result{}, nil
+	}
+	cancelled := false
+	service.opMu.Lock()
+	if service.provisions == nil {
+		service.provisions = make(map[string]activeProvision)
+	}
+	service.provisions[item.Name] = activeProvision{
+		generation:  1,
+		cancel:      func() { cancelled = true },
+		skipStorage: true,
+	}
+	service.opMu.Unlock()
+
+	response := dispatchBGPRequest(t, service, "bgp.enable", item.Name)
+	if !response.OK {
+		t.Fatalf("bgp.enable failed: %s", response.Error)
+	}
+
+	if !cancelled {
+		t.Fatal("bgp.enable left the in-flight provision running, so this test proves nothing")
+	}
+	if len(requests) != 1 {
+		t.Fatalf("reconciles after bgp.enable = %d, want 1", len(requests))
+	}
+	if !requests[0].SkipStorage || requests[0].Storage != nil {
+		t.Fatalf("bgp.enable reconcile = %+v, want the storage stage still skipped", requests[0])
+	}
+	if service.storagePhases[item.Name] != StoragePhaseLive {
+		t.Fatalf("storage phase after bgp.enable = %q, want it untouched at %q", service.storagePhases[item.Name], StoragePhaseLive)
 	}
 }
 
