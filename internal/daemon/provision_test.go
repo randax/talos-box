@@ -646,16 +646,55 @@ func TestPendingStorageProbeBacksOffAndSurfacesTheAdvisory(t *testing.T) {
 	}
 	// The hint says the wait once, in status's own voice: the pending note it
 	// stands for is the probe's advisory, which repeats itself and points back
-	// at `tbx status` — the output the reader is already looking at.
+	// at `tbx status` — the output the reader is already looking at. What it
+	// does keep is the object the wait is on, which status has no other way of
+	// knowing.
 	hint := storageHint(next[0])
 	if !strings.Contains(hint, "still finishing") || !strings.Contains(hint, "retries automatically") {
 		t.Fatalf("storage hint = %q, want the pending wait rendered as work in progress", hint)
+	}
+	if !strings.Contains(hint, "(probe claim is still terminating)") {
+		t.Fatalf("storage hint = %q, want it to name the object that is still terminating", hint)
 	}
 	if strings.Contains(hint, "failed") {
 		t.Fatalf("storage hint = %q, want no failure wording for a benign wait", hint)
 	}
 	if strings.Contains(hint, "tbx status") || strings.Count(hint, "still finishing") != 1 {
 		t.Fatalf("storage hint = %q, want one non-self-referential sentence", hint)
+	}
+}
+
+// The pending note the daemon actually stores is the probe's whole advisory:
+// the marker's sentence, the probe's own repeat of it wrapped around the
+// object, the deadline the wait hit, and a pointer back at `tbx status`. The
+// hint keeps the object and drops the rest.
+func TestStorageHintKeepsOnlyTheTerminatingObjectFromThePendingAdvisory(t *testing.T) {
+	status := ClusterStatus{
+		Name: "demo", Running: true, KubernetesReady: true,
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILocalPath},
+		StoragePhase:       StoragePhaseProvisioning,
+		StoragePending: "storage probe skipped while the previous probe's cleanup is still finishing: " +
+			`storage probe cleanup is still finishing (storage probe PVC "storage-probe" is still terminating: context deadline exceeded);` +
+			" the daemon keeps reconciling it — watch it with: tbx status demo",
+	}
+	hint := storageHint(status)
+	if !strings.Contains(hint, `(storage probe PVC "storage-probe" is still terminating)`) {
+		t.Fatalf("storage hint = %q, want the terminating object named once, without the deadline", hint)
+	}
+	for _, unwanted := range []string{"tbx status", "context deadline exceeded", "`"} {
+		if strings.Contains(hint, unwanted) {
+			t.Fatalf("storage hint = %q, want it to drop %q", hint, unwanted)
+		}
+	}
+	if strings.Count(hint, "still finishing") != 1 {
+		t.Fatalf("storage hint = %q, want one non-repeating sentence", hint)
+	}
+	// A pending note with nothing but the marker's own sentence leaves the hint
+	// as it was rather than trailing an empty parenthetical.
+	bare := status
+	bare.StoragePending = errStorageProbePending.Error()
+	if got := storageHint(bare); !strings.HasSuffix(got, "is still finishing; the daemon retries automatically.") {
+		t.Fatalf("storage hint without a detail = %q, want the plain sentence", got)
 	}
 }
 
@@ -819,8 +858,13 @@ func runningLonghornClusterForNodeMutation(t *testing.T, controlPlanes, workers 
 		storageStatusProbes:  make(map[string]activeStorageProbe),
 		storageProbeFailures: make(map[string]storageProbeFailure),
 		hostPressure:         noHostPressure,
-		subnetSources:        emptySubnetSources(),
-		defaultSchematic:     "curated-default",
+		// The start gate is not this fixture's subject, so the host it reads is
+		// pinned rather than measured: a runner short on free RAM must not turn
+		// a topology or schematic test into a headroom refusal.
+		hostFreeMemory:   plentifulHostMemory,
+		hostTotalMemory:  plentifulHostMemory,
+		subnetSources:    emptySubnetSources(),
+		defaultSchematic: "curated-default",
 		// no test reaches a real API server: the Kubernetes node deletion is
 		// stubbed out by default and overridden where it is the subject
 		deleteKubernetesNode: func(context.Context, cluster.Cluster, string) error { return nil },

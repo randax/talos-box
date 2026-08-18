@@ -252,10 +252,10 @@ type ClusterStatus struct {
 	// clearing the previous pass's objects. It reads as work in progress, so
 	// the operator is not shown a fault for a wait the daemon converges out of
 	// on its own (#347).
-	StoragePending string `json:"storagePending,omitempty"`
-	VIP             string       `json:"vip,omitempty"`
-	VIPLive         bool         `json:"vipLive"`
-	Nodes           []NodeStatus `json:"nodes"`
+	StoragePending string       `json:"storagePending,omitempty"`
+	VIP            string       `json:"vip,omitempty"`
+	VIPLive        bool         `json:"vipLive"`
+	Nodes          []NodeStatus `json:"nodes"`
 	// Capabilities reports the host capabilities this cluster's configuration
 	// depends on, so a file stays portable across host substrates and the gate
 	// is visible instead of silently doing nothing.

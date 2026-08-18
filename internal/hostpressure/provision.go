@@ -156,9 +156,12 @@ func swapBlocksProvisionStart(in ProvisionStart) bool {
 // positive at a larger file size: 8 GiB swapped out on a 64 GiB host with
 // 40 GiB free says nothing about whether the next guest can boot. The same
 // footprint while RAM is *also* scarce is live #84 pressure, which is the state
-// #334 recorded. Half the host is the line: below it the host has less memory
-// free than it has committed elsewhere, which is where a bringup's boot-time
-// faults start competing with the pages already out on disk.
+// #334 recorded. Half the host is the line, and it is a narrow one by design:
+// this rule only ever runs with guests already resident, which is usually
+// enough on its own to put free memory below half. What the check therefore
+// buys is the one case that would otherwise be refused — a large stale swap
+// file while most of RAM is still genuinely free — and once guests have claimed
+// half the host it stands aside and the absolute arm decides.
 //
 // A host whose free or total memory could not be measured keeps the arm active:
 // the swap footprint alone is the older, blunter reading, and falling back to it

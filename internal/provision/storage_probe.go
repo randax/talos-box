@@ -298,21 +298,50 @@ func waitForProbePod(ctx context.Context, client kubernetes.Interface, namespace
 }
 
 // storageProbeCleanupContext gives one teardown attempt its own
-// storageProbeCleanupTimeout, hung off the lifecycle rather than off the probe.
-// The teardown deliberately does not inherit ctx's cancellation or deadline: a
-// probe that spent its own budget, or one a newer reconcile superseded, still
-// has objects to tear down and the next pass would otherwise find residue it
-// must skip over. What it does answer to is the caller's lifecycle — the daemon
-// stopping — so a teardown never keeps a shutdown waiting out its full budget,
-// whichever way the probe itself ended. Without a lifecycle the teardown is
-// bounded only by its own timeout, which is the most a caller with no lifetime
-// to answer to can offer.
+// storageProbeCleanupTimeout on a base detached from ctx, then hangs two
+// watchers off it. Three rows, one per way the probe can end:
+//
+//   - ctx hit its DEADLINE: the teardown continues on its fresh budget. The
+//     probe spent its own time, but the objects it created still have to go or
+//     the next pass finds residue it must skip over (#347).
+//   - ctx was CANCELLED — a newer reconcile superseded this one, the storage
+//     phase was invalidated, or a destroy/drain is tearing the cluster down:
+//     the teardown dies promptly. Its objects have fixed names, so a superseded
+//     teardown would otherwise delete the very probe objects the superseding
+//     pass is creating, and drain/destroy would wait out the whole budget for a
+//     teardown nobody is waiting on.
+//   - lifecycle cancelled (daemon shutting down): the teardown dies promptly,
+//     whichever way the probe itself ended.
+//
+// The probe watcher fires for both endings and cancels only for the cancelled
+// one, so a latched deadline makes it a no-op — which is right, because the
+// lifecycle watcher still covers a shutdown that arrives afterwards. Without a
+// lifecycle the teardown answers to its own timeout and to ctx's cancellation,
+// which is the most a caller with no lifetime to offer can be given.
 func storageProbeCleanupContext(ctx context.Context, lifecycle context.Context) (context.Context, context.CancelFunc) {
-	parent := lifecycle
-	if parent == nil {
-		parent = context.WithoutCancel(ctx)
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), storageProbeCleanupTimeout)
+	stops := []func() bool{context.AfterFunc(ctx, func() {
+		if storageProbeContextWasCancelled(ctx) {
+			cancel()
+		}
+	})}
+	if lifecycle != nil {
+		stops = append(stops, context.AfterFunc(lifecycle, cancel))
 	}
-	return context.WithTimeout(parent, storageProbeCleanupTimeout)
+	return cleanupCtx, func() {
+		for _, stop := range stops {
+			stop()
+		}
+		cancel()
+	}
+}
+
+// storageProbeContextWasCancelled tells the cancelled ending from the expired
+// one. Err is the reading that separates them — Canceled for either kind of
+// cancel, DeadlineExceeded for a latched deadline — and Cause is consulted as
+// well so a cause that only wraps Canceled still reads as cancelled.
+func storageProbeContextWasCancelled(ctx context.Context) bool {
+	return errors.Is(ctx.Err(), context.Canceled) || errors.Is(context.Cause(ctx), context.Canceled)
 }
 
 func cleanupStorageProbe(ctx context.Context, client kubernetes.Interface, dynamicClient dynamic.Interface, spec storageProbeSpec) error {

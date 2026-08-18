@@ -89,8 +89,9 @@ func (r LocalPathReconciler) Reconcile(ctx context.Context, item cluster.Cluster
 // caller must be able to tell the two apart (#347).
 //
 // lifecycle is the caller's own lifetime and bounds the probe's teardown, which
-// otherwise outlives ctx on purpose (see storageProbeCleanupContext). It may be
-// nil when the caller has no lifetime to answer to.
+// outlives an *expired* ctx on purpose but still dies with a cancelled one (see
+// storageProbeCleanupContext). It may be nil when the caller has no lifetime to
+// answer to.
 func ProbeLocalPathStorage(ctx, lifecycle context.Context, clusterName string, kubeconfig []byte, interval time.Duration) (StorageProbeOutcome, error) {
 	config, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
 	if err != nil {

@@ -127,6 +127,18 @@ func (s *Server) checkHostPressure(path string, force bool) ([]string, error) {
 	return applyPressureFindings(hostpressure.Assess(snapshot), force)
 }
 
+// The host readings a Server falls back to when it was built without its own
+// probes — every production Server sets all three in newServer, so the fallback
+// only ever answers a Server assembled field by field. They are variables so
+// the package's tests can pin them: a gate that reads the real machine turns
+// every test that merely passes through it into a test of the runner's spare
+// RAM.
+var (
+	measureHostFreeMiB  = balloon.HostFreeMiB
+	measureHostTotalMiB = balloon.HostTotalMiB
+	measureHostPressure = hostpressure.SystemSnapshot
+)
+
 // checkProvisionStart gates the *start* of new guests on the host as measured
 // right now (#334). checkOvercommit only compares configured memory against
 // total RAM, and checkHostPressure only judges the host as it stands; neither
@@ -140,7 +152,7 @@ func (s *Server) checkProvisionStart(path string, addMiB int, force bool) ([]str
 	freeMiB := 0
 	measureFree := s.hostFreeMemory
 	if measureFree == nil {
-		measureFree = balloon.HostFreeMiB
+		measureFree = measureHostFreeMiB
 	}
 	if measured, err := measureFree(); err == nil {
 		freeMiB = measured
@@ -151,7 +163,7 @@ func (s *Server) checkProvisionStart(path string, addMiB int, force bool) ([]str
 	totalMiB := 0
 	measureTotal := s.hostTotalMemory
 	if measureTotal == nil {
-		measureTotal = balloon.HostTotalMiB
+		measureTotal = measureHostTotalMiB
 	}
 	if measured, err := measureTotal(); err == nil {
 		totalMiB = measured
@@ -214,7 +226,7 @@ func (s *Server) runningVMMemoryMiB() int {
 func (s *Server) pressureSnapshot(path string) (hostpressure.Snapshot, error) {
 	measure := s.hostPressure
 	if measure == nil {
-		measure = hostpressure.SystemSnapshot
+		measure = measureHostPressure
 	}
 	return measure(path)
 }

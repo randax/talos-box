@@ -92,8 +92,8 @@ type rawCluster struct {
 	ControlPlanes                   *int   `yaml:"controlPlanes"`
 	Workers                         *int   `yaml:"workers"`
 	cluster.ProvisioningIntentInput `yaml:",inline"`
-	Domain                          string   `yaml:"domain"`
-	AllowUnsafeDomain               bool     `yaml:"allowUnsafeDomain"`
+	Domain                          string    `yaml:"domain"`
+	AllowUnsafeDomain               bool      `yaml:"allowUnsafeDomain"`
 	Node                            rawNode   `yaml:"node"`
 	ControlPlane                    *rawNode  `yaml:"controlPlane"`
 	Worker                          *rawNode  `yaml:"worker"`
