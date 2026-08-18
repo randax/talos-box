@@ -263,6 +263,48 @@ func TestBGPEnableLeavesStorageAlone(t *testing.T) {
 	}
 }
 
+// Registering the BGP pass cancels whatever provision was already running, so
+// a scoped pass would strand an in-flight storage install: nothing re-drives it
+// and the memo it never reached stays as it was. When something is genuinely in
+// flight the BGP pass therefore takes the full scope and carries the storage
+// stage itself.
+func TestBGPEnableDuringAnActiveProvisionKeepsStorageInScope(t *testing.T) {
+	service, item, _ := runningCiliumClusterForBGP(t, false)
+	var requests []provision.Request
+	service.provisionReconcile = func(_ context.Context, request provision.Request) (provision.Result, error) {
+		requests = append(requests, request)
+		return provision.Result{}, nil
+	}
+	// A `tbx up` pass mid storage-install: registered, cancellable, nothing
+	// waiting on it yet.
+	cancelled := false
+	service.opMu.Lock()
+	if service.provisions == nil {
+		service.provisions = make(map[string]activeProvision)
+	}
+	service.provisions[item.Name] = activeProvision{
+		generation: 1,
+		cancel:     func() { cancelled = true },
+		done:       nil,
+	}
+	service.opMu.Unlock()
+
+	response := dispatchBGPRequest(t, service, "bgp.enable", item.Name)
+	if !response.OK {
+		t.Fatalf("bgp.enable failed: %s", response.Error)
+	}
+
+	if !cancelled {
+		t.Fatal("bgp.enable left the in-flight provision running, so this test proves nothing")
+	}
+	if len(requests) != 1 {
+		t.Fatalf("reconciles after bgp.enable = %d, want 1", len(requests))
+	}
+	if requests[0].SkipStorage {
+		t.Fatalf("bgp.enable reconcile = %+v, want the storage stage back in scope after cancelling an active provision", requests[0])
+	}
+}
+
 // Disabling on a cluster whose Kubernetes side never announced over BGP is a
 // host-side withdrawal and nothing else: there are no BGP objects to remove, so
 // forcing a full reconcile only exposes the verb to unrelated failures.

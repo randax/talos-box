@@ -11,12 +11,25 @@ import (
 	"github.com/randax/talos-box/internal/hostpressure"
 )
 
-// nearlyFullSwap is the #334 reading: 7.3 GiB of an 8 GiB swap file used with
-// the kernel reporting degraded pressure under the concurrent bringup, which
-// the steady-state guard still passed because it judges the host as it stands.
+// nearlyFullSwap is the #334 reading exactly as the incident records it: 7.3
+// GiB of an 8 GiB swap file used, and host pressure back to *normal* by the
+// time preflight read it — macOS keeps the file allocated long after the burst
+// that filled it ends, which is why the steady-state guard reported PASS and
+// the second create was admitted. The gate must refuse on the footprint alone.
 func nearlyFullSwap(string) (hostpressure.Snapshot, error) {
 	return hostpressure.Snapshot{
 		Swap:           hostpressure.Usage{TotalBytes: 8 << 30, AvailableBytes: 7 << 30 / 10},
+		MemoryPressure: hostpressure.MemoryPressureNormal,
+	}, nil
+}
+
+// elevatedPressureSmallSwap is the other half of the rule: a swapped-out
+// footprint far too small to condemn a host on its own, on a kernel that is
+// still reporting pressure. The percentage ceiling plus the live pressure
+// reading is enough there.
+func elevatedPressureSmallSwap(string) (hostpressure.Snapshot, error) {
+	return hostpressure.Snapshot{
+		Swap:           hostpressure.Usage{TotalBytes: 2 << 30, AvailableBytes: 2 << 30 * 18 / 100},
 		MemoryPressure: hostpressure.MemoryPressureWarning,
 	}, nil
 }
@@ -71,7 +84,7 @@ func TestCheckProvisionStart(t *testing.T) {
 			pressure:       noHostPressure,
 		},
 		{
-			name:           "nearly full swap under degraded pressure refuses a second bringup with memory to spare",
+			name:           "the #334 swap footprint refuses a second bringup with memory to spare (#334)",
 			clusterRunning: true,
 			addMiB:         2048,
 			freeMiB:        1 << 20,
@@ -84,6 +97,14 @@ func TestCheckProvisionStart(t *testing.T) {
 			addMiB:         2048,
 			freeMiB:        1 << 20,
 			pressure:       smallStickySwapfile,
+		},
+		{
+			name:           "a small sticky swapfile under elevated pressure refuses",
+			clusterRunning: true,
+			addMiB:         2048,
+			freeMiB:        1 << 20,
+			pressure:       elevatedPressureSmallSwap,
+			wantErr:        "host swap is 82% used",
 		},
 		{
 			name:           "sticky swap on an idle host still admits (#231)",
@@ -139,6 +160,21 @@ func TestCheckProvisionStart(t *testing.T) {
 				t.Fatalf("checkProvisionStart() warnings = %q, want %q", warnings, test.wantWarning)
 			}
 		})
+	}
+}
+
+// The refusal names how much guest memory is already resident, and an operator
+// has to be able to re-derive that number. A partly-running cluster's stopped
+// members are not resident, so counting the whole cluster would overstate it.
+func TestRunningVMMemoryCountsOnlyRunningNodes(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 2)
+	if got, want := service.runningVMMemoryMiB(), clusterMemoryMiB(item); got != want {
+		t.Fatalf("runningVMMemoryMiB() = %d, want %d for a fully running cluster", got, want)
+	}
+	delete(service.vms[item.Name], "demo-worker-2")
+	stopped := item.DefaultsFor(cluster.RoleWorker).MemoryMiB
+	if got, want := service.runningVMMemoryMiB(), clusterMemoryMiB(item)-stopped; got != want {
+		t.Fatalf("runningVMMemoryMiB() = %d, want %d once one member is stopped", got, want)
 	}
 }
 

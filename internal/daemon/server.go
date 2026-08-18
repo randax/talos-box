@@ -117,9 +117,18 @@ type activeStorageProbe struct {
 	cancel     context.CancelFunc
 }
 
+// storageProbeOutcomeRecord is the last probe pass the daemon has to back off
+// from. It covers both reasons to back off: a pass that failed, and a pass that
+// never ran because the previous one's teardown was still finishing. Only the
+// second is benign, so the record says which — the backoff is the same, the
+// text the operator sees is not.
 type storageProbeFailure struct {
 	message string
 	at      time.Time
+	// pending marks the benign case: nothing is wrong, the daemon is still
+	// clearing the previous pass's objects. Reporting it as StorageError would
+	// tell the operator their storage stack failed a readiness probe.
+	pending bool
 }
 
 type lockedListener struct {

@@ -100,7 +100,17 @@ func (s *Server) beginBGPProvisionLocked(item cluster.Cluster) ([]provisionTask,
 	// chart and its write/readback probe into the forced pass made `bgp enable`
 	// fail on unrelated storage faults and hold the request for the storage
 	// budget, while the memo storage already established stayed perfectly good.
-	tasks := s.beginProvisionTasksScopedLocked([]cluster.Cluster{item}, true)
+	//
+	// Except when a provision is already in flight. Registering this pass
+	// cancels that one (beginProvisionTasksScopedLocked), and a scoped pass
+	// neither re-drives storage nor invalidates the memo — so a `tbx up`
+	// cancelled mid storage-install would never be resumed and the install
+	// would be stranded with nothing scheduled to finish it. Taking the full
+	// pass instead costs nothing on a cluster whose storage is already live,
+	// because that stage fast no-ops; the cost is borne exactly when storage
+	// work was genuinely running.
+	_, provisionInFlight := s.provisions[item.Name]
+	tasks := s.beginProvisionTasksScopedLocked([]cluster.Cluster{item}, !provisionInFlight)
 	for i := range tasks {
 		tasks[i].force = true
 	}

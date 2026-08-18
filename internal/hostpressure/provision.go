@@ -15,6 +15,20 @@ const (
 	// exists only on the provision-start path, only while guests are already
 	// running, and must not be folded back into Assess.
 	provisionStartSwapUsedPercent = 80
+
+	// provisionStartSwapUsedBytes is the absolute companion to the percentage.
+	// The percentage alone cannot tell a 2 GiB dynamic swapfile that macOS grew
+	// once and never released from the multi-GiB file a host only ever ends up
+	// with after sustained real pressure — 82% of 2 GiB is 1.7 GiB, which is
+	// noise on a host with tens of gigabytes free (#231, #284), while #334's
+	// host was 7.3 GiB into an 8 GiB file. A swap footprint this large *is* the
+	// #84 corruption precondition: the pages are already out on disk and a
+	// second bringup's boot-time faults have to compete with paging them back.
+	// So it arms the rule on its own, without waiting for the kernel to still
+	// be reporting pressure — macOS drops back to normal as soon as the burst
+	// that filled the file ends, which is exactly the state #334 recorded at
+	// preflight.
+	provisionStartSwapUsedBytes = 4 << 30
 )
 
 // ProvisionStart is the host state measured at guest-start admission, plus the
@@ -59,15 +73,19 @@ type ProvisionStart struct {
 //   - Headroom: the binding constraint is measured free memory, not the
 //     configured ceiling. Starting NewVMMiB must leave at least the balloon
 //     reserve free.
-//   - Swap: a host already deep into its swap file, *and* not reporting normal
-//     memory pressure, cannot absorb the allocation burst of a second bringup.
-//     Both halves are needed: macOS grows a swap file on demand and keeps it
-//     allocated long after the pressure that filled it cleared, so a small
-//     sticky swapfile at 82% on a host with tens of gigabytes free and normal
-//     pressure says nothing about capacity (#231, #284) — while the #334
-//     reading (91% used, pressure degraded during a concurrent bringup) says
-//     everything. An unmeasurable pressure reading counts as not-normal, the
-//     same way memoryFinding treats it.
+//   - Swap: a host already deep into its swap file cannot absorb the
+//     allocation burst of a second bringup. "Deep" is two readings, not one:
+//     the file must be at least provisionStartSwapUsedPercent full *and* the
+//     host must either still be off normal memory pressure or be carrying at
+//     least provisionStartSwapUsedBytes of swapped-out pages. macOS grows a
+//     swap file on demand and keeps it allocated long after the pressure that
+//     filled it cleared, so a small sticky swapfile at 82% of 2 GiB on a host
+//     with tens of gigabytes free and normal pressure says nothing about
+//     capacity (#231, #284) — but #334's 7.3 GiB of an 8 GiB file said
+//     everything even though the preflight host-pressure read came back PASS,
+//     which is why the absolute rule exists alongside the pressure one. An
+//     unmeasurable pressure reading counts as not-normal, the same way
+//     memoryFinding treats it.
 //
 // Both rules apply only while guests are already running, which is deliberate.
 // A lone cluster on an otherwise idle host is the case the balloon reserve and
@@ -95,20 +113,43 @@ func AssessProvisionStart(in ProvisionStart) []Finding {
 			})
 		}
 	}
-	if in.Swap.TotalBytes > 0 && percentUsed(in.Swap) >= provisionStartSwapUsedPercent &&
-		in.MemoryPressure != MemoryPressureNormal {
+	if swapBlocksProvisionStart(in) {
 		findings = append(findings, Finding{
 			Severity: SeverityBlock,
 			Detail: fmt.Sprintf(
-				"host swap is %d%% used (%.1f GiB free of %.1f GiB) and memory pressure is %s, with %d MiB of guests already running;"+
-					" the %d MiB about to boot has nowhere to go, and %s",
-				percentUsed(in.Swap), gib(in.Swap.AvailableBytes), gib(in.Swap.TotalBytes), provisionStartPressureLabel(in.MemoryPressure),
-				in.RunningVMMiB, in.NewVMMiB, memoryConsequence,
+				"host swap is %d%% used (%.1f GiB of %.1f GiB, at or past the %d%% ceiling) with memory pressure %s and %d MiB of guests already running;"+
+					" %s the %d MiB about to boot has nowhere to go, and %s",
+				percentUsed(in.Swap), gib(in.Swap.usedBytes()), gib(in.Swap.TotalBytes), provisionStartSwapUsedPercent,
+				provisionStartPressureLabel(in.MemoryPressure), in.RunningVMMiB,
+				provisionStartSwapArmedBy(in), in.NewVMMiB, memoryConsequence,
 			),
 			Remedy: memoryRemedy,
 		})
 	}
 	return findings
+}
+
+// swapBlocksProvisionStart applies the swap rule's two-reading test: a swap
+// file at or past the percentage ceiling, armed either by the kernel still
+// reporting non-normal pressure or by the swapped-out footprint being large
+// enough to be a bringup hazard on its own.
+func swapBlocksProvisionStart(in ProvisionStart) bool {
+	if in.Swap.TotalBytes == 0 || percentUsed(in.Swap) < provisionStartSwapUsedPercent {
+		return false
+	}
+	return in.MemoryPressure != MemoryPressureNormal || in.Swap.usedBytes() >= provisionStartSwapUsedBytes
+}
+
+// provisionStartSwapArmedBy names which half of the swap rule fired, so the
+// operator can re-derive the refusal from the same two numbers the gate read.
+func provisionStartSwapArmedBy(in ProvisionStart) string {
+	if in.MemoryPressure != MemoryPressureNormal {
+		return "pressure is off normal, so"
+	}
+	return fmt.Sprintf(
+		"a swapped-out footprint at or past %.0f GiB only happens after sustained real pressure even when the kernel has since returned to normal, so",
+		gib(provisionStartSwapUsedBytes),
+	)
 }
 
 // provisionStartPressureLabel names the pressure reading in the refusal. An

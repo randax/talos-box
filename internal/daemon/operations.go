@@ -247,6 +247,12 @@ type ClusterStatus struct {
 	KubernetesReady bool         `json:"kubernetesReady"`
 	StoragePhase    StoragePhase `json:"storagePhase,omitempty"`
 	StorageError    string       `json:"storageError,omitempty"`
+	// StoragePending is the benign counterpart of StorageError: the readiness
+	// probe has not failed, it has not run yet because the daemon is still
+	// clearing the previous pass's objects. It reads as work in progress, so
+	// the operator is not shown a fault for a wait the daemon converges out of
+	// on its own (#347).
+	StoragePending string `json:"storagePending,omitempty"`
 	VIP             string       `json:"vip,omitempty"`
 	VIPLive         bool         `json:"vipLive"`
 	Nodes           []NodeStatus `json:"nodes"`

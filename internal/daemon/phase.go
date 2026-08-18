@@ -365,6 +365,11 @@ func storageHint(status ClusterStatus) string {
 		if status.StorageError != "" {
 			return fmt.Sprintf("storage provisioning: CSI readiness probe failed: %s; retrying after backoff.", status.StorageError)
 		}
+		if status.StoragePending != "" {
+			// Nothing failed: the probe is waiting on its own previous pass to
+			// finish clearing, so the wording stays "still working".
+			return fmt.Sprintf("storage provisioning: the CSI readiness probe has not run yet: %s; retrying after backoff.", status.StoragePending)
+		}
 		return "storage provisioning: waiting for the CSI readiness probe to pass."
 	case StoragePhaseLive:
 		return "storage live: the CSI readiness probe passed."

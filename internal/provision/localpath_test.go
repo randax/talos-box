@@ -346,11 +346,67 @@ func TestCleanupStorageProbeSweepsResidueAfterAStuckClaim(t *testing.T) {
 	}
 }
 
+// The teardown budget is one budget, not one per step: the waits are capped so
+// the sweep still has its slice, and the whole thing stays inside
+// storageProbeCleanupTimeout instead of the waits and the sweep each taking it.
+func TestStorageProbeWaitContextReservesTheResidueSlice(t *testing.T) {
+	shortenStorageProbeCleanup(t)
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), storageProbeCleanupTimeout)
+	defer cancel()
+
+	waitCtx, waitCancel := storageProbeWaitContext(cleanupCtx)
+	defer waitCancel()
+
+	waitDeadline, ok := waitCtx.Deadline()
+	if !ok {
+		t.Fatal("storageProbeWaitContext() left the waits unbounded, so the sweep can be starved")
+	}
+	cleanupDeadline, _ := cleanupCtx.Deadline()
+	// The reserve is exact by construction; the slack absorbs only the wall
+	// clock that moves between the two context constructions.
+	const slack = 2 * time.Millisecond
+	if remaining := cleanupDeadline.Sub(waitDeadline); remaining < storageProbeResidueTimeout-slack {
+		t.Fatalf("storageProbeWaitContext() left the sweep %s, want at least %s", remaining, storageProbeResidueTimeout)
+	}
+	if waitDeadline.After(cleanupDeadline) {
+		t.Fatal("storageProbeWaitContext() escaped the overall cleanup budget")
+	}
+}
+
+// A teardown must outlive the probe's own deadline — the objects it is deleting
+// are exactly what the next pass would otherwise trip over — but must not
+// outlive a cancelled lifecycle.
+func TestStorageProbeCleanupContextOutlivesADeadlineButNotACancel(t *testing.T) {
+	shortenStorageProbeCleanup(t)
+
+	expired, expireCancel := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer expireCancel()
+	<-expired.Done()
+	cleanupCtx, cleanupCancel := storageProbeCleanupContext(expired)
+	defer cleanupCancel()
+	if err := cleanupCtx.Err(); err != nil {
+		t.Fatalf("cleanup context after an expired probe = %v, want a fresh teardown budget", err)
+	}
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancelledCleanup, cancelledCleanupCancel := storageProbeCleanupContext(cancelled)
+	defer cancelledCleanupCancel()
+	cancel()
+	select {
+	case <-cancelledCleanup.Done():
+	case <-time.After(time.Second):
+		t.Fatal("cleanup context survived a cancelled lifecycle, so shutdown cannot stop the sweep")
+	}
+}
+
 func shortenStorageProbeCleanup(t *testing.T) {
 	t.Helper()
 	previousCleanup := storageProbeCleanupTimeout
 	previousResidue := storageProbeResidueTimeout
-	storageProbeCleanupTimeout = 20 * time.Millisecond
+	// The residue slice has to be a real fraction of the overall budget, the
+	// same way 15s is of 30s: the waits get the remainder and the sweep the
+	// rest, so a degenerate pair would leave the sweep nothing to run in.
+	storageProbeCleanupTimeout = 60 * time.Millisecond
 	storageProbeResidueTimeout = 20 * time.Millisecond
 	t.Cleanup(func() {
 		storageProbeCleanupTimeout = previousCleanup

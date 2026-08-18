@@ -176,9 +176,13 @@ func (s *Server) stoppedNodeMemoryMiB(item cluster.Cluster) int {
 	return total
 }
 
-// runningVMMemoryMiB sums the configured memory of every cluster whose guests
-// are running. Configured — not observed — memory is what a booting guest will
-// eventually claim, and it is the same unit checkOvercommit accounts in.
+// runningVMMemoryMiB sums the configured memory of the guests that are actually
+// running, node by node — the mirror image of stoppedNodeMemoryMiB, and for the
+// same reason. Counting a partly-running cluster's whole configured memory
+// would let a `node start` refusal claim more resident memory than the host
+// holds, and this repo's refusals are numbers an operator can re-derive.
+// Configured — not observed — memory is the right unit: it is what a booting
+// guest eventually claims, and what checkOvercommit accounts in.
 func (s *Server) runningVMMemoryMiB() int {
 	clusters, err := cluster.List()
 	if err != nil {
@@ -186,8 +190,10 @@ func (s *Server) runningVMMemoryMiB() int {
 	}
 	total := 0
 	for _, item := range clusters {
-		if s.clusterRunning(item.Name) {
-			total += clusterMemoryMiB(item)
+		for _, node := range item.Nodes {
+			if s.nodeRunning(item.Name, node.Name) {
+				total += item.DefaultsFor(node.Role).MemoryMiB
+			}
 		}
 	}
 	return total

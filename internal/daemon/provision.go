@@ -701,6 +701,7 @@ func (s *Server) refreshStoragePhases(statuses []ClusterStatus) {
 		status := &statuses[index]
 		status.StoragePhase = ""
 		status.StorageError = ""
+		status.StoragePending = ""
 		switch {
 		case status.CSI == "", !status.Running:
 		case known[status.Name] == StoragePhaseLive:
@@ -710,7 +711,11 @@ func (s *Server) refreshStoragePhases(statuses []ClusterStatus) {
 		default:
 			status.StoragePhase = StoragePhaseProvisioning
 			if failure, ok := failures[status.Name]; ok && time.Since(failure.at) < storageProbeRetryBackoff {
-				status.StorageError = failure.message
+				if failure.pending {
+					status.StoragePending = failure.message
+				} else {
+					status.StorageError = failure.message
+				}
 			} else {
 				s.beginStorageStatusProbe(status.Name)
 			}
@@ -756,8 +761,20 @@ func (s *Server) runStorageStatusProbe(ctx context.Context, name string, generat
 		// The pass never touched the data path. Recording it live would claim a
 		// storage stack nothing verified, and recording a failure would report
 		// the daemon's own pending cleanup as a storage fault — so the phase
-		// stays provisioning and the next status refresh probes again (#347).
+		// stays provisioning (#347). It still has to be recorded: without an
+		// entry every status refresh would start another probe with no backoff
+		// at all, each one spending the PVC-wait and residue budgets against
+		// the cluster API to discover the same terminating claim, and the
+		// operator would see a bare `storage-provisioning` with the reason only
+		// in tbxd.log. The record backs the next pass off and carries the
+		// advisory into the status payload as a pending note, not an error.
 		log.Printf("storage probe %s: %v", name, err)
+		if s.clusterRunning(name) {
+			if s.storageProbeFailures == nil {
+				s.storageProbeFailures = make(map[string]storageProbeFailure)
+			}
+			s.storageProbeFailures[name] = storageProbeFailure{message: err.Error(), at: time.Now(), pending: true}
+		}
 		return
 	}
 	if err == nil && s.clusterRunning(name) {

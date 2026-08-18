@@ -48,14 +48,20 @@ type StorageProbeOutcome struct {
 	Warnings []string
 }
 
-// storageProbeCleanupTimeout bounds one teardown attempt. Exceeding it is not a
-// failed probe: the objects are already deleting and the next pass collects
-// whatever is left. A variable so tests can exercise that bound.
+// storageProbeCleanupTimeout is the whole budget for one teardown attempt —
+// the terminating-object waits and the residue sweep together, not each. One
+// cleanup() therefore never runs longer than this, and runStorageProbe's two
+// cleanups never longer than twice it. Exceeding it is not a failed probe: the
+// objects are already deleting and the next pass collects whatever is left. A
+// variable so tests can exercise that bound.
 var storageProbeCleanupTimeout = 30 * time.Second
 
-// storageProbeResidueTimeout bounds the residue sweep on its own. The sweep is
-// the step most likely to release a claim that will not finish terminating, so
-// it must not be starved by the very wait that claim exhausted.
+// storageProbeResidueTimeout is the slice of storageProbeCleanupTimeout the
+// residue sweep is guaranteed, not an extra budget on top of it: the waits are
+// capped at the remainder so the sweep still has this much left. The sweep is
+// the step that releases a claim which will not finish terminating, so it must
+// not be starved by the very wait that claim exhausted — but it also must not
+// escape the overall bound or outlive a cancelled lifecycle.
 var storageProbeResidueTimeout = 15 * time.Second
 
 // runStorageProbe writes and reads back through the cluster's default
@@ -70,7 +76,7 @@ var storageProbeResidueTimeout = 15 * time.Second
 // It skips its own run instead, so nothing probes on top of a terminating PVC.
 func runStorageProbe(ctx context.Context, dynamicClient dynamic.Interface, mapper meta.RESTMapper, client kubernetes.Interface, spec storageProbeSpec, interval time.Duration) (outcome StorageProbeOutcome, err error) {
 	cleanup := func() error {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), storageProbeCleanupTimeout)
+		cleanupCtx, cleanupCancel := storageProbeCleanupContext(ctx)
 		defer cleanupCancel()
 		return cleanupStorageProbe(cleanupCtx, client, dynamicClient, spec)
 	}
@@ -284,28 +290,66 @@ func waitForProbePod(ctx context.Context, client kubernetes.Interface, namespace
 	})
 }
 
+// storageProbeCleanupContext gives one teardown attempt its own
+// storageProbeCleanupTimeout while staying cancellable. It does not inherit
+// ctx's deadline — a probe that spent its own budget still has objects to tear
+// down, and the next pass would otherwise find residue it must skip over — but
+// an actually cancelled ctx (daemon shutdown, a superseded reconcile) cancels
+// the teardown with it, so no sweep outlives the lifecycle that started it.
+func storageProbeCleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), storageProbeCleanupTimeout)
+	stop := context.AfterFunc(ctx, func() {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			cancel()
+		}
+	})
+	return cleanupCtx, func() {
+		stop()
+		cancel()
+	}
+}
+
 func cleanupStorageProbe(ctx context.Context, client kubernetes.Interface, dynamicClient dynamic.Interface, spec storageProbeSpec) error {
+	// The terminating-object waits get the cleanup budget minus the residue
+	// sweep's guaranteed slice. Anything still naming the claim is residue no
+	// other object accounts for — and residue that keeps holding disk — so a
+	// claim that will not finish terminating, the case where releasing its
+	// volume matters most, must not be the case that starves the sweep. Capping
+	// the waits rather than detaching the sweep keeps the whole teardown inside
+	// one budget and inside one cancellation.
+	waitCtx, waitCancel := storageProbeWaitContext(ctx)
+	defer waitCancel()
 	var errs []error
-	if err := deleteStorageProbePodAndWait(ctx, client, probeNamespace, storageProbeReaderPodName); err != nil {
+	if err := deleteStorageProbePodAndWait(waitCtx, client, probeNamespace, storageProbeReaderPodName); err != nil {
 		errs = append(errs, err)
 	}
-	if err := deleteStorageProbePodAndWait(ctx, client, probeNamespace, storageProbeWriterPodName); err != nil {
+	if err := deleteStorageProbePodAndWait(waitCtx, client, probeNamespace, storageProbeWriterPodName); err != nil {
 		errs = append(errs, err)
 	}
-	if err := deleteStorageProbePVCAndWait(ctx, client, probeNamespace, storageProbePVCName); err != nil {
+	if err := deleteStorageProbePVCAndWait(waitCtx, client, probeNamespace, storageProbePVCName); err != nil {
 		errs = append(errs, err)
 	}
-	// Anything still naming the claim is residue no other object accounts for —
-	// and residue that keeps holding disk. The sweep gets its own budget and
-	// runs even when the wait above spent theirs: a claim that will not finish
-	// terminating is the case where releasing its volume matters most, so it
-	// must not be the case that starves it.
-	residueCtx, residueCancel := context.WithTimeout(context.WithoutCancel(ctx), storageProbeResidueTimeout)
-	defer residueCancel()
-	if err := deleteStorageProbeVolumeResidue(residueCtx, client, dynamicClient, spec); err != nil {
+	if err := deleteStorageProbeVolumeResidue(ctx, client, dynamicClient, spec); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
+}
+
+// storageProbeWaitContext caps the terminating-object waits so the residue
+// sweep inherits at least storageProbeResidueTimeout of the same budget. A
+// cleanup context with no deadline, or one already down to less than the
+// sweep's slice, has nothing to reserve and the waits simply share what is
+// left — best effort is the most the bound can offer there.
+func storageProbeWaitContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return context.WithCancel(ctx)
+	}
+	budget := time.Until(deadline) - storageProbeResidueTimeout
+	if budget <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, budget)
 }
 
 // deleteStorageProbeVolumeResidue reclaims what a deleted probe claim can leave

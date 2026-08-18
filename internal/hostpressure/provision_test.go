@@ -69,7 +69,31 @@ func TestAssessProvisionStart(t *testing.T) {
 				MemoryPressure: MemoryPressureWarning,
 			},
 			wantBlocks:  1,
-			wantDetails: []string{"host swap is 91% used", "memory pressure is warning", "already running"},
+			wantDetails: []string{"host swap is 91% used", "memory pressure warning", "already running"},
+		},
+		{
+			// #334 records host-pressure PASS at preflight: macOS had already
+			// dropped back to normal while 7.3 GiB stayed swapped out. The gate
+			// must refuse on the footprint alone, or it is disarmed in the very
+			// state the incident was reported from.
+			name: "the #334 footprint refuses even after pressure returns to normal",
+			in: ProvisionStart{
+				RunningVMMiB: 18432, NewVMMiB: 6144, HostFreeMiB: 24576, ReserveMiB: reserve,
+				Swap:           Usage{TotalBytes: 8 << 30, AvailableBytes: 7 << 30 / 10},
+				MemoryPressure: MemoryPressureNormal,
+			},
+			wantBlocks:  1,
+			wantDetails: []string{"host swap is 91% used", "7.3 GiB of 8.0 GiB", "sustained real pressure"},
+		},
+		{
+			name: "a small sticky swapfile under elevated pressure still refuses",
+			in: ProvisionStart{
+				RunningVMMiB: 18432, NewVMMiB: 6144, HostFreeMiB: 30720, ReserveMiB: reserve,
+				Swap:           Usage{TotalBytes: 2 << 30, AvailableBytes: 2 << 30 * 18 / 100},
+				MemoryPressure: MemoryPressureWarning,
+			},
+			wantBlocks:  1,
+			wantDetails: []string{"pressure is off normal"},
 		},
 		{
 			name: "a small sticky swapfile at normal pressure admits (#231)",
@@ -88,7 +112,7 @@ func TestAssessProvisionStart(t *testing.T) {
 				Swap: Usage{TotalBytes: 10 << 30, AvailableBytes: 1 << 30},
 			},
 			wantBlocks:  1,
-			wantDetails: []string{"memory pressure is unmeasurable"},
+			wantDetails: []string{"memory pressure unmeasurable"},
 		},
 		{
 			name: "sticky swap on an idle host is not this gate's business (#231)",
@@ -163,8 +187,11 @@ func TestAssessProvisionStart(t *testing.T) {
 // the lower swap ceiling belongs to bringup only, so a steady-state host at the
 // same reading must stay a PASS for Assess.
 func TestAssessProvisionStartSwapCeilingIsNotSteadyState(t *testing.T) {
+	// A 2 GiB dynamic swapfile 80% used: past the bringup percentage ceiling,
+	// but only 1.6 GiB actually swapped out, which is the sticky-file reading
+	// #231 removed from the steady-state verdict.
 	snapshot := Snapshot{
-		Swap:           Usage{TotalBytes: 10 << 30, AvailableBytes: 2 << 30},
+		Swap:           Usage{TotalBytes: 2 << 30, AvailableBytes: 2 << 30 * 20 / 100},
 		MemoryPressure: MemoryPressureNormal,
 	}
 	for _, finding := range Assess(snapshot) {
@@ -173,8 +200,9 @@ func TestAssessProvisionStartSwapCeilingIsNotSteadyState(t *testing.T) {
 		}
 	}
 	// The bringup gate agrees with Assess while the kernel reports normal
-	// pressure — sticky swap alone is not a verdict on either path — and parts
-	// company with it as soon as pressure is anything else.
+	// pressure and the swapped-out footprint is small — a sticky file alone is
+	// not a verdict on either path — and parts company with it as soon as
+	// pressure is anything else.
 	admitted := AssessProvisionStart(ProvisionStart{
 		RunningVMMiB: 6144, NewVMMiB: 6144, HostFreeMiB: 1 << 20, ReserveMiB: 4096,
 		Swap: snapshot.Swap, MemoryPressure: snapshot.MemoryPressure,

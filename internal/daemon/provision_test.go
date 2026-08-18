@@ -591,6 +591,68 @@ func TestRefreshStoragePhasesSharesConcurrentRestartProbe(t *testing.T) {
 	}
 }
 
+// A pass that skipped because the previous teardown was still finishing is not
+// a fault, but it is still a reason to back off: without a record every refresh
+// would launch another probe that spends the PVC-wait and residue budgets
+// against the cluster API to rediscover the same terminating claim. The
+// operator has to be able to see why, too — the reason must not live only in
+// tbxd.log — and must not be shown a failed readiness probe for it (#347).
+func TestPendingStorageProbeBacksOffAndSurfacesTheAdvisory(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir, err := cluster.Dir("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "kubeconfig"), []byte("credentials"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	service := &Server{vms: runningStorageVMs("demo"), storageProbe: func(context.Context, []byte) error {
+		calls.Add(1)
+		return fmt.Errorf("%w: probe claim is still terminating", errStorageProbePending)
+	}}
+	newStatuses := func() []ClusterStatus {
+		return []ClusterStatus{{
+			Name: "demo", Running: true, KubernetesReady: true,
+			ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILocalPath},
+		}}
+	}
+
+	service.refreshStoragePhases(newStatuses())
+	eventually(t, func() bool {
+		service.opMu.Lock()
+		defer service.opMu.Unlock()
+		return service.storageProbeFailures["demo"].pending
+	})
+
+	next := newStatuses()
+	service.refreshStoragePhases(next)
+	// Nothing new may start inside the backoff window.
+	time.Sleep(10 * time.Millisecond)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("storage probe calls = %d, want the pending outcome to back the next refresh off", got)
+	}
+	if next[0].StoragePhase != StoragePhaseProvisioning {
+		t.Fatalf("storage phase = %q, want provisioning", next[0].StoragePhase)
+	}
+	if next[0].StorageError != "" {
+		t.Fatalf("storage error = %q, want a pending wait reported as no fault at all", next[0].StorageError)
+	}
+	if !strings.Contains(next[0].StoragePending, "still terminating") {
+		t.Fatalf("storage pending = %q, want the probe's advisory", next[0].StoragePending)
+	}
+	hint := storageHint(next[0])
+	if !strings.Contains(hint, "has not run yet") || !strings.Contains(hint, "still terminating") {
+		t.Fatalf("storage hint = %q, want the pending advisory rendered as work in progress", hint)
+	}
+	if strings.Contains(hint, "failed") {
+		t.Fatalf("storage hint = %q, want no failure wording for a benign wait", hint)
+	}
+}
+
 func TestRefreshStoragePhasesSkipsProbeUntilKubernetesIsReady(t *testing.T) {
 	called := false
 	service := &Server{storageProbe: func(context.Context, []byte) error {
