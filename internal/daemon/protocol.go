@@ -36,7 +36,11 @@ const (
 // receives stage responses on its own connection ahead of the single final
 // one, and cluster.create holds its answer until the nodes it started have
 // booted (#263 #273).
-const ProtocolVersion = 9
+// Version 10 reconciles the CNI on bgp.enable/bgp.disable: the mode change
+// re-renders Cilium with the BGP control plane on or off, rolls its agents and
+// applies the matching announcement objects before answering, instead of moving
+// only the host speaker (#344).
+const ProtocolVersion = 10
 
 // Request is one newline-delimited daemon request.
 type Request struct {

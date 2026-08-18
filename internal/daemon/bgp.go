@@ -3,6 +3,7 @@ package daemon
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/helper"
@@ -31,9 +32,80 @@ func hostBGPActive(clusterName string) (bool, error) {
 
 var connectBGPHelper = func() (bgpHelperClient, error) { return helper.Connect() }
 
+// setBGPLocked changes a live cluster's announcement mode end to end: the host
+// speaker and the persisted intent first, then the forced Cilium reconcile that
+// makes the cluster side match. Without that reconcile the mode change was
+// host-only — Cilium kept running with bgpControlPlane disabled, its BGP CRDs
+// absent, and the VIP still answering over L2, so the requested mechanism was
+// never in effect while the verb reported success (#344).
+//
+// It must be called with opMu held: it registers the provisioning task the
+// caller then runs, which is what lets a later mutation supersede it.
+func (s *Server) setBGPLocked(raw json.RawMessage, enable bool, progress stageFunc) (*ClusterSummary, []provisionTask, error) {
+	var args nameArgs
+	if err := decodeArgs(raw, &args); err != nil {
+		return nil, nil, err
+	}
+	if enable {
+		progress.stage("starting the host BGP speaker for cluster %s", args.Name)
+	} else {
+		progress.stage("stopping the host BGP speaker for cluster %s", args.Name)
+	}
+	summary, err := s.setBGP(raw, enable)
+	if err != nil {
+		return nil, nil, err
+	}
+	item, err := cluster.Load(summary.Name)
+	if err != nil {
+		return nil, nil, err
+	}
+	tasks, deferred := s.beginBGPProvisionLocked(item)
+	if deferred {
+		summary.addWarnings(bgpDeferredReconcileWarning(item.Name, enable))
+	}
+	return &summary, tasks, nil
+}
+
+// beginBGPProvisionLocked schedules the reconcile a mode change needs. The task
+// is forced for the same reason a topology change's is: the intent that decides
+// what the Cilium chart renders just changed, and no health probe observes that
+// — a converged L2 cluster looks complete right up to the moment BGP is asked
+// for, so the fast no-op path would skip the re-render entirely.
+//
+// Like a topology change it can only converge over a fully-running cluster: the
+// pass polls DHCP leases and readiness for every member. A partly-stopped
+// cluster therefore defers it and reports that, rather than spinning to the
+// provisioning timeout (#332).
+func (s *Server) beginBGPProvisionLocked(item cluster.Cluster) ([]provisionTask, bool) {
+	if !s.allNodesRunning(item) {
+		log.Printf("bgp %s: cluster is only partly running, skipping reconcile", item.Name)
+		return nil, clusterIsProvisioned(item) && len(item.Nodes) > 0
+	}
+	tasks := s.beginProvisionTasksLocked([]cluster.Cluster{item})
+	for i := range tasks {
+		tasks[i].force = true
+	}
+	return tasks, false
+}
+
+// bgpDeferredReconcileWarning explains the silence: the mode is recorded and the
+// host speaker follows it, but Cilium still announces the old way until a
+// reconcile runs over a fully-running cluster.
+func bgpDeferredReconcileWarning(clusterName string, enable bool) string {
+	requested, running := "bgp", "l2"
+	if !enable {
+		requested, running = "l2", "bgp"
+	}
+	return fmt.Sprintf(
+		"cluster members are stopped; %s is recorded as %s but Cilium still announces over %s — start every member to reconcile it",
+		clusterName, requested, running,
+	)
+}
+
 // setBGP enables or disables host-side BGP for a cluster: it starts/stops the
-// speaker in the helper and persists the mode. The attendee still applies the
-// Cilium BGP resources from `tbx manifests` — this brings up the host peer.
+// speaker in the helper and persists the mode. The Cilium side is reconciled by
+// setBGPLocked's provisioning task, which renders the chart from the intent this
+// saved.
 func (s *Server) setBGP(raw json.RawMessage, enable bool) (ClusterSummary, error) {
 	var args nameArgs
 	if err := decodeArgs(raw, &args); err != nil {

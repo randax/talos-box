@@ -419,6 +419,9 @@ func (s *Server) dispatchWithProgress(request Request, progress stageFunc) Respo
 	if request.Op == "snapshot.restore" {
 		return s.dispatchSnapshotRestore(request, progress)
 	}
+	if isBGPModeChange(request.Op) {
+		return s.dispatchBGP(request, progress)
+	}
 	if request.Op == "cluster.destroy" {
 		return s.dispatchDestroy(request)
 	}
@@ -649,6 +652,42 @@ func (s *Server) dispatchNodeMutation(request Request, progress stageFunc) Respo
 	return success(data)
 }
 
+// isBGPModeChange names the operations that change a cluster's announcement
+// mode, and so re-render its CNI.
+func isBGPModeChange(op string) bool {
+	return op == "bgp.enable" || op == "bgp.disable"
+}
+
+// dispatchBGP changes a cluster's announcement mode and keeps the reconcile that
+// realizes it on the request path. That reconcile is the verb: the host speaker
+// alone leaves Cilium announcing the old way, so answering ahead of it is the
+// silent success #344 reported. It also means a failed apply fails the verb
+// instead of surfacing only in the daemon log — the recorded mode stays, so a
+// rerun resumes from it.
+//
+// The cluster's mutation lock is held for the state change only, the way
+// dispatchNodeMutation holds it: the task is already registered under opMu, so a
+// later mutation supersedes it without the reconcile blocking the lock.
+func (s *Server) dispatchBGP(request Request, progress stageFunc) Response {
+	var args nameArgs
+	if err := decodeArgs(request.Args, &args); err != nil {
+		return failure(err)
+	}
+	lock := s.clusterMutationLock(args.Name)
+	lock.Lock()
+	s.opMu.Lock()
+	summary, tasks, err := s.setBGPLocked(request.Args, request.Op == "bgp.enable", progress)
+	s.opMu.Unlock()
+	lock.Unlock()
+	if err != nil {
+		return failure(err)
+	}
+	if err := s.runProvisionTasks(summary, tasks, progress); err != nil {
+		return failure(err)
+	}
+	return success(summary)
+}
+
 // dispatchSnapshotRestore gates the restore's node deletions outside the
 // operation lock, like dispatchNodeMutation: a restore drops every live node
 // the snapshot did not capture, disks and all.
@@ -762,10 +801,11 @@ func (s *Server) handle(request Request, progress stageFunc) (any, error) {
 		return s.snapshotList(request.Args)
 	case "snapshot.delete":
 		return s.snapshotDelete(request.Args)
-	case "bgp.enable":
-		return s.setBGP(request.Args, true)
-	case "bgp.disable":
-		return s.setBGP(request.Args, false)
+	case "bgp.enable", "bgp.disable":
+		// mode changes flow through dispatchBGP, which schedules the Cilium
+		// reconcile that puts the requested mechanism in effect; a locked path
+		// that only moves the host speaker must not exist (#344)
+		return nil, fmt.Errorf("operation %q must be dispatched as a BGP mode change", request.Op)
 	case "cache.pull":
 		return s.pullCache(request.Args)
 	case "cache.warm":

@@ -34,6 +34,7 @@ const (
 	snapshotRestoreGateProtocolVersion      = 6
 	snapshotCreateWarningProtocolVersion    = 7
 	nodeRunStateProtocolVersion             = 8
+	bgpReconcileProtocolVersion             = 10
 )
 
 func requiresProvisioningIntentHandshake(input cluster.ProvisioningIntentInput) bool {
@@ -104,6 +105,13 @@ func (c cli) ensureSnapshotCreateSupport() error {
 // version/schematic to every created cluster and drop extensions entirely.
 func (c cli) ensurePerClusterTalosSupport() error {
 	return c.ensureProtocolAtLeast(perClusterTalosProtocolVersion, "per-cluster talos settings")
+}
+
+// ensureBGPReconcileSupport refuses to send a mode change to a daemon that only
+// moves the host speaker: it would report success while Cilium keeps announcing
+// the old way, with the BGP control plane disabled and its CRDs absent (#344).
+func (c cli) ensureBGPReconcileSupport(verb string) error {
+	return c.ensureProtocolAtLeast(bgpReconcileProtocolVersion, "bgp "+verb)
 }
 
 func (c cli) ensureCacheWarmSupport() error {
