@@ -259,6 +259,25 @@ func recordedIntentFlags(status ClusterStatus) string {
 			flags = append(flags, "--allow-unsafe-domain")
 		}
 	}
+	// The image is as much of the recorded intent as the topology is. Dropping
+	// it would send the operator back to the daemon's current default version
+	// with no extensions at all — a materially different cluster, built after
+	// the destroy already made the original unrecoverable (#267).
+	if status.TalosVersion != "" {
+		flags = append(flags, fmt.Sprintf("--talos-version %s", status.TalosVersion))
+	}
+	if len(status.TalosExtensions) > 0 {
+		flags = append(flags, fmt.Sprintf("--extensions %s", strings.Join(status.TalosExtensions, ",")))
+		// Schematic is the composed id once extensions were folded into it, so
+		// replaying it alongside --extensions would compose them a second time.
+		// The base is the schematic the create actually took, and an empty one
+		// means the create took none.
+		if status.BaseSchematic != "" {
+			flags = append(flags, fmt.Sprintf("--schematic %s", status.BaseSchematic))
+		}
+	} else if status.Schematic != "" {
+		flags = append(flags, fmt.Sprintf("--schematic %s", status.Schematic))
+	}
 	return strings.Join(flags, " ")
 }
 

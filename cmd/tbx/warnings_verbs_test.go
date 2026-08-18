@@ -11,6 +11,7 @@ import (
 // Unrelated findings must reach the operator one per line, whichever verb
 // raised them (#291): a semicolon-joined run-on hides the second one.
 func TestNodeAddRendersEachWarningOnItsOwnLine(t *testing.T) {
+	stubStoredClusters(t, daemon.ClusterSummary{Name: "demo"})
 	_, command := newDestroyTestCLI(t, []daemon.Response{
 		{OK: true, Data: json.RawMessage(`{"name":"demo-worker-3","warning":"first; second","warnings":["first","second"]}`)},
 	})
@@ -68,6 +69,7 @@ func TestSnapshotRestoreRendersEachWarningOnItsOwnLine(t *testing.T) {
 // A daemon that predates the per-finding list still speaks only Warning, and
 // its single joined string must still be printed.
 func TestNodeAndSnapshotVerbsFallBackToTheLegacyJoinedWarning(t *testing.T) {
+	stubStoredClusters(t, daemon.ClusterSummary{Name: "demo"})
 	_, command := newDestroyTestCLI(t, []daemon.Response{
 		{OK: true, Data: json.RawMessage(`{"name":"demo-worker-3","warning":"first; second"}`)},
 	})

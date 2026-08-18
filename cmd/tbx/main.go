@@ -214,16 +214,17 @@ func storedClusters() ([]daemon.ClusterSummary, error) {
 	return clusters, nil
 }
 
-// startProvisionDeadline reports the budget the daemon will hold this start to:
-// a declared storage engine buys the larger one, exactly as the daemon's own
-// provisionTimeout decides it. The CLI cannot read the stored cluster directly,
-// so it asks the daemon what it has.
+// storedProvisionDeadline reports the budget the daemon will hold a blocking
+// reconcile of this stored cluster to — `cluster start` and `node add` both
+// keep one on the request path. A declared storage engine buys the larger one,
+// exactly as the daemon's own provisionTimeout decides it. The CLI cannot read
+// the stored cluster directly, so it asks the daemon what it has.
 //
 // Any failure — no daemon yet, a busy one, an unknown cluster — falls back to
 // the storage bound. Overstating the budget only makes the heartbeat
 // pessimistic; understating it would advertise a deadline the daemon does not
 // honor, which is the drift the heartbeat exists to avoid (#307).
-func startProvisionDeadline(name string) time.Duration {
+func storedProvisionDeadline(name string) time.Duration {
 	clusters, err := storedClustersQuery()
 	if err != nil {
 		return storageProvisionDeadline
@@ -249,7 +250,7 @@ func (c cli) startCluster(args []string) error {
 	// A start reconciles the cluster's declared CNI/CSI on the same blocking
 	// call as create, so the stated bound must be the one the daemon budgets
 	// this request at (#307).
-	signal := liveness{verb: "starting " + name, deadline: startProvisionDeadline(name), quiet: quiet}
+	signal := liveness{verb: "starting " + name, deadline: storedProvisionDeadline(name), quiet: quiet}
 	if err := c.callWithLiveness(signal, "cluster.start", request, &result); err != nil {
 		return err
 	}
@@ -474,7 +475,16 @@ func (c cli) runNode(args []string) error {
 		}
 		request := map[string]any{"cluster": positionals[0], "name": name, "role": *role, "force": *force}
 		var result daemon.NodeStatus
-		if err := c.callNarrated("node.add", request, &result, c.stages(*quiet)); err != nil {
+		// node add is the one node mutation that keeps its reconcile on the
+		// request path, and that reconcile reports nothing between its opening
+		// stage and its end. Without a heartbeat the terminal is dead for the
+		// whole budget, which is the silence narration exists to remove (#273).
+		signal := liveness{
+			verb:     "adding a node to " + positionals[0],
+			deadline: storedProvisionDeadline(positionals[0]),
+			quiet:    *quiet,
+		}
+		if err := c.callWithLivenessNarrated(signal, "node.add", request, &result, true); err != nil {
 			return err
 		}
 		if err := printWarnings(c.err, result.Warnings, result.Warning); err != nil {

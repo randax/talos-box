@@ -3,11 +3,16 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/hostpressure"
+	"github.com/randax/talos-box/internal/hypervisor"
+	"github.com/randax/talos-box/internal/imagecache"
 	"github.com/randax/talos-box/internal/provision"
 )
 
@@ -148,6 +153,42 @@ func TestNodeAddNarratesTheDiskCloneAndTheLaunch(t *testing.T) {
 	if clone < 0 || launch < 0 || clone > launch {
 		t.Fatalf("node.add narration = %q, want the disk clone before the launch", *stages)
 	}
+	// node.add keeps its reconcile on the request path, and that reconcile is
+	// the longest stretch of the verb: unannounced it is a silent 25 minutes
+	// after the last stage (#273).
+	reconcile := indexOfStage(*stages, "reconciling flannel on cluster demo")
+	if reconcile < 0 || reconcile < launch {
+		t.Fatalf("node.add narration = %q, want the reconcile announced after the launch", *stages)
+	}
+	if !strings.Contains((*stages)[reconcile], "up to 25 minutes") {
+		t.Fatalf("reconcile stage = %q, want the storage budget the daemon holds it to", (*stages)[reconcile])
+	}
+}
+
+// A substrate-only cluster reconciles nothing, so the reconcile must not be
+// narrated: the stage would promise work that never happens.
+func TestNodeAddOnASubstrateOnlyClusterDoesNotNarrateAReconcile(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 1)
+	item.ProvisioningIntent = cluster.ProvisioningIntent{}
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	service.hostTotalMemory = func() (int, error) { return 1 << 20, nil }
+	service.hostFreeMemory = func() (int, error) { return 1 << 20, nil }
+	service.nodeIPLookup = func(string, int) string { return "" }
+	progress, stages := recordStages()
+
+	raw, err := json.Marshal(nodeArgs{Cluster: item.Name, Role: cluster.RoleWorker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := service.dispatchWithProgress(Request{Op: "node.add", Args: raw}, progress)
+	if !response.OK {
+		t.Fatalf("node.add failed: %s", response.Error)
+	}
+	if indexOfStage(*stages, "reconciling") >= 0 {
+		t.Fatalf("node.add narration = %q, want no reconcile announced for a substrate-only cluster", *stages)
+	}
 }
 
 func TestNodeRemoveNarratesTheStopAndTheDiskDeletion(t *testing.T) {
@@ -248,6 +289,114 @@ func TestWaitForNodesBootedGivesUpWhenTheLifecycleIsCancelled(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("waitForNodesBooted did not return after the lifecycle was cancelled")
+	}
+}
+
+// newBootWaitCreateServer is a server a cluster.create request can be
+// dispatched against end to end: a cached disk for the default image, a fake
+// hypervisor, and a stubbed host so the overcommit check cannot refuse on a
+// small runner.
+func newBootWaitCreateServer(t *testing.T) *Server {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	path := filepath.Join(root, "aaa", DefaultTalosVersion, "arm64", "disk.raw")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("disk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return &Server{
+		cache:           imagecache.New(root),
+		hypervisor:      &fakeHypervisor{architecture: hypervisor.ArchitectureARM64},
+		vms:             make(map[string]map[string]hypervisor.Machine),
+		helperCheck:     func() error { return nil },
+		hostPressure:    func(string) (hostpressure.Snapshot, error) { return hostpressure.Snapshot{}, nil },
+		hostTotalMemory: func() (int, error) { return 1 << 20, nil },
+		hostFreeMemory:  func() (int, error) { return 1 << 20, nil },
+		nodeIPLookup:    func(string, int) string { return "10.0.0.2" },
+		// the host's real routing table is not this test's subject, and a VPN
+		// route on the developer's machine would otherwise add a warning
+		subnetSources: emptySubnetSources(),
+	}
+}
+
+// bootWaitCreateRequest is one substrate-only create of a single node: nothing
+// to reconcile afterwards, so the boot wait is the only thing that can hold it.
+func bootWaitCreateRequest(t *testing.T) Request {
+	t.Helper()
+	raw, err := json.Marshal(createArgs{
+		Name: "booted", Schematic: "aaa",
+		ControlPlanes: intPointer(1), Workers: intPointer(0),
+		Node: cluster.NodeDefaults{MemoryMiB: 1, CPUs: 1, DiskGiB: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Request{Op: "cluster.create", Args: raw}
+}
+
+// The whole point of #263 is that the create request itself does not answer
+// until its nodes have booted. The wait has its own tests; this one pins that
+// cluster.create is actually wired to it, so a refactor of the dispatch cannot
+// drop the wait and stay green.
+func TestClusterCreateDispatchHoldsItsAnswerForTheBootWait(t *testing.T) {
+	service := newBootWaitCreateServer(t)
+	restoreInterval(t, time.Millisecond)
+	var probes int
+	service.nodeProbe = func(string) ProbeResult {
+		probes++
+		// the node stays silent for the first pass, exactly as a real one does
+		if probes == 1 {
+			return ProbeResult{}
+		}
+		return ProbeResult{Dialed: true, TLS: true, MaintenanceCert: true}
+	}
+	progress, stages := recordStages()
+
+	response := service.dispatchProvisioning(bootWaitCreateRequest(t), progress)
+	if !response.OK {
+		t.Fatalf("cluster.create failed: %s", response.Error)
+	}
+	if probes < 2 {
+		t.Fatalf("probed %d times, want the create to have waited for the silent node", probes)
+	}
+	launch := indexOfStage(*stages, "starting 1 node(s)")
+	wait := indexOfStage(*stages, "waiting for 1 node(s) to boot")
+	booted := indexOfStage(*stages, "all 1 node(s) booted")
+	if launch < 0 || wait < 0 || booted < 0 || !(launch < wait && wait < booted) {
+		t.Fatalf("cluster.create narration = %q, want the boot wait between the launch and the answer", *stages)
+	}
+	var summary ClusterSummary
+	if err := json.Unmarshal(response.Data, &summary); err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Warnings) != 0 {
+		t.Fatalf("summary warnings = %q, want none for nodes that booted", summary.Warnings)
+	}
+}
+
+// A node that never answers must not fail the create — the cluster exists —
+// but the advisory has to reach the summary the CLI prints (#263).
+func TestClusterCreateDispatchFoldsTheUnansweredNodeWarningIntoTheSummary(t *testing.T) {
+	service := newBootWaitCreateServer(t)
+	restoreInterval(t, time.Millisecond)
+	service.nodeProbe = func(string) ProbeResult { return ProbeResult{} }
+
+	response := service.dispatchProvisioning(bootWaitCreateRequest(t), nil)
+	if !response.OK {
+		t.Fatalf("cluster.create failed: %s", response.Error)
+	}
+	var summary ClusterSummary
+	if err := json.Unmarshal(response.Data, &summary); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(summary.Warning, "1 of 1 node(s) had not answered") {
+		t.Fatalf("summary warning = %q, want the unanswered node reported", summary.Warning)
+	}
+	if len(summary.Warnings) != 1 || !strings.Contains(summary.Warnings[0], "tbx status booted") {
+		t.Fatalf("summary warnings = %q, want the advisory as its own finding", summary.Warnings)
 	}
 }
 

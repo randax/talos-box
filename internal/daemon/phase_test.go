@@ -502,6 +502,46 @@ func TestProvisioningRecoveryHintOmitsTheOptInForSafeDomains(t *testing.T) {
 	}
 }
 
+// The image is the half of the intent no error would catch on the way back:
+// a recreate without --talos-version and --extensions silently builds on the
+// daemon's current default with no extensions at all (#267).
+func TestProvisioningRecoveryHintNamesTheImageIntent(t *testing.T) {
+	status := ClusterStatus{
+		Name: "qa", TalosVersion: "v1.10.5", Schematic: "composed-id",
+		BaseSchematic: "base-id", TalosExtensions: []string{"gvisor", "iscsi-tools"},
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true},
+		ConfigOrigin:       cluster.OriginImperative,
+	}
+	got := provisioningRecoveryHint(status)
+	for _, want := range []string{"--talos-version v1.10.5", "--extensions gvisor,iscsi-tools", "--schematic base-id"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("provisioningRecoveryHint() missing %q: %s", want, got)
+		}
+	}
+	// the composed id is what the extensions were folded into; replaying it
+	// would compose them a second time
+	if strings.Contains(got, "composed-id") {
+		t.Fatalf("provisioningRecoveryHint() named the composed schematic: %s", got)
+	}
+}
+
+// Without extensions the stored schematic is the one the create took, so it
+// replays as-is; extensions the create never named must not be invented.
+func TestProvisioningRecoveryHintNamesAnExtensionlessSchematic(t *testing.T) {
+	status := ClusterStatus{
+		Name: "qa", TalosVersion: DefaultTalosVersion, Schematic: "plain-id",
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, LB: true},
+		ConfigOrigin:       cluster.OriginImperative,
+	}
+	got := provisioningRecoveryHint(status)
+	if !strings.Contains(got, "--schematic plain-id") {
+		t.Fatalf("provisioningRecoveryHint() missing the recorded schematic: %s", got)
+	}
+	if strings.Contains(got, "--extensions") {
+		t.Fatalf("provisioningRecoveryHint() invented extensions: %s", got)
+	}
+}
+
 // The hint is written to be pasted, so a cluster name carrying shell
 // metacharacters must not escape into the destroy command.
 func TestProvisioningRecoveryHintQuotesClusterName(t *testing.T) {

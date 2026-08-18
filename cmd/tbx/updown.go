@@ -31,9 +31,10 @@ const (
 var livenessInterval = time.Minute
 
 // liveness keeps a blocking daemon call distinguishable from a hang. up,
-// cluster create and cluster start all send one request that the daemon answers
-// only after provisioning converges — up to the deadline below — so without a
-// heartbeat the terminal shows nothing at all for the whole pass (#307).
+// cluster create, cluster start and node add all send one request that the
+// daemon answers only after provisioning converges — up to the deadline below —
+// so without a heartbeat the terminal shows nothing at all for the whole pass
+// (#307 #273).
 // Everything it writes goes to stderr: stdout stays the scriptable result.
 type liveness struct {
 	// verb reads as "provisioning demo" in both the preamble and the beat.

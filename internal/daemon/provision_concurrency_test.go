@@ -19,7 +19,7 @@ func TestStatusRemainsResponsiveDuringProvisioning(t *testing.T) {
 	service, item, task, started := blockedProvision(t)
 	done := make(chan error, 1)
 	go func() {
-		done <- service.runProvisionTasks(&ClusterSummary{Name: item.Name}, []provisionTask{task})
+		done <- service.runProvisionTasks(&ClusterSummary{Name: item.Name}, []provisionTask{task}, nil)
 	}()
 	waitForProvisionStart(t, started)
 
@@ -49,7 +49,7 @@ func TestStopCancelsActiveProvisioning(t *testing.T) {
 	service.storagePhases = map[string]StoragePhase{item.Name: StoragePhaseLive}
 	done := make(chan error, 1)
 	go func() {
-		done <- service.runProvisionTasks(&ClusterSummary{Name: item.Name}, []provisionTask{task})
+		done <- service.runProvisionTasks(&ClusterSummary{Name: item.Name}, []provisionTask{task}, nil)
 	}()
 	waitForProvisionStart(t, started)
 
@@ -74,7 +74,7 @@ func TestShutdownCancelsActiveProvisioning(t *testing.T) {
 	service, item, task, started := blockedProvision(t)
 	done := make(chan error, 1)
 	go func() {
-		done <- service.runProvisionTasks(&ClusterSummary{Name: item.Name}, []provisionTask{task})
+		done <- service.runProvisionTasks(&ClusterSummary{Name: item.Name}, []provisionTask{task}, nil)
 	}()
 	waitForProvisionStart(t, started)
 

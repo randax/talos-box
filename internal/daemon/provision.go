@@ -276,7 +276,7 @@ func (s *Server) cancelAllProvisionsLocked() {
 	}
 }
 
-func (s *Server) runProvisionTasks(data any, tasks []provisionTask) error {
+func (s *Server) runProvisionTasks(data any, tasks []provisionTask, progress stageFunc) error {
 	// Every task must release its waiters, including the ones a failure never
 	// gets to: a drain that outlived its task would hang the operation waiting
 	// for it.
@@ -287,6 +287,14 @@ func (s *Server) runProvisionTasks(data any, tasks []provisionTask) error {
 		}
 	}()
 	for i, task := range tasks {
+		// The reconcile is the longest stretch of any verb that keeps it on the
+		// request path, and it used to run behind a silent socket for its whole
+		// budget (#273). It reports no intermediate progress of its own, so the
+		// stage names the work and the bound the daemon holds the request to.
+		if reconcilesCNI(task.item) {
+			progress.stage("reconciling %s on cluster %s (up to %s)",
+				task.item.CNI, task.item.Name, formatBootWindow(provisionTimeout(task.item)))
+		}
 		narration, phase, err := s.provisionCNI(task.ctx, task.item, task.force)
 		if task.item.CSI != "" {
 			s.opMu.Lock()
@@ -329,10 +337,19 @@ func (s *Server) runProvisionTasksAsync(op string, tasks []provisionTask) {
 	s.backgroundProvisions.Add(1)
 	go func() {
 		defer s.backgroundProvisions.Done()
-		if err := s.runProvisionTasks(nil, tasks); err != nil {
+		// No progress sink: the request it followed has already been answered,
+		// so there is no connection left to narrate onto.
+		if err := s.runProvisionTasks(nil, tasks, nil); err != nil {
 			log.Printf("%s: follow-up reconcile failed: %v", op, err)
 		}
 	}()
+}
+
+// reconcilesCNI reports whether a provisioning pass over this cluster has any
+// work to do at all: only the curated CNIs are reconciled, and a substrate-only
+// cluster must not be narrated as if it were.
+func reconcilesCNI(item cluster.Cluster) bool {
+	return item.CNI == cluster.CNIFlannel || item.CNI == cluster.CNICilium
 }
 
 // provisionTimeout budgets one provisioning pass by what it must converge.
@@ -344,7 +361,7 @@ func provisionTimeout(item cluster.Cluster) time.Duration {
 }
 
 func (s *Server) provisionCNI(parent context.Context, item cluster.Cluster, force bool) ([]string, StoragePhase, error) {
-	if item.CNI != cluster.CNIFlannel && item.CNI != cluster.CNICilium {
+	if !reconcilesCNI(item) {
 		return nil, "", nil
 	}
 	// Once every desired outcome is observed healthy, a rerun is a genuine fast

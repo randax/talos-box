@@ -153,6 +153,8 @@ func TestSnapshotRestoreQuietSuppressesNarration(t *testing.T) {
 }
 
 func TestNodeAddNarratesAndQuietSuppressesIt(t *testing.T) {
+	stubStoredClusters(t, daemon.ClusterSummary{Name: "demo"})
+
 	requests, output := runNarratingCLI(t, []narratedExchange{
 		{stages: []string{"starting node demo-worker-3"}, data: `{"name":"demo-worker-3"}`},
 	}, func(command cli) error {

@@ -60,7 +60,7 @@ func TestDestroyWaitsForTheBackgroundReconcile(t *testing.T) {
 	reconcileDone := make(chan struct{})
 	go func() {
 		defer close(reconcileDone)
-		_ = service.runProvisionTasks(nil, []provisionTask{task})
+		_ = service.runProvisionTasks(nil, []provisionTask{task}, nil)
 	}()
 	waitForProvisionStart(t, started)
 

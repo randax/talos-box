@@ -517,7 +517,7 @@ func (s *Server) dispatchProvisioning(request Request, progress stageFunc) Respo
 			summary.addWarnings(s.waitForNodesBooted(summary.Name, progress))
 		}
 	}
-	if err := s.runProvisionTasks(data, tasks); err != nil {
+	if err := s.runProvisionTasks(data, tasks, progress); err != nil {
 		return failure(err)
 	}
 	return success(data)
@@ -586,7 +586,7 @@ func (s *Server) dispatchNodeMutation(request Request, progress stageFunc) Respo
 	// would otherwise outrun it. Every other node mutation answers as soon as
 	// the substrate settled and reconciles behind the response (#314).
 	if request.Op == "node.add" {
-		if err := s.runProvisionTasks(data, tasks); err != nil {
+		if err := s.runProvisionTasks(data, tasks, progress); err != nil {
 			return failure(err)
 		}
 		return success(data)
