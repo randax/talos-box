@@ -48,6 +48,11 @@ type createArgs struct {
 	// config-level opt-out) must survive the wire distinct from the field
 	// being absent.
 	Extensions []string `json:"extensions"`
+	// ConfigManaged marks a create that came from a talosbox.yaml spec, so
+	// the cluster's later recovery hints can name `tbx up` honestly (#267).
+	// It is set by the daemon's own up path, which re-encodes these args;
+	// `tbx cluster create` never sends it.
+	ConfigManaged bool `json:"configManaged,omitempty"`
 }
 
 type nameArgs struct {
@@ -245,8 +250,11 @@ type ClusterStatus struct {
 	// depends on, so a file stays portable across host substrates and the gate
 	// is visible instead of silently doing nothing.
 	Capabilities []CapabilityStatus `json:"capabilities,omitempty"`
-	Hints        []string           `json:"hints,omitempty"`
-	subnetIndex  int
+	// ConfigManaged reports that a talosbox.yaml backs this cluster, which
+	// decides whether a recovery hint may name `tbx up` (#267).
+	ConfigManaged bool     `json:"configManaged,omitempty"`
+	Hints         []string `json:"hints,omitempty"`
+	subnetIndex   int
 }
 
 // CapabilityStatus is one host capability a cluster depends on, with the reason
@@ -472,6 +480,7 @@ func (s *Server) createCluster(raw json.RawMessage, progress stageFunc) (Cluster
 	item.Domain = canonicalDomain
 	item.AllowUnsafeDomain = canonicalDomain != "" && args.AllowUnsafeDomain
 	item.ImageArchitecture = string(s.hypervisor.Architecture())
+	item.ConfigManaged = args.ConfigManaged
 	longhornWarning := s.checkLonghornMemoryWarning(item)
 	longhornCustomSchematicWarning := s.longhornCustomSchematicWarning(item, args.Schematic != "")
 	item.Schematic, item.TalosVersion, err = s.resolveImage(args.Schematic, args.Version, args.Extensions)
@@ -843,7 +852,7 @@ func (s *Server) destroyCluster(raw json.RawMessage) (map[string]string, error) 
 		return nil, err
 	}
 	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("cluster %q does not exist", args.Name)
+		return nil, ClusterMissingError(args.Name)
 	}
 	if err := disableHostBGP(args.Name); err != nil {
 		log.Printf("disable host BGP for %s during force destroy: %v", args.Name, err)
@@ -1091,7 +1100,7 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), TalosVersion: item.TalosVersion, Schematic: item.Schematic, BaseSchematic: item.BaseSchematic, TalosExtensions: item.TalosExtensions, ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: running,
 			// derived from disk, not from daemon memory, so a restarted
 			// daemon still reports its predecessor's suspension
-			Suspended: !running && clusterHasSavedState(item.Name), Capabilities: s.clusterCapabilities(item), subnetIndex: item.SubnetIndex}
+			Suspended: !running && clusterHasSavedState(item.Name), Capabilities: s.clusterCapabilities(item), ConfigManaged: item.ConfigManaged, subnetIndex: item.SubnetIndex}
 		for _, node := range item.Nodes {
 			running := s.nodeRunning(item.Name, node.Name)
 			clusterStatus.Nodes = append(clusterStatus.Nodes, NodeStatus{Name: node.Name, Role: node.Role, MAC: node.MAC, Phase: ClassifyPhase(running, ProbeResult{}), StartedAt: s.vmStartedAt(item.Name, node.Name),

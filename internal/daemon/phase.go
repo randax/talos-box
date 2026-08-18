@@ -145,7 +145,7 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 		hints = append(hints, hint)
 	}
 	if status.CNI != "" && !status.KubernetesReady {
-		hints = append(hints, fmt.Sprintf("%s provisioning is in progress; tbx will apply machine config, bootstrap, and reconcile the CNI. Rerun: tbx up;%s", status.CNI, credentialExports(status.Name)))
+		hints = append(hints, fmt.Sprintf("%s provisioning is in progress; tbx will apply machine config, bootstrap, and reconcile the CNI. %s;%s", status.CNI, provisioningRecoveryHint(status), credentialExports(status.Name)))
 	}
 	if len(maintenance) > 0 {
 		first := maintenance[0]
@@ -202,6 +202,24 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 		hints = append(hints, hint)
 	}
 	return hints
+}
+
+// provisioningRecoveryHint names the recovery an unfinished provisioning pass
+// can actually take. `tbx up` needs a talosbox.yaml; a cluster created
+// imperatively has none, so pointing at up would dead-end and the honest path
+// is destroy and recreate (#267).
+func provisioningRecoveryHint(status ClusterStatus) string {
+	if status.ConfigManaged {
+		return "Rerun: tbx up"
+	}
+	recreate := fmt.Sprintf("tbx cluster create %s --cni %s", status.Name, status.CNI)
+	if status.CSI != "" {
+		recreate += fmt.Sprintf(" --csi %s", status.CSI)
+	}
+	return fmt.Sprintf(
+		"No talosbox.yaml backs this cluster, so tbx up cannot resume it; recover with: tbx cluster destroy %s --force && %s",
+		status.Name, recreate,
+	)
 }
 
 // splitStalledNodes separates nodes still inside their boot budget from the

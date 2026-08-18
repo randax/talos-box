@@ -70,6 +70,11 @@ type Cluster struct {
 	// round-trips regardless of how the safe-TLD policy evolves.
 	Domain            string `json:"domain,omitempty"`
 	AllowUnsafeDomain bool   `json:"allowUnsafeDomain,omitempty"`
+	// ConfigManaged records that a talosbox.yaml backs this cluster: it was
+	// created by `tbx up`, or a later `tbx up` claimed it. Imperatively
+	// created clusters have no file to rerun, so recovery hints must name
+	// destroy-and-recreate instead of `tbx up` (#267).
+	ConfigManaged bool `json:"configManaged,omitempty"`
 }
 
 // DefaultDomainSuffix is the suffix under which default cluster domains live.

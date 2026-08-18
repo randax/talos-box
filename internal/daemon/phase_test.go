@@ -348,13 +348,35 @@ func TestHintsDoNotInferFlannelKubernetesReadiness(t *testing.T) {
 func TestHintsDescribeProvisioningInProgressAndExports(t *testing.T) {
 	status := ClusterStatus{
 		Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true},
-		Nodes: []NodeStatus{{Name: "demo-cp-1", Role: cluster.RoleControlPlane, Phase: PhaseConfigured}},
+		ConfigManaged: true,
+		Nodes:         []NodeStatus{{Name: "demo-cp-1", Role: cluster.RoleControlPlane, Phase: PhaseConfigured}},
 	}
 	joined := strings.Join(Hints(status), "\n")
 	for _, want := range []string{"provisioning is in progress", "tbx up; export TALOSCONFIG=~/.talosbox/clusters/demo/talosconfig", "KUBECONFIG=~/.talosbox/clusters/demo/kubeconfig"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("provisioning hint missing %q:\n%s", want, joined)
 		}
+	}
+}
+
+// An imperatively created cluster has no talosbox.yaml, so the recovery hint
+// must not point at `tbx up`, which would refuse for want of a file (#267).
+func TestHintsRecoverImperativeProvisioningWithDestroyAndRecreate(t *testing.T) {
+	status := ClusterStatus{
+		Name: "qa-cil", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, CSI: cluster.CSILonghorn, LB: true},
+		Nodes: []NodeStatus{{Name: "qa-cil-cp-1", Role: cluster.RoleControlPlane, Phase: PhaseConfigured}},
+	}
+	joined := strings.Join(Hints(status), "\n")
+	for _, want := range []string{
+		"No talosbox.yaml backs this cluster",
+		"tbx cluster destroy qa-cil --force && tbx cluster create qa-cil --cni cilium --csi longhorn",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("provisioning hint missing %q:\n%s", want, joined)
+		}
+	}
+	if strings.Contains(joined, "Rerun: tbx up") {
+		t.Fatalf("provisioning hint offers tbx up for an imperative cluster:\n%s", joined)
 	}
 }
 

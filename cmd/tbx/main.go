@@ -439,6 +439,12 @@ func (c cli) inspectDestroy(name string, request struct {
 }) error {
 	var inspection daemon.DestroyInspection
 	if err := c.call("cluster.destroy.inspect", request, &inspection); err != nil {
+		// A cluster that does not exist fails here rather than warning about
+		// data it cannot have; every other inspection failure still warns,
+		// since a partially-destroyed cluster may still hold volumes (#268).
+		if daemon.IsClusterMissing(err, name) {
+			return err
+		}
 		return printWarning(c.err, daemon.DestroyInspectionDataLossWarning(name, ""))
 	}
 	return printWarning(c.err, inspection.Warning)

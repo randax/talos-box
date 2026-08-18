@@ -64,3 +64,19 @@ func TestInspectDestroyClusterSkipsClustersWithoutCSIIntent(t *testing.T) {
 		t.Fatalf("warning = %q, want empty", result.Warning)
 	}
 }
+
+// Inspecting a cluster that does not exist must refuse rather than produce a
+// warning the client would print before the destroy fails (#268).
+func TestDestroyInspectRefusesMissingCluster(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	server := &Server{}
+
+	result, err := server.destroyInspect(mustRawJSON(t, destroyArgs{Name: "ghost", Force: true}))
+
+	if err == nil || !IsClusterMissing(err, "ghost") {
+		t.Fatalf("destroyInspect() error = %v, want missing-cluster refusal", err)
+	}
+	if result.Warning != "" {
+		t.Fatalf("warning = %q, want none for a cluster that does not exist", result.Warning)
+	}
+}

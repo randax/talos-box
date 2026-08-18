@@ -109,3 +109,24 @@ func assertDestroyRequests(t *testing.T, requests <-chan daemon.Request, want ..
 		t.Fatalf("unexpected extra requests: %d", extra)
 	}
 }
+
+// The existence check has to land before the data-loss warning: a cluster that
+// never existed has no volumes to lose (#268).
+func TestDestroyClusterMissingFailsWithoutDataLossWarning(t *testing.T) {
+	requests, command := newDestroyTestCLI(t, []daemon.Response{
+		{OK: false, Error: `cluster "demo" does not exist`},
+	})
+
+	err := command.destroyCluster([]string{"demo", "--force"})
+	if err == nil || !strings.Contains(err.Error(), `cluster "demo" does not exist`) {
+		t.Fatalf("destroyCluster() error = %v, want missing-cluster refusal", err)
+	}
+
+	assertDestroyRequests(t, requests, "cluster.destroy.inspect")
+	if got := command.err.(*bytes.Buffer).String(); strings.Contains(got, "permanently delete") {
+		t.Fatalf("stderr = %q, want no data-loss warning", got)
+	}
+	if got := command.out.(*bytes.Buffer).String(); got != "" {
+		t.Fatalf("stdout = %q, want no output", got)
+	}
+}

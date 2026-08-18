@@ -409,7 +409,13 @@ func (s *Server) preflightUpWithStorage(
 		if err != nil {
 			return nil, err
 		}
-		if changed {
+		// An existing cluster named by talosbox.yaml is config-managed from
+		// this up onwards, whether it was created imperatively or by a tbx
+		// predating the flag: the file can rerun it, so its hints may say so
+		// (#267).
+		claimed := !item.ConfigManaged
+		item.ConfigManaged = true
+		if changed || claimed {
 			item.ProvisioningIntent = intent
 			updates = append(updates, intentUpdate{next: item})
 		}
@@ -593,5 +599,6 @@ func createArgsFromSpec(spec config.ClusterSpec, force bool) createArgs {
 		Schematic:               spec.Talos.Schematic,
 		Version:                 spec.Talos.Version,
 		Extensions:              spec.Talos.Extensions,
+		ConfigManaged:           true,
 	}
 }
