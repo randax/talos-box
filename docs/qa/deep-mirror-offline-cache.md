@@ -25,9 +25,9 @@ BLOCKED unless: `tbx version` recorded; `tbx doctor` exits 0 (egress OK); no clu
 **Goal**: `cache warm` accepts pinned refs, rejects unpinned, and reports per-image progress.
 
 Steps:
-1. Write a list file with: one tag-pinned ref (e.g. `docker.io/library/pause:3.10`), one digest-pinned ref, one tag+digest ref, a `#` comment, and a blank line. Run `tbx cache warm <file>`.
+1. Write a list file with: one tag-pinned ref (`registry.k8s.io/pause:3.10` — `docker.io/library/pause` does NOT exist on Docker Hub and answers 401 to anonymous pulls, so it is not a valid probe), one tag-pinned ref on Docker Hub itself (`docker.io/library/alpine:3.20`, so the run exercises Hub's anonymous token flow), one digest-pinned ref, one tag+digest ref, a `#` comment, and a blank line. Run `tbx cache warm <file>`.
 2. Run again — record what a re-warm does (should be cheap/no-op-ish).
-3. Negative: a list containing `docker.io/library/pause:latest` — expect rejection; a tagless ref — expect rejection; a tag+digest where the digest is wrong — expect a resolution-mismatch error.
+3. Negative: a list containing `docker.io/library/alpine:latest` — expect rejection; a tagless ref — expect rejection; a tag+digest where the digest is wrong — expect a resolution-mismatch error.
 4. `tbx cache warm --check <file>` then `--check --deep <file>`; also `--deep` without `--check` — expect refusal.
 
 Expected observations: per-image progress with continue-through-failures and non-zero exit on any gap; `latest`/tagless rejected by design; mismatch pinned-digest error names the ref; `--check` verifies offline (no upstream dials — verify by watching for network errors with upstream unreachable if feasible, else trust exit + wording); `--deep` requires `--check`.

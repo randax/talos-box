@@ -16,7 +16,7 @@ You are running QA, not demos. For every charter: run the steps exactly, compare
 
 ## Preflight
 
-BLOCKED unless: `tbx version` recorded; `tbx doctor` exits 0 — on Linux record the `qemu` doctor line (it states suspend availability; QEMU 6.2–8.1 hosts will legitimately refuse suspend, turning C3 into a capability-refusal check rather than a suspend test); no cluster `qa-sta`; ≥ 10 GiB free RAM and ≥ 40 GiB free disk (snapshots on Linux may be full copies).
+BLOCKED unless: `tbx version` recorded; `tbx doctor` exits 0 — on Linux record the `qemu` doctor line (it states suspend availability; QEMU 6.2–8.1 hosts will legitimately refuse suspend, turning C3 into a capability-refusal check rather than a suspend test); no cluster `qa-sta`; ≥ 10 GiB free RAM; free disk per platform — **[Linux]** ≥ 40 GiB, because the snapshot path may fall back to full copies of every node disk; **[macOS/APFS]** ≥ 5 GiB, because APFS clonefiles make snapshot create and restore copy-on-write (measured disk delta ≈ 0). If `~/.talosbox` lives on a non-APFS volume on macOS, use the Linux floor.
 
 ## Charters
 

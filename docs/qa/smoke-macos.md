@@ -28,7 +28,7 @@ Abort the run (report BLOCKED, not FAIL) if any of these don't hold:
 2. `git -C <talos-box checkout> rev-parse HEAD` — record the commit if running from source.
 3. `tbx doctor` exits 0. Expected: `helper`, `resolver`, `DNS`, and `forwarding` all PASS, and `host-pressure` present — see the macOS check table in [docs/macos.md](../macos.md) for the full list. Record any WARN lines as friction.
    - Known BLOCKED cause — **helper protocol mismatch**: the LaunchDaemon plist (`/Library/LaunchDaemons/dev.talosbox.helper.plist`) pins the helper at an absolute path, so a moved/renamed checkout leaves an old helper running. Fix: `sudo <checkout>/bin/tbx system install` (full path — tbx may not be on PATH), then rerun doctor.
-   - Expected when tbxd isn't running yet (it starts on demand): the `DNS` check reports `SKIP`, not `FAIL`, and the other daemon-dependent checks SKIP alongside it. Nothing to work around — a `FAIL` here means the daemon is up and its resolver is genuinely unreachable, which is real friction to record.
+   - The `DNS` check is honest either way and never blocks the run: it `PASS`es when tbxd is already up (any earlier `tbx` command starts the on-demand daemon and it stays up), and `SKIP`s — never `FAIL`s — when the daemon simply isn't running, alongside the other daemon-dependent checks. Doctor exits 0 in both cases. A `FAIL` here means the daemon IS up and its embedded resolver is genuinely unreachable: real friction, record it.
 4. `tbx status` shows no cluster named `qa-smoke` (destroy leftovers first: `tbx cluster destroy qa-smoke --force`).
 5. Host has ≥ 8 GiB free RAM (`memory_pressure`: use the system-wide free percentage — macOS swap-used numbers stay high after pressure clears) — the default cluster wants 6 GiB.
 6. Host volume holding `~/.talosbox` has ≥ 25 GiB free (`df -h ~`) — node disks are 20 GB sparse and doctor warns that low storage can corrupt guest writes.
@@ -77,9 +77,9 @@ On failure: capture `scutil --dns` output and the resolver file contents.
 Steps:
 1. `tbx console qa-smoke qa-smoke-cp-1`, watch ~10 s, detach with `Ctrl-]`.
 
-Expected observations: a session banner states the detach key; Talos kernel/machined log lines stream; detach returns your shell without killing the VM (verify: node still `maintenance` in status).
+Expected observations: a session banner states the detach key; console output is present — on a maintenance-phase node that is legitimately replay-only (the node is idle and has nothing new to say, so expect the buffered boot/machined output and possibly no new lines during the watch, which is not a defect); detach returns your shell without killing the VM (verify: node still `maintenance` in status).
 
-Pass criteria: logs visible, clean detach, node phase unchanged.
+Pass criteria: banner with the detach key shown, console output present (streaming or replay-only), clean `Ctrl-]` detach, node phase unchanged.
 
 On failure: capture the banner and last 30 lines of console output.
 
