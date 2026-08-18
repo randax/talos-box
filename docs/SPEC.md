@@ -197,7 +197,11 @@ forwarding policy.
 
 **DNS**: every cluster has a **cluster domain** — chosen at create (`--domain` / `domain:`),
 immutable, unique across clusters, defaulting to `<cluster>.k8s.test`. `*.<domain>` → that
-cluster's `.200`; `<node>.<domain>` → node IP; the domain apex itself has no record. Domains
+cluster's `.200`; `<node>.<domain>` → node IP; the domain apex itself has no record. Records
+are substrate tied to the cluster's **existence, not its run-state**: the wildcard and the node
+A records exist for the cluster's lifetime and keep answering authoritatively while it is
+stopped — a stopped cluster's names resolve to addresses that will not respond — and only
+`destroy` withdraws the records and the resolver files. Domains
 may nest across clusters and resolve longest-suffix-wins — the owning cluster answers (or
 NXDOMAINs) alone. Safe domains (`.test`, `.internal`, `home.arpa`) are accepted outright;
 `.local`/`.localhost`/`.invalid`/single-label are always rejected; anything else can shadow
@@ -319,7 +323,9 @@ tbx up / tbx down
 tbx cluster create|start|stop|destroy|list [name] [--cp N --workers N]
                   [--cni cilium|flannel] [--csi longhorn|local-path] [--lb] [--bgp] [--hubble]
                   [--talos-version VERSION] [--schematic ID] [--extensions LIST]
-tbx node add|remove|start|stop <cluster> [node]
+tbx node add <cluster> [node] [--role worker|control-plane] [--force]
+tbx node remove <cluster> <node> [--force]
+tbx node start <cluster> <node> [--force]      tbx node stop <cluster> <node>
 tbx cluster suspend|resume <cluster>
 tbx snapshot create <cluster> [name] [--yes]
 tbx snapshot restore <cluster> <name> [--yes] [--force]
@@ -331,7 +337,7 @@ tbx mirror offline [on|off]
 tbx cache pull [-f talosbox.yaml] [--no-images]
                [--talos-version VERSION --schematic ID --extensions LIST]
 tbx cache warm [--check [--deep]] <list-file> [<list-file>...]
-tbx cache list
+tbx cache list [-o json]
 tbx cache prune [--mirror|--all]
 tbx doctor      tbx system install|uninstall|restart [--force]|status
 tbx version (also --version, -v)
@@ -339,6 +345,8 @@ tbx version (also --version, -v)
 
 `tbx cache list` reports Talos disk images and mirror-cache totals, labelling each disk-image
 combination `in-use` (naming the clusters that reference it), `pinned`, `default`, or `orphan`.
+A combination holding only leftovers — a compressed archive, an unusable disk image, or a lone
+pin marker — is listed too, marked `(incomplete)`, so the listing is a complete prune preview.
 Cache pruning is scope-limited: without a flag it removes disk images only and leaves mirror
 content intact; `--mirror` removes mirror content only; `--all` removes both and clears pins.
 These are the only cache-prune scopes. The default scope is additionally **reference-aware**:

@@ -130,6 +130,12 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 		}
 	}
 	if len(status.Nodes) > 0 && len(stopped) == len(status.Nodes) {
+		// Saved memory outranks the stopped reading: start boots the nodes
+		// cold and drops the suspended state on the floor, so the hint names
+		// resume and says what start would cost (#272).
+		if status.Suspended {
+			return append(hints, fmt.Sprintf("cluster is suspended — resume it with: tbx cluster resume %s (tbx cluster start discards the saved memory)", status.Name))
+		}
 		return append(hints, fmt.Sprintf("cluster is stopped — start it with: tbx cluster start %s", status.Name))
 	}
 	if hint := storageHint(status); hint != "" {

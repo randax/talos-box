@@ -442,6 +442,10 @@ func machinePrerequisitePatch(item cluster.Cluster) string {
 	if ciliumDisablesKubeProxy(item) {
 		patch += "  proxy:\n    disabled: true\n"
 	}
+	// SPEC §8: printed config snippets MUST carry the virtio_balloon kernel
+	// module. This is printed-inspection output only — curated provisioning
+	// still applies no balloon patch of its own.
+	patch += manifests.BalloonModule(manifestFacts(item))
 	return patch + catchAllMirrorDocument(item.SubnetIndex)
 }
 

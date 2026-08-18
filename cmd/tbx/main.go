@@ -90,9 +90,9 @@ func (c cli) run(args []string) error {
 // list is spelled out twice — so the two forms cannot drift apart.
 var groupUsages = map[string]string{
 	"cluster":  "usage: tbx cluster create|start|stop|suspend|resume|destroy|list",
-	"node":     "usage: tbx node add|remove <cluster> [node]",
+	"node":     "usage: tbx node add <cluster> [node] | remove|start|stop <cluster> <node>",
 	"snapshot": "usage: tbx snapshot create|restore|list|delete",
-	"cache":    "usage: tbx cache pull|prune|warm|list",
+	"cache":    "usage: tbx cache pull|prune|warm|list [-o json]",
 	"system":   "usage: tbx system install|uninstall|restart [--force]|status",
 	"mirror":   "usage: tbx mirror offline [on|off]",
 	"bgp":      "usage: tbx bgp enable|disable <cluster>",
@@ -495,9 +495,48 @@ func (c cli) runNode(args []string) error {
 			return err
 		}
 		return printWarnings(c.err, result.Warnings, result.Warning)
+	case "start", "stop":
+		return c.runNodeRunState(args[0], args[1:])
 	default:
 		return fmt.Errorf("unknown node command %q", args[0])
 	}
+}
+
+// runNodeRunState powers one node up or down; both verbs share a shape, so the
+// only thing that differs is the wire op and the confirmation's verb.
+func (c cli) runNodeRunState(verb string, args []string) error {
+	flags := flag.NewFlagSet("node "+verb, flag.ContinueOnError)
+	flags.SetOutput(c.err)
+	// start is gated on host memory and pressure exactly like cluster start and
+	// node add, so it takes --force. stop overrides nothing — a power-off frees
+	// host resources — so the flag is not registered there rather than accepted
+	// and ignored while its help promises an override.
+	var force bool
+	usage := fmt.Sprintf("usage: tbx node %s <cluster> <node>", verb)
+	if verb == "start" {
+		flags.BoolVar(&force, "force", false, "proceed despite memory overcommit or host pressure")
+		usage += " [--force]"
+	}
+	positionals, err := parseInterspersed(flags, args)
+	if err != nil {
+		return err
+	}
+	if len(positionals) != 2 {
+		return errors.New(usage)
+	}
+	if err := c.ensureNodeRunStateSupport(verb); err != nil {
+		return err
+	}
+	request := map[string]any{"cluster": positionals[0], "name": positionals[1], "force": force}
+	var result daemon.NodeStatus
+	if err := c.call("node."+verb, request, &result); err != nil {
+		return err
+	}
+	past := map[string]string{"start": "started", "stop": "stopped"}[verb]
+	if _, err := fmt.Fprintf(c.out, "%s node %s in cluster %s\n", past, positionals[1], positionals[0]); err != nil {
+		return err
+	}
+	return printWarnings(c.err, result.Warnings, result.Warning)
 }
 
 func (c cli) runStatus(args []string) error {
@@ -589,12 +628,34 @@ func (c cli) runCache(args []string) error {
 		}
 		return err
 	case "list":
-		if len(args) != 1 {
-			return errors.New("usage: tbx cache list")
+		flags := flag.NewFlagSet("cache list", flag.ContinueOnError)
+		flags.SetOutput(c.err)
+		outputFormat := flags.String("o", "table", "output format: table|json")
+		positionals, err := parseInterspersed(flags, args[1:])
+		if err != nil {
+			return err
+		}
+		if len(positionals) != 0 {
+			return errors.New("usage: tbx cache list [-o json]")
+		}
+		if err := validateOutputFormat(*outputFormat); err != nil {
+			return err
 		}
 		var result daemon.CacheListResult
 		if err := c.call("cache.list", struct{}{}, &result); err != nil {
 			return err
+		}
+		if *outputFormat == "json" {
+			if result.Images == nil {
+				result.Images = []daemon.CacheImageEntry{}
+			}
+			if result.Mirror == nil {
+				result.Mirror = []daemon.MirrorCacheEntry{}
+			}
+			if result.MirrorBoundGatewayIPs == nil {
+				result.MirrorBoundGatewayIPs = []string{}
+			}
+			return encodeJSON(c.out, result)
 		}
 		if len(result.Images) == 0 {
 			if _, err := fmt.Fprintln(c.out, "Talos disk images: empty"); err != nil {
@@ -625,7 +686,7 @@ func (c cli) runCache(args []string) error {
 				}
 			}
 		}
-		_, err := fmt.Fprintf(c.out, "Mirror total: %d blob(s) %d bytes, %d manifest(s) %d bytes\n",
+		_, err = fmt.Fprintf(c.out, "Mirror total: %d blob(s) %d bytes, %d manifest(s) %d bytes\n",
 			result.MirrorTotal.BlobCount, result.MirrorTotal.BlobBytes, result.MirrorTotal.ManifestCount, result.MirrorTotal.ManifestBytes)
 		return err
 	case "warm":
@@ -642,14 +703,14 @@ Commands:
   up [-f talosbox.yaml] [--force]
   down [-f talosbox.yaml]
   cluster create|start|stop|suspend|resume|destroy|list
-  node add|remove
+  node add <cluster> [node] | remove|start|stop <cluster> <node>
   snapshot create|restore|list|delete
   status [cluster]
   manifests <cluster> [section] [--cni cilium|flannel]
   console <cluster> <node>
   bgp enable|disable <cluster>
   mirror offline [on|off]
-  cache pull|prune|warm|list
+  cache pull|prune|warm|list [-o json]
   system install|uninstall|restart [--force]|status
   doctor
   version (also --version, -v)

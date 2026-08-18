@@ -416,6 +416,7 @@ func TestNodeRemoveReprovisionsRunningLonghornClusterWithUpdatedTopology(t *test
 	if !response.OK {
 		t.Fatalf("node.remove failed: %s", response.Error)
 	}
+	service.backgroundProvisions.Wait()
 	if reconciledNodes != 2 {
 		t.Fatalf("node.remove reconciled %d nodes, want 2 after Longhorn scale-down", reconciledNodes)
 	}
@@ -713,6 +714,9 @@ func runningLonghornClusterForNodeMutation(t *testing.T, controlPlanes, workers 
 		hostPressure:         noHostPressure,
 		subnetSources:        emptySubnetSources(),
 		defaultSchematic:     "curated-default",
+		// no test reaches a real API server: the Kubernetes node deletion is
+		// stubbed out by default and overridden where it is the subject
+		deleteKubernetesNode: func(context.Context, cluster.Cluster, string) error { return nil },
 	}, item
 }
 

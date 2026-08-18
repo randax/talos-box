@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -68,18 +69,28 @@ type Server struct {
 	nodeVolumeCount       nodeVolumeCountFunc
 	storageEngineDelete   func(context.Context, cluster.Cluster) error
 	storageEngineValidate func(context.Context, cluster.Cluster) error
+	deleteKubernetesNode  func(context.Context, cluster.Cluster, string) error
 	nodeIPLookup          func(string, int) string
 	nodeProbe             func(string) ProbeResult
 	hostFreeMemory        func() (int, error)
+	hostTotalMemory       func() (int, error)
 	helperCheck           func() error
 	maintenanceLoad       func(string) (cluster.Cluster, error)
 	lifecycleContext      context.Context
 	lifecycleCancel       context.CancelFunc
 	mirrors               *mirror.Manager
 	mirrorOffline         atomic.Bool
-	defaultSchematic      string
-	subnetSources         cluster.SubnetSources
-	hostPressure          func(string) (hostpressure.Snapshot, error)
+	// settingsPath is where daemon-wide modes are persisted so they survive a
+	// restart (#318). An empty path disables persistence, which is what a
+	// hand-built test server wants.
+	settingsPath     string
+	defaultSchematic string
+	subnetSources    cluster.SubnetSources
+	hostPressure     func(string) (hostpressure.Snapshot, error)
+
+	// backgroundProvisions tracks reconciles that were moved off the request
+	// path, so shutdown and tests can wait for them.
+	backgroundProvisions sync.WaitGroup
 
 	listenerMu   sync.Mutex
 	listener     net.Listener
@@ -91,6 +102,10 @@ type Server struct {
 type activeProvision struct {
 	generation uint64
 	cancel     context.CancelFunc
+	// done is closed when the task that owns this generation has finished.
+	// Cancelling a reconcile only asks it to stop; an operation that is about
+	// to delete the cluster's files has to wait until it actually has (#334).
+	done chan struct{}
 }
 
 type activeStorageProbe struct {
@@ -148,11 +163,15 @@ func NewServer(ctx context.Context) (*Server, error) {
 		subnetSources:         cluster.SystemSubnetSources(),
 		hostPressure:          hostpressure.SystemSnapshot,
 		hostFreeMemory:        balloon.HostFreeMiB,
+		hostTotalMemory:       balloon.HostTotalMiB,
 		destroyVolumeCount:    countDestroyStorageVolumes,
 		nodeVolumeCount:       countNodeRemovalStorageVolumes,
 		storageEngineDelete:   deleteConfiguredStorageEngine,
 		storageEngineValidate: validateConfiguredStorageEngine,
 	}
+	// A persisted mode is re-applied before the socket exists, so the first
+	// request after a restart already sees it (#318).
+	server.applyPersistedSettings()
 	server.boundMirrorGateways = func() []string {
 		return server.mirrors.BoundGatewayIPs()
 	}
@@ -323,6 +342,9 @@ func (s *Server) Shutdown() error {
 	s.cancelAllProvisionsLocked()
 	s.opMu.Unlock()
 	s.connectionWG.Wait()
+	// the reconciles that outlive their request answer to the cancelled
+	// lifecycle context, so this only waits for them to unwind
+	s.backgroundProvisions.Wait()
 
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
@@ -369,16 +391,46 @@ func (s *Server) dispatch(request Request) Response {
 	if request.Op == "cluster.create" || request.Op == "cluster.start" || request.Op == "up" {
 		return s.dispatchProvisioning(request)
 	}
-	if request.Op == "node.add" || request.Op == "node.remove" {
+	if isNodeMutation(request.Op) {
 		return s.dispatchNodeMutation(request)
 	}
 	if request.Op == "snapshot.restore" {
 		return s.dispatchSnapshotRestore(request)
 	}
+	if request.Op == "cluster.destroy" {
+		return s.dispatchDestroy(request)
+	}
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 
 	data, err := s.handle(request)
+	if err != nil {
+		return failure(err)
+	}
+	return success(data)
+}
+
+// dispatchDestroy drains the cluster's background reconcile before the
+// destruction takes the operation lock. The reconcile writes into the very
+// directory the destroy removes, and its epilogue re-registers daemon state for
+// the cluster — state a later cluster of the same name would inherit. The wait
+// cannot happen under opMu, which is why it is here and not in destroyCluster.
+func (s *Server) dispatchDestroy(request Request) Response {
+	var args destroyArgs
+	if err := decodeArgs(request.Args, &args); err != nil {
+		return failure(err)
+	}
+	// The cluster's disk-mutation lock closes the gap between the drain and
+	// the destroy: a concurrent node mutation could otherwise register a fresh
+	// reconcile after the drain and have it write into the directory being
+	// removed.
+	lock := s.clusterMutationLock(args.Name)
+	lock.Lock()
+	defer lock.Unlock()
+	s.drainProvision(args.Name)
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	data, err := s.destroyCluster(request.Args)
 	if err != nil {
 		return failure(err)
 	}
@@ -443,6 +495,17 @@ func (s *Server) dispatchProvisioning(request Request) Response {
 	return success(data)
 }
 
+// isNodeMutation names the operations that change one node's membership or run
+// state, and so share the per-cluster mutation lock.
+func isNodeMutation(op string) bool {
+	switch op {
+	case "node.add", "node.remove", "node.start", "node.stop":
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Server) dispatchNodeMutation(request Request) Response {
 	var args nodeArgs
 	if err := decodeArgs(request.Args, &args); err != nil {
@@ -457,9 +520,11 @@ func (s *Server) dispatchNodeMutation(request Request) Response {
 	lock.Lock()
 	var removalWarning string
 	if request.Op == "node.remove" {
+		log.Printf("node.remove %s/%s: begin", args.Cluster, args.Name)
 		warning, err := s.gateNodeRemoval(args)
 		if err != nil {
 			lock.Unlock()
+			log.Printf("node.remove %s/%s: refused: %v", args.Cluster, args.Name, err)
 			return failure(err)
 		}
 		removalWarning = warning
@@ -467,8 +532,8 @@ func (s *Server) dispatchNodeMutation(request Request) Response {
 	s.opMu.Lock()
 	data, tasks, err := s.handleNodeMutationLocked(request)
 	s.opMu.Unlock()
-	lock.Unlock()
 	if err != nil {
+		lock.Unlock()
 		if removalWarning != "" {
 			// the removal may have deleted state before failing; the data-loss
 			// note must reach the user alongside the failure
@@ -476,19 +541,31 @@ func (s *Server) dispatchNodeMutation(request Request) Response {
 		}
 		return failure(err)
 	}
-	if removalWarning != "" {
-		if status, ok := data.(NodeStatus); ok {
-			status.addWarnings(removalWarning)
-			data = status
-		}
+	warnings := []string{removalWarning}
+	if request.Op == "node.remove" {
+		// Still under the cluster mutation lock: a concurrent node.add could
+		// otherwise reuse the removed name before this bounded cleanup runs and
+		// have its freshly registered Kubernetes Node object deleted.
+		warnings = append(warnings, s.deleteRemovedKubernetesNode(args.Cluster, args.Name))
 	}
-	if err := s.runProvisionTasks(data, tasks); err != nil {
-		if removalWarning != "" {
-			// the node's disk is already gone; the data-loss note must survive
-			// a failed follow-up reconcile
-			return failure(fmt.Errorf("%w (warning: %s)", err, removalWarning))
+	lock.Unlock()
+	if status, ok := data.(NodeStatus); ok {
+		status.addWarnings(warnings...)
+		data = status
+	}
+	// node.add keeps its reconcile on the request path: the added node is not a
+	// usable cluster member until it is configured, and the CLI's confirmation
+	// would otherwise outrun it. Every other node mutation answers as soon as
+	// the substrate settled and reconciles behind the response (#314).
+	if request.Op == "node.add" {
+		if err := s.runProvisionTasks(data, tasks); err != nil {
+			return failure(err)
 		}
-		return failure(err)
+		return success(data)
+	}
+	s.runProvisionTasksAsync(request.Op, tasks)
+	if request.Op == "node.remove" {
+		log.Printf("node.remove %s/%s: complete", args.Cluster, args.Name)
 	}
 	return success(data)
 }
@@ -588,7 +665,7 @@ func (s *Server) handle(request Request) (any, error) {
 		return s.destroyInspect(request.Args)
 	case "cluster.list":
 		return s.listClusters()
-	case "node.add", "node.remove":
+	case "node.add", "node.remove", "node.start", "node.stop":
 		// node mutations flow through dispatchNodeMutation, which volume-gates
 		// node.remove before taking opMu; a locked ungated path must not exist
 		return nil, fmt.Errorf("operation %q must be dispatched as a node mutation", request.Op)
@@ -675,7 +752,11 @@ func removeNodeFiles(clusterName, nodeName string) error {
 	if err != nil {
 		return err
 	}
-	for _, suffix := range []string{".img", ".efi", ".console.sock", ".qga.sock"} {
+	// saveStateSuffix belongs here too: a removed node's suspended memory has
+	// nothing left to restore into, and clusterHasSavedState only globs the
+	// directory — an orphaned save would keep reporting the whole cluster
+	// Suspended and keep the hint recommending a resume forever.
+	for _, suffix := range []string{".img", ".efi", ".console.sock", ".qga.sock", saveStateSuffix} {
 		if err := os.Remove(filepath.Join(dir, nodeName+suffix)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("remove node file: %w", err)
 		}

@@ -260,6 +260,33 @@ func TestFileAwarePullSkipsImagesOnRequest(t *testing.T) {
 	}
 }
 
+// TestFileAwarePullIgnoresIncompleteCombinationsAsStrays keeps the widened
+// cache list out of the stray report: a combination that holds only a pin
+// marker or a leftover archive is not a usable pinned image, and naming it
+// stray would send the operator after an image that is not there.
+func TestFileAwarePullIgnoresIncompleteCombinationsAsStrays(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	service, cache := newPullTestServer(t)
+	if err := cache.Pin(pullDefaultSchematic, "v1.15.0", imagecache.ArchitectureARM64); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(CachePullArgs{FromFile: true, Combinations: []CachePullCombination{
+		{Schematic: "brought", Extensions: []string{"gvisor"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.pullCache(raw)
+	if err != nil {
+		t.Fatalf("pullCache() error = %v", err)
+	}
+	for _, stray := range result.Strays {
+		if stray.Version == "v1.15.0" {
+			t.Fatalf("pullCache() reported the pin-marker-only combination as a stray: %+v", stray)
+		}
+	}
+}
+
 // TestFileAwarePullReportsStraysWithoutDeleting covers the retention rule: a
 // pin nothing claims any more is named, and left exactly where it is. The
 // built-in default combination is pinned too, and must stay unreported: prune

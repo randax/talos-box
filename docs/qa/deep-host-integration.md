@@ -41,7 +41,7 @@ On failure: capture the full doctor transcript.
 
 Steps (macOS):
 1. `tbx cluster create qa-host --cni cilium` (configured nodes are balloon-managed; maintenance nodes are exempt).
-2. Verify printed config includes the balloon module: `tbx manifests qa-host balloon` (or `machine`) mentions `virtio_balloon`.
+2. Verify printed config includes the balloon module: `tbx manifests qa-host machine` mentions `virtio_balloon` (the `balloon` alias is deprecated and errors, pointing at `machine`).
 3. Create memory pressure (e.g. run a large `stress`-like allocation or record SKIPPED-if-impractical with reason); watch for balloon inflation evidence in guest free memory (`kubectl top nodes` deltas) — this is an observe-and-attest check, not a hard assertion.
 4. Overcommit guard: attempt `tbx cluster create qa-big --cp 1 --workers 6 --memory-mib 4096` sized to exceed host RAM minus 6 GiB — expect a warning; confirm `--force` overrides; destroy/abort without creating if possible.
 

@@ -87,7 +87,11 @@ func (s *Server) Balloonables() map[string]balloon.Balloonable {
 // memory the pending operation adds) and warns if it exceeds host RAM minus the
 // reserve. Returns a warning string for the caller to surface when forced.
 func (s *Server) checkOvercommit(addMiB int, force bool) (string, error) {
-	total, err := balloon.HostTotalMiB()
+	measure := s.hostTotalMemory
+	if measure == nil {
+		measure = balloon.HostTotalMiB
+	}
+	total, err := measure()
 	if err != nil {
 		return "", nil // can't read host RAM; don't block
 	}

@@ -166,7 +166,12 @@ type NodeStatus struct {
 	IP            string       `json:"ip,omitempty"`
 	APIDReachable bool         `json:"apidReachable"`
 	Phase         Phase        `json:"phase"`
-	Warning       string       `json:"warning,omitempty"`
+	// Suspended reports that this node's own memory is saved on disk, which
+	// only suspend writes and only for nodes that were running. A stopped
+	// member of a suspended cluster that has no save is plain stopped — a
+	// resume brings it up cold, not back where it left off.
+	Suspended bool   `json:"suspended,omitempty"`
+	Warning   string `json:"warning,omitempty"`
 	// Warnings is the same advisory set as Warning, one entry per finding.
 	// Warning stays populated for older clients that only read it.
 	Warnings []string `json:"warnings,omitempty"`
@@ -224,8 +229,12 @@ type ClusterStatus struct {
 	// from, as requested at create.
 	TalosExtensions []string `json:"talosExtensions,omitempty"`
 	cluster.ProvisioningIntent
-	BGP             bool         `json:"bgp"`
-	Running         bool         `json:"running"`
+	BGP     bool `json:"bgp"`
+	Running bool `json:"running"`
+	// Suspended reports saved VM memory on disk, the difference between a
+	// cluster that was stopped and one whose memory is waiting to be resumed —
+	// a distinction start would silently erase (#272).
+	Suspended       bool         `json:"suspended,omitempty"`
 	KubernetesReady bool         `json:"kubernetesReady"`
 	StoragePhase    StoragePhase `json:"storagePhase,omitempty"`
 	StorageError    string       `json:"storageError,omitempty"`
@@ -327,6 +336,9 @@ type CacheImageEntry struct {
 	// daemon leaves them empty, which the client renders as no status.
 	Status   CacheImageStatus `json:"status,omitempty"`
 	Clusters []string         `json:"clusters,omitempty"`
+	// Incomplete marks a combination with prunable leftovers but no usable
+	// image. It is listed so the preview covers everything prune removes.
+	Incomplete bool `json:"incomplete,omitempty"`
 }
 
 type MirrorCacheEntry struct {
@@ -491,7 +503,7 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 			log.Printf("resolver files for %s: %v", item.Name, err)
 		}
 	}
-	startWarning, err := s.start(item)
+	startWarnings, err := s.start(item)
 	if err != nil {
 		result := summary(item, false)
 		result.setWarnings(append([]string{talosVersionWarning, overcommitWarning}, append(hostPressureWarnings, longhornWarning, longhornCustomSchematicWarning, subnetWarning)...)...)
@@ -505,7 +517,7 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 		return result, startErr
 	}
 	result := summary(item, true)
-	result.setWarnings(append([]string{talosVersionWarning, overcommitWarning}, append(hostPressureWarnings, longhornWarning, longhornCustomSchematicWarning, subnetWarning, startWarning)...)...)
+	result.setWarnings(append([]string{talosVersionWarning, overcommitWarning}, append(hostPressureWarnings, append([]string{longhornWarning, longhornCustomSchematicWarning, subnetWarning}, startWarnings...)...)...)...)
 	return result, nil
 }
 
@@ -536,12 +548,12 @@ func (s *Server) startCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if err != nil {
 		return ClusterSummary{}, err
 	}
-	subnetWarning, err := s.start(item)
+	startWarnings, err := s.start(item)
 	if err != nil {
 		return ClusterSummary{}, err
 	}
 	result := summary(item, true)
-	result.setWarnings(append([]string{overcommitWarning}, append(hostPressureWarnings, longhornWarning, longhornCustomSchematicWarning, subnetWarning)...)...)
+	result.setWarnings(append([]string{overcommitWarning}, append(hostPressureWarnings, append([]string{longhornWarning, longhornCustomSchematicWarning}, startWarnings...)...)...)...)
 	return result, nil
 }
 
@@ -552,14 +564,18 @@ func (s *Server) longhornCustomSchematicWarning(item cluster.Cluster, custom boo
 	return "Longhorn on a custom Talos schematic requires siderolabs/iscsi-tools and siderolabs/util-linux-tools; tbx's default generated schematic already includes them"
 }
 
-func (s *Server) start(item cluster.Cluster) (string, error) {
+func (s *Server) start(item cluster.Cluster) ([]string, error) {
 	// The subnet was decided at create time and belongs to this cluster, so it
 	// is only inspected for advisory routing findings. Re-running the
 	// create-time collision guard would refuse the cluster's own bridge, which
 	// suspend leaves up and an unclean stop can strand (#271).
 	subnetWarning, err := cluster.AttachedSubnetWarning(item.SubnetIndex, s.hostSubnetSources())
 	if err != nil {
-		return "", err
+		return nil, err
+	}
+	dir, err := cluster.Dir(item.Name)
+	if err != nil {
+		return nil, err
 	}
 	nodes := s.vms[item.Name]
 	if nodes == nil {
@@ -573,31 +589,69 @@ func (s *Server) start(item cluster.Cluster) (string, error) {
 				continue
 			}
 			if err := existing.Close(); err != nil {
-				return "", fmt.Errorf("release inactive VM %s: %w", node.Name, err)
+				return nil, fmt.Errorf("release inactive VM %s: %w", node.Name, err)
 			}
 			delete(nodes, node.Name)
 		}
 		machine, err := s.launchMachine(item, node, nil)
 		if err != nil {
 			rollbackErr := s.rollbackStarted(item.Name, nodes, started)
-			return "", errors.Join(fmt.Errorf("create VM %s: %w", node.Name, err), rollbackErr)
+			// The rolled-back nodes did launch: they cold-booted and advanced
+			// their disks, so their saved memory no longer matches what is on
+			// disk and must not survive for a later `cluster resume` to restore.
+			// The nodes that never launched keep theirs — nothing touched them.
+			// A discard that itself fails must reach the operator: the stale
+			// save resurrects the suspended status and the resume hint.
+			var discardErrs []error
+			for _, name := range started {
+				if _, failure := discardSavedState(dir, name); failure != "" {
+					discardErrs = append(discardErrs, errors.New(failure))
+				}
+			}
+			return nil, errors.Join(append([]error{fmt.Errorf("create VM %s: %w", node.Name, err), rollbackErr}, discardErrs...)...)
 		}
 		nodes[node.Name] = machine
 		started = append(started, node.Name)
 	}
+	// start is a cold boot: suspended memory left by an earlier suspend is
+	// superseded by these launches and must not outlive them, or status keeps
+	// reporting the cluster Suspended and the hint keeps recommending a restore
+	// onto memory that no longer matches what is running. The saves are only
+	// superseded once EVERY launch has succeeded — launchMachine never reads a
+	// save, so a launch that never happened leaves its save intact. A failure
+	// partway through discards only the saves of the nodes that did launch (see
+	// the rollback above): those cold-booted and advanced their disks, while the
+	// untouched members stay resumable.
+	var discarded bool
+	var discardFailures []string
+	for _, name := range started {
+		dropped, failure := discardSavedState(dir, name)
+		if dropped {
+			discarded = true
+		}
+		if failure != "" {
+			discardFailures = append(discardFailures, failure)
+		}
+	}
 	go s.bindMirrors(item.SubnetIndex) // async: don't hold opMu across the retry
-	return subnetWarning, nil
+	warnings := []string{subnetWarning}
+	if discarded {
+		warnings = append(warnings, discardedSaveStateWarning("the cluster"))
+	}
+	return append(warnings, discardFailures...), nil
 }
 
 // startAndLogWarning starts the cluster on an operation's behalf, logging any
 // advisory finding and returning it so the operation can also carry it back to
 // the operator — the daemon log is not somewhere the CLI user looks.
-func (s *Server) startAndLogWarning(item cluster.Cluster) (string, error) {
-	warning, err := s.start(item)
-	if warning != "" {
-		log.Printf("start %s: %s", item.Name, warning)
+func (s *Server) startAndLogWarning(item cluster.Cluster) ([]string, error) {
+	warnings, err := s.start(item)
+	for _, warning := range warnings {
+		if warning != "" {
+			log.Printf("start %s: %s", item.Name, warning)
+		}
 	}
-	return warning, err
+	return warnings, err
 }
 
 // hostSubnetSources merges injected sources with system defaults per field, so
@@ -922,8 +976,13 @@ func (s *Server) addNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTask
 	}
 	status := nodeStatus(node, item.SubnetIndex, s.nodeRunning(item.Name, node.Name))
 	customSchematic := s.defaultSchematic != "" && item.Schematic != "" && item.Schematic != s.defaultSchematic
-	status.setWarnings(append([]string{overcommitWarning}, append(hostPressureWarnings, subnetWarning, s.longhornCustomSchematicWarning(item, customSchematic))...)...)
-	return status, s.beginNodeMutationProvisionLocked(item), nil
+	tasks, deferredReconcile := s.beginNodeMutationProvisionLocked(item)
+	var deferredWarning string
+	if deferredReconcile {
+		deferredWarning = nodeAddDeferredReconcileWarning(node.Name)
+	}
+	status.setWarnings(append([]string{overcommitWarning}, append(hostPressureWarnings, subnetWarning, s.longhornCustomSchematicWarning(item, customSchematic), deferredWarning)...)...)
+	return status, tasks, nil
 }
 
 func (s *Server) removeNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTask, error) {
@@ -941,9 +1000,11 @@ func (s *Server) removeNodeLocked(raw json.RawMessage) (NodeStatus, []provisionT
 	}
 	if machine := s.vms[item.Name][node.Name]; machine != nil {
 		if err := closeMachine(machine); err != nil {
+			log.Printf("node.remove %s/%s: stop VM failed: %v", item.Name, node.Name, err)
 			return NodeStatus{}, nil, fmt.Errorf("stop node %s: %w", node.Name, err)
 		}
 		delete(s.vms[item.Name], node.Name)
+		log.Printf("node.remove %s/%s: VM stopped", item.Name, node.Name)
 	}
 	s.forgetNode(item.Name, node.Name)
 	if err := cluster.Save(item); err != nil {
@@ -952,7 +1013,12 @@ func (s *Server) removeNodeLocked(raw json.RawMessage) (NodeStatus, []provisionT
 	if err := removeNodeFiles(item.Name, node.Name); err != nil {
 		return NodeStatus{}, nil, err
 	}
-	return nodeStatus(node, item.SubnetIndex, false), s.beginNodeMutationProvisionLocked(item), nil
+	tasks, deferredReconcile := s.beginNodeMutationProvisionLocked(item)
+	status := nodeStatus(node, item.SubnetIndex, false)
+	if deferredReconcile {
+		status.setWarnings(nodeRemoveDeferredReconcileWarning(node.Name))
+	}
+	return status, tasks, nil
 }
 
 func (s *Server) handleNodeMutationLocked(request Request) (any, []provisionTask, error) {
@@ -965,6 +1031,18 @@ func (s *Server) handleNodeMutationLocked(request Request) (any, []provisionTask
 		return result, tasks, nil
 	case "node.remove":
 		result, tasks, err := s.removeNodeLocked(request.Args)
+		if err != nil {
+			return nil, nil, err
+		}
+		return result, tasks, nil
+	case "node.start":
+		result, tasks, err := s.startNodeLocked(request.Args)
+		if err != nil {
+			return nil, nil, err
+		}
+		return result, tasks, nil
+	case "node.stop":
+		result, tasks, err := s.stopNodeLocked(request.Args)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -999,10 +1077,18 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 
 	result := make([]ClusterStatus, 0, len(items))
 	for _, item := range items {
-		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), TalosVersion: item.TalosVersion, Schematic: item.Schematic, BaseSchematic: item.BaseSchematic, TalosExtensions: item.TalosExtensions, ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: s.clusterRunning(item.Name), Capabilities: s.clusterCapabilities(item), subnetIndex: item.SubnetIndex}
+		running := s.clusterRunning(item.Name)
+		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), TalosVersion: item.TalosVersion, Schematic: item.Schematic, BaseSchematic: item.BaseSchematic, TalosExtensions: item.TalosExtensions, ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: running,
+			// derived from disk, not from daemon memory, so a restarted
+			// daemon still reports its predecessor's suspension
+			Suspended: !running && clusterHasSavedState(item.Name), Capabilities: s.clusterCapabilities(item), subnetIndex: item.SubnetIndex}
 		for _, node := range item.Nodes {
 			running := s.nodeRunning(item.Name, node.Name)
-			clusterStatus.Nodes = append(clusterStatus.Nodes, NodeStatus{Name: node.Name, Role: node.Role, MAC: node.MAC, Phase: ClassifyPhase(running, ProbeResult{}), StartedAt: s.vmStartedAt(item.Name, node.Name)})
+			clusterStatus.Nodes = append(clusterStatus.Nodes, NodeStatus{Name: node.Name, Role: node.Role, MAC: node.MAC, Phase: ClassifyPhase(running, ProbeResult{}), StartedAt: s.vmStartedAt(item.Name, node.Name),
+				// per-node, not per-cluster: suspend saves memory only for
+				// the nodes that were running, and the rest stay plain
+				// stopped rather than inheriting the cluster's flag
+				Suspended: !running && nodeHasSavedState(item.Name, node.Name)})
 		}
 		clusterStatus.Hints = Hints(clusterStatus)
 		result = append(result, clusterStatus)
@@ -1078,6 +1164,15 @@ func refreshKubernetesReadiness(statuses []ClusterStatus) {
 func (s *Server) nodeRunning(clusterName, nodeName string) bool {
 	machine := s.vms[clusterName][nodeName]
 	return machine != nil && machine.Active()
+}
+
+// allNodesRunning reports whether every member of the cluster has a running
+// VM, which is what a reconcile needs: its request lists all members and its
+// readiness gates wait on each of them.
+func (s *Server) allNodesRunning(item cluster.Cluster) bool {
+	return clusterReady(item, func(nodeName string) bool {
+		return s.nodeRunning(item.Name, nodeName)
+	})
 }
 
 func (s *Server) clusterRunning(name string) bool {
@@ -1250,6 +1345,11 @@ func (s *Server) strayPinnedImages(pulled []CachePullImage) ([]CacheImageEntry, 
 	}
 	var strays []CacheImageEntry
 	for _, entry := range entries {
+		// List also reports combinations that hold only prunable leftovers;
+		// they are not usable pinned images and were never strays here.
+		if entry.Incomplete {
+			continue
+		}
 		combination := imagecache.Combination{
 			Schematic:    entry.Schematic,
 			Version:      entry.Version,
@@ -1363,6 +1463,7 @@ func (s *Server) listCache() (CacheListResult, error) {
 			AllocatedSize: entry.AllocatedSize,
 			Status:        status,
 			Clusters:      clusters,
+			Incomplete:    entry.Incomplete,
 		})
 	}
 	for _, stat := range mirrorStats {

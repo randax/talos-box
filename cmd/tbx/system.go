@@ -106,6 +106,14 @@ func (c cli) restartDaemon(force bool) error {
 	// under a deadline: it is served under the daemon's operation lock, so a
 	// long suspend or destroy must never be able to hang --force
 	activity, activityErr := daemonClusterActivity(socketPath)
+	if activityErr != nil {
+		// A daemon too busy to answer cluster.list is exactly the one whose
+		// shutdown takes minutes, so the stop-wait must not collapse to the
+		// base timeout. On-disk state still names every configured node; the
+		// count over-estimates (stopped clusters included), which only ever
+		// lengthens the wait (#319).
+		activity.runningVMs = onDiskVMCount()
+	}
 	if !force {
 		if activityErr != nil {
 			return fmt.Errorf("tbx could not tell whether clusters are running (%v); restarting tbxd stops every running cluster — re-run: tbx system restart --force", activityErr)
@@ -114,7 +122,9 @@ func (c cli) restartDaemon(force bool) error {
 			return errors.New(restartRefusal(activity))
 		}
 	}
-	restarted, restartedPID, err := replaceDaemon(socketPath, info, pid)
+	// activity carries the VM count the stop-wait is scaled to; an unknown
+	// activity leaves the base wait, which is the pre-#319 behaviour.
+	restarted, restartedPID, err := replaceDaemon(socketPath, info, pid, activity, c.err)
 	if err != nil {
 		return err
 	}

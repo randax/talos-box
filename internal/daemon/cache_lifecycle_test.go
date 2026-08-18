@@ -573,3 +573,48 @@ func TestPruneCacheRemovesExactlyWhatListCallsOrphaned(t *testing.T) {
 		}
 	}
 }
+
+func TestListCachePreviewsOrphanedIncompleteCombinations(t *testing.T) {
+	// The reported bug: prune reclaimed an archive-only combination the
+	// preceding list never showed, then summarized it as 0 image(s).
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	service := newCacheReferenceTestServer(t, root)
+
+	writeCachedDisk(t, root, "ready-schematic", "v1.2.3", "amd64")
+	archive := filepath.Join(root, "orphan-schematic", "v1.2.3", "amd64", "metal-amd64.raw.xz")
+	if err := os.MkdirAll(filepath.Dir(archive), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(archive, []byte("orphan-archive"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	listed, err := service.listCache()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Images) != 2 {
+		t.Fatalf("images = %+v, want the ready image and the incomplete orphan", listed.Images)
+	}
+	var orphan CacheImageEntry
+	for _, image := range listed.Images {
+		if image.Schematic == "orphan-schematic" {
+			orphan = image
+		}
+	}
+	if orphan.Status != CacheImageStatusOrphan || !orphan.Incomplete {
+		t.Fatalf("orphan entry = %+v, want an incomplete orphan", orphan)
+	}
+	if want := int64(len("orphan-archive")); orphan.Size != want {
+		t.Fatalf("orphan size = %d, want the artifact bytes %d", orphan.Size, want)
+	}
+
+	result, err := service.pruneCache(mustRawJSON(t, CachePruneArgs{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ImageCount != len(result.Images) || result.ImageCount != 2 {
+		t.Fatalf("ImageCount = %d with %d itemized combination(s), want both to be 2", result.ImageCount, len(result.Images))
+	}
+}

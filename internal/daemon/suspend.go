@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/hypervisor"
@@ -192,6 +193,94 @@ const saveStateSuffix = ".vzstate"
 
 func saveStatePath(dir, node string) string {
 	return filepath.Join(dir, node+saveStateSuffix)
+}
+
+// discardSavedState drops a node's suspended memory before it cold-boots. A
+// save is only consumed by a successful resume, so a start that boots the node
+// from disk would otherwise leave a stale save behind: status keeps reporting
+// the cluster Suspended and the resume hint invites a restore onto memory that
+// no longer matches what is running. It reports whether a save was discarded,
+// plus an operator-visible warning when a save was found but could not be
+// removed — the cold boot proceeds either way, and the survivor would silently
+// resurrect the suspended status and the resume hint.
+func discardSavedState(dir, nodeName string) (bool, string) {
+	path := saveStatePath(dir, nodeName)
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, ""
+		}
+		// The save may well be there; a stat that failed for any other reason
+		// (permissions, an unreadable directory) proves nothing, and silently
+		// treating it as absent would leave the survivor to resurrect the
+		// suspended status and the resume hint.
+		log.Printf("discard saved state %s: %v", path, err)
+		return false, undiscardedSaveStateWarning(nodeName, err)
+	}
+	if err := os.Remove(path); err != nil {
+		log.Printf("discard saved state %s: %v", path, err)
+		return false, undiscardedSaveStateWarning(nodeName, err)
+	}
+	log.Printf("discarded saved state %s: cold boot", path)
+	return true, ""
+}
+
+// discardClusterSavedStates drops every save in a cluster directory, node names
+// unknown. A snapshot restore rewrites the node disks underneath the saved
+// memory, so every save in the directory is invalid afterwards — including one
+// belonging to a node the snapshot does not even contain. It reports whether
+// anything was discarded plus one warning per save that survived, exactly like
+// the per-node discard.
+func discardClusterSavedStates(dir string) (bool, []string) {
+	matches, err := filepath.Glob(filepath.Join(dir, "*"+saveStateSuffix))
+	if err != nil {
+		log.Printf("discard saved states in %s: %v", dir, err)
+		return false, []string{undiscardedSaveStateWarning("this cluster", err)}
+	}
+	var discarded bool
+	var failures []string
+	for _, path := range matches {
+		if err := os.Remove(path); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			log.Printf("discard saved state %s: %v", path, err)
+			node := strings.TrimSuffix(filepath.Base(path), saveStateSuffix)
+			failures = append(failures, undiscardedSaveStateWarning(node, err))
+			continue
+		}
+		log.Printf("discarded saved state %s: disks were replaced", path)
+		discarded = true
+	}
+	return discarded, failures
+}
+
+// discardedSaveStateWarning tells the operator that a cold boot threw suspended
+// memory away, because the discard is otherwise invisible: the next status just
+// stops saying Suspended.
+func discardedSaveStateWarning(subject string) string {
+	return fmt.Sprintf("discarded suspended memory state; %s cold-booted", subject)
+}
+
+// undiscardedSaveStateWarning is the other half: the cold boot happened but the
+// save outlived it, so status will keep calling the node suspended and the hint
+// will keep offering a resume onto memory the running VM no longer matches.
+func undiscardedSaveStateWarning(nodeName string, err error) string {
+	return fmt.Sprintf(
+		"could not discard suspended memory state for %s: %v; ignore the suspended status and do not resume",
+		nodeName, err,
+	)
+}
+
+// nodeHasSavedState reports whether one node's own memory is saved on disk.
+// suspend only writes a save for nodes that were running, so this is what
+// separates the members a resume restores from those it cold-boots.
+func nodeHasSavedState(clusterName, nodeName string) bool {
+	dir, err := cluster.Dir(clusterName)
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(saveStatePath(dir, nodeName))
+	return err == nil
 }
 
 // clusterHasSavedState reports whether a cluster still holds suspended VM
