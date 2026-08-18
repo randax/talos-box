@@ -261,6 +261,44 @@ func TestRenderMetalLBRejectsNonFlannelIntent(t *testing.T) {
 	}
 }
 
+// The curated flannel path is L2-only, so the frr-k8s subchart the packaged
+// MetalLB chart depends on must be pruned by its `frrk8s.enabled` condition
+// rather than rendered: its workloads watch FRRConfiguration CRDs this path
+// deliberately never installs and would CrashLoopBackOff (#336).
+func TestRenderMetalLBOmitsDisabledFRRK8sSubchart(t *testing.T) {
+	item, err := cluster.New("demo", 3, 1, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, LB: true}
+	objects, err := renderMetalLB(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, object := range objects {
+		if chart := object.GetLabels()["helm.sh/chart"]; strings.HasPrefix(chart, "frr-k8s") {
+			t.Errorf("rendered %s %q from disabled subchart %s", object.GetKind(), object.GetName(), chart)
+		}
+		if strings.Contains(object.GetName(), "frr") || strings.Contains(object.GetAPIVersion(), "frrk8s.metallb.io") {
+			t.Errorf("rendered frr-k8s object %s %q (%s)", object.GetKind(), object.GetName(), object.GetAPIVersion())
+		}
+		group, _, _ := unstructured.NestedString(object.Object, "spec", "group")
+		if group == "frrk8s.metallb.io" {
+			t.Errorf("rendered frr-k8s CRD %q", object.GetName())
+		}
+	}
+	// The curated values must keep describing what actually lands (SPEC
+	// manifests parity), so the speaker still runs without the FRR backends.
+	for _, object := range objects {
+		if object.GetKind() != "DaemonSet" {
+			continue
+		}
+		if object.GetName() != "metallb-speaker" {
+			t.Errorf("unexpected DaemonSet %q in L2-only render", object.GetName())
+		}
+	}
+}
+
 func objectNames(objects []unstructured.Unstructured) []string {
 	names := make([]string, 0, len(objects))
 	for _, object := range objects {
