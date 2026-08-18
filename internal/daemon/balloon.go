@@ -89,7 +89,7 @@ func (s *Server) Balloonables() map[string]balloon.Balloonable {
 func (s *Server) checkOvercommit(addMiB int, force bool) (string, error) {
 	measure := s.hostTotalMemory
 	if measure == nil {
-		measure = balloon.HostTotalMiB
+		measure = measureHostTotalMiB
 	}
 	total, err := measure()
 	if err != nil {
@@ -261,7 +261,7 @@ func (s *Server) checkLonghornMemoryWarning(item cluster.Cluster) string {
 	}
 	measure := s.hostFreeMemory
 	if measure == nil {
-		measure = balloon.HostFreeMiB
+		measure = measureHostFreeMiB
 	}
 	freeMiB, err := measure()
 	if err != nil {

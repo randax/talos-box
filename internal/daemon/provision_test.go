@@ -696,6 +696,27 @@ func TestStorageHintKeepsOnlyTheTerminatingObjectFromThePendingAdvisory(t *testi
 	if got := storageHint(bare); !strings.HasSuffix(got, "is still finishing; the daemon retries automatically.") {
 		t.Fatalf("storage hint without a detail = %q, want the plain sentence", got)
 	}
+	// A cleanup whose waits all hit the shared budget joins one observation per
+	// line; the hint folds them into a single line with the deadlines dropped.
+	joined := status
+	joined.StoragePending = "storage probe skipped while the previous probe's cleanup is still finishing: " +
+		"storage probe cleanup is still finishing (" +
+		"storage probe pod \"storage-probe-reader\" is still terminating: context deadline exceeded\n" +
+		"storage probe pod \"storage-probe-writer\" is still terminating: context deadline exceeded\n" +
+		`storage probe PVC "storage-probe" is still terminating: context deadline exceeded);` +
+		" the daemon keeps reconciling it — watch it with: tbx status demo"
+	got := storageHint(joined)
+	if strings.ContainsAny(got, "\n") {
+		t.Fatalf("storage hint = %q, want a single line", got)
+	}
+	for _, unwanted := range []string{"tbx status", "context deadline exceeded"} {
+		if strings.Contains(got, unwanted) {
+			t.Fatalf("storage hint = %q, want it to drop %q", got, unwanted)
+		}
+	}
+	if !strings.Contains(got, `storage probe pod "storage-probe-reader" is still terminating; storage probe pod "storage-probe-writer" is still terminating`) {
+		t.Fatalf("storage hint = %q, want the joined observations folded with semicolons", got)
+	}
 }
 
 func TestRefreshStoragePhasesSkipsProbeUntilKubernetesIsReady(t *testing.T) {

@@ -405,8 +405,25 @@ func storagePendingDetail(pending string) string {
 			detail = detail[open+1 : open+width]
 		}
 	}
-	detail = strings.TrimSpace(strings.ReplaceAll(detail, "`", ""))
-	detail = strings.TrimSuffix(detail, ": "+context.DeadlineExceeded.Error())
+	detail = strings.ReplaceAll(detail, "`", "")
+	// The advisory may carry an errors.Join of several waits that all hit the
+	// same deadline: one observation per line, each ending in the deadline the
+	// lead clause already reports. Fold them into one line and drop every
+	// deadline mention, not just a trailing one.
+	detail = strings.ReplaceAll(detail, ": "+context.DeadlineExceeded.Error(), "")
+	lines := make([]string, 0, 4)
+	for line := range strings.SplitSeq(detail, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line == context.DeadlineExceeded.Error() {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	detail = strings.Join(lines, "; ")
+	const storagePendingDetailMaxLen = 200
+	if len(detail) > storagePendingDetailMaxLen {
+		detail = detail[:storagePendingDetailMaxLen] + "…"
+	}
 	if detail == "" || strings.Contains(detail, "still finishing") || strings.Contains(detail, "tbx ") {
 		return ""
 	}
