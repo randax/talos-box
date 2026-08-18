@@ -378,24 +378,42 @@ func (s *Server) serveConnection(connection net.Conn) {
 			}
 			return
 		}
-		if err := encoder.Encode(s.dispatch(request)); err != nil {
+		// Narration goes onto this same connection ahead of the result, and
+		// only when the client asked for it; the sink is closed first so the
+		// result is always the last message of the exchange.
+		var progress stageFunc
+		var sink *progressSink
+		if request.Progress {
+			sink = &progressSink{encoder: encoder}
+			progress = sink.emit
+		}
+		response := s.dispatchWithProgress(request, progress)
+		if sink != nil {
+			sink.close()
+		}
+		if err := encoder.Encode(response); err != nil {
 			return
 		}
 	}
 }
 
+// dispatch serves one request without narrating it.
 func (s *Server) dispatch(request Request) Response {
+	return s.dispatchWithProgress(request, nil)
+}
+
+func (s *Server) dispatchWithProgress(request Request, progress stageFunc) Response {
 	if request.Op == "status" {
 		return s.dispatchStatus(request)
 	}
 	if request.Op == "cluster.create" || request.Op == "cluster.start" || request.Op == "up" {
-		return s.dispatchProvisioning(request)
+		return s.dispatchProvisioning(request, progress)
 	}
 	if isNodeMutation(request.Op) {
-		return s.dispatchNodeMutation(request)
+		return s.dispatchNodeMutation(request, progress)
 	}
 	if request.Op == "snapshot.restore" {
-		return s.dispatchSnapshotRestore(request)
+		return s.dispatchSnapshotRestore(request, progress)
 	}
 	if request.Op == "cluster.destroy" {
 		return s.dispatchDestroy(request)
@@ -403,7 +421,7 @@ func (s *Server) dispatch(request Request) Response {
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 
-	data, err := s.handle(request)
+	data, err := s.handle(request, progress)
 	if err != nil {
 		return failure(err)
 	}
@@ -445,7 +463,7 @@ func (s *Server) lifecycleTimeoutContext(timeout time.Duration) (context.Context
 	return context.WithTimeout(parent, timeout)
 }
 
-func (s *Server) dispatchProvisioning(request Request) Response {
+func (s *Server) dispatchProvisioning(request Request, progress stageFunc) Response {
 	var maintenance map[string]maintenanceObservation
 	if request.Op == "up" {
 		discovered, err := s.observeUpMaintenance(request.Args)
@@ -484,10 +502,20 @@ func (s *Server) dispatchProvisioning(request Request) Response {
 		}
 	}
 	s.opMu.Lock()
-	data, tasks, err := s.handleProvisioningLocked(request, maintenance, storage)
+	data, tasks, err := s.handleProvisioningLocked(request, maintenance, storage, progress)
 	s.opMu.Unlock()
 	if err != nil {
 		return failure(err)
+	}
+	// A create answers only once the substrate it promised exists: the VMs are
+	// launched under the lock, but a launched VM is not a booted node, and a
+	// past-tense success printed ahead of the boot is a lie the operator's next
+	// command races (#263). The wait is outside the lock — it takes minutes,
+	// and status must stay answerable while it runs.
+	if request.Op == "cluster.create" {
+		if summary, ok := data.(*ClusterSummary); ok {
+			summary.addWarnings(s.waitForNodesBooted(summary.Name, progress))
+		}
 	}
 	if err := s.runProvisionTasks(data, tasks); err != nil {
 		return failure(err)
@@ -506,7 +534,7 @@ func isNodeMutation(op string) bool {
 	}
 }
 
-func (s *Server) dispatchNodeMutation(request Request) Response {
+func (s *Server) dispatchNodeMutation(request Request, progress stageFunc) Response {
 	var args nodeArgs
 	if err := decodeArgs(request.Args, &args); err != nil {
 		return failure(err)
@@ -530,7 +558,7 @@ func (s *Server) dispatchNodeMutation(request Request) Response {
 		removalWarning = warning
 	}
 	s.opMu.Lock()
-	data, tasks, err := s.handleNodeMutationLocked(request)
+	data, tasks, err := s.handleNodeMutationLocked(request, progress)
 	s.opMu.Unlock()
 	if err != nil {
 		lock.Unlock()
@@ -573,7 +601,7 @@ func (s *Server) dispatchNodeMutation(request Request) Response {
 // dispatchSnapshotRestore gates the restore's node deletions outside the
 // operation lock, like dispatchNodeMutation: a restore drops every live node
 // the snapshot did not capture, disks and all.
-func (s *Server) dispatchSnapshotRestore(request Request) Response {
+func (s *Server) dispatchSnapshotRestore(request Request, progress stageFunc) Response {
 	var args snapshotArgs
 	if err := decodeArgs(request.Args, &args); err != nil {
 		return failure(err)
@@ -589,7 +617,7 @@ func (s *Server) dispatchSnapshotRestore(request Request) Response {
 		return failure(err)
 	}
 	s.opMu.Lock()
-	status, err := s.snapshotRestore(request.Args)
+	status, err := s.snapshotRestore(request.Args, progress)
 	s.opMu.Unlock()
 	lock.Unlock()
 	if err != nil {
@@ -628,7 +656,7 @@ func (s *Server) clusterMutationLock(clusterName string) *sync.Mutex {
 // operations.
 func (s *Server) dispatchStatus(request Request) Response {
 	s.opMu.Lock()
-	data, err := s.handle(request)
+	data, err := s.handle(request, nil)
 	s.opMu.Unlock()
 	if err != nil {
 		return failure(err)
@@ -643,7 +671,7 @@ func (s *Server) dispatchStatus(request Request) Response {
 	return success(statuses)
 }
 
-func (s *Server) handle(request Request) (any, error) {
+func (s *Server) handle(request Request, progress stageFunc) (any, error) {
 	switch request.Op {
 	case "daemon.ping":
 		return map[string]bool{"pong": true}, nil
@@ -654,7 +682,7 @@ func (s *Server) handle(request Request) (any, error) {
 	case "down":
 		return s.down(request.Args)
 	case "cluster.create":
-		return s.createCluster(request.Args)
+		return s.createCluster(request.Args, progress)
 	case "cluster.start":
 		return s.startCluster(request.Args)
 	case "cluster.stop":
@@ -676,7 +704,7 @@ func (s *Server) handle(request Request) (any, error) {
 	case "cluster.resume":
 		return s.resumeCluster(request.Args)
 	case "snapshot.create":
-		return s.snapshotCreate(request.Args)
+		return s.snapshotCreate(request.Args, progress)
 	case "snapshot.restore":
 		// restore flows through dispatchSnapshotRestore, which volume-gates the
 		// nodes it deletes before taking opMu; a locked ungated path must not exist

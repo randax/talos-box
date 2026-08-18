@@ -40,7 +40,7 @@ func TestCacheWarmRejectsUnpinnedRefsBeforeStartingWarm(t *testing.T) {
 		{strings.Repeat("a.", 126) + "aaaa/repo:tag"},
 	} {
 		t.Run(strings.Join(refs, ","), func(t *testing.T) {
-			_, err := service.handle(Request{Op: "cache.warm", Args: mustWarmArgs(t, CacheWarmArgs{Refs: refs})})
+			_, err := service.handle(Request{Op: "cache.warm", Args: mustWarmArgs(t, CacheWarmArgs{Refs: refs})}, nil)
 			if err == nil {
 				t.Fatalf("cache.warm accepted invalid refs %v", refs)
 			}
@@ -72,7 +72,7 @@ func TestCacheWarmUsesBoundedContext(t *testing.T) {
 	if _, err := service.handle(Request{
 		Op:   "cache.warm",
 		Args: mustWarmArgs(t, CacheWarmArgs{Refs: []string{"docker.io/library/nginx:1.27.0"}}),
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatal(err)
 	}
 }

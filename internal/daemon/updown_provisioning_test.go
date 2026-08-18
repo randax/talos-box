@@ -294,7 +294,7 @@ func TestUpAddsAndSwitchesCSIWithoutChangingMachineConfig(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			response := service.dispatchProvisioning(Request{Op: "up", Args: raw})
+			response := service.dispatchProvisioning(Request{Op: "up", Args: raw}, nil)
 			if !response.OK {
 				t.Fatalf("up failed: %s", response.Error)
 			}

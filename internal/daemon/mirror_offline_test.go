@@ -24,7 +24,7 @@ func TestMirrorOfflineSurvivesADaemonRestart(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
 	first := newPersistentServer(t)
-	if _, err := first.handle(Request{Op: "mirror.offline.set", Args: json.RawMessage(`{"enabled":true}`)}); err != nil {
+	if _, err := first.handle(Request{Op: "mirror.offline.set", Args: json.RawMessage(`{"enabled":true}`)}, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -35,7 +35,7 @@ func TestMirrorOfflineSurvivesADaemonRestart(t *testing.T) {
 	if !restarted.mirrors.Offline() {
 		t.Fatal("the restarted mirror manager did not observe the stored offline mode")
 	}
-	got, err := restarted.handle(Request{Op: "mirror.offline.get", Args: json.RawMessage(`{}`)})
+	got, err := restarted.handle(Request{Op: "mirror.offline.get", Args: json.RawMessage(`{}`)}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +43,7 @@ func TestMirrorOfflineSurvivesADaemonRestart(t *testing.T) {
 		t.Fatalf("mirror.offline.get after restart = %#v, want enabled", got)
 	}
 
-	if _, err := restarted.handle(Request{Op: "mirror.offline.set", Args: json.RawMessage(`{"enabled":false}`)}); err != nil {
+	if _, err := restarted.handle(Request{Op: "mirror.offline.set", Args: json.RawMessage(`{"enabled":false}`)}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if newPersistentServer(t).mirrorOffline.Load() {
@@ -70,7 +70,7 @@ func TestMirrorOfflineToleratesACorruptSettingsFile(t *testing.T) {
 	}
 
 	// The corrupt file must not block a later change from being stored.
-	if _, err := service.handle(Request{Op: "mirror.offline.set", Args: json.RawMessage(`{"enabled":true}`)}); err != nil {
+	if _, err := service.handle(Request{Op: "mirror.offline.set", Args: json.RawMessage(`{"enabled":true}`)}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if !newPersistentServer(t).mirrorOffline.Load() {
@@ -105,7 +105,7 @@ func TestMirrorOfflineDefaultsOffAndCanToggle(t *testing.T) {
 
 	service := &Server{mirrors: mirror.NewManager(t.TempDir())}
 
-	got, err := service.handle(Request{Op: "mirror.offline.get", Args: json.RawMessage(`{}`)})
+	got, err := service.handle(Request{Op: "mirror.offline.get", Args: json.RawMessage(`{}`)}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +117,7 @@ func TestMirrorOfflineDefaultsOffAndCanToggle(t *testing.T) {
 		t.Fatal("mirror offline default = on, want off")
 	}
 
-	got, err = service.handle(Request{Op: "mirror.offline.set", Args: json.RawMessage(`{"enabled":true}`)})
+	got, err = service.handle(Request{Op: "mirror.offline.set", Args: json.RawMessage(`{"enabled":true}`)}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +132,7 @@ func TestMirrorOfflineDefaultsOffAndCanToggle(t *testing.T) {
 		t.Fatal("mirror manager did not observe enabled state")
 	}
 
-	got, err = service.handle(Request{Op: "mirror.offline.get", Args: json.RawMessage(`{}`)})
+	got, err = service.handle(Request{Op: "mirror.offline.get", Args: json.RawMessage(`{}`)}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +159,7 @@ func TestMirrorOfflineSetRejectsMissingNullAndUnknownPayloads(t *testing.T) {
 		`true`,
 	} {
 		t.Run(payload, func(t *testing.T) {
-			_, err := service.handle(Request{Op: "mirror.offline.set", Args: json.RawMessage(payload)})
+			_, err := service.handle(Request{Op: "mirror.offline.set", Args: json.RawMessage(payload)}, nil)
 			if err == nil {
 				t.Fatalf("mirror.offline.set accepted invalid payload %s", payload)
 			}

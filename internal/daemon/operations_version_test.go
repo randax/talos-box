@@ -23,7 +23,7 @@ func TestCreateClusterRefusesVersionsBelowFloorBeforeMutation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = service.createCluster(raw)
+	_, err = service.createCluster(raw, nil)
 	if err == nil || !strings.Contains(err.Error(), "v0.14.0") || !strings.Contains(err.Error(), MinTalosVersion) {
 		t.Fatalf("createCluster() error = %v, want refusal naming v0.14.0 and the minimum %s", err, MinTalosVersion)
 	}
@@ -39,7 +39,7 @@ func TestCreateClusterRefusesMalformedVersionBeforeMutation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = service.createCluster(raw)
+	_, err = service.createCluster(raw, nil)
 	if err == nil || !strings.Contains(err.Error(), `"latest"`) {
 		t.Fatalf("createCluster() error = %v, want malformed-version refusal", err)
 	}
@@ -165,7 +165,7 @@ func createVersionTestCluster(t *testing.T, service *Server, name, schematic, ve
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := service.createCluster(raw)
+	result, err := service.createCluster(raw, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +202,7 @@ func TestVersionWarningReachesUserWhenCreatedClusterFailsToStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = service.createCluster(raw)
+	_, err = service.createCluster(raw, nil)
 	if err == nil || !strings.Contains(err.Error(), "failed to start") || !strings.Contains(err.Error(), "newer than") {
 		t.Fatalf("createCluster() error = %v, want the start failure carrying the newer-than-tested warning", err)
 	}

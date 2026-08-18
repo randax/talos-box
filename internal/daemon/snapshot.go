@@ -61,7 +61,7 @@ func withClusterStopped(running bool, stop, start, body func() error) error {
 	return errors.Join(bodyErr, startErr)
 }
 
-func (s *Server) snapshotCreate(raw json.RawMessage) (SnapshotStatus, error) {
+func (s *Server) snapshotCreate(raw json.RawMessage, progress stageFunc) (SnapshotStatus, error) {
 	args, item, err := s.loadSnapshotTarget(raw)
 	if err != nil {
 		return SnapshotStatus{}, err
@@ -73,13 +73,18 @@ func (s *Server) snapshotCreate(raw json.RawMessage) (SnapshotStatus, error) {
 	var created bool
 	var restartWarnings []string
 	err = withClusterStopped(running,
-		func() error { return s.stop(item.Name) },
 		func() error {
+			progress.stage("stopping cluster %s", item.Name)
+			return s.stop(item.Name)
+		},
+		func() error {
+			progress.stage("restarting cluster %s", item.Name)
 			warnings, startErr := s.startAndLogWarning(item)
 			restartWarnings = warnings
 			return startErr
 		},
 		func() error {
+			progress.stage("cloning %d node disk(s) as one crash-consistent set", len(item.Nodes))
 			if err := cluster.CreateSnapshot(item, args.Name); err != nil {
 				return err
 			}
@@ -96,6 +101,9 @@ func (s *Server) snapshotCreate(raw json.RawMessage) (SnapshotStatus, error) {
 		}
 		return SnapshotStatus{}, err
 	}
+	if running {
+		progress.stage("%s", convergenceHint(item.Name))
+	}
 	snapshots, err := cluster.ListSnapshots(item.Name)
 	if err != nil {
 		return SnapshotStatus{}, err
@@ -105,7 +113,7 @@ func (s *Server) snapshotCreate(raw json.RawMessage) (SnapshotStatus, error) {
 	return status, nil
 }
 
-func (s *Server) snapshotRestore(raw json.RawMessage) (SnapshotStatus, error) {
+func (s *Server) snapshotRestore(raw json.RawMessage, progress stageFunc) (SnapshotStatus, error) {
 	args, item, err := s.loadSnapshotTarget(raw)
 	if err != nil {
 		return SnapshotStatus{}, err
@@ -122,6 +130,7 @@ func (s *Server) snapshotRestore(raw json.RawMessage) (SnapshotStatus, error) {
 	err = withClusterStopped(true,
 		func() error {
 			if running {
+				progress.stage("stopping cluster %s", item.Name)
 				return s.stop(item.Name)
 			}
 			return nil
@@ -132,11 +141,13 @@ func (s *Server) snapshotRestore(raw json.RawMessage) (SnapshotStatus, error) {
 			if loadErr != nil {
 				return loadErr
 			}
+			progress.stage("starting cluster %s", restored.Name)
 			warnings, startErr := s.startAndLogWarning(restored)
 			restartWarnings = warnings
 			return startErr
 		},
 		func() error {
+			progress.stage("restoring %d node disk(s) from snapshot %s", len(item.Nodes), args.Name)
 			if err := cluster.RestoreSnapshot(item, args.Name); err != nil {
 				return err
 			}
@@ -156,6 +167,8 @@ func (s *Server) snapshotRestore(raw json.RawMessage) (SnapshotStatus, error) {
 	if err != nil {
 		return SnapshotStatus{}, err
 	}
+	// A restore always ends powered on, so it always leaves nodes converging.
+	progress.stage("%s", convergenceHint(item.Name))
 	snapshots, err := cluster.ListSnapshots(item.Name)
 	if err != nil {
 		return SnapshotStatus{}, err

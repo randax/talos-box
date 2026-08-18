@@ -69,10 +69,10 @@ func (t provisionTask) finish() {
 	}
 }
 
-func (s *Server) handleProvisioningLocked(request Request, maintenance map[string]maintenanceObservation, storage map[string]storageObservation) (any, []provisionTask, error) {
+func (s *Server) handleProvisioningLocked(request Request, maintenance map[string]maintenanceObservation, storage map[string]storageObservation, progress stageFunc) (any, []provisionTask, error) {
 	switch request.Op {
 	case "cluster.create":
-		result, err := s.createCluster(request.Args)
+		result, err := s.createCluster(request.Args, progress)
 		if err != nil {
 			return nil, nil, err
 		}

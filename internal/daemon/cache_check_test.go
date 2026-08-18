@@ -40,7 +40,7 @@ func TestCacheCheckRejectsUnpinnedRefsBeforeStartingCheck(t *testing.T) {
 		{strings.Repeat("a.", 126) + "aaaa/repo:tag"},
 	} {
 		t.Run(strings.Join(refs, ","), func(t *testing.T) {
-			_, err := service.handle(Request{Op: "cache.check", Args: mustCheckArgs(t, CacheCheckArgs{Refs: refs})})
+			_, err := service.handle(Request{Op: "cache.check", Args: mustCheckArgs(t, CacheCheckArgs{Refs: refs})}, nil)
 			if err == nil {
 				t.Fatalf("cache.check accepted invalid refs %v", refs)
 			}
@@ -78,7 +78,7 @@ func TestCacheCheckUsesBoundedContextAndOptions(t *testing.T) {
 	if _, err := service.handle(Request{
 		Op:   "cache.check",
 		Args: mustCheckArgs(t, CacheCheckArgs{Refs: []string{"docker.io/library/nginx:1.27.0"}, Deep: true}),
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -32,20 +32,36 @@ const (
 // node is off the substrate instead of holding the request for the follow-up
 // reconcile, and adds the additive suspended (cluster status) and incomplete
 // (cache image entry) fields.
-const ProtocolVersion = 8
+// Version 9 narrates the state-changing verbs: a request that sets progress
+// receives stage responses on its own connection ahead of the single final
+// one, and cluster.create holds its answer until the nodes it started have
+// booted (#263 #273).
+const ProtocolVersion = 9
 
 // Request is one newline-delimited daemon request.
 type Request struct {
 	Op   string          `json:"op"`
 	Args json.RawMessage `json:"args"`
+	// Progress asks the daemon to narrate the operation's stages on this
+	// connection while it runs. It is opt-in so a client that reads exactly
+	// one response — an older tbx, or any of the non-narrating verbs — never
+	// sees a message it would mistake for the result.
+	Progress bool `json:"progress,omitempty"`
 }
 
-// Response is one newline-delimited daemon response.
+// Response is one newline-delimited daemon response. A response carrying a
+// Stage is narration: the operation is still running and more responses
+// follow. Every other response is the operation's single final answer.
 type Response struct {
 	OK    bool            `json:"ok"`
 	Data  json.RawMessage `json:"data,omitempty"`
 	Error string          `json:"error,omitempty"`
+	Stage string          `json:"stage,omitempty"`
 }
+
+// IsProgress reports whether this response is a narration stage rather than
+// the operation's result.
+func (r Response) IsProgress() bool { return r.Stage != "" }
 
 // Info reports daemon wire compatibility details.
 type Info struct {
@@ -77,11 +93,19 @@ func Call(socketPath, op string, args any) (Response, error) {
 	if err := json.NewEncoder(connection).Encode(request); err != nil {
 		return Response{}, fmt.Errorf("write daemon request: %w", err)
 	}
-	var response Response
-	if err := json.NewDecoder(connection).Decode(&response); err != nil {
-		return Response{}, fmt.Errorf("read daemon response: %w", err)
+	decoder := json.NewDecoder(connection)
+	for {
+		var response Response
+		if err := decoder.Decode(&response); err != nil {
+			return Response{}, fmt.Errorf("read daemon response: %w", err)
+		}
+		// Call never asks for narration, but a stage response is still skipped
+		// rather than returned as a result if one ever arrives.
+		if response.IsProgress() {
+			continue
+		}
+		return response, nil
 	}
-	return response, nil
 }
 
 func success(data any) Response {

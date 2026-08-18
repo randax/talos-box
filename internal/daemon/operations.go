@@ -380,7 +380,7 @@ type MirrorOfflineStatus struct {
 	Enabled bool `json:"enabled"`
 }
 
-func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
+func (s *Server) createCluster(raw json.RawMessage, progress stageFunc) (ClusterSummary, error) {
 	var args createArgs
 	if err := decodeArgs(raw, &args); err != nil {
 		return ClusterSummary{}, err
@@ -486,10 +486,14 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 	// One line at create only; startCluster and status never repeat it.
 	talosVersionWarning := talosversion.NewerThanTestedWarning(item.TalosVersion)
 	item.TalosExtensions = args.Extensions
+	// The image fetch is the long pole of a cold create — ~100 MB from the
+	// Image Factory — and used to happen behind a silent request (#273).
+	progress.stage("preparing the Talos %s image", item.TalosVersion)
 	cachedDisk, err := s.cache.Ensure(item.Schematic, item.TalosVersion, s.imageArchitecture())
 	if err != nil {
 		return ClusterSummary{}, err
 	}
+	progress.stage("cloning %d node disk(s)", len(item.Nodes))
 	if err := cluster.ProvisionDisks(item, cachedDisk); err != nil {
 		_ = cluster.Destroy(item.Name)
 		return ClusterSummary{}, err
@@ -503,6 +507,7 @@ func (s *Server) createCluster(raw json.RawMessage) (ClusterSummary, error) {
 			log.Printf("resolver files for %s: %v", item.Name, err)
 		}
 	}
+	progress.stage("starting %d node(s)", len(item.Nodes))
 	startWarnings, err := s.start(item)
 	if err != nil {
 		result := summary(item, false)
@@ -911,11 +916,11 @@ func (s *Server) listClusters() ([]ClusterSummary, error) {
 }
 
 func (s *Server) addNode(raw json.RawMessage) (NodeStatus, error) {
-	status, _, err := s.addNodeLocked(raw)
+	status, _, err := s.addNodeLocked(raw, nil)
 	return status, err
 }
 
-func (s *Server) addNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTask, error) {
+func (s *Server) addNodeLocked(raw json.RawMessage, progress stageFunc) (NodeStatus, []provisionTask, error) {
 	var args nodeArgs
 	if err := decodeArgs(raw, &args); err != nil {
 		return NodeStatus{}, nil, err
@@ -959,6 +964,7 @@ func (s *Server) addNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTask
 	if err != nil {
 		return NodeStatus{}, nil, err
 	}
+	progress.stage("cloning the disk for node %s", node.Name)
 	if err := cluster.ProvisionDisks(item, cachedDisk); err != nil {
 		_ = removeNodeFiles(item.Name, node.Name)
 		return NodeStatus{}, nil, err
@@ -968,11 +974,13 @@ func (s *Server) addNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTask
 		return NodeStatus{}, nil, err
 	}
 	if running {
+		progress.stage("starting node %s", node.Name)
 		machine, err := s.launchMachine(item, node, nil)
 		if err != nil {
 			return nodeStatus(node, item.SubnetIndex, false), nil, fmt.Errorf("node added but failed to create VM: %w", err)
 		}
 		s.vms[item.Name][node.Name] = machine
+		progress.stage("%s", convergenceHint(item.Name))
 	}
 	status := nodeStatus(node, item.SubnetIndex, s.nodeRunning(item.Name, node.Name))
 	customSchematic := s.defaultSchematic != "" && item.Schematic != "" && item.Schematic != s.defaultSchematic
@@ -985,7 +993,7 @@ func (s *Server) addNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTask
 	return status, tasks, nil
 }
 
-func (s *Server) removeNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTask, error) {
+func (s *Server) removeNodeLocked(raw json.RawMessage, progress stageFunc) (NodeStatus, []provisionTask, error) {
 	var args nodeArgs
 	if err := decodeArgs(raw, &args); err != nil {
 		return NodeStatus{}, nil, err
@@ -999,6 +1007,7 @@ func (s *Server) removeNodeLocked(raw json.RawMessage) (NodeStatus, []provisionT
 		return NodeStatus{}, nil, err
 	}
 	if machine := s.vms[item.Name][node.Name]; machine != nil {
+		progress.stage("stopping node %s", node.Name)
 		if err := closeMachine(machine); err != nil {
 			log.Printf("node.remove %s/%s: stop VM failed: %v", item.Name, node.Name, err)
 			return NodeStatus{}, nil, fmt.Errorf("stop node %s: %w", node.Name, err)
@@ -1010,6 +1019,7 @@ func (s *Server) removeNodeLocked(raw json.RawMessage) (NodeStatus, []provisionT
 	if err := cluster.Save(item); err != nil {
 		return NodeStatus{}, nil, err
 	}
+	progress.stage("deleting the disk for node %s", node.Name)
 	if err := removeNodeFiles(item.Name, node.Name); err != nil {
 		return NodeStatus{}, nil, err
 	}
@@ -1021,16 +1031,16 @@ func (s *Server) removeNodeLocked(raw json.RawMessage) (NodeStatus, []provisionT
 	return status, tasks, nil
 }
 
-func (s *Server) handleNodeMutationLocked(request Request) (any, []provisionTask, error) {
+func (s *Server) handleNodeMutationLocked(request Request, progress stageFunc) (any, []provisionTask, error) {
 	switch request.Op {
 	case "node.add":
-		result, tasks, err := s.addNodeLocked(request.Args)
+		result, tasks, err := s.addNodeLocked(request.Args, progress)
 		if err != nil {
 			return nil, nil, err
 		}
 		return result, tasks, nil
 	case "node.remove":
-		result, tasks, err := s.removeNodeLocked(request.Args)
+		result, tasks, err := s.removeNodeLocked(request.Args, progress)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1866,6 +1876,12 @@ func warningList(warnings ...string) []string {
 func (s *ClusterSummary) setWarnings(warnings ...string) {
 	s.Warnings = warningList(warnings...)
 	s.Warning = strings.Join(s.Warnings, "; ")
+}
+
+// addWarnings records findings the operation only learned after its summary
+// was built — the out-of-lock boot wait — behind the ones already there.
+func (s *ClusterSummary) addWarnings(warnings ...string) {
+	s.setWarnings(append(append([]string{}, s.Warnings...), warnings...)...)
 }
 
 // setWarnings mirrors ClusterSummary.setWarnings for a node verb: `node add`

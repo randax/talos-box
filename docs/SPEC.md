@@ -323,12 +323,12 @@ tbx up / tbx down
 tbx cluster create|start|stop|destroy|list [name] [--cp N --workers N]
                   [--cni cilium|flannel] [--csi longhorn|local-path] [--lb] [--bgp] [--hubble]
                   [--talos-version VERSION] [--schematic ID] [--extensions LIST]
-tbx node add <cluster> [node] [--role worker|control-plane] [--force]
-tbx node remove <cluster> <node> [--force]
+tbx node add <cluster> [node] [--role worker|control-plane] [--force] [--quiet]
+tbx node remove <cluster> <node> [--force] [--quiet]
 tbx node start <cluster> <node> [--force]      tbx node stop <cluster> <node>
 tbx cluster suspend|resume <cluster>
-tbx snapshot create <cluster> [name] [--yes]
-tbx snapshot restore <cluster> <name> [--yes] [--force]
+tbx snapshot create <cluster> [name] [--yes] [--quiet]
+tbx snapshot restore <cluster> <name> [--yes] [--force] [--quiet]
 tbx snapshot list <cluster> [-o json]      tbx snapshot delete <cluster> <name>
 tbx status [cluster]      tbx manifests <cluster> [section|images] [--cni cilium|flannel]
 tbx console <cluster> <node>
@@ -420,6 +420,14 @@ copy-pasteable next-step hints keyed to observed state (maintenance node → the
 Hints **never execute anything**. `--quiet` suppresses hints and narration but keeps facts
 (schematic/extensions lines) and liveness (deadline preamble plus a periodic stderr heartbeat
 during blocking provisioning calls); all list/status commands support `-o json`.
+
+**State-changing verbs narrate their stages.** `cluster create`, `snapshot create|restore` and
+`node add|remove` stream the daemon's stages to stderr as the work proceeds — stopping the
+cluster, cloning disks, restarting, waiting for nodes — closing with a convergence hint where
+the verb left nodes booting, and `--quiet` suppresses the stages while keeping the result and
+its warnings. A verb's success line is past tense because it is true when printed: `cluster
+create` holds its answer until the nodes it started answer on apid (maintenance or configured),
+and warnings print above the success line, not after it.
 
 **`tbx console <cluster> <node>`** attaches interactively to the node's serial console (hvc0)
 through the `tbxd`-owned socket — Talos renders its console dashboard and logs there, and

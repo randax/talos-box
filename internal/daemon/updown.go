@@ -562,7 +562,9 @@ func (s *Server) createFromSpec(spec config.ClusterSpec, force bool) (ClusterSum
 	if err != nil {
 		return ClusterSummary{}, err
 	}
-	return s.createCluster(encoded)
+	// up narrates per-cluster actions in its own response; the create stages
+	// belong to the single-cluster verb that blocks on them.
+	return s.createCluster(encoded, nil)
 }
 
 // resolveSpecTalos returns the talos spec to create the cluster with. The

@@ -21,7 +21,7 @@ func TestCreateClusterChecksHostPressureBeforeMutation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = service.createCluster(raw)
+	_, err = service.createCluster(raw, nil)
 	if err == nil || !strings.Contains(err.Error(), "host swap is 90% used") {
 		t.Fatalf("createCluster() error = %v, want host-pressure refusal", err)
 	}
@@ -96,7 +96,7 @@ func TestCreateClusterRejectsInvalidProvisioningIntentBeforeMutation(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = service.createCluster(raw)
+	_, err = service.createCluster(raw, nil)
 	if err == nil || !strings.Contains(err.Error(), "bgp requires lb: true") {
 		t.Fatalf("createCluster() error = %v, want pre-mutation provisioning validation", err)
 	}
@@ -132,7 +132,7 @@ func TestCreateClusterRejectsInvalidCSIIntentBeforeMutation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, err = service.createCluster(raw)
+			_, err = service.createCluster(raw, nil)
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("createCluster() error = %v, want containing %q", err, tt.wantErr)
 			}
