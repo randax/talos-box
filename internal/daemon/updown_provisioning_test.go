@@ -672,6 +672,89 @@ func TestClusterWithoutRecordedOriginDecodesAsUnknown(t *testing.T) {
 	}
 }
 
+// convergedPassNarration is what a full provisioning pass narrates: manual
+// equivalents it emits whether or not the cluster moved. A first etcd bootstrap
+// and a first-time chart install produce the very same lines, which is why the
+// narration cannot decide whether a pass changed anything (#358).
+var convergedPassNarration = []string{
+	"bootstrap: ≈ talosctl bootstrap --talosconfig /t --nodes 172.30.0.2 --endpoints 172.30.0.2",
+	"Cilium chart: ≈ tbx manifests demo objects | kubectl apply --server-side -f -",
+	"credentials: ≈ talosctl kubeconfig /k --talosconfig /t --nodes 172.30.0.2 --endpoints 172.30.0.2",
+	"export TALOSCONFIG=/t",
+	"export KUBECONFIG=/k",
+}
+
+// stubConvergedProvisioning makes the pass's fast no-op path fire: the
+// credentials exist and every desired outcome probes healthy. Nothing here
+// reaches a network — the probes are the daemon's own seams.
+func stubConvergedProvisioning(t *testing.T, item cluster.Cluster) {
+	t.Helper()
+	dir, err := cluster.Dir(item.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"secrets.yaml", "talosconfig", "kubeconfig"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("test"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ready, scheduling, storage := kubernetesReadyProbe, controlPlaneSchedulingProbe, storageConvergenceProbe
+	t.Cleanup(func() {
+		kubernetesReadyProbe, controlPlaneSchedulingProbe, storageConvergenceProbe = ready, scheduling, storage
+	})
+	kubernetesReadyProbe = func(context.Context, []byte, []string) error { return nil }
+	controlPlaneSchedulingProbe = func(context.Context, []byte, cluster.Cluster) error { return nil }
+	storageConvergenceProbe = func(context.Context, context.Context, cluster.Cluster, []byte) error { return nil }
+}
+
+// A converged rerun takes the pass's fast no-op path and is reported as up to
+// date. A pass that had to run in full — a create interrupted before bootstrap,
+// a chart the cluster did not yet have — is reported as reconciled, even though
+// it narrates the same unconditional manual equivalents: calling that "up to
+// date" would hide a run that brought Kubernetes into existence (#358).
+func TestUpReportsFastNoopUpToDateAndAFullPassAsReconciled(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		converged bool
+		want      ActionKind
+	}{
+		{name: "fast no-op", converged: true, want: ActionNone},
+		{name: "full pass narrating only its manual equivalents", want: ActionReconcile},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service, item := runningLonghornClusterForNodeMutation(t, 1, 1)
+			if test.converged {
+				stubConvergedProvisioning(t, item)
+			}
+			reconciled := false
+			service.provisionReconcile = func(context.Context, provision.Request) (provision.Result, error) {
+				reconciled = true
+				return provision.Result{
+					Narration:    convergedPassNarration,
+					StoragePhase: provision.StoragePhaseLive,
+					StorageLive:  true,
+				}, nil
+			}
+			actions := []Action{{Cluster: item.Name, Kind: ActionNone}}
+			tasks := service.beginProvisionTasksLocked([]cluster.Cluster{item})
+			if len(tasks) != 1 {
+				t.Fatalf("provision tasks = %d, want 1", len(tasks))
+			}
+			tasks[0].action = 0
+
+			if err := service.runProvisionTasks(actions, tasks, nil); err != nil {
+				t.Fatal(err)
+			}
+			if reconciled == test.converged {
+				t.Fatalf("full pass ran = %t on a converged cluster = %t", reconciled, test.converged)
+			}
+			if actions[0].Kind != test.want {
+				t.Fatalf("up action = %q, want %q", actions[0].Kind, test.want)
+			}
+		})
+	}
+}
+
 // `tbx up` renders Action.Warnings, and the advisories a provisioning pass
 // converged in spite of belong there as much as on a cluster summary: dropping
 // them hid work the daemon was still finishing behind the verb (#347).

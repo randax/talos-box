@@ -42,12 +42,24 @@ On failure: capture the hint text and probe output.
 **Goal**: an attendee-style manual bootstrap works on the substrate tbx provides.
 
 Steps:
-1. Generate config with talosctl (`talosctl gen config qa-fork https://<cp-ip>:6443`), patch in the mirror registry config printed by `tbx manifests qa-fork mirrors` (hand-apply the equivalent) and the storage machine patch from `tbx manifests qa-fork storage-machine` (save to file, apply per the printed instructions: `talosctl patch mc -p @storage-machine.yaml --nodes <each-node>` — note nodes are unconfigured, so fold the patches into the generated config before apply instead; record which route the printed docs led you to).
+1. Generate config with talosctl (`talosctl gen config qa-fork https://<cp-ip>:6443`), patch in the mirror registry config printed by `tbx manifests qa-fork mirrors` (hand-apply the equivalent) and the storage machine patch from `tbx manifests qa-fork storage-machine` (save to file, then take the unconfigured-node branch the printed header names: `talosctl gen config qa-fork https://<cp-ip>:6443 --config-patch @storage-machine.yaml`, since maintenance-mode nodes have no machine config for `talosctl patch mc` to patch; record which route the printed docs led you to).
+   Hand-generated configs leave `machine.network.hostname` unset, so Talos assigns random `talos-*` hostnames. Those are the names `kubectl get nodes` reports, and they will not match the `qa-fork-*` names in `tbx status` — expected Talos behavior, not a tbx bug. Set `machine.network.hostname` per node in the generated config if you want the two views to line up; record which you did.
 2. `talosctl apply-config` to all three nodes; bootstrap the control plane; fetch kubeconfig.
 3. `tbx status qa-fork` — nodes now `configured` (tbx observes, doesn't own).
 4. Install any CNI by hand (e.g. flannel manifest) so nodes go Ready.
 
 Expected observations: substrate never fights the manual flow; status phase tracking flips to `configured` purely from observation; mirror config from the printed stream works for the hand-built cluster (pulls go through the gateway mirror).
+
+Note on hand-verifying the mirror: a bare `curl -I` against a manifest URL returns 404 for OCI-index images, because the registry only serves them to a client that asks for the index media types. Send the Accept headers when checking by hand:
+
+```
+curl -sI -H 'Accept: application/vnd.oci.image.index.v1+json' \
+  -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+  -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+  http://<gateway>:5000/v2/<repo>/manifests/<tag>
+```
+
+A 404 from a bare HEAD is a test artifact, not a mirror failure — do not log it as one.
 
 Pass criteria: hand-built cluster Ready on tbx's substrate with mirror-routed pulls.
 

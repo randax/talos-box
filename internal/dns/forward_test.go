@@ -59,7 +59,7 @@ func TestExchangeDNSRetriesTruncatedUDPResponseOverTCP(t *testing.T) {
 			upstreamErrors <- err
 			return
 		}
-		response, err := answer(query, func(string) net.IP { return net.IPv4(203, 0, 113, 9) })
+		response, err := answer(query, func(string) net.IP { return net.IPv4(203, 0, 113, 9) }, "")
 		if err == nil {
 			frame := make([]byte, 2+len(response))
 			binary.BigEndian.PutUint16(frame, uint16(len(response)))
@@ -108,7 +108,7 @@ func TestServerForwardsPublicQueryThroughUDPSocket(t *testing.T) {
 			upstreamErr <- err
 			return
 		}
-		response, err := answer(buffer[:size], func(string) net.IP { return net.IPv4(198, 51, 100, 4) })
+		response, err := answer(buffer[:size], func(string) net.IP { return net.IPv4(198, 51, 100, 4) }, "")
 		if err == nil {
 			_, err = upstream.WriteToUDP(response, peer)
 		}
@@ -175,7 +175,7 @@ func BenchmarkExchangeUDP(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	response, err := answer(query, func(string) net.IP { return net.IPv4(192, 0, 2, 8) })
+	response, err := answer(query, func(string) net.IP { return net.IPv4(192, 0, 2, 8) }, "")
 	if err != nil {
 		b.Fatal(err)
 	}

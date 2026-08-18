@@ -5,8 +5,13 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
+
+	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
+	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/shellquote"
@@ -97,6 +102,180 @@ func probeHostPort(ctx context.Context, address string) ProbeResult {
 	return ProbeResult{Dialed: true, TLS: true, MaintenanceCert: maintenance}
 }
 
+// kubeletService is the Talos service status reports on: a node answering apid
+// can still be dead to Kubernetes, and kubelet is where that shows.
+const kubeletService = "kubelet"
+
+// serviceProbeTimeout bounds one machine-API service query, dial included.
+const serviceProbeTimeout = 3 * time.Second
+
+// probeNodeService observes one Talos service on a configured node. It is a
+// package var because the live implementation dials a node's machine API,
+// which no hermetic test may do; tests replace it wholesale.
+var probeNodeService = probeNodeServiceLive
+
+// probeNodeServiceLive asks a node's machine API about one service, using the
+// cluster's own talosconfig. A cluster tbx never provisioned has no
+// credentials, so there is nothing to ask and nothing to report — the second
+// return says "no reading", never "healthy".
+func probeNodeServiceLive(clusterName, ip, service string) (NodeService, bool) {
+	dir, err := cluster.Dir(clusterName)
+	if err != nil {
+		return NodeService{}, false
+	}
+	talosconfig := filepath.Join(dir, "talosconfig")
+	if info, err := os.Stat(talosconfig); err != nil || !info.Mode().IsRegular() {
+		return NodeService{}, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), serviceProbeTimeout)
+	defer cancel()
+	// The observed endpoint wins over the talosconfig's generated list for the
+	// same reason the provisioning path prefers it: a node can hold a different
+	// lease than the one its config was written from.
+	connection, err := talosclient.New(ctx,
+		talosclient.WithConfigFromFile(talosconfig),
+		talosclient.WithDefaultGRPCDialOptions(),
+		talosclient.WithEndpoints(ip),
+	)
+	if err != nil {
+		return NodeService{}, false
+	}
+	defer func() { _ = connection.Close() }()
+	services, err := connection.ServiceInfo(talosclient.WithNode(ctx, ip), service)
+	if err != nil || len(services) == 0 {
+		return NodeService{}, false
+	}
+	return classifyService(service, observeService(services[0].Service)), true
+}
+
+// observeService reduces the machine API's service report to the facts the
+// classification rules read. A failure event's message is preferred over the
+// health verdict's: a kubelet that cannot exec never gets far enough to
+// publish a health message, and the exec error is the diagnosis.
+func observeService(info *machineapi.ServiceInfo) ServiceObservation {
+	if info == nil {
+		return ServiceObservation{}
+	}
+	observation := ServiceObservation{State: info.GetState(), HealthUnknown: true}
+	if health := info.GetHealth(); health != nil {
+		observation.Healthy = health.GetHealthy()
+		observation.HealthUnknown = health.GetUnknown()
+		observation.Message = health.GetLastMessage()
+	}
+	failureMessage := ""
+	for _, event := range info.GetEvents().GetEvents() {
+		if !strings.EqualFold(event.GetState(), serviceStateFailed) {
+			continue
+		}
+		observation.Failures++
+		failureMessage = event.GetMsg()
+	}
+	if failureMessage != "" {
+		observation.Message = failureMessage
+	}
+	return observation
+}
+
+// ServiceHealth is a Talos service's condition in status's own vocabulary. The
+// machine API reports a state string plus an optional health verdict; the
+// per-node surface needs one word for it, because the phase is derived from
+// apid alone and a node whose kubelet cannot even exec answers apid perfectly
+// well (#357).
+type ServiceHealth string
+
+const (
+	ServiceHealthUnknown      ServiceHealth = "unknown"
+	ServiceHealthStarting     ServiceHealth = "starting"
+	ServiceHealthHealthy      ServiceHealth = "healthy"
+	ServiceHealthUnhealthy    ServiceHealth = "unhealthy"
+	ServiceHealthCrashLooping ServiceHealth = "crashlooping"
+)
+
+// NodeService is one Talos service on one node, as status reports it.
+type NodeService struct {
+	Name string `json:"name"`
+	// State is Talos's own service state string (Running, Failed, Preparing…),
+	// kept verbatim beside the derived verdict.
+	State  string        `json:"state,omitempty"`
+	Health ServiceHealth `json:"health"`
+	// Message is the service's last failure or health message — the line that
+	// says what is actually wrong ("exec /usr/local/bin/kubelet: input/output
+	// error"), which is the whole point of surfacing this.
+	Message string `json:"message,omitempty"`
+	// Restarts counts the failure events the node still retains for the
+	// service: a service Talos restarts forever accumulates them.
+	Restarts int `json:"restarts,omitempty"`
+}
+
+// CrashLooping reports a service Talos keeps restarting without it ever
+// becoming healthy — the state no rerun of tbx up can clear.
+func (s NodeService) CrashLooping() bool { return s.Health == ServiceHealthCrashLooping }
+
+// Degraded reports a service that is observably not doing its job, as opposed
+// to one that is still coming up or has no verdict yet.
+func (s NodeService) Degraded() bool {
+	return s.Health == ServiceHealthCrashLooping || s.Health == ServiceHealthUnhealthy
+}
+
+// ServiceObservation is the raw shape a service probe reads off the machine
+// API, kept apart from the classified NodeService so the rules stay testable
+// without a live node.
+type ServiceObservation struct {
+	State         string
+	Healthy       bool
+	HealthUnknown bool
+	Message       string
+	Failures      int
+}
+
+const (
+	serviceStateRunning = "Running"
+	serviceStateFailed  = "Failed"
+	// crashLoopFailures is how many retained failure events make a loop: one
+	// is a restart, two in the window Talos keeps is a service that is not
+	// coming up.
+	crashLoopFailures = 2
+	// serviceMessageMaxLen keeps one node's message from taking over the hint
+	// or the table note it lands in.
+	serviceMessageMaxLen = 160
+)
+
+// classifyService turns one observation into the verdict status renders. A
+// service that is running and reports itself healthy is healthy however many
+// failures it accumulated on the way there; anything else reads off the state
+// first, because a failing service's health verdict is usually just unknown.
+func classifyService(name string, observation ServiceObservation) NodeService {
+	service := NodeService{
+		Name:     name,
+		State:    observation.State,
+		Message:  truncateServiceMessage(strings.TrimSpace(observation.Message)),
+		Restarts: observation.Failures,
+	}
+	running := strings.EqualFold(observation.State, serviceStateRunning)
+	switch {
+	case observation.State == "":
+		service.Health = ServiceHealthUnknown
+	case running && !observation.HealthUnknown && observation.Healthy:
+		service.Health = ServiceHealthHealthy
+	case strings.EqualFold(observation.State, serviceStateFailed), observation.Failures >= crashLoopFailures:
+		service.Health = ServiceHealthCrashLooping
+	case !running:
+		service.Health = ServiceHealthStarting
+	case observation.HealthUnknown:
+		service.Health = ServiceHealthUnknown
+	default:
+		service.Health = ServiceHealthUnhealthy
+	}
+	return service
+}
+
+func truncateServiceMessage(message string) string {
+	if len(message) <= serviceMessageMaxLen {
+		return message
+	}
+	return message[:serviceMessageMaxLen] + "…"
+}
+
 // nodeBootWindow is the boot budget the calm unreachable hint promises.
 const nodeBootWindow = time.Minute
 
@@ -164,7 +343,13 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 	if hint := longhornSingleNodeHint(status); hint != "" {
 		hints = append(hints, hint)
 	}
-	if status.CNI != "" && !status.KubernetesReady {
+	// A cluster with an unfinished provisioning intent is one tbx is driving:
+	// it applies the config and bootstraps etcd itself. The manual
+	// talosctl-bootstrap hint below is gated on the same fact so the two can
+	// never contradict each other — following the manual one mid-provision
+	// would race tbx (#366).
+	provisioning := status.CNI != "" && !status.KubernetesReady
+	if provisioning {
 		hints = append(hints, fmt.Sprintf("%s provisioning is in progress; tbx will apply machine config, bootstrap, and reconcile the CNI. %s;%s", status.CNI, provisioningRecoveryHint(status), credentialExports(status.Name)))
 	}
 	if len(maintenance) > 0 {
@@ -206,8 +391,15 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 			hints = append(hints, "Kubernetes is Ready with Cilium; LoadBalancer support is disabled by lb: false, so no VIP is provisioned."+credentialExports(status.Name))
 		}
 		if !status.KubernetesReady {
+			// Bootstrapping by hand belongs to the substrate-only path and to a
+			// cluster nobody is driving; while tbx is provisioning, the hint
+			// above owns the bootstrap and this one would race it (#366).
+			if !provisioning {
+				hints = append(hints,
+					fmt.Sprintf("all nodes configured. If etcd is not yet bootstrapped: talosctl bootstrap --talosconfig ./talosconfig --nodes %[1]s --endpoints %[1]s, then talosctl kubeconfig . --talosconfig ./talosconfig --nodes %[1]s --endpoints %[1]s", cp.IP),
+				)
+			}
 			hints = append(hints,
-				fmt.Sprintf("all nodes configured. If etcd is not yet bootstrapped: talosctl bootstrap --talosconfig ./talosconfig --nodes %[1]s --endpoints %[1]s, then talosctl kubeconfig . --talosconfig ./talosconfig --nodes %[1]s --endpoints %[1]s", cp.IP),
 				fmt.Sprintf("node TUI (the Talos dashboard): talosctl dashboard --talosconfig ./talosconfig --nodes %[1]s --endpoints %[1]s", cp.IP),
 			)
 		}
@@ -232,6 +424,13 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 // may well be sitting right there, and guessing "imperative" would advise
 // destroying a cluster a later up could simply resume.
 func provisioningRecoveryHint(status ClusterStatus) string {
+	// A node whose kubelet cannot start is not a pass that failed to finish;
+	// it is a node that will never join. Rerunning up against it only burns
+	// another provisioning deadline, so the crashloop names the node and the
+	// two moves that can actually change the outcome (#357).
+	if hint := kubeletCrashLoopHint(status); hint != "" {
+		return hint
+	}
 	if status.ConfigOrigin != cluster.OriginImperative {
 		return "Rerun: tbx up"
 	}
@@ -243,6 +442,43 @@ func provisioningRecoveryHint(status ClusterStatus) string {
 		"No talosbox.yaml backs this cluster, so tbx up cannot resume it; destroy it with: tbx cluster destroy %s --force, then recreate it with the tbx cluster create flags you used originally (recorded intent: %s; node sizing is not recorded here)",
 		shellquote.Quote(status.Name), recordedIntentFlags(status),
 	)
+}
+
+// kubeletCrashLoopHint names the nodes whose kubelet Talos keeps restarting,
+// carries the message that says why, and points at the console and at
+// remove+add — the remedies that exist for a node whose disk is bad (#357).
+// It is empty when no node reports a crashlooping kubelet, including when the
+// daemon has no reading at all.
+func kubeletCrashLoopHint(status ClusterStatus) string {
+	var crashed []NodeStatus
+	for _, node := range status.Nodes {
+		if node.Kubelet != nil && node.Kubelet.CrashLooping() {
+			crashed = append(crashed, node)
+		}
+	}
+	if len(crashed) == 0 {
+		return ""
+	}
+	name := shellquote.Quote(status.Name)
+	first := crashed[0]
+	// The node name is as operator-supplied as the cluster name is
+	// (tbx node add <cluster> <node>), and these commands are printed to be
+	// pasted, so it needs the same quoting the cluster name gets (#357).
+	node := shellquote.Quote(first.Name)
+	subject := fmt.Sprintf("%s's kubelet is crashlooping", first.Name)
+	if len(crashed) > 1 {
+		names := make([]string, 0, len(crashed))
+		for _, node := range crashed {
+			names = append(names, node.Name)
+		}
+		subject = fmt.Sprintf("kubelet is crashlooping on %d node(s): %s", len(crashed), strings.Join(names, ", "))
+	}
+	detail := ""
+	if first.Kubelet.Message != "" {
+		detail = fmt.Sprintf(" (%s)", first.Kubelet.Message)
+	}
+	return fmt.Sprintf("%s%s, so it will not join Kubernetes and rerunning tbx up cannot fix it: inspect it live with tbx console %s %s, then replace it: tbx node remove %s %s, tbx node add %s %s --role %s",
+		subject, detail, name, node, name, node, name, node, first.Role)
 }
 
 // recordedIntentFlags renders what the cluster's stored state actually knows

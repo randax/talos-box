@@ -10,7 +10,7 @@ All runbooks follow the format decided in [#214](https://github.com/randax/talos
 |---|---|---|---|
 | [smoke-macos](smoke-macos.md) | covered | platform-N/A | macOS-specific preflight/DNS mechanics |
 | [smoke-linux](smoke-linux.md) | platform-N/A | covered | Linux-specific preflight (kvm, units, resolvectl) |
-| [deep-cilium](deep-cilium.md) | covered | covered | C4 failover expectations differ per platform (documented ~40–50 s L2 window is macOS-only) |
+| [deep-cilium](deep-cilium.md) | covered | covered | C4 failover expectations differ per platform; on macOS a zero-outage result (no VIP outage at 2 s polling, post-GARP) is expected, with ARP revalidation up to ~60 s as the fallback |
 | [deep-flannel](deep-flannel.md) | covered | covered | |
 | [deep-storage](deep-storage.md) | covered | covered | |
 | [deep-domains-dns](deep-domains-dns.md) | covered | covered | C4 hygiene charter is split: resolver files (macOS) vs resolved registration (Linux) |

@@ -3,6 +3,7 @@ package mirror
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -82,10 +83,14 @@ func (m *Manager) warmOne(ctx context.Context, reference, hostArch string) (Warm
 	}
 
 	validateReference := parsed.listedRef
+	listedContext := ctx
 	if parsed.pinnedDigest != "" {
 		validateReference = parsed.pinnedDigest
+		// only the listed ref is pinned by the warm list; everything reached
+		// from it is pinned by its parent manifest
+		listedContext = withFilePin(ctx)
 	}
-	body, digest, cachedBefore, err := warmManifestRequest(ctx, handler, server, parsed.repository, parsed.listedRef, validateReference, staged)
+	body, digest, cachedBefore, err := warmManifestRequest(listedContext, handler, server, parsed.repository, parsed.listedRef, validateReference, staged)
 	if err != nil {
 		return WarmResult{}, err
 	}
@@ -255,7 +260,13 @@ func warmManifestRequest(ctx context.Context, handler http.Handler, server *Serv
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
-		return nil, "", cachedBefore, fmt.Errorf("%s returned %d: %s", path, recorder.Code, strings.TrimSpace(recorder.Body.String()))
+		message := strings.TrimSpace(recorder.Body.String())
+		if recorder.Code == http.StatusConflict {
+			// the mirror already named the image and both digests; the request
+			// path and status would only bury that under transport detail
+			return nil, "", cachedBefore, errors.New(message)
+		}
+		return nil, "", cachedBefore, fmt.Errorf("%s returned %d: %s", path, recorder.Code, message)
 	}
 	return recorder.Body.Bytes(), recorder.Header().Get("Docker-Content-Digest"), cachedBefore, nil
 }

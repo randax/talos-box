@@ -49,13 +49,44 @@ func nodePhase(node daemon.NodeStatus) string {
 	return string(node.Phase)
 }
 
+// nodeKubelet renders a node's kubelet verdict, or a dash for a node the
+// daemon could not ask — an unasked node is not a healthy one.
+func nodeKubelet(node daemon.NodeStatus) string {
+	if node.Kubelet == nil {
+		return "-"
+	}
+	return string(node.Kubelet.Health)
+}
+
+// anyKubeletReading reports whether the printed set carries any kubelet
+// reading at all, which is what decides the extra column.
+func anyKubeletReading(clusters []daemon.ClusterStatus) bool {
+	for _, item := range clusters {
+		for _, node := range item.Nodes {
+			if node.Kubelet != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func printStatus(output io.Writer, clusters []daemon.ClusterStatus, quiet bool) error {
 	if len(clusters) == 0 {
 		_, err := fmt.Fprintln(output, "No clusters.")
 		return err
 	}
 	table := tabwriter.NewWriter(output, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(table, "CLUSTER\tSUBNET\tDOMAIN\tTALOS\tNODE\tROLE\tMAC\tIP\tPHASE"); err != nil {
+	header := "CLUSTER\tSUBNET\tDOMAIN\tTALOS\tNODE\tROLE\tMAC\tIP\tPHASE"
+	// The kubelet column only appears once some node actually carries a
+	// reading: a stopped cluster, a node in maintenance and an older daemon
+	// report none, and a column of dashes would claim a measurement that was
+	// never taken.
+	services := anyKubeletReading(clusters)
+	if services {
+		header += "\tKUBELET"
+	}
+	if _, err := fmt.Fprintln(table, header); err != nil {
 		return err
 	}
 	for _, item := range clusters {
@@ -68,14 +99,35 @@ func printStatus(output io.Writer, clusters []daemon.ClusterStatus, quiet bool) 
 			if ip == "" {
 				ip = "-"
 			}
-			if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-				item.Name, item.Subnet, item.Domain, talos, node.Name, node.Role, node.MAC, ip, nodePhase(node)); err != nil {
+			row := fmt.Sprintf("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s",
+				item.Name, item.Subnet, item.Domain, talos, node.Name, node.Role, node.MAC, ip, nodePhase(node))
+			if services {
+				row += "\t" + nodeKubelet(node)
+			}
+			if _, err := fmt.Fprintln(table, row); err != nil {
 				return err
 			}
 		}
 	}
 	if err := table.Flush(); err != nil {
 		return err
+	}
+	// A degraded kubelet is an observation, not advice, so it survives --quiet
+	// alongside the other facts below: the column says which node, this line
+	// says what Talos last reported about it (#357).
+	for _, item := range clusters {
+		for _, node := range item.Nodes {
+			if node.Kubelet == nil || !node.Kubelet.Degraded() {
+				continue
+			}
+			line := fmt.Sprintf("cluster %s: node %s kubelet %s", item.Name, node.Name, node.Kubelet.Health)
+			if node.Kubelet.Message != "" {
+				line += ": " + node.Kubelet.Message
+			}
+			if _, err := fmt.Fprintln(output, line); err != nil {
+				return err
+			}
+		}
 	}
 	for _, item := range clusters {
 		if item.BGP {

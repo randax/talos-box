@@ -22,6 +22,15 @@ func dispatchNodeRunState(t *testing.T, service *Server, op, clusterName, nodeNa
 	return service.dispatch(Request{Op: op, Args: raw})
 }
 
+func decodeNodeRunState(t *testing.T, response Response) NodeRunState {
+	t.Helper()
+	var state NodeRunState
+	if err := json.Unmarshal(response.Data, &state); err != nil {
+		t.Fatalf("decode NodeRunState: %v", err)
+	}
+	return state
+}
+
 func TestNodeStopClosesOnlyTheNamedNode(t *testing.T) {
 	service, item := runningLonghornClusterForNodeMutation(t, 1, 2)
 	stubNodeMutationReconcile(service)
@@ -79,8 +88,12 @@ func TestNodeStopIsIdempotentForAStoppedNode(t *testing.T) {
 	if !response.OK {
 		t.Fatalf("node.stop of an already-stopped node failed: %s", response.Error)
 	}
-	if status := decodeNodeStatus(t, response); status.Phase != PhaseStopped {
-		t.Fatalf("node.stop status phase = %q, want %q", status.Phase, PhaseStopped)
+	state := decodeNodeRunState(t, response)
+	if state.Phase != PhaseStopped {
+		t.Fatalf("node.stop status phase = %q, want %q", state.Phase, PhaseStopped)
+	}
+	if !state.NoOp {
+		t.Fatal("node.stop of an already-stopped node did not mark the answer a no-op")
 	}
 }
 
@@ -255,6 +268,33 @@ func TestNodeStartIsIdempotentForARunningNode(t *testing.T) {
 
 	if !response.OK {
 		t.Fatalf("node.start of a running node failed: %s", response.Error)
+	}
+	if !decodeNodeRunState(t, response).NoOp {
+		t.Fatal("node.start of an already-running node did not mark the answer a no-op")
+	}
+}
+
+// TestNodeRunStateThatActsIsNotAnyNoOp is the other half of the marker: a verb
+// that really powered the node up or down must not claim it changed nothing.
+func TestNodeRunStateThatActsIsNotANoOp(t *testing.T) {
+	for _, test := range []struct{ name, op, node string }{
+		{"start", "node.start", "demo-worker-2"},
+		{"stop", "node.stop", "demo-worker-1"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service, item := runningLonghornClusterForNodeMutation(t, 1, 2)
+			stubNodeMutationReconcile(service)
+			delete(service.vms[item.Name], "demo-worker-2")
+
+			response := dispatchNodeRunState(t, service, test.op, item.Name, test.node)
+
+			if !response.OK {
+				t.Fatalf("%s failed: %s", test.op, response.Error)
+			}
+			if decodeNodeRunState(t, response).NoOp {
+				t.Fatalf("%s of a node it actually acted on reported a no-op", test.op)
+			}
+		})
 	}
 }
 

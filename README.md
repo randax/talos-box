@@ -61,6 +61,12 @@ applies the machine prerequisites, boots the cluster, installs Cilium, and waits
 LoadBalancer VIP to become live. In both cases, talosbox owns the substrate (VMs, networking,
 DNS, and image delivery); curated CNI and LoadBalancer provisioning are opt-in.
 
+On the substrate-only path you generate the machine config yourself, and Talos assigns each node a
+random `talos-*` hostname unless you set `machine.network.hostname`. That is expected Talos
+behavior: `kubectl get nodes` will then show `talos-*` names that do not match the `<cluster>-<role>-<i>`
+names in `tbx status`. Set `machine.network.hostname` per node in the generated config if you want
+the two views to line up.
+
 Add `--csi longhorn` (multinode, replicated) or `--csi local-path` (lightweight, single-node)
 — or the `csi:` key in `talosbox.yaml` — for persistent storage; it requires a curated CNI.
 The engine's StorageClass becomes the cluster default and Longhorn's replica count derives
@@ -114,7 +120,7 @@ inputs when `csi:` is declared. Use `storage-machine`, `storage-values`, `storag
 
 Bring-your-own CSI is unsupported above the talosbox substrate. The default image covers the curated storage requirements, and `talos.extensions` composes a closed curated set — `gvisor`, `nfs-utils`, `qemu-guest-agent` — on top of it, so an NFS-backed engine gets its client from `extensions: [nfs-utils]`. Names outside that set are rejected before anything is created; an engine needing any other Talos extension still uses the `talos.schematic` override in `talosbox.yaml`. The same curated list is available without a file as `tbx cluster create demo --extensions nfs-utils,gvisor`. A brought schematic combined with a curated list is re-composed through the Image Factory, so bringing your own schematic never silently drops the extensions you asked for — but that combination does require Factory access at create time unless the composed image is already cached.
 
-For a substrate-only BYO install, first save the patch with `tbx manifests demo storage-machine > storage-machine.yaml` and apply it to **every node** with `talosctl patch mc -p @storage-machine.yaml --nodes <node-ip>`. Before installing the CSI, create its namespace if needed and label it with the PSA commands printed by `tbx manifests demo storage`; then apply the CSI's own manifests. A declared curated CSI supplies exact streams (and Longhorn values through `storage-values`). For Longhorn, apply `storage-namespaces`, then `storage-crds`, wait for those CRDs to become Established, and only then apply post-CRD `storage-objects`; do not use a one-shot apply. Local-path has no CRD barrier: apply `storage-namespaces` before `storage-objects`.
+For a substrate-only BYO install, first save the patch with `tbx manifests demo storage-machine > storage-machine.yaml` and get it onto **every node**. Which route applies depends on where the nodes are: nodes that have no machine config yet (maintenance mode) cannot be patched, so fold the document in at generation time with `talosctl gen config demo https://<cp-ip>:6443 --config-patch @storage-machine.yaml` and then `talosctl apply-config --insecure --nodes <node-ip> --file controlplane.yaml|worker.yaml`; nodes that are already configured take it directly with `talosctl patch mc -p @storage-machine.yaml --nodes <node-ip>`. Before installing the CSI, create its namespace if needed and label it with the PSA commands printed by `tbx manifests demo storage`; then apply the CSI's own manifests. A declared curated CSI supplies exact streams (and Longhorn values through `storage-values`). For Longhorn, apply `storage-namespaces`, then `storage-crds`, wait for those CRDs to become Established, and only then apply post-CRD `storage-objects`; do not use a one-shot apply. Local-path has no CRD barrier: apply `storage-namespaces` before `storage-objects`.
 
 ### 4. Lifecycle
 

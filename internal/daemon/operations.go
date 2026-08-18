@@ -175,8 +175,14 @@ type NodeStatus struct {
 	// only suspend writes and only for nodes that were running. A stopped
 	// member of a suspended cluster that has no save is plain stopped — a
 	// resume brings it up cold, not back where it left off.
-	Suspended bool   `json:"suspended,omitempty"`
-	Warning   string `json:"warning,omitempty"`
+	Suspended bool `json:"suspended,omitempty"`
+	// Kubelet is the node's kubelet as its Talos machine API reports it, when
+	// the daemon could ask. The phase above is derived from apid alone, and a
+	// node whose kubelet is in a permanent crash loop answers apid perfectly
+	// well — without this it reads `configured` while being dead to
+	// Kubernetes (#357). Nil means no reading, never "healthy".
+	Kubelet *NodeService `json:"kubelet,omitempty"`
+	Warning string       `json:"warning,omitempty"`
 	// Warnings is the same advisory set as Warning, one entry per finding.
 	// Warning stays populated for older clients that only read it.
 	Warnings []string `json:"warnings,omitempty"`
@@ -1198,12 +1204,45 @@ func (s *Server) refreshNodeStatuses(statuses []ClusterStatus) {
 			node := cluster.Node{Name: snapshot.Name, Role: snapshot.Role, MAC: snapshot.MAC}
 			refreshed := nodeStatusWith(node, statuses[i].subnetIndex, snapshot.Phase != PhaseStopped, lookupIP, probe)
 			refreshed.StartedAt = snapshot.StartedAt
+			// Suspension is a disk fact the status handler already
+			// established; the refresh only re-derives the live phase, and
+			// dropping the flag here is what made a suspended cluster read as
+			// plain stopped in the PHASE column (#360).
+			refreshed.Suspended = snapshot.Suspended
 			refreshed.UnreachableSince = s.reachability.observe(nodeKey(statuses[i].Name, node.Name), refreshed.Phase, now)
 			statuses[i].Nodes[j] = refreshed
 		}
+		refreshNodeServices(&statuses[i])
 		statuses[i].Hints = hintsAt(statuses[i], now)
 	}
 	s.logNodeStalls(statuses, now)
+}
+
+// refreshNodeServices asks each configured node's machine API about its
+// kubelet, so a node that answers apid while its kubelet cannot exec stops
+// reading as a healthy `configured` node (#357). Only a running cluster's
+// configured nodes are asked — the periodic stall sweep builds statuses with
+// Running unset, so it stays probe-free — and the probes run concurrently, so
+// one silent node cannot add its timeout to every other node's.
+func refreshNodeServices(status *ClusterStatus) {
+	if !status.Running {
+		return
+	}
+	var wait sync.WaitGroup
+	for i := range status.Nodes {
+		node := &status.Nodes[i]
+		if node.Phase != PhaseConfigured || node.IP == "" {
+			continue
+		}
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			if service, ok := probeNodeService(status.Name, node.IP, kubeletService); ok {
+				node.Kubelet = &service
+			}
+		}()
+	}
+	wait.Wait()
 }
 
 func refreshKubernetesReadiness(statuses []ClusterStatus) {

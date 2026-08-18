@@ -159,6 +159,46 @@ func TestRunUpQuietSuppressesNarrationButDefaultOutputShowsManualEquivalents(t *
 	})
 }
 
+// A converged cluster comes back as ActionNone even when the pass narrated its
+// manual equivalents, and the CLI must reach its up-to-date wording — on stdout,
+// quiet or not (#358).
+func TestRunUpReportsConvergedClusterAsUpToDate(t *testing.T) {
+	const response = `[{"cluster":"demo","action":"none","narration":["export KUBECONFIG=/k"]}]`
+	for _, test := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "default", want: "demo is up to date\nexport KUBECONFIG=/k\n"},
+		{name: "quiet", args: []string{"--quiet"}, want: "demo is up to date\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			home, requests := startUpTestDaemon(t,
+				daemon.Response{OK: true, Data: json.RawMessage(fmt.Sprintf(`{"protocolVersion":%d}`, daemon.ProtocolVersion))},
+				daemon.Response{OK: true, Data: json.RawMessage(response)},
+			)
+			path := filepath.Join(home, "talosbox.yaml")
+			if err := os.WriteFile(path, []byte("version: 1\nclusters:\n  - name: demo\n    cni: cilium\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			var stdout, stderr bytes.Buffer
+			if err := (cli{out: &stdout, err: &stderr}).runUp(append([]string{"-f", path}, test.args...)); err != nil {
+				t.Fatal(err)
+			}
+			if request := <-requests; request.Op != "daemon.info" {
+				t.Fatalf("first operation = %q, want daemon.info", request.Op)
+			}
+			if request := <-requests; request.Op != "up" {
+				t.Fatalf("second operation = %q, want up", request.Op)
+			}
+			if got := stdout.String(); got != test.want {
+				t.Fatalf("runUp stdout = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func startUpTestDaemon(t *testing.T, responses ...daemon.Response) (string, <-chan daemon.Request) {
 	t.Helper()
 	home, err := os.MkdirTemp("/tmp", "tbx-")

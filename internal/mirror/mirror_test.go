@@ -652,13 +652,16 @@ func TestManifestIntegrityBeforeCachingOrServing(t *testing.T) {
 			wantError:    "Docker-Content-Digest",
 		},
 		{
+			// a digest-addressed request carries no pin to be stale: bytes that
+			// hash to something else are corruption, tampering, or a rewriting
+			// proxy, so this stays an upstream-integrity failure (#367)
 			name:         "requested digest mismatch",
 			requestRef:   blobDigest,
 			contentType:  "application/vnd.oci.image.manifest.v1+json",
 			digestHeader: validDigest,
 			body:         manifestBody,
 			wantStatus:   http.StatusBadGateway,
-			wantError:    "requested digest",
+			wantError:    "does not match requested digest",
 		},
 		{
 			name:         "valid manifest",
@@ -725,6 +728,50 @@ func TestManifestIntegrityBeforeCachingOrServing(t *testing.T) {
 				t.Errorf("invalid manifest was served from cache: %q", cachedBody)
 			}
 		})
+	}
+}
+
+// TestManifestDigestMismatchClassifiedByRequestPath puts the two mismatch
+// stories side by side. Only a request that named a tag has a pin behind it,
+// and only that one can have a stale pin worth telling the operator to update
+// (409). A digest-addressed request names the bytes it wants, so bytes hashing
+// to anything else are corruption, tampering, or a rewriting proxy — an
+// upstream-integrity failure (502), never a pin the operator never wrote (#367).
+func TestManifestDigestMismatchClassifiedByRequestPath(t *testing.T) {
+	manifestBody := `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:` + strings.Repeat("a", 64) + `"},"layers":[]}`
+	stalePin := "sha256:" + strings.Repeat("1", 64)
+	servedDigest := "sha256:" + sha256Hex([]byte(manifestBody))
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		_, _ = fmt.Fprint(w, manifestBody)
+	}))
+	defer upstream.Close()
+	server := newLoopbackMirrorServer(t, upstream.URL, t.TempDir())
+
+	serve := func(ctx context.Context, path string) (int, string) {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx)
+		recorder := httptest.NewRecorder()
+		server.ServeHTTP(recorder, request)
+		return recorder.Code, recorder.Body.String()
+	}
+
+	pinned := withManifestValidationReference(context.Background(), stalePin)
+	code, body := serve(pinned, "/v2/app/manifests/stable")
+	if code != http.StatusConflict || !strings.Contains(body, "pinned digest mismatch") {
+		t.Fatalf("tag path validated against a pin = %d %q, want 409 pinned digest mismatch", code, body)
+	}
+	if !strings.Contains(body, stalePin) || !strings.Contains(body, servedDigest) {
+		t.Fatalf("409 body = %q, want both the pin and the served digest", body)
+	}
+
+	code, body = serve(context.Background(), "/v2/app/manifests/"+stalePin)
+	if code != http.StatusBadGateway || !strings.Contains(body, "does not match requested digest") {
+		t.Fatalf("digest-addressed path = %d %q, want 502 upstream integrity failure", code, body)
+	}
+	if strings.Contains(body, "pinned digest mismatch") {
+		t.Fatalf("digest-addressed path body = %q, must not blame a pin the operator never wrote", body)
 	}
 }
 
@@ -1700,4 +1747,115 @@ func portOfHostPort(hostPort string) string {
 		panic(err)
 	}
 	return port
+}
+
+// A HEAD probe (containerd tries HEAD first) drops the body, so the offline
+// miss must carry its reason in headers or the node event is indistinguishable
+// from a broken mirror (#363).
+func TestOfflineMissCarriesReasonHeaders(t *testing.T) {
+	f := newFakeRegistry(t, false)
+	dir := t.TempDir()
+	server := newLoopbackMirrorServer(t, f.registry.URL, dir)
+	mirror := httptest.NewServer(server)
+	defer mirror.Close()
+	server.setOfflineMode(true)
+
+	for _, test := range []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{name: "manifest tag head", method: http.MethodHead, path: "/v2/app/manifests/latest"},
+		{name: "manifest tag get", method: http.MethodGet, path: "/v2/app/manifests/latest"},
+		{name: "manifest digest head", method: http.MethodHead, path: "/v2/app/manifests/" + blobDigest},
+		{name: "blob head", method: http.MethodHead, path: "/v2/app/blobs/" + blobDigest},
+		{name: "blob get", method: http.MethodGet, path: "/v2/app/blobs/" + blobDigest},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request, err := http.NewRequest(test.method, mirror.URL+test.path, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := http.DefaultClient.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want 503", resp.StatusCode)
+			}
+			if got := resp.Header.Get(reasonHeader); got != reasonOfflineNotCached {
+				t.Fatalf("%s = %q, want %q", reasonHeader, got, reasonOfflineNotCached)
+			}
+			if got := resp.Header.Get("Warning"); !strings.Contains(got, offlineNotCachedMessage) {
+				t.Fatalf("Warning = %q, want it to carry %q", got, offlineNotCachedMessage)
+			}
+		})
+	}
+}
+
+func TestOfflineCorruptedCachedDigestCarriesReasonHeaders(t *testing.T) {
+	f := newFakeRegistry(t, false)
+	dir := t.TempDir()
+	server := newLoopbackMirrorServer(t, f.registry.URL, dir)
+	mirror := httptest.NewServer(server)
+	defer mirror.Close()
+
+	validDigest := "sha256:" + sha256Hex([]byte(manifestBody))
+	path := "/v2/app/manifests/" + validDigest
+	if err := os.MkdirAll(filepath.Dir(server.manifestPath(path)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(server.manifestPath(path), []byte("corrupted"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	server.setOfflineMode(true)
+
+	request, err := http.NewRequest(http.MethodHead, mirror.URL+path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	if got := resp.Header.Get(reasonHeader); got != reasonOfflineCacheCorrupted {
+		t.Fatalf("%s = %q, want %q", reasonHeader, got, reasonOfflineCacheCorrupted)
+	}
+	if got := resp.Header.Get("Warning"); !strings.Contains(got, offlineCacheCorruptedMessage) {
+		t.Fatalf("Warning = %q, want it to carry %q", got, offlineCacheCorruptedMessage)
+	}
+}
+
+// The Manager answers an offline miss from its own cache-only probe, before
+// the Server's handler runs, so the reason has to reach that 503 too (#363).
+func TestManagerOfflineMissCarriesReasonHeaders(t *testing.T) {
+	manager := newManagerWithPorts(t.TempDir(), nil, freePort(t))
+	manager.offline.Store(true)
+	defer manager.Close()
+	mirror := httptest.NewServer(http.HandlerFunc(manager.serveCatchAll))
+	defer mirror.Close()
+
+	request, err := http.NewRequest(http.MethodHead, mirror.URL+"/v2/demo/manifests/stable?ns=registry.example", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	if got := resp.Header.Get(reasonHeader); got != reasonOfflineNotCached {
+		t.Fatalf("%s = %q, want %q", reasonHeader, got, reasonOfflineNotCached)
+	}
+	if got := resp.Header.Get("Warning"); !strings.Contains(got, offlineNotCachedMessage) {
+		t.Fatalf("Warning = %q, want it to carry %q", got, offlineNotCachedMessage)
+	}
 }

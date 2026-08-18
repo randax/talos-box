@@ -1,5 +1,9 @@
 # Binaries and shared libraries
 bin/
+# `go build ./cmd/tbx` drops its output in the repo root; an 80 MB build
+# artifact must never be tracked.
+/tbx
+/tbxd
 *.exe
 *.exe~
 *.dll

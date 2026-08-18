@@ -100,6 +100,8 @@ func TestRenderInspectionStoragePrerequisitesAreAvailableWithoutCuratedIntent(t 
 	for _, want := range []string{
 		"# Storage machine-config prerequisite patch",
 		manifests.StoragePrerequisiteKubeletMounts(),
+		"talosctl gen config demo https://<cp-ip>:6443 --config-patch @storage-machine.yaml",
+		"talosctl apply-config --insecure",
 		"talosctl patch mc -p @storage-machine.yaml --nodes <node-ip>",
 		"kubectl create namespace <your-csi-namespace> --dry-run=client -o yaml | kubectl apply -f -",
 		"pod-security.kubernetes.io/enforce=privileged",
@@ -108,6 +110,9 @@ func TestRenderInspectionStoragePrerequisitesAreAvailableWithoutCuratedIntent(t 
 		if !strings.Contains(storage, want) {
 			t.Fatalf("substrate-only storage inspection missing %q:\n%s", want, storage)
 		}
+	}
+	if strings.Index(storage, "talosctl gen config") > strings.Index(storage, "talosctl patch mc") {
+		t.Fatalf("storage inspection does not put the unconfigured-node branch before the patch branch:\n%s", storage)
 	}
 	if strings.Index(storage, "talosctl patch mc") > strings.Index(storage, "kubectl create namespace") || strings.Index(storage, "kubectl create namespace") > strings.Index(storage, "kubectl label namespace") {
 		t.Fatalf("storage inspection does not order node patching, namespace creation, and PSA labeling:\n%s", storage)

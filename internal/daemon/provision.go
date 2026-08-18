@@ -321,7 +321,7 @@ func (s *Server) runProvisionTasks(data any, tasks []provisionTask, progress sta
 			progress.stage("reconciling %s on cluster %s (up to %s)",
 				task.item.CNI, task.item.Name, formatBootWindow(provisionTimeout(task.item)))
 		}
-		narration, warnings, phase, err := s.provisionCNI(task.ctx, task.item, task.force, task.skipStorage)
+		narration, warnings, phase, fullPass, err := s.provisionCNI(task.ctx, task.item, task.force, task.skipStorage)
 		if task.item.CSI != "" && !task.skipStorage {
 			s.opMu.Lock()
 			s.recordStoragePhaseIfCurrentLocked(task.item.Name, task.generation, phase)
@@ -351,7 +351,7 @@ func (s *Server) runProvisionTasks(data any, tasks []provisionTask, progress sta
 				// Action.Warnings, and dropping them here hid work the daemon
 				// was still finishing behind the verb (#347).
 				result[task.action].Warnings = append(result[task.action].Warnings, warnings...)
-				result[task.action].Kind = actionAfterProvision(result[task.action].Kind, narration)
+				result[task.action].Kind = actionAfterProvision(result[task.action].Kind, fullPass)
 			}
 		}
 	}
@@ -404,22 +404,28 @@ func provisionTimeout(item cluster.Cluster) time.Duration {
 	return cniProvisionTimeout
 }
 
-func (s *Server) provisionCNI(parent context.Context, item cluster.Cluster, force, skipStorage bool) (narration, warnings []string, phase StoragePhase, err error) {
+// provisionCNI runs one provisioning pass over a cluster. fullPass reports
+// whether the pass actually ran: only the fast no-op path — every desired
+// outcome observed healthy — leaves the cluster untouched, so it is the one
+// honest answer to "did this change anything", and the narration is not (#358).
+// A full pass writes machine configs, bootstraps etcd and applies the charts,
+// and it narrates the same unconditional manual equivalents either way.
+func (s *Server) provisionCNI(parent context.Context, item cluster.Cluster, force, skipStorage bool) (narration, warnings []string, phase StoragePhase, fullPass bool, err error) {
 	if !reconcilesCNI(item) {
-		return nil, nil, "", nil
+		return nil, nil, "", false, nil
 	}
 	// Once every desired outcome is observed healthy, a rerun is a genuine fast
 	// no-op. Cilium additionally probes its optional Hubble deployments: a live
 	// VIP and Ready Nodes alone cannot establish that that desired set converged.
 	if !force && s.tryFastNoopReconcile(item) {
 		if item.CSI != "" && !skipStorage {
-			return nil, nil, StoragePhaseLive, nil
+			return nil, nil, StoragePhaseLive, false, nil
 		}
-		return nil, nil, "", nil
+		return nil, nil, "", false, nil
 	}
 	dir, err := cluster.Dir(item.Name)
 	if err != nil {
-		return nil, nil, "", err
+		return nil, nil, "", false, err
 	}
 	ctx, cancel := context.WithTimeout(parent, provisionTimeout(item))
 	defer cancel()
@@ -461,9 +467,9 @@ func (s *Server) provisionCNI(parent context.Context, item cluster.Cluster, forc
 	}
 	result, err := reconcile(ctx, request)
 	if err != nil {
-		return nil, nil, "", err
+		return nil, nil, "", true, err
 	}
-	return result.Narration, result.Warnings, storagePhaseFromProvisionResult(result), nil
+	return result.Narration, result.Warnings, storagePhaseFromProvisionResult(result), true, nil
 }
 
 func (s *Server) observeProvisionNodes(item cluster.Cluster) []provision.Node {

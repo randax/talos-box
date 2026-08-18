@@ -16,20 +16,26 @@ import (
 
 // A quiet up must still prove it is alive: the blocking provisioning call can
 // run for the daemon's full budget, and silence is indistinguishable from a
-// hang (#307).
+// hang (#307). The budget it states includes the node boot wait, because an up
+// that creates or starts a cluster is held for that too (#364).
 func TestUpQuietStatesTheDeadlineAndBeats(t *testing.T) {
 	stdout, stderr := runSlowCLI(t, []string{`{"protocolVersion":7}`, `[{"action":"create","cluster":"demo"}]`}, func(command cli) error {
 		return command.runUp([]string{"-f", writeUpConfig(t, "demo"), "--quiet"})
 	})
-	for _, wanted := range []string{"provisioning demo", "up to 25m", "progress suppressed by --quiet", "still provisioning demo"} {
+	// the file declares a CSI, which buys the wider provisioning budget
+	deadline := formatLivenessDuration(createProvisionDeadline(true))
+	if deadline == formatLivenessDuration(provisionDeadline(true)) {
+		t.Fatalf("stated deadline %s does not carry the boot wait", deadline)
+	}
+	for _, wanted := range []string{"provisioning demo", "up to " + deadline, "progress suppressed by --quiet", "still provisioning demo"} {
 		if !strings.Contains(stderr, wanted) {
 			t.Fatalf("quiet up stderr missing %q:\n%s", wanted, stderr)
 		}
 	}
-	if !strings.Contains(stderr, "elapsed") || !strings.Contains(stderr, "deadline 25m") {
+	if !strings.Contains(stderr, "elapsed") || !strings.Contains(stderr, "deadline "+deadline) {
 		t.Fatalf("heartbeat did not carry elapsed/deadline:\n%s", stderr)
 	}
-	if strings.Contains(stdout, "still provisioning") || strings.Contains(stdout, "up to 25m") {
+	if strings.Contains(stdout, "still provisioning") || strings.Contains(stdout, "up to "+deadline) {
 		t.Fatalf("liveness leaked into stdout:\n%s", stdout)
 	}
 	if !strings.Contains(stdout, "created demo") {
@@ -63,14 +69,15 @@ func TestClusterCreateQuietStatesTheDeadline(t *testing.T) {
 }
 
 // A start states the bound the daemon actually budgets it at: the stored
-// cluster declares no storage engine, so it is the CNI budget, not the outer
-// storage one (#307).
+// cluster declares no storage engine, so it is the CNI budget plus the boot
+// wait a start runs ahead of its reconcile (#307, #364).
 func TestClusterStartQuietStatesTheDeadline(t *testing.T) {
 	stubStoredClusters(t, daemon.ClusterSummary{Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium}})
 	_, stderr := runSlowCLI(t, []string{`{"name":"demo"}`}, func(command cli) error {
 		return command.startCluster([]string{"demo", "--quiet"})
 	})
-	for _, wanted := range []string{"starting demo", "up to 10m", "progress suppressed by --quiet", "still starting demo", "deadline 10m"} {
+	deadline := formatLivenessDuration(cniProvisionDeadline + nodeBootDeadline)
+	for _, wanted := range []string{"starting demo", "up to " + deadline, "progress suppressed by --quiet", "still starting demo", "deadline " + deadline} {
 		if !strings.Contains(stderr, wanted) {
 			t.Fatalf("quiet start stderr missing %q:\n%s", wanted, stderr)
 		}

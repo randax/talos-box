@@ -176,9 +176,12 @@ func (c cli) runUp(args []string) error {
 		config.Config
 		Force bool `json:"force"`
 	}{Config: cfg, Force: force}
+	// An up may create or start clusters, and both wait for their nodes to boot
+	// before the provisioning budget starts — a start since #364 — so the stated
+	// deadline carries that wait exactly as a create's does (#307).
 	signal := liveness{
 		verb:     "provisioning " + upSubject(cfg),
-		deadline: provisionDeadline(declaresStorage(cfg)),
+		deadline: createProvisionDeadline(declaresStorage(cfg)),
 		quiet:    quiet,
 	}
 	if err := c.callWithLiveness(signal, "up", request, &actions); err != nil {

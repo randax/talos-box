@@ -28,7 +28,7 @@ Steps:
 1. `tbx cluster create qa-dom --domain lab.internal`
 2. Resolve: `<node>.lab.internal` (each node), `anything.lab.internal` (wildcard → `.200`), and `lab.internal` itself (apex — expect NXDOMAIN/no record). Use `dscacheutil -q host -a name ...` on macOS, `resolvectl query` (or the gateway `dig` fallback) on Linux.
 
-Expected observations: node records and wildcard resolve to status-reported IPs / the `.200` VIP; the apex has no record; **[macOS]** `/etc/resolver/lab.internal` exists with an ownership marker; **[Linux]** resolved shows a route-only `~lab.internal` on the bridge.
+Expected observations: node records and wildcard resolve to status-reported IPs / the `.200` VIP; the apex has no record; note that the wildcard covers every non-node name under the domain, so a typo'd node name silently resolves to the VIP instead of NXDOMAIN — check the returned address, never just that the query succeeded; **[macOS]** `/etc/resolver/lab.internal` exists with an ownership marker; **[Linux]** resolved shows a route-only `~lab.internal` on the bridge.
 
 Pass criteria: all three resolution behaviors correct.
 
@@ -57,11 +57,11 @@ Steps:
 1. `tbx cluster create qa-sub --domain deep.lab.internal --allow-unsafe-domain` if prompted-by-error, otherwise plain (record which was needed — `deep.lab.internal` nests under C1's domain).
 2. Resolve `x.deep.lab.internal` (→ qa-sub's `.200`) and `x.lab.internal` (→ qa-dom's `.200`) — different VIPs.
 3. Stop `qa-sub`; verify `x.deep.lab.internal` **still** resolves authoritatively to qa-sub's `.200` and its node records still answer (DNS reflects cluster existence, not run-state — SPEC §5), while `x.lab.internal` still resolves to qa-dom's `.200`. The stopped cluster's names now point at addresses that will not respond; that is expected.
-4. Destroy `qa-sub`; verify `x.deep.lab.internal` now NXDOMAINs (withdrawal happens on destroy alone) while `x.lab.internal` still resolves to qa-dom's `.200`.
+4. Destroy `qa-sub`; verify `deep.lab.internal` is withdrawn — `x.deep.lab.internal` no longer resolves to qa-sub's `.200` but resolves per longest-suffix-wins to the parent's wildcard (qa-dom's `.200`, since `lab.internal` still exists), or NXDOMAINs if no parent domain remains. `x.lab.internal` still resolves to qa-dom's `.200`.
 
-Expected observations: longest suffix wins; the owning cluster answers or NXDOMAINs alone; stop leaves records answering, destroy withdraws them; no cross-cluster bleed.
+Expected observations: longest suffix wins; the owning cluster answers alone; stop leaves records answering, destroy withdraws them and resolution falls back to the surviving parent (or NXDOMAIN with no parent); no cross-cluster bleed.
 
-Pass criteria: both wildcards land on their own cluster's VIP; stop changes no resolution; destroy — and only destroy — produces NXDOMAIN for the nested domain.
+Pass criteria: both wildcards land on their own cluster's VIP; stop changes no resolution; destroy — and only destroy — withdraws the nested domain, after which the name resolves per longest-suffix-wins to the parent's wildcard (or NXDOMAINs if no parent domain remains).
 
 On failure: capture both resolutions and the resolver state.
 

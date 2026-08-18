@@ -438,6 +438,9 @@ func (s *Server) dispatchWithProgress(request Request, progress stageFunc) Respo
 	if request.Op == "cluster.destroy" {
 		return s.dispatchDestroy(request)
 	}
+	if request.Op == "cluster.destroy.inspect" {
+		return s.dispatchDestroyInspect(request)
+	}
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 
@@ -481,6 +484,21 @@ func (s *Server) dispatchDestroy(request Request) Response {
 		return failure(err)
 	}
 	return success(data)
+}
+
+// dispatchDestroyInspect answers the destroy's data-loss question without the
+// operation lock. The inspection reads the cluster's files and probes its
+// Kubernetes API — it mutates nothing the lock protects — and its probe retries
+// a control plane that can still heal, so running it under opMu would freeze
+// every other operation for the whole retry budget: exactly the half-broken
+// cluster an operator reaches for `tbx cluster destroy` on is the one that
+// would make `tbx status` hang behind the warning it is about to print (#356).
+func (s *Server) dispatchDestroyInspect(request Request) Response {
+	inspection, err := s.destroyInspect(request.Args)
+	if err != nil {
+		return failure(err)
+	}
+	return success(inspection)
 }
 
 // lifecycle is the daemon's own lifetime, safe to call on a Server a test
@@ -591,6 +609,12 @@ func (s *Server) dispatchProvisioning(request Request, progress stageFunc) Respo
 	if err != nil {
 		return failure(err)
 	}
+	// A start's reconcile is the same one create keeps on the request path, and
+	// it needs the same nodes: waiting here, outside opMu, is what lets it judge
+	// a cluster that is up instead of one still booting (#364). `up` reaches the
+	// identical path for every cluster it planned a start for, so the wait is
+	// keyed on what the pass did, not on which verb asked for it.
+	s.waitForStartedNodesBooted(data, progress)
 	if err := s.runProvisionTasks(data, tasks, progress); err != nil {
 		return failure(err)
 	}

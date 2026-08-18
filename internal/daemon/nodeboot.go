@@ -26,6 +26,14 @@ var (
 	// nodeBootPollInterval is how often the wait re-probes. A var so tests do
 	// not have to sleep through a real boot.
 	nodeBootPollInterval = 2 * time.Second
+	// kubernetesReadyWaitTimeout bounds the second half of a started cluster's
+	// wait — see waitForKubernetesReady. It is short next to the boot budget on
+	// purpose: past it the control plane is not merely lagging apid, and the
+	// full pass is the right answer. A var so tests do not have to sleep.
+	kubernetesReadyWaitTimeout = 90 * time.Second
+	// kubernetesReadyPollInterval is how often that wait re-probes. Each probe
+	// carries its own kubernetesReadyTimeout, so this only spaces them out.
+	kubernetesReadyPollInterval = 3 * time.Second
 )
 
 // waitForNodesBooted blocks until every node of the cluster answers on apid —
@@ -54,6 +62,108 @@ func (s *Server) waitForNodesBooted(name string, progress stageFunc) string {
 	release := s.preemptions.register(name, func() { cancel(errBootWaitPreempted) })
 	defer release()
 	return s.waitForNodesBootedContext(ctx, name, progress)
+}
+
+// waitForStartedNodesBooted is the same wait on behalf of every verb that
+// starts a stopped cluster — `cluster start` and the `tbx up` that plans a
+// start for the same cluster — run between its launches and the reconcile the
+// verb keeps on the request path.
+//
+// A start used to hand the reconcile a cluster whose VMs were launched
+// microseconds earlier, so the pass judged nodes that could not possibly answer
+// yet: its fast no-op check was decided against a booting cluster and always
+// lost, and a cluster that had merely been stopped and restarted re-applied
+// every chart it already had — minutes of work the fast path exists to skip
+// (#364). Waiting first costs nothing the reconcile would not have waited for
+// anyway (it cannot configure a node that is not up), and it turns the silence
+// into narration: the operator sees which node is still booting rather than one
+// reconcile banner for the whole wait.
+//
+// It is advisory like create's: a node that never answers warns, it does not
+// fail the start — the substrate is up either way.
+func (s *Server) waitForStartedNodesBooted(data any, progress stageFunc) {
+	switch result := data.(type) {
+	case *ClusterSummary:
+		result.addWarnings(s.waitForStartedClusterReady(result.Name, progress))
+	case []Action:
+		// `tbx up` is the file-driven way to reach the same start, and its
+		// reconcile is the same one: only the clusters this pass started need
+		// the wait. A cluster the pass left alone was up before it ran, and a
+		// freshly created one has no fast no-op to lose — its pass must
+		// configure the nodes it just launched, and it polls for them itself
+		// (#364).
+		for i := range result {
+			if result[i].Kind != ActionStart {
+				continue
+			}
+			result[i].addWarnings(s.waitForStartedClusterReady(result[i].Cluster, progress))
+		}
+	}
+}
+
+// waitForStartedClusterReady is the whole wait a started cluster gets: apid
+// first, then Kubernetes.
+//
+// The boot wait alone does not protect what it was written for. It ends when
+// every node answers on apid, but the fast no-op it exists to preserve asks
+// whether provisioning is *complete*, and that begins with a Kubernetes
+// readiness probe — kube-apiserver, etcd quorum, every Node Ready. After a
+// stop/start apid answers seconds before any of that, so the fast check still
+// ran against a cluster that was not up yet and every chart was re-applied
+// anyway: the exact behaviour #364 is about, only later in the boot.
+//
+// The Kubernetes half is bounded and silent. A cluster that does not converge
+// inside the window is not one the fast path could have claimed, and the full
+// pass that follows is the right answer for it — so the window costs a wait,
+// never a refusal or a warning.
+func (s *Server) waitForStartedClusterReady(name string, progress stageFunc) string {
+	warning := s.waitForNodesBooted(name, progress)
+	if warning != "" {
+		// A node that never answered apid will not answer Kubernetes either;
+		// spending the second window on it only delays the pass that reports it.
+		return warning
+	}
+	s.waitForKubernetesReady(name, progress)
+	return ""
+}
+
+// waitForKubernetesReady polls the readiness probe the fast no-op check leads
+// with, for a cluster that was already provisioned once. A cluster without
+// credentials has never been provisioned, so there is no fast path to protect
+// and nothing to wait for — its pass must configure the nodes regardless.
+//
+// Like the boot wait it answers to the daemon lifecycle and to other operators
+// on the cluster, so a shutdown or a queued destroy is not held behind it.
+func (s *Server) waitForKubernetesReady(name string, progress stageFunc) {
+	if !provisioningCredentialsPresent(name) {
+		return
+	}
+	item, err := cluster.Load(name)
+	if err != nil || len(item.Nodes) == 0 || !reconcilesCNI(item) {
+		return
+	}
+	deadline, cancelDeadline := s.lifecycleTimeoutContext(kubernetesReadyWaitTimeout)
+	defer cancelDeadline()
+	ctx, cancel := context.WithCancelCause(deadline)
+	defer cancel(nil)
+	release := s.preemptions.register(name, func() { cancel(errBootWaitPreempted) })
+	defer release()
+
+	expected := nodeNames(item.Nodes)
+	progress.stage("waiting for Kubernetes to answer")
+	for {
+		if kubernetesReady(item.Name, expected) {
+			progress.stage("Kubernetes is ready")
+			return
+		}
+		timer := time.NewTimer(kubernetesReadyPollInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
 }
 
 // errBootWaitPreempted is the wait's end when another operation is queued on

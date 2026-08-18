@@ -18,6 +18,8 @@ You are running QA, not demos. For every charter: run the steps exactly, compare
 
 BLOCKED unless: `tbx version` recorded; `tbx doctor` exits 0 (including `port-179` free on Linux); no clusters `qa-a`/`qa-b`; ≥ 14 GiB free RAM (two 3-node clusters).
 
+`port-179` is checked on both platforms, but macOS reports only an any-address squatter (`*:179`) and reports it as WARN, so `tbx doctor` still exits 0 with it. Read the `port-179` line, and confirm by hand with `netstat -an | grep '\.179'` (no foreign `LISTEN` line) or `sudo lsof -iTCP:179 -sTCP:LISTEN`. Note that unprivileged `lsof -iTCP:179` cannot see the root-owned helper socket, so an empty unprivileged listing is not evidence — use `netstat` or `sudo`.
+
 ## Charters
 
 ### C1 — Two clusters, two subnets
@@ -56,8 +58,8 @@ On failure: capture which path failed, traceroute/mtr from the failing side, doc
 
 Steps:
 1. `tbx bgp enable qa-a`
-2. Confirm `qa-a` VIP still reachable (now BGP-announced: learned route present — macOS `netstat -rn | grep 172.30.<n>.200` / Linux `ip route | grep 172.30.<n>.200` shows a host route via the cluster's node, injected by the helper).
-3. Confirm `qa-b` VIP still reachable via L2 (no such host route for `qa-b`'s VIP).
+2. Confirm `qa-a` VIP still reachable (now BGP-announced: learned route present — macOS `netstat -rn | grep 172.30.<n>.200` / Linux `ip route | grep 172.30.<n>.200`). A bare grep hit is NOT sufficient evidence on macOS: ordinary L2 traffic to the VIP leaves an ARP-cache entry (flags `UHLWI`, interface `bridge*`) that matches the same grep. Demand a static, helper-injected route: the signature is `172.30.<n>.200  <node-ip>  UGHS` (gateway = the cluster's announcing node, `S` = static). Record the full route line, not just that grep matched.
+3. Confirm `qa-b` VIP still reachable via L2 (no such `UGHS` host route for `qa-b`'s VIP — an ARP-cache `UHLWI` entry there is expected and is not a route).
 4. `tbx manifests qa-a bgp` and `tbx manifests qa-a l2` — record what each renders under BGP mode (BGP replaces L2 for the pool; the l2 section should reflect that).
 5. `tbx bgp disable qa-a` — VIP reachability survives the switch back (allow the L2 convergence window); the injected route disappears.
 

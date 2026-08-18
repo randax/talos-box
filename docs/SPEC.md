@@ -197,7 +197,10 @@ forwarding policy.
 
 **DNS**: every cluster has a **cluster domain** — chosen at create (`--domain` / `domain:`),
 immutable, unique across clusters, defaulting to `<cluster>.k8s.test`. `*.<domain>` → that
-cluster's `.200`; `<node>.<domain>` → node IP; the domain apex itself has no record. Records
+cluster's `.200`; `<node>.<domain>` → node IP; the domain apex itself has no record. Because the
+wildcard covers every name under the domain, a name that is not a node's — a typo'd node name
+included — answers with the VIP rather than NXDOMAIN; only the apex and names outside the domain
+NXDOMAIN. Records
 are substrate tied to the cluster's **existence, not its run-state**: the wildcard and the node
 A records exist for the cluster's lifetime and keep answering authoritatively while it is
 stopped — a stopped cluster's names resolve to addresses that will not respond — and only
@@ -269,7 +272,10 @@ file-handle-backed device identity required by vz restore no longer exists. Linu
 saves to a versioned file and can restore after a daemon restart when the QEMU version,
 architecture, and machine type match; older QEMU refuses suspend with the capability reason.
 On the substrate-only path, nodes always come up **unconfigured** — talosbox generates and
-applies machine config only when a curated `cni:` is declared (§1).
+applies machine config only when a curated `cni:` is declared (§1). Hand-generated configs that
+leave `machine.network.hostname` unset get random `talos-*` hostnames from Talos, so the names in
+`kubectl get nodes` will not match the `<cluster>-<role>-<i>` names `tbx status` shows; that is
+Talos behavior, and the operator sets `machine.network.hostname` if the two views should agree.
 `tbx status` reports each node's observed phase — `stopped`, `unreachable`, `maintenance`,
 `configured` — derived from a credential-free TLS probe of apid: **both** apid modes serve TLS
 (empirical correction, #31 — the earlier "insecure = maintenance" model was wrong);
@@ -466,8 +472,12 @@ beyond the default schematic use the existing `talos.schematic` override; tbx do
 schematics from extension lists.
 
 For a hand-managed substrate-only CSI, save `tbx manifests <cluster> storage-machine > storage-machine.yaml`
-and apply the resulting patch to **every node** with `talosctl patch mc -p @storage-machine.yaml --nodes
-<node-ip>`. Then, before installing the CSI, create its namespace if needed and apply the
+and get the resulting patch onto **every node**. The route depends on node state, and the printed
+header presents both because it cannot tell which the reader has: nodes still in maintenance mode
+have no machine config to patch, so the document is folded in at generation time with `talosctl gen
+config <cluster> https://<cp-ip>:6443 --config-patch @storage-machine.yaml` before `talosctl
+apply-config --insecure`; already-configured nodes take it directly with `talosctl patch mc -p
+@storage-machine.yaml --nodes <node-ip>`. Then, before installing the CSI, create its namespace if needed and apply the
 printed PSA labels. Curated CSI namespace streams carry their own PSA labels. For Longhorn,
 apply `storage-namespaces`, then `storage-crds`, run the printed Established wait against the
 CRD stream, and only then apply post-CRD `storage-objects`; it is not a one-shot apply.

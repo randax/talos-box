@@ -63,7 +63,7 @@ func (s *Server) suspendCluster(raw json.RawMessage) (ClusterSummary, error) {
 // resumeCluster brings a suspended cluster back: each node restores from its
 // saved state, or cold-boots with a warning if the save is missing/corrupt.
 func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
-	var args nameArgs
+	var args startArgs
 	if err := decodeArgs(raw, &args); err != nil {
 		return ClusterSummary{}, err
 	}
@@ -77,6 +77,31 @@ func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
 	dir, err := cluster.Dir(item.Name)
 	if err != nil {
 		return ClusterSummary{}, err
+	}
+	// Resume answers to the same trio start does (#368). The projected-start
+	// gate alone is inert here: it stands down when no other guest is resident,
+	// and a resume target is by definition not running — so a lone suspended
+	// cluster would resume straight into a host `cluster start` would refuse.
+	// checkOvercommit sizes the restored footprint against host RAM and
+	// checkHostPressure judges the host as it stands; --force is the documented
+	// override for all three, as it is everywhere else.
+	overcommitWarning, err := s.checkOvercommit(clusterMemoryMiB(item), args.Force)
+	if err != nil {
+		return ClusterSummary{}, err
+	}
+	pressureWarnings, err := s.checkHostPressure(dir, args.Force)
+	if err != nil {
+		return ClusterSummary{}, err
+	}
+	// A resume re-admits every suspended node's full allocation beside whatever
+	// guests are already resident, which is the concurrent bringup the
+	// projected-start gate exists for (#334).
+	if bootingMiB := s.stoppedNodeMemoryMiB(item); bootingMiB > 0 {
+		provisionStartWarnings, err := s.checkProvisionStart(dir, bootingMiB, args.Force)
+		if err != nil {
+			return ClusterSummary{}, err
+		}
+		pressureWarnings = append(pressureWarnings, provisionStartWarnings...)
 	}
 	// Suspend deliberately leaves the cluster's bridge up, so its own subnet
 	// occupancy is expected here: inspect for advisory findings only, never
@@ -121,7 +146,7 @@ func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
 	}
 	go s.bindMirrors(item.SubnetIndex) // resume bypasses start(); rebind the gateway
 	result := summary(item, true)
-	result.setWarnings(append([]string{subnetWarning}, warnings...)...)
+	result.setWarnings(append(append([]string{subnetWarning, overcommitWarning}, pressureWarnings...), warnings...)...)
 	return result, nil
 }
 
@@ -163,9 +188,37 @@ func platformErrorSummary(cause error) string {
 	}
 	summary = strings.TrimSpace(summary)
 	if runes := []rune(summary); len(runes) > maxPlatformErrorSummary {
-		summary = strings.TrimSpace(string(runes[:maxPlatformErrorSummary])) + "..."
+		cut := strings.TrimRight(strings.TrimSpace(string(runes[:maxPlatformErrorSummary])), "“")
+		summary = closeTruncatedQuotes(strings.TrimSpace(cut) + "...")
 	}
 	return summary
+}
+
+// closeTruncatedQuotes appends the closers a truncation left open. Cutting at a
+// fixed rune count lands inside the platform's own quoted message often enough
+// that operators saw a dangling opening quote instead of a readable line
+// (#361). Both curly and straight quoting reach us: Cocoa quotes its
+// descriptions with ", while the messages it wraps sometimes use “ ”.
+func closeTruncatedQuotes(summary string) string {
+	var pending []rune
+	for _, r := range summary {
+		switch r {
+		case '“':
+			pending = append(pending, '”')
+		case '”', '"':
+			if n := len(pending); n > 0 && pending[n-1] == r {
+				pending = pending[:n-1] // closes the quote this opened
+			} else if r == '"' {
+				pending = append(pending, '"') // straight quotes toggle
+			}
+		}
+	}
+	var builder strings.Builder
+	builder.WriteString(summary)
+	for i := len(pending) - 1; i >= 0; i-- {
+		builder.WriteRune(pending[i])
+	}
+	return builder.String()
 }
 
 type resumedNode struct {
