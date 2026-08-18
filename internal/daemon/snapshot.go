@@ -147,7 +147,7 @@ func (s *Server) snapshotRestore(raw json.RawMessage, progress stageFunc) (Snaps
 			return startErr
 		},
 		func() error {
-			progress.stage("restoring %d node disk(s) from snapshot %s", len(item.Nodes), args.Name)
+			progress.stage("%s", restoreStage(item, args.Name))
 			if err := cluster.RestoreSnapshot(item, args.Name); err != nil {
 				return err
 			}
@@ -176,6 +176,24 @@ func (s *Server) snapshotRestore(raw json.RawMessage, progress stageFunc) (Snaps
 	status := SnapshotStatus{Snapshots: snapshots}
 	status.setWarnings(append(discardWarnings, restartWarnings...)...)
 	return status, nil
+}
+
+// restoreStage narrates what the restore actually does: it restores the disks
+// the snapshot captured — not the live node count, which may have grown since —
+// and names the live nodes it deletes because the snapshot never captured them
+// (#273). A snapshot whose captured state cannot be read is narrated by name
+// alone; cluster.RestoreSnapshot owns reporting why it is unusable.
+func restoreStage(item cluster.Cluster, name string) string {
+	captured, err := cluster.SnapshotNodes(item.Name, name)
+	if err != nil {
+		return fmt.Sprintf("restoring node disks from snapshot %s", name)
+	}
+	stage := fmt.Sprintf("restoring %d node disk(s) from snapshot %s", len(captured), name)
+	vanishing := vanishingRestoreNodes(item.Nodes, captured)
+	if len(vanishing) > 0 {
+		stage += fmt.Sprintf(", deleting %d node(s) it did not capture (%s)", len(vanishing), strings.Join(nodeNames(vanishing), ", "))
+	}
+	return stage
 }
 
 func (s *Server) snapshotList(raw json.RawMessage) ([]cluster.SnapshotInfo, error) {

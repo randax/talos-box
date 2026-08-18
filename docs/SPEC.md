@@ -432,7 +432,10 @@ cluster, cloning disks, restarting, waiting for nodes — closing with a converg
 the verb left nodes booting, and `--quiet` suppresses the stages while keeping the result and
 its warnings. A verb's success line is past tense because it is true when printed: `cluster
 create` holds its answer until the nodes it started answer on apid (maintenance or configured),
-and for these narrating verbs warnings print above the success line, not after it. Other
+up to a bounded boot budget — when the budget runs out, or the daemon's lifecycle is cancelled,
+it answers anyway with an advisory naming the nodes that stayed silent, so a successful exit
+never proves the nodes answered. For these narrating verbs warnings print above the success
+line, not after it. Other
 state-changing verbs (`cluster start|stop|suspend|resume`, `node start|stop`) still print their
 warnings below their success line.
 

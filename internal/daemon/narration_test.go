@@ -114,6 +114,43 @@ func TestSnapshotRestoreNarratesStopRestoreAndStart(t *testing.T) {
 	}
 }
 
+// The restore narrates the snapshot's node set, not the live one: a cluster
+// grown since the snapshot restores fewer disks than it has nodes, and the
+// nodes the snapshot never captured are deleted rather than restored (#273).
+func TestSnapshotRestoreNarratesTheCapturedNodesAndTheOnesItDeletes(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 1)
+	liveDisks(t, item, "running")
+	if err := cluster.CreateSnapshot(item, "before"); err != nil {
+		t.Fatal(err)
+	}
+	// the cluster grew after the snapshot, exactly as `tbx node add` grows it
+	grown := item
+	grown.Workers++
+	grown.Nodes = append(append([]cluster.Node{}, item.Nodes...), cluster.Node{Name: "demo-worker-2", Role: cluster.RoleWorker})
+	if err := cluster.Save(grown); err != nil {
+		t.Fatal(err)
+	}
+	liveDisks(t, grown, "running")
+	service.nodeVolumeCount = func(context.Context, cluster.Cluster, string) (int, error) { return 0, nil }
+	progress, stages := recordStages()
+
+	raw, err := json.Marshal(snapshotArgs{Cluster: grown.Name, Name: "before"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := service.dispatchWithProgress(Request{Op: "snapshot.restore", Args: raw}, progress)
+	if !response.OK {
+		t.Fatalf("snapshot.restore failed: %s", response.Error)
+	}
+	restore := indexOfStage(*stages, "restoring 2 node disk(s) from snapshot before")
+	if restore < 0 {
+		t.Fatalf("snapshot.restore narration = %q, want the 2 captured disks reported, not the 3 live nodes", *stages)
+	}
+	if !strings.Contains((*stages)[restore], "deleting 1 node(s) it did not capture (demo-worker-2)") {
+		t.Fatalf("restore stage = %q, want the node the restore deletes named", (*stages)[restore])
+	}
+}
+
 // A request that did not ask for progress must not be narrated: the sink is
 // nil, and every stage call has to survive that.
 func TestSnapshotCreateWithoutProgressStaysSilent(t *testing.T) {
@@ -234,7 +271,7 @@ func TestNodeRemoveNarratesTheStopAndTheDiskDeletion(t *testing.T) {
 // true once every node has (#263).
 func TestWaitForNodesBootedHoldsUntilEveryNodeAnswers(t *testing.T) {
 	service, item := runningLonghornClusterForNodeMutation(t, 1, 1)
-	restoreInterval(t, time.Millisecond)
+	restoreInterval(t, time.Millisecond, 30*time.Second)
 	service.nodeIPLookup = func(string, int) string { return "10.0.0.2" }
 	var probes int
 	service.nodeProbe = func(string) ProbeResult {
@@ -265,7 +302,7 @@ func TestWaitForNodesBootedHoldsUntilEveryNodeAnswers(t *testing.T) {
 // exists, so the wait gives up with an advisory finding instead of failing.
 func TestWaitForNodesBootedWarnsWhenTheBudgetRunsOut(t *testing.T) {
 	service, item := runningLonghornClusterForNodeMutation(t, 1, 0)
-	restoreInterval(t, time.Millisecond)
+	restoreInterval(t, time.Millisecond, 20*time.Millisecond)
 	service.nodeIPLookup = func(string, int) string { return "10.0.0.2" }
 	service.nodeProbe = func(string) ProbeResult { return ProbeResult{} }
 
@@ -356,7 +393,7 @@ func bootWaitCreateRequest(t *testing.T) Request {
 // drop the wait and stay green.
 func TestClusterCreateDispatchHoldsItsAnswerForTheBootWait(t *testing.T) {
 	service := newBootWaitCreateServer(t)
-	restoreInterval(t, time.Millisecond)
+	restoreInterval(t, time.Millisecond, 30*time.Second)
 	var probes int
 	service.nodeProbe = func(string) ProbeResult {
 		probes++
@@ -394,7 +431,7 @@ func TestClusterCreateDispatchHoldsItsAnswerForTheBootWait(t *testing.T) {
 // but the advisory has to reach the summary the CLI prints (#263).
 func TestClusterCreateDispatchFoldsTheUnansweredNodeWarningIntoTheSummary(t *testing.T) {
 	service := newBootWaitCreateServer(t)
-	restoreInterval(t, time.Millisecond)
+	restoreInterval(t, time.Millisecond, 20*time.Millisecond)
 	service.nodeProbe = func(string) ProbeResult { return ProbeResult{} }
 
 	response := service.dispatchProvisioning(bootWaitCreateRequest(t), nil)
@@ -414,10 +451,13 @@ func TestClusterCreateDispatchFoldsTheUnansweredNodeWarningIntoTheSummary(t *tes
 }
 
 // restoreInterval shrinks the boot wait so a test does not sleep through a
-// real Talos boot, and restores both knobs afterward.
-func restoreInterval(t *testing.T, interval time.Duration) {
+// real Talos boot, and restores both knobs afterward. The budget is the
+// caller's own choice: a test that must see the deadline expire passes a tiny
+// one, while a success-path test passes a generous one so a scheduling stall on
+// a loaded runner cannot expire the budget it is not testing.
+func restoreInterval(t *testing.T, interval, timeout time.Duration) {
 	t.Helper()
 	previousInterval, previousTimeout := nodeBootPollInterval, nodeBootTimeout
-	nodeBootPollInterval, nodeBootTimeout = interval, 20*interval
+	nodeBootPollInterval, nodeBootTimeout = interval, timeout
 	t.Cleanup(func() { nodeBootPollInterval, nodeBootTimeout = previousInterval, previousTimeout })
 }
