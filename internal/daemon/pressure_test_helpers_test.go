@@ -11,3 +11,9 @@ func extremeSwapPressure(string) (hostpressure.Snapshot, error) {
 func noHostPressure(string) (hostpressure.Snapshot, error) {
 	return hostpressure.Snapshot{}, nil
 }
+
+// plentifulHostMemory pins the overcommit gate open: tests that exercise start
+// paths for other reasons must not depend on the runner's real RAM.
+func plentifulHostMemory() (int, error) {
+	return 1 << 20, nil
+}

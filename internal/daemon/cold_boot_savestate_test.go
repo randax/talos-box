@@ -34,10 +34,11 @@ func TestStartClusterDiscardsStaleSavedState(t *testing.T) {
 	writeSavedState(t, item)
 
 	service := &Server{
-		hypervisor:    &fakeHypervisor{},
-		vms:           make(map[string]map[string]hypervisor.Machine),
-		hostPressure:  noHostPressure,
-		subnetSources: emptySubnetSources(),
+		hypervisor:      &fakeHypervisor{},
+		vms:             make(map[string]map[string]hypervisor.Machine),
+		hostPressure:    noHostPressure,
+		hostTotalMemory: plentifulHostMemory,
+		subnetSources:   emptySubnetSources(),
 	}
 	raw, err := json.Marshal(startArgs{Name: item.Name})
 	if err != nil {
@@ -104,9 +105,10 @@ func TestStartClusterKeepsSavedStateWhenLaunchFails(t *testing.T) {
 		hypervisor: &fakeHypervisor{launch: func(context.Context, hypervisor.Spec) (hypervisor.Machine, error) {
 			return nil, errors.New("no hypervisor today")
 		}},
-		vms:           make(map[string]map[string]hypervisor.Machine),
-		hostPressure:  noHostPressure,
-		subnetSources: emptySubnetSources(),
+		vms:             make(map[string]map[string]hypervisor.Machine),
+		hostPressure:    noHostPressure,
+		hostTotalMemory: plentifulHostMemory,
+		subnetSources:   emptySubnetSources(),
 	}
 	raw, err := json.Marshal(startArgs{Name: item.Name})
 	if err != nil {
@@ -153,9 +155,10 @@ func TestStartClusterDiscardsOnlyLaunchedNodesSavedStateWhenALaterLaunchFails(t 
 			}
 			return nil, errors.New("no hypervisor today")
 		}},
-		vms:           make(map[string]map[string]hypervisor.Machine),
-		hostPressure:  noHostPressure,
-		subnetSources: emptySubnetSources(),
+		vms:             make(map[string]map[string]hypervisor.Machine),
+		hostPressure:    noHostPressure,
+		hostTotalMemory: plentifulHostMemory,
+		subnetSources:   emptySubnetSources(),
 	}
 	raw, err := json.Marshal(startArgs{Name: item.Name})
 	if err != nil {
