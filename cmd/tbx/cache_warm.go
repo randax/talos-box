@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/randax/talos-box/internal/daemon"
+	"github.com/randax/talos-box/internal/provision"
 )
 
 type warmListEntry struct {
@@ -43,6 +44,13 @@ func (c cli) runCacheWarm(args []string) error {
 	}
 	if len(refs) == 0 {
 		return errors.New("cache warm list is empty")
+	}
+	// A deep check is the pre-venue verification, so it also answers for the
+	// images no warm list can name: nothing tbx renders references the CRI pod
+	// sandbox image, yet no pod starts without it. Adding it here means the
+	// gap is reported while it can still be pulled.
+	if *checkOnly && *deep {
+		refs = withBootstrapRequiredRefs(refs)
 	}
 	if err := c.ensureCacheWarmSupport(); err != nil {
 		return err
@@ -114,6 +122,24 @@ func (c cli) runCacheWarm(args []string) error {
 		return fmt.Errorf("cache warm failed for %d ref(s)", failed)
 	}
 	return nil
+}
+
+// withBootstrapRequiredRefs appends the bootstrap-required images the list
+// does not already carry, preserving the list's own order so the appended refs
+// read as the addition they are.
+func withBootstrapRequiredRefs(refs []string) []string {
+	present := make(map[string]struct{}, len(refs))
+	for _, ref := range refs {
+		present[ref] = struct{}{}
+	}
+	for _, ref := range provision.BootstrapRequiredImages() {
+		if _, duplicate := present[ref]; duplicate {
+			continue
+		}
+		present[ref] = struct{}{}
+		refs = append(refs, ref)
+	}
+	return refs
 }
 
 func cacheCheckEntryForRef(ref string, result daemon.CacheCheckResult) (daemon.CacheCheckEntry, error) {

@@ -57,6 +57,11 @@ var ciliumChart []byte
 type CiliumReconciler struct {
 	PollInterval time.Duration
 	HTTPClient   *http.Client
+	// MirrorOffline records that the registry mirror is serving from cache
+	// only. It changes nothing about the apply path; it is the one piece of
+	// context that makes a control plane which never starts diagnosable
+	// (see annotateAPIServerTimeout).
+	MirrorOffline bool
 }
 
 // Reconcile installs Cilium before waiting for Kubernetes Nodes to become
@@ -83,7 +88,7 @@ func (r CiliumReconciler) reconcile(ctx context.Context, item cluster.Cluster, c
 	// discovery-backed applies below treat a refused dial as fatal, so gate
 	// them on the API server actually answering.
 	if err := waitForAPIServer(ctx, config, r.PollInterval); err != nil {
-		return LoadBalancerResult{}, err
+		return LoadBalancerResult{}, annotateAPIServerTimeout(err, r.MirrorOffline)
 	}
 	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
 	if err != nil {
@@ -789,6 +794,23 @@ func waitForAPIServer(ctx context.Context, config *rest.Config, interval time.Du
 		return fmt.Errorf("wait for kube-apiserver at %s: %w", config.Host, err)
 	}
 	return nil
+}
+
+// annotateAPIServerTimeout names the failure a deadline on the very first
+// API-server wait almost always hides when the mirror is offline: the CRI pod
+// sandbox image was never cached, so every static pod loops on a 503 from the
+// mirror and the control plane never comes up at all. The client this code
+// holds here talks to kube-apiserver, which by definition is not answering, so
+// no CRI or kubelet state is cheaply readable at this point — this is a
+// pointer at the check that settles it, not a verdict, and it is only added
+// when the provisioner knows the mirror is serving from cache alone.
+func annotateAPIServerTimeout(err error, mirrorOffline bool) error {
+	if err == nil || !mirrorOffline || !errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return fmt.Errorf("%w; the mirror is offline, so no node can pull an image it never cached: "+
+		"verify the CRI pod sandbox image %s is present with `tbx cache warm --check --deep`, "+
+		"and re-run `tbx cache pull` online if it is missing", err, KubernetesSandboxImage)
 }
 
 // isUntrustedCertificateError matches only trust-chain failures that cannot

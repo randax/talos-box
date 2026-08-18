@@ -160,6 +160,70 @@ func TestClusterImagesChangeWithIntent(t *testing.T) {
 	}
 }
 
+// TestClusterImagesIncludeTheCRISandboxImage is the offline promise: the pod
+// sandbox image is pulled for every pod on every node, no rendered object
+// names it, and an online node never fetches it through the mirror — so it has
+// to be in every cluster's warm set or a dark venue cannot bootstrap.
+func TestClusterImagesIncludeTheCRISandboxImage(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		intent cluster.ProvisioningIntent
+	}{
+		{name: "substrate only", intent: cluster.ProvisioningIntent{}},
+		{name: "cilium", intent: cluster.ProvisioningIntent{CNI: cluster.CNICilium}},
+		{name: "flannel with metallb", intent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, LB: true}},
+		{name: "cilium with local-path", intent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, CSI: cluster.CSILocalPath}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			images, err := ClusterImages(imagesTestCluster(test.intent))
+			if err != nil {
+				t.Fatalf("ClusterImages() error = %v", err)
+			}
+			if !slices.Contains(images, KubernetesSandboxImage) {
+				t.Errorf("images missing sandbox image %q, got %v", KubernetesSandboxImage, images)
+			}
+		})
+	}
+}
+
+// TestSandboxImagePinTracksTheBundledKubernetes is a tripwire, not a check of
+// behaviour: the sandbox tag is hand-pinned against a Kubernetes minor, so a
+// machinery bump has to re-read the kubelet's default instead of silently
+// warming a pause image the new kubelet will not ask for.
+func TestSandboxImagePinTracksTheBundledKubernetes(t *testing.T) {
+	t.Parallel()
+	minor := constants.DefaultKubernetesVersion
+	if index := strings.LastIndex(minor, "."); index > 0 {
+		minor = minor[:index]
+	}
+	if minor != sandboxImageKubernetesMinor {
+		t.Fatalf("bundled Kubernetes is %s but the sandbox image is pinned for %s: re-read the kubelet's "+
+			"pod sandbox default and update KubernetesSandboxImage (currently %q)",
+			minor, sandboxImageKubernetesMinor, KubernetesSandboxImage)
+	}
+	if !isImageRef(KubernetesSandboxImage) {
+		t.Fatalf("sandbox image %q is not a warmable reference", KubernetesSandboxImage)
+	}
+}
+
+// TestBootstrapRequiredImagesCoverTheSandboxImage keeps the deep check's extra
+// set honest: it exists so the un-renderable sandbox image is verified.
+func TestBootstrapRequiredImagesCoverTheSandboxImage(t *testing.T) {
+	t.Parallel()
+	required := BootstrapRequiredImages()
+	if !slices.Contains(required, KubernetesSandboxImage) {
+		t.Fatalf("BootstrapRequiredImages() = %v, want it to contain %q", required, KubernetesSandboxImage)
+	}
+	for _, ref := range required {
+		if !isImageRef(ref) {
+			t.Errorf("BootstrapRequiredImages() contains unwarmable ref %q", ref)
+		}
+	}
+}
+
 func TestIsImageRefRejectsUnwarmableStrings(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

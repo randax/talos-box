@@ -407,7 +407,9 @@ func (s *Server) provisionCNI(parent context.Context, item cluster.Cluster, forc
 	case cluster.CNIFlannel:
 		loadBalancer = provision.MetalLBReconciler{PollInterval: time.Second}
 	case cluster.CNICilium:
-		loadBalancer = provision.CiliumReconciler{PollInterval: time.Second}
+		// Offline mode is passed in so a control plane that never starts can
+		// say why: nothing pulls an image the cache does not hold.
+		loadBalancer = provision.CiliumReconciler{PollInterval: time.Second, MirrorOffline: s.mirrorOffline.Load()}
 	}
 	reconcile := s.provisionReconcile
 	if reconcile == nil {
