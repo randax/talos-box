@@ -184,7 +184,7 @@ func replaceDriftedStorageClass(ctx context.Context, client dynamic.Interface, m
 		if maps.Equal(liveParameters, renderedParameters) {
 			continue
 		}
-		if !storageObjectOwnedByTalosbox(live) {
+		if !storageObjectOwnedByTalosbox(live, object) {
 			return fmt.Errorf("StorageClass %q exists with different parameters but is not managed by talosbox; remove or rename it before provisioning curated storage", object.GetName())
 		}
 		if err := client.Resource(mapping.Resource).Delete(ctx, object.GetName(), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
@@ -216,7 +216,7 @@ func validateRenderedStorageObjects(ctx context.Context, client dynamic.Interfac
 		if err != nil {
 			return fmt.Errorf("get stale storage %s %q: %w", candidate.GetKind(), candidate.GetName(), err)
 		}
-		if found && !storageObjectOwnedByTalosbox(live) {
+		if found && !storageObjectOwnedByTalosbox(live, &candidate) {
 			return fmt.Errorf("refuse to remove unmanaged storage %s %q", candidate.GetKind(), candidate.GetName())
 		}
 	}
@@ -254,36 +254,62 @@ func storageProbePVResidue(persistentVolume *corev1.PersistentVolume) bool {
 		persistentVolume.Spec.ClaimRef.Name == storageProbePVCName
 }
 
-func storageObjectOwnedByTalosbox(object *unstructured.Unstructured) bool {
-	if object.GetLabels()[managedLabelKey] == "true" {
+func storageObjectOwnedByTalosbox(live, rendered *unstructured.Unstructured) bool {
+	if live.GetLabels()[managedLabelKey] == "true" {
 		return true
 	}
-	for _, field := range object.GetManagedFields() {
+	for _, field := range live.GetManagedFields() {
 		if field.Manager == fieldManager {
 			return true
 		}
 	}
-	return storageEngineOwnedStorageClass(object)
+	return storageEngineOwnedStorageClass(live, rendered)
 }
 
 // storageEngineOwnedStorageClass recognizes a StorageClass the curated engine
-// re-creates for itself. longhorn-driver-deployer rewrites the `longhorn`
+// re-created for itself. longhorn-driver-deployer rewrites the `longhorn`
 // class from the longhorn-storageclass ConfigMap, and until #338 that
 // definition carried no managed label — so a class tbx installed comes back
-// looking user-owned and every switch away from longhorn is refused. Only
-// classes rendered for the engine being removed are ever checked here, so a
-// class carrying Longhorn's own provisioner belongs to that engine and never
-// to a user: a user-owned class would have to answer to a different name, and
-// a different name is not a candidate for removal in the first place.
-func storageEngineOwnedStorageClass(object *unstructured.Unstructured) bool {
-	if object.GetKind() != "StorageClass" {
+// looking user-owned and every switch away from longhorn is refused. The
+// provisioner alone does not prove that history: a user can pre-create their
+// own `longhorn` class with Longhorn's provisioner and customized fields, and
+// that class must never be adopted for deletion. Legacy tbx classes only ever
+// diverge from the rendered definition in numberOfReplicas (the one parameter
+// tbx derives from topology), so ownership additionally requires the live
+// parameters and reclaim policy to match the rendered ones with that key set
+// aside. A customized class fails the comparison and stays refused —
+// fail-closed; labeling it talosbox.dev/managed remains the escape hatch.
+func storageEngineOwnedStorageClass(live, rendered *unstructured.Unstructured) bool {
+	if live.GetKind() != "StorageClass" || rendered == nil {
 		return false
 	}
-	provisioner, _, err := unstructured.NestedString(object.Object, "provisioner")
+	liveProvisioner, _, err := unstructured.NestedString(live.Object, "provisioner")
+	if err != nil || liveProvisioner != longhornProvisioner {
+		return false
+	}
+	renderedProvisioner, _, err := unstructured.NestedString(rendered.Object, "provisioner")
+	if err != nil || renderedProvisioner != longhornProvisioner {
+		return false
+	}
+	liveReclaim, _, err := unstructured.NestedString(live.Object, "reclaimPolicy")
 	if err != nil {
 		return false
 	}
-	return provisioner == longhornProvisioner
+	renderedReclaim, _, err := unstructured.NestedString(rendered.Object, "reclaimPolicy")
+	if err != nil || liveReclaim != renderedReclaim {
+		return false
+	}
+	liveParameters, _, err := unstructured.NestedStringMap(live.Object, "parameters")
+	if err != nil {
+		return false
+	}
+	renderedParameters, _, err := unstructured.NestedStringMap(rendered.Object, "parameters")
+	if err != nil {
+		return false
+	}
+	delete(liveParameters, "numberOfReplicas")
+	delete(renderedParameters, "numberOfReplicas")
+	return maps.Equal(liveParameters, renderedParameters)
 }
 
 func storageDeletionOrder(objects []unstructured.Unstructured) []unstructured.Unstructured {

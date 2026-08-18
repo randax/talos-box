@@ -340,22 +340,43 @@ func TestReplaceDriftedStorageClassWaitsOutAsynchronousDeletion(t *testing.T) {
 // longhorn-driver-deployer re-creates the `longhorn` StorageClass from the
 // longhorn-storageclass ConfigMap, and clusters provisioned before #338 hold a
 // definition without the managed label. The class is still tbx-installed, so
-// its provisioner — not its labels — decides ownership when the engine being
-// removed is the one that wrote it.
+// ownership falls back to matching the live class against the rendered legacy
+// shape — provisioner, reclaim policy, and every parameter except the
+// topology-derived numberOfReplicas. A user's own longhorn-named class with
+// customized fields must never match.
 func TestValidateRenderedStorageObjectsAdoptsUnlabeledEngineStorageClass(t *testing.T) {
 	tests := []struct {
-		name        string
-		provisioner string
-		wantErr     bool
+		name          string
+		provisioner   string
+		parameters    map[string]any
+		reclaimPolicy string
+		wantErr       bool
 	}{
-		{name: "longhorn re-created its own class", provisioner: longhornProvisioner},
-		{name: "foreign provisioner stays user-owned", provisioner: "csi.example.com", wantErr: true},
+		{name: "longhorn re-created its own class", provisioner: longhornProvisioner,
+			parameters: map[string]any{"numberOfReplicas": "3", "staleReplicaTimeout": "30"}},
+		{name: "replica-count drift alone is still tbx's own class", provisioner: longhornProvisioner,
+			parameters: map[string]any{"numberOfReplicas": "1", "staleReplicaTimeout": "30"}},
+		{name: "foreign provisioner stays user-owned", provisioner: "csi.example.com",
+			parameters: map[string]any{"numberOfReplicas": "3", "staleReplicaTimeout": "30"}, wantErr: true},
+		{name: "customized parameters stay user-owned", provisioner: longhornProvisioner,
+			parameters: map[string]any{"numberOfReplicas": "3", "staleReplicaTimeout": "600"}, wantErr: true},
+		{name: "extra parameter stays user-owned", provisioner: longhornProvisioner,
+			parameters: map[string]any{"numberOfReplicas": "3", "staleReplicaTimeout": "30", "dataLocality": "best-effort"}, wantErr: true},
+		{name: "customized reclaim policy stays user-owned", provisioner: longhornProvisioner,
+			parameters:    map[string]any{"numberOfReplicas": "3", "staleReplicaTimeout": "30"},
+			reclaimPolicy: "Retain", wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			rendered := storageClassFixture(longhornStorageClass, map[string]any{"numberOfReplicas": "3"}, true)
-			live := storageClassFixture(longhornStorageClass, map[string]any{"numberOfReplicas": "3"}, false)
+			rendered := storageClassFixture(longhornStorageClass, map[string]any{"numberOfReplicas": "3", "staleReplicaTimeout": "30"}, true)
+			rendered.Object["provisioner"] = longhornProvisioner
+			rendered.Object["reclaimPolicy"] = "Delete"
+			live := storageClassFixture(longhornStorageClass, tt.parameters, false)
 			live.Object["provisioner"] = tt.provisioner
+			live.Object["reclaimPolicy"] = "Delete"
+			if tt.reclaimPolicy != "" {
+				live.Object["reclaimPolicy"] = tt.reclaimPolicy
+			}
 			objects := []unstructured.Unstructured{*rendered}
 			client := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
 			mapper := storageLifecycleTestMapper(objects)
