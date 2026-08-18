@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -32,7 +34,20 @@ var (
 // node as it comes up and returns an advisory finding if the budget runs out:
 // the cluster is created either way, and refusing it because a node booted
 // slowly would destroy work the operator already paid for.
+//
+// The wait answers to the daemon lifecycle, not just the wall clock: it runs on
+// the request goroutine Shutdown waits for, so a shutdown that could not
+// interrupt it would hold the daemon for the full boot budget and risk the
+// supervisor killing the VMs hard instead of closing them.
 func (s *Server) waitForNodesBooted(name string, progress stageFunc) string {
+	ctx, cancel := s.lifecycleTimeoutContext(nodeBootTimeout)
+	defer cancel()
+	return s.waitForNodesBootedContext(ctx, name, progress)
+}
+
+// waitForNodesBootedContext is waitForNodesBooted with an injectable context,
+// so both the boot budget and the shutdown signal arrive through one channel.
+func (s *Server) waitForNodesBootedContext(ctx context.Context, name string, progress stageFunc) string {
 	item, err := cluster.Load(name)
 	if err != nil {
 		// Nothing to wait on that we can name; the operation's own result
@@ -52,7 +67,6 @@ func (s *Server) waitForNodesBooted(name string, progress stageFunc) string {
 	}
 	progress.stage("waiting for %d node(s) to boot", len(item.Nodes))
 	pending := append([]cluster.Node(nil), item.Nodes...)
-	deadline := time.Now().Add(nodeBootTimeout)
 	for {
 		remaining := pending[:0]
 		for _, node := range pending {
@@ -74,16 +88,36 @@ func (s *Server) waitForNodesBooted(name string, progress stageFunc) string {
 			progress.stage("all %d node(s) booted", len(item.Nodes))
 			return ""
 		}
-		if !time.Now().Before(deadline) {
-			names := make([]string, 0, len(pending))
-			for _, node := range pending {
-				names = append(names, node.Name)
-			}
-			// The name is quoted: a cluster name may contain shell
-			// metacharacters, and this line invites a paste (SPEC §10).
-			return fmt.Sprintf("%d of %d node(s) had not answered after %s (%s); watch them with: tbx status %s",
-				len(pending), len(item.Nodes), formatBootWindow(nodeBootTimeout), strings.Join(names, ", "), shellquote.Quote(item.Name))
+		if err := ctx.Err(); err != nil {
+			return unansweredNodesWarning(item, pending, err)
 		}
-		time.Sleep(nodeBootPollInterval)
+		timer := time.NewTimer(nodeBootPollInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			// A cancelled lifecycle means the daemon is going down and the
+			// VMs still need closing; give the create its advisory answer now
+			// rather than holding shutdown for the rest of the budget.
+			return unansweredNodesWarning(item, pending, ctx.Err())
+		case <-timer.C:
+		}
 	}
+}
+
+// unansweredNodesWarning names the nodes still silent when the wait ended, and
+// says which end it was: a blown budget is the node's problem, a cancelled
+// lifecycle is the daemon's, and conflating them would misreport both.
+func unansweredNodesWarning(item cluster.Cluster, pending []cluster.Node, cause error) string {
+	names := make([]string, 0, len(pending))
+	for _, node := range pending {
+		names = append(names, node.Name)
+	}
+	ended := fmt.Sprintf("after %s", formatBootWindow(nodeBootTimeout))
+	if errors.Is(cause, context.Canceled) {
+		ended = "before the daemon stopped waiting"
+	}
+	// The name is quoted: a cluster name may contain shell metacharacters,
+	// and this line invites a paste (SPEC §10).
+	return fmt.Sprintf("%d of %d node(s) had not answered %s (%s); watch them with: tbx status %s",
+		len(pending), len(item.Nodes), ended, strings.Join(names, ", "), shellquote.Quote(item.Name))
 }

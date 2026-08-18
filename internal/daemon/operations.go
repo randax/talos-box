@@ -223,6 +223,10 @@ type ClusterStatus struct {
 	Subnet string `json:"subnet"`
 	// Domain is the cluster's effective domain (explicit or defaulted).
 	Domain string `json:"domain"`
+	// AllowUnsafeDomain records the opt-in the domain was accepted under, so
+	// a recovery hint naming --domain can name the flag that makes it
+	// replayable (#267).
+	AllowUnsafeDomain bool `json:"allowUnsafeDomain,omitempty"`
 	// TalosVersion and Schematic identify the image the cluster was created
 	// from, as persisted at create.
 	TalosVersion string `json:"talosVersion,omitempty"`
@@ -1104,7 +1108,7 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 	result := make([]ClusterStatus, 0, len(items))
 	for _, item := range items {
 		running := s.clusterRunning(item.Name)
-		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), TalosVersion: item.TalosVersion, Schematic: item.Schematic, BaseSchematic: item.BaseSchematic, TalosExtensions: item.TalosExtensions, ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: running,
+		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), AllowUnsafeDomain: item.AllowUnsafeDomain, TalosVersion: item.TalosVersion, Schematic: item.Schematic, BaseSchematic: item.BaseSchematic, TalosExtensions: item.TalosExtensions, ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: running,
 			// derived from disk, not from daemon memory, so a restarted
 			// daemon still reports its predecessor's suspension
 			Suspended: !running && clusterHasSavedState(item.Name), Capabilities: s.clusterCapabilities(item), ConfigOrigin: item.ConfigOrigin, subnetIndex: item.SubnetIndex}

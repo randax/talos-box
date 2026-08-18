@@ -159,6 +159,13 @@ func clustersDir() (string, error) {
 	return filepath.Join(home, ".talosbox", "clusters"), nil
 }
 
+// ValidateName reports whether a name can identify a cluster at all, so a
+// caller can tell a name no cluster could ever carry apart from a name that
+// simply has no cluster behind it.
+func ValidateName(name string) error {
+	return validName(name)
+}
+
 func validName(name string) error {
 	if name == "" {
 		return errors.New("cluster name cannot be empty")

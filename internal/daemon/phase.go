@@ -253,6 +253,11 @@ func recordedIntentFlags(status ClusterStatus) string {
 	flags = append(flags, fmt.Sprintf("--cp %d", controlPlanes), fmt.Sprintf("--workers %d", workers))
 	if status.Domain != "" && status.Domain != status.Name+"."+cluster.DefaultDomainSuffix {
 		flags = append(flags, fmt.Sprintf("--domain %s", status.Domain))
+		// Without the opt-in the create would refuse the very domain this
+		// line names, so the flags stay replayable as printed.
+		if status.AllowUnsafeDomain {
+			flags = append(flags, "--allow-unsafe-domain")
+		}
 	}
 	return strings.Join(flags, " ")
 }

@@ -475,6 +475,33 @@ func TestProvisioningRecoveryHintNamesAnExplicitDomain(t *testing.T) {
 	}
 }
 
+// An unsafe domain is only accepted with its opt-in, so the recorded intent
+// has to name the flag or the recreate it describes would be refused (#267).
+func TestProvisioningRecoveryHintNamesTheUnsafeDomainOptIn(t *testing.T) {
+	status := ClusterStatus{
+		Name: "demo", Domain: "demo.lab.internal", AllowUnsafeDomain: true,
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, LB: true},
+		ConfigOrigin:       cluster.OriginImperative,
+	}
+	got := provisioningRecoveryHint(status)
+	if !strings.Contains(got, "--domain demo.lab.internal --allow-unsafe-domain") {
+		t.Fatalf("provisioningRecoveryHint() missing the unsafe-domain opt-in: %s", got)
+	}
+}
+
+// A safe explicit domain needs no opt-in, and naming one would send the
+// operator back with a flag the create does not want.
+func TestProvisioningRecoveryHintOmitsTheOptInForSafeDomains(t *testing.T) {
+	status := ClusterStatus{
+		Name: "demo", Domain: "demo.lab.test",
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, LB: true},
+		ConfigOrigin:       cluster.OriginImperative,
+	}
+	if got := provisioningRecoveryHint(status); strings.Contains(got, "--allow-unsafe-domain") {
+		t.Fatalf("provisioningRecoveryHint() named an opt-in the cluster never took: %s", got)
+	}
+}
+
 // The hint is written to be pasted, so a cluster name carrying shell
 // metacharacters must not escape into the destroy command.
 func TestProvisioningRecoveryHintQuotesClusterName(t *testing.T) {

@@ -221,6 +221,36 @@ func TestWaitForNodesBootedWarnsWhenTheBudgetRunsOut(t *testing.T) {
 	}
 }
 
+// The wait runs on the request goroutine Shutdown waits for, so a cancelled
+// lifecycle must end it at once: holding it for the rest of the boot budget
+// would keep the daemon from closing its VMs before a supervisor kills it.
+func TestWaitForNodesBootedGivesUpWhenTheLifecycleIsCancelled(t *testing.T) {
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 0)
+	// a real boot budget: only the cancellation may end this wait
+	service.nodeIPLookup = func(string, int) string { return "10.0.0.2" }
+	lifecycle, cancel := context.WithCancel(context.Background())
+	service.lifecycleContext, service.lifecycleCancel = lifecycle, cancel
+	service.nodeProbe = func(string) ProbeResult {
+		service.cancelLifecycle()
+		return ProbeResult{}
+	}
+
+	done := make(chan string, 1)
+	go func() { done <- service.waitForNodesBooted(item.Name, nil) }()
+
+	select {
+	case warning := <-done:
+		if !strings.Contains(warning, "before the daemon stopped waiting") {
+			t.Fatalf("warning = %q, want the cancelled wait reported as such", warning)
+		}
+		if !strings.Contains(warning, "tbx status demo") {
+			t.Fatalf("warning = %q, want the unanswered nodes named with the status command", warning)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("waitForNodesBooted did not return after the lifecycle was cancelled")
+	}
+}
+
 // restoreInterval shrinks the boot wait so a test does not sleep through a
 // real Talos boot, and restores both knobs afterward.
 func restoreInterval(t *testing.T, interval time.Duration) {

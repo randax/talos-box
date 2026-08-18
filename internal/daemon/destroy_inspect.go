@@ -30,6 +30,12 @@ func (s *Server) destroyInspect(raw json.RawMessage) (DestroyInspection, error) 
 	}
 	// A cluster that never existed has no data to lose: say so here, before
 	// the client can print a data-loss warning about nothing (#268).
+	// A name no cluster can carry names no cluster either: refuse it as
+	// missing so the client suppresses the warning here too, keeping the
+	// reason the name was rejected in the message (#268).
+	if err := cluster.ValidateName(args.Name); err != nil {
+		return DestroyInspection{}, fmt.Errorf("%w: %w", ClusterMissingError(args.Name), err)
+	}
 	dir, err := cluster.Dir(args.Name)
 	if err != nil {
 		return DestroyInspection{}, err

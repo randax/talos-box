@@ -419,7 +419,9 @@ copy-pasteable next-step hints keyed to observed state (maintenance node → the
 `talosctl --insecure` probe; provisioned clusters report convergence progress and the
 recovery that actually applies — a safe `tbx up` rerun for clusters a `talosbox.yaml` backs,
 and destroy-and-recreate guidance naming the recorded intent, never a fabricated `cluster
-create` line, for imperatively created ones; substrate-only clusters retain manual guidance).
+create` line, for imperatively created ones; a cluster created before the origin was recorded
+keeps the `tbx up` wording, because tbx cannot prove no file backs it and advising a destroy on
+a guess is the worse error; substrate-only clusters retain manual guidance).
 Hints **never execute anything**. `--quiet` suppresses hints and narration but keeps facts
 (schematic/extensions lines) and liveness (deadline preamble plus a periodic stderr heartbeat
 during blocking provisioning calls); all list/status commands support `-o json`.
@@ -430,7 +432,9 @@ cluster, cloning disks, restarting, waiting for nodes — closing with a converg
 the verb left nodes booting, and `--quiet` suppresses the stages while keeping the result and
 its warnings. A verb's success line is past tense because it is true when printed: `cluster
 create` holds its answer until the nodes it started answer on apid (maintenance or configured),
-and warnings print above the success line, not after it.
+and for these narrating verbs warnings print above the success line, not after it. Other
+state-changing verbs (`cluster start|stop|suspend|resume`, `node start|stop`) still print their
+warnings below their success line.
 
 **`tbx console <cluster> <node>`** attaches interactively to the node's serial console (hvc0)
 through the `tbxd`-owned socket — Talos renders its console dashboard and logs there, and
