@@ -441,6 +441,13 @@ func (s *Server) createCluster(raw json.RawMessage, progress stageFunc) (Cluster
 	if err != nil {
 		return ClusterSummary{}, err
 	}
+	// The projected-start gate runs before anything is written: a create that
+	// cannot safely boot must not leave a cluster directory behind (#334).
+	provisionStartWarnings, err := s.checkProvisionStart(dir, addMiB, args.Force)
+	if err != nil {
+		return ClusterSummary{}, err
+	}
+	hostPressureWarnings = append(hostPressureWarnings, provisionStartWarnings...)
 	clusters, err := cluster.List()
 	if err != nil {
 		return ClusterSummary{}, err
@@ -572,6 +579,15 @@ func (s *Server) startCluster(raw json.RawMessage) (ClusterSummary, error) {
 	hostPressureWarnings, err := s.checkHostPressure(dir, args.Force)
 	if err != nil {
 		return ClusterSummary{}, err
+	}
+	if !s.clusterRunning(item.Name) {
+		// Same projected-start gate as create: bringing a stopped cluster up
+		// beside a running one is the same concurrent-bringup risk (#334).
+		provisionStartWarnings, err := s.checkProvisionStart(dir, clusterMemoryMiB(item), args.Force)
+		if err != nil {
+			return ClusterSummary{}, err
+		}
+		hostPressureWarnings = append(hostPressureWarnings, provisionStartWarnings...)
 	}
 	startWarnings, err := s.start(item)
 	if err != nil {

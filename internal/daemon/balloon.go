@@ -117,19 +117,79 @@ func (s *Server) checkOvercommit(addMiB int, force bool) (string, error) {
 }
 
 func (s *Server) checkHostPressure(path string, force bool) ([]string, error) {
-	measure := s.hostPressure
-	if measure == nil {
-		measure = hostpressure.SystemSnapshot
-	}
-	snapshot, err := measure(path)
+	snapshot, err := s.pressureSnapshot(path)
 	if err != nil {
 		return []string{fmt.Sprintf("host-pressure probe failed: %v; proceeding without host-pressure protection", err)}, nil
 	}
 	// hostpressure.Assess is the shared classification: tbx doctor reports the
 	// same blocking findings as FAIL, so the gate and the diagnostic agree.
 	// Findings stay one warning each so the CLI renders them one per line.
+	return applyPressureFindings(hostpressure.Assess(snapshot), force)
+}
+
+// checkProvisionStart gates the *start* of new guests on the host as measured
+// right now (#334). checkOvercommit only compares configured memory against
+// total RAM, and checkHostPressure only judges the host as it stands; neither
+// sees a second bringup arriving on a host whose free memory is already spoken
+// for. That gap admitted the create that drove host swap to 7.3/8 GiB and
+// panicked a worker guest mid-boot.
+//
+// Probe failures never block: an unmeasurable host falls back to the guards
+// that came before this one, exactly as checkOvercommit does.
+func (s *Server) checkProvisionStart(path string, addMiB int, force bool) ([]string, error) {
+	freeMiB := 0
+	measureFree := s.hostFreeMemory
+	if measureFree == nil {
+		measureFree = balloon.HostFreeMiB
+	}
+	if measured, err := measureFree(); err == nil {
+		freeMiB = measured
+	}
+	var swap hostpressure.Usage
+	if snapshot, err := s.pressureSnapshot(path); err == nil {
+		swap = snapshot.Swap
+	}
+	findings := hostpressure.AssessProvisionStart(hostpressure.ProvisionStart{
+		RunningVMMiB: s.runningVMMemoryMiB(),
+		NewVMMiB:     addMiB,
+		HostFreeMiB:  freeMiB,
+		ReserveMiB:   balloon.DefaultConfig().ReserveMiB,
+		Swap:         swap,
+	})
+	return applyPressureFindings(findings, force)
+}
+
+// runningVMMemoryMiB sums the configured memory of every cluster whose guests
+// are running. Configured — not observed — memory is what a booting guest will
+// eventually claim, and it is the same unit checkOvercommit accounts in.
+func (s *Server) runningVMMemoryMiB() int {
+	clusters, err := cluster.List()
+	if err != nil {
+		return 0
+	}
+	total := 0
+	for _, item := range clusters {
+		if s.clusterRunning(item.Name) {
+			total += clusterMemoryMiB(item)
+		}
+	}
+	return total
+}
+
+func (s *Server) pressureSnapshot(path string) (hostpressure.Snapshot, error) {
+	measure := s.hostPressure
+	if measure == nil {
+		measure = hostpressure.SystemSnapshot
+	}
+	return measure(path)
+}
+
+// applyPressureFindings turns a classification into the operation's refusal or
+// warnings: blocking findings refuse unless forced, advisory ones always ride
+// along, and each finding stays its own warning so the CLI prints one per line.
+func applyPressureFindings(findings []hostpressure.Finding, force bool) ([]string, error) {
 	var blocking, advisory []string
-	for _, finding := range hostpressure.Assess(snapshot) {
+	for _, finding := range findings {
 		if finding.Severity == hostpressure.SeverityBlock {
 			blocking = append(blocking, finding.String())
 			continue
