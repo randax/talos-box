@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,6 +39,11 @@ type Server struct {
 	// so no gate can vouch for a node another operation is about to delete.
 	mutationMu    sync.Mutex
 	mutationLocks map[string]*sync.Mutex
+
+	// preemptions lets an operation queued on a cluster's mutation lock tell
+	// the current holder that the work it is still doing for that cluster —
+	// a create's boot wait, a reconcile — is not worth finishing.
+	preemptions preemptions
 
 	opMu sync.Mutex
 	vms  map[string]map[string]hypervisor.Machine
@@ -442,8 +446,16 @@ func (s *Server) dispatchDestroy(request Request) Response {
 	// the destroy: a concurrent node mutation could otherwise register a fresh
 	// reconcile after the drain and have it write into the directory being
 	// removed.
+	//
+	// Announce the destroy before queueing on that lock. A create holding it is
+	// in a boot wait, or a reconcile, whose outcome nobody wants any more —
+	// waiting out a budget measured in minutes for a cluster about to be
+	// deleted is time the operator spends for nothing. The announcement only
+	// interrupts; the lock is still what serializes the destruction.
+	releasePreemption := s.preemptions.request(args.Name)
 	lock := s.clusterMutationLock(args.Name)
 	lock.Lock()
+	releasePreemption()
 	defer lock.Unlock()
 	s.drainProvision(args.Name)
 	s.opMu.Lock()
@@ -463,7 +475,56 @@ func (s *Server) lifecycleTimeoutContext(timeout time.Duration) (context.Context
 	return context.WithTimeout(parent, timeout)
 }
 
+// dispatchCreate serializes a create against the cluster's other mutations for
+// the whole span it owns the cluster: the launch, the boot wait it answers
+// from, and the reconcile that follows. The wait used to run outside every
+// lock, so a destroy could delete the cluster while the create was still
+// waiting for its nodes — and the create would then report a past-tense success
+// for a cluster that no longer existed (#263).
+//
+// Status stays answerable throughout: neither the wait nor the reconcile holds
+// opMu, and the lock order is the one dispatchDestroy and dispatchNodeMutation
+// use — the cluster's mutation lock first, opMu only inside it, never the
+// reverse.
+func (s *Server) dispatchCreate(request Request, progress stageFunc) Response {
+	var args createArgs
+	if err := decodeArgs(request.Args, &args); err != nil {
+		return failure(err)
+	}
+	lock := s.clusterMutationLock(args.Name)
+	lock.Lock()
+	defer lock.Unlock()
+
+	s.opMu.Lock()
+	data, tasks, err := s.handleProvisioningLocked(request, nil, nil, progress)
+	s.opMu.Unlock()
+	if err != nil {
+		return failure(err)
+	}
+	// Everything left is work a destroy queued behind this lock has no use for.
+	// Offer it up: the reconcile answers to its own context, and the boot wait
+	// registers its own interrupt. Without this the queued destroy would sit
+	// behind a provisioning budget measured in minutes.
+	release := s.preemptions.register(args.Name, func() { s.cancelProvisionForHandover(args.Name) })
+	defer release()
+	// A create answers only once the substrate it promised exists: the VMs are
+	// launched under opMu, but a launched VM is not a booted node, and a
+	// past-tense success printed ahead of the boot is a lie the operator's next
+	// command races (#263). The wait runs outside opMu — it takes minutes, and
+	// status must stay answerable while it runs.
+	if summary, ok := data.(*ClusterSummary); ok {
+		summary.addWarnings(s.waitForNodesBooted(summary.Name, progress))
+	}
+	if err := s.runProvisionTasks(data, tasks, progress); err != nil {
+		return failure(err)
+	}
+	return success(data)
+}
+
 func (s *Server) dispatchProvisioning(request Request, progress stageFunc) Response {
+	if request.Op == "cluster.create" {
+		return s.dispatchCreate(request, progress)
+	}
 	var maintenance map[string]maintenanceObservation
 	if request.Op == "up" {
 		discovered, err := s.observeUpMaintenance(request.Args)
@@ -506,16 +567,6 @@ func (s *Server) dispatchProvisioning(request Request, progress stageFunc) Respo
 	s.opMu.Unlock()
 	if err != nil {
 		return failure(err)
-	}
-	// A create answers only once the substrate it promised exists: the VMs are
-	// launched under the lock, but a launched VM is not a booted node, and a
-	// past-tense success printed ahead of the boot is a lie the operator's next
-	// command races (#263). The wait is outside the lock — it takes minutes,
-	// and status must stay answerable while it runs.
-	if request.Op == "cluster.create" {
-		if summary, ok := data.(*ClusterSummary); ok {
-			summary.addWarnings(s.waitForNodesBooted(summary.Name, progress))
-		}
 	}
 	if err := s.runProvisionTasks(data, tasks, progress); err != nil {
 		return failure(err)
@@ -635,9 +686,7 @@ func (s *Server) dispatchSnapshotRestore(request Request, progress stageFunc) Re
 }
 
 func (s *Server) clusterMutationLock(clusterName string) *sync.Mutex {
-	// normalize the key: on a case-insensitive filesystem "Demo" and "demo"
-	// load the same cluster state and must share one mutation lock
-	clusterName = strings.ToLower(clusterName)
+	clusterName = clusterKey(clusterName)
 	s.mutationMu.Lock()
 	defer s.mutationMu.Unlock()
 	if s.mutationLocks == nil {

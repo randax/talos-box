@@ -256,6 +256,18 @@ func (s *Server) drainProvision(name string) {
 	}
 }
 
+// cancelProvisionForHandover cancels a cluster's reconcile without retiring it,
+// so the operation that asked for the handover can still drain it: drainProvision
+// waits on the task's done channel, and a retired entry leaves nothing to wait
+// on — cancelling only asks the goroutine to stop, it does not stop it.
+func (s *Server) cancelProvisionForHandover(name string) {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	if active, ok := s.provisions[name]; ok {
+		active.cancel()
+	}
+}
+
 func (s *Server) cancelProvisionLocked(name string) {
 	if active, ok := s.provisions[name]; ok {
 		active.cancel()

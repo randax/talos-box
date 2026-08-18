@@ -39,11 +39,28 @@ var (
 // the request goroutine Shutdown waits for, so a shutdown that could not
 // interrupt it would hold the daemon for the full boot budget and risk the
 // supervisor killing the VMs hard instead of closing them.
+//
+// It also answers to the cluster's other operators: a destroy queued on the
+// cluster's mutation lock interrupts the wait, because nodes finishing their
+// boot is not something a cluster about to be deleted needs, and the create
+// must not hold the destroy behind a budget nobody wants spent.
 func (s *Server) waitForNodesBooted(name string, progress stageFunc) string {
-	ctx, cancel := s.lifecycleTimeoutContext(nodeBootTimeout)
-	defer cancel()
+	deadline, cancelDeadline := s.lifecycleTimeoutContext(nodeBootTimeout)
+	defer cancelDeadline()
+	// The cause distinguishes the three ends this wait can come to — budget,
+	// shutdown, handover — which the warning has to report apart.
+	ctx, cancel := context.WithCancelCause(deadline)
+	defer cancel(nil)
+	release := s.preemptions.register(name, func() { cancel(errBootWaitPreempted) })
+	defer release()
 	return s.waitForNodesBootedContext(ctx, name, progress)
 }
+
+// errBootWaitPreempted is the wait's end when another operation is queued on
+// the cluster's mutation lock. The create still succeeded — the substrate is
+// there — but it says so with the interruption named, so an operator whose
+// destroy took the cluster next is not handed an unqualified success for it.
+var errBootWaitPreempted = errors.New("another operation was waiting for the cluster")
 
 // waitForNodesBootedContext is waitForNodesBooted with an injectable context,
 // so both the boot budget and the shutdown signal arrive through one channel.
@@ -88,7 +105,7 @@ func (s *Server) waitForNodesBootedContext(ctx context.Context, name string, pro
 			progress.stage("all %d node(s) booted", len(item.Nodes))
 			return ""
 		}
-		if err := ctx.Err(); err != nil {
+		if err := context.Cause(ctx); err != nil {
 			return unansweredNodesWarning(item, pending, err)
 		}
 		timer := time.NewTimer(nodeBootPollInterval)
@@ -98,7 +115,7 @@ func (s *Server) waitForNodesBootedContext(ctx context.Context, name string, pro
 			// A cancelled lifecycle means the daemon is going down and the
 			// VMs still need closing; give the create its advisory answer now
 			// rather than holding shutdown for the rest of the budget.
-			return unansweredNodesWarning(item, pending, ctx.Err())
+			return unansweredNodesWarning(item, pending, context.Cause(ctx))
 		case <-timer.C:
 		}
 	}
@@ -113,7 +130,10 @@ func unansweredNodesWarning(item cluster.Cluster, pending []cluster.Node, cause 
 		names = append(names, node.Name)
 	}
 	ended := fmt.Sprintf("after %s", formatBootWindow(nodeBootTimeout))
-	if errors.Is(cause, context.Canceled) {
+	switch {
+	case errors.Is(cause, errBootWaitPreempted):
+		ended = "before another operation on the cluster interrupted the wait"
+	case errors.Is(cause, context.Canceled):
 		ended = "before the daemon stopped waiting"
 	}
 	// The name is quoted: a cluster name may contain shell metacharacters,
