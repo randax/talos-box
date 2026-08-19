@@ -40,22 +40,29 @@ func TestPlanUpStartsPartiallyRunningCluster(t *testing.T) {
 	}
 }
 
-func TestActionAfterProvisionDoesNotCallReconciledClusterUpToDate(t *testing.T) {
+// Only the provisioning pass's fast no-op path — every desired outcome already
+// observed healthy — leaves a planned no-op reported as "up to date". A pass
+// that ran in full applied machine configs, bootstrapped etcd or re-applied the
+// charts, and calling that "up to date" is the lie #358 set out to remove; its
+// narration cannot tell the two apart, because a first bootstrap and a
+// first-time chart install narrate exactly what a converged rerun does.
+func TestActionAfterProvisionReservesUpToDateForTheFastNoop(t *testing.T) {
 	tests := []struct {
-		name      string
-		action    ActionKind
-		narration []string
-		want      ActionKind
+		name     string
+		action   ActionKind
+		fullPass bool
+		want     ActionKind
 	}{
 		{name: "running substrate-only cluster stays no-op", action: ActionNone, want: ActionNone},
 		{name: "fast no-op provisioned cluster is up to date", action: ActionNone, want: ActionNone},
-		{name: "provisioning work is reported as reconciled", action: ActionNone, narration: []string{"≈ kubectl apply --server-side -f -"}, want: ActionReconcile},
-		{name: "stopped provisioned cluster starts before reconciliation", action: ActionStart, narration: []string{"≈ kubectl apply --server-side -f -"}, want: ActionStart},
+		{name: "full pass over a running cluster is reconciled", action: ActionNone, fullPass: true, want: ActionReconcile},
+		{name: "stopped provisioned cluster starts before reconciliation", action: ActionStart, fullPass: true, want: ActionStart},
+		{name: "created cluster keeps its own verb", action: ActionCreate, fullPass: true, want: ActionCreate},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := actionAfterProvision(test.action, test.narration); got != test.want {
-				t.Fatalf("actionAfterProvision(%q, %q) = %q, want %q", test.action, test.narration, got, test.want)
+			if got := actionAfterProvision(test.action, test.fullPass); got != test.want {
+				t.Fatalf("actionAfterProvision(%q, %t) = %q, want %q", test.action, test.fullPass, got, test.want)
 			}
 		})
 	}

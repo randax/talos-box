@@ -30,7 +30,7 @@ Steps:
 3. `kubectl get sc` — record which class is default.
 4. Create a 1Gi PVC + writer pod (write a known string to the volume), then a reader pod on a different node reading it back.
 
-Expected observations: Longhorn pods Running; the curated StorageClass is the cluster default; PVC binds; readback matches the written string; replica count derived from node count (3 nodes → up to 3, capped) — check `kubectl -n longhorn-system get volumes.longhorn.io -o yaml` for the replica number and record it.
+Expected observations: Longhorn pods Running; the curated StorageClass is the cluster default; PVC binds; readback matches the written string; replicas = worker count (a defaults 3-node cluster has 2 workers, so `numberOfReplicas=2` — the workers are the only schedulable storage nodes) — check `kubectl -n longhorn-system get volumes.longhorn.io -o yaml` for the replica number and record it.
 
 Pass criteria: PVC bound, cross-node readback exact.
 

@@ -108,7 +108,7 @@ func TestProvisionCNIKeepsFastNoopWithoutForce(t *testing.T) {
 		return provision.Result{}, nil
 	}
 
-	_, _, phase, err := service.provisionCNI(context.Background(), item, false, false)
+	_, _, phase, _, err := service.provisionCNI(context.Background(), item, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +137,7 @@ func TestProvisionCNIRecoversDriftedControlPlaneSchedulingWithoutForce(t *testin
 		return provision.Result{StoragePhase: provision.StoragePhaseLive, StorageLive: true}, nil
 	}
 
-	if _, _, _, err := service.provisionCNI(context.Background(), item, false, false); err != nil {
+	if _, _, _, _, err := service.provisionCNI(context.Background(), item, false, false); err != nil {
 		t.Fatal(err)
 	}
 	if !reconciled {

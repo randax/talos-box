@@ -85,7 +85,7 @@ Steps:
 3. Time how long `.200` is unreachable (`while ! curl -s --max-time 1 http://<subnet>.200/ >/dev/null; do date; sleep 2; done`).
 
 Expected observations:
-- **macOS**: convergence in ~40–50 s is EXPECTED (vmnet ignores GARP; macOS ARP revalidation converges) — under ~60 s is a PASS, not friction. Materially faster or slower than the documented window is worth reporting.
+- **macOS**: since the GARP work, no observed VIP outage at 2 s polling is the expected result — a zero-outage measurement is a clean PASS, not an anomaly. If GARP does not take, the fallback is macOS ARP revalidation (tens of seconds); anything under ~60 s is still a PASS. Record the measured window either way; only materially slower than ~60 s is worth reporting as friction.
 - **Linux**: normal bridge L2 — convergence within a few seconds.
 
 Pass criteria: VIP reachable again within 90 s (macOS) / 15 s (Linux).

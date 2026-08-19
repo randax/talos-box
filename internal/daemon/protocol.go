@@ -42,7 +42,18 @@ const (
 // only the host speaker (#344). It also adds the additive storagePending field
 // to cluster status, which separates a readiness probe the daemon's own cleanup
 // has not let run yet from one that failed (#347).
-const ProtocolVersion = 10
+// Version 11 adds the additive per-node kubelet field to cluster status: the
+// node's kubelet as its machine API reports it, so a node that answers apid
+// with a crashlooping kubelet no longer reads as a healthy configured node
+// (#357).
+// Version 12 adds the additive noop field to the node.start/node.stop
+// response: a verb that found the node already in the requested run state
+// changed nothing, and the CLI says so instead of claiming it acted (#362).
+// Version 13 honors the additive force field on cluster.resume: a resume
+// re-admits the suspended cluster's whole memory footprint, so it answers to
+// the same host-pressure gate create and start do, with --force as the
+// override (#368).
+const ProtocolVersion = 13
 
 // Request is one newline-delimited daemon request.
 type Request struct {
@@ -72,6 +83,19 @@ func (r Response) IsProgress() bool { return r.Stage != "" }
 // Info reports daemon wire compatibility details.
 type Info struct {
 	ProtocolVersion int `json:"protocolVersion"`
+}
+
+// NodeRunState is the answer to node.start and node.stop: the node's status
+// plus whether the verb actually changed anything. The status is embedded, so
+// the wire shape stays the plain NodeStatus object an older tbx already reads,
+// with one additive field beside it.
+type NodeRunState struct {
+	NodeStatus
+	// NoOp reports that the node was already in the requested run state, so
+	// nothing was started or stopped. The request still succeeds — asking for
+	// a state the node is already in is not an error — but the CLI narrates it
+	// honestly rather than claiming an action it never took (#362).
+	NoOp bool `json:"noop,omitempty"`
 }
 
 // SocketPath returns the per-user daemon socket path.

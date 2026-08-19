@@ -159,6 +159,46 @@ func TestRunUpQuietSuppressesNarrationButDefaultOutputShowsManualEquivalents(t *
 	})
 }
 
+// A converged cluster comes back as ActionNone even when the pass narrated its
+// manual equivalents, and the CLI must reach its up-to-date wording — on stdout,
+// quiet or not (#358).
+func TestRunUpReportsConvergedClusterAsUpToDate(t *testing.T) {
+	const response = `[{"cluster":"demo","action":"none","narration":["export KUBECONFIG=/k"]}]`
+	for _, test := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "default", want: "demo is up to date\nexport KUBECONFIG=/k\n"},
+		{name: "quiet", args: []string{"--quiet"}, want: "demo is up to date\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			home, requests := startUpTestDaemon(t,
+				daemon.Response{OK: true, Data: json.RawMessage(fmt.Sprintf(`{"protocolVersion":%d}`, daemon.ProtocolVersion))},
+				daemon.Response{OK: true, Data: json.RawMessage(response)},
+			)
+			path := filepath.Join(home, "talosbox.yaml")
+			if err := os.WriteFile(path, []byte("version: 1\nclusters:\n  - name: demo\n    cni: cilium\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			var stdout, stderr bytes.Buffer
+			if err := (cli{out: &stdout, err: &stderr}).runUp(append([]string{"-f", path}, test.args...)); err != nil {
+				t.Fatal(err)
+			}
+			if request := <-requests; request.Op != "daemon.info" {
+				t.Fatalf("first operation = %q, want daemon.info", request.Op)
+			}
+			if request := <-requests; request.Op != "up" {
+				t.Fatalf("second operation = %q, want up", request.Op)
+			}
+			if got := stdout.String(); got != test.want {
+				t.Fatalf("runUp stdout = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func startUpTestDaemon(t *testing.T, responses ...daemon.Response) (string, <-chan daemon.Request) {
 	t.Helper()
 	home, err := os.MkdirTemp("/tmp", "tbx-")
@@ -368,5 +408,24 @@ func TestCreateProvisionDeadlineIncludesTheNodeBootWait(t *testing.T) {
 	}
 	if got, want := createProvisionDeadline(true), daemon.StorageProvisionTimeout+daemon.NodeBootTimeout; got != want {
 		t.Fatalf("createProvisionDeadline(true) = %v, want %v", got, want)
+	}
+}
+
+// An up handles the file's clusters one after another — each boot wait,
+// readiness wait and provisioning pass runs before the next cluster's — so the
+// stated deadline is the sum of every cluster's share, each widened only by
+// its own storage engine.
+func TestUpProvisionDeadlineSumsEveryCluster(t *testing.T) {
+	cfg := config.Config{Clusters: []config.ClusterSpec{
+		{Name: "plain", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel}},
+		{Name: "stored", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, CSI: cluster.CSILonghorn}},
+	}}
+	want := startedProvisionDeadline(false) + startedProvisionDeadline(true)
+	if got := upProvisionDeadline(cfg); got != want {
+		t.Fatalf("upProvisionDeadline = %s, want %s (one plain + one storage share)", got, want)
+	}
+	// A file with no clusters still needs a bound for the heartbeat to state.
+	if got := upProvisionDeadline(config.Config{}); got != startedProvisionDeadline(false) {
+		t.Fatalf("upProvisionDeadline(empty) = %s, want the single plain budget", got)
 	}
 }

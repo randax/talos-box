@@ -63,6 +63,45 @@ func TestNodeStopConfirmsAndPrintsWarnings(t *testing.T) {
 	}
 }
 
+// TestNodeRunStateNarratesANoOp pins #362: a verb the daemon answered with
+// noop changed nothing, so claiming "started"/"stopped" would be a lie. The
+// command still succeeds — the node is in the state that was asked for.
+func TestNodeRunStateNarratesANoOp(t *testing.T) {
+	for _, test := range []struct{ verb, want string }{
+		{"start", "node demo-worker-2 in cluster demo is already running"},
+		{"stop", "node demo-worker-2 in cluster demo is already stopped"},
+	} {
+		_, command := newDestroyTestCLI(t, []daemon.Response{
+			{OK: true, Data: json.RawMessage(`{"protocolVersion":12}`)},
+			{OK: true, Data: json.RawMessage(`{"name":"demo-worker-2","noop":true}`)},
+		})
+
+		if err := command.runNode([]string{test.verb, "demo", "demo-worker-2"}); err != nil {
+			t.Fatalf("node %s of an unchanged node failed: %v", test.verb, err)
+		}
+		got := command.out.(*bytes.Buffer).String()
+		if !strings.Contains(got, test.want) {
+			t.Fatalf("node %s stdout = %q, want %q", test.verb, got, test.want)
+		}
+	}
+}
+
+// An older daemon sends no marker, so the verb keeps its acting wording.
+func TestNodeRunStateWithoutANoOpMarkerConfirmsTheAction(t *testing.T) {
+	_, command := newDestroyTestCLI(t, []daemon.Response{
+		{OK: true, Data: json.RawMessage(`{"protocolVersion":8}`)},
+		{OK: true, Data: json.RawMessage(`{"name":"demo-worker-2","phase":"running"}`)},
+	})
+
+	if err := command.runNode([]string{"start", "demo", "demo-worker-2"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := command.out.(*bytes.Buffer).String(); !strings.Contains(got, "started node demo-worker-2 in cluster demo") {
+		t.Fatalf("stdout = %q, want the start confirmation", got)
+	}
+}
+
 func TestNodeRunStateRefusesOldDaemonProtocol(t *testing.T) {
 	for _, verb := range []string{"start", "stop"} {
 		_, command := newDestroyTestCLI(t, []daemon.Response{

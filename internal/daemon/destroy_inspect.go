@@ -12,6 +12,7 @@ import (
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/provision"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
 // DestroyInspection is the best-effort storage data-loss warning surfaced
@@ -57,13 +58,20 @@ func (s *Server) inspectDestroyCluster(item cluster.Cluster) DestroyInspection {
 	if s.destroyVolumeCount == nil {
 		return DestroyInspection{Warning: DestroyInspectionDataLossWarning(item.Name, item.CSI)}
 	}
-	ctx := s.lifecycleContext
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	// The inspection is what a destroy prints its confirmation from, so it is
+	// bounded by what an interactive verb can absorb rather than by the daemon
+	// lifetime: an unreachable control plane must fall back to the generic
+	// warning, not hold the operator at a silent socket (#356).
+	ctx, cancel := context.WithTimeout(s.lifecycle(), destroyInspectionTimeout)
+	defer cancel()
 	count, err := s.destroyVolumeCount(ctx, item)
 	if err != nil {
-		return DestroyInspection{Warning: DestroyInspectionDataLossWarning(item.Name, item.CSI)}
+		return DestroyInspection{Warning: destroyInspectionProbeFailureWarning(item.Name, item.CSI, err)}
+	}
+	// A cluster with no volumes has no data to lose, so a warning about zero
+	// of them is noise (#356).
+	if count == 0 {
+		return DestroyInspection{}
 	}
 	return DestroyInspection{Warning: destroyInspectionCountWarning(item.Name, item.CSI, count)}
 }
@@ -73,9 +81,71 @@ func countDestroyStorageVolumes(ctx context.Context, item cluster.Cluster) (int,
 	if err != nil {
 		return 0, fmt.Errorf("read kubeconfig for destroy inspection: %w", err)
 	}
-	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	return defaultDestroyCountSchedule.count(ctx, func(probeCtx context.Context) (int, error) {
+		return provision.CountProvisionedStorageVolumes(probeCtx, kubeconfig, item.CSI)
+	})
+}
+
+// destroyCountSchedule bounds the volume-count probe: every attempt gets its
+// own timeout, and attempts that can still heal are retried until the budget
+// runs out. Without the retry a cold-booted API server — which answers authz
+// errors for about a minute while RBAC settles — is indistinguishable from an
+// unreachable one, and the destroy warns about volumes it could have counted
+// (#356).
+//
+// The budget is what an operator waiting on `tbx cluster destroy` can absorb
+// before the silence is worse than the fallback warning, not how long RBAC may
+// take to settle: the destroy that follows does not need the count, and a
+// longer retry only delays the confirmation prompt.
+type destroyCountSchedule struct {
+	attempt  time.Duration
+	budget   time.Duration
+	interval time.Duration
+}
+
+var defaultDestroyCountSchedule = destroyCountSchedule{
+	attempt:  5 * time.Second,
+	budget:   10 * time.Second,
+	interval: 2 * time.Second,
+}
+
+// destroyInspectionTimeout is the whole inspection's bound, schedule included:
+// the retry budget is per-probe arithmetic, and only a deadline over the lot of
+// it keeps the verb's silence to something an operator recognises as a pause.
+const destroyInspectionTimeout = 15 * time.Second
+
+func (s destroyCountSchedule) count(ctx context.Context, probe func(context.Context) (int, error)) (int, error) {
+	deadline := time.Now().Add(s.budget)
+	for {
+		count, err := s.attemptCount(ctx, probe)
+		if err == nil || !destroyCountRetryable(err) || !time.Now().Before(deadline) {
+			return count, err
+		}
+		select {
+		case <-ctx.Done():
+			return 0, err
+		case <-time.After(s.interval):
+		}
+	}
+}
+
+func (s destroyCountSchedule) attemptCount(ctx context.Context, probe func(context.Context) (int, error)) (int, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, s.attempt)
 	defer cancel()
-	return provision.CountProvisionedStorageVolumes(probeCtx, kubeconfig, item.CSI)
+	return probe(probeCtx)
+}
+
+// destroyCountRetryable reports whether a failed count can still heal by
+// waiting. Authz and server-side refusals do while a freshly booted control
+// plane settles; an unreachable endpoint, a bad kubeconfig or a missing
+// resource never will, so those fall back immediately.
+func destroyCountRetryable(err error) bool {
+	return apierrors.IsUnauthorized(err) ||
+		apierrors.IsForbidden(err) ||
+		apierrors.IsServerTimeout(err) ||
+		apierrors.IsTooManyRequests(err) ||
+		apierrors.IsInternalError(err) ||
+		apierrors.IsServiceUnavailable(err)
 }
 
 func clusterKubeconfig(name string) ([]byte, error) {
@@ -110,12 +180,26 @@ func DestroyInspectionDataLossWarning(name string, engine cluster.CSI) string {
 	)
 }
 
+// destroyInspectionProbeFailureWarning keeps the reason the count is unknown
+// in the warning, so a degraded probe is diagnosable instead of silent (#356).
+func destroyInspectionProbeFailureWarning(name string, engine cluster.CSI, err error) string {
+	return fmt.Sprintf("%s (volume count unavailable: %v)", DestroyInspectionDataLossWarning(name, engine), err)
+}
+
 func destroyInspectionCountWarning(name string, engine cluster.CSI, count int) string {
 	return fmt.Sprintf(
-		"destroying cluster %s will permanently delete %d %s %s and their data",
+		"destroying cluster %s will permanently delete %d %s %s and %s data",
 		name,
 		count,
 		strings.TrimSpace(string(engine)),
 		volumeUnit(count),
+		volumePossessive(count),
 	)
+}
+
+func volumePossessive(count int) string {
+	if count == 1 {
+		return "its"
+	}
+	return "their"
 }

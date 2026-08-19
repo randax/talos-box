@@ -13,22 +13,22 @@ import (
 // A node started into a cluster with nothing else running gets the same
 // cluster-start side effects the whole-cluster path performs, so the registry
 // mirrors are bound before the first node needs them (#322).
-func (s *Server) startNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTask, error) {
+func (s *Server) startNodeLocked(raw json.RawMessage) (NodeRunState, []provisionTask, error) {
 	var args nodeArgs
 	if err := decodeArgs(raw, &args); err != nil {
-		return NodeStatus{}, nil, err
+		return NodeRunState{}, nil, err
 	}
 	item, err := cluster.Load(args.Cluster)
 	if err != nil {
-		return NodeStatus{}, nil, err
+		return NodeRunState{}, nil, err
 	}
 	node, err := clusterNode(item, args.Name)
 	if err != nil {
-		return NodeStatus{}, nil, err
+		return NodeRunState{}, nil, err
 	}
 	if s.nodeRunning(item.Name, node.Name) {
 		log.Printf("node.start %s/%s: already running", item.Name, node.Name)
-		return nodeStatus(node, item.SubnetIndex, true), nil, nil
+		return NodeRunState{NodeStatus: nodeStatus(node, item.SubnetIndex, true), NoOp: true}, nil, nil
 	}
 	firstNode := !s.clusterRunning(item.Name)
 	// Powering a node on commits the same host memory `cluster start` and
@@ -46,7 +46,7 @@ func (s *Server) startNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTa
 	}
 	overcommitWarning, err := s.checkOvercommit(addMiB, args.Force)
 	if err != nil {
-		return NodeStatus{}, nil, err
+		return NodeRunState{}, nil, err
 	}
 	var subnetWarning string
 	if firstNode {
@@ -54,16 +54,16 @@ func (s *Server) startNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTa
 		// it is only inspected for advisory routing findings (#271).
 		subnetWarning, err = cluster.AttachedSubnetWarning(item.SubnetIndex, s.hostSubnetSources())
 		if err != nil {
-			return NodeStatus{}, nil, err
+			return NodeRunState{}, nil, err
 		}
 	}
 	dir, err := cluster.Dir(item.Name)
 	if err != nil {
-		return NodeStatus{}, nil, err
+		return NodeRunState{}, nil, err
 	}
 	hostPressureWarnings, err := s.checkHostPressure(dir, args.Force)
 	if err != nil {
-		return NodeStatus{}, nil, err
+		return NodeRunState{}, nil, err
 	}
 	// The projected-start gate is charged the node's full memory whether or not
 	// the cluster is already partly running: this node is not resident yet, so
@@ -72,7 +72,7 @@ func (s *Server) startNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTa
 	// which only decides whether the gate applies at all (#334).
 	provisionStartWarnings, err := s.checkProvisionStart(dir, item.DefaultsFor(node.Role).MemoryMiB, args.Force)
 	if err != nil {
-		return NodeStatus{}, nil, err
+		return NodeRunState{}, nil, err
 	}
 	hostPressureWarnings = append(hostPressureWarnings, provisionStartWarnings...)
 	nodes := s.vms[item.Name]
@@ -83,13 +83,13 @@ func (s *Server) startNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTa
 	if existing := nodes[node.Name]; existing != nil {
 		// an inactive machine still holds its host resources until it is released
 		if err := existing.Close(); err != nil {
-			return NodeStatus{}, nil, fmt.Errorf("release inactive VM %s: %w", node.Name, err)
+			return NodeRunState{}, nil, fmt.Errorf("release inactive VM %s: %w", node.Name, err)
 		}
 		delete(nodes, node.Name)
 	}
 	machine, err := s.launchMachine(item, node, nil)
 	if err != nil {
-		return NodeStatus{}, nil, fmt.Errorf("create VM %s: %w", node.Name, err)
+		return NodeRunState{}, nil, fmt.Errorf("create VM %s: %w", node.Name, err)
 	}
 	nodes[node.Name] = machine
 	// node.start is a cold boot: suspended memory for this node is superseded
@@ -116,28 +116,28 @@ func (s *Server) startNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTa
 	// Bringing members back up is the very act the deferred-reconcile warning
 	// asks for, so node.start does not repeat it back at the operator.
 	tasks, _ := s.beginNodeMutationProvisionLocked(item)
-	return status, tasks, nil
+	return NodeRunState{NodeStatus: status}, tasks, nil
 }
 
 // stopNodeLocked powers one node's VM off, leaving it a cluster member with its
 // disk intact. Stopping the last running node leaves the cluster stopped, so it
 // performs the same teardown the whole-cluster stop does (#322).
-func (s *Server) stopNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTask, error) {
+func (s *Server) stopNodeLocked(raw json.RawMessage) (NodeRunState, []provisionTask, error) {
 	var args nodeArgs
 	if err := decodeArgs(raw, &args); err != nil {
-		return NodeStatus{}, nil, err
+		return NodeRunState{}, nil, err
 	}
 	item, err := cluster.Load(args.Cluster)
 	if err != nil {
-		return NodeStatus{}, nil, err
+		return NodeRunState{}, nil, err
 	}
 	node, err := clusterNode(item, args.Name)
 	if err != nil {
-		return NodeStatus{}, nil, err
+		return NodeRunState{}, nil, err
 	}
 	if !s.nodeRunning(item.Name, node.Name) {
 		log.Printf("node.stop %s/%s: already stopped", item.Name, node.Name)
-		return nodeStatus(node, item.SubnetIndex, false), nil, nil
+		return NodeRunState{NodeStatus: nodeStatus(node, item.SubnetIndex, false), NoOp: true}, nil, nil
 	}
 	quorumWarning := controlPlaneQuorumWarning(item, node, func(name string) bool {
 		return s.nodeRunning(item.Name, name)
@@ -145,7 +145,7 @@ func (s *Server) stopNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTas
 	log.Printf("node.stop %s/%s: begin", item.Name, node.Name)
 	if err := s.closeNodes(item.Name, s.vms[item.Name], []string{node.Name}); err != nil {
 		log.Printf("node.stop %s/%s: stop VM failed: %v", item.Name, node.Name, err)
-		return NodeStatus{}, nil, err
+		return NodeRunState{}, nil, err
 	}
 	// A recorded `live` phase short-circuits refreshStoragePhases, so leaving it
 	// standing would keep reporting storage live over a cluster that just lost a
@@ -163,7 +163,7 @@ func (s *Server) stopNodeLocked(raw json.RawMessage) (NodeStatus, []provisionTas
 	// No reconcile: stopping a node leaves the cluster short of a member the
 	// reconcile's own request still lists, so provisioning could never converge
 	// and would only burn the provision timeout before parking storage.
-	return status, nil, nil
+	return NodeRunState{NodeStatus: status}, nil, nil
 }
 
 // controlPlaneQuorumWarning is advisory only — `node stop` never blocks — but

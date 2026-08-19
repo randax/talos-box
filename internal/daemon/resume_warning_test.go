@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/hypervisor"
@@ -189,6 +190,78 @@ func TestPlatformErrorSummaryBoundsARunawayCause(t *testing.T) {
 	}
 	if !strings.HasSuffix(summary, "...") {
 		t.Fatalf("summary = %q, want an elision marker", summary)
+	}
+}
+
+// TestPlatformErrorSummaryBalancesTruncatedQuotes pins #361: the rune-count cut
+// is blind to the platform's own quoting, so a summary must never hand the
+// operator a dangling opening quote.
+func TestPlatformErrorSummaryBalancesTruncatedQuotes(t *testing.T) {
+	filler := strings.Repeat("x", maxPlatformErrorSummary)
+	tests := []struct {
+		name      string
+		cause     string
+		want      string   // exact summary, when short enough to spell out
+		wantParts []string // substrings a truncated summary must carry
+	}{
+		{
+			name:  "no truncation keeps the quotes untouched",
+			cause: `failed with “invalid save state” from the hypervisor`,
+			want:  `failed with “invalid save state” from the hypervisor`,
+		},
+		{
+			name:      "truncation inside a curly quote closes it",
+			cause:     `failed with “invalid ` + filler + `” trailing`,
+			wantParts: []string{`“invalid `, `...”`},
+		},
+		{
+			name:      "truncation inside a straight quote closes it",
+			cause:     `failed with "invalid ` + filler + `" trailing`,
+			wantParts: []string{`"invalid `, `..."`},
+		},
+		{
+			name:      "truncation after balanced quotes adds nothing",
+			cause:     `failed with “invalid save state” ` + filler,
+			wantParts: []string{`“invalid save state”`, `x...`},
+		},
+		{
+			name:      "truncation landing on the opening quote drops it",
+			cause:     strings.Repeat("y", maxPlatformErrorSummary-1) + ` “invalid save state” tail`,
+			wantParts: []string{"y..."},
+		},
+		{
+			name:      "multibyte runes near the boundary stay intact",
+			cause:     strings.Repeat("é", maxPlatformErrorSummary-3) + `“så” ` + filler,
+			wantParts: []string{"é", `“så...”`},
+		},
+		{
+			name:      "multibyte quote closed just inside the boundary",
+			cause:     strings.Repeat("é", maxPlatformErrorSummary-4) + `“så” ` + filler,
+			wantParts: []string{"é", `“så”...`},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			summary := platformErrorSummary(errors.New(test.cause))
+			if test.want != "" && summary != test.want {
+				t.Fatalf("summary = %q, want %q", summary, test.want)
+			}
+			for _, want := range test.wantParts {
+				if !strings.Contains(summary, want) {
+					t.Fatalf("summary = %q, want substring %q", summary, want)
+				}
+			}
+			if !utf8.ValidString(summary) {
+				t.Fatalf("summary = %q, want valid UTF-8", summary)
+			}
+			if got := strings.Count(summary, "“") - strings.Count(summary, "”"); got != 0 {
+				t.Fatalf("summary = %q, leaves %d curly quotes open", summary, got)
+			}
+			if got := strings.Count(summary, `"`); got%2 != 0 {
+				t.Fatalf("summary = %q, leaves a straight quote open", summary)
+			}
+		})
 	}
 }
 

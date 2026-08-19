@@ -44,7 +44,7 @@ Steps:
 1. `tbx bgp enable qa-fla` — expect refusal.
 2. `tbx cluster create qa-bad --cni flannel --bgp` — expect refusal before mutation.
 
-Expected observations: both rejections name the actual constraint (bgp requires `cni: cilium` and `lb`); no `qa-bad` exists after; `qa-fla` unaffected.
+Expected observations: both rejections name the actual constraint — the shipped message is `bgp requires cni: cilium` and deliberately does not also name `lb`; no `qa-bad` exists after; `qa-fla` unaffected.
 
 Pass criteria: both refused with specific errors; nothing created or changed.
 

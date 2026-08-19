@@ -167,6 +167,7 @@ type manifestRefreshKey struct{}
 type manifestValidationReferenceKey struct{}
 type stagedManifestKey struct{}
 type warmBlobKey struct{}
+type filePinKey struct{}
 
 func withManifestRefresh(ctx context.Context) context.Context {
 	return context.WithValue(ctx, manifestRefreshKey{}, true)
@@ -186,6 +187,20 @@ func manifestValidationReference(ctx context.Context, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// withFilePin marks a request whose validation digest comes from a warm list
+// file, so a mismatch names the file as the thing to edit rather than the
+// request (child manifests are pinned by their parent index, not by a file).
+func withFilePin(ctx context.Context) context.Context {
+	return context.WithValue(ctx, filePinKey{}, true)
+}
+
+func pinSource(ctx context.Context) string {
+	if pinned, _ := ctx.Value(filePinKey{}).(bool); pinned {
+		return "file"
+	}
+	return "request"
 }
 
 type stagedManifest struct {
@@ -237,7 +252,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.offlineEnabled() {
-		http.Error(w, "mirror offline: content not cached", http.StatusServiceUnavailable)
+		http.Error(w, offlineNotCachedMessage, http.StatusServiceUnavailable)
 		return
 	}
 	if s.validateUpstream != nil {
@@ -258,7 +273,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.offlineEnabled() {
-		http.Error(w, "mirror offline: content not cached", http.StatusServiceUnavailable)
+		http.Error(w, offlineNotCachedMessage, http.StatusServiceUnavailable)
 		return
 	}
 
@@ -293,8 +308,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		case isManifest:
-			data, metadata, err := validateManifest(resp, manifestValidationReference(r.Context(), manifestReference(r.URL.Path)))
+			pathReference := manifestReference(r.URL.Path)
+			data, metadata, err := validateManifest(resp, manifestValidationReference(r.Context(), pathReference), pathReference)
 			if err != nil {
+				var mismatch *pinnedDigestMismatchError
+				if errors.As(err, &mismatch) {
+					// the upstream answered correctly; it is the caller's pin
+					// that is stale, so this is a client-side conflict (#365)
+					http.Error(w, mismatch.message(s.imageReference(r.URL.Path), pinSource(r.Context())), http.StatusConflict)
+					return
+				}
 				http.Error(w, fmt.Sprintf("upstream manifest: %v", err), http.StatusBadGateway)
 				return
 			}
@@ -322,7 +345,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
+// serveCacheIfAvailable replays cached content, stamping an unserved offline
+// request with the reason it will 503 with. Every offline miss ends in a 503 —
+// here, or in the Manager's cache-only probe — so stamping on the way out
+// covers both without either writer knowing about the other (#363).
 func (s *Server) serveCacheIfAvailable(w http.ResponseWriter, r *http.Request, digest string, isManifest bool) (bool, *cacheReplayError) {
+	served, err := s.replayCache(w, r, digest, isManifest)
+	if !served && err == nil && s.offlineEnabled() {
+		setReasonHeaders(w, reasonOfflineNotCached, offlineNotCachedMessage)
+	}
+	return served, err
+}
+
+func (s *Server) replayCache(w http.ResponseWriter, r *http.Request, digest string, isManifest bool) (bool, *cacheReplayError) {
 	if digest != "" && s.serveCachedBlob(w, r, digest) {
 		return true, nil
 	}
@@ -621,7 +656,14 @@ var manifestMediaTypes = map[string]struct{}{
 // indexes are well under 1 MiB, so 10 MiB leaves generous headroom.
 const maxManifestBytes = 10 << 20
 
-func validateManifest(resp *http.Response, requestedReference string) ([]byte, manifestMetadata, error) {
+// validateManifest checks an upstream manifest response against
+// requestedReference — the digest or tag the bytes must answer to, which for a
+// warm is the pin its parent index or warm list carries rather than the
+// reference in the path. pathReference is the reference the request itself
+// asked for, and it is what separates the two mismatch stories: a tag request
+// validated against a pin can have a stale pin, while a digest-addressed
+// request can only be looking at corruption, tampering, or a rewriting proxy.
+func validateManifest(resp *http.Response, requestedReference, pathReference string) ([]byte, manifestMetadata, error) {
 	manifestURL := responseURL(resp, "upstream URL")
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxManifestBytes+1))
 	if err != nil {
@@ -657,6 +699,13 @@ func validateManifest(resp *http.Response, requestedReference string) ([]byte, m
 	if isDigestReference(requestedReference) {
 		canonicalDigest, err := verifySupportedDigest(data, requestedReference)
 		if err != nil {
+			// Only a request that did *not* name a digest can have a stale
+			// pin. When the caller asked for sha256:A and got bytes hashing to
+			// B, there is no pin to update — the content is wrong — so that
+			// stays an upstream-integrity failure (#367).
+			if served := digestOfAs(requestedReference, data); served != "" && !isDigestReference(pathReference) {
+				return nil, manifestMetadata{}, &pinnedDigestMismatchError{pinned: requestedReference, served: served}
+			}
 			return nil, manifestMetadata{}, fmt.Errorf("manifest response from %s does not match requested digest %s: %w", manifestURL, requestedReference, err)
 		}
 		if persistedDigest != "" && persistedDigest != canonicalDigest {
@@ -717,9 +766,10 @@ func (s *Server) serveCachedDigestManifest(w http.ResponseWriter, r *http.Reques
 	data, path, err := s.cachedManifest(r.URL.Path)
 	if err != nil {
 		if s.offlineEnabled() && errors.Is(err, errCachedManifestDigestMismatch) {
+			setReasonHeaders(w, reasonOfflineCacheCorrupted, offlineCacheCorruptedMessage)
 			return false, &cacheReplayError{
 				status: http.StatusServiceUnavailable,
-				err:    fmt.Errorf("mirror offline: cached digest corrupted"),
+				err:    errors.New(offlineCacheCorruptedMessage),
 			}
 		}
 		return false, nil
@@ -727,9 +777,10 @@ func (s *Server) serveCachedDigestManifest(w http.ResponseWriter, r *http.Reques
 	canonical, err := verifySupportedDigest(data, requestedDigest)
 	if err != nil {
 		if s.offlineEnabled() {
+			setReasonHeaders(w, reasonOfflineCacheCorrupted, offlineCacheCorruptedMessage)
 			return false, &cacheReplayError{
 				status: http.StatusServiceUnavailable,
-				err:    fmt.Errorf("mirror offline: cached digest corrupted"),
+				err:    errors.New(offlineCacheCorruptedMessage),
 			}
 		}
 		return false, nil
@@ -1072,6 +1123,70 @@ func decodeJSON(r io.Reader, destination any) error {
 	return json.Unmarshal(data, destination)
 }
 
+// Reason headers ride along with the error surfaces a client may never see a
+// body for: containerd probes with HEAD first, and a HEAD response carries no
+// body, so a bare 503 reads as a broken mirror. Headers survive HEAD, so the
+// honest reason travels there — X-Talosbox-Reason for machines, Warning for
+// the surfaces (containerd, kubectl) that already render it (#363).
+const reasonHeader = "X-Talosbox-Reason"
+
+const (
+	reasonOfflineNotCached      = "offline-not-cached"
+	reasonOfflineCacheCorrupted = "offline-cache-corrupted"
+)
+
+const (
+	offlineNotCachedMessage      = "mirror offline: content not cached"
+	offlineCacheCorruptedMessage = "mirror offline: cached digest corrupted"
+)
+
+// setReasonHeaders stamps the reason on a response whose body may be dropped.
+// The Warning value follows RFC 7234's "199 <agent> <quoted-text>" shape.
+func setReasonHeaders(w http.ResponseWriter, reason, text string) {
+	w.Header().Set(reasonHeader, reason)
+	w.Header().Set("Warning", fmt.Sprintf("199 talos-box %q", text))
+}
+
+// pinnedDigestMismatchError reports a manifest the upstream served correctly
+// but whose bytes the caller's pinned digest no longer names. The pin is what
+// is stale, so callers surface this as a client-side conflict rather than an
+// upstream failure (#365).
+type pinnedDigestMismatchError struct {
+	pinned string
+	served string
+}
+
+func (e *pinnedDigestMismatchError) Error() string {
+	return fmt.Sprintf("pinned digest mismatch: pinned %s, upstream serves %s", e.pinned, e.served)
+}
+
+// message names the image and where the stale pin lives, so the reader knows
+// what to edit.
+func (e *pinnedDigestMismatchError) message(image, source string) string {
+	return fmt.Sprintf("pinned digest mismatch for %s: %s pins %s, upstream serves %s", image, source, e.pinned, e.served)
+}
+
+// imageReference renders a request path the way an operator writes it — the
+// form a warm list would carry — so the pin is easy to find and fix.
+func (s *Server) imageReference(requestPath string) string {
+	match := manifestPathRe.FindStringSubmatch(requestPath)
+	if match == nil {
+		return upstreamHost(s.base) + requestPath
+	}
+	separator := ":"
+	if isDigestReference(match[2]) {
+		separator = "@"
+	}
+	return upstreamHost(s.base) + "/" + match[1] + separator + match[2]
+}
+
+func upstreamHost(base string) string {
+	if parsed, err := url.Parse(base); err == nil && parsed.Host != "" {
+		return parsed.Host
+	}
+	return base
+}
+
 type upstreamValidationError struct {
 	status int
 	err    error
@@ -1114,6 +1229,22 @@ func canonicalSupportedDigest(reference string) (string, bool) {
 		return "", false
 	}
 	return algorithm + ":" + encoded, true
+}
+
+// digestOfAs returns data's digest under reference's algorithm, or "" when
+// that algorithm is not one the mirror verifies.
+func digestOfAs(reference string, data []byte) string {
+	algorithm, _, ok := splitDigestReference(reference)
+	if !ok {
+		return ""
+	}
+	switch algorithm {
+	case "sha256":
+		return "sha256:" + manifestSHA256(data)
+	case "sha512":
+		return "sha512:" + manifestSHA512(data)
+	}
+	return ""
 }
 
 func verifySupportedDigest(data []byte, reference string) (string, error) {

@@ -186,7 +186,14 @@ func (s *Server) setBGP(raw json.RawMessage, enable bool) (ClusterSummary, error
 	if err := cluster.Save(item); err != nil {
 		return ClusterSummary{}, err
 	}
-	return summary(item, s.clusterRunning(item.Name)), nil
+	result := summary(item, s.clusterRunning(item.Name))
+	if enable {
+		// The speaker is up; a foreign listener already holding the port is
+		// something the operator has to know about, not a reason to fail the
+		// verb that just took effect (#359).
+		result.addWarnings(bgpPortSquatterWarning(item))
+	}
+	return result, nil
 }
 
 func enableHostBGP(item cluster.Cluster) error {

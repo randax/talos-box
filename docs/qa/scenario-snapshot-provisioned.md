@@ -36,7 +36,7 @@ Pass criteria: end state reached; epoch-one data committed.
 
 Steps:
 1. `tbx snapshot create qa-snap epoch1 --yes` — cluster stops, snapshots, restarts.
-2. After restart: cluster reconverges to the full end state (VIP live, Longhorn healthy) without intervention; `epoch-one` data intact. Record reconvergence time.
+2. After restart: cluster reconverges to the full end state (VIP live, Longhorn healthy) without intervention; `epoch-one` data intact. Record reconvergence time. Longhorn needs a settle window: the volume comes back `degraded` and rebuilds to `healthy` within ~10 s, so poll `kubectl -n longhorn-system get volumes.longhorn.io` for up to 60 s before scoring it — a single early sample recording `degraded` is a false FAIL.
 
 Expected observations: a provisioned cluster survives its own snapshot cycle: etcd quorum returns, CNI and storage come back on their own.
 
@@ -51,7 +51,7 @@ On failure: capture status timeline, pod states, Longhorn volume health.
 Steps:
 1. Create namespace `epoch-two`; append `epoch-two` to the volume; delete namespace `epoch-one`'s workload (leave visible divergence at both the k8s and data layers).
 2. `tbx snapshot restore qa-snap epoch1 --yes`; wait through the cold boot for full reconvergence.
-3. Verify: namespace `epoch-two` does NOT exist; `epoch-one` workload is back; the volume reads exactly `epoch-one` (no `epoch-two` line); VIP live; Longhorn healthy; node IPs unchanged.
+3. Verify: namespace `epoch-two` does NOT exist; `epoch-one` workload is back; the volume reads exactly `epoch-one` (no `epoch-two` line); VIP live; Longhorn healthy — poll for up to 60 s, since the restored volume is transiently `degraded` and rebuilds to `healthy` within ~10 s; node IPs unchanged.
 
 Expected observations: one crash-consistent set: etcd state and Longhorn disks agree with each other at the snapshot point — no "namespace exists but volume is newer" splits.
 

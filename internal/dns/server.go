@@ -92,16 +92,31 @@ func (s *Server) response(query []byte) ([]byte, error) {
 		return nil, err
 	}
 	if s.authoritative(q.name) {
-		return answer(query, s.lookup)
+		return answer(query, s.lookup, s.zone(q.name))
 	}
 	if s.forward == nil {
-		return answer(query, s.lookup)
+		return answer(query, s.lookup, "")
 	}
 	response, err := s.forward(query)
 	if err != nil {
 		return errorAnswer(query, 2)
 	}
 	return response, nil
+}
+
+// zone names the apex whose SOA accompanies a miss on name: the shortest
+// suffix we still answer for. A bare TLD is never claimed, so the "*" sentinel
+// — which makes every name ours while cluster state is unreadable — bottoms
+// out at the registrable name rather than at "test" or "com".
+func (s *Server) zone(name string) string {
+	name = strings.ToLower(strings.TrimSuffix(name, "."))
+	labels := strings.Split(name, ".")
+	for i := len(labels) - 2; i > 0; i-- {
+		if candidate := strings.Join(labels[i:], "."); s.authoritative(candidate) {
+			return candidate
+		}
+	}
+	return name
 }
 
 func (s *Server) Close() error {

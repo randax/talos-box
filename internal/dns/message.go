@@ -11,7 +11,14 @@ import (
 
 const (
 	typeA   = 1
+	typeSOA = 6
 	classIN = 1
+
+	// negativeTTL bounds how long a client may cache a miss in a zone we own.
+	// macOS derives its negative-cache lifetime from the SOA minimum and falls
+	// back to ~30s when the authority section is empty, which strands a node
+	// queried just before its DHCP lease lands.
+	negativeTTL = 5
 )
 
 type question struct {
@@ -21,19 +28,29 @@ type question struct {
 	end        int
 }
 
+func encodeName(name string) ([]byte, error) {
+	encoded := make([]byte, 0, len(name)+2)
+	for _, label := range strings.Split(strings.TrimSuffix(name, "."), ".") {
+		if len(label) == 0 || len(label) > 63 {
+			return nil, fmt.Errorf("invalid DNS label %q", label)
+		}
+		encoded = append(encoded, byte(len(label)))
+		encoded = append(encoded, label...)
+	}
+	return append(encoded, 0), nil
+}
+
 func encodeQuery(name string, id uint16) ([]byte, error) {
 	message := make([]byte, 12)
 	binary.BigEndian.PutUint16(message, id)
 	binary.BigEndian.PutUint16(message[2:], 0x0100)
 	binary.BigEndian.PutUint16(message[4:], 1)
-	for _, label := range strings.Split(strings.TrimSuffix(name, "."), ".") {
-		if len(label) == 0 || len(label) > 63 {
-			return nil, fmt.Errorf("invalid DNS label %q", label)
-		}
-		message = append(message, byte(len(label)))
-		message = append(message, label...)
+	encoded, err := encodeName(name)
+	if err != nil {
+		return nil, err
 	}
-	message = append(message, 0, 0, typeA, 0, classIN)
+	message = append(message, encoded...)
+	message = append(message, 0, typeA, 0, classIN)
 	return message, nil
 }
 
@@ -69,16 +86,57 @@ func parseQuestion(message []byte) (question, error) {
 	}, nil
 }
 
-func answer(query []byte, lookup func(string) net.IP) ([]byte, error) {
+// authoritySOA renders the AUTHORITY-section SOA published with a miss in one
+// of our zones. Only the minimum field matters to clients — it caps negative
+// caching — so the remaining timers are fixed, deterministic placeholders. The
+// zone is unencodable only if it came from a name we could not have parsed, in
+// which case the caller simply omits the authority section.
+func authoritySOA(zone string) []byte {
+	owner, err := encodeName(zone)
+	if err != nil {
+		return nil
+	}
+	mailbox, err := encodeName("hostmaster." + zone)
+	if err != nil {
+		return nil
+	}
+	rdata := append(append([]byte(nil), owner...), mailbox...)
+	rdata = binary.BigEndian.AppendUint32(rdata, 1)     // serial
+	rdata = binary.BigEndian.AppendUint32(rdata, 3600)  // refresh
+	rdata = binary.BigEndian.AppendUint32(rdata, 600)   // retry
+	rdata = binary.BigEndian.AppendUint32(rdata, 86400) // expire
+	rdata = binary.BigEndian.AppendUint32(rdata, negativeTTL)
+
+	record := append([]byte(nil), owner...)
+	record = binary.BigEndian.AppendUint16(record, typeSOA)
+	record = binary.BigEndian.AppendUint16(record, classIN)
+	record = binary.BigEndian.AppendUint32(record, negativeTTL)
+	record = binary.BigEndian.AppendUint16(record, uint16(len(rdata)))
+	return append(record, rdata...)
+}
+
+// answer resolves a query locally. A non-empty zone names the apex we own,
+// whose SOA is attached to a miss so clients bound their negative caching. A
+// miss is either NXDOMAIN (the name is unknown) or NODATA (the name exists but
+// not with the queried type/class); both carry the SOA, only the first sets
+// rcode 3.
+func answer(query []byte, lookup func(string) net.IP, zone string) ([]byte, error) {
 	q, err := parseQuestion(query)
 	if err != nil {
 		return nil, err
 	}
 	ip := lookup(q.name).To4()
 	matched := q.recordType == typeA && q.class == classIN && ip != nil
+	// RFC 2308 separates the two misses, and with an SOA attached the
+	// difference is no longer cosmetic: NXDOMAIN denies the whole name, so an
+	// AAAA lookup for a live node would plant a cacheable denial that makes its
+	// A record unresolvable for the negative-TTL window. A name we do hold an
+	// address for answers NODATA — rcode 0, no answers, same SOA — and rcode 3
+	// is reserved for names we know nothing about.
+	nameExists := ip != nil
 	response := append([]byte(nil), query[:q.end]...)
 	flags := uint16(0x8400) | binary.BigEndian.Uint16(query[2:])&0x0100
-	if !matched {
+	if !matched && !nameExists {
 		flags |= 3
 	}
 	binary.BigEndian.PutUint16(response[2:], flags)
@@ -87,7 +145,15 @@ func answer(query []byte, lookup func(string) net.IP) ([]byte, error) {
 	binary.BigEndian.PutUint16(response[8:], 0)
 	binary.BigEndian.PutUint16(response[10:], 0)
 	if !matched {
-		return response, nil
+		if zone == "" {
+			return response, nil
+		}
+		soa := authoritySOA(zone)
+		if soa == nil {
+			return response, nil
+		}
+		binary.BigEndian.PutUint16(response[8:], 1)
+		return append(response, soa...), nil
 	}
 	binary.BigEndian.PutUint16(response[6:], 1)
 	response = append(response,

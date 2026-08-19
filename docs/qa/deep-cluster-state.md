@@ -46,11 +46,11 @@ On failure: capture snapshot list/status before-after, durations, free-disk befo
 Steps:
 1. `tbx node add qa-sta --role worker` — a new `qa-sta-worker-<i>` appears, reaches `maintenance`; existing node IPs unchanged.
 2. `tbx node remove qa-sta qa-sta-worker-<i>` — it disappears from status; the others untouched.
-3. Spec-drift probe: `tbx node start qa-sta qa-sta-worker-1` and `tbx node stop ...` — SPEC §9 lists these verbs; the CLI is expected to reject them (unimplemented). Record the exact behavior as evidence for the spec-drift item in deep-host-integration.
+3. Per-node lifecycle: `tbx node stop qa-sta qa-sta-worker-1` then `tbx node start qa-sta qa-sta-worker-1` — both verbs are implemented and expected to succeed. After `node stop` the node shows `stopped` in `tbx status qa-sta` (the rest of the cluster untouched); after `node start` it comes back and rejoins.
 
-Expected observations: add/remove clean and narrated; deterministic MACs keep DHCP/DNS stable for survivors; node start/stop behavior recorded verbatim (this charter does not fail on the drift itself — it feeds the drift charter).
+Expected observations: add/remove clean and narrated; deterministic MACs keep DHCP/DNS stable for survivors; `node stop` leaves the node in `stopped` and `node start` returns it to a running state, both narrated.
 
-Pass criteria: add/remove correct with stable survivor identity.
+Pass criteria: add/remove correct with stable survivor identity; `node stop`/`node start` both succeed and the status state follows.
 
 On failure: capture status before/after each verb.
 
@@ -76,7 +76,7 @@ On failure: capture suspend/resume output and console evidence.
 **Goal**: the documented degradation is a warned cold boot, never an error-out.
 
 Steps:
-1. **[macOS]** Suspend `qa-sta`, then restart the daemon (`tbx system` provides no restart verb — kill the user-agent tbxd process or `launchctl kickstart -k` the tbxd agent; record the exact method). `tbx cluster resume qa-sta` — expect a warning and a graceful cold boot, not an error.
+1. **[macOS]** Suspend `qa-sta`, then restart the daemon with `tbx system restart` (implemented end to end; it refuses while clusters are running and names `--force`, so use `tbx system restart --force` here and record which path you took). `tbx cluster resume qa-sta` — expect a warning and a graceful cold boot, not an error.
 2. **[Linux]** Suspend survives a daemon restart by design; restore after restarting the user service (`systemctl --user restart tbxd` or equivalent) — expect memory-preserving success when QEMU identity is unchanged. (Degradation on QEMU-identity mismatch is acknowledged as untestable in place — mark that sub-case SKIPPED with reason.)
 
 Expected observations: exactly the documented boundary behavior; the warning names why memory could not be preserved (macOS).

@@ -130,7 +130,9 @@ func (c cli) runCluster(args []string) error {
 		return c.createCluster(args[1:])
 	case "start":
 		return c.startCluster(args[1:])
-	case "stop", "suspend", "resume":
+	case "resume":
+		return c.resumeCluster(args[1:])
+	case "stop", "suspend":
 		if len(args) != 2 {
 			return fmt.Errorf("usage: tbx cluster %s <name>", args[0])
 		}
@@ -169,6 +171,35 @@ func (c cli) runCluster(args []string) error {
 	default:
 		return unknownVerbError("cluster", args[0])
 	}
+}
+
+// resumeCluster restores a suspended cluster. It parses flags rather than
+// counting arguments because a resume re-admits the cluster's whole memory
+// footprint at once — the same concurrent-bringup risk create and start are
+// gated on — so it accepts the same --force override they document (#368).
+func (c cli) resumeCluster(args []string) error {
+	flags := flag.NewFlagSet("cluster resume", flag.ContinueOnError)
+	flags.SetOutput(c.err)
+	force := flags.Bool("force", false, "proceed despite an overcommit or host-pressure warning")
+	positionals, err := parseInterspersed(flags, args)
+	if err != nil {
+		return err
+	}
+	if len(positionals) != 1 {
+		return errors.New("usage: tbx cluster resume <name> [--force]")
+	}
+	request := struct {
+		Name  string `json:"name"`
+		Force bool   `json:"force"`
+	}{Name: positionals[0], Force: *force}
+	var result daemon.ClusterSummary
+	if err := c.call("cluster.resume", request, &result); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(c.out, "%s cluster %s\n", pastTense("resume"), result.Name); err != nil {
+		return err
+	}
+	return printWarnings(c.err, result.Warnings, result.Warning)
 }
 
 func parseClusterStartArgs(args []string, output io.Writer) (string, bool, error) {
@@ -257,8 +288,9 @@ func (c cli) startCluster(args []string) error {
 	var result daemon.ClusterSummary
 	// A start reconciles the cluster's declared CNI/CSI on the same blocking
 	// call as create, so the stated bound must be the one the daemon budgets
-	// this request at (#307).
-	signal := liveness{verb: "starting " + name, deadline: storedProvisionDeadline(name), quiet: quiet}
+	// this request at (#307) — including the boot and Kubernetes-readiness
+	// waits a start now runs ahead of its reconcile (#364).
+	signal := liveness{verb: "starting " + name, deadline: storedProvisionDeadline(name) + nodeBootDeadline + kubernetesReadyDeadline, quiet: quiet}
 	if err := c.callWithLiveness(signal, "cluster.start", request, &result); err != nil {
 		return err
 	}
@@ -558,12 +590,20 @@ func (c cli) runNodeRunState(verb string, args []string) error {
 		return err
 	}
 	request := map[string]any{"cluster": positionals[0], "name": positionals[1], "force": force}
-	var result daemon.NodeStatus
+	var result daemon.NodeRunState
 	if err := c.call("node."+verb, request, &result); err != nil {
 		return err
 	}
+	// The daemon reports whether it actually acted, so a node that was already
+	// in the requested state is narrated as the no-op it was rather than as a
+	// power cycle that never happened (#362). It stays a success either way.
 	past := map[string]string{"start": "started", "stop": "stopped"}[verb]
-	if _, err := fmt.Fprintf(c.out, "%s node %s in cluster %s\n", past, positionals[1], positionals[0]); err != nil {
+	line := fmt.Sprintf("%s node %s in cluster %s\n", past, positionals[1], positionals[0])
+	if result.NoOp {
+		state := map[string]string{"start": "running", "stop": "stopped"}[verb]
+		line = fmt.Sprintf("node %s in cluster %s is already %s\n", positionals[1], positionals[0], state)
+	}
+	if _, err := fmt.Fprint(c.out, line); err != nil {
 		return err
 	}
 	return printWarnings(c.err, result.Warnings, result.Warning)

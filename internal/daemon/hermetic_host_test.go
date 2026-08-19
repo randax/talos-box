@@ -16,5 +16,10 @@ func TestMain(m *testing.M) {
 	measureHostFreeMiB = plentifulHostMemory
 	measureHostTotalMiB = plentifulHostMemory
 	measureHostPressure = noHostPressure
+	// The BGP port inventory shells out to the host's netstat, whose listeners
+	// are the runner's business and not any test's: an unrelated process on
+	// port 179 must not add an advisory to a `bgp enable` a test is asserting
+	// on. Tests about the inventory stub it themselves.
+	bgpPortListeners = nil
 	os.Exit(m.Run())
 }

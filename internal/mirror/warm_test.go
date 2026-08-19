@@ -1413,6 +1413,20 @@ func TestWarmPinnedTagMismatchPreservesPreviouslyCachedTag(t *testing.T) {
 	if summary.Failed != 1 {
 		t.Fatalf("mismatch rerun summary = %+v", summary)
 	}
+	// The upstream answered correctly; the list file's pin is stale, so the
+	// reason has to lead with the pin instead of reading as a 502 (#365).
+	reason := summary.Results[0].Error
+	newDigest := "sha256:" + sha256Hex([]byte(newManifest))
+	for _, want := range []string{"pinned digest mismatch", "file pins " + oldDigest, "upstream serves " + newDigest} {
+		if !strings.Contains(reason, want) {
+			t.Fatalf("mismatch reason = %q, want it to carry %q", reason, want)
+		}
+	}
+	for _, unwanted := range []string{"502", "upstream manifest", "returned"} {
+		if strings.Contains(reason, unwanted) {
+			t.Fatalf("mismatch reason = %q, should not read as an upstream failure (%q)", reason, unwanted)
+		}
+	}
 
 	upstream.Close()
 	manager.offline.Store(true)

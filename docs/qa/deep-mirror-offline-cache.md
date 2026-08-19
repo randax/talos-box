@@ -36,6 +36,8 @@ Pass criteria: all accept/reject behaviors as documented.
 
 On failure: capture full command output per case.
 
+**Open QA task**: re-run C1 for `docker.io` on a host with working Docker Hub anonymous access. On the 2026-08-17 run, Hub anonymous auth was broken host-wide, so the `docker.io/library/alpine:3.20` leg could not validate the [#242](https://github.com/randax/talos-box/issues/242) anonymous-auth fix either way — neither confirmed nor refuted. Before running, sanity-check Hub anonymous auth outside tbx (a plain anonymous token fetch + manifest HEAD); if that fails, record the leg as BLOCKED on the host rather than FAIL, and leave this task open.
+
 ### C2 — Gateway-only binds and port layout (depends on a running cluster)
 
 **Goal**: mirror ports live on cluster gateways only, added/removed with cluster lifecycle.

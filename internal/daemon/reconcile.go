@@ -1,6 +1,10 @@
 package daemon
 
-import "github.com/randax/talos-box/internal/config"
+import (
+	"strings"
+
+	"github.com/randax/talos-box/internal/config"
+)
 
 // ClusterState is what reconciliation knows about one existing cluster.
 type ClusterState struct {
@@ -15,9 +19,13 @@ type ActionKind string
 const (
 	ActionCreate ActionKind = "create"
 	ActionStart  ActionKind = "start"
-	// ActionReconcile marks a running provisioned cluster whose Talos/Kubernetes
-	// end state is still incomplete. It is intentionally distinct from a VM
-	// no-op so the CLI never calls a half-provisioned cluster "up to date".
+	// ActionReconcile marks a running provisioned cluster whose provisioning
+	// pass ran in full — a node still in maintenance, a drifted machine config,
+	// an etcd that had never been bootstrapped, a chart the cluster did not yet
+	// have. It is intentionally distinct from a VM no-op so the CLI never calls
+	// a half-provisioned cluster "up to date"; ActionNone is reserved for the
+	// pass's fast no-op path, which fires only once every desired outcome is
+	// observed healthy (#358).
 	ActionReconcile ActionKind = "reconcile"
 	ActionStop      ActionKind = "stop"
 	ActionNone      ActionKind = "none"
@@ -34,6 +42,20 @@ type Action struct {
 	// can render them one per line. Warning stays populated for old clients.
 	Warnings  []string `json:"warnings,omitempty"`
 	Narration []string `json:"narration,omitempty"`
+}
+
+// addWarnings records findings the pass only learned after the action was
+// decided — the out-of-lock boot wait — behind the ones already there, and
+// keeps the legacy joined string in step for an old CLI.
+func (a *Action) addWarnings(warnings ...string) {
+	existing := a.Warnings
+	if len(existing) == 0 && a.Warning != "" {
+		// An action that carries only the legacy joined string keeps it: this
+		// must add findings, never drop one.
+		existing = []string{a.Warning}
+	}
+	a.Warnings = warningList(append(append([]string{}, existing...), warnings...)...)
+	a.Warning = strings.Join(a.Warnings, "; ")
 }
 
 // PlanUp decides, per desired cluster: create it, start it, or leave it.

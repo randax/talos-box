@@ -340,8 +340,15 @@ func (s *Server) observeUpMaintenance(raw json.RawMessage) (map[string]maintenan
 	return observations, nil
 }
 
-func actionAfterProvision(action ActionKind, narration []string) ActionKind {
-	if action == ActionNone && len(narration) > 0 {
+// actionAfterProvision promotes a planned no-op to a reconcile whenever the
+// provisioning pass ran in full. The pass itself is the only witness of that:
+// its fast no-op path fires exactly when every desired outcome is already
+// observed healthy, and a full pass applies machine configs, bootstraps etcd
+// and re-applies the charts — work `tbx up` must not report as "up to date"
+// (#358). Narration cannot stand in for it: a first etcd bootstrap and a
+// first-time MetalLB install narrate the same lines a converged rerun does.
+func actionAfterProvision(action ActionKind, fullPass bool) ActionKind {
+	if action == ActionNone && fullPass {
 		return ActionReconcile
 	}
 	return action
