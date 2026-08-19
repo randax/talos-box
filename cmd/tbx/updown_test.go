@@ -410,3 +410,22 @@ func TestCreateProvisionDeadlineIncludesTheNodeBootWait(t *testing.T) {
 		t.Fatalf("createProvisionDeadline(true) = %v, want %v", got, want)
 	}
 }
+
+// An up handles the file's clusters one after another — each boot wait,
+// readiness wait and provisioning pass runs before the next cluster's — so the
+// stated deadline is the sum of every cluster's share, each widened only by
+// its own storage engine.
+func TestUpProvisionDeadlineSumsEveryCluster(t *testing.T) {
+	cfg := config.Config{Clusters: []config.ClusterSpec{
+		{Name: "plain", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel}},
+		{Name: "stored", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, CSI: cluster.CSILonghorn}},
+	}}
+	want := startedProvisionDeadline(false) + startedProvisionDeadline(true)
+	if got := upProvisionDeadline(cfg); got != want {
+		t.Fatalf("upProvisionDeadline = %s, want %s (one plain + one storage share)", got, want)
+	}
+	// A file with no clusters still needs a bound for the heartbeat to state.
+	if got := upProvisionDeadline(config.Config{}); got != startedProvisionDeadline(false) {
+		t.Fatalf("upProvisionDeadline(empty) = %s, want the single plain budget", got)
+	}
+}

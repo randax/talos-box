@@ -166,6 +166,26 @@ func startedProvisionDeadline(storage bool) time.Duration {
 	return createProvisionDeadline(storage) + kubernetesReadyDeadline
 }
 
+// upProvisionDeadline is the request-wide bound for an up: the daemon walks
+// the file's clusters one at a time — each boot wait, readiness wait and
+// provisioning pass runs before the next cluster's begins — so a deadline
+// stating one cluster's budget under-promises every multi-cluster file. The
+// sum is conservative (a cluster already up spends almost none of its share),
+// which is the safe direction: overstating only makes the heartbeat
+// pessimistic, understating reports a healthy call as past its own deadline.
+func upProvisionDeadline(cfg config.Config) time.Duration {
+	var total time.Duration
+	for _, spec := range cfg.Clusters {
+		total += startedProvisionDeadline(spec.Input().CSI != "")
+	}
+	if total == 0 {
+		// A file with no clusters has nothing to provision, but the heartbeat
+		// still needs a bound to state.
+		return startedProvisionDeadline(false)
+	}
+	return total
+}
+
 func (c cli) runUp(args []string) error {
 	cfg, force, quiet, err := loadUpConfigFile(args)
 	if err != nil {
@@ -188,11 +208,12 @@ func (c cli) runUp(args []string) error {
 	}{Config: cfg, Force: force}
 	// An up may create or start clusters, and both wait for their nodes to boot
 	// before the provisioning budget starts — a start since #364 also waits for
-	// Kubernetes readiness — so the stated deadline carries the widest wait an
-	// up can be held for (#307).
+	// Kubernetes readiness. The clusters are handled one after another, so the
+	// stated deadline carries every cluster's share of those waits, not just
+	// one pass's (#307).
 	signal := liveness{
 		verb:     "provisioning " + upSubject(cfg),
-		deadline: startedProvisionDeadline(declaresStorage(cfg)),
+		deadline: upProvisionDeadline(cfg),
 		quiet:    quiet,
 	}
 	if err := c.callWithLiveness(signal, "up", request, &actions); err != nil {
@@ -217,17 +238,6 @@ func upSubject(cfg config.Config) string {
 		return "the declared clusters"
 	}
 	return strings.Join(names, ", ")
-}
-
-// declaresStorage reports whether any cluster in the file brings a CSI, which
-// is what widens the daemon's provisioning budget.
-func declaresStorage(cfg config.Config) bool {
-	for _, spec := range cfg.Clusters {
-		if spec.Input().CSI != "" {
-			return true
-		}
-	}
-	return false
 }
 
 func strongestProvisioningIntent(cfg config.Config) (cluster.ProvisioningIntentInput, bool) {
