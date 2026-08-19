@@ -24,6 +24,7 @@ const (
 	cniProvisionDeadline     = daemon.CNIProvisionTimeout
 	storageProvisionDeadline = daemon.StorageProvisionTimeout
 	nodeBootDeadline         = daemon.NodeBootTimeout
+	kubernetesReadyDeadline  = daemon.KubernetesReadyWaitTimeout
 )
 
 // livenessInterval is how often a blocking lifecycle call reports it is still
@@ -156,6 +157,15 @@ func createProvisionDeadline(storage bool) time.Duration {
 	return provisionDeadline(storage) + nodeBootDeadline
 }
 
+// startedProvisionDeadline is createProvisionDeadline plus the Kubernetes
+// readiness wait a started cluster additionally runs before its reconcile
+// (#364): a start — direct or planned by `up` — can spend that whole window
+// before the provisioning budget begins, and a heartbeat that omits it reports
+// a healthy call as past its own deadline.
+func startedProvisionDeadline(storage bool) time.Duration {
+	return createProvisionDeadline(storage) + kubernetesReadyDeadline
+}
+
 func (c cli) runUp(args []string) error {
 	cfg, force, quiet, err := loadUpConfigFile(args)
 	if err != nil {
@@ -177,11 +187,12 @@ func (c cli) runUp(args []string) error {
 		Force bool `json:"force"`
 	}{Config: cfg, Force: force}
 	// An up may create or start clusters, and both wait for their nodes to boot
-	// before the provisioning budget starts — a start since #364 — so the stated
-	// deadline carries that wait exactly as a create's does (#307).
+	// before the provisioning budget starts — a start since #364 also waits for
+	// Kubernetes readiness — so the stated deadline carries the widest wait an
+	// up can be held for (#307).
 	signal := liveness{
 		verb:     "provisioning " + upSubject(cfg),
-		deadline: createProvisionDeadline(declaresStorage(cfg)),
+		deadline: startedProvisionDeadline(declaresStorage(cfg)),
 		quiet:    quiet,
 	}
 	if err := c.callWithLiveness(signal, "up", request, &actions); err != nil {

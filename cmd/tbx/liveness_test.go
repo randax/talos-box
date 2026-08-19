@@ -22,8 +22,9 @@ func TestUpQuietStatesTheDeadlineAndBeats(t *testing.T) {
 	stdout, stderr := runSlowCLI(t, []string{`{"protocolVersion":7}`, `[{"action":"create","cluster":"demo"}]`}, func(command cli) error {
 		return command.runUp([]string{"-f", writeUpConfig(t, "demo"), "--quiet"})
 	})
-	// the file declares a CSI, which buys the wider provisioning budget
-	deadline := formatLivenessDuration(createProvisionDeadline(true))
+	// the file declares a CSI, which buys the wider provisioning budget; an up
+	// can also start clusters, whose readiness wait the bound carries too (#364)
+	deadline := formatLivenessDuration(startedProvisionDeadline(true))
 	if deadline == formatLivenessDuration(provisionDeadline(true)) {
 		t.Fatalf("stated deadline %s does not carry the boot wait", deadline)
 	}
@@ -76,7 +77,7 @@ func TestClusterStartQuietStatesTheDeadline(t *testing.T) {
 	_, stderr := runSlowCLI(t, []string{`{"name":"demo"}`}, func(command cli) error {
 		return command.startCluster([]string{"demo", "--quiet"})
 	})
-	deadline := formatLivenessDuration(cniProvisionDeadline + nodeBootDeadline)
+	deadline := formatLivenessDuration(cniProvisionDeadline + nodeBootDeadline + kubernetesReadyDeadline)
 	for _, wanted := range []string{"starting demo", "up to " + deadline, "progress suppressed by --quiet", "still starting demo", "deadline " + deadline} {
 		if !strings.Contains(stderr, wanted) {
 			t.Fatalf("quiet start stderr missing %q:\n%s", wanted, stderr)

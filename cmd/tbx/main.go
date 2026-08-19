@@ -288,9 +288,9 @@ func (c cli) startCluster(args []string) error {
 	var result daemon.ClusterSummary
 	// A start reconciles the cluster's declared CNI/CSI on the same blocking
 	// call as create, so the stated bound must be the one the daemon budgets
-	// this request at (#307) — including the boot wait a start now runs ahead
-	// of its reconcile, exactly as createProvisionDeadline counts it (#364).
-	signal := liveness{verb: "starting " + name, deadline: storedProvisionDeadline(name) + nodeBootDeadline, quiet: quiet}
+	// this request at (#307) — including the boot and Kubernetes-readiness
+	// waits a start now runs ahead of its reconcile (#364).
+	signal := liveness{verb: "starting " + name, deadline: storedProvisionDeadline(name) + nodeBootDeadline + kubernetesReadyDeadline, quiet: quiet}
 	if err := c.callWithLiveness(signal, "cluster.start", request, &result); err != nil {
 		return err
 	}
