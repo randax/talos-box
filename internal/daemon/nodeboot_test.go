@@ -436,9 +436,56 @@ func TestKubernetesReadyWaitIsSkippedWithoutCredentials(t *testing.T) {
 	restoreKubernetesReadyWait(t, time.Millisecond, 30*time.Second)
 	readiness := lateKubernetesReadiness(t, math.MaxInt)
 
-	service.waitForKubernetesReady(item.Name, nil)
+	service.waitForKubernetesReady(item.Name, nil, nil)
 
 	if *readiness != 0 {
 		t.Fatalf("readiness probed %d times for a cluster with no credentials, want none", *readiness)
+	}
+}
+
+// Registration is also replacement: a node or BGP mutation that supersedes the
+// provisioning task cancels the task's context, and the readiness wait must
+// end with it — otherwise the original start holds its request through the
+// whole window only to discard the task afterwards.
+func TestSupersededTaskEndsTheKubernetesReadyWait(t *testing.T) {
+	service, item := stoppedProvisionedClusterForStart(t)
+	stubConvergedProvisioning(t, item)
+	// A window far past any test budget: only the supersession can end it.
+	restoreKubernetesReadyWait(t, time.Millisecond, time.Hour)
+	readiness := lateKubernetesReadiness(t, math.MaxInt)
+
+	superseded, cancel := context.WithCancel(context.Background())
+	cancel()
+	done := make(chan struct{})
+	go func() {
+		service.waitForKubernetesReady(item.Name, superseded, nil)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("readiness wait outlived the provisioning task it protects")
+	}
+	if *readiness > 1 {
+		t.Fatalf("readiness probed %d times after supersession, want at most the in-flight one", *readiness)
+	}
+}
+
+// The boot half of the wait answers to the same supersession, and its advisory
+// warning names that end apart from a blown budget.
+func TestSupersededTaskEndsTheBootWait(t *testing.T) {
+	service, item := stoppedProvisionedClusterForStart(t)
+	superseded, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done := make(chan string, 1)
+	go func() { done <- service.waitForNodesBootedUnless(item.Name, superseded, nil) }()
+	select {
+	case warning := <-done:
+		if !strings.Contains(warning, "superseded") {
+			t.Fatalf("boot wait warning = %q, want the supersession named", warning)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("boot wait outlived the provisioning task it protects")
 	}
 }

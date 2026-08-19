@@ -19,6 +19,12 @@ import (
 // provisioning budget starts (#307).
 const NodeBootTimeout = nodeStallThreshold
 
+// KubernetesReadyWaitTimeout bounds the readiness wait a started cluster runs
+// after its nodes answer apid and before its reconcile (#364). It is exported
+// because the CLI states a start's deadline up front, and this wait spends its
+// budget before the provisioning budget starts (#307).
+const KubernetesReadyWaitTimeout = 90 * time.Second
+
 var (
 	// nodeBootTimeout is the budget the wait actually honours. A var so tests
 	// do not have to sleep through a real boot.
@@ -30,7 +36,7 @@ var (
 	// wait — see waitForKubernetesReady. It is short next to the boot budget on
 	// purpose: past it the control plane is not merely lagging apid, and the
 	// full pass is the right answer. A var so tests do not have to sleep.
-	kubernetesReadyWaitTimeout = 90 * time.Second
+	kubernetesReadyWaitTimeout = KubernetesReadyWaitTimeout
 	// kubernetesReadyPollInterval is how often that wait re-probes. Each probe
 	// carries its own kubernetesReadyTimeout, so this only spaces them out.
 	kubernetesReadyPollInterval = 3 * time.Second
@@ -53,14 +59,29 @@ var (
 // boot is not something a cluster about to be deleted needs, and the create
 // must not hold the destroy behind a budget nobody wants spent.
 func (s *Server) waitForNodesBooted(name string, progress stageFunc) string {
+	return s.waitForNodesBootedUnless(name, nil, progress)
+}
+
+// waitForNodesBootedUnless is waitForNodesBooted with one more way to end: the
+// provisioning task the wait protects being superseded. Task registration
+// cancels the task it replaces, but that cancellation used to reach only the
+// pass itself — a start already inside this wait kept waiting its full budget
+// for a task that would be discarded on arrival. A nil superseded context is
+// create's case: its task cannot be replaced while the create still holds the
+// request.
+func (s *Server) waitForNodesBootedUnless(name string, superseded context.Context, progress stageFunc) string {
 	deadline, cancelDeadline := s.lifecycleTimeoutContext(nodeBootTimeout)
 	defer cancelDeadline()
-	// The cause distinguishes the three ends this wait can come to — budget,
-	// shutdown, handover — which the warning has to report apart.
+	// The cause distinguishes the ends this wait can come to — budget,
+	// shutdown, handover, supersession — which the warning has to report apart.
 	ctx, cancel := context.WithCancelCause(deadline)
 	defer cancel(nil)
 	release := s.preemptions.register(name, func() { cancel(errBootWaitPreempted) })
 	defer release()
+	if superseded != nil {
+		stop := context.AfterFunc(superseded, func() { cancel(errBootWaitSuperseded) })
+		defer stop()
+	}
 	return s.waitForNodesBootedContext(ctx, name, progress)
 }
 
@@ -81,10 +102,10 @@ func (s *Server) waitForNodesBooted(name string, progress stageFunc) string {
 //
 // It is advisory like create's: a node that never answers warns, it does not
 // fail the start — the substrate is up either way.
-func (s *Server) waitForStartedNodesBooted(data any, progress stageFunc) {
+func (s *Server) waitForStartedNodesBooted(data any, tasks []provisionTask, progress stageFunc) {
 	switch result := data.(type) {
 	case *ClusterSummary:
-		result.addWarnings(s.waitForStartedClusterReady(result.Name, progress))
+		result.addWarnings(s.waitForStartedClusterReady(result.Name, taskContext(tasks, result.Name), progress))
 	case []Action:
 		// `tbx up` is the file-driven way to reach the same start, and its
 		// reconcile is the same one: only the clusters this pass started need
@@ -96,9 +117,23 @@ func (s *Server) waitForStartedNodesBooted(data any, progress stageFunc) {
 			if result[i].Kind != ActionStart {
 				continue
 			}
-			result[i].addWarnings(s.waitForStartedClusterReady(result[i].Cluster, progress))
+			result[i].addWarnings(s.waitForStartedClusterReady(result[i].Cluster, taskContext(tasks, result[i].Cluster), progress))
 		}
 	}
+}
+
+// taskContext is the registered provisioning task's context for the named
+// cluster, or nil when this pass registered none. The wait watches it because
+// registration is also replacement: a node or BGP mutation that supersedes the
+// task cancels this exact context, and a wait that missed that would hold the
+// original request through its full budget only to discard the task after.
+func taskContext(tasks []provisionTask, name string) context.Context {
+	for _, task := range tasks {
+		if task.item.Name == name {
+			return task.ctx
+		}
+	}
+	return nil
 }
 
 // waitForStartedClusterReady is the whole wait a started cluster gets: apid
@@ -116,14 +151,14 @@ func (s *Server) waitForStartedNodesBooted(data any, progress stageFunc) {
 // inside the window is not one the fast path could have claimed, and the full
 // pass that follows is the right answer for it — so the window costs a wait,
 // never a refusal or a warning.
-func (s *Server) waitForStartedClusterReady(name string, progress stageFunc) string {
-	warning := s.waitForNodesBooted(name, progress)
+func (s *Server) waitForStartedClusterReady(name string, superseded context.Context, progress stageFunc) string {
+	warning := s.waitForNodesBootedUnless(name, superseded, progress)
 	if warning != "" {
 		// A node that never answered apid will not answer Kubernetes either;
 		// spending the second window on it only delays the pass that reports it.
 		return warning
 	}
-	s.waitForKubernetesReady(name, progress)
+	s.waitForKubernetesReady(name, superseded, progress)
 	return ""
 }
 
@@ -134,7 +169,7 @@ func (s *Server) waitForStartedClusterReady(name string, progress stageFunc) str
 //
 // Like the boot wait it answers to the daemon lifecycle and to other operators
 // on the cluster, so a shutdown or a queued destroy is not held behind it.
-func (s *Server) waitForKubernetesReady(name string, progress stageFunc) {
+func (s *Server) waitForKubernetesReady(name string, superseded context.Context, progress stageFunc) {
 	if !provisioningCredentialsPresent(name) {
 		return
 	}
@@ -148,6 +183,10 @@ func (s *Server) waitForKubernetesReady(name string, progress stageFunc) {
 	defer cancel(nil)
 	release := s.preemptions.register(name, func() { cancel(errBootWaitPreempted) })
 	defer release()
+	if superseded != nil {
+		stop := context.AfterFunc(superseded, func() { cancel(errBootWaitSuperseded) })
+		defer stop()
+	}
 
 	expected := nodeNames(item.Nodes)
 	progress.stage("waiting for Kubernetes to answer")
@@ -171,6 +210,13 @@ func (s *Server) waitForKubernetesReady(name string, progress stageFunc) {
 // there — but it says so with the interruption named, so an operator whose
 // destroy took the cluster next is not handed an unqualified success for it.
 var errBootWaitPreempted = errors.New("another operation was waiting for the cluster")
+
+// errBootWaitSuperseded is the wait's end when the provisioning task it
+// protects was replaced by a newer registration — a node or BGP mutation took
+// the cluster over mid-wait. The wait's job disappeared with the task, so it
+// returns at once and lets the request discover the replacement where it
+// always did, instead of spending the rest of the budget on a discarded pass.
+var errBootWaitSuperseded = errors.New("a newer operation superseded the provisioning pass")
 
 // waitForNodesBootedContext is waitForNodesBooted with an injectable context,
 // so both the boot budget and the shutdown signal arrive through one channel.
@@ -255,6 +301,8 @@ func unansweredNodesWarning(item cluster.Cluster, pending []cluster.Node, cause 
 	switch {
 	case errors.Is(cause, errBootWaitPreempted):
 		ended = "before another operation on the cluster interrupted the wait"
+	case errors.Is(cause, errBootWaitSuperseded):
+		ended = "before a newer operation superseded this one"
 	case errors.Is(cause, context.Canceled):
 		ended = "before the daemon stopped waiting"
 	}

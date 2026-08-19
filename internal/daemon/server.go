@@ -614,7 +614,7 @@ func (s *Server) dispatchProvisioning(request Request, progress stageFunc) Respo
 	// a cluster that is up instead of one still booting (#364). `up` reaches the
 	// identical path for every cluster it planned a start for, so the wait is
 	// keyed on what the pass did, not on which verb asked for it.
-	s.waitForStartedNodesBooted(data, progress)
+	s.waitForStartedNodesBooted(data, tasks, progress)
 	if err := s.runProvisionTasks(data, tasks, progress); err != nil {
 		return failure(err)
 	}
