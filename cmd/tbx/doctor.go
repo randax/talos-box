@@ -28,7 +28,10 @@ type doctorDependencies struct {
 	listConfig      func() ([]cluster.Cluster, error)
 	getStatus       func() ([]daemon.ClusterStatus, error)
 	listCache       func() (daemon.CacheListResult, error)
-	hostPressure    func() (hostpressure.Snapshot, error)
+	// mirrorOffline reports the mirror's offline mode, which persists across a
+	// daemon restart and changes how every pull on the host fails (#403).
+	mirrorOffline func() (bool, error)
+	hostPressure  func() (hostpressure.Snapshot, error)
 	// guestAgentSupport is the host capability, not a running backend's, so the
 	// gate is explained even with the daemon down.
 	guestAgentSupport func() hypervisor.FeatureStatus
@@ -207,6 +210,10 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 	}
 
 	if err := writeFindings(cacheFindings(deps.listCache, clusters, clusterErr)...); err != nil {
+		return err
+	}
+
+	if err := writeFindings(mirrorOfflineFinding(deps.mirrorOffline)); err != nil {
 		return err
 	}
 
@@ -420,6 +427,11 @@ func (c cli) doctorDependencies() doctorDependencies {
 			var result daemon.CacheListResult
 			err := c.doctorCall("cache.list", struct{}{}, &result)
 			return result, err
+		},
+		mirrorOffline: func() (bool, error) {
+			var result daemon.MirrorOfflineStatus
+			err := c.doctorCall("mirror.offline.get", struct{}{}, &result)
+			return result.Enabled, err
 		},
 		hostPressure: func() (hostpressure.Snapshot, error) {
 			home, err := os.UserHomeDir()

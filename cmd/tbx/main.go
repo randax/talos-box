@@ -70,6 +70,8 @@ func (c cli) run(args []string) error {
 		return c.runConsole(args[1:])
 	case "cache":
 		return c.runCache(args[1:])
+	case "logs":
+		return c.runLogs(args[1:])
 	case "system":
 		return c.runSystem(args[1:])
 	case "doctor":
@@ -93,7 +95,7 @@ var groupUsages = map[string]string{
 	"node":     "usage: tbx node add <cluster> [node] | remove|start|stop <cluster> <node>",
 	"snapshot": "usage: tbx snapshot create|restore|list|delete",
 	"cache":    "usage: tbx cache pull|prune|warm|list [-o json]",
-	"system":   "usage: tbx system install|uninstall|restart [--force]|status",
+	"system":   "usage: tbx system install|uninstall|restart [--force]|status|logs",
 	"mirror":   "usage: tbx mirror offline [on|off]",
 	"bgp":      "usage: tbx bgp enable|disable <cluster> [--quiet]",
 }
@@ -196,10 +198,18 @@ func (c cli) resumeCluster(args []string) error {
 	if err := c.call("cluster.resume", request, &result); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(c.out, "%s cluster %s\n", pastTense("resume"), result.Name); err != nil {
+	// The warnings come first and the summary carries the cold-boot count: a
+	// reader skimming "resumed cluster X" must not conclude memory was
+	// preserved while the detail below says three nodes cold-booted (#411).
+	if err := printWarnings(c.err, result.Warnings, result.Warning); err != nil {
 		return err
 	}
-	return printWarnings(c.err, result.Warnings, result.Warning)
+	coldBooted := ""
+	if count := coldBootedNodeCount(result.Warnings, result.Warning); count > 0 {
+		coldBooted = fmt.Sprintf(" (%d node(s) cold-booted)", count)
+	}
+	_, err = fmt.Fprintf(c.out, "%s cluster %s%s\n", pastTense("resume"), result.Name, coldBooted)
+	return err
 }
 
 func parseClusterStartArgs(args []string, output io.Writer) (string, bool, error) {
@@ -640,6 +650,12 @@ func (c cli) runStatus(args []string) error {
 	if *outputFormat == "json" {
 		return encodeJSON(c.out, result)
 	}
+	// The banner is asked for after the listing so the status exchange stays
+	// first, and printed before it so the mode cannot be missed (#403).
+	offline, offlineErr := c.mirrorOfflineEnabled()
+	if err := printMirrorOfflineNotice(c.out, offline, offlineErr); err != nil {
+		return err
+	}
 	return printStatus(c.out, result, *quiet)
 }
 
@@ -781,7 +797,8 @@ Commands:
   bgp enable|disable <cluster> [--quiet]
   mirror offline [on|off]
   cache pull|prune|warm|list [-o json]
-  system install|uninstall|restart [--force]|status
+  system install|uninstall|restart [--force]|status|logs
+  logs [cluster] [--follow] [--lines n]
   doctor
   version (also --version, -v)
 `
