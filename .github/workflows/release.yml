@@ -16,6 +16,9 @@ on:
 
 permissions:
   contents: write
+  # The gate reads the tag commit's check runs; explicit permissions deny
+  # every scope not listed.
+  checks: read
 
 jobs:
   gate:

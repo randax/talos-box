@@ -10,8 +10,8 @@ with `CGO_ENABLED=0`.
 
 1. Bump `VERSION` to the new version without the `v` prefix (`0.2.0`,
    `0.2.0-rc.1`) and land it on `main` through a normal PR. `VERSION` is the
-   single source of truth the Nix flake reads, so a flake pinned at the tag
-   reports that version.
+   single source of truth the Nix flake reads: a flake build reports
+   `<VERSION>+<short commit>` (for example `0.2.0+abc1234`).
 2. Tag the merged commit and push the tag:
 
    ```sh
