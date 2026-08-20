@@ -11,7 +11,13 @@
         "aarch64-linux"
       ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
-      version = if self ? shortRev then "0.0.0+${self.shortRev}" else "0.0.0";
+      # VERSION is the release contract: the release workflow refuses a tag
+      # that disagrees with it. The flake reports VERSION plus the commit it
+      # was built from ("0.2.0+abc1234", or "+dirty" for an uncommitted
+      # working tree), so a pinned flake still identifies its exact source;
+      # the release tarballs carry the bare tag via ldflags.
+      baseVersion = nixpkgs.lib.removeSuffix "\n" (builtins.readFile ./VERSION);
+      version = if self ? shortRev then "${baseVersion}+${self.shortRev}" else "${baseVersion}+dirty";
     in
     {
       overlays.default = final: prev: {

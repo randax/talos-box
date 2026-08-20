@@ -192,7 +192,8 @@ if grep -Fq -- 'talosctl' "$storage_harness"; then
   printf 'provisioning-path e2e must not manage Talos by hand\n' >&2
   exit 1
 fi
-for pinned_workflow in "$workflow" "$depot_ci" "$depot_e2e" "$depot_floor"; do
+release_workflow="$root/.github/workflows/release.yml"
+for pinned_workflow in "$workflow" "$release_workflow" "$depot_ci" "$depot_e2e" "$depot_floor"; do
   if grep -Eq 'uses: [^[:space:]]+@v[0-9]' "$pinned_workflow"; then
     printf 'CI workflows must pin actions to immutable commit SHAs (%s)\n' "$pinned_workflow" >&2
     exit 1
