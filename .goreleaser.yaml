@@ -1,0 +1,115 @@
+# GoReleaser runs once, on a macOS runner: darwin/arm64 needs cgo for
+# Virtualization.framework, while the Linux binaries are pure Go and
+# cross-compile with CGO_ENABLED=0. One run means one release, one checksum
+# file, and one brew formula that knows every platform.
+version: 2
+project_name: tbx
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: tbx-darwin
+    main: ./cmd/tbx
+    binary: tbx
+    goos: [darwin]
+    goarch: [arm64]
+    env: [CGO_ENABLED=1]
+    ldflags:
+      - "-X github.com/randax/talos-box/internal/version.Version={{ .Tag }}"
+    hooks:
+      post: codesign --force --sign - --entitlements build/entitlements.plist {{ .Path }}
+  - id: tbxd-darwin
+    main: ./cmd/tbxd
+    binary: tbxd
+    goos: [darwin]
+    goarch: [arm64]
+    env: [CGO_ENABLED=1]
+    ldflags:
+      - "-X github.com/randax/talos-box/internal/version.Version={{ .Tag }}"
+    hooks:
+      post: codesign --force --sign - --entitlements build/entitlements.plist {{ .Path }}
+  - id: tbx-helper-darwin
+    main: ./cmd/tbx-helper
+    binary: tbx-helper
+    goos: [darwin]
+    goarch: [arm64]
+    env: [CGO_ENABLED=1]
+    ldflags:
+      - "-X github.com/randax/talos-box/internal/version.Version={{ .Tag }}"
+  - id: tbx-linux
+    main: ./cmd/tbx
+    binary: tbx
+    goos: [linux]
+    goarch: [amd64, arm64]
+    env: [CGO_ENABLED=0]
+    ldflags:
+      - "-X github.com/randax/talos-box/internal/version.Version={{ .Tag }}"
+  - id: tbxd-linux
+    main: ./cmd/tbxd
+    binary: tbxd
+    goos: [linux]
+    goarch: [amd64, arm64]
+    env: [CGO_ENABLED=0]
+    ldflags:
+      - "-X github.com/randax/talos-box/internal/version.Version={{ .Tag }}"
+  - id: tbx-helper-linux
+    main: ./cmd/tbx-helper
+    binary: tbx-helper
+    goos: [linux]
+    goarch: [amd64, arm64]
+    env: [CGO_ENABLED=0]
+    ldflags:
+      - "-X github.com/randax/talos-box/internal/version.Version={{ .Tag }}"
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - docs/linux.md
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github
+  sort: asc
+
+release:
+  github:
+    owner: randax
+    name: talos-box
+  prerelease: auto
+  draft: false
+
+homebrew_casks:
+  - name: tbx
+    repository:
+      owner: randax
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Casks
+    homepage: https://github.com/randax/talos-box
+    description: Talos Linux VM clusters on your laptop
+    binaries: [tbx, tbxd, tbx-helper]
+    commit_author:
+      name: talos-box-release
+      email: noreply@github.com
+    # Prereleases publish to GitHub Releases only; the tap tracks stable tags.
+    skip_upload: auto
+    caveats: |
+      Register the privileged networking helper once:
+        sudo tbx system install
+    hooks:
+      post:
+        # Ad-hoc signed, not notarized: strip quarantine so Gatekeeper lets the
+        # entitled binaries run.
+        install: |
+          if OS.mac?
+            ["tbx", "tbxd", "tbx-helper"].each do |bin|
+              system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/#{bin}"]
+            end
+          end

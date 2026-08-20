@@ -11,7 +11,10 @@
         "aarch64-linux"
       ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
-      version = if self ? shortRev then "0.0.0+${self.shortRev}" else "0.0.0";
+      # VERSION is the release contract: the release workflow refuses a tag
+      # that disagrees with it, so a flake pinned at a tag reports that tag.
+      baseVersion = nixpkgs.lib.removeSuffix "\n" (builtins.readFile ./VERSION);
+      version = if self ? shortRev then "${baseVersion}+${self.shortRev}" else "${baseVersion}+dirty";
     in
     {
       overlays.default = final: prev: {

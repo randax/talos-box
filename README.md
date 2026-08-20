@@ -20,6 +20,16 @@ are still pending; use the documented source-preview setup rather than guessed p
 
 #### macOS
 
+Released binaries come from the Homebrew tap:
+
+```sh
+brew install randax/tap/tbx
+sudo tbx system install
+tbx doctor
+```
+
+Or build from source:
+
 ```sh
 make build
 sudo bin/tbx system install

@@ -1,0 +1,83 @@
+name: Release
+
+# Releases are cut from v* tags and gated on the floor-version e2e that the
+# same tag triggers on Depot CI: a broken support-window floor stops the
+# release by construction. workflow_dispatch exists to rehearse the publish
+# path against an existing tag; its gate bypass is for rehearsals only.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      skip_floor_gate:
+        description: "Rehearsal only: publish without waiting for the floor e2e"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    name: Release gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Tag must match VERSION
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          case "$GITHUB_REF" in
+            refs/tags/v*) ;;
+            *) echo "release must run on a v* tag, got $GITHUB_REF" >&2; exit 1 ;;
+          esac
+          want="$(tr -d '[:space:]' < VERSION)"
+          if [ "${tag#v}" != "$want" ]; then
+            echo "tag $tag disagrees with VERSION ($want): bump VERSION before tagging" >&2
+            exit 1
+          fi
+      - name: Wait for the floor-version e2e on this tag
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_floor_gate) }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Depot CI reports the floor lane as a check run named
+          # "Floor e2e / KVM floor-version e2e" on the tag's commit.
+          for attempt in $(seq 1 60); do
+            state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs" \
+              --jq '[.check_runs[] | select(.name == "Floor e2e / KVM floor-version e2e")] | first | "\(.status) \(.conclusion)"' 2>/dev/null || echo "absent")
+            echo "attempt $attempt: $state"
+            case "$state" in
+              "completed success") exit 0 ;;
+              "completed "*) echo "floor-version e2e did not pass ($state); refusing to release" >&2; exit 1 ;;
+            esac
+            sleep 60
+          done
+          echo "floor-version e2e did not finish within 60 minutes" >&2
+          exit 1
+
+  release:
+    name: GoReleaser
+    needs: gate
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26"
+          cache: false
+      - name: Tap token can reach the tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          test -n "$HOMEBREW_TAP_TOKEN" || { echo "HOMEBREW_TAP_TOKEN secret is missing" >&2; exit 1; }
+          curl -fsS -H "Authorization: Bearer $HOMEBREW_TAP_TOKEN" https://api.github.com/repos/randax/homebrew-tap >/dev/null
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser
+          version: v2.17.1
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
