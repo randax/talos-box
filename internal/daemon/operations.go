@@ -221,6 +221,10 @@ type StoragePhase string
 const (
 	StoragePhaseProvisioning StoragePhase = "provisioning"
 	StoragePhaseLive         StoragePhase = "live"
+	// StoragePhaseFailed is the terminal state an aborted provision settles
+	// into. Nothing is converging any more, so reporting `provisioning` would
+	// describe work no process is doing (#395).
+	StoragePhaseFailed StoragePhase = "failed"
 )
 
 // ClusterStatus is the status result for one cluster.
@@ -258,10 +262,15 @@ type ClusterStatus struct {
 	// clearing the previous pass's objects. It reads as work in progress, so
 	// the operator is not shown a fault for a wait the daemon converges out of
 	// on its own (#347).
-	StoragePending string       `json:"storagePending,omitempty"`
-	VIP            string       `json:"vip,omitempty"`
-	VIPLive        bool         `json:"vipLive"`
-	Nodes          []NodeStatus `json:"nodes"`
+	StoragePending string `json:"storagePending,omitempty"`
+	// StorageGate names the convergence gate a running pass is currently held
+	// at. Storage cannot go live until every gate ahead of it passes, and the
+	// blocking one is frequently not the readiness probe at all — naming the
+	// probe regardless sent diagnosis at the wrong subsystem (#391).
+	StorageGate string       `json:"storageGate,omitempty"`
+	VIP         string       `json:"vip,omitempty"`
+	VIPLive     bool         `json:"vipLive"`
+	Nodes       []NodeStatus `json:"nodes"`
 	// Capabilities reports the host capabilities this cluster's configuration
 	// depends on, so a file stays portable across host substrates and the gate
 	// is visible instead of silently doing nothing.

@@ -191,7 +191,7 @@ func replaceDriftedStorageClass(ctx context.Context, client dynamic.Interface, m
 			return fmt.Errorf("replace StorageClass %q: %w", object.GetName(), err)
 		}
 		name := object.GetName()
-		if err := poll(ctx, interval, func(ctx context.Context) error {
+		if err := poll(ctx, GateStorageClass, interval, func(ctx context.Context) error {
 			_, err := client.Resource(mapping.Resource).Get(ctx, name, metav1.GetOptions{})
 			if apierrors.IsNotFound(err) {
 				return nil

@@ -22,6 +22,7 @@ import (
 	"github.com/randax/talos-box/internal/hypervisor"
 	"github.com/randax/talos-box/internal/imagecache"
 	"github.com/randax/talos-box/internal/mirror"
+	"github.com/randax/talos-box/internal/provision"
 	"golang.org/x/sys/unix"
 )
 
@@ -61,10 +62,18 @@ type Server struct {
 	stallWatchStop    chan struct{}
 	stallWatchDone    chan struct{}
 
-	provisions            map[string]activeProvision
-	storagePhases         map[string]StoragePhase
-	storageStatusProbes   map[string]activeStorageProbe
-	storageProbeFailures  map[string]storageProbeFailure
+	provisions           map[string]activeProvision
+	storagePhases        map[string]StoragePhase
+	storageStatusProbes  map[string]activeStorageProbe
+	storageProbeFailures map[string]storageProbeFailure
+	// provisionBlockers is what each running pass's convergence gates last
+	// reported they were waiting on, so status can name the gate that is
+	// actually holding the cluster instead of guessing at one (#391).
+	provisionBlockers map[string]provisionBlocker
+	// storageFailures carries the cause of a terminal StoragePhaseFailed, so an
+	// aborted provision's storage state says why it ended rather than reading
+	// as work still in progress (#395).
+	storageFailures       map[string]string
 	storageProbeSequence  uint64
 	provisionSequence     uint64
 	provisionReconcile    provisionReconcileFunc
@@ -121,6 +130,14 @@ type activeStorageProbe struct {
 	cancel     context.CancelFunc
 }
 
+// provisionBlocker is the last thing a running pass's convergence gates said
+// they were waiting on: which gate, and the observation that gate keeps making.
+type provisionBlocker struct {
+	gate    provision.Gate
+	message string
+	at      time.Time
+}
+
 // storageProbeFailure is the last probe pass the daemon has to back off
 // from. It covers both reasons to back off: a pass that failed, and a pass that
 // never ran because the previous one's teardown was still finishing. Only the
@@ -174,6 +191,8 @@ func NewServer(ctx context.Context) (*Server, error) {
 		storagePhases:         make(map[string]StoragePhase),
 		storageStatusProbes:   make(map[string]activeStorageProbe),
 		storageProbeFailures:  make(map[string]storageProbeFailure),
+		provisionBlockers:     make(map[string]provisionBlocker),
+		storageFailures:       make(map[string]string),
 		lifecycleContext:      lifecycleContext,
 		lifecycleCancel:       lifecycleCancel,
 		mirrors:               mirror.NewManager(mirror.DefaultDir(root)),

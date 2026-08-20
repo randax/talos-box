@@ -226,7 +226,7 @@ func partitionLocalPathObjects(objects []unstructured.Unstructured) (namespaces,
 }
 
 func waitForLocalPath(ctx context.Context, client kubernetes.Interface, interval time.Duration) error {
-	return poll(ctx, interval, func(ctx context.Context) error {
+	return poll(ctx, GateLocalPath, interval, func(ctx context.Context) error {
 		deployment, err := client.AppsV1().Deployments(localPathNamespace).Get(ctx, localPathProvisionerName, metav1.GetOptions{})
 		if err != nil {
 			return err

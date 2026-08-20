@@ -408,7 +408,7 @@ func reconcileLonghornControlPlaneScheduling(ctx context.Context, client dynamic
 			continue
 		}
 		name := node.Name
-		if err := poll(ctx, interval, func(ctx context.Context) error {
+		if err := poll(ctx, GateLonghornScheduling, interval, func(ctx context.Context) error {
 			return setLonghornNodeScheduling(ctx, client, name, allowScheduling, nodeExpected)
 		}); err != nil {
 			return err
@@ -576,7 +576,7 @@ func partitionLonghornObjects(objects []unstructured.Unstructured) (namespaces, 
 }
 
 func waitForLonghorn(ctx context.Context, client kubernetes.Interface, interval time.Duration) error {
-	return poll(ctx, interval, func(ctx context.Context) error {
+	return poll(ctx, GateLonghorn, interval, func(ctx context.Context) error {
 		manager, err := client.AppsV1().DaemonSets(longhornNamespace).Get(ctx, longhornManagerName, metav1.GetOptions{})
 		if err != nil {
 			return err

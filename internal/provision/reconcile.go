@@ -236,6 +236,7 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 		// lease would bake a planned address that may never exist into its
 		// peers, so wait for the leases instead of guessing.
 		if unleased := unleasedControlPlanes(request.Cluster, nodes); len(unleased) > 0 {
+			reportGate(ctx, GateDHCPLease, fmt.Errorf("no DHCP lease yet on %s", strings.Join(unleased, ", ")))
 			if expired := wait(ctx, request.PollInterval); expired != nil {
 				return Result{}, fmt.Errorf("waiting for a DHCP lease on %s: %w", strings.Join(unleased, ", "), expired)
 			}
@@ -289,6 +290,7 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 
 		controlPlane, allConfigured := configuredControlPlane(nodes)
 		if !allConfigured {
+			reportGate(ctx, GateMachineConfig, fmt.Errorf("nodes not configured yet: %s", strings.Join(unconfiguredNodes(nodes), ", ")))
 			if err := wait(ctx, request.PollInterval); err != nil {
 				return Result{}, err
 			}
@@ -382,9 +384,11 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 			result.Narration = append(result.Narration, loadBalancer.Narration...)
 		}
 		for {
-			if err := request.Client.KubernetesReady(ctx, kubeconfig, nodeNames(nodes)); err == nil {
+			ready := request.Client.KubernetesReady(ctx, kubeconfig, nodeNames(nodes))
+			if ready == nil {
 				break
 			}
+			reportGate(ctx, GateKubernetesReady, ready)
 			if err := wait(ctx, request.PollInterval); err != nil {
 				return Result{}, annotateAPIServerTimeout(err, request.MirrorOffline)
 			}
@@ -938,6 +942,19 @@ func clusterControlPlane(item cluster.Cluster) (Node, []string) {
 		}
 	}
 	return controlPlane, endpoints
+}
+
+// unconfiguredNodes names the nodes the config gate is still waiting on, so a
+// pass stalled there says which node never took its machine config rather than
+// just that something is not ready (#390).
+func unconfiguredNodes(nodes []Node) []string {
+	var pending []string
+	for _, node := range nodes {
+		if node.Phase != PhaseConfigured {
+			pending = append(pending, fmt.Sprintf("%s (%s)", node.Name, node.Phase))
+		}
+	}
+	return pending
 }
 
 func configuredControlPlane(nodes []Node) (Node, bool) {

@@ -597,7 +597,24 @@ func storageHint(status ClusterStatus) string {
 		return ""
 	}
 	switch status.StoragePhase {
+	case StoragePhaseFailed:
+		// Terminal: the pass that would have made storage live has ended, so
+		// the hint says so and points at the recovery instead of describing a
+		// wait nothing is serving (#395).
+		if status.StorageError != "" {
+			return fmt.Sprintf("storage provisioning failed: %s. Nothing is retrying. %s", status.StorageError, provisioningRecoveryHint(status))
+		}
+		return fmt.Sprintf("storage provisioning failed. Nothing is retrying. %s", provisioningRecoveryHint(status))
 	case StoragePhaseProvisioning:
+		// A running pass knows which gate is holding it, and that gate is
+		// frequently not the readiness probe — naming the probe regardless
+		// pointed diagnosis at a subsystem that had not even started (#391).
+		if status.StorageGate != "" {
+			if status.StorageError != "" {
+				return fmt.Sprintf("storage provisioning: waiting on the %s gate: %s.", status.StorageGate, status.StorageError)
+			}
+			return fmt.Sprintf("storage provisioning: waiting on the %s gate.", status.StorageGate)
+		}
 		if status.StorageError != "" {
 			return fmt.Sprintf("storage provisioning: CSI readiness probe failed: %s; retrying after backoff.", status.StorageError)
 		}

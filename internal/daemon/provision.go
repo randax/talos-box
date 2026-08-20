@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -45,6 +46,48 @@ var (
 )
 
 const storageProbeRetryBackoff = time.Minute
+
+// gateLogInterval rate-limits how often one waiting gate repeats itself in the
+// daemon log. A twenty-minute stall used to leave no trace at all (#390); a
+// line per gate per interval makes it self-diagnosing without drowning the log
+// in one-second poll noise.
+const gateLogInterval = 45 * time.Second
+
+// gateLogger narrates one goroutine's convergence gates, rate-limited per gate.
+// A gate change is always announced: it is the moment the pass moved on, which
+// is exactly what an operator watching a stall needs to see.
+func gateLogger(subject string) provision.GateObserver {
+	var mu sync.Mutex
+	var lastGate provision.Gate
+	var lastLog time.Time
+	return func(gate provision.Gate, blocker error) {
+		mu.Lock()
+		now := time.Now()
+		if gate == lastGate && now.Sub(lastLog) < gateLogInterval {
+			mu.Unlock()
+			return
+		}
+		lastGate, lastLog = gate, now
+		mu.Unlock()
+		log.Printf("%s: waiting on %s: %s", subject, gate, provision.BlockerMessage(blocker))
+	}
+}
+
+// observeProvisionGate is the pass's gate observer: it narrates the blocker to
+// the daemon log and records it so `tbx status` can name the gate that is
+// actually holding the cluster (#390, #391).
+func (s *Server) observeProvisionGate(name string) provision.GateObserver {
+	narrate := gateLogger("provision " + name)
+	return func(gate provision.Gate, blocker error) {
+		s.opMu.Lock()
+		if s.provisionBlockers == nil {
+			s.provisionBlockers = make(map[string]provisionBlocker)
+		}
+		s.provisionBlockers[name] = provisionBlocker{gate: gate, message: provision.BlockerMessage(blocker), at: time.Now()}
+		s.opMu.Unlock()
+		narrate(gate, blocker)
+	}
+}
 
 type provisionReconcileFunc func(context.Context, provision.Request) (provision.Result, error)
 
@@ -236,6 +279,9 @@ func (s *Server) finishProvision(task provisionTask) {
 	if active, ok := s.provisions[task.item.Name]; ok && active.generation == task.generation {
 		active.cancel()
 		delete(s.provisions, task.item.Name)
+		// The gates that recorded it are gone with the pass; a blocker left
+		// behind would describe a wait nobody is serving any more.
+		delete(s.provisionBlockers, task.item.Name)
 	}
 }
 
@@ -258,6 +304,7 @@ func (s *Server) drainProvision(name string) {
 	if ok {
 		active.cancel()
 		delete(s.provisions, name)
+		delete(s.provisionBlockers, name)
 	}
 	s.opMu.Unlock()
 	if !ok || active.done == nil {
@@ -286,6 +333,7 @@ func (s *Server) cancelProvisionLocked(name string) {
 	if active, ok := s.provisions[name]; ok {
 		active.cancel()
 		delete(s.provisions, name)
+		delete(s.provisionBlockers, name)
 	}
 }
 
@@ -299,6 +347,7 @@ func (s *Server) cancelAllProvisionsLocked() {
 	for name, active := range s.provisions {
 		active.cancel()
 		delete(s.provisions, name)
+		delete(s.provisionBlockers, name)
 	}
 }
 
@@ -324,7 +373,11 @@ func (s *Server) runProvisionTasks(data any, tasks []provisionTask, progress sta
 		narration, warnings, phase, fullPass, err := s.provisionCNI(task.ctx, task.item, task.force, task.skipStorage)
 		if task.item.CSI != "" && !task.skipStorage {
 			s.opMu.Lock()
-			s.recordStoragePhaseIfCurrentLocked(task.item.Name, task.generation, phase)
+			if err != nil {
+				s.recordStorageFailureIfCurrentLocked(task.item.Name, task.generation, err)
+			} else {
+				s.recordStoragePhaseIfCurrentLocked(task.item.Name, task.generation, phase)
+			}
 			s.opMu.Unlock()
 		}
 		s.finishProvision(task)
@@ -429,6 +482,10 @@ func (s *Server) provisionCNI(parent context.Context, item cluster.Cluster, forc
 	}
 	ctx, cancel := context.WithTimeout(parent, provisionTimeout(item))
 	defer cancel()
+	// Every convergence gate below reports what it is waiting on through this
+	// observer: the log gets narration a stall used to have none of, and status
+	// gets the blocker it used to have to guess at (#390, #391).
+	ctx = provision.WithGateObserver(ctx, s.observeProvisionGate(item.Name))
 	var loadBalancer provision.LoadBalancerReconciler
 	switch item.CNI {
 	case cluster.CNIFlannel:
@@ -704,6 +761,14 @@ func (s *Server) refreshStoragePhases(statuses []ClusterStatus) {
 	for name, failure := range s.storageProbeFailures {
 		failures[name] = failure
 	}
+	blockers := make(map[string]provisionBlocker, len(s.provisionBlockers))
+	for name, blocker := range s.provisionBlockers {
+		blockers[name] = blocker
+	}
+	aborted := make(map[string]string, len(s.storageFailures))
+	for name, message := range s.storageFailures {
+		aborted[name] = message
+	}
 	s.opMu.Unlock()
 
 	for index := range statuses {
@@ -711,12 +776,25 @@ func (s *Server) refreshStoragePhases(statuses []ClusterStatus) {
 		status.StoragePhase = ""
 		status.StorageError = ""
 		status.StoragePending = ""
+		status.StorageGate = ""
 		switch {
 		case status.CSI == "", !status.Running:
 		case known[status.Name] == StoragePhaseLive:
 			status.StoragePhase = StoragePhaseLive
+		case known[status.Name] == StoragePhaseFailed:
+			// Terminal: the pass ended. Nothing re-probes and nothing is
+			// waiting, so the phase carries the cause and stays put until a new
+			// provisioning pass invalidates it (#395).
+			status.StoragePhase = StoragePhaseFailed
+			status.StorageError = aborted[status.Name]
 		case active[status.Name], !status.KubernetesReady:
 			status.StoragePhase = StoragePhaseProvisioning
+			// A pass is running: whichever gate it is held at is the honest
+			// answer to "what is storage waiting for" (#391).
+			if blocker, ok := blockers[status.Name]; ok {
+				status.StorageGate = string(blocker.gate)
+				status.StorageError = blocker.message
+			}
 		default:
 			status.StoragePhase = StoragePhaseProvisioning
 			if failure, ok := failures[status.Name]; ok && time.Since(failure.at) < storageProbeRetryBackoff {
@@ -737,7 +815,11 @@ func (s *Server) beginStorageStatusProbe(name string) {
 	s.opMu.Lock()
 	failure, failed := s.storageProbeFailures[name]
 	backingOff := failed && time.Since(failure.at) < storageProbeRetryBackoff
-	if !s.clusterRunning(name) || backingOff || s.storagePhases[name] == StoragePhaseLive || s.storageStatusProbes[name].cancel != nil {
+	// A terminal failure is not a phase a probe can move: the pass that owned it
+	// has ended, and re-probing would resurrect the retry loop #395 removed.
+	if !s.clusterRunning(name) || backingOff ||
+		s.storagePhases[name] == StoragePhaseLive || s.storagePhases[name] == StoragePhaseFailed ||
+		s.storageStatusProbes[name].cancel != nil {
 		s.opMu.Unlock()
 		return
 	}
@@ -789,11 +871,16 @@ func (s *Server) runStorageStatusProbe(ctx context.Context, name string, generat
 	if err == nil && s.clusterRunning(name) {
 		delete(s.storageProbeFailures, name)
 		s.recordStoragePhaseLocked(name, StoragePhaseLive)
-	} else if err != nil && s.clusterRunning(name) {
-		if s.storageProbeFailures == nil {
-			s.storageProbeFailures = make(map[string]storageProbeFailure)
+	} else if err != nil {
+		// A hard probe failure used to be stored and never said out loud, so a
+		// wedged probe left tbxd.log completely silent about it (#390).
+		log.Printf("storage probe %s: failed: %v", name, err)
+		if s.clusterRunning(name) {
+			if s.storageProbeFailures == nil {
+				s.storageProbeFailures = make(map[string]storageProbeFailure)
+			}
+			s.storageProbeFailures[name] = storageProbeFailure{message: err.Error(), at: time.Now()}
 		}
-		s.storageProbeFailures[name] = storageProbeFailure{message: err.Error(), at: time.Now()}
 	}
 }
 
@@ -808,6 +895,9 @@ func (s *Server) probeStorageStatus(parent context.Context, name string) error {
 	}
 	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
+	// The status probe has the same gates the provisioning pass has, and a
+	// probe wedged on one of them was invisible in the daemon log (#390).
+	ctx = provision.WithGateObserver(ctx, gateLogger("storage probe "+name))
 	probe := s.storageProbe
 	if probe == nil {
 		item, err := cluster.Load(name)
@@ -839,6 +929,8 @@ func (s *Server) probeStorageStatus(parent context.Context, name string) error {
 func (s *Server) invalidateStoragePhaseLocked(name string) {
 	delete(s.storagePhases, name)
 	delete(s.storageProbeFailures, name)
+	delete(s.storageFailures, name)
+	delete(s.provisionBlockers, name)
 	if active, ok := s.storageStatusProbes[name]; ok {
 		active.cancel()
 		delete(s.storageStatusProbes, name)
@@ -860,12 +952,42 @@ func (s *Server) recordStoragePhaseIfCurrentLocked(name string, generation uint6
 	s.recordStoragePhaseLocked(name, phase)
 }
 
+// recordStorageFailureIfCurrentLocked settles a cluster's storage into the
+// terminal failed state its aborted pass left it in. Recording `provisioning`
+// instead — which is what an empty phase used to map to — kept `tbx status`
+// reporting activity against a create that had already exited 1, and left the
+// backoff loop free to start yet another probe against it (#395). The probe
+// goroutine and its backoff record go with the phase: they belong to the pass
+// that ended.
+func (s *Server) recordStorageFailureIfCurrentLocked(name string, generation uint64, cause error) {
+	active, ok := s.provisions[name]
+	if !ok || active.generation != generation {
+		log.Printf("provision %s: superseded pass, storage failure not recorded: %v", name, cause)
+		return
+	}
+	if probe, ok := s.storageStatusProbes[name]; ok {
+		probe.cancel()
+		delete(s.storageStatusProbes, name)
+	}
+	delete(s.storageProbeFailures, name)
+	delete(s.provisionBlockers, name)
+	if s.storageFailures == nil {
+		s.storageFailures = make(map[string]string)
+	}
+	s.storageFailures[name] = provision.BlockerMessage(cause)
+	s.recordStoragePhaseLocked(name, StoragePhaseFailed)
+	log.Printf("provision %s: storage provisioning failed: %v", name, cause)
+}
+
 func (s *Server) recordStoragePhaseLocked(name string, phase StoragePhase) {
 	if s.storagePhases == nil {
 		s.storagePhases = make(map[string]StoragePhase)
 	}
 	if phase == "" {
 		phase = StoragePhaseProvisioning
+	}
+	if phase != StoragePhaseFailed {
+		delete(s.storageFailures, name)
 	}
 	s.storagePhases[name] = phase
 }
