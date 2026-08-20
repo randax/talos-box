@@ -398,6 +398,19 @@ func longhornNodeCR(name string, allowScheduling bool) *unstructured.Unstructure
 	}}
 }
 
+// longhornFakeClient knows both Longhorn list kinds the scheduling code
+// touches: nodes to reconcile and replicas to decide where the manager runs.
+func longhornFakeClient(objects ...runtime.Object) dynamic.Interface {
+	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{
+			longhornNodeResource:    "NodeList",
+			longhornReplicaResource: "ReplicaList",
+		},
+		objects...,
+	)
+}
+
 func longhornNodeScheduling(t *testing.T, client dynamic.Interface, name string) bool {
 	t.Helper()
 	live, err := client.Resource(longhornNodeResource).Namespace(longhornNamespace).Get(context.Background(), name, metav1.GetOptions{})
@@ -435,11 +448,7 @@ func TestReconcileLonghornControlPlaneSchedulingFollowsWorkerCount(t *testing.T)
 			for _, node := range item.Nodes[1:] {
 				objects = append(objects, longhornNodeCR(node.Name, true))
 			}
-			client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
-				runtime.NewScheme(),
-				map[schema.GroupVersionResource]string{longhornNodeResource: "NodeList"},
-				objects...,
-			)
+			client := longhornFakeClient(objects...)
 			if err := reconcileLonghornControlPlaneScheduling(context.Background(), client, item, time.Millisecond); err != nil {
 				t.Fatal(err)
 			}
@@ -455,19 +464,24 @@ func TestReconcileLonghornControlPlaneSchedulingFollowsWorkerCount(t *testing.T)
 	}
 }
 
-// A worker-ful cluster withholds the control-plane taint toleration, so
-// longhorn-manager never registers the control plane and no node resource
-// ever appears: that absence already is the reserved state. A worker-less
-// cluster is the opposite — the manager must run there, so a missing node is
-// a registration race worth waiting out.
-func TestReconcileLonghornControlPlaneSchedulingTreatsAMissingNodeByTopology(t *testing.T) {
+// A missing control-plane node resource means one of two things. Where
+// longhorn-manager never runs — a worker-ful cluster whose control plane holds
+// no replicas, see renderLonghornForPlacement — nothing can register the node,
+// and the absence already is the reserved state. Where the manager does run —
+// a worker-less cluster, or a control plane still holding replicas a
+// worker-less phase placed — the node will appear, so the absence is a
+// registration race to wait out (reconcile) or drift to report (probe).
+func testMissingLonghornNodeFollowsManagerReach(t *testing.T, subject func(context.Context, dynamic.Interface, cluster.Cluster) error) {
+	t.Helper()
 	tests := []struct {
-		name    string
-		workers int
-		wantErr bool
+		name         string
+		workers      int
+		holdsReplica bool
+		wantNode     bool
 	}{
-		{name: "worker-ful cluster converges without the node", workers: 1},
-		{name: "worker-less cluster waits for the node", workers: 0, wantErr: true},
+		{name: "worker-ful cluster never registers its control plane", workers: 1},
+		{name: "worker-ful cluster still serving control-plane replicas", workers: 1, holdsReplica: true, wantNode: true},
+		{name: "worker-less cluster registers its control plane", workers: 0, wantNode: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -475,24 +489,36 @@ func TestReconcileLonghornControlPlaneSchedulingTreatsAMissingNodeByTopology(t *
 			if err != nil {
 				t.Fatal(err)
 			}
-			client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
-				runtime.NewScheme(),
-				map[schema.GroupVersionResource]string{longhornNodeResource: "NodeList"},
-			)
+			var objects []runtime.Object
+			if test.holdsReplica {
+				objects = append(objects, longhornReplicaCR("replica-1", item.Nodes[0].Name))
+			}
+			// The cancelled context bounds the cases that wait for the node;
+			// the converged case returns before anything waits.
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
-			err = reconcileLonghornControlPlaneScheduling(ctx, client, item, time.Millisecond)
-			if !test.wantErr {
+			err = subject(ctx, longhornFakeClient(objects...), item)
+			if !test.wantNode {
 				if err != nil {
-					t.Fatalf("reconcileLonghornControlPlaneScheduling() error = %v, want nil", err)
+					t.Fatalf("error = %v, want nil", err)
 				}
 				return
 			}
 			if err == nil || !strings.Contains(err.Error(), item.Nodes[0].Name) {
-				t.Fatalf("reconcileLonghornControlPlaneScheduling() error = %v, want the missing control plane node", err)
+				t.Fatalf("error = %v, want the missing control plane node", err)
 			}
 		})
 	}
+}
+
+func TestReconcileLonghornControlPlaneSchedulingRequiresTheNodeOnlyWhereTheManagerRuns(t *testing.T) {
+	testMissingLonghornNodeFollowsManagerReach(t, func(ctx context.Context, client dynamic.Interface, item cluster.Cluster) error {
+		return reconcileLonghornControlPlaneScheduling(ctx, client, item, time.Millisecond)
+	})
+}
+
+func TestLonghornSchedulingConvergedRequiresTheNodeOnlyWhereTheManagerRuns(t *testing.T) {
+	testMissingLonghornNodeFollowsManagerReach(t, longhornSchedulingConverged)
 }
 
 // The Longhorn node resource is the only barrier once longhorn-manager
@@ -526,11 +552,7 @@ func TestLonghornSchedulingConvergedObservesBothDirections(t *testing.T) {
 			for _, node := range item.Nodes[1:] {
 				objects = append(objects, longhornNodeCR(node.Name, true))
 			}
-			client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
-				runtime.NewScheme(),
-				map[schema.GroupVersionResource]string{longhornNodeResource: "NodeList"},
-				objects...,
-			)
+			client := longhornFakeClient(objects...)
 			err = longhornSchedulingConverged(context.Background(), client, item)
 			if test.wantErr == "" {
 				if err != nil {
@@ -540,39 +562,6 @@ func TestLonghornSchedulingConvergedObservesBothDirections(t *testing.T) {
 			}
 			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
 				t.Fatalf("longhornSchedulingConverged() error = %v, want %q", err, test.wantErr)
-			}
-		})
-	}
-}
-
-func TestLonghornSchedulingConvergedTreatsAMissingNodeByTopology(t *testing.T) {
-	tests := []struct {
-		name    string
-		workers int
-		wantErr bool
-	}{
-		{name: "worker-ful cluster is converged without the node", workers: 1},
-		{name: "worker-less cluster has drifted without the node", workers: 0, wantErr: true},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			item, err := cluster.New("demo", 0, 1, test.workers, cluster.NodeDefaults{})
-			if err != nil {
-				t.Fatal(err)
-			}
-			client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
-				runtime.NewScheme(),
-				map[schema.GroupVersionResource]string{longhornNodeResource: "NodeList"},
-			)
-			err = longhornSchedulingConverged(context.Background(), client, item)
-			if !test.wantErr {
-				if err != nil {
-					t.Fatalf("longhornSchedulingConverged() error = %v, want nil", err)
-				}
-				return
-			}
-			if err == nil || !strings.Contains(err.Error(), item.Nodes[0].Name) {
-				t.Fatalf("longhornSchedulingConverged() error = %v, want the missing control plane node", err)
 			}
 		})
 	}
