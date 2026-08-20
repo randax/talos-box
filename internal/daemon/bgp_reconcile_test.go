@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/helper"
 	"github.com/randax/talos-box/internal/provision"
 )
 
@@ -19,6 +20,7 @@ type recordingBGPHelper struct {
 	enabled  []string
 	disabled []string
 	active   bool
+	routes   []helper.BGPRoute
 }
 
 func (c *recordingBGPHelper) EnableBGP(name string, _ int, _, _ uint32) error {
@@ -33,8 +35,10 @@ func (c *recordingBGPHelper) DisableBGP(name string) error {
 	return nil
 }
 
-func (c *recordingBGPHelper) HasBGP(string) (bool, error) { return c.active, nil }
-func (c *recordingBGPHelper) Close() error                { return nil }
+func (c *recordingBGPHelper) BGPStatus(string) (helper.BGPState, error) {
+	return helper.BGPState{Active: c.active, Routes: c.routes}, nil
+}
+func (c *recordingBGPHelper) Close() error { return nil }
 
 // runningCiliumClusterForBGP arranges the exact situation #344 was reported
 // from: a live, fully converged Cilium cluster with a load balancer, whose

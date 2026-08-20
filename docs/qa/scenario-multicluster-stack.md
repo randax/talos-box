@@ -70,9 +70,10 @@ On failure: capture which leg fails, host routing table, doctor forwarding/rp-fi
 Steps:
 1. `tbx cluster stop qa-edge`, then start it again; wait for its end state.
 2. Verify C3's cross-cluster paths again (both directions).
-3. `tbx bgp disable qa-core`; verify qa-core's VIP remains reachable from qa-edge after L2 convergence; re-verify host route withdrawal.
+3. `tbx bgp disable qa-core`; verify qa-core's VIP remains reachable from qa-edge after L2 convergence; re-verify host route withdrawal with `tbx bgp status qa-core`.
+4. `tbx doctor` while both clusters run — the `inter-cluster` check must report every host→VIP and cluster→sibling-VIP path, and `FAIL` naming the dead direction whenever one is down (#388).
 
-Expected observations: stop/start of one cluster never disturbs the other's announcements or routes; the announcement-mechanism flip mid-life keeps the VIP served.
+Expected observations: stop/start of one cluster never disturbs the other's announcements or routes; the announcement-mechanism flip mid-life keeps the VIP served; `bgp disable` narrates only the flip, never the create-time equivalent-command block (#400).
 
 Pass criteria: all paths recover; no cross-cluster interference.
 

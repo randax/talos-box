@@ -67,6 +67,101 @@ func TestBGPDisableQuietSuppressesNarration(t *testing.T) {
 	}
 }
 
+// Disabling is an announcement-mode flip. The reconcile's equivalent-command
+// block is the create-time bootstrap script, and replaying it read as if
+// bootstrapping a live cluster were the suggested next step (#400).
+func TestBGPDisableOmitsTheCreateStyleEquivalentCommands(t *testing.T) {
+	stubStoredClusters(t, daemon.ClusterSummary{Name: "demo"})
+
+	_, output := runNarratingCLI(t, []narratedExchange{
+		{data: `{"protocolVersion":14}`},
+		{
+			stages: []string{"stopping the host BGP speaker for cluster demo"},
+			data:   `{"name":"demo","cni":"cilium","lb":true,"narration":["bootstrap: ≈ talosctl bootstrap --nodes 172.30.0.68","Cilium chart: ≈ tbx manifests demo objects | kubectl apply --server-side -f -"]}`,
+		},
+	}, func(command cli) error {
+		return command.runBGP([]string{"disable", "demo"})
+	})
+
+	if !strings.Contains(output, "stopping the host BGP speaker for cluster demo") {
+		t.Fatalf("bgp disable lost its stage narration:\n%s", output)
+	}
+	if !strings.Contains(output, "BGP disabled for cluster demo") {
+		t.Fatalf("bgp disable lost its result:\n%s", output)
+	}
+	for _, unwanted := range []string{"bootstrap: ≈", "Cilium chart: ≈"} {
+		if strings.Contains(output, unwanted) {
+			t.Fatalf("bgp disable echoed the create-style block %q:\n%s", unwanted, output)
+		}
+	}
+}
+
+// Enabling keeps the block: its equivalent commands are how an operator
+// re-applies the announcement objects the mode change just rendered.
+func TestBGPEnableKeepsTheEquivalentCommands(t *testing.T) {
+	stubStoredClusters(t, daemon.ClusterSummary{Name: "demo"})
+
+	_, output := runNarratingCLI(t, []narratedExchange{
+		{data: `{"protocolVersion":14}`},
+		{data: `{"name":"demo","cni":"cilium","lb":true,"bgp":true,"narration":["Cilium chart: ≈ tbx manifests demo objects | kubectl apply --server-side -f -"]}`},
+	}, func(command cli) error {
+		return command.runBGP([]string{"enable", "demo"})
+	})
+
+	if !strings.Contains(output, "Cilium chart: ≈") {
+		t.Fatalf("bgp enable lost its equivalent commands:\n%s", output)
+	}
+}
+
+// `bgp status` is how an operator confirms a refused or deferred mode change
+// without reaching for doctor (#399).
+func TestBGPStatusReportsSpeakerStateAndRoutes(t *testing.T) {
+	stubStoredClusters(t, daemon.ClusterSummary{Name: "demo"})
+
+	requests, output := runNarratingCLI(t, []narratedExchange{
+		{data: `{"protocolVersion":14}`},
+		{data: `{"name":"demo","cni":"cilium","bgp":true,"speaker":true,"bindAddress":"172.30.0.1","port":179,"routes":[{"prefix":"172.30.0.200/32","nexthop":"172.30.0.2"}]}`},
+	}, func(command cli) error {
+		return command.runBGP([]string{"status", "demo"})
+	})
+
+	if requests[1].Op != "bgp.status" {
+		t.Fatalf("second request op = %q, want bgp.status", requests[1].Op)
+	}
+	for _, wanted := range []string{
+		"cluster demo: announcement mode bgp (cni: cilium)",
+		"host BGP speaker: running on 172.30.0.1:179",
+		"announced route: 172.30.0.200/32 via 172.30.0.2",
+	} {
+		if !strings.Contains(output, wanted) {
+			t.Fatalf("bgp status output missing %q:\n%s", wanted, output)
+		}
+	}
+}
+
+func TestBGPStatusReportsAStoppedSpeaker(t *testing.T) {
+	stubStoredClusters(t, daemon.ClusterSummary{Name: "demo"})
+
+	_, output := runNarratingCLI(t, []narratedExchange{
+		{data: `{"protocolVersion":14}`},
+		{data: `{"name":"demo","cni":"flannel","bindAddress":"172.30.0.1","port":179}`},
+	}, func(command cli) error {
+		return command.runBGP([]string{"status", "demo"})
+	})
+
+	for _, wanted := range []string{
+		"cluster demo: announcement mode l2 (cni: flannel)",
+		"host BGP speaker: stopped",
+	} {
+		if !strings.Contains(output, wanted) {
+			t.Fatalf("bgp status output missing %q:\n%s", wanted, output)
+		}
+	}
+	if strings.Contains(output, "announced route") {
+		t.Fatalf("stopped speaker reported routes:\n%s", output)
+	}
+}
+
 // A deferred reconcile is the one case where the mode is recorded but not in
 // effect; the daemon's note has to reach the operator above the success line.
 func TestBGPEnablePrintsTheDeferralWarning(t *testing.T) {
