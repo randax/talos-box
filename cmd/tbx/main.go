@@ -786,7 +786,7 @@ Commands:
   snapshot create|restore|list|delete
   status [cluster]
   manifests <cluster> [section] [--cni cilium|flannel]
-  console <cluster> <node>
+  console <cluster> <node> [--no-follow] [--lines N]
   bgp enable|disable <cluster> [--quiet]
   mirror offline [on|off]
   cache pull|prune|warm|list [-o json]

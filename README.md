@@ -107,6 +107,7 @@ clusters:
 ```sh
 tbx status demo            # nodes, IPs, DNS names, and copy-pasteable next-step hints
 tbx console demo demo-cp-1 # attach to a node's serial console (detach with Ctrl-])
+tbx console demo demo-cp-1 --no-follow --lines 50  # dump the console ring buffer and exit
 tbx manifests demo         # exact machine patch, chart values/objects, and LB/BGP extras
 ```
 

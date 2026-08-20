@@ -336,13 +336,14 @@ tbx cluster create|start|stop|destroy|list [name] [--cp N --workers N]
                   [--talos-version VERSION] [--schematic ID] [--extensions LIST]
 tbx node add <cluster> [node] [--role worker|control-plane] [--force] [--quiet]
 tbx node remove <cluster> <node> [--force] [--quiet]
-tbx node start <cluster> <node> [--force]      tbx node stop <cluster> <node>
+tbx node start <cluster> <node> [--force] [--quiet]
+tbx node stop <cluster> <node> [--quiet]
 tbx cluster suspend|resume <cluster>
 tbx snapshot create <cluster> [name] [--yes] [--quiet]
 tbx snapshot restore <cluster> <name> [--yes] [--force] [--quiet]
-tbx snapshot list <cluster> [-o json]      tbx snapshot delete <cluster> <name>
+tbx snapshot list [cluster] [-o json]      tbx snapshot delete <cluster> <name>
 tbx status [cluster]      tbx manifests <cluster> [section|images] [--cni cilium|flannel]
-tbx console <cluster> <node>
+tbx console <cluster> <node> [--no-follow [--lines N]]
 tbx bgp enable|disable <cluster> [--quiet]
 tbx mirror offline [on|off]
 tbx cache pull [-f talosbox.yaml] [--no-images]
@@ -413,7 +414,10 @@ prints a soft pre-flight warning (never a hard gate). Storage is ordinary provis
 volume data. Cluster-level operations never delete user data except `tbx cluster destroy`:
 switching or removing `csi:` is allowed only while the engine holds zero volumes (hard error
 otherwise), and the destroy confirmation reports a best-effort volume count without ever
-blocking the destroy of an unreachable cluster. `tbx node remove` deletes that node's disk, so
+blocking the destroy of an unreachable cluster. A destroy closes with a summary of what it
+removed — nodes, disk bytes reclaimed, snapshots deleted, the DNS or resolver entry withdrawn,
+and any volumes it warned about — so the scope of the destruction can be checked without a
+residue check by hand. `tbx node remove` deletes that node's disk, so
 it is volume-gated the same best-effort way: when the engine reports the node holds the only
 copy of volume data — local-path volumes pinned to it, Longhorn volumes with no healthy replica
 elsewhere — the removal is refused unless rerun with `--force`, and a stopped or unreachable
@@ -454,7 +458,10 @@ warnings below their success line.
 through the `tbxd`-owned socket — Talos renders its console dashboard and logs there, and
 maintenance-mode debugging works before any config exists. Detach with **`Ctrl-]`**; the
 session banner states the detach key. Attaching never blocks the VM; multiple attach/detach
-cycles are supported. `tbx manifests` is the exact inspection/fork surface for the declared
+cycles are supported. **`--no-follow`** makes the console scriptable: it dumps the ring buffer
+the attach replays, writes it to stdout and exits, with **`--lines N`** keeping only the last N
+lines. There is no `--since`: the ring buffer holds the guest's raw bytes with no host
+timestamps to cut a duration on. `tbx manifests` is the exact inspection/fork surface for the declared
 curated path: its `machine`, `values`, `objects`, and `extras` sections match the patch,
 pinned Helm release, rendered objects, and LB/BGP/MetalLB probe resources tbx applies. The gate
 is per section: `machine`, `mirrors`, `images`, and the `storage` streams are substrate and
