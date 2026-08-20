@@ -177,15 +177,24 @@ func renderLonghorn(item cluster.Cluster) ([]unstructured.Unstructured, error) {
 // to keep tolerating the taint a joining worker returned, even though a
 // cluster that never ran worker-less must keep them off (#339).
 func renderLonghornForPlacement(ctx context.Context, client dynamic.Interface, item cluster.Cluster) ([]unstructured.Unstructured, error) {
-	tolerate := !clusterHasWorkers(item)
-	if !tolerate {
-		holdsReplicas, err := controlPlaneHoldsLonghornReplicas(ctx, client, item)
-		if err != nil {
-			return nil, err
-		}
-		tolerate = holdsReplicas
+	tolerate, err := longhornManagerReachesControlPlanes(ctx, client, item)
+	if err != nil {
+		return nil, err
 	}
 	return renderLonghornWithTolerations(item, tolerate)
+}
+
+// longhornManagerReachesControlPlanes is the one placement rule: the manager
+// DaemonSet tolerates the control-plane taint on a worker-less cluster, which
+// has nowhere else to run it, and on a worker-ful one only while a control
+// plane still holds replicas a worker-less phase placed. The manager registers
+// a Longhorn node wherever it runs, so this also decides whether a control
+// plane without a node resource is waiting to register or simply unreachable.
+func longhornManagerReachesControlPlanes(ctx context.Context, client dynamic.Interface, item cluster.Cluster) (bool, error) {
+	if !clusterHasWorkers(item) {
+		return true, nil
+	}
+	return controlPlaneHoldsLonghornReplicas(ctx, client, item)
 }
 
 // controlPlaneHoldsLonghornReplicas reports whether any control plane still
@@ -381,21 +390,26 @@ func longhornSidecarReplicaCount(storageNodes int) int {
 // replica-eligible set storageNodeCount derives: a control plane attracts
 // replicas only while the cluster is worker-less. Longhorn schedules onto
 // every node its manager runs on, and the manager tolerates the control-plane
-// taint (see longhornValues), so the cluster shape has to be expressed on the
-// node resource instead. Clearing spec.allowScheduling stops new replicas
+// taint whenever a control plane is or was replica-eligible (see
+// renderLonghornForPlacement), so the cluster shape has to be expressed on
+// the node resource too. Clearing spec.allowScheduling stops new replicas
 // without evicting copies a worker-less phase already placed there — replica
 // I/O beside etcd is what the taint exists to prevent.
 // LonghornSchedulingConverged is the matching observed-state probe: it gates
 // the fast no-op so an interrupted pass rewrites this on the next tbx up.
 func reconcileLonghornControlPlaneScheduling(ctx context.Context, client dynamic.Interface, item cluster.Cluster, interval time.Duration) error {
 	allowScheduling := !clusterHasWorkers(item)
+	nodeExpected, err := longhornManagerReachesControlPlanes(ctx, client, item)
+	if err != nil {
+		return err
+	}
 	for _, node := range item.Nodes {
 		if node.Role != cluster.RoleControlPlane {
 			continue
 		}
 		name := node.Name
 		if err := poll(ctx, interval, func(ctx context.Context) error {
-			return setLonghornNodeScheduling(ctx, client, name, allowScheduling)
+			return setLonghornNodeScheduling(ctx, client, name, allowScheduling, nodeExpected)
 		}); err != nil {
 			return err
 		}
@@ -424,16 +438,23 @@ func LonghornSchedulingConverged(ctx context.Context, kubeconfig []byte, item cl
 
 func longhornSchedulingConverged(ctx context.Context, client dynamic.Interface, item cluster.Cluster) error {
 	allowScheduling := !clusterHasWorkers(item)
+	nodeExpected, err := longhornManagerReachesControlPlanes(ctx, client, item)
+	if err != nil {
+		return err
+	}
 	nodes := client.Resource(longhornNodeResource).Namespace(longhornNamespace)
 	for _, node := range item.Nodes {
 		if node.Role != cluster.RoleControlPlane {
 			continue
 		}
-		// A missing node resource is drift, not an absence to skip: the
-		// manager DaemonSet registers every node it runs on, so convergence
-		// cannot be claimed while a control plane has no Longhorn node.
+		// A control plane the manager never reaches has no node resource,
+		// and that absence is the reserved state; one the manager does reach
+		// must have registered, so the same absence is drift.
 		live, err := nodes.Get(ctx, node.Name, metav1.GetOptions{})
 		if err != nil {
+			if apierrors.IsNotFound(err) && !nodeExpected {
+				continue
+			}
 			return fmt.Errorf("get longhorn node %q: %w", node.Name, err)
 		}
 		current, err := longhornNodeAllowsScheduling(live, node.Name)
@@ -460,13 +481,17 @@ func longhornNodeAllowsScheduling(live *unstructured.Unstructured, name string) 
 	return current, nil
 }
 
-func setLonghornNodeScheduling(ctx context.Context, client dynamic.Interface, name string, allowScheduling bool) error {
+func setLonghornNodeScheduling(ctx context.Context, client dynamic.Interface, name string, allowScheduling, nodeExpected bool) error {
 	nodes := client.Resource(longhornNodeResource).Namespace(longhornNamespace)
 	// longhorn-manager creates the node resource once its pod registers the
-	// node; the manager DaemonSet is Ready by this point, so a missing
-	// resource is a race worth retrying rather than a failure.
+	// node: where the manager runs, a missing resource is a registration
+	// race to retry; where it never runs, nothing will register and there is
+	// nothing to clear.
 	live, err := nodes.Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
+		if apierrors.IsNotFound(err) && !nodeExpected {
+			return nil
+		}
 		return fmt.Errorf("get longhorn node %q: %w", name, err)
 	}
 	current, err := longhornNodeAllowsScheduling(live, name)

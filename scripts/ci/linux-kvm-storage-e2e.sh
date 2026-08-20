@@ -280,13 +280,20 @@ longhorn_replicas_scheduled() {
   [[ "$(jq -r --arg cp "$control_plane" 'index($cp) // "none"' <<<"$nodes")" == none ]]
 }
 
-# The node resource is what keeps replicas off a tainted control plane, since
-# tolerating the taint makes it a scheduling candidate again.
+# A control plane is reserved in one of two ways: longhorn-manager never runs
+# there, so no node resource exists to schedule onto; or the manager does run
+# there (a worker-less phase left replicas) and the node resource says no.
+# Anything else — a present node that allows scheduling, or an API error — is
+# not reserved.
 longhorn_control_plane_unschedulable() {
-  local node
+  local node allow
   node=$(node_name_by_role control-plane) || return 1
   [[ -n "$node" ]] || return 1
-  [[ "$(kc -n longhorn-system get nodes.longhorn.io "$node" -o jsonpath='{.spec.allowScheduling}' 2>/dev/null)" == false ]]
+  if ! allow=$(kc -n longhorn-system get nodes.longhorn.io "$node" -o jsonpath='{.spec.allowScheduling}' 2>&1); then
+    [[ "$allow" == *"not found"* ]]
+    return
+  fi
+  [[ "$allow" == false ]]
 }
 
 longhorn_config="$workdir/talosbox-longhorn.yaml"
