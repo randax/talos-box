@@ -186,12 +186,88 @@ func platformErrorSummary(cause error) string {
 	if index := strings.Index(summary, " UserInfo={"); index >= 0 {
 		summary = summary[:index]
 	}
-	summary = strings.TrimSpace(summary)
-	if runes := []rune(summary); len(runes) > maxPlatformErrorSummary {
-		cut := strings.TrimRight(strings.TrimSpace(string(runes[:maxPlatformErrorSummary])), "“")
-		summary = closeTruncatedQuotes(strings.TrimSpace(cut) + "...")
+	return boundPlatformErrorSummary(strings.TrimSpace(summary))
+}
+
+// maxPlatformErrorSummaryQuoted is the slack the budget may borrow to carry a
+// quoted reason whole. Cutting at the fixed budget landed inside the
+// platform's own quoted reason — the one part the operator needs — rendering a
+// 16-character reason as `“invalid...”` (#412). A quote that closes within the
+// slack is kept entire; a longer one is cut before it opens, so the elision
+// never lands inside quotes.
+const maxPlatformErrorSummaryQuoted = 320
+
+// boundPlatformErrorSummary bounds a one-line cause without ever eliding
+// inside a quoted span.
+func boundPlatformErrorSummary(summary string) string {
+	runes := []rune(summary)
+	if len(runes) <= maxPlatformErrorSummary {
+		return summary
 	}
-	return summary
+	cut := maxPlatformErrorSummary
+	if open, unclosed := unclosedQuoteStart(runes[:cut]); unclosed {
+		if end, closed := quoteEnd(runes, open); closed && end <= maxPlatformErrorSummaryQuoted {
+			cut = end
+		} else if open > 0 {
+			cut = open // drop the quote the budget cannot carry
+		}
+	}
+	if cut >= len(runes) {
+		return summary
+	}
+	// A cut landing right after an opener leaves nothing quoted to read;
+	// closeTruncatedQuotes still balances the pathological open-at-zero case.
+	trimmed := strings.TrimRight(strings.TrimSpace(string(runes[:cut])), "“")
+	return closeTruncatedQuotes(strings.TrimSpace(trimmed) + "...")
+}
+
+// unclosedQuoteStart reports where the outermost quote still open at the end of
+// prefix was opened. Both curly and straight quoting reach us: Cocoa quotes its
+// descriptions with ", while the messages it wraps sometimes use “ ”.
+func unclosedQuoteStart(prefix []rune) (int, bool) {
+	var open []int // indices of quotes opened and not yet closed
+	for index, r := range prefix {
+		switch r {
+		case '“':
+			open = append(open, index)
+		case '”':
+			if n := len(open); n > 0 && prefix[open[n-1]] == '“' {
+				open = open[:n-1]
+			}
+		case '"':
+			if n := len(open); n > 0 && prefix[open[n-1]] == '"' {
+				open = open[:n-1] // straight quotes toggle
+			} else {
+				open = append(open, index)
+			}
+		}
+	}
+	if len(open) == 0 {
+		return 0, false
+	}
+	return open[0], true
+}
+
+// quoteEnd reports the index just past the closer of the quote opened at start.
+func quoteEnd(runes []rune, start int) (int, bool) {
+	opener := runes[start]
+	closer := '”'
+	if opener == '"' {
+		closer = '"'
+	}
+	depth := 0
+	for index := start + 1; index < len(runes); index++ {
+		switch runes[index] {
+		case closer:
+			if depth == 0 {
+				return index + 1, true
+			}
+			depth--
+		case opener:
+			depth++ // a nested curly quote; straight quotes never reach here
+		}
+	}
+	return 0, false
 }
 
 // closeTruncatedQuotes appends the closers a truncation left open. Cutting at a
