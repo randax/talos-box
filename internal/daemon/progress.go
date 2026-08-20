@@ -55,3 +55,11 @@ func (p *progressSink) close() {
 func convergenceHint(clusterName string) string {
 	return fmt.Sprintf("nodes are booting; watch them converge with: tbx status %s", shellquote.Quote(clusterName))
 }
+
+// stoppedNodeHint is the closing narration of a `node stop` that left the
+// cluster running: the VM is off when the verb answers, but the members that
+// stay up need a moment to agree it is gone, and status is where that is
+// watched (#414).
+func stoppedNodeHint(clusterName string) string {
+	return fmt.Sprintf("the cluster reconverges without it; watch it with: tbx status %s", shellquote.Quote(clusterName))
+}

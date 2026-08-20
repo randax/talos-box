@@ -1115,13 +1115,13 @@ func (s *Server) handleNodeMutationLocked(request Request, progress stageFunc) (
 		}
 		return result, tasks, nil
 	case "node.start":
-		result, tasks, err := s.startNodeLocked(request.Args)
+		result, tasks, err := s.startNodeLocked(request.Args, progress)
 		if err != nil {
 			return nil, nil, err
 		}
 		return result, tasks, nil
 	case "node.stop":
-		result, tasks, err := s.stopNodeLocked(request.Args)
+		result, tasks, err := s.stopNodeLocked(request.Args, progress)
 		if err != nil {
 			return nil, nil, err
 		}

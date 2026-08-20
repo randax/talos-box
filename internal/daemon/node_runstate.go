@@ -13,7 +13,7 @@ import (
 // A node started into a cluster with nothing else running gets the same
 // cluster-start side effects the whole-cluster path performs, so the registry
 // mirrors are bound before the first node needs them (#322).
-func (s *Server) startNodeLocked(raw json.RawMessage) (NodeRunState, []provisionTask, error) {
+func (s *Server) startNodeLocked(raw json.RawMessage, progress stageFunc) (NodeRunState, []provisionTask, error) {
 	var args nodeArgs
 	if err := decodeArgs(raw, &args); err != nil {
 		return NodeRunState{}, nil, err
@@ -87,6 +87,7 @@ func (s *Server) startNodeLocked(raw json.RawMessage) (NodeRunState, []provision
 		}
 		delete(nodes, node.Name)
 	}
+	progress.stage("starting node %s", node.Name)
 	machine, err := s.launchMachine(item, node, nil)
 	if err != nil {
 		return NodeRunState{}, nil, fmt.Errorf("create VM %s: %w", node.Name, err)
@@ -116,13 +117,17 @@ func (s *Server) startNodeLocked(raw json.RawMessage) (NodeRunState, []provision
 	// Bringing members back up is the very act the deferred-reconcile warning
 	// asks for, so node.start does not repeat it back at the operator.
 	tasks, _ := s.beginNodeMutationProvisionLocked(item)
+	// The VM is up, the node is not: the boot and the rejoin both continue
+	// after this call returns, so the verb closes by naming where that is
+	// watched rather than leaving the operator to guess (#414).
+	progress.stage("%s", convergenceHint(item.Name))
 	return NodeRunState{NodeStatus: status}, tasks, nil
 }
 
 // stopNodeLocked powers one node's VM off, leaving it a cluster member with its
 // disk intact. Stopping the last running node leaves the cluster stopped, so it
 // performs the same teardown the whole-cluster stop does (#322).
-func (s *Server) stopNodeLocked(raw json.RawMessage) (NodeRunState, []provisionTask, error) {
+func (s *Server) stopNodeLocked(raw json.RawMessage, progress stageFunc) (NodeRunState, []provisionTask, error) {
 	var args nodeArgs
 	if err := decodeArgs(raw, &args); err != nil {
 		return NodeRunState{}, nil, err
@@ -143,6 +148,7 @@ func (s *Server) stopNodeLocked(raw json.RawMessage) (NodeRunState, []provisionT
 		return s.nodeRunning(item.Name, name)
 	})
 	log.Printf("node.stop %s/%s: begin", item.Name, node.Name)
+	progress.stage("stopping node %s", node.Name)
 	if err := s.closeNodes(item.Name, s.vms[item.Name], []string{node.Name}); err != nil {
 		log.Printf("node.stop %s/%s: stop VM failed: %v", item.Name, node.Name, err)
 		return NodeRunState{}, nil, err
@@ -156,6 +162,13 @@ func (s *Server) stopNodeLocked(raw json.RawMessage) (NodeRunState, []provisionT
 		s.cancelProvisionLocked(item.Name)
 		s.unbindMirrors(item.SubnetIndex)
 		log.Printf("node.stop %s/%s: last running node, cluster is stopped", item.Name, node.Name)
+		// Powering off the last member stops the cluster — a consequence the
+		// operator did not name and must not have to infer (#414).
+		progress.stage("%s was the last running node; cluster %s is now stopped", node.Name, item.Name)
+	} else {
+		// The VM is off before the answer, but etcd membership and the
+		// remaining nodes' view of it settle afterward (#414).
+		progress.stage("%s", stoppedNodeHint(item.Name))
 	}
 	log.Printf("node.stop %s/%s: VM stopped", item.Name, node.Name)
 	status := nodeStatus(node, item.SubnetIndex, false)

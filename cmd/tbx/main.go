@@ -579,6 +579,8 @@ func (c cli) runNodeRunState(verb string, args []string) error {
 		flags.BoolVar(&force, "force", false, "proceed despite memory overcommit or host pressure")
 		usage += " [--force]"
 	}
+	quiet := flags.Bool("quiet", false, "suppress stage narration")
+	usage += " [--quiet]"
 	positionals, err := parseInterspersed(flags, args)
 	if err != nil {
 		return err
@@ -591,7 +593,10 @@ func (c cli) runNodeRunState(verb string, args []string) error {
 	}
 	request := map[string]any{"cluster": positionals[0], "name": positionals[1], "force": force}
 	var result daemon.NodeRunState
-	if err := c.call("node."+verb, request, &result); err != nil {
+	// Both verbs narrate like their siblings: a stop takes the node off the
+	// substrate and a start begins a boot that outlives the call, and neither
+	// was visible behind a single past-tense line (#414).
+	if err := c.callNarrated("node."+verb, request, &result, c.stages(*quiet)); err != nil {
 		return err
 	}
 	// The daemon reports whether it actually acted, so a node that was already
