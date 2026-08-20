@@ -114,8 +114,13 @@ tbx manifests demo         # exact machine patch, chart values/objects, and LB/B
 storage provisioning from probe-verified live storage, while
 printing credential exports and the flannel NetworkPolicy limitation. Hints never execute
 anything; suppress them with `--quiet`. `tbx up --quiet` and `tbx cluster create --quiet` keep
-their final result and facts, suppress stage narration, state the operation's deadline up
-front, and emit a once-a-minute liveness line on stderr so a long provision never looks hung. `tbx manifests` is the exact inspection/fork
+their final result and facts, suppress stage narration, state the operation's overall deadline
+up front (once the run is long enough to need one — a no-op announces nothing), and emit a
+once-a-minute liveness line on stderr (`still provisioning demo (elapsed 1m, overall deadline
+13m)`) so a long provision never looks hung. Per-phase budgets the daemon narrates are named
+for their phase (`reconciling cilium on cluster demo (CNI budget 10m)`), so they read apart
+from that overall deadline; a call still unanswered past its overall deadline fails instead of
+waiting forever. `tbx manifests` is the exact inspection/fork
 surface for the curated path: `machine`, `values`, `objects`, and `extras` match the machine
 prerequisite patch, pinned Helm values, rendered chart objects, and LB/BGP resources `tbx`
 applies. The substrate sections — `machine`, `mirrors`, `images`, and the `storage` streams —

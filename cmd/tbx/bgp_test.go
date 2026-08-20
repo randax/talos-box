@@ -20,7 +20,7 @@ func TestBGPEnableNarratesTheDaemonStages(t *testing.T) {
 	requests, output := runNarratingCLI(t, []narratedExchange{
 		{data: `{"protocolVersion":10}`},
 		{
-			stages: []string{"starting the host BGP speaker for cluster demo", "reconciling cilium on cluster demo (up to 10m)"},
+			stages: []string{"starting the host BGP speaker for cluster demo", "reconciling cilium on cluster demo (CNI budget 10m)"},
 			data:   `{"name":"demo","cni":"cilium","lb":true,"bgp":true}`,
 		},
 	}, func(command cli) error {

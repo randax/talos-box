@@ -434,8 +434,12 @@ create` line, for imperatively created ones; a cluster created before the origin
 keeps the `tbx up` wording, because tbx cannot prove no file backs it and advising a destroy on
 a guess is the worse error; substrate-only clusters retain manual guidance).
 Hints **never execute anything**. `--quiet` suppresses hints and narration but keeps facts
-(schematic/extensions lines) and liveness (deadline preamble plus a periodic stderr heartbeat
-during blocking provisioning calls); all list/status commands support `-o json`.
+(schematic/extensions lines) and liveness (the overall-deadline preamble, held back until the
+run outlasts the no-op window, plus a periodic stderr heartbeat during blocking provisioning
+calls); all list/status commands support `-o json`. The heartbeat names the request-wide bound
+`overall deadline`, distinct from the per-phase budgets the daemon narrates (`CNI budget`,
+`CNI+storage budget`), and the CLI stops waiting once the overall deadline plus a grace has
+passed, so a daemon-side gate that never answers fails the verb instead of hanging it.
 
 **State-changing verbs narrate their stages.** `cluster create`, `snapshot create|restore` and
 `node add|remove` stream the daemon's stages to stderr as the work proceeds — stopping the

@@ -197,8 +197,10 @@ func TestNodeAddNarratesTheDiskCloneAndTheLaunch(t *testing.T) {
 	if reconcile < 0 || reconcile < launch {
 		t.Fatalf("node.add narration = %q, want the reconcile announced after the launch", *stages)
 	}
-	if !strings.Contains((*stages)[reconcile], "up to 25 minutes") {
-		t.Fatalf("reconcile stage = %q, want the storage budget the daemon holds it to", (*stages)[reconcile])
+	// The budget is named as a phase budget, so it cannot be confused with the
+	// request-wide deadline the CLI heartbeat states (#423).
+	if !strings.Contains((*stages)[reconcile], "CNI+storage budget 25m") {
+		t.Fatalf("reconcile stage = %q, want the named storage budget the daemon holds it to", (*stages)[reconcile])
 	}
 	// The convergence hint closes a verb that left nodes booting. This one
 	// blocks on its own reconcile and returns with the node configured, so

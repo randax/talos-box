@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/randax/talos-box/internal/shellquote"
 )
@@ -46,6 +47,16 @@ func (p *progressSink) close() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.closed = true
+}
+
+// formatBudget renders a phase budget the compact way the CLI renders its own
+// deadline ("10m", "45s"), so a named phase budget and the request-wide bound
+// read as comparable numbers in the same stream (#423).
+func formatBudget(budget time.Duration) string {
+	if budget >= time.Minute && budget%time.Minute == 0 {
+		return fmt.Sprintf("%dm", int(budget/time.Minute))
+	}
+	return fmt.Sprintf("%ds", int(budget.Round(time.Second).Seconds()))
 }
 
 // convergenceHint is the closing narration of a verb that left the cluster
