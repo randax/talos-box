@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -201,9 +202,38 @@ func (s *Server) snapshotList(raw json.RawMessage) ([]cluster.SnapshotInfo, erro
 	if err := decodeArgs(raw, &args); err != nil {
 		return nil, err
 	}
+	// No cluster means every cluster: the post-destroy residue check has no
+	// cluster name left to name, and asking for one made the question
+	// unanswerable (#417).
+	if args.Cluster == "" {
+		return listAllSnapshots()
+	}
 	// ListSnapshots never returns nil on success, so an empty result
 	// marshals as [] like cluster.list and status do.
 	return cluster.ListSnapshots(args.Cluster)
+}
+
+// listAllSnapshots gathers every cluster's snapshots, newest first, each tagged
+// with the cluster it belongs to. Like the filtered form it never returns nil,
+// so an empty result marshals as [] rather than null.
+func listAllSnapshots() ([]cluster.SnapshotInfo, error) {
+	items, err := cluster.List()
+	if err != nil {
+		return nil, err
+	}
+	all := []cluster.SnapshotInfo{}
+	for _, item := range items {
+		snapshots, err := cluster.ListSnapshots(item.Name)
+		if err != nil {
+			return nil, err
+		}
+		for _, snapshot := range snapshots {
+			snapshot.Cluster = item.Name
+			all = append(all, snapshot)
+		}
+	}
+	sort.SliceStable(all, func(i, j int) bool { return all[i].Created.After(all[j].Created) })
+	return all, nil
 }
 
 func (s *Server) snapshotDelete(raw json.RawMessage) ([]cluster.SnapshotInfo, error) {

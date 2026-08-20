@@ -116,14 +116,21 @@ func (c cli) snapshotList(args []string) error {
 	if err != nil {
 		return err
 	}
-	if len(positionals) != 1 {
-		return errors.New("usage: tbx snapshot list <cluster> [-o json]")
+	if len(positionals) > 1 {
+		return errors.New("usage: tbx snapshot list [cluster] [-o json]")
 	}
 	if err := validateOutputFormat(*outputFormat); err != nil {
 		return err
 	}
+	// No cluster lists every cluster's snapshots: after a destroy there is no
+	// cluster name left to pass, and the residue check still has to be
+	// answerable — with an empty result, not a usage error (#417).
+	name := ""
+	if len(positionals) == 1 {
+		name = positionals[0]
+	}
 	var snaps []cluster.SnapshotInfo
-	if err := c.call("snapshot.list", map[string]string{"cluster": positionals[0]}, &snaps); err != nil {
+	if err := c.call("snapshot.list", map[string]string{"cluster": name}, &snaps); err != nil {
 		return err
 	}
 	if *outputFormat == "json" {
@@ -133,10 +140,26 @@ func (c cli) snapshotList(args []string) error {
 		return encodeJSON(c.out, snaps)
 	}
 	if len(snaps) == 0 {
-		_, err := fmt.Fprintf(c.out, "no snapshots for %s\n", positionals[0])
+		if name == "" {
+			_, err := fmt.Fprintln(c.out, "no snapshots")
+			return err
+		}
+		_, err := fmt.Fprintf(c.out, "no snapshots for %s\n", name)
 		return err
 	}
 	table := tabwriter.NewWriter(c.out, 0, 4, 2, ' ', 0)
+	if name == "" {
+		// the cluster column only earns its place when the listing spans them
+		if _, err := fmt.Fprintln(table, "CLUSTER\tNAME\tCREATED"); err != nil {
+			return err
+		}
+		for _, snap := range snaps {
+			if _, err := fmt.Fprintf(table, "%s\t%s\t%s\n", snap.Cluster, snap.Name, snap.Created.Format("2006-01-02 15:04")); err != nil {
+				return err
+			}
+		}
+		return table.Flush()
+	}
 	if _, err := fmt.Fprintln(table, "NAME\tCREATED"); err != nil {
 		return err
 	}

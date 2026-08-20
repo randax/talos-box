@@ -13,10 +13,13 @@ import (
 // snapshotNameRe forbids path separators, dots-only names, and traversal.
 var snapshotNameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
 
-// SnapshotInfo describes one stored snapshot.
+// SnapshotInfo describes one stored snapshot. Cluster is filled only by a
+// listing that spans clusters, where the snapshot name alone does not say
+// which cluster it belongs to (#417).
 type SnapshotInfo struct {
 	Name    string    `json:"name"`
 	Created time.Time `json:"created"`
+	Cluster string    `json:"cluster,omitempty"`
 }
 
 func snapshotsDir(clusterName string) (string, error) {
