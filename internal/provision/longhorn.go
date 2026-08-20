@@ -381,8 +381,9 @@ func longhornSidecarReplicaCount(storageNodes int) int {
 // replica-eligible set storageNodeCount derives: a control plane attracts
 // replicas only while the cluster is worker-less. Longhorn schedules onto
 // every node its manager runs on, and the manager tolerates the control-plane
-// taint (see longhornValues), so the cluster shape has to be expressed on the
-// node resource instead. Clearing spec.allowScheduling stops new replicas
+// taint whenever a control plane is or was replica-eligible (see
+// renderLonghornForPlacement), so the cluster shape has to be expressed on
+// the node resource too. Clearing spec.allowScheduling stops new replicas
 // without evicting copies a worker-less phase already placed there — replica
 // I/O beside etcd is what the taint exists to prevent.
 // LonghornSchedulingConverged is the matching observed-state probe: it gates
@@ -429,11 +430,16 @@ func longhornSchedulingConverged(ctx context.Context, client dynamic.Interface, 
 		if node.Role != cluster.RoleControlPlane {
 			continue
 		}
-		// A missing node resource is drift, not an absence to skip: the
-		// manager DaemonSet registers every node it runs on, so convergence
-		// cannot be claimed while a control plane has no Longhorn node.
+		// The manager DaemonSet registers every node it runs on, and
+		// renderLonghornForPlacement keeps it off the control planes of a
+		// worker-ful cluster, so there a missing node resource already is
+		// the reserved state. A worker-less cluster needs the manager on its
+		// control plane, so the same absence is drift.
 		live, err := nodes.Get(ctx, node.Name, metav1.GetOptions{})
 		if err != nil {
+			if apierrors.IsNotFound(err) && !allowScheduling {
+				continue
+			}
 			return fmt.Errorf("get longhorn node %q: %w", node.Name, err)
 		}
 		current, err := longhornNodeAllowsScheduling(live, node.Name)
@@ -463,10 +469,15 @@ func longhornNodeAllowsScheduling(live *unstructured.Unstructured, name string) 
 func setLonghornNodeScheduling(ctx context.Context, client dynamic.Interface, name string, allowScheduling bool) error {
 	nodes := client.Resource(longhornNodeResource).Namespace(longhornNamespace)
 	// longhorn-manager creates the node resource once its pod registers the
-	// node; the manager DaemonSet is Ready by this point, so a missing
-	// resource is a race worth retrying rather than a failure.
+	// node. A worker-ful cluster keeps the manager off its control planes
+	// (renderLonghornForPlacement), so no resource ever appears there and
+	// nothing needs clearing; a worker-less cluster runs the manager on the
+	// control plane, so a missing resource is a registration race to retry.
 	live, err := nodes.Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
+		if apierrors.IsNotFound(err) && !allowScheduling {
+			return nil
+		}
 		return fmt.Errorf("get longhorn node %q: %w", name, err)
 	}
 	current, err := longhornNodeAllowsScheduling(live, name)

@@ -455,20 +455,43 @@ func TestReconcileLonghornControlPlaneSchedulingFollowsWorkerCount(t *testing.T)
 	}
 }
 
-func TestReconcileLonghornControlPlaneSchedulingRetriesUntilTheNodeRegisters(t *testing.T) {
-	item, err := cluster.New("demo", 0, 1, 1, cluster.NodeDefaults{})
-	if err != nil {
-		t.Fatal(err)
+// A worker-ful cluster withholds the control-plane taint toleration, so
+// longhorn-manager never registers the control plane and no node resource
+// ever appears: that absence already is the reserved state. A worker-less
+// cluster is the opposite — the manager must run there, so a missing node is
+// a registration race worth waiting out.
+func TestReconcileLonghornControlPlaneSchedulingTreatsAMissingNodeByTopology(t *testing.T) {
+	tests := []struct {
+		name    string
+		workers int
+		wantErr bool
+	}{
+		{name: "worker-ful cluster converges without the node", workers: 1},
+		{name: "worker-less cluster waits for the node", workers: 0, wantErr: true},
 	}
-	client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
-		runtime.NewScheme(),
-		map[schema.GroupVersionResource]string{longhornNodeResource: "NodeList"},
-	)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	err = reconcileLonghornControlPlaneScheduling(ctx, client, item, time.Millisecond)
-	if err == nil || !strings.Contains(err.Error(), item.Nodes[0].Name) {
-		t.Fatalf("reconcileLonghornControlPlaneScheduling() error = %v, want the missing control plane node", err)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			item, err := cluster.New("demo", 0, 1, test.workers, cluster.NodeDefaults{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+				runtime.NewScheme(),
+				map[schema.GroupVersionResource]string{longhornNodeResource: "NodeList"},
+			)
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			err = reconcileLonghornControlPlaneScheduling(ctx, client, item, time.Millisecond)
+			if !test.wantErr {
+				if err != nil {
+					t.Fatalf("reconcileLonghornControlPlaneScheduling() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), item.Nodes[0].Name) {
+				t.Fatalf("reconcileLonghornControlPlaneScheduling() error = %v, want the missing control plane node", err)
+			}
+		})
 	}
 }
 
@@ -522,18 +545,36 @@ func TestLonghornSchedulingConvergedObservesBothDirections(t *testing.T) {
 	}
 }
 
-func TestLonghornSchedulingConvergedRequiresTheNodeResource(t *testing.T) {
-	item, err := cluster.New("demo", 0, 1, 1, cluster.NodeDefaults{})
-	if err != nil {
-		t.Fatal(err)
+func TestLonghornSchedulingConvergedTreatsAMissingNodeByTopology(t *testing.T) {
+	tests := []struct {
+		name    string
+		workers int
+		wantErr bool
+	}{
+		{name: "worker-ful cluster is converged without the node", workers: 1},
+		{name: "worker-less cluster has drifted without the node", workers: 0, wantErr: true},
 	}
-	client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
-		runtime.NewScheme(),
-		map[schema.GroupVersionResource]string{longhornNodeResource: "NodeList"},
-	)
-	err = longhornSchedulingConverged(context.Background(), client, item)
-	if err == nil || !strings.Contains(err.Error(), item.Nodes[0].Name) {
-		t.Fatalf("longhornSchedulingConverged() error = %v, want the missing control plane node", err)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			item, err := cluster.New("demo", 0, 1, test.workers, cluster.NodeDefaults{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+				runtime.NewScheme(),
+				map[schema.GroupVersionResource]string{longhornNodeResource: "NodeList"},
+			)
+			err = longhornSchedulingConverged(context.Background(), client, item)
+			if !test.wantErr {
+				if err != nil {
+					t.Fatalf("longhornSchedulingConverged() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), item.Nodes[0].Name) {
+				t.Fatalf("longhornSchedulingConverged() error = %v, want the missing control plane node", err)
+			}
+		})
 	}
 }
 
