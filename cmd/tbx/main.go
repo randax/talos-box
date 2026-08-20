@@ -464,31 +464,35 @@ func (c cli) destroyCluster(args []string) error {
 		Name  string `json:"name"`
 		Force bool   `json:"force"`
 	}{Name: positionals[0], Force: true}
-	if err := c.inspectDestroy(positionals[0], request); err != nil {
+	inspection, err := c.inspectDestroy(positionals[0], request)
+	if err != nil {
 		return err
 	}
-	if err := c.call("cluster.destroy", request, nil); err != nil {
+	var summary daemon.DestroySummary
+	if err := c.call("cluster.destroy", request, &summary); err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(c.out, "destroyed cluster %s\n", positionals[0])
-	return err
+	if _, err := fmt.Fprintf(c.out, "destroyed cluster %s\n", positionals[0]); err != nil {
+		return err
+	}
+	return printDestroySummary(c.out, summary, inspection)
 }
 
 func (c cli) inspectDestroy(name string, request struct {
 	Name  string `json:"name"`
 	Force bool   `json:"force"`
-}) error {
+}) (daemon.DestroyInspection, error) {
 	var inspection daemon.DestroyInspection
 	if err := c.call("cluster.destroy.inspect", request, &inspection); err != nil {
 		// A cluster that does not exist fails here rather than warning about
 		// data it cannot have; every other inspection failure still warns,
 		// since a partially-destroyed cluster may still hold volumes (#268).
 		if daemon.IsClusterMissing(err, name) {
-			return err
+			return daemon.DestroyInspection{}, err
 		}
-		return printWarning(c.err, daemon.DestroyInspectionDataLossWarning(name, ""))
+		return daemon.DestroyInspection{}, printWarning(c.err, daemon.DestroyInspectionDataLossWarning(name, ""))
 	}
-	return printWarning(c.err, inspection.Warning)
+	return inspection, printWarning(c.err, inspection.Warning)
 }
 
 func (c cli) runNode(args []string) error {

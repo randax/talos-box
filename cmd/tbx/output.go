@@ -181,6 +181,58 @@ func printStatus(output io.Writer, clusters []daemon.ClusterStatus, quiet bool) 
 }
 
 // encodeJSON writes indented JSON — the machine-readable face of list/status.
+// printDestroySummary accounts for what a destroy removed, so the scope of the
+// CLI's most destructive verb can be checked without a residue check by hand
+// (#422). Only lines the daemon actually reported are printed: an unknown
+// count is left out rather than printed as zero.
+func printDestroySummary(output io.Writer, summary daemon.DestroySummary, inspection daemon.DestroyInspection) error {
+	lines := []string{
+		fmt.Sprintf("%d node(s) removed", summary.Nodes),
+		fmt.Sprintf("%s reclaimed (%d bytes)", humanBytes(summary.DiskBytes), summary.DiskBytes),
+	}
+	if summary.Snapshots > 0 {
+		lines = append(lines, fmt.Sprintf("%d snapshot(s) deleted", summary.Snapshots))
+	}
+	switch {
+	case summary.ResolverWithdrawn:
+		lines = append(lines, fmt.Sprintf("resolver entry for %s withdrawn", summary.Domain))
+	case summary.Domain != "":
+		// the default domain's resolver file is shared, so only the cluster's
+		// own records went with it
+		lines = append(lines, fmt.Sprintf("DNS records for %s withdrawn", summary.Domain))
+	}
+	if inspection.Volumes > 0 {
+		engine := strings.TrimSpace(string(inspection.CSI))
+		if engine != "" {
+			engine += " "
+		}
+		lines = append(lines, fmt.Sprintf("%d %svolume(s) deleted with the cluster (warned above)", inspection.Volumes, engine))
+	}
+	for _, line := range lines {
+		if _, err := fmt.Fprintf(output, "  %s\n", line); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// humanBytes renders a byte count at the scale an operator reads it in; the
+// exact count is printed alongside it wherever it matters.
+func humanBytes(size int64) string {
+	const unit = 1024
+	if size < unit {
+		return fmt.Sprintf("%d B", size)
+	}
+	value := float64(size)
+	units := []string{"KiB", "MiB", "GiB", "TiB", "PiB"}
+	index := -1
+	for value >= unit && index < len(units)-1 {
+		value /= unit
+		index++
+	}
+	return fmt.Sprintf("%.1f %s", value, units[index])
+}
+
 func encodeJSON(output io.Writer, value any) error {
 	encoder := json.NewEncoder(output)
 	encoder.SetIndent("", "  ")
