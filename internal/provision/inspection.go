@@ -1,6 +1,7 @@
 package provision
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -312,7 +313,8 @@ func inspectProvisioning(item cluster.Cluster) (inspection, error) {
 func storageInspection(item cluster.Cluster) (string, error) {
 	quoted := shellquote.Quote(item.Name)
 	sections := []string{fmt.Sprintf("# Storage machine-config prerequisite patch (apply to every node before installing any CSI):\n#   tbx manifests %s storage-machine > storage-machine.yaml\n# Nodes that have no machine config yet (maintenance mode) cannot be patched; fold the document\n# into the config you generate, before apply-config:\n#   talosctl gen config %s https://<cp-ip>:6443 --config-patch @storage-machine.yaml\n#   talosctl apply-config --insecure --nodes <node-ip> --file controlplane.yaml|worker.yaml\n# Nodes that are already configured take the patch directly:\n#   talosctl patch mc -p @storage-machine.yaml --nodes <node-ip>\n%s", quoted, quoted, manifests.StoragePrerequisiteKubeletMounts())}
-	sections = append(sections, "# After the machine-config patch and before a BYO CSI install, create its namespace if needed and label it for Pod Security Admission:\n#   kubectl create namespace <your-csi-namespace> --dry-run=client -o yaml | kubectl apply -f -\n#   kubectl label namespace <your-csi-namespace> pod-security.kubernetes.io/enforce=privileged pod-security.kubernetes.io/audit=privileged pod-security.kubernetes.io/warn=privileged --overwrite\n# Curated CSI namespace streams carry their own PSA labels. BYO CSI remains unsupported above the substrate.")
+	sections = append(sections, "# After the machine-config patch and before a BYO CSI install, create its namespace if needed and label it for Pod Security Admission:\n#   kubectl create namespace <your-csi-namespace> --dry-run=client -o yaml | kubectl apply -f -\n#   kubectl label namespace <your-csi-namespace> pod-security.kubernetes.io/enforce=privileged pod-security.kubernetes.io/audit=privileged pod-security.kubernetes.io/warn=privileged --overwrite\n# Curated CSI namespace streams carry their own PSA labels. BYO CSI remains unsupported above the substrate.\n")
+	sections = append(sections, upstreamLocalPathConfigMapNote())
 	if item.CSI == cluster.CSILonghorn {
 		values, err := storageInspectionValues(item)
 		if err != nil {
@@ -340,6 +342,33 @@ func storageInspection(item cluster.Cluster) (string, error) {
 		}
 	}
 	return strings.Join(sections, "---\n"), nil
+}
+
+// upstreamLocalPathDefaultVolume is the path upstream local-path-provisioner's
+// shipped ConfigMap defaults to. tbx does not use it; it is named only so the
+// printed guidance can point at the mismatch it resolves.
+const upstreamLocalPathDefaultVolume = "/opt/local-path-provisioner"
+
+// upstreamLocalPathConfigMapNote reconciles the printed bind mount with
+// upstream local-path-provisioner. The mount is tbx's own curated path, and the
+// curated CSI writes there; upstream's shipped ConfigMap defaults elsewhere, so
+// a reader who applies the upstream manifest after the printed prerequisite
+// would otherwise get a bind mount nothing uses — silently (#409).
+func upstreamLocalPathConfigMapNote() string {
+	const nodePathMap = `{"nodePathMap":[{"node":"DEFAULT_PATH_FOR_NON_LISTED_NODES","paths":["%s"]}]}`
+	config, err := json.Marshal(fmt.Sprintf(nodePathMap, manifests.LocalPathVolume))
+	if err != nil {
+		// Marshalling a string cannot fail; fall back to the literal rather
+		// than growing an error path through every storage render.
+		config = []byte(`""`)
+	}
+	return fmt.Sprintf(`# If your BYO CSI is upstream local-path-provisioner, its shipped ConfigMap writes to
+#   %s, which is NOT the %s the patch above mounts.
+# Repoint it before creating PVCs, or the bind mount is never used and volume data lands outside it:
+#   kubectl -n %s patch configmap %s --type merge -p '{"data":{"config.json":%s}}'
+#   kubectl -n %s rollout restart deployment/%s
+# tbx's own curated local-path CSI (csi: local-path) already ships this path.
+`, upstreamLocalPathDefaultVolume, manifests.LocalPathVolume, localPathNamespace, localPathConfigMap, config, localPathNamespace, localPathProvisionerName)
 }
 
 func storageInspectionValues(item cluster.Cluster) (string, error) {
@@ -447,7 +476,7 @@ func machinePrerequisitePatch(item cluster.Cluster) string {
 	// module. This is printed-inspection output only — curated provisioning
 	// still applies no balloon patch of its own.
 	patch += manifests.BalloonModule(manifestFacts(item))
-	return patch + catchAllMirrorDocument(item.SubnetIndex)
+	return patch + "---\n" + catchAllMirrorDocument(item.SubnetIndex)
 }
 
 func encodeInspectionObjects(objects []unstructured.Unstructured) (string, error) {

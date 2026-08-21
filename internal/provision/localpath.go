@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/manifests"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/discovery"
@@ -29,7 +30,7 @@ const (
 	localPathConfigMap        = "local-path-config"
 	localPathProvisionerImage = "docker.io/rancher/local-path-provisioner:v0.0.37"
 	localPathHelperImage      = "docker.io/library/busybox:1.37.0"
-	localPathNodePath         = "/var/local-path-provisioner"
+	localPathNodePath         = manifests.LocalPathVolume
 )
 
 //go:embed assets/local-path-storage-0.0.37.yaml
