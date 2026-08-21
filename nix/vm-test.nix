@@ -47,12 +47,12 @@ let
       connection.connect("/var/run/tbx-helper.sock")
       request = {
           "op": "helper.info",
-          "args": {"protocolVersion": 2},
+          "args": {"protocolVersion": 3},
       }
       connection.sendall(json.dumps(request).encode() + b"\n")
       response = json.loads(connection.makefile().readline())
       assert response["ok"], response
-      assert response["data"]["protocolVersion"] == 2, response
+      assert response["data"]["protocolVersion"] == 3, response
     '';
   };
 in

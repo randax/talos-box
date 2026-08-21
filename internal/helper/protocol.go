@@ -21,6 +21,10 @@ const (
 	// router. A version 2 helper therefore reports no routes for a speaker that is
 	// announcing, and leaves the cross-cluster BGP-VIP path dead; refusing the
 	// handshake sends the operator to a reinstall instead of a wrong answer.
+	//
+	// Bumping this also means bumping the literal in nix/vm-test.nix: the NixOS
+	// smoke test's helper-probe performs this handshake against the packaged
+	// helper, and `nix flake check` fails on a mismatch.
 	protocolVersion = 3
 	helperInfoOp    = "helper.info"
 )
