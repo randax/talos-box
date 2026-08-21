@@ -43,7 +43,10 @@ func TestHints(t *testing.T) {
 		{
 			name:  "maintenance node suggests config workflow",
 			nodes: []NodeStatus{node("demo-cp-1", PhaseMaintenance)},
-			want:  []string{"talosctl gen config", "apply-config --insecure"},
+			// The read-only probe is printed alongside the mutating
+			// apply-config hint so a reader can check a node without
+			// configuring it (#435).
+			want: []string{"talosctl version --insecure --nodes 172.30.0.2", "talosctl gen config", "apply-config --insecure"},
 		},
 		{
 			name:  "all configured suggests bootstrap and the dashboard",
