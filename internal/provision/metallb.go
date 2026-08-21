@@ -64,9 +64,13 @@ type MetalLBReconciler struct {
 	HTTPClient   *http.Client
 }
 
-// LiveVIP returns the durable tbx probe VIP only after both Kubernetes has
-// assigned it and the host can receive a successful response through the
-// selected CNI's announcement path.
+// LiveVIP reports the durable tbx probe VIP and whether it is answering, as
+// two independent values. The string is the announced VIP: empty until
+// Kubernetes has assigned the expected 172.30.<subnet>.200 to the probe
+// LoadBalancer service, non-empty from that point on. The bool is true only
+// when the host also received a 200 back through the selected CNI's
+// announcement path, so a non-empty VIP with a false bool means "announced but
+// not yet answering" rather than "no VIP" (#427).
 func LiveVIP(ctx context.Context, item cluster.Cluster, kubeconfig []byte) (string, bool) {
 	if (item.CNI != cluster.CNIFlannel && item.CNI != cluster.CNICilium) || !item.LB {
 		return "", false
