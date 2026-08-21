@@ -92,7 +92,7 @@ var groupUsages = map[string]string{
 	"cluster":  "usage: tbx cluster create|start|stop|suspend|resume|destroy|list",
 	"node":     "usage: tbx node add <cluster> [node] | remove|start|stop <cluster> <node>",
 	"snapshot": "usage: tbx snapshot create|restore|list|delete",
-	"cache":    "usage: tbx cache pull|prune|warm|list [-o json]",
+	"cache":    "usage: tbx cache pull|prune|warm|list [<image-ref>] [-o json]",
 	"system":   "usage: tbx system install|uninstall|restart [--force]|status",
 	"mirror":   "usage: tbx mirror offline [on|off]",
 	"bgp":      "usage: tbx bgp enable|disable <cluster> [--quiet]",
@@ -705,11 +705,14 @@ func (c cli) runCache(args []string) error {
 		if err != nil {
 			return err
 		}
-		if len(positionals) != 0 {
-			return errors.New("usage: tbx cache list [-o json]")
+		if len(positionals) > 1 {
+			return errors.New("usage: tbx cache list [-o json] [<image-ref>]")
 		}
 		if err := validateOutputFormat(*outputFormat); err != nil {
 			return err
+		}
+		if len(positionals) == 1 {
+			return c.runCacheListRef(positionals[0], *outputFormat)
 		}
 		var result daemon.CacheListResult
 		if err := c.call("cache.list", struct{}{}, &result); err != nil {
@@ -780,7 +783,7 @@ Commands:
   console <cluster> <node>
   bgp enable|disable <cluster> [--quiet]
   mirror offline [on|off]
-  cache pull|prune|warm|list [-o json]
+  cache pull|prune|warm|list [<image-ref>] [-o json]
   system install|uninstall|restart [--force]|status
   doctor
   version (also --version, -v)

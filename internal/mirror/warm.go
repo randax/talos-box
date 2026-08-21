@@ -18,12 +18,20 @@ type WarmSummary struct {
 	Warmed          int
 	AlreadyComplete int
 	Failed          int
+	// ReResolvedTags counts the tag-pinned refs whose tag was resolved
+	// upstream again. That resolution is what a re-warm of an already
+	// complete list spends its time on, so the summary can explain the
+	// cost instead of looking like a download (#405).
+	ReResolvedTags int
 }
 
 type WarmResult struct {
 	Ref             string
 	AlreadyComplete bool
-	Error           string
+	// ReResolvedTag records that this ref named a tag and the tag was
+	// re-resolved against the upstream registry.
+	ReResolvedTag bool
+	Error         string
 }
 
 type warmReference struct {
@@ -43,6 +51,9 @@ func (m *Manager) Warm(ctx context.Context, references []string, architecture im
 			continue
 		}
 		summary.Results = append(summary.Results, result)
+		if result.ReResolvedTag {
+			summary.ReResolvedTags++
+		}
 		if result.AlreadyComplete {
 			summary.AlreadyComplete++
 		} else {
@@ -123,6 +134,9 @@ func (m *Manager) warmOne(ctx context.Context, reference, hostArch string) (Warm
 			if err := server.storeManifest(staged.requestPath, staged.metadata, staged.data); err != nil {
 				return WarmResult{}, fmt.Errorf("publish listed manifest: %w", err)
 			}
+			// A staged manifest is one the refresh fetched upstream: the tag
+			// was resolved again, whether or not anything was downloaded.
+			result.ReResolvedTag = true
 		case cachedBefore && server.offlineEnabled():
 			// offline replay answered the listed tag from the cache, so the
 			// entry it would republish is already on disk. Online, an empty

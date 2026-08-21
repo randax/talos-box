@@ -319,6 +319,10 @@ type CacheWarmEntry struct {
 	Ref    string          `json:"ref"`
 	Status CacheWarmStatus `json:"status"`
 	Reason string          `json:"reason,omitempty"`
+	// ReResolvedTag records that the ref named a tag and the tag was
+	// resolved upstream again, which is where a no-op re-warm spends its
+	// time. An older daemon leaves it unset (#405).
+	ReResolvedTag bool `json:"reResolvedTag,omitempty"`
 }
 
 type CacheWarmResult struct {
@@ -326,6 +330,8 @@ type CacheWarmResult struct {
 	Warmed          int              `json:"warmed"`
 	AlreadyComplete int              `json:"alreadyComplete"`
 	Failed          int              `json:"failed"`
+	// ReResolvedTags counts the entries whose tag was re-resolved upstream.
+	ReResolvedTags int `json:"reResolvedTags,omitempty"`
 }
 
 const cacheWarmTimeout = 2 * time.Hour
@@ -361,6 +367,11 @@ type CacheImageEntry struct {
 	// daemon leaves them empty, which the client renders as no status.
 	Status   CacheImageStatus `json:"status,omitempty"`
 	Clusters []string         `json:"clusters,omitempty"`
+	// Reasons is every keep-reason that applies, strongest last, so the
+	// listing shows what a prune weighs instead of one masking reason
+	// (#407). Status stays the single strongest one. An older daemon
+	// reports none, which the client renders from Status alone.
+	Reasons []CacheImageStatus `json:"reasons,omitempty"`
 	// Incomplete marks a combination with prunable leftovers but no usable
 	// image. It is listed so the preview covers everything prune removes.
 	Incomplete bool `json:"incomplete,omitempty"`
@@ -1559,7 +1570,7 @@ func (s *Server) listCache() (CacheListResult, error) {
 		return CacheListResult{}, err
 	}
 	for _, entry := range entries {
-		status, clusters, err := classifier.status(imagecache.Combination{
+		reasons, clusters, err := classifier.statuses(imagecache.Combination{
 			Schematic:    entry.Schematic,
 			Version:      entry.Version,
 			Architecture: entry.Architecture,
@@ -1573,7 +1584,8 @@ func (s *Server) listCache() (CacheListResult, error) {
 			Architecture:  string(entry.Architecture),
 			Size:          entry.Size,
 			AllocatedSize: entry.AllocatedSize,
-			Status:        status,
+			Status:        primaryCacheImageStatus(reasons),
+			Reasons:       reasons,
 			Clusters:      clusters,
 			Incomplete:    entry.Incomplete,
 		})

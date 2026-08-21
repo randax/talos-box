@@ -125,3 +125,57 @@ func TestCacheImageLineReportsAllocatedSize(t *testing.T) {
 		t.Fatalf("cacheImageLine without allocated size = %q, want %q", got, want)
 	}
 }
+
+// TestCacheImageStatusSuffixShowsEveryKeepReason: a pinned image that is also
+// in use survives a prune for both reasons, and the preview has to say so
+// instead of letting `in-use` mask `pinned` (#407).
+func TestCacheImageStatusSuffixShowsEveryKeepReason(t *testing.T) {
+	for _, testCase := range []struct {
+		name  string
+		entry daemon.CacheImageEntry
+		want  string
+	}{
+		{
+			name: "pinned and in use",
+			entry: daemon.CacheImageEntry{
+				Status:   daemon.CacheImageStatusInUse,
+				Reasons:  []daemon.CacheImageStatus{daemon.CacheImageStatusPinned, daemon.CacheImageStatusInUse},
+				Clusters: []string{"qa-mir"},
+			},
+			want: " pinned, in-use (qa-mir)",
+		},
+		{
+			name: "pinned only",
+			entry: daemon.CacheImageEntry{
+				Status:  daemon.CacheImageStatusPinned,
+				Reasons: []daemon.CacheImageStatus{daemon.CacheImageStatusPinned},
+			},
+			want: " pinned",
+		},
+		{
+			name: "orphan",
+			entry: daemon.CacheImageEntry{
+				Status:  daemon.CacheImageStatusOrphan,
+				Reasons: []daemon.CacheImageStatus{daemon.CacheImageStatusOrphan},
+			},
+			want: " orphan",
+		},
+		{
+			// An older daemon reports only the single status.
+			name:  "status without reasons",
+			entry: daemon.CacheImageEntry{Status: daemon.CacheImageStatusInUse, Clusters: []string{"qa-mir"}},
+			want:  " in-use (qa-mir)",
+		},
+		{
+			name:  "no status at all",
+			entry: daemon.CacheImageEntry{},
+			want:  "",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := cacheImageStatusSuffix(testCase.entry); got != testCase.want {
+				t.Fatalf("cacheImageStatusSuffix = %q, want %q", got, testCase.want)
+			}
+		})
+	}
+}

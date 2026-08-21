@@ -201,6 +201,7 @@ func NewServer(ctx context.Context) (*Server, error) {
 			Warmed:          summary.Warmed,
 			AlreadyComplete: summary.AlreadyComplete,
 			Failed:          summary.Failed,
+			ReResolvedTags:  summary.ReResolvedTags,
 			Entries:         make([]CacheWarmEntry, 0, len(summary.Results)),
 		}
 		for _, entry := range summary.Results {
@@ -211,9 +212,10 @@ func NewServer(ctx context.Context) (*Server, error) {
 				status = CacheWarmStatusAlreadyComplete
 			}
 			result.Entries = append(result.Entries, CacheWarmEntry{
-				Ref:    entry.Ref,
-				Status: status,
-				Reason: entry.Error,
+				Ref:           entry.Ref,
+				Status:        status,
+				Reason:        entry.Error,
+				ReResolvedTag: entry.ReResolvedTag,
 			})
 		}
 		return result, nil
