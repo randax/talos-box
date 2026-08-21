@@ -88,10 +88,14 @@ node — capped at 3, so a bare PVC just works. `tbx status` reports storage as
 provisioning until a real write/readback probe passes, then live; a single-node Longhorn
 cluster is reminded its volumes have no redundancy, and Longhorn on a memory-tight host gets a
 soft warning. Adding `csi:` to an already-provisioned cluster is just `tbx up`; switching or
-removing it is refused while the engine holds volumes. Only `tbx cluster destroy` deletes
+removing it is refused while the engine holds volumes, and the refusal names them. Only `tbx cluster destroy` deletes
 data wholesale, and its confirmation reports the volume count. `tbx node remove` deletes that
 node's disk, so it is refused while the node holds the only copy of volume data
 (`--force` overrides); an unreachable cluster never blocks removal — it warns instead.
+Reading Longhorn volume health straight after a probe, a snapshot restart or a deleted PVC
+can show a `volumes.longhorn.io` object in `deleting`/`degraded` with no PVC or PV behind it.
+That is Longhorn converging, not damage or a leak: it clears itself, and tbx deletes the
+volume behind its own probe as soon as the claim it belongs to goes.
 
 Every imperative command prints the equivalent `talosbox.yaml` stanza. Alternatively, work
 declaratively from the start: write a `talosbox.yaml` and run `tbx up` (idempotent — it

@@ -3,6 +3,7 @@ package provision
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -56,6 +57,48 @@ func TestCountProvisionedStorageVolumesCountsOnlyMatchingEnginePVs(t *testing.T)
 	}
 	if count != 1 {
 		t.Fatalf("countProvisionedStorageVolumes() = %d, want 1", count)
+	}
+}
+
+// The csi gate refuses on these names, so they have to be the ones an operator
+// can act on: the claim, sorted, and the volume itself where the claim
+// reference is already gone (#393).
+func TestProvisionedStorageVolumeClaimsNamesTheClaims(t *testing.T) {
+	client := kubernetesfake.NewClientset(
+		&corev1.PersistentVolume{
+			ObjectMeta: metav1.ObjectMeta{Name: "pvc-logs"},
+			Spec: corev1.PersistentVolumeSpec{
+				StorageClassName: longhornStorageClass,
+				ClaimRef:         &corev1.ObjectReference{Namespace: "app", Name: "logs"},
+			},
+		},
+		&corev1.PersistentVolume{
+			ObjectMeta: metav1.ObjectMeta{Name: "pvc-data"},
+			Spec: corev1.PersistentVolumeSpec{
+				StorageClassName: longhornStorageClass,
+				ClaimRef:         &corev1.ObjectReference{Namespace: "app", Name: "data"},
+			},
+		},
+		&corev1.PersistentVolume{
+			ObjectMeta: metav1.ObjectMeta{Name: "pvc-released"},
+			Spec:       corev1.PersistentVolumeSpec{StorageClassName: longhornStorageClass},
+		},
+		&corev1.PersistentVolume{
+			ObjectMeta: metav1.ObjectMeta{Name: "probe-residue"},
+			Spec: corev1.PersistentVolumeSpec{
+				StorageClassName: longhornStorageClass,
+				ClaimRef:         &corev1.ObjectReference{Namespace: probeNamespace, Name: storageProbePVCName},
+			},
+		},
+	)
+
+	claims, err := provisionedStorageVolumeClaims(context.Background(), client, cluster.CSILonghorn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"app/data", "app/logs", "pvc-released"}
+	if !slices.Equal(claims, want) {
+		t.Fatalf("provisionedStorageVolumeClaims() = %v, want %v", claims, want)
 	}
 }
 
@@ -454,6 +497,111 @@ func TestDeleteRenderedStorageObjectsRecoversFromInterruptedRun(t *testing.T) {
 	}
 }
 
+// Longhorn's admission webhooks fail closed: once their Service is gone they
+// reject every PVC bind in the cluster and hold longhorn-system in Terminating
+// (#386). Teardown therefore has to take the cluster-wide objects down first —
+// webhook configurations and StorageClasses, the latter so no class advertises
+// an engine the cluster no longer runs (#394).
+func TestStorageDeletionOrderTakesClusterWideObjectsDownFirst(t *testing.T) {
+	objects := storageLifecycleObjects(t, cluster.CSILonghorn)
+	ordered := storageDeletionOrder(objects)
+
+	names := map[string]int{}
+	for i, object := range ordered {
+		names[object.GetKind()+"/"+object.GetName()] = i
+	}
+	service, ok := names["Service/"+longhornAdmissionWebhookService]
+	if !ok {
+		t.Fatalf("rendered Longhorn objects do not contain the %q Service", longhornAdmissionWebhookService)
+	}
+	manager, ok := names["DaemonSet/"+longhornManagerName]
+	if !ok {
+		t.Fatalf("rendered Longhorn objects do not contain the %q DaemonSet", longhornManagerName)
+	}
+	for _, key := range []string{
+		"ValidatingWebhookConfiguration/" + longhornValidatingWebhookName,
+		"MutatingWebhookConfiguration/" + longhornMutatingWebhookName,
+		"StorageClass/" + longhornStaticStorageClass,
+		"StorageClass/" + longhornStorageClass,
+	} {
+		position, ok := names[key]
+		if !ok {
+			t.Fatalf("storage deletion order is missing %s", key)
+		}
+		if position > service {
+			t.Fatalf("%s is deleted at %d, after the webhook Service at %d", key, position, service)
+		}
+		// The controllers go first or they simply reinstall what this move
+		// deletes (#338).
+		if position < manager {
+			t.Fatalf("%s is deleted at %d, before the manager DaemonSet at %d", key, position, manager)
+		}
+	}
+	last := ordered[len(ordered)-1]
+	if last.GetKind() != "Namespace" {
+		t.Fatalf("last deletion = %s/%s, want the Namespace", last.GetKind(), last.GetName())
+	}
+}
+
+// Adopting longhorn-manager's own cluster-scoped objects must not adopt a
+// user's object that merely shares the name: the guard reads identity, and
+// anything else stays refused.
+func TestLonghornOwnedRuntimeObjectReadsIdentityNotName(t *testing.T) {
+	tests := []struct {
+		name  string
+		live  *unstructured.Unstructured
+		owned bool
+	}{
+		{
+			name:  "webhook configuration served by longhorn",
+			live:  longhornRuntimeTestObject(t, "ValidatingWebhookConfiguration", longhornValidatingWebhookName, longhornNamespace),
+			owned: true,
+		},
+		{
+			name: "webhook configuration served from elsewhere",
+			live: longhornRuntimeTestObject(t, "MutatingWebhookConfiguration", longhornMutatingWebhookName, "team-admission"),
+		},
+		{
+			name: "webhook configuration with no webhooks at all",
+			live: &unstructured.Unstructured{Object: map[string]any{
+				"apiVersion": "admissionregistration.k8s.io/v1",
+				"kind":       "ValidatingWebhookConfiguration",
+				"metadata":   map[string]any{"name": longhornValidatingWebhookName},
+			}},
+		},
+		{
+			name:  "static class provisioned by longhorn",
+			live:  storageLifecycleLiveForm(&longhornRuntimeObjects()[2]),
+			owned: true,
+		},
+		{
+			name: "static class provisioned by something else",
+			live: &unstructured.Unstructured{Object: map[string]any{
+				"apiVersion":  "storage.k8s.io/v1",
+				"kind":        "StorageClass",
+				"metadata":    map[string]any{"name": longhornStaticStorageClass},
+				"provisioner": "rancher.io/local-path",
+			}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := longhornOwnedRuntimeObject(test.live); got != test.owned {
+				t.Fatalf("longhornOwnedRuntimeObject() = %t, want %t", got, test.owned)
+			}
+		})
+	}
+}
+
+func longhornRuntimeTestObject(t *testing.T, kind, name, webhookNamespace string) *unstructured.Unstructured {
+	t.Helper()
+	object := clusterScopedIdentity("admissionregistration.k8s.io/v1", kind, name)
+	if err := unstructured.SetNestedSlice(object.Object, []any{longhornWebhookEntry(webhookNamespace)}, "webhooks"); err != nil {
+		t.Fatal(err)
+	}
+	return &object
+}
+
 func storageLifecycleObjects(t *testing.T, engine cluster.CSI) []unstructured.Unstructured {
 	t.Helper()
 	objects, err := storageObjectsForEngine(engine)
@@ -498,10 +646,43 @@ func storageLifecycleTestResource(t *testing.T, client *dynamicfake.FakeDynamicC
 func createStorageLifecycleObjects(t *testing.T, client *dynamicfake.FakeDynamicClient, mapper meta.RESTMapper, objects []unstructured.Unstructured) {
 	t.Helper()
 	for i := range objects {
-		object := objects[i].DeepCopy()
+		object := storageLifecycleLiveForm(&objects[i])
 		if _, err := storageLifecycleTestResource(t, client, mapper, object).Create(context.Background(), object, metav1.CreateOptions{}); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// storageLifecycleLiveForm fills in what longhorn-manager writes on the
+// cluster-scoped objects tbx renders as bare identities (longhornRuntimeObjects).
+// The ownership guard reads exactly those fields, so a live cluster holds them
+// and a fixture that omitted them would prove nothing.
+func storageLifecycleLiveForm(object *unstructured.Unstructured) *unstructured.Unstructured {
+	live := object.DeepCopy()
+	switch live.GetKind() {
+	case "ValidatingWebhookConfiguration", "MutatingWebhookConfiguration":
+		if err := unstructured.SetNestedSlice(live.Object, []any{longhornWebhookEntry(longhornNamespace)}, "webhooks"); err != nil {
+			panic(err)
+		}
+	case "StorageClass":
+		if live.GetName() == longhornStaticStorageClass {
+			if err := unstructured.SetNestedField(live.Object, longhornProvisioner, "provisioner"); err != nil {
+				panic(err)
+			}
+		}
+	}
+	return live
+}
+
+func longhornWebhookEntry(namespace string) map[string]any {
+	return map[string]any{
+		"name": "validator.longhorn.io",
+		"clientConfig": map[string]any{
+			"service": map[string]any{
+				"name":      longhornAdmissionWebhookService,
+				"namespace": namespace,
+			},
+		},
 	}
 }
 

@@ -36,7 +36,7 @@ Pass criteria: end state reached; epoch-one data committed.
 
 Steps:
 1. `tbx snapshot create qa-snap epoch1 --yes` — cluster stops, snapshots, restarts.
-2. After restart: cluster reconverges to the full end state (VIP live, Longhorn healthy) without intervention; `epoch-one` data intact. Record reconvergence time. Longhorn needs a settle window: the volume comes back `degraded` and rebuilds to `healthy` within ~10 s, so poll `kubectl -n longhorn-system get volumes.longhorn.io` for up to 60 s before scoring it — a single early sample recording `degraded` is a false FAIL.
+2. After restart: cluster reconverges to the full end state (VIP live, Longhorn healthy) without intervention; `epoch-one` data intact. Record reconvergence time. Longhorn needs a settle window: the volume comes back `degraded` and rebuilds to `healthy` within ~10 s, so poll `kubectl -n longhorn-system get volumes.longhorn.io` for up to 60 s before scoring it — a single early sample recording `degraded` is a false FAIL. A second volume with no PVC or PV behind it may appear in `deleting`/`degraded` in the same window; it is Longhorn converging and clears itself, so score it only if it is still there after several minutes.
 
 Expected observations: a provisioned cluster survives its own snapshot cycle: etcd quorum returns, CNI and storage come back on their own.
 

@@ -86,6 +86,29 @@ func countDestroyStorageVolumes(ctx context.Context, item cluster.Cluster) (int,
 	})
 }
 
+// listStorageVolumeClaims names the claims a curated engine still serves. The
+// csi gate refuses on them, so the refusal can point at the volumes to delete
+// rather than only count them (#393); it shares the destroy probe's retry
+// schedule because it reads the same objects through the same cold API server.
+func listStorageVolumeClaims(ctx context.Context, item cluster.Cluster) ([]string, error) {
+	kubeconfig, err := clusterKubeconfig(item.Name)
+	if err != nil {
+		return nil, fmt.Errorf("read kubeconfig for storage volume inspection: %w", err)
+	}
+	var claims []string
+	if _, err := defaultDestroyCountSchedule.count(ctx, func(probeCtx context.Context) (int, error) {
+		found, err := provision.ProvisionedStorageVolumeClaims(probeCtx, kubeconfig, item.CSI)
+		if err != nil {
+			return 0, err
+		}
+		claims = found
+		return len(found), nil
+	}); err != nil {
+		return nil, err
+	}
+	return claims, nil
+}
+
 // destroyCountSchedule bounds the volume-count probe: every attempt gets its
 // own timeout, and attempts that can still heal are retried until the budget
 // runs out. Without the retry a cold-booted API server — which answers authz

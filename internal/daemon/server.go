@@ -70,6 +70,7 @@ type Server struct {
 	provisionReconcile    provisionReconcileFunc
 	storageProbe          func(context.Context, []byte) error
 	destroyVolumeCount    func(context.Context, cluster.Cluster) (int, error)
+	storageVolumeClaims   func(context.Context, cluster.Cluster) ([]string, error)
 	nodeVolumeCount       nodeVolumeCountFunc
 	storageEngineDelete   func(context.Context, cluster.Cluster) error
 	storageEngineValidate func(context.Context, cluster.Cluster) error
@@ -182,6 +183,7 @@ func NewServer(ctx context.Context) (*Server, error) {
 		hostFreeMemory:        balloon.HostFreeMiB,
 		hostTotalMemory:       balloon.HostTotalMiB,
 		destroyVolumeCount:    countDestroyStorageVolumes,
+		storageVolumeClaims:   listStorageVolumeClaims,
 		nodeVolumeCount:       countNodeRemovalStorageVolumes,
 		storageEngineDelete:   deleteConfiguredStorageEngine,
 		storageEngineValidate: validateConfiguredStorageEngine,

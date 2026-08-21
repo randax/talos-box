@@ -521,6 +521,33 @@ func TestLonghornSchedulingConvergedRequiresTheNodeOnlyWhereTheManagerRuns(t *te
 	testMissingLonghornNodeFollowsManagerReach(t, longhornSchedulingConverged)
 }
 
+// The default layout — one control plane, two workers — is where every
+// `tbx cluster create --csi longhorn` burned its whole provisioning deadline
+// waiting for a nodes.longhorn.io resource longhorn-manager can never create,
+// because the manager is kept off those control planes in the first place
+// (#385). Both the reconcile and its convergence probe have to return on the
+// spot here, so the guard is a deadline neither can outlast rather than a
+// cancelled context that would pass whatever they did.
+func TestLonghornSchedulingConvergesOnTheDefaultLayout(t *testing.T) {
+	item, err := cluster.New("qa", 0, 1, 2, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	objects := make([]runtime.Object, 0, len(item.Nodes))
+	for _, node := range item.Nodes[1:] {
+		objects = append(objects, longhornNodeCR(node.Name, true))
+	}
+	client := longhornFakeClient(objects...)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := reconcileLonghornControlPlaneScheduling(ctx, client, item, time.Millisecond); err != nil {
+		t.Fatalf("reconcileLonghornControlPlaneScheduling() error = %v, want nil", err)
+	}
+	if err := longhornSchedulingConverged(ctx, client, item); err != nil {
+		t.Fatalf("longhornSchedulingConverged() error = %v, want nil", err)
+	}
+}
+
 // The Longhorn node resource is the only barrier once longhorn-manager
 // tolerates the control-plane taint, so a drifted spec.allowScheduling has to
 // fail convergence or the fast no-op would hide it forever.
