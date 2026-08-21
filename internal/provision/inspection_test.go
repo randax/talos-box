@@ -606,3 +606,50 @@ func TestCiliumValuesRefusalNamesTheRunnableCommand(t *testing.T) {
 		t.Fatalf("cilium-values refusal with unsafe name = %v, want the quoted redirect", err)
 	}
 }
+
+// The printed BYO-storage prerequisite mounts tbx's curated local-path path,
+// which is NOT where upstream local-path-provisioner writes by default. The
+// guidance must name that mismatch and the ConfigMap edit that resolves it,
+// otherwise a reader who applies the upstream manifest gets an unused bind
+// mount and never learns it (#409).
+func TestStorageInspectionNamesUpstreamLocalPathConfigMapEdit(t *testing.T) {
+	item := cluster.Cluster{Name: "demo", SubnetIndex: 3, Nodes: []cluster.Node{{Role: cluster.RoleControlPlane}}}
+	got, err := RenderInspection(item, "storage")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"/opt/local-path-provisioner",
+		manifests.LocalPathVolume,
+		"local-path-config",
+		"rollout restart",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("storage guidance missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// No section may open with a document separator: a leading `---` used to appear
+// on `mirrors` and `machine` but not on `lb-pool` or `l2`, which made the
+// renders inconsistent to read and to diff (#424). Separators stay *between*
+// documents inside a multi-document section.
+func TestRenderInspectionSectionsNeverLeadWithSeparator(t *testing.T) {
+	item := cluster.Cluster{
+		Name:               "demo",
+		SubnetIndex:        7,
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true, BGP: true, CSI: cluster.CSILocalPath},
+		Nodes:              []cluster.Node{{Role: cluster.RoleControlPlane}},
+	}
+	for _, section := range InspectionSections() {
+		t.Run(section, func(t *testing.T) {
+			got, err := RenderInspection(item, section)
+			if err != nil {
+				t.Skipf("section %q unavailable for this cluster: %v", section, err)
+			}
+			if strings.HasPrefix(got, "---") {
+				t.Fatalf("section %q leads with a document separator:\n%s", section, got)
+			}
+		})
+	}
+}

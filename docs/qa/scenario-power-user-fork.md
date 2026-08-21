@@ -28,8 +28,8 @@ BLOCKED unless: doctor clean; no cluster `qa-fork`; `talosctl` installed; ≥ 8 
 
 Steps:
 1. `tbx cluster create qa-fork --domain forge.internal`
-2. `tbx status qa-fork` — three `maintenance` nodes; hints show the `talosctl --insecure` probe.
-3. Run the printed probe verbatim against a node.
+2. `tbx status qa-fork` — three `maintenance` nodes; the hints show a read-only probe (`talosctl version --insecure --nodes <ip>`) alongside the mutating `talosctl apply-config --insecure` hint.
+3. Run the printed **read-only probe** verbatim against a node. Do not run the printed `apply-config` hint here — it configures the node and is C2's work.
 
 Expected observations: tbx applied no machine config (nodes stay maintenance indefinitely); the printed hint works exactly as printed; DNS for `forge.internal` live.
 

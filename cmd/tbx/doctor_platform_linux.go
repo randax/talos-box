@@ -81,6 +81,17 @@ func doctorCompareInt(left, right int) int {
 	}
 }
 
+// platformDoctorCheckNames names the Linux-only checks, in the order
+// linuxPlatformDoctorFindings runs them, so `tbx doctor --help` lists exactly
+// what this platform reports (#419).
+func platformDoctorCheckNames() []string {
+	return []string{
+		"kvm", "qemu", "bridge-netfilter", "bridge-stp", "rp-filter",
+		"port-53", "port-67", "port-179",
+		"helper-unit", "helper-access", "helper-capabilities",
+	}
+}
+
 func platformDoctorDependencies(deps *doctorDependencies) {
 	if deps == nil {
 		return

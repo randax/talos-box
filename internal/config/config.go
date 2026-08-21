@@ -3,6 +3,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"slices"
@@ -74,7 +75,9 @@ type ClusterSpec struct {
 }
 
 type rawConfig struct {
-	Version  int          `yaml:"version"`
+	// Version is a pointer so an absent key can be told apart from a declared
+	// one: "missing" earns a different, actionable error than "unsupported".
+	Version  *int         `yaml:"version"`
 	Talos    rawTalos     `yaml:"talos"`
 	Clusters []rawCluster `yaml:"clusters"`
 }
@@ -114,8 +117,11 @@ func Parse(data []byte) (Config, error) {
 	if err := dec.Decode(&raw); err != nil {
 		return Config{}, fmt.Errorf("parse talosbox.yaml: %w", err)
 	}
-	if raw.Version != 1 {
-		return Config{}, fmt.Errorf("unsupported version %d (this tbx understands version 1)", raw.Version)
+	if raw.Version == nil {
+		return Config{}, errors.New("talosbox.yaml is missing 'version:'; add 'version: 1'")
+	}
+	if *raw.Version != 1 {
+		return Config{}, fmt.Errorf("unsupported version %d (this tbx understands version 1)", *raw.Version)
 	}
 	if len(raw.Clusters) == 0 {
 		return Config{}, fmt.Errorf("talosbox.yaml must describe at least one cluster")

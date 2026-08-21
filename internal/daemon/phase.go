@@ -356,8 +356,14 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 		first := maintenance[0]
 		endpoint := status.controlPlaneOr(first)
 		hints = append(hints,
-			fmt.Sprintf("%d node(s) await machine config. Generate one: talosctl gen config %s https://%s:6443 --output-dir .",
-				len(maintenance), status.Name, nodeHost(status, endpoint)),
+			// A read-only probe comes first so a reader can confirm a
+			// maintenance node answers without configuring it: apply-config
+			// below is the only other --insecure command printed, and it
+			// mutates the node (#435).
+			fmt.Sprintf("%d node(s) await machine config. Probe one read-only (changes nothing): talosctl version --insecure --nodes %s",
+				len(maintenance), first.IP),
+			fmt.Sprintf("generate a machine config: talosctl gen config %s https://%s:6443 --output-dir .",
+				status.Name, nodeHost(status, endpoint)),
 			fmt.Sprintf("then apply it: talosctl apply-config --insecure --nodes %s --file controlplane.yaml (workers get worker.yaml)",
 				first.IP),
 		)

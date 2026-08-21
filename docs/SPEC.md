@@ -478,7 +478,11 @@ have no machine config to patch, so the document is folded in at generation time
 config <cluster> https://<cp-ip>:6443 --config-patch @storage-machine.yaml` before `talosctl
 apply-config --insecure`; already-configured nodes take it directly with `talosctl patch mc -p
 @storage-machine.yaml --nodes <node-ip>`. Then, before installing the CSI, create its namespace if needed and apply the
-printed PSA labels. Curated CSI namespace streams carry their own PSA labels. For Longhorn,
+printed PSA labels. Curated CSI namespace streams carry their own PSA labels. The printed
+prerequisite mounts `/var/local-path-provisioner`, the path tbx's curated local-path CSI writes
+to; upstream local-path-provisioner's shipped ConfigMap defaults to `/opt/local-path-provisioner`,
+so the `storage` section also prints the `local-path-config` edit that repoints it at the mounted
+path. A BYO install that skips that edit gets a bind mount nothing uses. For Longhorn,
 apply `storage-namespaces`, then `storage-crds`, run the printed Established wait against the
 CRD stream, and only then apply post-CRD `storage-objects`; it is not a one-shot apply.
 Longhorn's `storage-values` stream records the exact values used to render those objects.

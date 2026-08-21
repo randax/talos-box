@@ -604,7 +604,7 @@ func disableKubeProxy(config []byte) ([]byte, error) {
 }
 
 func addCatchAllMirror(config []byte, subnetIndex int) []byte {
-	return append(config, []byte(catchAllMirrorDocument(subnetIndex))...)
+	return append(config, []byte("---\n"+catchAllMirrorDocument(subnetIndex))...)
 }
 
 // machineCNIName is the value of cluster.network.cni.name for the cluster.
@@ -622,9 +622,12 @@ func ciliumDisablesKubeProxy(item cluster.Cluster) bool {
 	return item.CNI == cluster.CNICilium
 }
 
+// catchAllMirrorDocument is one YAML document with no leading separator: the
+// separator belongs to whoever concatenates it after another document, so a
+// single-section `tbx manifests <cluster> mirrors` render does not open with a
+// stray `---` (#424).
 func catchAllMirrorDocument(subnetIndex int) string {
-	return fmt.Sprintf(`---
-apiVersion: v1alpha1
+	return fmt.Sprintf(`apiVersion: v1alpha1
 kind: RegistryMirrorConfig
 name: "*"
 endpoints:
