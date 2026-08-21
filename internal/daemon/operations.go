@@ -947,9 +947,10 @@ func (s *Server) destroyCluster(raw json.RawMessage) (DestroySummary, error) {
 	return summary, nil
 }
 
-// directoryBytes sums the regular files under dir. It is best effort: the
-// destroy summary is an account of what was removed, and a file that cannot be
-// stat'ed must not fail the verb that removes it.
+// directoryBytes sums what the files under dir occupy on disk. Node disks are
+// sparse, so their apparent size would overstate what the destroy gives back —
+// the block count is the only honest number for reclaimed capacity. Best
+// effort: a file that cannot be stat'ed must not fail the verb that removes it.
 func directoryBytes(dir string) int64 {
 	var total int64
 	_ = filepath.WalkDir(dir, func(_ string, entry fs.DirEntry, err error) error {
@@ -960,7 +961,7 @@ func directoryBytes(dir string) int64 {
 		if infoErr != nil {
 			return nil
 		}
-		total += info.Size()
+		total += imagecache.AllocatedSize(info)
 		return nil
 	})
 	return total
