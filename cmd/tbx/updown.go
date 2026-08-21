@@ -156,8 +156,12 @@ func (c cli) callWithLivenessNarrated(signal liveness, op string, args, destinat
 	defer stop()
 	err := c.callNarratedWithin(op, args, destination, stream.stages(!narrate || signal.quiet), signal.bound())
 	if err != nil && isTimeout(err) {
-		return fmt.Errorf("tbxd did not finish %s within %s (overall deadline %s plus %s grace); "+
-			"the daemon may still be working — check: tbx status",
+		// The bound measures silence, not total elapsed: a narrated call
+		// re-arms it on every stage the daemon sends. Wording it as "did not
+		// finish within" contradicted the heartbeat printed on the same
+		// stream, which reports the real elapsed time (#423).
+		return fmt.Errorf("tbxd stopped reporting progress for %s (no sign of life for %s: "+
+			"overall deadline %s plus %s grace); the daemon may still be working — check: tbx status",
 			signal.verb, formatLivenessDuration(signal.bound()),
 			formatLivenessDuration(signal.deadline), formatLivenessDuration(livenessGrace))
 	}

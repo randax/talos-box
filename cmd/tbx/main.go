@@ -533,9 +533,13 @@ func (c cli) runNode(args []string) error {
 		// request path, and that reconcile reports nothing between its opening
 		// stage and its end. Without a heartbeat the terminal is dead for the
 		// whole budget, which is the silence narration exists to remove (#273).
+		// It also prepares the Talos image inside the same request — a cold
+		// cache re-runs the Image Factory download before the disk is cloned —
+		// so the stated bound carries that allowance exactly as a create does,
+		// or a healthy --quiet add trips the client bound (#392).
 		signal := liveness{
 			verb:     "adding a node to " + positionals[0],
-			deadline: storedProvisionDeadline(positionals[0]),
+			deadline: storedProvisionDeadline(positionals[0]) + imagePrepareDeadline,
 			quiet:    *quiet,
 		}
 		if err := c.callWithLivenessNarrated(signal, "node.add", request, &result, true); err != nil {

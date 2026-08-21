@@ -1148,6 +1148,10 @@ func (s *Server) addNodeLocked(raw json.RawMessage, progress stageFunc) (NodeSta
 			return NodeStatus{}, nil, err
 		}
 	}
+	// The image fetch is the long pole of an add against a cold cache, exactly
+	// as it is for a create, and it runs before any other stage — narrating it
+	// first is what re-arms the CLI's liveness deadline across it (#392).
+	progress.stage("%s", talosImageStage(item.TalosVersion))
 	cachedDisk, err := s.cachedDisk(item)
 	if err != nil {
 		return NodeStatus{}, nil, err
@@ -1190,6 +1194,16 @@ func (s *Server) addNodeLocked(raw json.RawMessage, progress stageFunc) (NodeSta
 	}
 	status.setWarnings(append([]string{overcommitWarning}, append(hostPressureWarnings, subnetWarning, s.longhornCustomSchematicWarning(item, customSchematic), deferredWarning)...)...)
 	return status, tasks, nil
+}
+
+// talosImageStage names the image-prepare stage. Stored state predating the
+// recorded Talos version leaves the field empty, and a stage line with a hole
+// in it reads worse than one that simply omits the version.
+func talosImageStage(version string) string {
+	if version == "" {
+		return "preparing the Talos image"
+	}
+	return fmt.Sprintf("preparing the Talos %s image", version)
 }
 
 func (s *Server) removeNodeLocked(raw json.RawMessage, progress stageFunc) (NodeStatus, []provisionTask, error) {

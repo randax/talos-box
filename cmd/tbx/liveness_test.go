@@ -158,7 +158,7 @@ func TestBlockingCallFailsPastItsBound(t *testing.T) {
 	if err == nil {
 		t.Fatal("a hung lifecycle call returned no error")
 	}
-	for _, wanted := range []string{"tbxd did not finish provisioning demo within", "overall deadline", "tbx status"} {
+	for _, wanted := range []string{"tbxd stopped reporting progress for provisioning demo", "no sign of life for", "overall deadline", "tbx status"} {
 		if !strings.Contains(err.Error(), wanted) {
 			t.Fatalf("bound error = %q, want it to mention %q", err, wanted)
 		}
@@ -387,4 +387,106 @@ func narratingDaemon(t *testing.T, stages int, interval time.Duration, answer bo
 		<-release
 	}()
 	return socket
+}
+
+// A narrated call re-arms its bound on every stage, so the bound measures
+// silence rather than total elapsed — and the error it fails with must say so,
+// or it contradicts the elapsed figure the heartbeat printed just above it
+// (#423).
+func TestNarratedCallBoundMeasuresSilenceNotElapsed(t *testing.T) {
+	previousInterval := livenessInterval
+	livenessInterval = 5 * time.Millisecond
+	previousGrace := livenessGrace
+	livenessGrace = 20 * time.Millisecond
+	t.Cleanup(func() {
+		livenessInterval = previousInterval
+		livenessGrace = previousGrace
+	})
+
+	home, err := os.MkdirTemp("/tmp", "tbx-narrated-bound-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	t.Setenv("HOME", home)
+	socket := filepath.Join(home, ".talosbox", "tbxd.sock")
+	if err := os.MkdirAll(filepath.Dir(socket), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	go func() {
+		for {
+			connection, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			var request daemon.Request
+			if decodeErr := json.NewDecoder(connection).Decode(&request); decodeErr != nil {
+				_ = connection.Close()
+				return
+			}
+			go func() {
+				encoder := json.NewEncoder(connection)
+				// Stages keep arriving past the bound, each one re-arming it;
+				// then the gate goes silent and the bound finally fires.
+				for i := 0; i < 4; i++ {
+					time.Sleep(20 * time.Millisecond)
+					if encodeErr := encoder.Encode(daemon.Response{OK: true, Stage: "working"}); encodeErr != nil {
+						break
+					}
+				}
+				<-release
+				_ = connection.Close()
+			}()
+		}
+	}()
+
+	var stdout, stderr bytes.Buffer
+	signal := liveness{verb: "provisioning demo", deadline: 20 * time.Millisecond}
+	started := time.Now()
+	err = (cli{out: &stdout, err: &stderr}).callWithLivenessNarrated(
+		signal, "cluster.create", map[string]string{"name": "demo"}, nil, true)
+	if err == nil {
+		t.Fatal("a narrated call whose stages stopped returned no error")
+	}
+	if elapsed := time.Since(started); elapsed <= signal.bound() {
+		t.Fatalf("the narrated call failed after %s, so its stages never re-armed the %s bound", elapsed, signal.bound())
+	}
+	for _, wanted := range []string{"tbxd stopped reporting progress for provisioning demo", "no sign of life for", "tbx status"} {
+		if !strings.Contains(err.Error(), wanted) {
+			t.Fatalf("bound error = %q, want it to mention %q", err, wanted)
+		}
+	}
+	if strings.Contains(err.Error(), "did not finish") {
+		t.Fatalf("bound error claims a total elapsed bound the code never enforces: %q", err)
+	}
+	if !strings.Contains(stderr.String(), "working") {
+		t.Fatalf("narrated call printed no stages:\n%s", stderr.String())
+	}
+}
+
+// node add prepares the Talos image inside the same request it reconciles, so
+// the bound it states must carry that allowance — otherwise a healthy --quiet
+// add against a cold cache trips the client bound (#392).
+func TestNodeAddQuietStatesTheImagePrepareAllowance(t *testing.T) {
+	stubStoredClusters(t, daemon.ClusterSummary{Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium}})
+	_, stderr := runSlowCLI(t, []string{`{"name":"demo-worker-2"}`}, func(command cli) error {
+		return command.runNode([]string{"add", "demo", "--quiet"})
+	})
+	deadline := formatLivenessDuration(cniProvisionDeadline + imagePrepareDeadline)
+	if deadline == formatLivenessDuration(cniProvisionDeadline) {
+		t.Fatalf("stated deadline %s does not carry the image prepare allowance", deadline)
+	}
+	for _, wanted := range []string{"adding a node to demo", "overall deadline " + deadline, "still adding a node to demo (elapsed"} {
+		if !strings.Contains(stderr, wanted) {
+			t.Fatalf("quiet node add stderr missing %q:\n%s", wanted, stderr)
+		}
+	}
 }
