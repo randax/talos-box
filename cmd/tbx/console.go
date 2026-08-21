@@ -268,9 +268,9 @@ func tailLines(data []byte, count int) []byte {
 // drops its saved memory. Only a fully stopped cluster can be resumed.
 func suspendedConsoleError(clusterName, nodeName string, clusterRunning bool) error {
 	if clusterRunning {
-		return fmt.Errorf("node %s is suspended while the rest of the cluster runs — boot it with: tbx node start %s %s (that cold-boots the node and discards its saved memory)", nodeName, clusterName, nodeName)
+		return fmt.Errorf("node %s is suspended while the rest of the cluster runs — boot it with: tbx node start %s %s (that cold-boots the node and discards its saved memory)", nodeName, shellquote.Quote(clusterName), shellquote.Quote(nodeName))
 	}
-	return fmt.Errorf("node %s is suspended — resume the cluster first: tbx cluster resume %s", nodeName, clusterName)
+	return fmt.Errorf("node %s is suspended — resume the cluster first: tbx cluster resume %s", nodeName, shellquote.Quote(clusterName))
 }
 
 func configuredConsoleTip(ip, talosconfig string) string {

@@ -81,3 +81,23 @@ func TestPlatformErrorSummaryNeverTruncatesInsideQuotes(t *testing.T) {
 		})
 	}
 }
+
+// TestPlatformErrorSummaryDropsAQuoteOpeningAtTheStart covers the case neither
+// truncation branch used to fire on: a quote that opens at index 0 and does not
+// close within the slack left the cut at the fixed budget, landing mid-quote —
+// the exact #412 defect. With nothing before the quote to keep, the summary is
+// dropped and the warning falls back to its log pointer.
+func TestPlatformErrorSummaryDropsAQuoteOpeningAtTheStart(t *testing.T) {
+	for _, cause := range []string{
+		`“` + strings.Repeat("z", 4096) + `”`,
+		`"` + strings.Repeat("z", 4096),
+	} {
+		if got := platformErrorSummary(errors.New(cause)); got != "" {
+			t.Fatalf("summary = %q, want it dropped rather than cut inside the quote", got)
+		}
+	}
+	warning := coldBootWarning("qa-sta-cp-1", false, errors.New(`“`+strings.Repeat("z", 4096)+`”`))
+	if strings.Contains(warning, "z") || !strings.HasSuffix(warning, "(details: ~/.talosbox/tbxd.log)") {
+		t.Fatalf("warning = %q, want the bare cold-boot warning with the log pointer", warning)
+	}
+}

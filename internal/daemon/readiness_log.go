@@ -27,14 +27,22 @@ type unreadyRun struct {
 	last  time.Time
 }
 
+// unreadyRunAbandonWindow is how long a run may go unobserved before the next
+// failure counts as a fresh one. It is deliberately much longer than
+// unreadyEscalationWindow: keying both on the same constant meant an operator
+// polling `tbx status` less often than the escalation window restarted the
+// clock on every poll and could never reach the destroy advice, no matter how
+// dead the cluster was (#418).
+const unreadyRunAbandonWindow = 10 * time.Minute
+
 // observe records one readiness observation and reports when the current run of
 // failures began, or nil when the cluster is ready.
 //
-// A gap longer than the escalation window starts a fresh run: the daemon was
-// not watching across it, so it cannot claim the failure persisted through it,
-// and inheriting the old clock would let a brand-new blip escalate straight to
+// A gap longer than the abandon window starts a fresh run: the daemon was not
+// watching across it, so it cannot claim the failure persisted through it, and
+// inheriting the old clock would let a brand-new blip escalate straight to
 // "destroy and recreate" — exactly the #418 advice the debounce exists to
-// prevent.
+// prevent. Shorter gaps keep accumulating, so a slow poller still escalates.
 func (l *readinessLog) observe(name string, ready bool, now time.Time) *time.Time {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -46,7 +54,7 @@ func (l *readinessLog) observe(name string, ready bool, now time.Time) *time.Tim
 		l.clusters = make(map[string]unreadyRun)
 	}
 	run, seen := l.clusters[name]
-	if !seen || now.Sub(run.last) > unreadyEscalationWindow || now.Before(run.since) {
+	if !seen || now.Sub(run.last) > unreadyRunAbandonWindow || now.Before(run.since) {
 		run.since = now
 	}
 	run.last = now

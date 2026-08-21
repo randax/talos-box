@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -378,7 +379,7 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 	}
 	if len(maintenance) > 0 {
 		first := maintenance[0]
-		endpoint := status.controlPlaneOr(first)
+		endpointHost := nodeHost(status, status.controlPlaneOr(first))
 		hints = append(hints,
 			// A read-only probe comes first so a reader can confirm a
 			// maintenance node answers without configuring it: apply-config
@@ -386,8 +387,8 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 			// mutates the node (#435).
 			fmt.Sprintf("%d node(s) await machine config. Probe one read-only (changes nothing): talosctl version --insecure --nodes %s",
 				len(maintenance), first.IP),
-			fmt.Sprintf("generate a machine config: talosctl gen config %s https://%s:6443 --output-dir .",
-				status.Name, nodeHost(status, endpoint)),
+			fmt.Sprintf("generate a machine config: talosctl gen config %s https://%s:6443 --output-dir .%s",
+				status.Name, endpointHost, resolverBypassNote(endpointHost)),
 			fmt.Sprintf("then apply it: talosctl apply-config --insecure --nodes %s --file controlplane.yaml (workers get worker.yaml)",
 				first.IP),
 		)
@@ -892,6 +893,22 @@ func (c ClusterStatus) controlPlaneOr(fallback NodeStatus) NodeStatus {
 		}
 	}
 	return fallback
+}
+
+// hintGOOS is the host platform the hints are written for. It is a variable so
+// a test can exercise the macOS-only wording from any host.
+var hintGOOS = runtime.GOOS
+
+// resolverBypassNote warns that the most obvious DNS tools do not see the name
+// the hint just handed out. macOS keeps tbx's per-domain entries under
+// /etc/resolver, which dig and nslookup bypass entirely, so the first tool
+// anyone reaches for reads a working name as dead (#438). Empty everywhere
+// else: no other host substrate has the split.
+func resolverBypassNote(host string) string {
+	if hintGOOS != "darwin" {
+		return ""
+	}
+	return fmt.Sprintf(" (dig/nslookup bypass /etc/resolver on macOS; check that name with: dscacheutil -q host -a name %s, or ping)", shellquote.Quote(host))
 }
 
 // nodeHost prefers the DNS name talosbox serves for a node.

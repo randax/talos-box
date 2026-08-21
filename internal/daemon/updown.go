@@ -12,6 +12,7 @@ import (
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/config"
 	"github.com/randax/talos-box/internal/provision"
+	"github.com/randax/talos-box/internal/shellquote"
 	"github.com/randax/talos-box/internal/talosversion"
 )
 
@@ -466,13 +467,13 @@ func reconcileProvisioningIntentWithVolumes(item cluster.Cluster, spec config.Cl
 	if desired.CNI != current.CNI {
 		return current, false, fmt.Errorf(
 			"cluster %q: cni is immutable once provisioning begins (cluster has %q, talosbox.yaml wants %q); run: tbx cluster destroy %s && tbx up",
-			item.Name, current.CNI, desired.CNI, item.Name,
+			item.Name, current.CNI, desired.CNI, shellquote.Quote(item.Name),
 		)
 	}
 	if current.LB && !desired.LB {
 		return current, false, fmt.Errorf(
 			"cluster %q: lb is immutable once enabled; run: tbx cluster destroy %s && tbx up to disable it",
-			item.Name, item.Name,
+			item.Name, shellquote.Quote(item.Name),
 		)
 	}
 
@@ -507,7 +508,7 @@ func reconcileProvisioningIntentWithVolumes(item cluster.Cluster, spec config.Cl
 func storageVolumesBlockChange(item cluster.Cluster, volumes []string) error {
 	return fmt.Errorf(
 		"cluster %q: cannot change csi from %q while it has %d provisioned %s (%s); delete the volumes first, or run: tbx cluster destroy %s",
-		item.Name, item.CSI, len(volumes), volumeUnit(len(volumes)), storageVolumeList(volumes), item.Name,
+		item.Name, item.CSI, len(volumes), volumeUnit(len(volumes)), storageVolumeList(volumes), shellquote.Quote(item.Name),
 	)
 }
 

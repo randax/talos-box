@@ -263,7 +263,8 @@ func platformErrorSummary(cause error) string {
 // platform's own quoted reason — the one part the operator needs — rendering a
 // 16-character reason as `“invalid...”` (#412). A quote that closes within the
 // slack is kept entire; a longer one is cut before it opens, so the elision
-// never lands inside quotes.
+// never lands inside quotes — and a quote opening at the very start, with
+// nothing before it to keep, drops the summary entirely.
 const maxPlatformErrorSummaryQuoted = 320
 
 // boundPlatformErrorSummary bounds a one-line cause without ever eliding
@@ -277,15 +278,21 @@ func boundPlatformErrorSummary(summary string) string {
 	if open, unclosed := unclosedQuoteStart(runes[:cut]); unclosed {
 		if end, closed := quoteEnd(runes, open); closed && end <= maxPlatformErrorSummaryQuoted {
 			cut = end
-		} else if open > 0 {
+		} else {
 			cut = open // drop the quote the budget cannot carry
 		}
+	}
+	if cut == 0 {
+		// The quote opens at the very start, so cutting before it leaves
+		// nothing: a bare ellipsis says less than no summary at all, and an
+		// empty one is the caller's "the log has it verbatim" path (#412).
+		return ""
 	}
 	if cut >= len(runes) {
 		return summary
 	}
 	// A cut landing right after an opener leaves nothing quoted to read;
-	// closeTruncatedQuotes still balances the pathological open-at-zero case.
+	// closeTruncatedQuotes still balances any quote the prefix left open.
 	trimmed := strings.TrimRight(strings.TrimSpace(string(runes[:cut])), "“")
 	return closeTruncatedQuotes(strings.TrimSpace(trimmed) + "...")
 }

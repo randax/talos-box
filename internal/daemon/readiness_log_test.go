@@ -116,14 +116,14 @@ func TestReadinessLogStartsFreshRunAfterAnUnwatchedGap(t *testing.T) {
 		t.Fatalf("first failure = %v, want %v", first, start)
 	}
 	// The cluster recovers with nobody polling, then blips again much later.
-	gap := start.Add(unreadyEscalationWindow + 5*time.Minute)
+	gap := start.Add(unreadyRunAbandonWindow + time.Minute)
 	again := log.observe("qa-host", false, gap)
 	if again == nil || !again.Equal(gap) {
 		t.Fatalf("failure after an unwatched gap = %v, want a fresh clock %v", again, gap)
 	}
 	// Inside the window the run still accumulates, so a genuinely stuck
 	// cluster still escalates.
-	within := gap.Add(unreadyEscalationWindow - time.Second)
+	within := gap.Add(unreadyRunAbandonWindow - time.Second)
 	if run := log.observe("qa-host", false, within); run == nil || !run.Equal(gap) {
 		t.Fatalf("failure inside the window = %v, want the run's start %v", run, gap)
 	}
@@ -143,7 +143,31 @@ func TestBlipAfterAnUnwatchedRecoveryDoesNotEscalate(t *testing.T) {
 	if got := blip(start); strings.Contains(got, "tbx cluster destroy") {
 		t.Fatalf("first blip escalated to destroy: %s", got)
 	}
-	if got := blip(start.Add(unreadyEscalationWindow + 5*time.Minute)); strings.Contains(got, "tbx cluster destroy") {
+	if got := blip(start.Add(unreadyRunAbandonWindow + time.Minute)); strings.Contains(got, "tbx cluster destroy") {
 		t.Fatalf("a fresh blip after an unwatched recovery escalated to destroy: %s", got)
+	}
+}
+
+// TestSlowPollerStillEscalates pins the other half of the staleness rule: the
+// abandon window is not the escalation window. An operator (or a script)
+// polling less often than the 2-minute escalation window used to restart the
+// run on every poll, so a dead cluster could never reach the destroy advice
+// (#418).
+func TestSlowPollerStillEscalates(t *testing.T) {
+	service := &Server{}
+	start := time.Now()
+	poll := func(now time.Time) string {
+		statuses := []ClusterStatus{unresumableStatus()}
+		service.observeKubernetesReadiness(statuses, now)
+		return provisioningRecoveryHintAt(statuses[0], now)
+	}
+	// A poll interval longer than the escalation window but shorter than the
+	// abandon window: the run accumulates across the gaps.
+	interval := unreadyEscalationWindow + time.Minute
+	if got := poll(start); strings.Contains(got, "tbx cluster destroy") {
+		t.Fatalf("the first observation escalated to destroy: %s", got)
+	}
+	if got := poll(start.Add(interval)); !strings.Contains(got, "tbx cluster destroy qa-host --force") {
+		t.Fatalf("a cluster unready across a %s poll gap did not escalate: %s", interval, got)
 	}
 }

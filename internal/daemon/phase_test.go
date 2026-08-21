@@ -601,3 +601,42 @@ func TestStoppedClusterHintsQuoteClusterName(t *testing.T) {
 		})
 	}
 }
+
+// TestGenConfigHintNamesTheResolverBypassOnMacOS pins #438: `dig` is the first
+// tool anyone reaches for and it bypasses /etc/resolver, so a working tbx name
+// reads as dead. The hint that hands out such a name says so — on macOS only,
+// where the split exists.
+func TestGenConfigHintNamesTheResolverBypassOnMacOS(t *testing.T) {
+	status := ClusterStatus{
+		Name:   "demo",
+		Subnet: "172.30.0.0/24",
+		Nodes:  []NodeStatus{{Name: "demo-cp-1", Role: cluster.RoleControlPlane, Phase: PhaseMaintenance, IP: "172.30.0.2"}},
+	}
+	genConfigHint := func() string {
+		for _, hint := range Hints(status) {
+			if strings.Contains(hint, "gen config") {
+				return hint
+			}
+		}
+		t.Fatal("no gen config hint")
+		return ""
+	}
+	restore := hintGOOS
+	t.Cleanup(func() { hintGOOS = restore })
+
+	hintGOOS = "darwin"
+	got := genConfigHint()
+	for _, want := range []string{
+		"dig/nslookup bypass /etc/resolver",
+		"dscacheutil -q host -a name demo-cp-1.demo.k8s.test",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("darwin gen config hint = %q, want substring %q", got, want)
+		}
+	}
+
+	hintGOOS = "linux"
+	if got := genConfigHint(); strings.Contains(got, "dscacheutil") {
+		t.Fatalf("non-darwin gen config hint = %q, want no macOS resolver note", got)
+	}
+}
