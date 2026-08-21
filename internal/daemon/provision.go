@@ -821,6 +821,10 @@ func (s *Server) refreshStoragePhases(statuses []ClusterStatus) {
 				s.beginStorageStatusProbe(status.Name)
 			}
 		}
+		// Last stage of the status pipeline, so it is the first point at which
+		// every fact a settling reason reads — storage phase included — is
+		// final (#396).
+		status.Converging = convergingReasons(*status, time.Now())
 		status.Hints = Hints(*status)
 	}
 }

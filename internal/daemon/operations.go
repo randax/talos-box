@@ -211,6 +211,18 @@ func (n NodeStatus) UnreachableFor(now time.Time) time.Duration {
 	}
 }
 
+// suspendedPhase promotes a stopped node holding its own saved memory to
+// PhaseSuspended, so the JSON surface says what the table has said since #360
+// instead of the coarser "stopped" a consumer keying on phase alone misread
+// (#415). Suspended stays set beside it: it is the same fact, and older
+// clients read only the boolean.
+func (n NodeStatus) suspendedPhase() NodeStatus {
+	if n.Suspended && n.Phase == PhaseStopped {
+		n.Phase = PhaseSuspended
+	}
+	return n
+}
+
 // answeredSinceStart reports whether the node answered at least once since its
 // VM launched, which decides how its silence is described.
 func (n NodeStatus) answeredSinceStart() bool { return n.UnreachableSince != nil }
@@ -253,10 +265,26 @@ type ClusterStatus struct {
 	// Suspended reports saved VM memory on disk, the difference between a
 	// cluster that was stopped and one whose memory is waiting to be resumed —
 	// a distinction start would silently erase (#272).
-	Suspended       bool         `json:"suspended,omitempty"`
-	KubernetesReady bool         `json:"kubernetesReady"`
-	StoragePhase    StoragePhase `json:"storagePhase,omitempty"`
-	StorageError    string       `json:"storageError,omitempty"`
+	Suspended bool `json:"suspended,omitempty"`
+	// SavedStateStale reports suspended memory whose owning daemon process is
+	// gone. A save is only restorable by the daemon that wrote it, so once
+	// `tbx system restart --force` replaced that process the memory is already
+	// lost and a resume will cold-boot — which the suspend hint used to
+	// promise the opposite of (#413).
+	SavedStateStale bool `json:"savedStateStale,omitempty"`
+	KubernetesReady bool `json:"kubernetesReady"`
+	// KubernetesNotReadySince is when the daemon first observed this cluster
+	// failing its Kubernetes readiness probe without a success since. It is
+	// what keeps a momentary apiserver blip from being escalated into "destroy
+	// and recreate" (#418). Nil means ready now, or never observed.
+	KubernetesNotReadySince *time.Time `json:"kubernetesNotReadySince,omitempty"`
+	// Converging names what is still coming back on a cluster whose nodes are
+	// up and whose Kubernetes reports Ready — CSI drivers re-registering, a
+	// VIP announced but not answering. Empty means nothing outstanding, which
+	// is the only reading a single-sample check may treat as converged (#396).
+	Converging   []string     `json:"converging,omitempty"`
+	StoragePhase StoragePhase `json:"storagePhase,omitempty"`
+	StorageError string       `json:"storageError,omitempty"`
 	// StoragePending is the benign counterpart of StorageError: the readiness
 	// probe has not failed, it has not run yet because the daemon is still
 	// clearing the previous pass's objects. It reads as work in progress, so
@@ -281,6 +309,30 @@ type ClusterStatus struct {
 	ConfigOrigin cluster.ConfigOrigin `json:"configOrigin,omitempty"`
 	Hints        []string             `json:"hints,omitempty"`
 	subnetIndex  int
+}
+
+// kubernetesUnreadyFor reports how long the daemon has been watching this
+// cluster fail its readiness probe. Zero means it is ready, or that no
+// observation window exists at all.
+func (c ClusterStatus) kubernetesUnreadyFor(now time.Time) time.Duration {
+	if c.KubernetesNotReadySince == nil {
+		return 0
+	}
+	return now.Sub(*c.KubernetesNotReadySince)
+}
+
+// unreadyEscalationWindow is how long Kubernetes must stay unreachable before
+// status is willing to recommend destroying the cluster. QA's blip recovered
+// on its own inside a minute; anything shorter than this is a blip until
+// proven otherwise (#418).
+const unreadyEscalationWindow = 2 * time.Minute
+
+// KubernetesUnreadyBriefly reports an unreadiness the daemon has watched for
+// too little time to call it stuck. An unknown window is not brief: without an
+// observation the daemon cannot vouch for the cluster either way, and the
+// stuck-cluster advice is what the hint exists for.
+func (c ClusterStatus) KubernetesUnreadyBriefly(now time.Time) bool {
+	return c.KubernetesNotReadySince != nil && c.kubernetesUnreadyFor(now) < unreadyEscalationWindow
 }
 
 // CapabilityStatus is one host capability a cluster depends on, with the reason
@@ -1180,14 +1232,14 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), AllowUnsafeDomain: item.AllowUnsafeDomain, TalosVersion: item.TalosVersion, Schematic: item.Schematic, BaseSchematic: item.BaseSchematic, TalosExtensions: item.TalosExtensions, ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: running,
 			// derived from disk, not from daemon memory, so a restarted
 			// daemon still reports its predecessor's suspension
-			Suspended: !running && clusterHasSavedState(item.Name), Capabilities: s.clusterCapabilities(item), ConfigOrigin: item.ConfigOrigin, subnetIndex: item.SubnetIndex}
+			Suspended: !running && clusterHasSavedState(item.Name), SavedStateStale: !running && savedStateOwnerReplaced(item.Name), Capabilities: s.clusterCapabilities(item), ConfigOrigin: item.ConfigOrigin, subnetIndex: item.SubnetIndex}
 		for _, node := range item.Nodes {
 			running := s.nodeRunning(item.Name, node.Name)
 			clusterStatus.Nodes = append(clusterStatus.Nodes, NodeStatus{Name: node.Name, Role: node.Role, MAC: node.MAC, Phase: ClassifyPhase(running, ProbeResult{}), StartedAt: s.vmStartedAt(item.Name, node.Name),
 				// per-node, not per-cluster: suspend saves memory only for
 				// the nodes that were running, and the rest stay plain
 				// stopped rather than inheriting the cluster's flag
-				Suspended: !running && nodeHasSavedState(item.Name, node.Name)})
+				Suspended: !running && nodeHasSavedState(item.Name, node.Name)}.suspendedPhase())
 		}
 		clusterStatus.Hints = Hints(clusterStatus)
 		result = append(result, clusterStatus)
@@ -1222,13 +1274,14 @@ func (s *Server) refreshNodeStatuses(statuses []ClusterStatus) {
 	for i := range statuses {
 		for j, snapshot := range statuses[i].Nodes {
 			node := cluster.Node{Name: snapshot.Name, Role: snapshot.Role, MAC: snapshot.MAC}
-			refreshed := nodeStatusWith(node, statuses[i].subnetIndex, snapshot.Phase != PhaseStopped, lookupIP, probe)
+			refreshed := nodeStatusWith(node, statuses[i].subnetIndex, !snapshot.Phase.Stopped(), lookupIP, probe)
 			refreshed.StartedAt = snapshot.StartedAt
 			// Suspension is a disk fact the status handler already
 			// established; the refresh only re-derives the live phase, and
 			// dropping the flag here is what made a suspended cluster read as
 			// plain stopped in the PHASE column (#360).
 			refreshed.Suspended = snapshot.Suspended
+			refreshed = refreshed.suspendedPhase()
 			refreshed.UnreachableSince = s.reachability.observe(nodeKey(statuses[i].Name, node.Name), refreshed.Phase, now)
 			statuses[i].Nodes[j] = refreshed
 		}
