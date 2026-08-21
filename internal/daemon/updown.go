@@ -28,10 +28,15 @@ func (s *Server) up(raw json.RawMessage) ([]Action, error) {
 }
 
 func (s *Server) upWithMaintenance(raw json.RawMessage, maintenance map[string]maintenanceObservation) ([]Action, error) {
-	return s.upWithObservations(raw, maintenance, nil)
+	return s.upWithObservations(raw, maintenance, nil, nil)
 }
 
-func (s *Server) upWithObservations(raw json.RawMessage, maintenance map[string]maintenanceObservation, storage map[string]storageObservation) ([]Action, error) {
+// upWithObservations runs the pass. progress narrates the per-cluster creates:
+// they run under the operation lock and a cold image fetch is minutes of work,
+// so a silent pass would leave the client's liveness bound with nothing to
+// re-arm it (#392). Each line is prefixed with the cluster it belongs to,
+// because one pass speaks for several.
+func (s *Server) upWithObservations(raw json.RawMessage, maintenance map[string]maintenanceObservation, storage map[string]storageObservation, progress stageFunc) ([]Action, error) {
 	var args upArgs
 	if err := decodeArgs(raw, &args); err != nil {
 		return nil, err
@@ -56,7 +61,7 @@ func (s *Server) upWithObservations(raw json.RawMessage, maintenance map[string]
 		switch action.Kind {
 		case ActionCreate:
 			spec.Talos = resolveSpecTalos(spec, args.Talos)
-			result, err := s.createFromSpec(spec, args.Force)
+			result, err := s.createFromSpec(spec, args.Force, clusterStages(progress, spec.Name))
 			if err != nil {
 				return actions[:i], fmt.Errorf("create %s: %w", spec.Name, err)
 			}
@@ -589,15 +594,13 @@ func clusterReady(item cluster.Cluster, nodeActive func(string) bool) bool {
 }
 
 // createFromSpec provisions and starts one cluster from a config spec.
-func (s *Server) createFromSpec(spec config.ClusterSpec, force bool) (ClusterSummary, error) {
+func (s *Server) createFromSpec(spec config.ClusterSpec, force bool, progress stageFunc) (ClusterSummary, error) {
 	args := createArgsFromSpec(spec, force)
 	encoded, err := json.Marshal(args)
 	if err != nil {
 		return ClusterSummary{}, err
 	}
-	// up narrates per-cluster actions in its own response; the create stages
-	// belong to the single-cluster verb that blocks on them.
-	return s.createCluster(encoded, nil)
+	return s.createCluster(encoded, progress)
 }
 
 // resolveSpecTalos returns the talos spec to create the cluster with. The

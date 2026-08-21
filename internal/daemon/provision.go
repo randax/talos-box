@@ -159,7 +159,7 @@ func (s *Server) handleProvisioningLocked(request Request, maintenance map[strin
 		}
 		return &result, s.beginProvisionTasksLocked([]cluster.Cluster{item}), nil
 	case "up":
-		actions, err := s.upWithObservations(request.Args, maintenance, storage)
+		actions, err := s.upWithObservations(request.Args, maintenance, storage, progress)
 		if err != nil {
 			return nil, nil, err
 		}

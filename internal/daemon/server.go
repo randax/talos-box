@@ -484,7 +484,7 @@ func (s *Server) dispatchWithProgress(request Request, progress stageFunc) Respo
 	if request.Op == "cluster.destroy.inspect" {
 		return s.dispatchDestroyInspect(request)
 	}
-	s.opMu.Lock()
+	s.lockOperation(progress)
 	defer s.opMu.Unlock()
 
 	data, err := s.handle(request, progress)
@@ -575,11 +575,10 @@ func (s *Server) dispatchCreate(request Request, progress stageFunc) Response {
 	if err := decodeArgs(request.Args, &args); err != nil {
 		return failure(err)
 	}
-	lock := s.clusterMutationLock(args.Name)
-	lock.Lock()
+	lock := s.lockClusterMutation(args.Name, progress)
 	defer lock.Unlock()
 
-	s.opMu.Lock()
+	s.lockOperation(progress)
 	data, tasks, err := s.handleProvisioningLocked(request, nil, nil, progress)
 	s.opMu.Unlock()
 	if err != nil {
@@ -636,7 +635,7 @@ func (s *Server) dispatchProvisioning(request Request, progress stageFunc) Respo
 		if err != nil {
 			return failure(err)
 		}
-		s.opMu.Lock()
+		s.lockOperation(progress)
 		err = s.validateUp(request.Args, maintenance, storage)
 		s.opMu.Unlock()
 		if err != nil {
@@ -646,7 +645,7 @@ func (s *Server) dispatchProvisioning(request Request, progress stageFunc) Respo
 			return failure(err)
 		}
 	}
-	s.opMu.Lock()
+	s.lockOperation(progress)
 	data, tasks, err := s.handleProvisioningLocked(request, maintenance, storage, progress)
 	s.opMu.Unlock()
 	if err != nil {
@@ -685,8 +684,7 @@ func (s *Server) dispatchNodeMutation(request Request, progress stageFunc) Respo
 	// the other's node as the surviving replica holder and delete both copies
 	// of a volume, and a node added between another operation's observation and
 	// its disk deletions would lose its disk unobserved.
-	lock := s.clusterMutationLock(args.Cluster)
-	lock.Lock()
+	lock := s.lockClusterMutation(args.Cluster, progress)
 	var removalWarning string
 	if request.Op == "node.remove" {
 		log.Printf("node.remove %s/%s: begin", args.Cluster, args.Name)
@@ -698,7 +696,7 @@ func (s *Server) dispatchNodeMutation(request Request, progress stageFunc) Respo
 		}
 		removalWarning = warning
 	}
-	s.opMu.Lock()
+	s.lockOperation(progress)
 	data, tasks, err := s.handleNodeMutationLocked(request, progress)
 	s.opMu.Unlock()
 	if err != nil {
@@ -760,9 +758,8 @@ func (s *Server) dispatchBGP(request Request, progress stageFunc) Response {
 	if err := decodeArgs(request.Args, &args); err != nil {
 		return failure(err)
 	}
-	lock := s.clusterMutationLock(args.Name)
-	lock.Lock()
-	s.opMu.Lock()
+	lock := s.lockClusterMutation(args.Name, progress)
+	s.lockOperation(progress)
 	summary, tasks, err := s.setBGPLocked(request.Args, request.Op == "bgp.enable", progress)
 	s.opMu.Unlock()
 	lock.Unlock()
@@ -786,14 +783,13 @@ func (s *Server) dispatchSnapshotRestore(request Request, progress stageFunc) Re
 	// restore shares the node mutations' per-cluster lock: they all delete or
 	// add node disks, and no gate may observe a node another operation is
 	// about to delete as a copy holder.
-	lock := s.clusterMutationLock(args.Cluster)
-	lock.Lock()
+	lock := s.lockClusterMutation(args.Cluster, progress)
 	warning, err := s.gateSnapshotRestore(args)
 	if err != nil {
 		lock.Unlock()
 		return failure(err)
 	}
-	s.opMu.Lock()
+	s.lockOperation(progress)
 	status, err := s.snapshotRestore(request.Args, progress)
 	s.opMu.Unlock()
 	lock.Unlock()

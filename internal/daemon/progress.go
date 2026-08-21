@@ -74,3 +74,69 @@ func convergenceHint(clusterName string) string {
 func stoppedNodeHint(clusterName string) string {
 	return fmt.Sprintf("the cluster reconverges without it; watch it with: tbx status %s", shellquote.Quote(clusterName))
 }
+
+// opWaitNarrationInterval is how often a request queued behind the daemon's
+// operation lock repeats that it is still waiting. It is a var only so tests
+// can shorten it.
+var opWaitNarrationInterval = 30 * time.Second
+
+// clusterStages narrates on behalf of one cluster inside a multi-cluster pass,
+// naming it on every line so an operator watching an `up` can tell whose image
+// fetch or boot the stage belongs to. A nil sink stays nil, so a pass nobody
+// listens to keeps costing nothing.
+func clusterStages(progress stageFunc, clusterName string) stageFunc {
+	if progress == nil {
+		return nil
+	}
+	return func(line string) {
+		progress(clusterName + ": " + line)
+	}
+}
+
+// lockOperation takes the daemon's operation lock, narrating the wait. The
+// client's liveness bound measures silence and is re-armed by every stage, so a
+// verb queued behind a long-running operation would otherwise count its queue
+// time as silence and fail with "tbxd stopped reporting progress" while the
+// daemon is healthy and about to serve it (#392).
+func (s *Server) lockOperation(progress stageFunc) {
+	lockNarrated(&s.opMu, progress, "the daemon's current operation")
+}
+
+// lockClusterMutation takes one cluster's mutation lock, narrating the wait for
+// the same reason lockOperation does: a create holds it across a boot wait
+// measured in minutes, and the verb queued behind it must keep proving it is
+// alive.
+func (s *Server) lockClusterMutation(clusterName string, progress stageFunc) *sync.Mutex {
+	lock := s.clusterMutationLock(clusterName)
+	lockNarrated(lock, progress, fmt.Sprintf("the operation in flight on %s", clusterName))
+	return lock
+}
+
+// lockNarrated takes mu, saying what it is waiting on while it is contended and
+// repeating that on a ticker until the lock is held. A nil sink means nobody is
+// listening, so the wait is silent; an uncontended lock narrates nothing.
+func lockNarrated(mu *sync.Mutex, progress stageFunc, what string) {
+	if progress == nil {
+		mu.Lock()
+		return
+	}
+	if mu.TryLock() {
+		return
+	}
+	progress.stage("waiting for %s to finish", what)
+	acquired := make(chan struct{})
+	go func() {
+		mu.Lock()
+		close(acquired)
+	}()
+	ticker := time.NewTicker(opWaitNarrationInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-acquired:
+			return
+		case <-ticker.C:
+			progress.stage("still waiting for %s to finish", what)
+		}
+	}
+}
