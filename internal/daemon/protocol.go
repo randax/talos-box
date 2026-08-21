@@ -60,7 +60,11 @@ const (
 // it removed instead of the cluster's name alone, narrates node.start/node.stop
 // like the other node verbs, and serves snapshot.list with no cluster as every
 // cluster's snapshots — the post-destroy residue check has no cluster name
-// left to pass (#410 #414 #417 #422).
+// left to pass (#414 #417 #422). It also adds these additive response fields:
+// the cluster-status savedStateStale (#413), kubernetesNotReadySince (#418),
+// converging (#396) and storageGate (#391) fields, cache.list's reasons array
+// (#407), cache.warm's reResolvedTag/reResolvedTags (#405), and
+// cluster.destroy.inspect's volumes/csi (#422).
 const ProtocolVersion = 14
 
 // Request is one newline-delimited daemon request.
