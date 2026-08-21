@@ -208,3 +208,29 @@ func TestStaleBlockerIsNotReportedWithoutARunningPass(t *testing.T) {
 		t.Fatalf("gate = %q, error = %q, want a stale blocker ignored", statuses[0].StorageGate, statuses[0].StorageError)
 	}
 }
+
+// A running pass has un-gated stretches — the control plane spends minutes
+// bringing up etcd and kube-apiserver — during which the last recorded gate is
+// simply out of date. Quoting it would tell an operator the cluster is waiting
+// on a gate the pass moved past, which is the mis-steering #391 removed.
+func TestStaleBlockerIsNotReportedWhileAPassRuns(t *testing.T) {
+	service := &Server{
+		provisions:    map[string]activeProvision{"demo": {generation: 1, cancel: func() {}}},
+		storagePhases: map[string]StoragePhase{"demo": StoragePhaseProvisioning},
+		provisionBlockers: map[string]provisionBlocker{"demo": {
+			gate:    provision.GateMachineConfig,
+			message: "nodes not configured yet: demo-cp-1",
+			at:      time.Now().Add(-2 * provisionBlockerFreshness),
+		}},
+		storageProbeFailures: map[string]storageProbeFailure{},
+	}
+	statuses := []ClusterStatus{storageStatus("demo")}
+	service.refreshStoragePhases(statuses)
+
+	if statuses[0].StoragePhase != StoragePhaseProvisioning {
+		t.Fatalf("phase = %q, want provisioning while the pass runs", statuses[0].StoragePhase)
+	}
+	if statuses[0].StorageGate != "" || statuses[0].StorageError != "" {
+		t.Fatalf("gate = %q, error = %q, want a stale gate dropped", statuses[0].StorageGate, statuses[0].StorageError)
+	}
+}

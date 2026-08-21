@@ -7,6 +7,9 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // A gate that keeps failing must say what it is failing on: a provisioning pass
@@ -98,5 +101,41 @@ func TestBlockerMessageFoldsAndCaps(t *testing.T) {
 	}
 	if len([]rune(multibyte)) != 201 || !strings.HasSuffix(multibyte, "…") {
 		t.Fatalf("BlockerMessage() length = %d, want a capped, elided line", len([]rune(multibyte)))
+	}
+}
+
+// Bringing up etcd and kube-apiserver is the longest stretch of a pass, and
+// nothing else gates it: the retry loop itself has to name the wait, or `tbx
+// status` reports whatever gate was last observed minutes ago (#390, #391).
+func TestRetryUnavailableReportsItsGate(t *testing.T) {
+	var gates []Gate
+	var blockers []string
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx = WithGateObserver(ctx, func(gate Gate, blocker error) {
+		gates = append(gates, gate)
+		blockers = append(blockers, blocker.Error())
+		if len(gates) == 2 {
+			cancel()
+		}
+	})
+
+	unavailable := status.Error(codes.Unavailable, "connection refused")
+	_, err := retryUnavailable(ctx, GateAPIServer, "10.0.0.5", time.Millisecond, func() (struct{}, error) {
+		return struct{}{}, unavailable
+	})
+	if err == nil {
+		t.Fatal("retryUnavailable() error = nil, want the cancelled budget")
+	}
+	if len(gates) < 2 {
+		t.Fatalf("gate reports = %d, want the retry loop to keep naming itself", len(gates))
+	}
+	for i, gate := range gates {
+		if gate != GateAPIServer {
+			t.Fatalf("gate report %d = %q, want %q", i, gate, GateAPIServer)
+		}
+		if !strings.Contains(blockers[i], "10.0.0.5") || !strings.Contains(blockers[i], "connection refused") {
+			t.Fatalf("blocker %d = %q, want the address and the underlying error", i, blockers[i])
+		}
 	}
 }

@@ -821,13 +821,12 @@ func (s *Server) refreshStoragePhases(statuses []ClusterStatus) {
 			status.StorageError = aborted[status.Name]
 		case active[status.Name], !status.KubernetesReady:
 			status.StoragePhase = StoragePhaseProvisioning
-			// A pass is running: whichever gate it is held at is the honest
-			// answer to "what is storage waiting for" (#391). With no pass
-			// running the arm is here on !KubernetesReady alone, so a recorded
-			// blocker only speaks for the cluster while it is fresh — an older
-			// one describes a wait that has already ended.
-			if blocker, ok := blockers[status.Name]; ok &&
-				(active[status.Name] || time.Since(blocker.at) < provisionBlockerFreshness) {
+			// Whichever gate the pass is held at is the honest answer to
+			// "what is storage waiting for" (#391) — but only while the
+			// observation is fresh. Gates re-observe every poll interval, so a
+			// stale entry describes a wait that has already ended, whether the
+			// pass moved on to an un-gated stretch or ended altogether.
+			if blocker, ok := blockers[status.Name]; ok && time.Since(blocker.at) < provisionBlockerFreshness {
 				status.StorageGate = string(blocker.gate)
 				status.StorageError = blocker.message
 			}
