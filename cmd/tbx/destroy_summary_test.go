@@ -67,6 +67,44 @@ func TestDestroyClusterSummaryOmitsResolverLineOnTheDefaultDomain(t *testing.T) 
 	}
 }
 
+// A partially-destroyed cluster has no countable node total, and printing it
+// as "0 node(s) removed" next to gigabytes of removed state would tell the
+// operator the opposite of what the destroy did (#422).
+func TestDestroyClusterSummaryOmitsTheNodeLineWhenTheCountIsUnknown(t *testing.T) {
+	_, command := newDestroyTestCLI(t, []daemon.Response{
+		{OK: true, Data: json.RawMessage(`{}`)},
+		{OK: true, Data: json.RawMessage(`{"name":"demo","diskBytes":3221225472}`)},
+	})
+
+	if err := command.destroyCluster([]string{"demo", "--force"}); err != nil {
+		t.Fatal(err)
+	}
+
+	out := command.out.(*bytes.Buffer).String()
+	if strings.Contains(out, "node(s) removed") {
+		t.Fatalf("destroy summary reported a node count it does not have:\n%s", out)
+	}
+	if !strings.Contains(out, "3.0 GiB of cluster state removed") {
+		t.Fatalf("destroy summary missing the state line:\n%s", out)
+	}
+}
+
+// A genuinely empty cluster still reports its zero, since the count is known.
+func TestDestroyClusterSummaryKeepsAKnownZeroNodeCount(t *testing.T) {
+	_, command := newDestroyTestCLI(t, []daemon.Response{
+		{OK: true, Data: json.RawMessage(`{}`)},
+		{OK: true, Data: json.RawMessage(`{"name":"demo","nodes":0,"diskBytes":4096}`)},
+	})
+
+	if err := command.destroyCluster([]string{"demo", "--force"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if out := command.out.(*bytes.Buffer).String(); !strings.Contains(out, "0 node(s) removed") {
+		t.Fatalf("destroy summary dropped a known zero node count:\n%s", out)
+	}
+}
+
 func TestHumanBytes(t *testing.T) {
 	for _, test := range []struct {
 		bytes int64

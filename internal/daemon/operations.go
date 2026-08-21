@@ -978,9 +978,13 @@ func (s *Server) closeNodes(clusterName string, nodes map[string]hypervisor.Mach
 // the destruction against (#422). Every count is measured before anything is
 // deleted; a partially-destroyed cluster reports what could still be counted.
 type DestroySummary struct {
-	Name      string `json:"name"`
-	Nodes     int    `json:"nodes"`
-	Snapshots int    `json:"snapshots"`
+	Name string `json:"name"`
+	// Nodes is nil when the node count could not be established — a
+	// partially-destroyed cluster whose cluster.json is gone still has its
+	// disks removed, and reporting that as zero nodes would understate the
+	// destruction. A count that is known is always sent, zero included.
+	Nodes     *int `json:"nodes,omitempty"`
+	Snapshots int  `json:"snapshots"`
 	// DiskBytes is the cluster's whole state directory — node disks, snapshots
 	// and configuration — as it stood before the removal. It is the sum of each
 	// file's allocated blocks, so blocks cloned from the image cache or shared
@@ -1021,7 +1025,8 @@ func (s *Server) destroyCluster(raw json.RawMessage) (DestroySummary, error) {
 	// stop what we can, but a partially-destroyed cluster (state dir present,
 	// cluster.json gone) must still be removable — and still summarised
 	if item, loadErr := cluster.Load(args.Name); loadErr == nil {
-		summary.Nodes = len(item.Nodes)
+		nodes := len(item.Nodes)
+		summary.Nodes = &nodes
 		summary.Domain = item.EffectiveDomain()
 		customDomain = item.Domain != ""
 		if err := s.stop(args.Name); err != nil {

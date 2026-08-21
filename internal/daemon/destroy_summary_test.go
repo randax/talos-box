@@ -48,8 +48,8 @@ func TestDestroySummarisesWhatItRemoved(t *testing.T) {
 	if summary.Name != item.Name {
 		t.Fatalf("summary name = %q, want %q", summary.Name, item.Name)
 	}
-	if summary.Nodes != len(item.Nodes) {
-		t.Fatalf("summary nodes = %d, want %d", summary.Nodes, len(item.Nodes))
+	if summary.Nodes == nil || *summary.Nodes != len(item.Nodes) {
+		t.Fatalf("summary nodes = %v, want %d", summary.Nodes, len(item.Nodes))
 	}
 	if summary.Snapshots != 2 {
 		t.Fatalf("summary snapshots = %d, want 2", summary.Snapshots)
@@ -74,6 +74,11 @@ func TestDestroySummaryOfAPartiallyDestroyedClusterCountsWhatIsLeft(t *testing.T
 		t.Fatal(err)
 	}
 	delete(service.vms, item.Name)
+	for _, node := range item.Nodes {
+		if err := os.WriteFile(filepath.Join(dir, node.Name+".img"), make([]byte, 4096), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := os.Remove(filepath.Join(dir, "cluster.json")); err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +93,12 @@ func TestDestroySummaryOfAPartiallyDestroyedClusterCountsWhatIsLeft(t *testing.T
 	}
 
 	summary := decodeDestroySummary(t, response)
-	if summary.Name != item.Name || summary.Nodes != 0 {
-		t.Fatalf("summary = %+v, want the name and no countable nodes", summary)
+	// The disks still went, so an uncountable node count is reported as
+	// unknown rather than as zero nodes removed.
+	if summary.Name != item.Name || summary.Nodes != nil {
+		t.Fatalf("summary = %+v, want the name and an uncounted node total", summary)
+	}
+	if summary.DiskBytes < 4096 {
+		t.Fatalf("summary diskBytes = %d, want the state that was removed", summary.DiskBytes)
 	}
 }

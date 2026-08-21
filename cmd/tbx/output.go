@@ -186,13 +186,16 @@ func printStatus(output io.Writer, clusters []daemon.ClusterStatus, quiet bool) 
 // (#422). Only lines the daemon actually reported are printed: an unknown
 // count is left out rather than printed as zero.
 func printDestroySummary(output io.Writer, summary daemon.DestroySummary, inspection daemon.DestroyInspection) error {
-	lines := []string{
-		fmt.Sprintf("%d node(s) removed", summary.Nodes),
+	var lines []string
+	if summary.Nodes != nil {
+		lines = append(lines, fmt.Sprintf("%d node(s) removed", *summary.Nodes))
+	}
+	lines = append(lines,
 		// deliberately not "reclaimed": blocks a node disk shares with the image
 		// cache (or with a snapshot) are counted per file, and the cache is not
 		// touched by a destroy, so this is state removed, not capacity freed
 		fmt.Sprintf("%s of cluster state removed (%d bytes)", humanBytes(summary.DiskBytes), summary.DiskBytes),
-	}
+	)
 	if summary.Snapshots > 0 {
 		lines = append(lines, fmt.Sprintf("%d snapshot(s) deleted", summary.Snapshots))
 	}
