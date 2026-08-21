@@ -88,6 +88,15 @@ type Config struct {
 	ReserveMiB   int
 	FloorMiB     int
 	PollInterval time.Duration
+	// HoldMiB reports memory that has already been ballooned out of the running
+	// guests on purpose and must stay out — the pre-balloon the provision-start
+	// gate takes to make room for a guest that is booting (#398). Run subtracts
+	// it from the host-free reading, which holds the reclaimed targets in place
+	// without the manager needing any state of its own: without it the manager
+	// would see free memory back above the reserve, compute no deficit, and hand
+	// the memory back in the seconds before the new guest claims it. Nil means
+	// nothing is held.
+	HoldMiB func() int
 }
 
 // DefaultConfig is the G3-tuned default: 6 GiB host reserve, 1 GiB per-node
@@ -126,6 +135,9 @@ func RunWithLogger(cfg Config, vms func() map[string]Balloonable, stop <-chan st
 			if err != nil {
 				m.log("balloon: read host memory: %v", err)
 				continue
+			}
+			if cfg.HoldMiB != nil {
+				free -= cfg.HoldMiB()
 			}
 			m.Reconcile(vms(), free, cfg.ReserveMiB, cfg.FloorMiB)
 		}

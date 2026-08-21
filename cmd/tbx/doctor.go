@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/randax/talos-box/internal/balloon"
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/daemon"
 	"github.com/randax/talos-box/internal/extensions"
@@ -29,6 +30,11 @@ type doctorDependencies struct {
 	getStatus       func() ([]daemon.ClusterStatus, error)
 	listCache       func() (daemon.CacheListResult, error)
 	hostPressure    func() (hostpressure.Snapshot, error)
+	// hostFreeMemory is the free-memory reading the provision-start gate
+	// refuses on. The host-pressure snapshot does not carry it — Assess never
+	// needed it — but the check is not self-attesting without it (#420). Nil
+	// reports free memory as unmeasured rather than guessing.
+	hostFreeMemory func() (int, error)
 	// guestAgentSupport is the host capability, not a running backend's, so the
 	// gate is explained even with the daemon down.
 	guestAgentSupport func() hypervisor.FeatureStatus
@@ -77,6 +83,20 @@ Exit code:
 usage: tbx doctor
 `)
 	return b.String()
+}
+
+// doctorFreeMemoryMiB reads host free memory for the host-pressure summary. It
+// never fails the check: an unreadable probe reports the other two numbers and
+// says free memory was not measured.
+func doctorFreeMemoryMiB(deps doctorDependencies) int {
+	if deps.hostFreeMemory == nil {
+		return 0
+	}
+	freeMiB, err := deps.hostFreeMemory()
+	if err != nil {
+		return 0
+	}
+	return freeMiB
 }
 
 type doctorFinding struct {
@@ -160,7 +180,16 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 			return err
 		}
 	} else if findings := hostpressure.Assess(snapshot); len(findings) == 0 {
-		if err := writeFindings(doctorFinding{level: "PASS", check: "host-pressure"}); err != nil {
+		// A PASS states the three numbers it was decided on — free memory, swap
+		// in use, free space on the ~/.talosbox volume — plus the headroom the
+		// provision-start gate will measure the next bringup against, so the
+		// verdict can be attested without re-running memory_pressure, sysctl and
+		// df by hand, and so a host cannot read PASS here and still be refused a
+		// second cluster without warning (#420, #397).
+		snapshot.FreeMemoryMiB = doctorFreeMemoryMiB(deps)
+		if err := writeFindings(doctorFinding{
+			level: "PASS", check: "host-pressure", detail: snapshot.Summary(balloon.DefaultConfig().ReserveMiB),
+		}); err != nil {
 			return err
 		}
 	} else {
@@ -463,6 +492,7 @@ func (c cli) doctorDependencies() doctorDependencies {
 			err := c.doctorCall("cache.list", struct{}{}, &result)
 			return result, err
 		},
+		hostFreeMemory: balloon.HostFreeMiB,
 		hostPressure: func() (hostpressure.Snapshot, error) {
 			home, err := os.UserHomeDir()
 			if err != nil {

@@ -271,7 +271,7 @@ spec:
 // switch between engines passes through exactly that window, so the wait is
 // what keeps the probe from creating a claim the cluster cannot serve.
 func waitForDefaultStorageClass(ctx context.Context, client kubernetes.Interface, expected string, interval time.Duration) error {
-	return poll(ctx, interval, func(ctx context.Context) error {
+	return poll(ctx, GateDefaultStorageClass, interval, func(ctx context.Context) error {
 		list, err := client.StorageV1().StorageClasses().List(ctx, metav1.ListOptions{})
 		if err != nil {
 			return fmt.Errorf("list storage classes for storage probe: %w", err)

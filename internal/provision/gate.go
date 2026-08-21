@@ -28,6 +28,7 @@ const (
 	GateLonghornScheduling  Gate = "Longhorn node scheduling"
 	GateLocalPath           Gate = "local-path provisioner"
 	GateStorageClass        Gate = "StorageClass replacement"
+	GateDefaultStorageClass Gate = "default StorageClass"
 	GateStorageProbePVC     Gate = "storage probe PVC"
 	GateStorageProbePod     Gate = "storage probe pod"
 	GateStorageProbeCleanup Gate = "storage probe cleanup"

@@ -9,6 +9,7 @@ import (
 	"github.com/randax/talos-box/internal/balloon"
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/hostpressure"
+	"github.com/randax/talos-box/internal/hypervisor"
 )
 
 // nearlyFullSwap is the #334 reading exactly as the incident records it: 7.3
@@ -333,5 +334,123 @@ func TestStartClusterSkipsTheGateWhenEveryMemberIsRunning(t *testing.T) {
 	}
 	if _, err := service.startCluster(raw); err != nil {
 		t.Fatalf("startCluster() error = %v, want admission", err)
+	}
+}
+
+// balloonableFixture re-sizes the shared node-mutation fixture to guest memory
+// the balloon controller can actually take back: the fixture's 1 MiB nodes sit
+// below the per-node floor, so nothing about them is reclaimable and the
+// reclaim path never arms. It also reports balloon readback, which is what lets
+// Balloonables answer without probing apid on a guest that does not exist.
+func balloonableFixture(t *testing.T, memoryMiB int) (*Server, cluster.Cluster) {
+	t.Helper()
+	service, item := runningLonghornClusterForNodeMutation(t, 1, 2)
+	item.NodeDefaults.MemoryMiB = memoryMiB
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	service.hypervisor = &fakeHypervisor{
+		architecture: hypervisor.ArchitectureARM64,
+		capabilities: hypervisor.Capabilities{BalloonReadback: hypervisor.FeatureStatus{Supported: true}},
+	}
+	service.hostPressure = noHostPressure
+	service.hostTotalMemory = plentifulHostMemory
+	return service, item
+}
+
+// #398: a shortfall the already-running guests can give back is not a refusal.
+// The gate pre-balloons exactly the shortfall out of them before the new guests
+// boot, which is the --force-free path forward the incident had none of.
+func TestProvisionStartPreBalloonsRunningGuestsInsteadOfRefusing(t *testing.T) {
+	const nodeMiB = 2048
+	reserve := balloon.DefaultConfig().ReserveMiB
+	floor := balloon.DefaultConfig().FloorMiB
+	service, _ := balloonableFixture(t, nodeMiB)
+	const shortfall = 512
+	service.hostFreeMemory = func() (int, error) { return reserve + nodeMiB - shortfall, nil }
+
+	warnings, err := service.checkProvisionStart(t.TempDir(), nodeMiB, false)
+
+	if err != nil {
+		t.Fatalf("checkProvisionStart() = %v, want admission after pre-ballooning", err)
+	}
+	if joined := strings.Join(warnings, "\n"); !strings.Contains(joined, "pre-ballooned 512 MiB") {
+		t.Fatalf("checkProvisionStart() warnings = %q, want the pre-balloon narration", warnings)
+	}
+	reclaimed := 0
+	for _, machine := range service.vms["demo"] {
+		fake, ok := machine.(*fakeMachine)
+		if !ok || len(fake.memoryTargets) == 0 {
+			t.Fatalf("node was never ballooned down: %#v", machine)
+		}
+		target := fake.memoryTargets[len(fake.memoryTargets)-1]
+		if target < floor {
+			t.Fatalf("balloon target %d MiB is below the %d MiB per-node floor", target, floor)
+		}
+		reclaimed += nodeMiB - target
+	}
+	if reclaimed < shortfall {
+		t.Fatalf("pre-balloon reclaimed %d MiB, want at least the %d MiB shortfall", reclaimed, shortfall)
+	}
+	if got := service.BalloonHoldMiB(); got != shortfall {
+		t.Fatalf("BalloonHoldMiB() = %d, want the %d MiB hold that keeps the manager from handing it straight back", got, shortfall)
+	}
+}
+
+// The credit is bounded by what the running guests can actually give back: past
+// it the gate still refuses, and says the pre-balloon was already counted so the
+// operator does not go looking for headroom the gate ignored.
+func TestProvisionStartRefusesShortfallBeyondReclaimableMemory(t *testing.T) {
+	const nodeMiB = 2048
+	reserve := balloon.DefaultConfig().ReserveMiB
+	floor := balloon.DefaultConfig().FloorMiB
+	service, _ := balloonableFixture(t, nodeMiB)
+	reclaimable := 3 * (nodeMiB - floor)
+	service.hostFreeMemory = func() (int, error) { return reserve + nodeMiB - reclaimable - 1, nil }
+
+	_, err := service.checkProvisionStart(t.TempDir(), nodeMiB, false)
+
+	if err == nil {
+		t.Fatal("checkProvisionStart() admitted a shortfall past the reclaimable memory")
+	}
+	if !strings.Contains(err.Error(), "the running guests can give back") {
+		t.Fatalf("checkProvisionStart() error = %v, want the refusal to name the balloon credit", err)
+	}
+	if got := service.BalloonHoldMiB(); got != 0 {
+		t.Fatalf("BalloonHoldMiB() = %d after a refusal, want no hold", got)
+	}
+}
+
+// A guest that cannot be ballooned is not headroom: if the reclaim fails to
+// apply, the start is refused rather than admitted on memory nothing gave back.
+func TestProvisionStartRefusesWhenThePreBalloonFails(t *testing.T) {
+	const nodeMiB = 2048
+	reserve := balloon.DefaultConfig().ReserveMiB
+	service, _ := balloonableFixture(t, nodeMiB)
+	service.hostFreeMemory = func() (int, error) { return reserve + nodeMiB - 512, nil }
+	for _, machine := range service.vms["demo"] {
+		machine.(*fakeMachine).setMemoryErr = errors.New("virtio_balloon not ready")
+	}
+
+	_, err := service.checkProvisionStart(t.TempDir(), nodeMiB, false)
+
+	if err == nil || !strings.Contains(err.Error(), "virtio_balloon not ready") {
+		t.Fatalf("checkProvisionStart() error = %v, want the failed pre-balloon to refuse", err)
+	}
+}
+
+// The whole provisioning dispatch — create, start, up, and every node mutation
+// — runs under opMu, so the gate and the pre-balloon it takes must never lock
+// it again. A regression here does not fail, it hangs.
+func TestProvisionStartGateRunsUnderOpMu(t *testing.T) {
+	const nodeMiB = 2048
+	service, _ := balloonableFixture(t, nodeMiB)
+	service.hostFreeMemory = func() (int, error) { return balloon.DefaultConfig().ReserveMiB + nodeMiB - 512, nil }
+
+	service.opMu.Lock()
+	defer service.opMu.Unlock()
+
+	if _, err := service.checkProvisionStart(t.TempDir(), nodeMiB, false); err != nil {
+		t.Fatalf("checkProvisionStart() under opMu = %v, want admission after pre-ballooning", err)
 	}
 }
