@@ -395,7 +395,13 @@ func (s *Server) runProvisionTasks(data any, tasks []provisionTask, progress sta
 		narration, warnings, phase, fullPass, err := s.provisionCNI(task.ctx, task.item, task.generation, task.force, task.skipStorage)
 		if task.item.CSI != "" && !task.skipStorage {
 			s.opMu.Lock()
-			if err != nil {
+			// Only a failure from the storage stage itself is a verdict on
+			// storage. A pass that died at the Cilium or Kubernetes gates never
+			// reached the storage reconciler, so it leaves storage where any
+			// other unfinished pass does — at `provisioning`, for the status
+			// probe to re-establish — instead of condemning a live storage
+			// stack to a terminal phase nothing re-evaluates (#395).
+			if err != nil && errors.Is(err, provision.ErrStorageStage) {
 				s.recordStorageFailureIfCurrentLocked(task.item.Name, task.generation, err)
 			} else {
 				s.recordStoragePhaseIfCurrentLocked(task.item.Name, task.generation, phase)

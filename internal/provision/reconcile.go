@@ -411,14 +411,17 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 		}
 		if request.Cluster.CSI != "" && !request.SkipStorage {
 			if request.Storage == nil {
-				return Result{}, errors.New("storage provisioning requires a Kubernetes reconciler")
+				return Result{}, StorageStageError(errors.New("storage provisioning requires a Kubernetes reconciler"))
 			}
 			storage, err := request.Storage.Reconcile(ctx, request.Cluster, kubeconfig)
 			if err != nil {
 				// Storage is reconciled the same way behind either CNI, so the
 				// failure names the engine that failed rather than the CNI the
 				// shared path was first written for (#347).
-				return Result{}, fmt.Errorf("reconcile %s storage: %w", request.Cluster.CSI, err)
+				// Marked as a storage-stage failure: it is the only failure
+				// that says anything about storage, and the daemon settles the
+				// terminal storage phase on that marker alone (#395).
+				return Result{}, StorageStageError(fmt.Errorf("reconcile %s storage: %w", request.Cluster.CSI, err))
 			}
 			result.StoragePhase = storage.Phase
 			result.StorageLive = storage.Live

@@ -748,6 +748,22 @@ func credentialExports(name string) string {
 	return fmt.Sprintf(" export TALOSCONFIG=~/.talosbox/clusters/%s/talosconfig; export KUBECONFIG=~/.talosbox/clusters/%s/kubeconfig", name, name)
 }
 
+// storageRecoveryHint names the recovery for a terminal storage failure. It is
+// deliberately not provisioningRecoveryHint: a failed storage stage does not
+// condemn the cluster, so recommending a destroy-and-recreate for it is both
+// far too expensive and — whenever the provisioning hint fires alongside this
+// one — the same ~200-character paragraph printed twice in consecutive hints,
+// the duplicate-fact defect #427 removed for the VIP note. The move that
+// actually re-drives the storage pass is a stop/start: Server.stop invalidates
+// the storage phase, and start provisions again.
+func storageRecoveryHint(status ClusterStatus) string {
+	name := shellquote.Quote(status.Name)
+	if status.ConfigOrigin != cluster.OriginImperative {
+		return fmt.Sprintf("Re-run the storage pass with: tbx up (or tbx cluster stop %[1]s && tbx cluster start %[1]s)", name)
+	}
+	return fmt.Sprintf("Re-run the storage pass with: tbx cluster stop %[1]s && tbx cluster start %[1]s", name)
+}
+
 func storageHint(status ClusterStatus) string {
 	if status.CSI == "" {
 		return ""
@@ -758,9 +774,9 @@ func storageHint(status ClusterStatus) string {
 		// the hint says so and points at the recovery instead of describing a
 		// wait nothing is serving (#395).
 		if status.StorageError != "" {
-			return fmt.Sprintf("storage provisioning failed: %s. Nothing is retrying. %s", status.StorageError, provisioningRecoveryHint(status))
+			return fmt.Sprintf("storage provisioning failed: %s. Nothing is retrying. %s", status.StorageError, storageRecoveryHint(status))
 		}
-		return fmt.Sprintf("storage provisioning failed. Nothing is retrying. %s", provisioningRecoveryHint(status))
+		return fmt.Sprintf("storage provisioning failed. Nothing is retrying. %s", storageRecoveryHint(status))
 	case StoragePhaseProvisioning:
 		// A running pass knows which gate is holding it, and that gate is
 		// frequently not the readiness probe — naming the probe regardless

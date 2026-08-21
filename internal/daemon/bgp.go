@@ -196,10 +196,12 @@ func (s *Server) beginBGPProvisionLocked(item cluster.Cluster) ([]provisionTask,
 	// stays scoped too.
 	//
 	// A full-scope pass that then fails at the CNI stage leaves storage exactly
-	// where any other failed provision does: the memo was invalidated at
-	// registration and the phase parked at `provisioning`, and once the task
-	// retires, refreshStoragePhases starts a status probe that can re-establish
-	// `live` on its own.
+	// where any other pass that never reached the storage stage does: the memo
+	// was invalidated at registration and the phase parked at `provisioning`,
+	// and once the task retires, refreshStoragePhases starts a status probe
+	// that can re-establish `live` on its own. Only a failure inside the
+	// storage stage settles the terminal failed phase (#395), so a CNI-stage
+	// failure never condemns storage that was live.
 	active, provisionInFlight := s.provisions[item.Name]
 	skipStorage := !provisionInFlight || active.skipStorage
 	tasks := s.beginProvisionTasksScopedLocked([]cluster.Cluster{item}, skipStorage)

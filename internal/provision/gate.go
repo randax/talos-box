@@ -2,6 +2,7 @@ package provision
 
 import (
 	"context"
+	"errors"
 	"strings"
 )
 
@@ -88,3 +89,28 @@ func BlockerMessage(blocker error) string {
 	}
 	return message
 }
+
+// ErrStorageStage marks a provisioning failure as having happened inside the
+// storage stage. Only a storage-stage failure says anything about storage: a
+// pass that died at the Cilium or Kubernetes gates never reached the storage
+// reconciler, and treating its error as a storage verdict condemned a perfectly
+// healthy storage stack to a terminal failed phase nothing re-evaluates (#395).
+var ErrStorageStage = errors.New("storage stage")
+
+// StorageStageError wraps err as a storage-stage failure. The wrapper is
+// transparent — it reports err's own message, so callers that render the cause
+// are unaffected — and only errors.Is can see the marker.
+func StorageStageError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return storageStageError{err: err}
+}
+
+type storageStageError struct{ err error }
+
+func (e storageStageError) Error() string { return e.err.Error() }
+
+func (e storageStageError) Unwrap() error { return e.err }
+
+func (e storageStageError) Is(target error) bool { return target == ErrStorageStage }
