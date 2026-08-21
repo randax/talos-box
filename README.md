@@ -28,6 +28,8 @@ sudo tbx system install
 tbx doctor
 ```
 
+After `brew upgrade tbx`, run `sudo tbx system install` again: the launchd helper keeps running the previous binary until it is reinstalled, and `tbx` refuses a helper that speaks an older protocol until then.
+
 Or build from source:
 
 ```sh
