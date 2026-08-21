@@ -26,6 +26,11 @@ func TestDoctorHelpDescribesChecksAndExitCodes(t *testing.T) {
 			want := []string{
 				"usage: tbx doctor",
 				"exits non-zero",
+				// the output shape a script parses: doctor prints one line per
+				// finding, and host-pressure and security-inventory each report
+				// several in a single run
+				"One line per finding",
+				"may report several",
 				"WARN",
 				"INFO",
 				// every portable check name is listed

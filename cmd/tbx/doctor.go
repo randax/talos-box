@@ -61,8 +61,10 @@ func doctorHelp() string {
 	var b strings.Builder
 	b.WriteString(`tbx doctor checks whether this host can run talos-box clusters, and whether the
 clusters that already exist are wired up. Every check is read-only: doctor
-reports, it never repairs. One line per check, each PASS, WARN, FAIL, INFO, or
-SKIP (the probe did not apply here).
+reports, it never repairs. One line per finding, each PASS, WARN, FAIL, INFO, or
+SKIP (the probe did not apply here). Most checks report a single line, but a
+check may report several: host-pressure reports one per condition that fired,
+security-inventory one per activated system extension.
 
 Checks:
   helper              privileged helper is installed and answers
