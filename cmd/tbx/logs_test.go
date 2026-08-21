@@ -239,3 +239,77 @@ func (b *syncBuffer) String() string {
 	defer b.mu.Unlock()
 	return b.buffer.String()
 }
+
+// The filter is written from the shapes the daemon actually logs, so the table
+// below quotes real lines. A short name matching anywhere on any line — the
+// "<cluster> " form the filter used to accept — turns `tbx logs qa` into the
+// unfiltered log and buries the cluster the operator asked about.
+func TestLogLineMatchesAnchorsOnTheNarrationShapes(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		line    string
+		cluster string
+		want    bool
+	}{
+		{
+			name:    "node-scoped subject",
+			line:    "2026/08/19 13:37:03 node.remove qa/qa-cp-1: begin",
+			cluster: "qa",
+			want:    true,
+		},
+		{
+			name:    "cluster-scoped subject",
+			line:    "2026/08/19 13:37:02 provision qa: waiting on Longhorn node scheduling: longhorn manager is not Ready",
+			cluster: "qa",
+			want:    true,
+		},
+		{
+			name:    "status subject with a node in the message",
+			line:    "2026/08/19 13:37:04 status qa: node qa-cp-1 stopped answering on apid 2m ago; inspect it live: tbx console qa qa-cp-1",
+			cluster: "qa",
+			want:    true,
+		},
+		{
+			name:    "prose form",
+			line:    "2026/08/19 13:37:05 qa-cp-1 was the last running node; cluster qa is now stopped",
+			cluster: "qa",
+			want:    true,
+		},
+		{
+			name:    "another cluster's subject ending in the name",
+			line:    "2026/08/19 13:37:06 provision prod-qa: waiting on Cilium workloads",
+			cluster: "qa",
+			want:    false,
+		},
+		{
+			name:    "another cluster's node subject",
+			line:    "2026/08/19 13:37:07 balloon prod-qa/prod-qa-cp-1: target=2048MiB",
+			cluster: "qa",
+			want:    false,
+		},
+		{
+			name:    "a longer name in the prose form",
+			line:    "2026/08/19 13:37:08 stopping cluster qa-cil",
+			cluster: "qa",
+			want:    false,
+		},
+		{
+			name:    "the name only inside a node of a longer cluster",
+			line:    "2026/08/19 13:37:09 node.start qa-cil/qa-cil-cp-1: VM started",
+			cluster: "qa",
+			want:    false,
+		},
+		{
+			name:    "no filter keeps everything",
+			line:    "2026/08/19 13:37:10 daemon settings: continuing with defaults",
+			cluster: "",
+			want:    true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := logLineMatches(test.line, test.cluster); got != test.want {
+				t.Fatalf("logLineMatches(%q, %q) = %v, want %v", test.line, test.cluster, got, test.want)
+			}
+		})
+	}
+}

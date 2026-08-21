@@ -44,6 +44,7 @@ func (c cli) runBGP(args []string) error {
 	// budget `cluster start` does and needs the same heartbeat (#307 #344).
 	signal := liveness{
 		verb:     bgpLivenessVerbs[verb] + name,
+		subject:  name,
 		deadline: storedProvisionDeadline(name),
 		quiet:    *quiet,
 	}

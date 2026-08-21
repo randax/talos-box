@@ -300,7 +300,7 @@ func (c cli) startCluster(args []string) error {
 	// call as create, so the stated bound must be the one the daemon budgets
 	// this request at (#307) — including the boot and Kubernetes-readiness
 	// waits a start now runs ahead of its reconcile (#364).
-	signal := liveness{verb: "starting " + name, deadline: storedProvisionDeadline(name) + nodeBootDeadline + kubernetesReadyDeadline, quiet: quiet}
+	signal := liveness{verb: "starting " + name, subject: name, deadline: storedProvisionDeadline(name) + nodeBootDeadline + kubernetesReadyDeadline, quiet: quiet}
 	if err := c.callWithLiveness(signal, "cluster.start", request, &result); err != nil {
 		return err
 	}
@@ -419,6 +419,7 @@ func (c cli) createCluster(args []string) error {
 	var result daemon.ClusterSummary
 	signal := liveness{
 		verb:     "provisioning " + positionals[0],
+		subject:  positionals[0],
 		deadline: createProvisionDeadline(*csi != ""),
 		quiet:    *quiet,
 	}
@@ -539,6 +540,7 @@ func (c cli) runNode(args []string) error {
 		// or a healthy --quiet add trips the client bound (#392).
 		signal := liveness{
 			verb:     "adding a node to " + positionals[0],
+			subject:  positionals[0],
 			deadline: storedProvisionDeadline(positionals[0]) + imagePrepareDeadline,
 			quiet:    *quiet,
 		}

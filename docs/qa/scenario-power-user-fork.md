@@ -46,7 +46,7 @@ Steps:
    Hand-generated configs leave `machine.network.hostname` unset, so Talos assigns random `talos-*` hostnames. Those are the names `kubectl get nodes` reports, and they will not match the `qa-fork-*` names in `tbx status` — expected Talos behavior, not a tbx bug. Leave the mismatch in place: on Talos 1.13, adding `machine.network.hostname` to a config produced by `talosctl gen config` makes **every** `apply-config` fail with `InvalidArgument … static hostname is already set in v1alpha1 config`, because the generated bundle already carries a separate `kind: HostnameConfig` (`auto: stable`) document. If you do want the two views to line up, you must remove or replace that `HostnameConfig` document in the same bundle before setting `machine.network.hostname` — record which route you took.
 2. `talosctl apply-config` to all three nodes; bootstrap the control plane; fetch kubeconfig.
 3. `tbx status qa-fork` — nodes now `configured` (tbx observes, doesn't own).
-4. Install any CNI by hand (e.g. flannel manifest) so nodes go Ready.
+4. Install any CNI by hand (e.g. flannel manifest) so nodes go Ready. A CNI is a `hostNetwork`/privileged workload and cannot be made `restricted`-compliant, so expect the `would violate PodSecurity "restricted:latest"` warning block on apply — a warning, not a rejection, and not a finding.
 
 Expected observations: substrate never fights the manual flow; status phase tracking flips to `configured` purely from observation; mirror config from the printed stream works for the hand-built cluster (pulls go through the gateway mirror).
 
@@ -77,7 +77,7 @@ On failure: capture where the manual flow and the printed guidance diverged — 
 Steps:
 1. `tbx manifests qa-fork storage` — follow it: apply PSA labels to your CSI namespace as printed.
 2. Install a BYO CSI (local-path-provisioner upstream manifest is the cheap honest choice).
-3. PVC write/readback.
+3. PVC write/readback. Use the [PSA-compliant test pod](deep-storage.md#psa-compliant-test-pod) for the writer/reader pods so the apply does not emit a `would violate PodSecurity "restricted:latest"` block — that block is a warning, not a rejection, and is not a finding.
 
 Expected observations: the printed prerequisites are complete — the BYO CSI works without undocumented extra steps; anything you had to figure out yourself is friction by definition.
 
@@ -102,9 +102,9 @@ On failure: capture each refusal/verb output.
 
 ### C5 — Destroy and cleanup (always run)
 
-Steps: `tbx cluster destroy qa-fork --force`; verify no residue (status, disk, `forge.internal` DNS state).
+Steps: `tbx cluster destroy qa-fork --force`; verify no **per-cluster** residue (status, disk, `forge.internal` DNS state — on macOS the per-cluster `/etc/resolver/forge.internal` file must be gone). The shared `/etc/resolver/k8s.test` file is install-scoped (written by `tbx system install`, required by `tbx doctor`'s `resolver` check) and is expected to persist — its survival is correct behaviour, never residue. On Linux the per-cluster equivalent is the systemd-resolved domain registration on the cluster bridge, which goes with the bridge.
 
-Pass criteria: no residue.
+Pass criteria: no per-cluster residue; the install-scoped resolver file intact.
 
 ## Report template
 

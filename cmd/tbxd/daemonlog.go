@@ -6,17 +6,35 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+
+	"github.com/randax/talos-box/internal/daemon"
 )
 
-// daemonLogFile is the file `tbx logs` reads and every runbook points at.
-const daemonLogFile = "tbxd.log"
-
 func daemonLogPath() (string, error) {
+	return stateFilePath(daemon.LogFile)
+}
+
+// stateFilePath resolves one file in the daemon's state directory. Both logs
+// live there and both need the same answer to "where is home".
+func stateFilePath(name string) (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("find home directory: %w", err)
 	}
-	return filepath.Join(home, ".talosbox", daemonLogFile), nil
+	return filepath.Join(home, ".talosbox", name), nil
+}
+
+// openLogFile opens one append-only log, creating its directory first. Both
+// logs are the daemon's own diagnostics, so both are readable by nobody else.
+func openLogFile(path string) (*os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("create %s: %w", filepath.Dir(path), err)
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", path, err)
+	}
+	return file, nil
 }
 
 // routeDaemonLog points the standard logger — the daemon's whole narration — at
@@ -31,12 +49,9 @@ func daemonLogPath() (string, error) {
 // left alone so lines are not written twice. Otherwise output is teed, keeping
 // the journal complete for a supervised daemon.
 func routeDaemonLog(path string) (io.Closer, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return nil, fmt.Errorf("create %s: %w", filepath.Dir(path), err)
-	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	file, err := openLogFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("open %s: %w", path, err)
+		return nil, err
 	}
 	if sameFile(os.Stderr, file) {
 		return file, nil

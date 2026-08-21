@@ -223,7 +223,7 @@ func destroyInspectionCountWarning(name string, engine cluster.CSI, count int) s
 		name,
 		count,
 		strings.TrimSpace(string(engine)),
-		volumeUnit(count),
+		Unit(count, "volume", "volumes"),
 		volumePossessive(count),
 	)
 }

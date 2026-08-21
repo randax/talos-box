@@ -428,8 +428,14 @@ status hint that its volumes have no redundancy, and choosing Longhorn on a memo
 prints a soft pre-flight warning (never a hard gate). Storage is ordinary provisioned state —
 `tbx up` converges the storage stage from any interruption and `tbx down`/restarts preserve
 volume data. Cluster-level operations never delete user data except `tbx cluster destroy`:
-switching or removing `csi:` is allowed only while the engine holds zero volumes (hard error
-otherwise), and the destroy confirmation reports a best-effort volume count without ever
+switching or removing `csi:` is allowed only while the engine holds zero volumes, and the hard
+error otherwise names the blocking volumes by `namespace/name` — capped, with an `and N more`
+for a long list — so the operator can go and delete exactly what holds the switch. A switch that proceeds
+tears the old engine down completely: leaving Longhorn removes every cluster-scoped object
+Longhorn installed for itself — its validating and mutating webhook configurations, the
+`longhorn-static` StorageClass, its CSIDriver registration — **before** the admission Service
+they point at, because a webhook configuration outliving its Service fails closed and would
+reject every PVC bind in the cluster. The destroy confirmation reports a best-effort volume count without ever
 blocking the destroy of an unreachable cluster. A destroy closes with a summary of what it
 removed — nodes, bytes of cluster state removed (a per-file allocated-block sum, so extents
 cloned from the image cache or shared with a snapshot count once per file rather than once per
@@ -456,8 +462,10 @@ create` line, for imperatively created ones; a cluster created before the origin
 keeps the `tbx up` wording, because tbx cannot prove no file backs it and advising a destroy on
 a guess is the worse error; substrate-only clusters retain manual guidance).
 Hints **never execute anything**. `--quiet` suppresses hints and narration but keeps facts
-(schematic/extensions lines) and liveness (the overall-deadline preamble, held back for a 5s
-grace so the usual no-op — which answers immediately — announces nothing, plus a periodic
+(schematic/extensions lines) and liveness (the deadline preamble, held back for a 5s
+grace so the usual no-op — which answers immediately — announces nothing, and worded
+conditionally (`checking demo; if provisioning is needed it may take up to 14m`) until the
+daemon narrates a stage, after which it states the window outright, plus a periodic
 stderr heartbeat during blocking provisioning calls); all list/status commands support
 `-o json`. The heartbeat names the request-wide bound `overall deadline`, covering every phase
 the daemon holds the request for — image prepare, node boot, readiness, provisioning — and
@@ -495,7 +503,13 @@ render for a cluster that declares no CNI, while the CNI-derived sections (`valu
 <section> --cni cilium|flannel` renders what tbx **would** apply for that curated CNI on a
 substrate-only cluster; naming a CNI that contradicts a declared one is refused. Its
 `storage` section always includes the kubelet mount prerequisite and privileged-namespace PSA
-guidance, including for a substrate-only cluster. If `csi:` is declared it also includes the
+guidance, including for a substrate-only cluster. That guidance is about the CSI's own namespace;
+every other namespace is governed by the cluster-wide default, which enforces `baseline` and
+warns/audits at `restricted` wherever a namespace carries no `pod-security.kubernetes.io/*`
+labels of its own — `default` included. A workload applied there that is not `restricted`-compliant
+is still admitted and prints a `would violate PodSecurity "restricted:latest"` block: a warning,
+not a failure. A workload that genuinely needs `hostNetwork` or privileges exceeds `baseline`, so
+it needs its own namespace labelled `privileged` the same way a CSI namespace does. If `csi:` is declared it also includes the
 exact Longhorn values and renderer-derived namespace, CRD, and post-CRD object streams, or
 local-path namespace and object streams, that tbx applies; use `storage-machine`,
 `storage-values`, `storage-namespaces`, `storage-crds`, and `storage-objects` as the clean
@@ -510,7 +524,11 @@ have no machine config to patch, so the document is folded in at generation time
 config <cluster> https://<cp-ip>:6443 --config-patch @storage-machine.yaml` before `talosctl
 apply-config --insecure`; already-configured nodes take it directly with `talosctl patch mc -p
 @storage-machine.yaml --nodes <node-ip>`. Then, before installing the CSI, create its namespace if needed and apply the
-printed PSA labels. Curated CSI namespace streams carry their own PSA labels. The printed
+printed PSA labels. Curated CSI namespace streams carry their own PSA labels. Unlabelled
+namespaces — `default` included — fall to the cluster-wide default of `baseline` enforcement with
+`restricted` warn/audit, so an ordinary test workload applied there is admitted but prints a
+`would violate PodSecurity "restricted:latest"` warning block, while a `hostNetwork` or privileged
+one needs its namespace labelled `privileged`. The printed
 prerequisite mounts `/var/local-path-provisioner`, the path tbx's curated local-path CSI writes
 to; upstream local-path-provisioner's shipped ConfigMap defaults to `/opt/local-path-provisioner`,
 so the `storage` section also prints the `local-path-config` edit that repoints it at the mounted

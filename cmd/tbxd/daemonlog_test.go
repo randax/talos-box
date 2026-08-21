@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/randax/talos-box/internal/daemon"
 )
 
 // A socket-activated tbxd is never spawned by the CLI, so nothing else creates
@@ -14,7 +16,7 @@ func TestRouteDaemonLogWritesTheFileAndKeepsStderr(t *testing.T) {
 	restore := swapDefaultLoggerOutput(t)
 	defer restore()
 
-	path := filepath.Join(t.TempDir(), "state", daemonLogFile)
+	path := filepath.Join(t.TempDir(), "state", daemon.LogFile)
 	var closer interface{ Close() error }
 	stderr := stderrDuringRouting(t, func() {
 		var err error
@@ -50,7 +52,7 @@ func TestRouteDaemonLogDoesNotDuplicateWhenStderrIsTheLog(t *testing.T) {
 	restore := swapDefaultLoggerOutput(t)
 	defer restore()
 
-	path := filepath.Join(t.TempDir(), daemonLogFile)
+	path := filepath.Join(t.TempDir(), daemon.LogFile)
 	file, err := os.Create(path)
 	if err != nil {
 		t.Fatal(err)
@@ -113,7 +115,7 @@ func TestRouteDaemonLogCloseRestoresStderr(t *testing.T) {
 	restore := swapDefaultLoggerOutput(t)
 	defer restore()
 
-	path := filepath.Join(t.TempDir(), "state", daemonLogFile)
+	path := filepath.Join(t.TempDir(), "state", daemon.LogFile)
 	closer, err := routeDaemonLog(path)
 	if err != nil {
 		t.Fatal(err)

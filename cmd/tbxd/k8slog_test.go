@@ -11,6 +11,8 @@ import (
 
 	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
+
+	"github.com/randax/talos-box/internal/daemon"
 )
 
 // TestRouteKubernetesClientLogsKeepsKlogOutOfTheDaemonLog pins #401: klog's
@@ -21,7 +23,7 @@ func TestRouteKubernetesClientLogsKeepsKlogOutOfTheDaemonLog(t *testing.T) {
 	restoreLog := swapDefaultLogger(t, &daemonLog)
 	defer restoreLog()
 
-	path := filepath.Join(t.TempDir(), ".talosbox", kubernetesLogFile)
+	path := filepath.Join(t.TempDir(), ".talosbox", daemon.KubernetesLogFile)
 	closer, err := routeKubernetesClientLogs(path, false)
 	if err != nil {
 		t.Fatal(err)
@@ -39,7 +41,7 @@ func TestRouteKubernetesClientLogsKeepsKlogOutOfTheDaemonLog(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(content), "deprecated since v1.30") {
-		t.Fatalf("%s = %q, want the klog line", kubernetesLogFile, content)
+		t.Fatalf("%s = %q, want the klog line", daemon.KubernetesLogFile, content)
 	}
 	if got := daemonLog.String(); strings.Contains(got, "deprecated since v1.30") {
 		t.Fatalf("daemon log = %q, want no klog line", got)
@@ -62,7 +64,7 @@ func TestRouteKubernetesClientLogsDivertsErrorsAndWarningsToo(t *testing.T) {
 	restoreLog := swapDefaultLogger(t, &daemonLog)
 	defer restoreLog()
 
-	path := filepath.Join(t.TempDir(), ".talosbox", kubernetesLogFile)
+	path := filepath.Join(t.TempDir(), ".talosbox", daemon.KubernetesLogFile)
 	closer, err := routeKubernetesClientLogs(path, false)
 	if err != nil {
 		t.Fatal(err)
@@ -84,7 +86,7 @@ func TestRouteKubernetesClientLogsDivertsErrorsAndWarningsToo(t *testing.T) {
 	}
 	for _, want := range []string{"chart values omit", "current server API group list"} {
 		if got := strings.Count(string(content), want); got != 1 {
-			t.Fatalf("%s holds %d copies of %q, want exactly 1", kubernetesLogFile, got, want)
+			t.Fatalf("%s holds %d copies of %q, want exactly 1", daemon.KubernetesLogFile, got, want)
 		}
 	}
 	if got := daemonLog.String(); got != "" {
@@ -133,7 +135,7 @@ func TestRouteKubernetesClientLogsInstallsTheWarningHandler(t *testing.T) {
 			setDefaultWarningHandler = func(handler rest.WarningHandler) { installed = handler }
 			defer func() { setDefaultWarningHandler = original }()
 
-			closer, err := routeKubernetesClientLogs(filepath.Join(t.TempDir(), kubernetesLogFile), test.enabled)
+			closer, err := routeKubernetesClientLogs(filepath.Join(t.TempDir(), daemon.KubernetesLogFile), test.enabled)
 			if err != nil {
 				t.Fatal(err)
 			}

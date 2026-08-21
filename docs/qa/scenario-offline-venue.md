@@ -67,7 +67,7 @@ On failure: capture the stalled pod's describe/events, `tbx cache list`, mirror 
 **Goal**: an uncached image fails fast and clearly, not with a hang.
 
 Steps:
-1. Deploy a pod with an image that was never warmed. Expect a clear pull failure (offline: content not cached) within a bounded time, no infinite hang.
+1. Deploy a pod with an image that was never warmed. Base it on the [PSA-compliant test pod](deep-storage.md#psa-compliant-test-pod) (swap in the uncached image) so the apply does not emit a `would violate PodSecurity "restricted:latest"` block — that block is a warning, not a rejection, and is not a finding. Expect a clear pull failure (offline: content not cached) within a bounded time, no infinite hang.
 
 Pass criteria: hard, legible failure; cluster otherwise unaffected.
 

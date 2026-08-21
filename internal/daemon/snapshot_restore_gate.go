@@ -152,7 +152,7 @@ func unverifiedNodesSuffix(unverified []string) string {
 func nodeVolumeList(counted []nodeVolumeData) string {
 	entries := make([]string, 0, len(counted))
 	for _, item := range counted {
-		entries = append(entries, fmt.Sprintf("%s (%d %s)", item.node, item.count, volumeUnit(item.count)))
+		entries = append(entries, fmt.Sprintf("%s (%d %s)", item.node, item.count, Unit(item.count, "volume", "volumes")))
 	}
 	return strings.Join(entries, ", ")
 }

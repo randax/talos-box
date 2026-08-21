@@ -162,16 +162,53 @@ func readAppended(path string, offset int64) (int64, string, error) {
 }
 
 // logLineMatches applies the cluster filter. The daemon narrates per-cluster
-// work under two conventions: node-scoped lines carry a "<cluster>/<node>"
-// subject — `balloon qa-cil/qa-cil-cp-1: …` — while cluster-scoped ones name
-// the cluster alone — `provision qa-cil: waiting on …`. Matching only the
-// slash form hid every gate, status and provision line the daemon writes, so
-// the filter accepts both (#402).
+// work in three shapes and no others: node-scoped lines carry a
+// "<cluster>/<node>" subject — `node.remove qa/qa-cp-1: begin` — cluster-scoped
+// ones name the cluster alone before the colon — `provision qa: waiting on …` —
+// and a few read it in prose — `stopping cluster qa`. Matching only the slash
+// form hid every gate, status and provision line the daemon writes (#402);
+// matching a bare "<cluster> " instead pulled in every line that merely
+// contains the name, which for a short name is most of them.
 func logLineMatches(line, cluster string) bool {
 	if cluster == "" {
 		return true
 	}
-	return strings.Contains(line, cluster+"/") ||
-		strings.Contains(line, cluster+":") ||
-		strings.Contains(line, cluster+" ")
+	return containsSubject(line, cluster+"/", false) ||
+		containsSubject(line, cluster+":", false) ||
+		containsSubject(line, "cluster "+cluster, true)
+}
+
+// containsSubject reports whether line names subject as a whole subject rather
+// than as part of a longer name: the byte before it must not be one a cluster
+// name can contain, and when trailing is set the byte after it must not be
+// either — without that, filtering on "qa" matches every "prod-qa" line.
+func containsSubject(line, subject string, trailing bool) bool {
+	for offset := 0; offset+len(subject) <= len(line); {
+		index := strings.Index(line[offset:], subject)
+		if index < 0 {
+			return false
+		}
+		index += offset
+		end := index + len(subject)
+		if (index == 0 || nameBoundary(line[index-1])) &&
+			(!trailing || end == len(line) || nameBoundary(line[end])) {
+			return true
+		}
+		offset = index + 1
+	}
+	return false
+}
+
+// nameBoundary reports whether b can sit next to a cluster name without being
+// part of it. Names are lowercase alphanumerics and dashes; dots and
+// underscores are treated as name bytes too, so a domain or a dotted verb
+// (`node.remove`) never looks like a boundary.
+func nameBoundary(b byte) bool {
+	switch {
+	case b >= 'a' && b <= 'z', b >= 'A' && b <= 'Z', b >= '0' && b <= '9':
+		return false
+	case b == '-', b == '.', b == '_':
+		return false
+	}
+	return true
 }

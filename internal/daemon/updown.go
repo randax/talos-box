@@ -508,7 +508,7 @@ func reconcileProvisioningIntentWithVolumes(item cluster.Cluster, spec config.Cl
 func storageVolumesBlockChange(item cluster.Cluster, volumes []string) error {
 	return fmt.Errorf(
 		"cluster %q: cannot change csi from %q while it has %d provisioned %s (%s); delete the volumes first, or run: tbx cluster destroy %s",
-		item.Name, item.CSI, len(volumes), volumeUnit(len(volumes)), storageVolumeList(volumes), shellquote.Quote(item.Name),
+		item.Name, item.CSI, len(volumes), Unit(len(volumes), "volume", "volumes"), storageVolumeList(volumes), shellquote.Quote(item.Name),
 	)
 }
 

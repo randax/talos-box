@@ -47,7 +47,7 @@ On failure: capture status, subnet assignments, doctor routes section.
 
 Steps:
 1. From the host: ping a `qa-a` node and a `qa-b` node; curl both VIPs.
-2. From inside `qa-a` (a test pod or `kubectl debug` node shell): ping a `qa-b` node IP; curl `qa-b`'s VIP (`172.30.<m>.200`).
+2. From inside `qa-a` (a test pod or `kubectl debug` node shell): ping a `qa-b` node IP; curl `qa-b`'s VIP (`172.30.<m>.200`). Base a test pod on the [PSA-compliant test pod](deep-storage.md#psa-compliant-test-pod) so the apply does not emit a `would violate PodSecurity "restricted:latest"` block — that block is a warning, not a rejection, and is not a finding. A `kubectl debug` node shell is privileged by construction, so expect the warning block there instead.
 3. Reverse: from `qa-b`, reach `qa-a`'s node and VIP.
 
 Expected observations: all six paths work — the host routes between cluster subnets as a first-class contract; record round-trip times (gross anomalies are friction).

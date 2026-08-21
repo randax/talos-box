@@ -24,12 +24,12 @@ func TestDestroyClusterPrintsASummaryOfWhatWasRemoved(t *testing.T) {
 	out := command.out.(*bytes.Buffer).String()
 	for _, wanted := range []string{
 		"destroyed cluster demo",
-		"3 node(s) removed",
-		"1 snapshot(s) deleted",
+		"3 nodes removed",
+		"1 snapshot deleted",
 		"3.0 GiB of cluster state removed",
 		"3221225472 bytes",
 		"resolver entry for demo.example.test withdrawn",
-		"2 longhorn volume(s)",
+		"2 longhorn volumes",
 	} {
 		if !strings.Contains(out, wanted) {
 			t.Fatalf("destroy summary missing %q:\n%s", wanted, out)
@@ -62,13 +62,13 @@ func TestDestroyClusterSummaryOmitsResolverLineOnTheDefaultDomain(t *testing.T) 
 	if !strings.Contains(out, "DNS records for demo.k8s.test withdrawn") {
 		t.Fatalf("destroy summary missing the DNS line:\n%s", out)
 	}
-	if strings.Contains(out, "volume(s)") {
+	if strings.Contains(out, "deleted with the cluster") {
 		t.Fatalf("destroy summary invented a volume line:\n%s", out)
 	}
 }
 
 // A partially-destroyed cluster has no countable node total, and printing it
-// as "0 node(s) removed" next to gigabytes of removed state would tell the
+// as "0 nodes removed" next to gigabytes of removed state would tell the
 // operator the opposite of what the destroy did (#422).
 func TestDestroyClusterSummaryOmitsTheNodeLineWhenTheCountIsUnknown(t *testing.T) {
 	_, command := newDestroyTestCLI(t, []daemon.Response{
@@ -81,7 +81,7 @@ func TestDestroyClusterSummaryOmitsTheNodeLineWhenTheCountIsUnknown(t *testing.T
 	}
 
 	out := command.out.(*bytes.Buffer).String()
-	if strings.Contains(out, "node(s) removed") {
+	if strings.Contains(out, "nodes removed") || strings.Contains(out, "node removed") {
 		t.Fatalf("destroy summary reported a node count it does not have:\n%s", out)
 	}
 	if !strings.Contains(out, "3.0 GiB of cluster state removed") {
@@ -100,7 +100,7 @@ func TestDestroyClusterSummaryKeepsAKnownZeroNodeCount(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if out := command.out.(*bytes.Buffer).String(); !strings.Contains(out, "0 node(s) removed") {
+	if out := command.out.(*bytes.Buffer).String(); !strings.Contains(out, "0 nodes removed") {
 		t.Fatalf("destroy summary dropped a known zero node count:\n%s", out)
 	}
 }

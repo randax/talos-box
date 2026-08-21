@@ -180,7 +180,6 @@ func printStatus(output io.Writer, clusters []daemon.ClusterStatus, quiet bool) 
 	return nil
 }
 
-// encodeJSON writes indented JSON — the machine-readable face of list/status.
 // printDestroySummary accounts for what a destroy removed, so the scope of the
 // CLI's most destructive verb can be checked without a residue check by hand
 // (#422). Only lines the daemon actually reported are printed: an unknown
@@ -188,7 +187,7 @@ func printStatus(output io.Writer, clusters []daemon.ClusterStatus, quiet bool) 
 func printDestroySummary(output io.Writer, summary daemon.DestroySummary, inspection daemon.DestroyInspection) error {
 	var lines []string
 	if summary.Nodes != nil {
-		lines = append(lines, fmt.Sprintf("%d node(s) removed", *summary.Nodes))
+		lines = append(lines, fmt.Sprintf("%d %s removed", *summary.Nodes, daemon.Unit(*summary.Nodes, "node", "nodes")))
 	}
 	lines = append(lines,
 		// deliberately not "reclaimed": blocks a node disk shares with the image
@@ -197,7 +196,7 @@ func printDestroySummary(output io.Writer, summary daemon.DestroySummary, inspec
 		fmt.Sprintf("%s of cluster state removed (%d bytes)", humanBytes(summary.DiskBytes), summary.DiskBytes),
 	)
 	if summary.Snapshots > 0 {
-		lines = append(lines, fmt.Sprintf("%d snapshot(s) deleted", summary.Snapshots))
+		lines = append(lines, fmt.Sprintf("%d %s deleted", summary.Snapshots, daemon.Unit(summary.Snapshots, "snapshot", "snapshots")))
 	}
 	switch {
 	case summary.ResolverWithdrawn:
@@ -212,7 +211,8 @@ func printDestroySummary(output io.Writer, summary daemon.DestroySummary, inspec
 		if engine != "" {
 			engine += " "
 		}
-		lines = append(lines, fmt.Sprintf("%d %svolume(s) deleted with the cluster (warned above)", inspection.Volumes, engine))
+		lines = append(lines, fmt.Sprintf("%d %s%s deleted with the cluster (warned above)",
+			inspection.Volumes, engine, daemon.Unit(inspection.Volumes, "volume", "volumes")))
 	}
 	for _, line := range lines {
 		if _, err := fmt.Fprintf(output, "  %s\n", line); err != nil {

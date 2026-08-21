@@ -61,7 +61,7 @@ On failure: capture the listener table verbatim.
 
 Steps:
 1. `tbx manifests qa-mir mirrors` — expect `"*"` → `http://172.30.<n>.1:5059`, `skipFallback: true`.
-2. From a test pod, pull an image that is NOT cached and NOT on any warm list (while online): confirm it arrives via the mirror (mirror stats change: `tbx cache list` before/after shows the upstream's counters grow). Confirm the image was novel first with `tbx cache list <image-ref>`, which answers `cached` / `not cached` for that one reference — pick a tag-pinned ref for this (not `:latest`, not tagless: `cache list <ref>` applies the same ref validation `cache warm` does and rejects those forms with an error rather than an answer).
+2. From a test pod, pull an image that is NOT cached and NOT on any warm list (while online): confirm it arrives via the mirror (mirror stats change: `tbx cache list` before/after shows the upstream's counters grow). Confirm the image was novel first with `tbx cache list <image-ref>`, which answers `cached` / `not cached` for that one reference — pick a tag-pinned ref for this (not `:latest`, not tagless: `cache list <ref>` applies the same ref validation `cache warm` does and rejects those forms with an error rather than an answer). Base the test pod on the [PSA-compliant test pod](deep-storage.md#psa-compliant-test-pod) (swap in the image under test) so the apply does not emit a `would violate PodSecurity "restricted:latest"` block — that block is a warning, not a rejection, and is not a finding.
 
 Expected observations: the rendered mirror config matches the live pull behavior; `cache list` per-upstream counters reflect the pull.
 
@@ -75,7 +75,7 @@ On failure: capture `manifests mirrors` output and `cache list` before/after.
 
 Steps:
 1. Warm one specific tag-pinned image (C1's list). `tbx mirror offline on`; `tbx mirror offline` reports `on`.
-2. From a test pod, pull the warmed image by tag — succeeds from cache. Pull it by digest — also succeeds (digest/tag parity).
+2. From the C3 test pod (the [PSA-compliant test pod](deep-storage.md#psa-compliant-test-pod) again), pull the warmed image by tag — succeeds from cache. Pull it by digest — also succeeds (digest/tag parity).
 3. Pull an uncached image — expect a hard failure mentioning offline/not-cached (skipFallback means the node cannot bypass; the pull fails, it does not hang).
 4. Restart the daemon itself with `tbx system restart --force` (`--force` is required here: `qa-mir` is running, and a plain restart refuses rather than stop it; on a supervised install — packaged Linux units — restart the tbxd service via the service manager instead). If neither is available, exercise the cluster path: `tbx cluster stop qa-mir && tbx cluster start qa-mir`. Afterwards `tbx mirror offline` still reports `on`.
 5. `tbx system restart --force` stops running clusters and does **not** bring them back (it narrates `stopped clusters: qa-mir`), so start the cluster again before the next step: `tbx cluster start qa-mir`, then wait for the API to answer — allow ~1 min to settle. Skip this step only if step 4 took the `cluster stop`/`start` path, which already leaves the cluster running.

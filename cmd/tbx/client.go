@@ -1040,7 +1040,7 @@ func daemonLogPath() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("find home directory: %w", err)
 	}
-	return filepath.Join(home, ".talosbox", "tbxd.log"), nil
+	return filepath.Join(home, ".talosbox", daemon.LogFile), nil
 }
 
 // startDaemon spawns tbxd and returns the daemon log's size before the spawn,

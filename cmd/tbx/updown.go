@@ -40,9 +40,8 @@ var livenessInterval = time.Minute
 // livenessPreambleDelay is how long a --quiet call waits before announcing its
 // provisioning window. The window is worth stating up front for real work, but
 // a run the planner classifies as a no-op must not open by announcing work it
-// never does (#421). --quiet carries no stage stream to read the plan from, so
-// the delay is a heuristic: a no-op answers well inside it in the normal case,
-// while one held longer by slow node probes can still reach the preamble.
+// never does (#421), so the delay lets the usual no-op answer first and the
+// preamble stays conditional until the daemon has narrated a stage.
 var livenessPreambleDelay = 5 * time.Second
 
 // livenessGrace is how far past its stated deadline a blocking call may run
@@ -59,9 +58,25 @@ var livenessGrace = 2 * time.Minute
 // Everything it writes goes to stderr: stdout stays the scriptable result.
 type liveness struct {
 	// verb reads as "provisioning demo" in both the preamble and the beat.
-	verb     string
+	verb string
+	// subject is what the verb acts on — the cluster or the file's clusters —
+	// so the conditional preamble can name it without claiming the work (#421).
+	subject  string
 	deadline time.Duration
 	quiet    bool
+}
+
+// preambleText is the --quiet deadline announcement. Until the daemon has
+// narrated a stage the CLI does not know whether this run has any work to do,
+// so it states the window conditionally: a run that turns out to be a no-op
+// must not open by announcing a provisioning window it never uses (#421).
+func (l liveness) preambleText(working bool) string {
+	if working {
+		return fmt.Sprintf("%s; overall deadline %s; progress suppressed by --quiet",
+			l.verb, formatLivenessDuration(l.deadline))
+	}
+	return fmt.Sprintf("checking %s; if provisioning is needed it may take up to %s; progress suppressed by --quiet",
+		l.subject, formatLivenessDuration(l.deadline))
 }
 
 // narrator serializes the progress stream's two writers: the liveness
@@ -70,6 +85,24 @@ type liveness struct {
 type narrator struct {
 	mu     sync.Mutex
 	output io.Writer
+	// sawStage records that the daemon has reported work, which is what turns
+	// the --quiet preamble from conditional into a stated window (#421).
+	sawStage bool
+}
+
+// noteStage records that the daemon narrated a stage, whether or not the stage
+// itself is printed: a --quiet call drops the text but still learns that the
+// run is doing work.
+func (n *narrator) noteStage() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.sawStage = true
+}
+
+func (n *narrator) working() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.sawStage
 }
 
 // line writes one progress line, ignoring a write failure: an operation must
@@ -87,7 +120,10 @@ func (n *narrator) stages(quiet bool) func(string) {
 	if quiet {
 		return nil
 	}
-	return func(stage string) { n.line("%s\n", stage) }
+	return func(stage string) {
+		n.noteStage()
+		n.line("%s\n", stage)
+	}
 }
 
 // beat starts the heartbeat and returns the function that stops and joins it.
@@ -110,8 +146,7 @@ func (l liveness) beat(output *narrator) func() {
 			case <-stop:
 				return
 			case <-preamble.C:
-				output.line("%s; overall deadline %s; progress suppressed by --quiet\n",
-					l.verb, formatLivenessDuration(l.deadline))
+				output.line("%s\n", l.preambleText(output.working()))
 			case <-ticker.C:
 				// "overall deadline" names this budget apart from the
 				// per-phase budgets the daemon narrates (#423).
@@ -163,7 +198,7 @@ func (c cli) callWithLivenessNarrated(signal liveness, op string, args, destinat
 		// call — a cold image fetch, a slow reconcile — trips where the same
 		// call with narration on survives, so keep asking for the stages and
 		// drop them on the floor instead (#392 #423).
-		sink = func(string) {}
+		sink = func(string) { stream.noteStage() }
 	}
 	err := c.callNarratedWithin(op, args, destination, sink, bound)
 	if err != nil && isTimeout(err) {
@@ -271,6 +306,7 @@ func (c cli) runUp(args []string) error {
 	// one pass's (#307).
 	signal := liveness{
 		verb:     "provisioning " + upSubject(cfg),
+		subject:  upSubject(cfg),
 		deadline: upProvisionDeadline(cfg),
 		quiet:    quiet,
 	}
