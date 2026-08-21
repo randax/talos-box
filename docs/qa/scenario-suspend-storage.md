@@ -26,7 +26,7 @@ BLOCKED unless: doctor clean and the platform suspend gate is open (macOS 14+; L
 
 Steps:
 1. `tbx cluster create qa-sus --cni cilium --csi longhorn`; wait for storage-ready.
-2. Create a PVC and a writer pod that appends timestamped lines to the volume every second; let it run ≥ 60 s; record the last line.
+2. Create a PVC and a writer pod that appends timestamped lines to the volume every second; let it run ≥ 60 s; record the last line. Base it on the [PSA-compliant test pod](deep-storage.md#psa-compliant-test-pod) (swap the command for the append loop) so the apply does not emit a `would violate PodSecurity "restricted:latest"` block — that block is a warning, not a rejection, and is not a finding.
 
 Pass criteria: data flowing, last-written line recorded.
 

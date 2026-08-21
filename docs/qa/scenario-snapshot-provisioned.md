@@ -26,7 +26,7 @@ BLOCKED unless: doctor clean; no cluster `qa-snap`; ≥ 10 GiB RAM; ≥ 60 GiB f
 
 Steps:
 1. `tbx cluster create qa-snap --cni cilium --csi longhorn`; wait for the full end state.
-2. Create namespace `epoch-one` with a PVC and write the string `epoch-one` to the volume; verify readback.
+2. Create namespace `epoch-one` with a PVC and write the string `epoch-one` to the volume; verify readback. Use the [PSA-compliant test pod](deep-storage.md#psa-compliant-test-pod) so the apply does not emit a `would violate PodSecurity "restricted:latest"` block — that block is a warning, not a rejection, and is not a finding.
 
 Pass criteria: end state reached; epoch-one data committed.
 
