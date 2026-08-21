@@ -34,8 +34,10 @@ func TestRunCacheWarmCheckRequestsOfflineVerification(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// A plain check verifies the list plus the bootstrap-required set (#404).
+	wantRefs := append([]string{ref}, provision.BootstrapRequiredImages()...)
 	done := make(chan struct{})
-	go serveDaemonRequests(t, listener, 1, func(_ int, request daemon.Request) daemon.Response {
+	go serveDaemonRequests(t, listener, len(wantRefs), func(index int, request daemon.Request) daemon.Response {
 		if request.Op != "cache.check" {
 			t.Fatalf("request op = %q, want cache.check", request.Op)
 		}
@@ -46,11 +48,11 @@ func TestRunCacheWarmCheckRequestsOfflineVerification(t *testing.T) {
 		if args.Deep {
 			t.Fatal("cache.check deep = true, want false")
 		}
-		if len(args.Refs) != 1 || args.Refs[0] != ref {
-			t.Fatalf("refs = %v, want [%q]", args.Refs, ref)
+		if len(args.Refs) != 1 || args.Refs[0] != wantRefs[index] {
+			t.Fatalf("refs = %v, want [%q]", args.Refs, wantRefs[index])
 		}
 		return daemon.Response{OK: true, Data: mustJSON(t, daemon.CacheCheckResult{
-			Entries:  []daemon.CacheCheckEntry{{Ref: ref, Status: daemon.CacheCheckStatusComplete}},
+			Entries:  []daemon.CacheCheckEntry{{Ref: wantRefs[index], Status: daemon.CacheCheckStatusComplete}},
 			Complete: 1,
 		})}
 	}, done)
@@ -64,7 +66,8 @@ func TestRunCacheWarmCheckRequestsOfflineVerification(t *testing.T) {
 
 	wantStdout := "" +
 		"\u2713 docker.io/library/pause:3.10 complete\n" +
-		"summary: 1 complete, 0 failed\n"
+		"\u2713 " + provision.KubernetesSandboxImage + " complete\n" +
+		"summary: 2 complete, 0 failed\n"
 	if got := stdout.String(); got != wantStdout {
 		t.Fatalf("stdout = %q, want %q", got, wantStdout)
 	}
@@ -251,9 +254,10 @@ func TestRunCacheWarmCheckDeepDoesNotDuplicateSandboxImage(t *testing.T) {
 	}
 }
 
-// TestRunCacheWarmCheckShallowLeavesTheListAlone: only the deep check is the
-// venue gate; a plain --check must still verify exactly what it was handed.
-func TestRunCacheWarmCheckShallowLeavesTheListAlone(t *testing.T) {
+// TestRunCacheWarmCheckShallowAlsoCoversTheSandboxImage: both check modes are
+// offline-readiness gates, so a plain --check must not hand out an all-clear
+// that a deep check would fail on the CRI pod sandbox image (#404).
+func TestRunCacheWarmCheckShallowAlsoCoversTheSandboxImage(t *testing.T) {
 	t.Setenv("HOME", shortTestHome(t))
 	socketPath, err := daemon.SocketPath()
 	if err != nil {
@@ -274,29 +278,45 @@ func TestRunCacheWarmCheckShallowLeavesTheListAlone(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	wantRefs := append([]string{ref}, provision.BootstrapRequiredImages()...)
 	done := make(chan struct{})
-	go serveDaemonRequests(t, listener, 1, func(_ int, request daemon.Request) daemon.Response {
+	go serveDaemonRequests(t, listener, len(wantRefs), func(index int, request daemon.Request) daemon.Response {
 		var args daemon.CacheCheckArgs
 		if err := json.Unmarshal(request.Args, &args); err != nil {
 			t.Fatal(err)
 		}
-		if len(args.Refs) != 1 || args.Refs[0] != ref {
-			t.Fatalf("refs = %v, want [%q]", args.Refs, ref)
+		if args.Deep {
+			t.Fatal("cache.check deep = true, want false")
+		}
+		if len(args.Refs) != 1 || args.Refs[0] != wantRefs[index] {
+			t.Fatalf("refs = %v, want [%q]", args.Refs, wantRefs[index])
+		}
+		if args.Refs[0] == provision.KubernetesSandboxImage {
+			return daemon.Response{OK: true, Data: mustJSON(t, daemon.CacheCheckResult{
+				Entries: []daemon.CacheCheckEntry{{
+					Ref: provision.KubernetesSandboxImage, Status: daemon.CacheCheckStatusFailed, Reason: "manifest not cached",
+				}},
+				Failed: 1,
+			})}
 		}
 		return daemon.Response{OK: true, Data: mustJSON(t, daemon.CacheCheckResult{
-			Entries:  []daemon.CacheCheckEntry{{Ref: ref, Status: daemon.CacheCheckStatusComplete}},
+			Entries:  []daemon.CacheCheckEntry{{Ref: args.Refs[0], Status: daemon.CacheCheckStatusComplete}},
 			Complete: 1,
 		})}
 	}, done)
 
 	var stdout, stderr bytes.Buffer
 	command := cli{out: &stdout, err: &stderr, in: bytes.NewBuffer(nil)}
-	if err := command.run([]string{"cache", "warm", "--check", listPath}); err != nil {
-		t.Fatalf("shallow check err = %v, want nil", err)
-	}
+	err = command.run([]string{"cache", "warm", "--check", listPath})
 	<-done
-	if strings.Contains(stdout.String(), provision.KubernetesSandboxImage) {
-		t.Fatalf("shallow check added the bootstrap set: %q", stdout.String())
+	if err == nil || err.Error() != "cache check failed for 1 ref(s)" {
+		t.Fatalf("shallow check err = %v, want cache check failed for 1 ref(s)", err)
+	}
+	if !strings.Contains(stdout.String(), "\u2717 "+provision.KubernetesSandboxImage+" manifest not cached") {
+		t.Fatalf("shallow check did not flag the missing sandbox image: %q", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "is the CRI pod sandbox image every node needs") {
+		t.Fatalf("shallow check did not name the remedy: %q", stdout.String())
 	}
 }
 
@@ -328,8 +348,9 @@ func TestRunCacheWarmCheckReadsFilesAndStdinThenPrintsMixedSummary(t *testing.T)
 		t.Fatal(err)
 	}
 
+	wantRefs := append([]string{firstRef, secondRef, thirdRef}, provision.BootstrapRequiredImages()...)
 	done := make(chan struct{})
-	go serveDaemonRequests(t, listener, 3, func(index int, request daemon.Request) daemon.Response {
+	go serveDaemonRequests(t, listener, len(wantRefs), func(index int, request daemon.Request) daemon.Response {
 		if request.Op != "cache.check" {
 			t.Fatalf("request op = %q, want cache.check", request.Op)
 		}
@@ -337,7 +358,6 @@ func TestRunCacheWarmCheckReadsFilesAndStdinThenPrintsMixedSummary(t *testing.T)
 		if err := json.Unmarshal(request.Args, &args); err != nil {
 			t.Fatal(err)
 		}
-		wantRefs := []string{firstRef, secondRef, thirdRef}
 		if len(args.Refs) != 1 || args.Refs[0] != wantRefs[index] {
 			t.Fatalf("refs = %v, want [%q]", args.Refs, wantRefs[index])
 		}
@@ -366,7 +386,8 @@ func TestRunCacheWarmCheckReadsFilesAndStdinThenPrintsMixedSummary(t *testing.T)
 		"\u2713 docker.io/library/pause:3.10 complete\n" +
 		"\u2717 public.ecr.aws/eks-distro/kubernetes/pause:3.10 blob sha256:deadbeef not cached\n" +
 		"\u2713 ghcr.io/siderolabs/installer:v1.9.3 complete\n" +
-		"summary: 2 complete, 1 failed\n"
+		"\u2713 " + provision.KubernetesSandboxImage + " complete\n" +
+		"summary: 3 complete, 1 failed\n"
 	if got := stdout.String(); got != wantStdout {
 		t.Fatalf("stdout = %q, want %q", got, wantStdout)
 	}
@@ -411,16 +432,17 @@ func TestRunCacheWarmCheckReportsEveryRefBeforeFailing(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	wantRefs := append(append([]string{}, refs...), provision.BootstrapRequiredImages()...)
 	done := make(chan struct{})
-	go serveDaemonRequests(t, listener, len(refs), func(index int, request daemon.Request) daemon.Response {
+	go serveDaemonRequests(t, listener, len(wantRefs), func(index int, request daemon.Request) daemon.Response {
 		var args daemon.CacheCheckArgs
 		if err := json.Unmarshal(request.Args, &args); err != nil {
 			t.Fatal(err)
 		}
-		if len(args.Refs) != 1 || args.Refs[0] != refs[index] {
-			t.Fatalf("refs = %v, want [%q]", args.Refs, refs[index])
+		if len(args.Refs) != 1 || args.Refs[0] != wantRefs[index] {
+			t.Fatalf("refs = %v, want [%q]", args.Refs, wantRefs[index])
 		}
-		result := daemon.CacheCheckResult{Entries: []daemon.CacheCheckEntry{{Ref: refs[index], Status: daemon.CacheCheckStatusComplete}}, Complete: 1}
+		result := daemon.CacheCheckResult{Entries: []daemon.CacheCheckEntry{{Ref: wantRefs[index], Status: daemon.CacheCheckStatusComplete}}, Complete: 1}
 		if index == 0 {
 			result.Entries[0].Status = daemon.CacheCheckStatusFailed
 			result.Entries[0].Reason = "blob missing"
@@ -440,7 +462,8 @@ func TestRunCacheWarmCheckReportsEveryRefBeforeFailing(t *testing.T) {
 	wantStdout := "" +
 		"\u2717 docker.io/library/pause:3.10 blob missing\n" +
 		"\u2713 ghcr.io/example/app@sha256:1111111111111111111111111111111111111111111111111111111111111111 complete\n" +
-		"summary: 1 complete, 1 failed\n"
+		"\u2713 " + provision.KubernetesSandboxImage + " complete\n" +
+		"summary: 2 complete, 1 failed\n"
 	if got := stdout.String(); got != wantStdout {
 		t.Fatalf("stdout = %q, want %q", got, wantStdout)
 	}
