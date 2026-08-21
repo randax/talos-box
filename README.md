@@ -217,13 +217,18 @@ tbx cache warm workshop-images.txt more-images.txt # any number of lists; `-` re
 tbx cache warm --check workshop-images.txt         # verify locally, without downloading
 tbx cache warm --check --deep workshop-images.txt  # also rehash cached blobs
 tbx cache list                                     # disk images and mirror-cache totals
-tbx cache list docker.io/library/busybox:1.37      # is this one image cached? (query, always exits 0)
+tbx cache list docker.io/library/busybox:1.37      # is this one image cached? (query; exits 0 whether or not it is)
 ```
 
 `tbx manifests demo images` prints the exact pinned image set a cluster will pull — the curated
 path's rendered objects for its declared intent plus the Talos system images for its pinned
 version — in this same list format, so `tbx manifests demo images | tbx cache warm -` needs no
 hand-maintained list at all.
+
+A single-ref `tbx cache list` applies the same ref validation `cache warm` does: a pinned or
+digested ref is answered `cached` or `not cached (<reason>)` and exits 0 either way, while an
+unpinnable ref (`:latest`, tagless, no registry host) is rejected with an error and a non-zero
+exit rather than an answer.
 
 Blank lines and lines beginning with `#` are ignored. `--check` verifies the cached manifest
 graph and host-platform image offline; `--deep` is valid only with `--check` and adds only a
