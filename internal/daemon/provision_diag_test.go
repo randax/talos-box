@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/hypervisor"
@@ -27,7 +28,7 @@ func TestStorageStatusNamesTheGateThatIsActuallyBlocking(t *testing.T) {
 		storagePhases:     map[string]StoragePhase{"demo": StoragePhaseProvisioning},
 		provisionBlockers: map[string]provisionBlocker{},
 	}
-	service.observeProvisionGate("demo")(provision.GateLonghornScheduling, errors.New(`longhorn node "demo-cp-1" allowScheduling = true, want false`))
+	service.observeProvisionGate("demo", 1)(provision.GateLonghornScheduling, errors.New(`longhorn node "demo-cp-1" allowScheduling = true, want false`))
 
 	statuses := []ClusterStatus{storageStatus("demo")}
 	service.refreshStoragePhases(statuses)
@@ -142,5 +143,68 @@ func TestAbortedProvisionSettlesStorageIntoATerminalFailure(t *testing.T) {
 	service.opMu.Unlock()
 	if phase != StoragePhaseProvisioning || message != "" {
 		t.Fatalf("phase = %q, failure = %q after a new pass, want a clean provisioning state", phase, message)
+	}
+}
+
+// A pass that has been superseded or cancelled can still land one last gate
+// observation: its in-flight check returns `context canceled` and the observer
+// then blocks on opMu until the operation that displaced it releases the lock.
+// Recording it would report a dead pass's wait as the live cluster's blocker.
+func TestSupersededPassDoesNotOverwriteTheLiveBlocker(t *testing.T) {
+	service := &Server{
+		provisions:        map[string]activeProvision{"demo": {generation: 2, cancel: func() {}}},
+		storagePhases:     map[string]StoragePhase{"demo": StoragePhaseProvisioning},
+		provisionBlockers: map[string]provisionBlocker{},
+	}
+	service.observeProvisionGate("demo", 2)(provision.GateLonghornScheduling, errors.New(`longhorn node "demo-cp-1" allowScheduling = true, want false`))
+	// The generation-1 pass, already replaced, reports its cancellation.
+	service.observeProvisionGate("demo", 1)(provision.GateLonghorn, context.Canceled)
+
+	statuses := []ClusterStatus{storageStatus("demo")}
+	service.refreshStoragePhases(statuses)
+
+	if statuses[0].StorageGate != string(provision.GateLonghornScheduling) {
+		t.Fatalf("storage gate = %q, want the live pass's gate", statuses[0].StorageGate)
+	}
+	if strings.Contains(statuses[0].StorageError, "canceled") {
+		t.Fatalf("storage error = %q, want the live pass's observation, not a cancelled pass's", statuses[0].StorageError)
+	}
+}
+
+// After the cancelling operation retired the pass there is no entry left to
+// speak for: a late observation must not resurrect one, or `tbx status` reports
+// a gate for a pass that ended before the suspend.
+func TestCancelledPassDoesNotResurrectItsBlocker(t *testing.T) {
+	service := &Server{
+		provisions:        map[string]activeProvision{},
+		storagePhases:     map[string]StoragePhase{"demo": StoragePhaseProvisioning},
+		provisionBlockers: map[string]provisionBlocker{},
+	}
+	service.observeProvisionGate("demo", 1)(provision.GateLonghorn, context.Canceled)
+	if len(service.provisionBlockers) != 0 {
+		t.Fatalf("provisionBlockers = %v, want no entry for a retired pass", service.provisionBlockers)
+	}
+}
+
+// With no pass running the storage arm is reached on !KubernetesReady alone, so
+// a blocker left over from an earlier pass has to age out rather than be quoted
+// as the current wait.
+func TestStaleBlockerIsNotReportedWithoutARunningPass(t *testing.T) {
+	service := &Server{
+		storagePhases: map[string]StoragePhase{"demo": StoragePhaseProvisioning},
+		provisionBlockers: map[string]provisionBlocker{"demo": {
+			gate:    provision.GateLonghorn,
+			message: "context canceled",
+			at:      time.Now().Add(-2 * provisionBlockerFreshness),
+		}},
+		storageProbeFailures: map[string]storageProbeFailure{},
+	}
+	status := storageStatus("demo")
+	status.KubernetesReady = false
+	statuses := []ClusterStatus{status}
+	service.refreshStoragePhases(statuses)
+
+	if statuses[0].StorageGate != "" || statuses[0].StorageError != "" {
+		t.Fatalf("gate = %q, error = %q, want a stale blocker ignored", statuses[0].StorageGate, statuses[0].StorageError)
 	}
 }

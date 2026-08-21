@@ -47,6 +47,12 @@ var (
 
 const storageProbeRetryBackoff = time.Minute
 
+// provisionBlockerFreshness bounds how old a recorded gate blocker may be and
+// still be reported as what the cluster is waiting on. Gates re-observe every
+// poll interval (a second), so anything older than a handful of them belongs to
+// a pass that is no longer making the observation.
+const provisionBlockerFreshness = 10 * time.Second
+
 // gateLogInterval rate-limits how often one waiting gate repeats itself in the
 // daemon log. A twenty-minute stall used to leave no trace at all (#390); a
 // line per gate per interval makes it self-diagnosing without drowning the log
@@ -76,10 +82,22 @@ func gateLogger(subject string) provision.GateObserver {
 // observeProvisionGate is the pass's gate observer: it narrates the blocker to
 // the daemon log and records it so `tbx status` can name the gate that is
 // actually holding the cluster (#390, #391).
-func (s *Server) observeProvisionGate(name string) provision.GateObserver {
+//
+// generation is the observing pass's own. A gate observation can land after the
+// pass that made it stopped being the cluster's current one — the in-flight
+// check returns `context canceled`, and the observer then blocks on opMu until
+// the superseding or cancelling operation releases it. Recording it anyway
+// would either overwrite the successor's live blocker or resurrect an entry the
+// cancellation just deleted, and the dead pass's wait would be reported as the
+// live one, which is the "wait nobody is serving" #395 set out to remove.
+func (s *Server) observeProvisionGate(name string, generation uint64) provision.GateObserver {
 	narrate := gateLogger("provision " + name)
 	return func(gate provision.Gate, blocker error) {
 		s.opMu.Lock()
+		if active, ok := s.provisions[name]; !ok || active.generation != generation {
+			s.opMu.Unlock()
+			return
+		}
 		if s.provisionBlockers == nil {
 			s.provisionBlockers = make(map[string]provisionBlocker)
 		}
@@ -374,7 +392,7 @@ func (s *Server) runProvisionTasks(data any, tasks []provisionTask, progress sta
 				task.item.CNI, task.item.Name, provisionBudgetName(task.item),
 				formatBudget(provisionTimeout(task.item)))
 		}
-		narration, warnings, phase, fullPass, err := s.provisionCNI(task.ctx, task.item, task.force, task.skipStorage)
+		narration, warnings, phase, fullPass, err := s.provisionCNI(task.ctx, task.item, task.generation, task.force, task.skipStorage)
 		if task.item.CSI != "" && !task.skipStorage {
 			s.opMu.Lock()
 			if err != nil {
@@ -477,7 +495,7 @@ func provisionTimeout(item cluster.Cluster) time.Duration {
 // honest answer to "did this change anything", and the narration is not (#358).
 // A full pass writes machine configs, bootstraps etcd and applies the charts,
 // and it narrates the same unconditional manual equivalents either way.
-func (s *Server) provisionCNI(parent context.Context, item cluster.Cluster, force, skipStorage bool) (narration, warnings []string, phase StoragePhase, fullPass bool, err error) {
+func (s *Server) provisionCNI(parent context.Context, item cluster.Cluster, generation uint64, force, skipStorage bool) (narration, warnings []string, phase StoragePhase, fullPass bool, err error) {
 	if !reconcilesCNI(item) {
 		return nil, nil, "", false, nil
 	}
@@ -499,7 +517,7 @@ func (s *Server) provisionCNI(parent context.Context, item cluster.Cluster, forc
 	// Every convergence gate below reports what it is waiting on through this
 	// observer: the log gets narration a stall used to have none of, and status
 	// gets the blocker it used to have to guess at (#390, #391).
-	ctx = provision.WithGateObserver(ctx, s.observeProvisionGate(item.Name))
+	ctx = provision.WithGateObserver(ctx, s.observeProvisionGate(item.Name, generation))
 	var loadBalancer provision.LoadBalancerReconciler
 	switch item.CNI {
 	case cluster.CNIFlannel:
@@ -804,8 +822,12 @@ func (s *Server) refreshStoragePhases(statuses []ClusterStatus) {
 		case active[status.Name], !status.KubernetesReady:
 			status.StoragePhase = StoragePhaseProvisioning
 			// A pass is running: whichever gate it is held at is the honest
-			// answer to "what is storage waiting for" (#391).
-			if blocker, ok := blockers[status.Name]; ok {
+			// answer to "what is storage waiting for" (#391). With no pass
+			// running the arm is here on !KubernetesReady alone, so a recorded
+			// blocker only speaks for the cluster while it is fresh — an older
+			// one describes a wait that has already ended.
+			if blocker, ok := blockers[status.Name]; ok &&
+				(active[status.Name] || time.Since(blocker.at) < provisionBlockerFreshness) {
 				status.StorageGate = string(blocker.gate)
 				status.StorageError = blocker.message
 			}
