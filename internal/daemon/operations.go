@@ -535,6 +535,15 @@ func (s *Server) createCluster(raw json.RawMessage, progress stageFunc) (Cluster
 	if err != nil {
 		return ClusterSummary{}, err
 	}
+	// Every step between the gate and the launch can fail — a domain clash, an
+	// image fetch, a disk clone — and a start that never happened must not keep
+	// memory out of the running guests for the rest of the hold's TTL (#398).
+	launched := false
+	defer func() {
+		if !launched {
+			s.releaseBalloonHold(preBalloonedMiB)
+		}
+	}()
 	hostPressureWarnings = append(hostPressureWarnings, provisionStartWarnings...)
 	clusters, err := cluster.List()
 	if err != nil {
@@ -628,6 +637,7 @@ func (s *Server) createCluster(raw json.RawMessage, progress stageFunc) (Cluster
 	// inflate the reclaimed guests back before these ones have booted — the
 	// squeeze the pre-balloon was taken to prevent (#398).
 	s.holdBalloonReclaim(preBalloonedMiB)
+	launched = true
 	progress.stage("starting %d node(s)", len(item.Nodes))
 	startWarnings, err := s.start(item)
 	if err != nil {
@@ -1148,6 +1158,14 @@ func (s *Server) addNodeLocked(raw json.RawMessage, progress stageFunc) (NodeSta
 		preBalloonedMiB = held
 		hostPressureWarnings = append(hostPressureWarnings, provisionStartWarnings...)
 	}
+	// As in createCluster: an add that fails before it launches must hand the
+	// pre-balloon back rather than sit on it until the TTL runs out (#398).
+	launched := false
+	defer func() {
+		if !launched {
+			s.releaseBalloonHold(preBalloonedMiB)
+		}
+	}()
 	var subnetWarning string
 	if running {
 		// The subnet is already fixed and attached, so it is only inspected for
@@ -1184,6 +1202,7 @@ func (s *Server) addNodeLocked(raw json.RawMessage, progress stageFunc) (NodeSta
 		// TTL is a boot window, and the image fetch and disk clone above can
 		// outlast it (#398).
 		s.holdBalloonReclaim(preBalloonedMiB)
+		launched = true
 		progress.stage("starting node %s", node.Name)
 		machine, err := s.launchMachine(item, node, nil)
 		if err != nil {

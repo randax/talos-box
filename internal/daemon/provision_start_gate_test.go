@@ -652,3 +652,59 @@ func seedCachedDisk(t *testing.T, schematic, version string) {
 		t.Fatal(err)
 	}
 }
+
+// #398: the hold manufactures a reconcile deficit that PlanTargets spreads over
+// whatever is balloonable at that tick, so a hold that outlives the guests it
+// was taken from squeezes guests that were never part of the reclaim. Stopping
+// the reclaimed cluster must take its share of the hold with it.
+func TestBalloonHoldNeverOutlivesTheGuestsItWasTakenFrom(t *testing.T) {
+	const nodeMiB, shortfall = 2048, 512
+	reserve := balloon.DefaultConfig().ReserveMiB
+	service, _ := balloonableFixture(t, nodeMiB)
+	service.hostFreeMemory = func() (int, error) { return reserve + nodeMiB - shortfall, nil }
+
+	if _, _, err := service.checkProvisionStart(t.TempDir(), nodeMiB, false); err != nil {
+		t.Fatalf("checkProvisionStart() = %v, want admission after pre-ballooning", err)
+	}
+	if got := service.BalloonHoldMiB(); got < shortfall {
+		t.Fatalf("BalloonHoldMiB() = %d right after the pre-balloon, want at least the %d MiB reclaimed", got, shortfall)
+	}
+
+	// The reclaimed cluster stops: its memory is back on the host, and nothing
+	// is being held out of any guest any more.
+	delete(service.vms, "demo")
+	if got := service.BalloonHoldMiB(); got != 0 {
+		t.Fatalf("BalloonHoldMiB() = %d after the reclaimed guests stopped, want 0 — a stale hold pins unrelated guests at the balloon floor on a host with memory to spare", got)
+	}
+}
+
+// #398: the hold is armed at admission but only re-armed at the launch. Every
+// failure in between is a start that never happened, and it must not keep
+// memory out of the running guests for the rest of the TTL.
+func TestCreateClusterReleasesThePreBalloonHoldWhenItFailsBeforeLaunch(t *testing.T) {
+	const nodeMiB, shortfall = 2048, 512
+	reserve := balloon.DefaultConfig().ReserveMiB
+	service, item := balloonableFixture(t, nodeMiB)
+	stubNodeMutationReconcile(service)
+	service.helperCheck = func() error { return nil }
+	service.hostFreeMemory = func() (int, error) { return reserve + nodeMiB - shortfall, nil }
+
+	// A domain already taken by the running cluster: refused after the gate has
+	// already pre-ballooned, and long before anything launches.
+	raw, err := json.Marshal(createArgs{
+		Name:          "second",
+		ControlPlanes: intPtr(1),
+		Workers:       intPtr(0),
+		Domain:        item.Name + "." + cluster.DefaultDomainSuffix,
+		NodeDefaults:  cluster.NodeDefaults{MemoryMiB: nodeMiB, DiskGiB: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.createCluster(raw, nil); err == nil {
+		t.Fatal("createCluster() accepted a domain already in use; the test no longer exercises a failure between the gate and the launch")
+	}
+	if got := service.BalloonHoldMiB(); got != 0 {
+		t.Fatalf("BalloonHoldMiB() = %d after a create that never launched, want 0", got)
+	}
+}
