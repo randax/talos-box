@@ -364,12 +364,13 @@ func storageEngineOwnedStorageClass(live, rendered *unstructured.Unstructured) b
 //     from its ConfigMap (#338), and longhorn-manager installs its own
 //     admission webhook configurations.
 //  2. What the engine reaches the whole cluster with — the admission webhook
-//     configurations and the StorageClasses. A Longhorn webhook outliving its
+//     configurations, the StorageClasses, and the CSIDriver registration. A Longhorn webhook outliving its
 //     Service fails closed: it rejects every PVC bind in the cluster,
 //     including the storage probe's, and holds the longhorn-system namespace
 //     in Terminating for good (#386). A StorageClass outliving its engine
-//     advertises a provisioner nothing serves (#394). Both therefore go before
-//     the Service and the namespace that back them.
+//     advertises a provisioner nothing serves, as does a CSIDriver outliving
+//     its deployer (#394). All therefore go before the Service and the
+//     namespace that back them.
 //  3. Everything else — Services, RBAC, config, CRDs.
 func storageDeletionOrder(objects []unstructured.Unstructured) []unstructured.Unstructured {
 	controllers := make([]unstructured.Unstructured, 0, len(objects))
@@ -408,7 +409,7 @@ func storageObjectRunsWorkload(object unstructured.Unstructured) bool {
 
 func storageObjectReachesWholeCluster(object unstructured.Unstructured) bool {
 	switch object.GetKind() {
-	case "ValidatingWebhookConfiguration", "MutatingWebhookConfiguration", "StorageClass":
+	case "ValidatingWebhookConfiguration", "MutatingWebhookConfiguration", "StorageClass", "CSIDriver":
 		return true
 	default:
 		return false

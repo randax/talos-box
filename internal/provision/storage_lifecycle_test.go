@@ -523,6 +523,7 @@ func TestStorageDeletionOrderTakesClusterWideObjectsDownFirst(t *testing.T) {
 		"MutatingWebhookConfiguration/" + longhornMutatingWebhookName,
 		"StorageClass/" + longhornStaticStorageClass,
 		"StorageClass/" + longhornStorageClass,
+		"CSIDriver/" + longhornProvisioner,
 	} {
 		position, ok := names[key]
 		if !ok {
@@ -573,6 +574,19 @@ func TestLonghornOwnedRuntimeObjectReadsIdentityNotName(t *testing.T) {
 			name:  "static class provisioned by longhorn",
 			live:  storageLifecycleLiveForm(&longhornRuntimeObjects()[2]),
 			owned: true,
+		},
+		{
+			name:  "csi driver registration for longhorn",
+			live:  storageLifecycleLiveForm(&longhornRuntimeObjects()[3]),
+			owned: true,
+		},
+		{
+			name: "csi driver registration for another driver",
+			live: &unstructured.Unstructured{Object: map[string]any{
+				"apiVersion": "storage.k8s.io/v1",
+				"kind":       "CSIDriver",
+				"metadata":   map[string]any{"name": "csi.example.com"},
+			}},
 		},
 		{
 			name: "static class provisioned by something else",

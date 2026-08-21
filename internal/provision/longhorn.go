@@ -608,13 +608,15 @@ func waitForLonghorn(ctx context.Context, client kubernetes.Interface, interval 
 // reject every PVC bind in the cluster and hold the longhorn-system namespace
 // in Terminating for good (#386). longhorn-static is the second class the
 // driver deployer installs beside the rendered one and outlives the engine the
-// same way (#394). They are rendered here as bare identities: teardown needs
-// only the name to delete and the kind to map.
+// same way (#394), as does the CSIDriver the deployer registers for
+// driver.longhorn.io. They are rendered here as bare identities: teardown
+// needs only the name to delete and the kind to map.
 func longhornRuntimeObjects() []unstructured.Unstructured {
 	return []unstructured.Unstructured{
 		clusterScopedIdentity("admissionregistration.k8s.io/v1", "ValidatingWebhookConfiguration", longhornValidatingWebhookName),
 		clusterScopedIdentity("admissionregistration.k8s.io/v1", "MutatingWebhookConfiguration", longhornMutatingWebhookName),
 		clusterScopedIdentity("storage.k8s.io/v1", "StorageClass", longhornStaticStorageClass),
+		clusterScopedIdentity("storage.k8s.io/v1", "CSIDriver", longhornProvisioner),
 	}
 }
 
@@ -636,7 +638,9 @@ func clusterScopedIdentity(apiVersion, kind, name string) unstructured.Unstructu
 // configuration counts only while every webhook in it is served by Longhorn's
 // own admission Service, and longhorn-static only while it provisions through
 // Longhorn's driver. Anything else is a user's object under a familiar name,
-// and stays refused.
+// and stays refused. The CSIDriver is the one exception to identity-over-name:
+// it carries no provisioner or endpoint field at all, so its name — which is
+// the driver name itself, driver.longhorn.io — is the whole identity there is.
 func longhornOwnedRuntimeObject(live *unstructured.Unstructured) bool {
 	switch live.GetKind() {
 	case "ValidatingWebhookConfiguration", "MutatingWebhookConfiguration":
@@ -650,6 +654,8 @@ func longhornOwnedRuntimeObject(live *unstructured.Unstructured) bool {
 		}
 		provisioner, _, err := unstructured.NestedString(live.Object, "provisioner")
 		return err == nil && provisioner == longhornProvisioner
+	case "CSIDriver":
+		return live.GetName() == longhornProvisioner
 	default:
 		return false
 	}
