@@ -40,6 +40,9 @@ func (c cli) runSystem(args []string) error {
 			return errors.New("usage: tbx system status")
 		}
 		return c.daemonStatus()
+	// `tbx logs` is the short form; both spellings read the same daemon log.
+	case "logs":
+		return c.runLogs(args[1:])
 	case "install":
 		if len(args) > 2 {
 			return errors.New("usage: tbx system install [absolute-helper-path]")

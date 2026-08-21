@@ -353,8 +353,26 @@ func (s *Server) serveCacheIfAvailable(w http.ResponseWriter, r *http.Request, d
 	served, err := s.replayCache(w, r, digest, isManifest)
 	if !served && err == nil && s.offlineEnabled() {
 		setReasonHeaders(w, reasonOfflineNotCached, offlineNotCachedMessage)
+		// containerd only surfaces the bare 503 to the kubelet event, so
+		// without this line an offline miss left no trace anywhere in tbx and
+		// the operator saw an unexplained ImagePullBackOff (#403).
+		log.Printf("mirror offline miss: %s (upstream namespace %s)",
+			offlineMissReference(r.URL.Path), upstreamHost(s.base))
 	}
 	return served, err
+}
+
+// offlineMissReference names what was asked for the way an operator writes it,
+// without the upstream host the miss line reports separately.
+func offlineMissReference(requestPath string) string {
+	if match := manifestPathRe.FindStringSubmatch(requestPath); match != nil {
+		separator := ":"
+		if isDigestReference(match[2]) {
+			separator = "@"
+		}
+		return match[1] + separator + match[2]
+	}
+	return strings.TrimPrefix(requestPath, "/v2/")
 }
 
 func (s *Server) replayCache(w http.ResponseWriter, r *http.Request, digest string, isManifest bool) (bool, *cacheReplayError) {

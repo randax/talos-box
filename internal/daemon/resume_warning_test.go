@@ -195,7 +195,9 @@ func TestPlatformErrorSummaryBoundsARunawayCause(t *testing.T) {
 
 // TestPlatformErrorSummaryBalancesTruncatedQuotes pins #361: the rune-count cut
 // is blind to the platform's own quoting, so a summary must never hand the
-// operator a dangling opening quote.
+// operator a dangling opening quote. Since #412 a quote that closes within the
+// slack is carried whole, so the elision follows the closer instead of
+// preceding it.
 func TestPlatformErrorSummaryBalancesTruncatedQuotes(t *testing.T) {
 	filler := strings.Repeat("x", maxPlatformErrorSummary)
 	tests := []struct {
@@ -210,14 +212,14 @@ func TestPlatformErrorSummaryBalancesTruncatedQuotes(t *testing.T) {
 			want:  `failed with “invalid save state” from the hypervisor`,
 		},
 		{
-			name:      "truncation inside a curly quote closes it",
+			name:      "a curly quote closing within the slack is carried whole",
 			cause:     `failed with “invalid ` + filler + `” trailing`,
-			wantParts: []string{`“invalid `, `...”`},
+			wantParts: []string{`“invalid `, `”...`},
 		},
 		{
-			name:      "truncation inside a straight quote closes it",
+			name:      "a straight quote closing within the slack is carried whole",
 			cause:     `failed with "invalid ` + filler + `" trailing`,
-			wantParts: []string{`"invalid `, `..."`},
+			wantParts: []string{`"invalid `, `"...`},
 		},
 		{
 			name:      "truncation after balanced quotes adds nothing",
@@ -232,7 +234,7 @@ func TestPlatformErrorSummaryBalancesTruncatedQuotes(t *testing.T) {
 		{
 			name:      "multibyte runes near the boundary stay intact",
 			cause:     strings.Repeat("é", maxPlatformErrorSummary-3) + `“så” ` + filler,
-			wantParts: []string{"é", `“så...”`},
+			wantParts: []string{"é", `“så”...`},
 		},
 		{
 			name:      "multibyte quote closed just inside the boundary",

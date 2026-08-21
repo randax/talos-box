@@ -29,7 +29,10 @@ type doctorDependencies struct {
 	listConfig      func() ([]cluster.Cluster, error)
 	getStatus       func() ([]daemon.ClusterStatus, error)
 	listCache       func() (daemon.CacheListResult, error)
-	hostPressure    func() (hostpressure.Snapshot, error)
+	// mirrorOffline reports the mirror's offline mode, which persists across a
+	// daemon restart and changes how every pull on the host fails (#403).
+	mirrorOffline func() (bool, error)
+	hostPressure  func() (hostpressure.Snapshot, error)
 	// hostFreeMemory is the free-memory reading the provision-start gate
 	// refuses on. The host-pressure snapshot does not carry it — Assess never
 	// needed it — but the check is not self-attesting without it (#420). Nil
@@ -292,6 +295,10 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		return err
 	}
 
+	if err := writeFindings(mirrorOfflineFinding(deps.mirrorOffline)); err != nil {
+		return err
+	}
+
 	if err := writeFindings(egressFinding(probeFactoryEgress(deps.doHTTP))); err != nil {
 		return err
 	}
@@ -504,6 +511,11 @@ func (c cli) doctorDependencies() doctorDependencies {
 			return result, err
 		},
 		hostFreeMemory: balloon.HostFreeMiB,
+		mirrorOffline: func() (bool, error) {
+			var result daemon.MirrorOfflineStatus
+			err := c.doctorCall("mirror.offline.get", struct{}{}, &result)
+			return result.Enabled, err
+		},
 		hostPressure: func() (hostpressure.Snapshot, error) {
 			home, err := os.UserHomeDir()
 			if err != nil {

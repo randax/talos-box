@@ -30,6 +30,10 @@ func main() {
 }
 
 func run() error {
+	// Keep client-library chatter out of the log the runbooks point at (#401).
+	if closer := startKubernetesLogRouting(log.Printf); closer != nil {
+		defer func() { _ = closer.Close() }()
+	}
 	socketPath, err := daemon.SocketPath()
 	if err != nil {
 		return err

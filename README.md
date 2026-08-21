@@ -115,7 +115,17 @@ clusters:
 tbx status demo            # nodes, IPs, DNS names, and copy-pasteable next-step hints
 tbx console demo demo-cp-1 # attach to a node's serial console (detach with Ctrl-])
 tbx manifests demo         # exact machine patch, chart values/objects, and LB/BGP extras
+tbx logs demo --follow     # the daemon's narration for one cluster, as it happens
 ```
+
+`tbx logs` (also `tbx system logs`) prints the daemon log the background work narrates into —
+provisioning reconciles, node lifecycle, ballooning targets, mirror offline misses — instead of
+requiring `~/.talosbox/tbxd.log` to be known out of band. It prints the last 200 lines by
+default (`--lines n`, `--lines 0` for the whole log), follows with `--follow`, and a cluster
+name (positional or `--cluster`) keeps only that cluster's lines. Kubernetes client-library
+output (klog, API deprecation and PodSecurity warnings) is kept out of that log: it goes to
+`~/.talosbox/tbxd.k8s.log`, and the API warning handler is off unless `TBXD_K8S_WARNINGS` is
+set in the daemon's environment.
 
 `status` is state-aware: it distinguishes provisioning, Ready-without-LB, a live VIP, and
 storage provisioning from probe-verified live storage, while
@@ -222,6 +232,12 @@ reported while it can still be pulled instead of deadlocking every static pod of
 `tbx mirror offline on` serves cached content only (uncached content fails), and `off` restores
 normal pull-through behavior. New machine configs use the catch-all mirror at the cluster
 gateway with `skipFallback: true`, so nodes do not bypass that mirror directly.
+
+Offline mode persists across a daemon restart and changes how every pull on the host fails, so
+while it is on `tbx status` heads its listing with a banner and `tbx doctor` reports it as a
+`WARN mirror-offline` line. Each miss is also logged as
+`mirror offline miss: <ref> (upstream namespace <host>)` in the daemon log, so an
+`ImagePullBackOff` whose node event shows only a bare 503 is greppable with `tbx logs`.
 
 `tbx cache pull` with no flags reads `talosbox.yaml` the way `tbx up` does: it resolves every
 cluster's Talos version, schematic, and extensions with inheritance applied, performs any
