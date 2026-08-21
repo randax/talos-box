@@ -74,8 +74,11 @@ DNS, and image delivery); curated CNI and LoadBalancer provisioning are opt-in.
 On the substrate-only path you generate the machine config yourself, and Talos assigns each node a
 random `talos-*` hostname unless you set `machine.network.hostname`. That is expected Talos
 behavior: `kubectl get nodes` will then show `talos-*` names that do not match the `<cluster>-<role>-<i>`
-names in `tbx status`. Set `machine.network.hostname` per node in the generated config if you want
-the two views to line up.
+names in `tbx status`. Leaving that mismatch alone is the simplest path: on Talos 1.13,
+`talosctl gen config` already emits a `kind: HostnameConfig` (`auto: stable`) document, and adding
+`machine.network.hostname` alongside it makes every `apply-config` fail with `static hostname is
+already set in v1alpha1 config`. To line the two views up you must remove or replace that generated
+`HostnameConfig` document in the same bundle.
 
 Add `--csi longhorn` (multinode, replicated) or `--csi local-path` (lightweight, single-node)
 — or the `csi:` key in `talosbox.yaml` — for persistent storage; it requires a curated CNI.
@@ -85,10 +88,14 @@ node — capped at 3, so a bare PVC just works. `tbx status` reports storage as
 provisioning until a real write/readback probe passes, then live; a single-node Longhorn
 cluster is reminded its volumes have no redundancy, and Longhorn on a memory-tight host gets a
 soft warning. Adding `csi:` to an already-provisioned cluster is just `tbx up`; switching or
-removing it is refused while the engine holds volumes. Only `tbx cluster destroy` deletes
+removing it is refused while the engine holds volumes, and the refusal names them. Only `tbx cluster destroy` deletes
 data wholesale, and its confirmation reports the volume count. `tbx node remove` deletes that
 node's disk, so it is refused while the node holds the only copy of volume data
 (`--force` overrides); an unreachable cluster never blocks removal — it warns instead.
+Reading Longhorn volume health straight after a probe, a snapshot restart or a deleted PVC
+can show a `volumes.longhorn.io` object in `deleting`/`degraded` with no PVC or PV behind it.
+That is Longhorn converging, not damage or a leak: it clears itself, and tbx deletes the
+volume behind its own probe as soon as the claim it belongs to goes.
 
 Every imperative command prints the equivalent `talosbox.yaml` stanza. Alternatively, work
 declaratively from the start: write a `talosbox.yaml` and run `tbx up` (idempotent — it
@@ -107,15 +114,37 @@ clusters:
 ```sh
 tbx status demo            # nodes, IPs, DNS names, and copy-pasteable next-step hints
 tbx console demo demo-cp-1 # attach to a node's serial console (detach with Ctrl-])
+tbx console demo demo-cp-1 --no-follow --lines 50  # dump the console ring buffer and exit
 tbx manifests demo         # exact machine patch, chart values/objects, and LB/BGP extras
+tbx logs demo --follow     # the daemon's narration for one cluster, as it happens
 ```
+
+`tbx logs` (also `tbx system logs`) prints the daemon log the background work narrates into —
+provisioning reconciles, node lifecycle, ballooning targets, mirror offline misses — instead of
+requiring `~/.talosbox/tbxd.log` to be known out of band. It prints the last 200 lines by
+default (`--lines n`, `--lines 0` for the whole log), follows with `--follow`, and a cluster
+name (positional or `--cluster`) keeps only that cluster's lines. Kubernetes client-library
+output (klog, API deprecation and PodSecurity warnings) is kept out of that log: it goes to
+`~/.talosbox/tbxd.k8s.log`, and the API warning handler is off unless `TBXD_K8S_WARNINGS` is
+set in the daemon's environment.
 
 `status` is state-aware: it distinguishes provisioning, Ready-without-LB, a live VIP, and
 storage provisioning from probe-verified live storage, while
-printing credential exports and the flannel NetworkPolicy limitation. Hints never execute
+printing credential exports and the flannel NetworkPolicy limitation. While a provisioning
+pass is running, the storage hint and `-o json`'s `storageGate`/`storageError` name the
+convergence gate the pass is actually held at — the CSI readiness probe is only one of them —
+and `tbxd.log` narrates the same blocker periodically, so a long wait says what it is waiting
+on. When a pass aborts, storage settles at `storagePhase: failed` carrying the cause, instead
+of reporting provisioning that nothing is doing any more. Hints never execute
 anything; suppress them with `--quiet`. `tbx up --quiet` and `tbx cluster create --quiet` keep
-their final result and facts, suppress stage narration, state the operation's deadline up
-front, and emit a once-a-minute liveness line on stderr so a long provision never looks hung. `tbx manifests` is the exact inspection/fork
+their final result and facts, suppress stage narration, state the operation's overall deadline
+up front (after a 5s grace, so a run that answers immediately — the usual no-op — announces
+nothing), and emit a once-a-minute liveness line on stderr (`still provisioning demo (elapsed
+1m, overall deadline 23m)`) so a long provision never looks hung. That overall deadline covers
+every phase the daemon holds the request for, image prepare and node boot included. Per-phase budgets the daemon narrates are named
+for their phase (`reconciling cilium on cluster demo (CNI budget 10m)`), so they read apart
+from that overall deadline; a call that goes silent past its overall deadline fails instead of
+waiting forever, while one still narrating keeps its wait alive. `tbx manifests` is the exact inspection/fork
 surface for the curated path: `machine`, `values`, `objects`, and `extras` match the machine
 prerequisite patch, pinned Helm values, rendered chart objects, and LB/BGP resources `tbx`
 applies. The substrate sections — `machine`, `mirrors`, `images`, and the `storage` streams —
@@ -130,7 +159,7 @@ inputs when `csi:` is declared. Use `storage-machine`, `storage-values`, `storag
 
 Bring-your-own CSI is unsupported above the talosbox substrate. The default image covers the curated storage requirements, and `talos.extensions` composes a closed curated set — `gvisor`, `nfs-utils`, `qemu-guest-agent` — on top of it, so an NFS-backed engine gets its client from `extensions: [nfs-utils]`. Names outside that set are rejected before anything is created; an engine needing any other Talos extension still uses the `talos.schematic` override in `talosbox.yaml`. The same curated list is available without a file as `tbx cluster create demo --extensions nfs-utils,gvisor`. A brought schematic combined with a curated list is re-composed through the Image Factory, so bringing your own schematic never silently drops the extensions you asked for — but that combination does require Factory access at create time unless the composed image is already cached.
 
-For a substrate-only BYO install, first save the patch with `tbx manifests demo storage-machine > storage-machine.yaml` and get it onto **every node**. Which route applies depends on where the nodes are: nodes that have no machine config yet (maintenance mode) cannot be patched, so fold the document in at generation time with `talosctl gen config demo https://<cp-ip>:6443 --config-patch @storage-machine.yaml` and then `talosctl apply-config --insecure --nodes <node-ip> --file controlplane.yaml|worker.yaml`; nodes that are already configured take it directly with `talosctl patch mc -p @storage-machine.yaml --nodes <node-ip>`. Before installing the CSI, create its namespace if needed and label it with the PSA commands printed by `tbx manifests demo storage`; then apply the CSI's own manifests. A declared curated CSI supplies exact streams (and Longhorn values through `storage-values`). For Longhorn, apply `storage-namespaces`, then `storage-crds`, wait for those CRDs to become Established, and only then apply post-CRD `storage-objects`; do not use a one-shot apply. Local-path has no CRD barrier: apply `storage-namespaces` before `storage-objects`.
+For a substrate-only BYO install, first save the patch with `tbx manifests demo storage-machine > storage-machine.yaml` and get it onto **every node**. Which route applies depends on where the nodes are: nodes that have no machine config yet (maintenance mode) cannot be patched, so fold the document in at generation time with `talosctl gen config demo https://<cp-ip>:6443 --config-patch @storage-machine.yaml` and then `talosctl apply-config --insecure --nodes <node-ip> --file controlplane.yaml|worker.yaml`; nodes that are already configured take it directly with `talosctl patch mc -p @storage-machine.yaml --nodes <node-ip>`. Before installing the CSI, create its namespace if needed and label it with the PSA commands printed by `tbx manifests demo storage`; then apply the CSI's own manifests. Those labels cover the CSI's namespace only. Every namespace without `pod-security.kubernetes.io/*` labels of its own — `default` included — falls to the cluster-wide default: `baseline` enforcement with `restricted` warn/audit. A test workload applied to `default` is admitted but prints a `Warning: would violate PodSecurity "restricted:latest"` block, which is a warning and not a failure; a workload that genuinely needs `hostNetwork` or privileges exceeds `baseline` and needs its own namespace labelled `privileged`. The patch mounts `/var/local-path-provisioner` — the path tbx's curated local-path CSI uses — while upstream local-path-provisioner's shipped ConfigMap defaults to `/opt/local-path-provisioner`; if you install upstream by hand, run the `local-path-config` edit printed by `tbx manifests demo storage` so it writes into the mounted path. A declared curated CSI supplies exact streams (and Longhorn values through `storage-values`). For Longhorn, apply `storage-namespaces`, then `storage-crds`, wait for those CRDs to become Established, and only then apply post-CRD `storage-objects`; do not use a one-shot apply. Local-path has no CRD barrier: apply `storage-namespaces` before `storage-objects`.
 
 ### 4. Lifecycle
 
@@ -144,6 +173,15 @@ tbx node add demo --role worker
 tbx cluster destroy demo --force   # permanent
 ```
 
+Node addresses are not tied to creation order. Each node's MAC is derived from
+`sha256("<cluster>/<node>")` on both platforms, but the address behind it comes from a different
+allocator per platform. On macOS the address is vmnet's own DHCP lease keyed by that MAC: stable
+per node but not sequential, so a fourth node joining `.31/.32/.33` may come up at `.46`. On Linux
+the helper serves a static reservation taken as the lowest free host address in the cluster's
+`172.30.<n>.0/24` subnet, starting at `172.30.<n>.2`, so addresses normally read sequentially and a
+removed node's address returns to the free pool for the next node added. Either way, read a node's
+address from `tbx status` rather than inferring it from node order.
+
 Suspend/resume is capability-gated by the host backend:
 
 - macOS 14+ preserves memory while the same `tbxd` process remains alive. After a daemon
@@ -152,6 +190,12 @@ Suspend/resume is capability-gated by the host backend:
 - Linux requires QEMU 8.2+. A save can survive a daemon restart, but restore requires the same
   QEMU version, architecture, and machine type; an incompatible save warns and safely
   cold-boots. QEMU 6.2–8.1 remains supported for every operation except suspend/resume.
+- A resumed guest's clock restarts where it stopped, so it comes back behind the host by the
+  length of the suspend. The Talos machine API offers no resync call, so `tbx` cannot correct
+  it: `resume` reports the expected gap as a warning, and Talos itself closes it at its next
+  NTP poll — minutes away, and not at all on an offline host. Stop and start the cluster
+  instead of resuming it when a workload cannot tolerate a clock jump (certificate validity
+  windows, leases, time-series writers).
 
 On macOS, `sudo tbx system uninstall` removes the helper and resolver integration. On Linux,
 remove or disable the systemd units installed by the selected installation method.
@@ -173,6 +217,7 @@ tbx cache warm workshop-images.txt more-images.txt # any number of lists; `-` re
 tbx cache warm --check workshop-images.txt         # verify locally, without downloading
 tbx cache warm --check --deep workshop-images.txt  # also rehash cached blobs
 tbx cache list                                     # disk images and mirror-cache totals
+tbx cache list docker.io/library/busybox:1.37      # is this one image cached? (query; exits 0 whether or not it is)
 ```
 
 `tbx manifests demo images` prints the exact pinned image set a cluster will pull — the curated
@@ -180,17 +225,30 @@ path's rendered objects for its declared intent plus the Talos system images for
 version — in this same list format, so `tbx manifests demo images | tbx cache warm -` needs no
 hand-maintained list at all.
 
+A single-ref `tbx cache list` applies the same ref validation `cache warm` does: a pinned or
+digested ref is answered `cached` or `not cached (<reason>)` and exits 0 either way, while an
+unpinnable ref (`:latest`, tagless, no registry host) is rejected with an error and a non-zero
+exit rather than an answer.
+
 Blank lines and lines beginning with `#` are ignored. `--check` verifies the cached manifest
-graph and host-platform image offline; `--deep` is valid only with `--check` and additionally
-rehashes blobs. It does not run a live-cluster pull test. Because `--check --deep` is the
-pre-travel gate, it also verifies the images every node needs before any pod can start but that
-no list can name — the CRI pod sandbox (`registry.k8s.io/pause`) image — so a missing one is
-reported while it can still be pulled instead of deadlocking every static pod offline.
+graph and host-platform image offline; `--deep` is valid only with `--check` and adds only a
+rehash of the cached blobs. Neither runs a live-cluster pull test. Both modes also verify the
+images every node needs before any pod can start but that no list can name — the CRI pod sandbox
+(`registry.k8s.io/pause`) image — so neither mode reports the cache complete while that image is
+missing, and the gap surfaces while it can still be pulled instead of deadlocking every static
+pod offline. `--deep` still catches what a plain `--check` cannot — a blob that is present but
+whose bytes no longer match its digest — so `--check --deep` remains the pre-travel gate.
 
 `tbx mirror offline` reports whether the pull-through mirror may reach upstream registries;
 `tbx mirror offline on` serves cached content only (uncached content fails), and `off` restores
 normal pull-through behavior. New machine configs use the catch-all mirror at the cluster
 gateway with `skipFallback: true`, so nodes do not bypass that mirror directly.
+
+Offline mode persists across a daemon restart and changes how every pull on the host fails, so
+while it is on `tbx status` heads its listing with a banner and `tbx doctor` reports it as a
+`WARN mirror-offline` line. Each miss is also logged as
+`mirror offline miss: <ref> (upstream namespace <host>)` in the daemon log, so an
+`ImagePullBackOff` whose node event shows only a bare 503 is greppable with `tbx logs`.
 
 `tbx cache pull` with no flags reads `talosbox.yaml` the way `tbx up` does: it resolves every
 cluster's Talos version, schematic, and extensions with inheritance applied, performs any

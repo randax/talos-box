@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"slices"
+
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/imagecache"
 )
@@ -46,22 +48,50 @@ func (s *Server) cacheImageClassifier() (*cacheImageClassifier, error) {
 	return classifier, nil
 }
 
-func (c *cacheImageClassifier) status(combination imagecache.Combination) (CacheImageStatus, []string, error) {
-	if clusters := c.references[combination]; len(clusters) > 0 {
-		return CacheImageStatusInUse, clusters, nil
-	}
+// statuses reports every keep-reason that applies to a combination, so a
+// listing can show what a prune would actually weigh: an image can be pinned
+// *and* in use, and reporting only the strongest reason makes it look prunable
+// once the weaker one lapses (#407). Orphan is the reason-less answer, so it is
+// never reported beside another.
+func (c *cacheImageClassifier) statuses(combination imagecache.Combination) ([]CacheImageStatus, []string, error) {
 	pinned, err := c.cache.Pinned(combination.Schematic, combination.Version, combination.Architecture)
+	if err != nil {
+		return nil, nil, err
+	}
+	clusters := c.references[combination]
+	var reasons []CacheImageStatus
+	if pinned {
+		reasons = append(reasons, CacheImageStatusPinned)
+	}
+	if c.hasDefault && combination == c.defaultCombination {
+		reasons = append(reasons, CacheImageStatusDefault)
+	}
+	if len(clusters) > 0 {
+		reasons = append(reasons, CacheImageStatusInUse)
+	}
+	if len(reasons) == 0 {
+		return []CacheImageStatus{CacheImageStatusOrphan}, nil, nil
+	}
+	return reasons, clusters, nil
+}
+
+// status is the single strongest reason, which prune and the stray report
+// already reason about.
+func (c *cacheImageClassifier) status(combination imagecache.Combination) (CacheImageStatus, []string, error) {
+	reasons, clusters, err := c.statuses(combination)
 	if err != nil {
 		return "", nil, err
 	}
-	switch {
-	case pinned:
-		return CacheImageStatusPinned, nil, nil
-	case c.hasDefault && combination == c.defaultCombination:
-		return CacheImageStatusDefault, nil, nil
-	default:
-		return CacheImageStatusOrphan, nil, nil
+	return primaryCacheImageStatus(reasons), clusters, nil
+}
+
+func primaryCacheImageStatus(reasons []CacheImageStatus) CacheImageStatus {
+	for _, want := range []CacheImageStatus{CacheImageStatusInUse, CacheImageStatusPinned, CacheImageStatusDefault} {
+		if slices.Contains(reasons, want) {
+			return want
+		}
 	}
+	return CacheImageStatusOrphan
 }
 
 // keep is prune's predicate: everything that carries a reason to exist stays.

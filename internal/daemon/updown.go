@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/config"
 	"github.com/randax/talos-box/internal/provision"
+	"github.com/randax/talos-box/internal/shellquote"
 	"github.com/randax/talos-box/internal/talosversion"
 )
 
@@ -27,10 +29,15 @@ func (s *Server) up(raw json.RawMessage) ([]Action, error) {
 }
 
 func (s *Server) upWithMaintenance(raw json.RawMessage, maintenance map[string]maintenanceObservation) ([]Action, error) {
-	return s.upWithObservations(raw, maintenance, nil)
+	return s.upWithObservations(raw, maintenance, nil, nil)
 }
 
-func (s *Server) upWithObservations(raw json.RawMessage, maintenance map[string]maintenanceObservation, storage map[string]storageObservation) ([]Action, error) {
+// upWithObservations runs the pass. progress narrates the per-cluster creates:
+// they run under the operation lock and a cold image fetch is minutes of work,
+// so a silent pass would leave the client's liveness bound with nothing to
+// re-arm it (#392). Each line is prefixed with the cluster it belongs to,
+// because one pass speaks for several.
+func (s *Server) upWithObservations(raw json.RawMessage, maintenance map[string]maintenanceObservation, storage map[string]storageObservation, progress stageFunc) ([]Action, error) {
 	var args upArgs
 	if err := decodeArgs(raw, &args); err != nil {
 		return nil, err
@@ -55,7 +62,7 @@ func (s *Server) upWithObservations(raw json.RawMessage, maintenance map[string]
 		switch action.Kind {
 		case ActionCreate:
 			spec.Talos = resolveSpecTalos(spec, args.Talos)
-			result, err := s.createFromSpec(spec, args.Force)
+			result, err := s.createFromSpec(spec, args.Force, clusterStages(progress, spec.Name))
 			if err != nil {
 				return actions[:i], fmt.Errorf("create %s: %w", spec.Name, err)
 			}
@@ -120,8 +127,11 @@ type maintenanceObservation struct {
 }
 
 type storageObservation struct {
-	engine  cluster.CSI
-	count   int
+	engine cluster.CSI
+	// volumes names the claims behind the engine's PersistentVolumes, so a
+	// refusal can list what blocks the switch (#393). Its length is the count
+	// the gate turns on.
+	volumes []string
 	running map[string]bool
 }
 
@@ -164,19 +174,19 @@ func (s *Server) observeUpStorage(raw json.RawMessage) (map[string]storageObserv
 	}
 	s.opMu.Unlock()
 
-	countVolumes := s.destroyVolumeCount
-	if countVolumes == nil {
-		countVolumes = countDestroyStorageVolumes
+	listVolumes := s.storageVolumeClaims
+	if listVolumes == nil {
+		listVolumes = listStorageVolumeClaims
 	}
 	observations := make(map[string]storageObservation, len(candidates))
 	for _, candidate := range candidates {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		count, err := countVolumes(ctx, candidate.item)
+		volumes, err := listVolumes(ctx, candidate.item)
 		cancel()
 		if err != nil {
 			return nil, fmt.Errorf("cluster %q: cannot verify %s volume count before changing csi: %w", candidate.item.Name, candidate.item.CSI, err)
 		}
-		observations[candidate.item.Name] = storageObservation{engine: candidate.item.CSI, count: count, running: candidate.running}
+		observations[candidate.item.Name] = storageObservation{engine: candidate.item.CSI, volumes: volumes, running: candidate.running}
 	}
 	return observations, nil
 }
@@ -189,9 +199,9 @@ func (s *Server) deleteUpStorageTransitions(raw json.RawMessage, observations ma
 	if err := decodeArgs(raw, &args); err != nil {
 		return err
 	}
-	countVolumes := s.destroyVolumeCount
-	if countVolumes == nil {
-		countVolumes = countDestroyStorageVolumes
+	listVolumes := s.storageVolumeClaims
+	if listVolumes == nil {
+		listVolumes = listStorageVolumeClaims
 	}
 	deleteEngine := s.storageEngineDelete
 	if deleteEngine == nil {
@@ -215,9 +225,9 @@ func (s *Server) deleteUpStorageTransitions(raw json.RawMessage, observations ma
 			continue
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		count, err := countVolumes(ctx, item)
-		if err == nil && count > 0 {
-			err = storageVolumesBlockChange(item, count)
+		volumes, err := listVolumes(ctx, item)
+		if err == nil && len(volumes) > 0 {
+			err = storageVolumesBlockChange(item, volumes)
 		}
 		if err == nil {
 			err = validateEngine(ctx, item)
@@ -404,15 +414,15 @@ func (s *Server) preflightUpWithStorage(
 				return s.nodeRunning(item.Name, nodeName)
 			})
 		}
-		var volumeCount *int
+		var volumes *[]string
 		if item.CSI != "" && item.CSI != spec.CSI {
 			observation, ok := storage[item.Name]
 			if !ok || !observation.matches(item, func(nodeName string) bool { return s.nodeRunning(item.Name, nodeName) }) {
 				return nil, fmt.Errorf("cluster %q: storage state changed while verifying csi mutation; retry tbx up", item.Name)
 			}
-			volumeCount = &observation.count
+			volumes = &observation.volumes
 		}
-		intent, changed, err := reconcileProvisioningIntentWithVolumes(item, spec, allNodesMaintenance, volumeCount)
+		intent, changed, err := reconcileProvisioningIntentWithVolumes(item, spec, allNodesMaintenance, volumes)
 		if err != nil {
 			return nil, err
 		}
@@ -438,7 +448,7 @@ func reconcileProvisioningIntent(item cluster.Cluster, spec config.ClusterSpec, 
 	return reconcileProvisioningIntentWithVolumes(item, spec, allMaintenance, nil)
 }
 
-func reconcileProvisioningIntentWithVolumes(item cluster.Cluster, spec config.ClusterSpec, allMaintenance bool, volumeCount *int) (cluster.ProvisioningIntent, bool, error) {
+func reconcileProvisioningIntentWithVolumes(item cluster.Cluster, spec config.ClusterSpec, allMaintenance bool, volumes *[]string) (cluster.ProvisioningIntent, bool, error) {
 	current := item.ProvisioningIntent
 	desired := spec.ProvisioningIntent
 	if current.CNI == "" {
@@ -457,13 +467,13 @@ func reconcileProvisioningIntentWithVolumes(item cluster.Cluster, spec config.Cl
 	if desired.CNI != current.CNI {
 		return current, false, fmt.Errorf(
 			"cluster %q: cni is immutable once provisioning begins (cluster has %q, talosbox.yaml wants %q); run: tbx cluster destroy %s && tbx up",
-			item.Name, current.CNI, desired.CNI, item.Name,
+			item.Name, current.CNI, desired.CNI, shellquote.Quote(item.Name),
 		)
 	}
 	if current.LB && !desired.LB {
 		return current, false, fmt.Errorf(
 			"cluster %q: lb is immutable once enabled; run: tbx cluster destroy %s && tbx up to disable it",
-			item.Name, item.Name,
+			item.Name, shellquote.Quote(item.Name),
 		)
 	}
 
@@ -473,11 +483,11 @@ func reconcileProvisioningIntentWithVolumes(item cluster.Cluster, spec config.Cl
 	}
 	if desired.CSI != current.CSI {
 		if current.CSI != "" {
-			if volumeCount == nil {
+			if volumes == nil {
 				return current, false, fmt.Errorf("cluster %q: csi can be changed only after its volume count is verified", item.Name)
 			}
-			if *volumeCount > 0 {
-				return current, false, storageVolumesBlockChange(item, *volumeCount)
+			if len(*volumes) > 0 {
+				return current, false, storageVolumesBlockChange(item, *volumes)
 			}
 		}
 		next.CSI = desired.CSI
@@ -491,11 +501,27 @@ func reconcileProvisioningIntentWithVolumes(item cluster.Cluster, spec config.Cl
 	return next, next != current, nil
 }
 
-func storageVolumesBlockChange(item cluster.Cluster, count int) error {
+// storageVolumesBlockChange refuses a csi switch by naming what blocks it. A
+// count alone leaves the operator to go and find the volumes themselves, which
+// is the work the refusal exists to save them (#393); the inflection follows
+// the destroy warning's.
+func storageVolumesBlockChange(item cluster.Cluster, volumes []string) error {
 	return fmt.Errorf(
-		"cluster %q: cannot change csi from %q while it has %d provisioned volume(s); delete the volumes first, or run: tbx cluster destroy %s",
-		item.Name, item.CSI, count, item.Name,
+		"cluster %q: cannot change csi from %q while it has %d provisioned %s (%s); delete the volumes first, or run: tbx cluster destroy %s",
+		item.Name, item.CSI, len(volumes), Unit(len(volumes), "volume", "volumes"), storageVolumeList(volumes), shellquote.Quote(item.Name),
 	)
+}
+
+// storageVolumeListCap is how many volumes a refusal names before it stops:
+// enough to act on, few enough that the refusal stays a line an operator reads
+// rather than a dump they scroll past.
+const storageVolumeListCap = 5
+
+func storageVolumeList(volumes []string) string {
+	if len(volumes) <= storageVolumeListCap {
+		return strings.Join(volumes, ", ")
+	}
+	return fmt.Sprintf("%s, and %d more", strings.Join(volumes[:storageVolumeListCap], ", "), len(volumes)-storageVolumeListCap)
 }
 
 // down stops every cluster the file describes; it never destroys.
@@ -569,15 +595,13 @@ func clusterReady(item cluster.Cluster, nodeActive func(string) bool) bool {
 }
 
 // createFromSpec provisions and starts one cluster from a config spec.
-func (s *Server) createFromSpec(spec config.ClusterSpec, force bool) (ClusterSummary, error) {
+func (s *Server) createFromSpec(spec config.ClusterSpec, force bool, progress stageFunc) (ClusterSummary, error) {
 	args := createArgsFromSpec(spec, force)
 	encoded, err := json.Marshal(args)
 	if err != nil {
 		return ClusterSummary{}, err
 	}
-	// up narrates per-cluster actions in its own response; the create stages
-	// belong to the single-cluster verb that blocks on them.
-	return s.createCluster(encoded, nil)
+	return s.createCluster(encoded, progress)
 }
 
 // resolveSpecTalos returns the talos spec to create the cluster with. The

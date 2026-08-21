@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/helper"
 )
 
 type legacyBGPClient struct {
@@ -17,8 +18,10 @@ type legacyBGPClient struct {
 
 func (c *legacyBGPClient) EnableBGP(string, int, uint32, uint32) error { c.enabled = true; return nil }
 func (*legacyBGPClient) DisableBGP(string) error                       { return nil }
-func (*legacyBGPClient) HasBGP(string) (bool, error)                   { return true, nil }
-func (*legacyBGPClient) Close() error                                  { return nil }
+func (*legacyBGPClient) BGPStatus(string) (helper.BGPState, error) {
+	return helper.BGPState{Active: true}, nil
+}
+func (*legacyBGPClient) Close() error { return nil }
 
 func TestSetBGPRepairsMigratedLegacyState(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
@@ -103,8 +106,10 @@ func (c *fakeBGPClient) DisableBGP(cluster string) error {
 	c.disabled = append(c.disabled, cluster)
 	return c.err
 }
-func (c *fakeBGPClient) HasBGP(string) (bool, error) { return c.active, nil }
-func (c *fakeBGPClient) Close() error                { return nil }
+func (c *fakeBGPClient) BGPStatus(string) (helper.BGPState, error) {
+	return helper.BGPState{Active: c.active}, nil
+}
+func (c *fakeBGPClient) Close() error { return nil }
 
 func TestDestroyDisablesHostBGPBeforeRemovingState(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())

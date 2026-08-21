@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -105,7 +106,7 @@ func (r CiliumReconciler) reconcile(ctx context.Context, item cluster.Cluster, c
 	}
 
 	namespaces, chart, extras, probe := partitionCiliumObjects(objects)
-	if err := applyAll(ctx, dynamicClient, mapper, namespaces); err != nil {
+	if err := applyAllAwaitingDefaultNamespaces(ctx, dynamicClient, mapper, namespaces, r.PollInterval); err != nil {
 		return LoadBalancerResult{}, err
 	}
 	if item.Hubble {
@@ -117,7 +118,7 @@ func (r CiliumReconciler) reconcile(ctx context.Context, item cluster.Cluster, c
 			return LoadBalancerResult{}, err
 		}
 	}
-	if err := applyAll(ctx, dynamicClient, mapper, chart); err != nil {
+	if err := applyAllAwaitingDefaultNamespaces(ctx, dynamicClient, mapper, chart, r.PollInterval); err != nil {
 		return LoadBalancerResult{}, err
 	}
 	if !item.Hubble {
@@ -160,6 +161,56 @@ func (r CiliumReconciler) reconcile(ctx context.Context, item cluster.Cluster, c
 		return LoadBalancerResult{}, err
 	}
 	return LoadBalancerResult{VIP: vip, Narration: ciliumNarration(item, true)}, nil
+}
+
+// apiServerDefaultNamespaces are the namespaces kube-apiserver creates for
+// itself. They exist moments after it starts answering, not before it: a
+// substrate-only create followed straight by a CNI reconcile can win that race
+// on a warm cache and be handed a NotFound for kube-system (#389).
+var apiServerDefaultNamespaces = []string{"kube-system", "default", "kube-public", "kube-node-lease"}
+
+// missingDefaultNamespace reports the one NotFound a fresh control plane cures
+// on its own: an apply into a default namespace the API server has not created
+// yet. Every other NotFound stays fatal — a chart object addressed to a
+// namespace nobody will ever create must not burn the provisioning budget.
+func missingDefaultNamespace(err error) bool {
+	if !apierrors.IsNotFound(err) {
+		return false
+	}
+	var status apierrors.APIStatus
+	if errors.As(err, &status) {
+		if details := status.Status().Details; details != nil && details.Kind == "namespaces" {
+			return slices.Contains(apiServerDefaultNamespaces, details.Name)
+		}
+	}
+	// A wrapped status error can lose its details; the message is then the only
+	// evidence of which namespace was missing.
+	for _, namespace := range apiServerDefaultNamespaces {
+		if strings.Contains(err.Error(), fmt.Sprintf("namespaces %q not found", namespace)) {
+			return true
+		}
+	}
+	return false
+}
+
+// applyAllAwaitingDefaultNamespaces is applyAll with the API server's own
+// startup race retried inside the caller's budget instead of aborting the
+// create (#389). Server-side apply is idempotent, so replaying the whole set
+// after a transient miss costs a repeated apply and nothing else.
+func applyAllAwaitingDefaultNamespaces(
+	ctx context.Context,
+	client dynamic.Interface,
+	mapper meta.RESTMapper,
+	objects []unstructured.Unstructured,
+	interval time.Duration,
+) error {
+	return poll(ctx, GateCiliumApply, interval, func(ctx context.Context) error {
+		err := applyAll(ctx, client, mapper, objects)
+		if err == nil || missingDefaultNamespace(err) {
+			return err
+		}
+		return terminal(err)
+	})
 }
 
 func renderCilium(item cluster.Cluster) ([]unstructured.Unstructured, error) {
@@ -781,7 +832,7 @@ func waitForAPIServer(ctx context.Context, config *rest.Config, interval time.Du
 	if err != nil {
 		return fmt.Errorf("create Kubernetes discovery client: %w", err)
 	}
-	if err := poll(ctx, interval, func(ctx context.Context) error {
+	if err := poll(ctx, GateAPIServer, interval, func(ctx context.Context) error {
 		_, err := client.RESTClient().Get().AbsPath("/version").DoRaw(ctx)
 		if err == nil {
 			return nil
@@ -837,7 +888,7 @@ func isUntrustedCertificateError(err error) bool {
 }
 
 func waitForCilium(ctx context.Context, client kubernetes.Interface, interval time.Duration) error {
-	return poll(ctx, interval, func(ctx context.Context) error {
+	return poll(ctx, GateCilium, interval, func(ctx context.Context) error {
 		operator, err := client.AppsV1().Deployments(ciliumNamespace).Get(ctx, "cilium-operator", metav1.GetOptions{})
 		if err != nil || !deploymentReady(operator) {
 			return errors.New("cilium operator is not ready")
@@ -855,7 +906,7 @@ func waitForCilium(ctx context.Context, client kubernetes.Interface, interval ti
 }
 
 func waitForHubble(ctx context.Context, client kubernetes.Interface, interval time.Duration) error {
-	return poll(ctx, interval, func(ctx context.Context) error {
+	return poll(ctx, GateHubble, interval, func(ctx context.Context) error {
 		for _, name := range []string{"hubble-relay", "hubble-ui"} {
 			deployment, err := client.AppsV1().Deployments(ciliumNamespace).Get(ctx, name, metav1.GetOptions{})
 			if err != nil || !deploymentReady(deployment) {
@@ -885,7 +936,7 @@ func waitForCiliumCRDs(ctx context.Context, client dynamic.Interface, interval t
 		)
 	}
 	resource := schema.GroupVersionResource{Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions"}
-	return poll(ctx, interval, func(ctx context.Context) error {
+	return poll(ctx, GateCiliumCRDs, interval, func(ctx context.Context) error {
 		for _, name := range names {
 			live, err := client.Resource(resource).Get(ctx, name, metav1.GetOptions{})
 			if err != nil {

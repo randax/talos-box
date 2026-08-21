@@ -359,8 +359,8 @@ func (s *Server) handle(request Request) (any, int, func(), error) {
 		if err := validateBGPCluster(args.Cluster); err != nil {
 			return nil, -1, nil, err
 		}
-		_, active := s.speakers[args.Cluster]
-		return map[string]bool{"active": active}, -1, nil, nil
+		speaker, active := s.speakers[args.Cluster]
+		return bgpState(speaker, active), -1, nil, nil
 	case helperInfoOp:
 		var args struct {
 			ProtocolVersion int `json:"protocolVersion"`

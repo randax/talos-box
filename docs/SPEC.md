@@ -119,7 +119,11 @@ end-to-end timing and cluster-up gate remains #97. The ISO+install path is dropp
   more lists (use `-` for stdin once); blank lines and `#` comments are ignored. Each entry is a
   fully qualified image reference with a non-`latest` tag or a `sha256`/`sha512` digest; a
   tag-plus-digest entry is the immutable list form. `tbx cache warm --check [--deep] <list>...`
-  verifies that content locally and offline; `--deep` also rehashes blobs and requires `--check`.
+  verifies that content locally and offline; `--deep` only adds a blob rehash and requires
+  `--check`. Both check modes also verify the implicit bootstrap-required set no list can name
+  (the CRI pod sandbox image), so neither mode reports the cache complete while that image is
+  missing; only `--deep` detects a cached blob whose bytes no longer match its digest, so
+  `--check --deep` remains the pre-travel gate.
   This verifies cache completeness, not a live-cluster pull.
 - Node disks: `~/.talosbox/clusters/<name>/<node>.img`, **20 GB sparse** default.
 - **Talos version matrix**: each tbx release pins one tested default Talos version (initially
@@ -275,12 +279,18 @@ On the substrate-only path, nodes always come up **unconfigured** — talosbox g
 applies machine config only when a curated `cni:` is declared (§1). Hand-generated configs that
 leave `machine.network.hostname` unset get random `talos-*` hostnames from Talos, so the names in
 `kubectl get nodes` will not match the `<cluster>-<role>-<i>` names `tbx status` shows; that is
-Talos behavior, and the operator sets `machine.network.hostname` if the two views should agree.
-`tbx status` reports each node's observed phase — `stopped`, `unreachable`, `maintenance`,
-`configured` — derived from a credential-free TLS probe of apid: **both** apid modes serve TLS
+Talos behavior, and leaving the mismatch alone is the simplest path. On Talos 1.13 `talosctl gen
+config` already emits a `kind: HostnameConfig` (`auto: stable`) document, so adding
+`machine.network.hostname` alongside it makes every `apply-config` fail with `static hostname is
+already set in v1alpha1 config`; lining the two views up requires removing or replacing that
+generated document in the same bundle.
+`tbx status` reports each node's observed phase — `stopped`, `suspended`, `unreachable`,
+`maintenance`, `configured` — derived from a credential-free TLS probe of apid: **both** apid modes serve TLS
 (empirical correction, #31 — the earlier "insecure = maintenance" model was wrong);
 maintenance mode presents the well-known `maintenance-service.talos.dev` certificate, a
-configured node presents its cluster-CA identity and demands a client certificate.
+configured node presents its cluster-CA identity and demands a client certificate. `suspended`
+is not a probe verdict — no VM is running to probe — but a stopped node holding its own saved
+memory, and it still counts as "not running" for every rule keyed on stopped (#415).
 
 ## 7. Snapshots and reset
 
@@ -336,26 +346,33 @@ tbx cluster create|start|stop|destroy|list [name] [--cp N --workers N]
                   [--talos-version VERSION] [--schematic ID] [--extensions LIST]
 tbx node add <cluster> [node] [--role worker|control-plane] [--force] [--quiet]
 tbx node remove <cluster> <node> [--force] [--quiet]
-tbx node start <cluster> <node> [--force]      tbx node stop <cluster> <node>
+tbx node start <cluster> <node> [--force] [--quiet]
+tbx node stop <cluster> <node> [--quiet]
 tbx cluster suspend|resume <cluster>
 tbx snapshot create <cluster> [name] [--yes] [--quiet]
 tbx snapshot restore <cluster> <name> [--yes] [--force] [--quiet]
-tbx snapshot list <cluster> [-o json]      tbx snapshot delete <cluster> <name>
+tbx snapshot list [cluster] [-o json]      tbx snapshot delete <cluster> <name>
 tbx status [cluster]      tbx manifests <cluster> [section|images] [--cni cilium|flannel]
-tbx console <cluster> <node>
-tbx bgp enable|disable <cluster> [--quiet]
+tbx console <cluster> <node> [--no-follow [--lines N]]
+tbx bgp enable|disable <cluster> [--quiet]      tbx bgp status <cluster>
 tbx mirror offline [on|off]
 tbx cache pull [-f talosbox.yaml] [--no-images]
                [--talos-version VERSION --schematic ID --extensions LIST]
 tbx cache warm [--check [--deep]] <list-file> [<list-file>...]
-tbx cache list [-o json]
+tbx cache list [<image-ref>] [-o json]
 tbx cache prune [--mirror|--all]
-tbx doctor      tbx system install|uninstall|restart [--force]|status
+tbx logs [cluster] [--cluster name] [--follow] [--lines n]
+tbx doctor      tbx system install|uninstall|restart [--force]|status|logs
 tbx version (also --version, -v)
 ```
 
 `tbx cache list` reports Talos disk images and mirror-cache totals, labelling each disk-image
-combination `in-use` (naming the clusters that reference it), `pinned`, `default`, or `orphan`.
+combination with every keep-reason that applies — `in-use` (naming the clusters that reference
+it), `pinned`, `default` — or `orphan` when none does; an image that is both pinned and in use
+reads `pinned, in-use (<cluster>)`, because a prune keeps it for both reasons.
+`tbx cache list <image-ref>` answers a different question: whether that one container image is
+cached completely enough to be served offline (`cached` / `not cached (<reason>)`). It is a
+query, not a gate, so it exits 0 either way; `tbx cache warm --check` is the gate.
 A combination holding only leftovers — a compressed archive, an unusable disk image, or a lone
 pin marker — is listed too, marked `(incomplete)`, so the listing is a complete prune preview.
 Cache pruning is scope-limited: without a flag it removes disk images only and leaves mirror
@@ -411,9 +428,20 @@ status hint that its volumes have no redundancy, and choosing Longhorn on a memo
 prints a soft pre-flight warning (never a hard gate). Storage is ordinary provisioned state —
 `tbx up` converges the storage stage from any interruption and `tbx down`/restarts preserve
 volume data. Cluster-level operations never delete user data except `tbx cluster destroy`:
-switching or removing `csi:` is allowed only while the engine holds zero volumes (hard error
-otherwise), and the destroy confirmation reports a best-effort volume count without ever
-blocking the destroy of an unreachable cluster. `tbx node remove` deletes that node's disk, so
+switching or removing `csi:` is allowed only while the engine holds zero volumes, and the hard
+error otherwise names the blocking volumes by `namespace/name` — capped, with an `and N more`
+for a long list — so the operator can go and delete exactly what holds the switch. A switch that proceeds
+tears the old engine down completely: leaving Longhorn removes every cluster-scoped object
+Longhorn installed for itself — its validating and mutating webhook configurations, the
+`longhorn-static` StorageClass, its CSIDriver registration — **before** the admission Service
+they point at, because a webhook configuration outliving its Service fails closed and would
+reject every PVC bind in the cluster. The destroy confirmation reports a best-effort volume count without ever
+blocking the destroy of an unreachable cluster. A destroy closes with a summary of what it
+removed — nodes, bytes of cluster state removed (a per-file allocated-block sum, so extents
+cloned from the image cache or shared with a snapshot count once per file rather than once per
+physical block: it is not a measure of capacity freed), snapshots deleted, the DNS or resolver entry withdrawn,
+and any volumes it warned about — so the scope of the destruction can be checked without a
+residue check by hand. `tbx node remove` deletes that node's disk, so
 it is volume-gated the same best-effort way: when the engine reports the node holds the only
 copy of volume data — local-path volumes pinned to it, Longhorn volumes with no healthy replica
 elsewhere — the removal is refused unless rerun with `--force`, and a stopped or unreachable
@@ -434,27 +462,39 @@ create` line, for imperatively created ones; a cluster created before the origin
 keeps the `tbx up` wording, because tbx cannot prove no file backs it and advising a destroy on
 a guess is the worse error; substrate-only clusters retain manual guidance).
 Hints **never execute anything**. `--quiet` suppresses hints and narration but keeps facts
-(schematic/extensions lines) and liveness (deadline preamble plus a periodic stderr heartbeat
-during blocking provisioning calls); all list/status commands support `-o json`.
+(schematic/extensions lines) and liveness (the deadline preamble, held back for a 5s
+grace so the usual no-op — which answers immediately — announces nothing, and worded
+conditionally (`checking demo; if provisioning is needed it may take up to 14m`) until the
+daemon narrates a stage, after which it states the window outright, plus a periodic
+stderr heartbeat during blocking provisioning calls); all list/status commands support
+`-o json`. The heartbeat names the request-wide bound `overall deadline`, covering every phase
+the daemon holds the request for — image prepare, node boot, readiness, provisioning — and
+distinct from the per-phase budgets the daemon narrates (`CNI budget`, `CNI+storage budget`).
+The CLI stops waiting once that bound plus a grace passes **without any sign of life**: a
+narrated call re-arms the wait on every stage the daemon sends, so only a gate that goes silent
+fails the verb instead of hanging it.
 
-**State-changing verbs narrate their stages.** `cluster create`, `snapshot create|restore` and
-`node add|remove` stream the daemon's stages to stderr as the work proceeds — stopping the
-cluster, cloning disks, restarting, waiting for nodes — closing with a convergence hint where
-the verb left nodes booting, and `--quiet` suppresses the stages while keeping the result and
+**State-changing verbs narrate their stages.** `cluster create`, `snapshot create|restore`,
+`node add|remove` and `node start|stop` stream the daemon's stages to stderr as the work
+proceeds — stopping the cluster, cloning disks, restarting, waiting for nodes — closing with a
+convergence hint where the verb left nodes booting, and `--quiet` suppresses the stages while keeping the result and
 its warnings. A verb's success line is past tense because it is true when printed: `cluster
 create` holds its answer until the nodes it started answer on apid (maintenance or configured),
 up to a bounded boot budget — when the budget runs out, or the daemon's lifecycle is cancelled,
 it answers anyway with an advisory naming the nodes that stayed silent, so a successful exit
-never proves the nodes answered. For these narrating verbs warnings print above the success
-line, not after it. Other
-state-changing verbs (`cluster start|stop|suspend|resume`, `node start|stop`) still print their
-warnings below their success line.
+never proves the nodes answered. `cluster create`, `cluster resume`, `snapshot create|restore`
+and `node add|remove` print their warnings above the success line, not after it; `cluster
+start|stop|suspend` and `node start|stop` print theirs below it. `cluster resume` warns first
+because its success line carries the cold-booted count, which the warnings explain.
 
 **`tbx console <cluster> <node>`** attaches interactively to the node's serial console (hvc0)
 through the `tbxd`-owned socket — Talos renders its console dashboard and logs there, and
 maintenance-mode debugging works before any config exists. Detach with **`Ctrl-]`**; the
 session banner states the detach key. Attaching never blocks the VM; multiple attach/detach
-cycles are supported. `tbx manifests` is the exact inspection/fork surface for the declared
+cycles are supported. **`--no-follow`** makes the console scriptable: it dumps the ring buffer
+the attach replays, writes it to stdout and exits, with **`--lines N`** keeping only the last N
+lines. There is no `--since`: the ring buffer holds the guest's raw bytes with no host
+timestamps to cut a duration on. `tbx manifests` is the exact inspection/fork surface for the declared
 curated path: its `machine`, `values`, `objects`, and `extras` sections match the patch,
 pinned Helm release, rendered objects, and LB/BGP/MetalLB probe resources tbx applies. The gate
 is per section: `machine`, `mirrors`, `images`, and the `storage` streams are substrate and
@@ -463,7 +503,13 @@ render for a cluster that declares no CNI, while the CNI-derived sections (`valu
 <section> --cni cilium|flannel` renders what tbx **would** apply for that curated CNI on a
 substrate-only cluster; naming a CNI that contradicts a declared one is refused. Its
 `storage` section always includes the kubelet mount prerequisite and privileged-namespace PSA
-guidance, including for a substrate-only cluster. If `csi:` is declared it also includes the
+guidance, including for a substrate-only cluster. That guidance is about the CSI's own namespace;
+every other namespace is governed by the cluster-wide default, which enforces `baseline` and
+warns/audits at `restricted` wherever a namespace carries no `pod-security.kubernetes.io/*`
+labels of its own — `default` included. A workload applied there that is not `restricted`-compliant
+is still admitted and prints a `would violate PodSecurity "restricted:latest"` block: a warning,
+not a failure. A workload that genuinely needs `hostNetwork` or privileges exceeds `baseline`, so
+it needs its own namespace labelled `privileged` the same way a CSI namespace does. If `csi:` is declared it also includes the
 exact Longhorn values and renderer-derived namespace, CRD, and post-CRD object streams, or
 local-path namespace and object streams, that tbx applies; use `storage-machine`,
 `storage-values`, `storage-namespaces`, `storage-crds`, and `storage-objects` as the clean
@@ -478,7 +524,15 @@ have no machine config to patch, so the document is folded in at generation time
 config <cluster> https://<cp-ip>:6443 --config-patch @storage-machine.yaml` before `talosctl
 apply-config --insecure`; already-configured nodes take it directly with `talosctl patch mc -p
 @storage-machine.yaml --nodes <node-ip>`. Then, before installing the CSI, create its namespace if needed and apply the
-printed PSA labels. Curated CSI namespace streams carry their own PSA labels. For Longhorn,
+printed PSA labels. Curated CSI namespace streams carry their own PSA labels. Unlabelled
+namespaces — `default` included — fall to the cluster-wide default of `baseline` enforcement with
+`restricted` warn/audit, so an ordinary test workload applied there is admitted but prints a
+`would violate PodSecurity "restricted:latest"` warning block, while a `hostNetwork` or privileged
+one needs its namespace labelled `privileged`. The printed
+prerequisite mounts `/var/local-path-provisioner`, the path tbx's curated local-path CSI writes
+to; upstream local-path-provisioner's shipped ConfigMap defaults to `/opt/local-path-provisioner`,
+so the `storage` section also prints the `local-path-config` edit that repoints it at the mounted
+path. A BYO install that skips that edit gets a bind mount nothing uses. For Longhorn,
 apply `storage-namespaces`, then `storage-crds`, run the printed Established wait against the
 CRD stream, and only then apply post-CRD `storage-objects`; it is not a one-shot apply.
 Longhorn's `storage-values` stream records the exact values used to render those objects.

@@ -43,7 +43,10 @@ func TestHints(t *testing.T) {
 		{
 			name:  "maintenance node suggests config workflow",
 			nodes: []NodeStatus{node("demo-cp-1", PhaseMaintenance)},
-			want:  []string{"talosctl gen config", "apply-config --insecure"},
+			// The read-only probe is printed alongside the mutating
+			// apply-config hint so a reader can check a node without
+			// configuring it (#435).
+			want: []string{"talosctl version --insecure --nodes 172.30.0.2", "talosctl gen config", "apply-config --insecure"},
 		},
 		{
 			name:  "all configured suggests bootstrap and the dashboard",
@@ -558,5 +561,82 @@ func TestProvisioningRecoveryHintQuotesClusterName(t *testing.T) {
 func TestConvergenceHintQuotesClusterName(t *testing.T) {
 	if got := convergenceHint("demo; rm -rf ~"); !strings.Contains(got, "tbx status 'demo; rm -rf ~'") {
 		t.Fatalf("convergenceHint() left the cluster name unquoted: %s", got)
+	}
+}
+
+// TestStoppedClusterHintsQuoteClusterName pins the same paste-safety rule for
+// the all-stopped hints: stale save, plain suspend, and plain stopped all name
+// a command, so a cluster name carrying shell metacharacters must be quoted.
+func TestStoppedClusterHintsQuoteClusterName(t *testing.T) {
+	const name = "demo; rm -rf ~"
+	const quoted = "'demo; rm -rf ~'"
+	for _, test := range []struct {
+		label  string
+		status ClusterStatus
+		want   []string
+	}{
+		{
+			label:  "stale save",
+			status: ClusterStatus{Name: name, Suspended: true, SavedStateStale: true, Nodes: []NodeStatus{{Phase: PhaseSuspended}}},
+			want:   []string{"tbx cluster resume " + quoted, "tbx cluster start " + quoted},
+		},
+		{
+			label:  "suspended",
+			status: ClusterStatus{Name: name, Suspended: true, Nodes: []NodeStatus{{Phase: PhaseSuspended}}},
+			want:   []string{"tbx cluster resume " + quoted},
+		},
+		{
+			label:  "stopped",
+			status: ClusterStatus{Name: name, Nodes: []NodeStatus{{Phase: PhaseStopped}}},
+			want:   []string{"tbx cluster start " + quoted},
+		},
+	} {
+		t.Run(test.label, func(t *testing.T) {
+			got := strings.Join(Hints(test.status), "\n")
+			for _, want := range test.want {
+				if !strings.Contains(got, want) {
+					t.Fatalf("hints = %q, want %q", got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestGenConfigHintNamesTheResolverBypassOnMacOS pins #438: `dig` is the first
+// tool anyone reaches for and it bypasses /etc/resolver, so a working tbx name
+// reads as dead. The hint that hands out such a name says so — on macOS only,
+// where the split exists.
+func TestGenConfigHintNamesTheResolverBypassOnMacOS(t *testing.T) {
+	status := ClusterStatus{
+		Name:   "demo",
+		Subnet: "172.30.0.0/24",
+		Nodes:  []NodeStatus{{Name: "demo-cp-1", Role: cluster.RoleControlPlane, Phase: PhaseMaintenance, IP: "172.30.0.2"}},
+	}
+	genConfigHint := func() string {
+		for _, hint := range Hints(status) {
+			if strings.Contains(hint, "gen config") {
+				return hint
+			}
+		}
+		t.Fatal("no gen config hint")
+		return ""
+	}
+	restore := hintGOOS
+	t.Cleanup(func() { hintGOOS = restore })
+
+	hintGOOS = "darwin"
+	got := genConfigHint()
+	for _, want := range []string{
+		"dig/nslookup bypass /etc/resolver",
+		"dscacheutil -q host -a name demo-cp-1.demo.k8s.test",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("darwin gen config hint = %q, want substring %q", got, want)
+		}
+	}
+
+	hintGOOS = "linux"
+	if got := genConfigHint(); strings.Contains(got, "dscacheutil") {
+		t.Fatalf("non-darwin gen config hint = %q, want no macOS resolver note", got)
 	}
 }

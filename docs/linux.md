@@ -159,6 +159,9 @@ Log out and back in so the new `tbx` and `kvm` memberships apply, then run:
 tbx doctor
 ```
 
+A socket-activated `tbxd` writes its narration to `~/.talosbox/tbxd.log` — the file `tbx logs`
+reads — as well as to the journal, so both `tbx logs` and `journalctl --user -u tbxd` work.
+
 Do not use `tbx system install` on Linux. That command currently installs the macOS launchd
 helper; Linux installation is owned by packages and systemd units.
 
@@ -180,10 +183,12 @@ configured bridge or running cluster report `SKIP` before one exists.
 | `port-53`, `port-67`, `port-179` | DNS, DHCP, and optional BGP ports are available on each cluster gateway or already owned by talosbox | Stop the conflicting listener or keep BGP disabled when port 179 is intentionally occupied |
 | `resolver`, `DNS`, `system-dns` | Guest DNS is listening and systemd-resolved routes `~<cluster>.k8s.test` to the cluster gateway | Run the per-link `resolvectl` command printed by `doctor` when resolved registration is unavailable |
 | `routes` | Host routes to live nodes and cluster subnets use the talosbox bridge | Resolve overlapping VPN or host routes and restart the cluster |
+| `inter-cluster` | With more than one cluster running, every cluster's ingress VIP answers from the host **and** from each sibling cluster — the sibling leg is dialled by the `lb-probe` behind each VIP, so it travels the same pod-to-sibling-VIP path a workload would. `SKIP`s with the reason when fewer than two running clusters report a live VIP | `FAIL` names the dead direction (`qa-edge → qa-core VIP 172.30.0.200`). Check the announcement mode of the *target* cluster (`tbx bgp status <cluster>`) and the host route to its VIP; `routes` and `forwarding` can both pass while this path is dead |
 | `host-pressure` | Currently reports `SKIP` because Linux host-pressure sampling is not implemented | Size the default cluster for at least 16 GB RAM and monitor the host separately |
 | `guest-agent` | Clusters that requested the `qemu-guest-agent` extension have a working host channel | `WARN` only: the config stays valid and portable, the extension is simply inert on this host. `SKIP`s when no cluster requests it |
 | `mirror-health` | Pull-through mirror listeners are bound on exactly the running clusters' gateway IPs, and reports the registry-mirror cache totals | Restart the affected cluster (or `tbxd`) so the bind set is reconverged with cluster lifecycle |
 | `image-cache` | Reports the Talos disk-image cache totals, named apart from the registry-mirror cache so offline prep can tell the two stores under `~/.talosbox/cache` apart. Incomplete combinations — prunable leftovers with no usable image — are held out of the total and counted separately, and a cache holding nothing else is a `WARN` | Never `FAIL`s: a failed cache listing is reported once on `mirror-health` and skips this line. On `WARN`, rerun `tbx cache pull` before going offline; use `tbx cache list` for the per-combination breakdown |
+| `mirror-offline` | Whether `tbx mirror offline` is on. The mode persists across a daemon restart and makes every uncached pull fail, so it is named rather than left to be remembered | `WARN` only: run `tbx mirror offline off` to restore upstream pulls; each miss is also logged as `mirror offline miss: …` in `tbx logs` |
 | `egress`, `security-inventory` | Image Factory access is usable and relevant security/VPN software is visible | Follow the specific warning or failure detail |
 
 `FAIL` makes `tbx doctor` exit non-zero. `WARN` identifies a degraded but usable configuration,
@@ -197,10 +202,24 @@ forwarding, binds the cluster DNS listener, and registers the route-only DNS dom
 systemd-resolved when available. It does not modify foreign nftables tables or a Docker-owned
 `FORWARD` policy.
 
+Each node's MAC is derived deterministically from its identity — `52:54:00` plus the first three
+bytes of `sha256("<cluster>/<node>")` — and the helper's DHCP reservation follows that MAC, so a
+node keeps its address across stop/start, and across a remove/re-add as long as nothing else claims
+it in between. Reservations are taken from the lowest free host address in the cluster subnet,
+starting at `172.30.<n>.2`, so on Linux they normally read sequentially, and a removed node's
+address goes back to the free pool for the next node added; on macOS the address comes from vmnet's
+own DHCP server and is stable per node but not sequential. Either way, read a node's address from
+`tbx status` rather than inferring it from node order.
+
 Cilium L2 announcements are the default ingress-VIP path and work directly on the Linux bridge.
 BGP is optional on Linux: use it for routed upstreams, ECMP, or
 `externalTrafficPolicy: Local` when only nodes with local endpoints should advertise. It is not
 required for fast L2 failover on Linux.
+
+`tbx bgp enable|disable <cluster>` flips the announcement mode; it requires `--cni cilium` and
+refuses anything else without touching the speaker. `tbx bgp status <cluster>` reports where the
+mode actually stands: the recorded mode, whether the host speaker is running, the address it
+binds, and the routes it announces.
 
 After `tbx doctor` passes, continue with the common
 [Cilium ingress walkthrough](walkthrough-cilium-ingress.md).

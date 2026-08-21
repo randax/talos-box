@@ -5,11 +5,14 @@ import (
 	"errors"
 	"net"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/randax/talos-box/internal/bgp"
 )
 
 func TestBGPRejectsInvalidArguments(t *testing.T) {
@@ -42,13 +45,30 @@ func TestBGPRejectsInvalidArguments(t *testing.T) {
 
 func TestBGPStatusReportsObservedSpeakerOwnership(t *testing.T) {
 	server := NewServer(nil)
-	server.speakers = map[string]bgpSpeaker{"demo": &shutdownSpeaker{}}
+	announced := []bgp.Route{
+		{Prefix: "172.30.7.200/32", Nexthop: "172.30.7.2"},
+		{Prefix: "172.30.7.201/32", Nexthop: "172.30.7.3"},
+	}
+	server.speakers = map[string]bgpSpeaker{
+		"demo":   &reportingSpeaker{routes: announced},
+		"silent": &shutdownSpeaker{},
+	}
 	for _, test := range []struct {
-		name   string
-		args   string
-		active bool
+		name       string
+		args       string
+		active     bool
+		wantRoutes []BGPRoute
 	}{
-		{name: "active speaker", args: `{"cluster":"demo"}`, active: true},
+		{
+			name:   "active speaker reports its announced routes",
+			args:   `{"cluster":"demo"}`,
+			active: true,
+			wantRoutes: []BGPRoute{
+				{Prefix: "172.30.7.200/32", Nexthop: "172.30.7.2"},
+				{Prefix: "172.30.7.201/32", Nexthop: "172.30.7.3"},
+			},
+		},
+		{name: "speaker that cannot report routes", args: `{"cluster":"silent"}`, active: true},
 		{name: "no speaker", args: `{"cluster":"missing"}`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -56,14 +76,15 @@ func TestBGPStatusReportsObservedSpeakerOwnership(t *testing.T) {
 			if !reply.response.OK {
 				t.Fatalf("bgp.status response = %+v", reply.response)
 			}
-			var data struct {
-				Active bool `json:"active"`
-			}
+			var data BGPState
 			if err := json.Unmarshal(reply.response.Data, &data); err != nil {
 				t.Fatal(err)
 			}
 			if data.Active != test.active {
 				t.Fatalf("bgp.status active = %t, want %t", data.Active, test.active)
+			}
+			if !reflect.DeepEqual(data.Routes, test.wantRoutes) {
+				t.Fatalf("bgp.status routes = %v, want %v", data.Routes, test.wantRoutes)
 			}
 		})
 	}
@@ -72,6 +93,15 @@ func TestBGPStatusReportsObservedSpeakerOwnership(t *testing.T) {
 type shutdownSpeaker struct{ stops int }
 
 func (s *shutdownSpeaker) Stop() { s.stops++ }
+
+// reportingSpeaker stands in for the real *bgp.Speaker, which reports the
+// routes it has installed in the host FIB.
+type reportingSpeaker struct {
+	shutdownSpeaker
+	routes []bgp.Route
+}
+
+func (s *reportingSpeaker) Routes() []bgp.Route { return s.routes }
 
 func TestShutdownStopsEveryBGPSpeaker(t *testing.T) {
 	server := NewServer(nil)

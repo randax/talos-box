@@ -53,7 +53,19 @@ const (
 // re-admits the suspended cluster's whole memory footprint, so it answers to
 // the same host-pressure gate create and start do, with --force as the
 // override (#368).
-const ProtocolVersion = 13
+// Version 14 serves bgp.status: a read-only report of a cluster's announcement
+// mode, the host speaker behind it and the routes that speaker announces, so a
+// refused or deferred mode change can be confirmed directly instead of through
+// `tbx doctor` (#399). It also answers cluster.destroy with a summary of what
+// it removed instead of the cluster's name alone, narrates node.start/node.stop
+// like the other node verbs, and serves snapshot.list with no cluster as every
+// cluster's snapshots — the post-destroy residue check has no cluster name
+// left to pass (#414 #417 #422). It also adds these additive response fields:
+// the cluster-status savedStateStale (#413), kubernetesNotReadySince (#418),
+// converging (#396) and storageGate (#391) fields, cache.list's reasons array
+// (#407), cache.warm's reResolvedTag/reResolvedTags (#405), and
+// cluster.destroy.inspect's volumes/csi (#422).
+const ProtocolVersion = 14
 
 // Request is one newline-delimited daemon request.
 type Request struct {
@@ -83,6 +95,13 @@ func (r Response) IsProgress() bool { return r.Stage != "" }
 // Info reports daemon wire compatibility details.
 type Info struct {
 	ProtocolVersion int `json:"protocolVersion"`
+	// BalloonReserveMiB is the host-memory reserve the daemon's
+	// provision-start gate actually measures against. It is read in the daemon
+	// process, where TBX_BALLOON_RESERVE_MIB takes effect, so a CLI reporting
+	// headroom quotes the number that will decide the next bringup rather than
+	// its own process's default (#397, #420). Additive: an older daemon omits
+	// it and the CLI falls back to the compiled-in default.
+	BalloonReserveMiB int `json:"balloonReserveMiB,omitempty"`
 }
 
 // NodeRunState is the answer to node.start and node.stop: the node's status

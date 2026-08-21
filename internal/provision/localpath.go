@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/manifests"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/discovery"
@@ -29,7 +30,7 @@ const (
 	localPathConfigMap        = "local-path-config"
 	localPathProvisionerImage = "docker.io/rancher/local-path-provisioner:v0.0.37"
 	localPathHelperImage      = "docker.io/library/busybox:1.37.0"
-	localPathNodePath         = "/var/local-path-provisioner"
+	localPathNodePath         = manifests.LocalPathVolume
 )
 
 //go:embed assets/local-path-storage-0.0.37.yaml
@@ -226,7 +227,7 @@ func partitionLocalPathObjects(objects []unstructured.Unstructured) (namespaces,
 }
 
 func waitForLocalPath(ctx context.Context, client kubernetes.Interface, interval time.Duration) error {
-	return poll(ctx, interval, func(ctx context.Context) error {
+	return poll(ctx, GateLocalPath, interval, func(ctx context.Context) error {
 		deployment, err := client.AppsV1().Deployments(localPathNamespace).Get(ctx, localPathProvisionerName, metav1.GetOptions{})
 		if err != nil {
 			return err

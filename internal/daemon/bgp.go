@@ -13,21 +13,92 @@ import (
 type bgpHelperClient interface {
 	EnableBGP(cluster string, subnetIndex int, localASN, peerASN uint32) error
 	DisableBGP(cluster string) error
-	HasBGP(cluster string) (bool, error)
+	BGPStatus(cluster string) (helper.BGPState, error)
 	Close() error
 }
 
-func hostBGPActive(clusterName string) (bool, error) {
+func hostBGPState(clusterName string) (helper.BGPState, error) {
 	client, err := connectBGPHelper()
 	if err != nil {
-		return false, helperInstallError(err)
+		return helper.BGPState{}, helperInstallError(err)
 	}
 	defer func() { _ = client.Close() }()
-	active, err := client.HasBGP(clusterName)
+	state, err := client.BGPStatus(clusterName)
 	if err != nil {
-		return false, fmt.Errorf("read BGP speaker for %s: %w", clusterName, err)
+		return helper.BGPState{}, fmt.Errorf("read BGP speaker for %s: %w", clusterName, err)
 	}
-	return active, nil
+	return state, nil
+}
+
+func hostBGPActive(clusterName string) (bool, error) {
+	state, err := hostBGPState(clusterName)
+	return state.Active, err
+}
+
+// BGPRoute is one path the host speaker announces for a cluster.
+type BGPRoute struct {
+	Prefix  string `json:"prefix"`
+	Nexthop string `json:"nexthop"`
+}
+
+// BGPStatus reports a cluster's announcement mode as it actually stands: the
+// recorded intent, the host speaker behind it, and the routes that speaker has
+// installed. `tbx bgp enable` used to be confirmable only through `doctor`,
+// which is what left a refused enable indistinguishable from a half-done one
+// (#399).
+type BGPStatus struct {
+	Name string `json:"name"`
+	CNI  string `json:"cni,omitempty"`
+	// BGP is the recorded announcement mode; Speaker is what the helper owns.
+	BGP         bool       `json:"bgp"`
+	Speaker     bool       `json:"speaker"`
+	BindAddress string     `json:"bindAddress"`
+	Port        int        `json:"port"`
+	Routes      []BGPRoute `json:"routes,omitempty"`
+	// SpeakerError names a helper that could not be asked, so a stopped
+	// speaker is never reported from an unanswered question.
+	SpeakerError string   `json:"speakerError,omitempty"`
+	Warnings     []string `json:"warnings,omitempty"`
+}
+
+// bgpStatus answers `tbx bgp status <cluster>`: a read-only report, so it never
+// touches the speaker or the cluster's intent.
+func (s *Server) bgpStatus(raw json.RawMessage) (BGPStatus, error) {
+	var args nameArgs
+	if err := decodeArgs(raw, &args); err != nil {
+		return BGPStatus{}, err
+	}
+	item, err := cluster.Load(args.Name)
+	if err != nil {
+		return BGPStatus{}, err
+	}
+	status := BGPStatus{
+		Name:        item.Name,
+		CNI:         string(item.CNI),
+		BGP:         item.BGP,
+		BindAddress: cluster.Gateway(item.SubnetIndex),
+		Port:        hostBGPPort,
+	}
+	state, err := hostBGPState(item.Name)
+	if err != nil {
+		status.SpeakerError = err.Error()
+		return status, nil
+	}
+	status.Speaker = state.Active
+	for _, route := range state.Routes {
+		status.Routes = append(status.Routes, BGPRoute{Prefix: route.Prefix, Nexthop: route.Nexthop})
+	}
+	if state.Active {
+		status.Warnings = appendNonEmpty(status.Warnings, bgpPortSquatterWarning(item))
+	}
+	return status, nil
+}
+
+func appendNonEmpty(list []string, value string) []string {
+	if value == "" {
+		return list
+	}
+	return append(list, value)
 }
 
 var connectBGPHelper = func() (bgpHelperClient, error) { return helper.Connect() }
@@ -46,16 +117,24 @@ func (s *Server) setBGPLocked(raw json.RawMessage, enable bool, progress stageFu
 	if err := decodeArgs(raw, &args); err != nil {
 		return nil, nil, err
 	}
-	if enable {
-		progress.stage("starting the host BGP speaker for cluster %s", args.Name)
-	} else {
-		progress.stage("stopping the host BGP speaker for cluster %s", args.Name)
-	}
 	// The pre-change state decides whether the cluster side has anything to
 	// reconcile at all, and setBGP overwrites it.
 	previous, err := cluster.Load(args.Name)
 	if err != nil {
 		return nil, nil, err
+	}
+	// The precondition is checked before anything is narrated: a refusal is a
+	// pure validation failure, and narrating "starting the host BGP speaker"
+	// ahead of it read as an action that failed halfway through when nothing
+	// had been started at all. `cluster create --bgp` refuses with no narration
+	// either (#399).
+	if enable {
+		if err := validateBGPIntent(previous); err != nil {
+			return nil, nil, err
+		}
+		progress.stage("starting the host BGP speaker for cluster %s", args.Name)
+	} else {
+		progress.stage("stopping the host BGP speaker for cluster %s", args.Name)
 	}
 	summary, err := s.setBGP(raw, enable)
 	if err != nil {
@@ -117,10 +196,12 @@ func (s *Server) beginBGPProvisionLocked(item cluster.Cluster) ([]provisionTask,
 	// stays scoped too.
 	//
 	// A full-scope pass that then fails at the CNI stage leaves storage exactly
-	// where any other failed provision does: the memo was invalidated at
-	// registration and the phase parked at `provisioning`, and once the task
-	// retires, refreshStoragePhases starts a status probe that can re-establish
-	// `live` on its own.
+	// where any other pass that never reached the storage stage does: the memo
+	// was invalidated at registration and the phase parked at `provisioning`,
+	// and once the task retires, refreshStoragePhases starts a status probe
+	// that can re-establish `live` on its own. Only a failure inside the
+	// storage stage settles the terminal failed phase (#395), so a CNI-stage
+	// failure never condemns storage that was live.
 	active, provisionInFlight := s.provisions[item.Name]
 	skipStorage := !provisionInFlight || active.skipStorage
 	tasks := s.beginProvisionTasksScopedLocked([]cluster.Cluster{item}, skipStorage)
@@ -165,12 +246,8 @@ func (s *Server) setBGP(raw json.RawMessage, enable bool) (ClusterSummary, error
 		return ClusterSummary{}, err
 	}
 	if enable {
-		if item.CNI == "" {
-			return ClusterSummary{}, fmt.Errorf("cluster %q cannot enable BGP: bgp requires cni: cilium", item.Name)
-		}
-		enabled := true
-		if _, err := cluster.ParseProvisioningIntent(string(item.CNI), string(item.CSI), &item.LB, &enabled, &item.Hubble); err != nil {
-			return ClusterSummary{}, fmt.Errorf("cluster %q cannot enable BGP: %w", item.Name, err)
+		if err := validateBGPIntent(item); err != nil {
+			return ClusterSummary{}, err
 		}
 	}
 
@@ -194,6 +271,20 @@ func (s *Server) setBGP(raw json.RawMessage, enable bool) (ClusterSummary, error
 		result.addWarnings(bgpPortSquatterWarning(item))
 	}
 	return result, nil
+}
+
+// validateBGPIntent reports whether the cluster's recorded intent can carry BGP
+// at all. Only Cilium renders the announcement objects, so a substrate-only or
+// flannel cluster is refused before any part of the change is attempted.
+func validateBGPIntent(item cluster.Cluster) error {
+	if item.CNI == "" {
+		return fmt.Errorf("cluster %q cannot enable BGP: bgp requires cni: cilium", item.Name)
+	}
+	enabled := true
+	if _, err := cluster.ParseProvisioningIntent(string(item.CNI), string(item.CSI), &item.LB, &enabled, &item.Hubble); err != nil {
+		return fmt.Errorf("cluster %q cannot enable BGP: %w", item.Name, err)
+	}
+	return nil
 }
 
 func enableHostBGP(item cluster.Cluster) error {

@@ -70,6 +70,8 @@ func (c cli) run(args []string) error {
 		return c.runConsole(args[1:])
 	case "cache":
 		return c.runCache(args[1:])
+	case "logs":
+		return c.runLogs(args[1:])
 	case "system":
 		return c.runSystem(args[1:])
 	case "doctor":
@@ -92,10 +94,10 @@ var groupUsages = map[string]string{
 	"cluster":  "usage: tbx cluster create|start|stop|suspend|resume|destroy|list",
 	"node":     "usage: tbx node add <cluster> [node] | remove|start|stop <cluster> <node>",
 	"snapshot": "usage: tbx snapshot create|restore|list|delete",
-	"cache":    "usage: tbx cache pull|prune|warm|list [-o json]",
-	"system":   "usage: tbx system install|uninstall|restart [--force]|status",
+	"cache":    "usage: tbx cache pull|prune|warm|list [<image-ref>] [-o json]",
+	"system":   "usage: tbx system install|uninstall|restart [--force]|status|logs",
 	"mirror":   "usage: tbx mirror offline [on|off]",
-	"bgp":      "usage: tbx bgp enable|disable <cluster> [--quiet]",
+	"bgp":      "usage: tbx bgp enable|disable|status <cluster> [--quiet]",
 }
 
 // unknownVerbError refuses an unrecognized verb with the group's verb list
@@ -196,10 +198,18 @@ func (c cli) resumeCluster(args []string) error {
 	if err := c.call("cluster.resume", request, &result); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(c.out, "%s cluster %s\n", pastTense("resume"), result.Name); err != nil {
+	// The warnings come first and the summary carries the cold-boot count: a
+	// reader skimming "resumed cluster X" must not conclude memory was
+	// preserved while the detail below says three nodes cold-booted (#411).
+	if err := printWarnings(c.err, result.Warnings, result.Warning); err != nil {
 		return err
 	}
-	return printWarnings(c.err, result.Warnings, result.Warning)
+	coldBooted := ""
+	if count := coldBootedNodeCount(result.Warnings, result.Warning); count > 0 {
+		coldBooted = fmt.Sprintf(" (%d node(s) cold-booted)", count)
+	}
+	_, err = fmt.Fprintf(c.out, "%s cluster %s%s\n", pastTense("resume"), result.Name, coldBooted)
+	return err
 }
 
 func parseClusterStartArgs(args []string, output io.Writer) (string, bool, error) {
@@ -290,7 +300,7 @@ func (c cli) startCluster(args []string) error {
 	// call as create, so the stated bound must be the one the daemon budgets
 	// this request at (#307) — including the boot and Kubernetes-readiness
 	// waits a start now runs ahead of its reconcile (#364).
-	signal := liveness{verb: "starting " + name, deadline: storedProvisionDeadline(name) + nodeBootDeadline + kubernetesReadyDeadline, quiet: quiet}
+	signal := liveness{verb: "starting " + name, subject: name, deadline: storedProvisionDeadline(name) + nodeBootDeadline + kubernetesReadyDeadline, quiet: quiet}
 	if err := c.callWithLiveness(signal, "cluster.start", request, &result); err != nil {
 		return err
 	}
@@ -409,6 +419,7 @@ func (c cli) createCluster(args []string) error {
 	var result daemon.ClusterSummary
 	signal := liveness{
 		verb:     "provisioning " + positionals[0],
+		subject:  positionals[0],
 		deadline: createProvisionDeadline(*csi != ""),
 		quiet:    *quiet,
 	}
@@ -464,31 +475,35 @@ func (c cli) destroyCluster(args []string) error {
 		Name  string `json:"name"`
 		Force bool   `json:"force"`
 	}{Name: positionals[0], Force: true}
-	if err := c.inspectDestroy(positionals[0], request); err != nil {
+	inspection, err := c.inspectDestroy(positionals[0], request)
+	if err != nil {
 		return err
 	}
-	if err := c.call("cluster.destroy", request, nil); err != nil {
+	var summary daemon.DestroySummary
+	if err := c.call("cluster.destroy", request, &summary); err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(c.out, "destroyed cluster %s\n", positionals[0])
-	return err
+	if _, err := fmt.Fprintf(c.out, "destroyed cluster %s\n", positionals[0]); err != nil {
+		return err
+	}
+	return printDestroySummary(c.out, summary, inspection)
 }
 
 func (c cli) inspectDestroy(name string, request struct {
 	Name  string `json:"name"`
 	Force bool   `json:"force"`
-}) error {
+}) (daemon.DestroyInspection, error) {
 	var inspection daemon.DestroyInspection
 	if err := c.call("cluster.destroy.inspect", request, &inspection); err != nil {
 		// A cluster that does not exist fails here rather than warning about
 		// data it cannot have; every other inspection failure still warns,
 		// since a partially-destroyed cluster may still hold volumes (#268).
 		if daemon.IsClusterMissing(err, name) {
-			return err
+			return daemon.DestroyInspection{}, err
 		}
-		return printWarning(c.err, daemon.DestroyInspectionDataLossWarning(name, ""))
+		return daemon.DestroyInspection{}, printWarning(c.err, daemon.DestroyInspectionDataLossWarning(name, ""))
 	}
-	return printWarning(c.err, inspection.Warning)
+	return inspection, printWarning(c.err, inspection.Warning)
 }
 
 func (c cli) runNode(args []string) error {
@@ -519,9 +534,14 @@ func (c cli) runNode(args []string) error {
 		// request path, and that reconcile reports nothing between its opening
 		// stage and its end. Without a heartbeat the terminal is dead for the
 		// whole budget, which is the silence narration exists to remove (#273).
+		// It also prepares the Talos image inside the same request — a cold
+		// cache re-runs the Image Factory download before the disk is cloned —
+		// so the stated bound carries that allowance exactly as a create does,
+		// or a healthy --quiet add trips the client bound (#392).
 		signal := liveness{
 			verb:     "adding a node to " + positionals[0],
-			deadline: storedProvisionDeadline(positionals[0]),
+			subject:  positionals[0],
+			deadline: storedProvisionDeadline(positionals[0]) + imagePrepareDeadline,
 			quiet:    *quiet,
 		}
 		if err := c.callWithLivenessNarrated(signal, "node.add", request, &result, true); err != nil {
@@ -579,6 +599,8 @@ func (c cli) runNodeRunState(verb string, args []string) error {
 		flags.BoolVar(&force, "force", false, "proceed despite memory overcommit or host pressure")
 		usage += " [--force]"
 	}
+	quiet := flags.Bool("quiet", false, "suppress stage narration")
+	usage += " [--quiet]"
 	positionals, err := parseInterspersed(flags, args)
 	if err != nil {
 		return err
@@ -591,7 +613,10 @@ func (c cli) runNodeRunState(verb string, args []string) error {
 	}
 	request := map[string]any{"cluster": positionals[0], "name": positionals[1], "force": force}
 	var result daemon.NodeRunState
-	if err := c.call("node."+verb, request, &result); err != nil {
+	// Both verbs narrate like their siblings: a stop takes the node off the
+	// substrate and a start begins a boot that outlives the call, and neither
+	// was visible behind a single past-tense line (#414).
+	if err := c.callNarrated("node."+verb, request, &result, c.stages(*quiet)); err != nil {
 		return err
 	}
 	// The daemon reports whether it actually acted, so a node that was already
@@ -639,6 +664,12 @@ func (c cli) runStatus(args []string) error {
 	}
 	if *outputFormat == "json" {
 		return encodeJSON(c.out, result)
+	}
+	// The banner is asked for after the listing so the status exchange stays
+	// first, and printed before it so the mode cannot be missed (#403).
+	offline, offlineErr := c.mirrorOfflineEnabled()
+	if err := printMirrorOfflineNotice(c.out, offline, offlineErr); err != nil {
+		return err
 	}
 	return printStatus(c.out, result, *quiet)
 }
@@ -705,11 +736,14 @@ func (c cli) runCache(args []string) error {
 		if err != nil {
 			return err
 		}
-		if len(positionals) != 0 {
-			return errors.New("usage: tbx cache list [-o json]")
+		if len(positionals) > 1 {
+			return errors.New("usage: tbx cache list [-o json] [<image-ref>]")
 		}
 		if err := validateOutputFormat(*outputFormat); err != nil {
 			return err
+		}
+		if len(positionals) == 1 {
+			return c.runCacheListRef(positionals[0], *outputFormat)
 		}
 		var result daemon.CacheListResult
 		if err := c.call("cache.list", struct{}{}, &result); err != nil {
@@ -777,11 +811,12 @@ Commands:
   snapshot create|restore|list|delete
   status [cluster]
   manifests <cluster> [section] [--cni cilium|flannel]
-  console <cluster> <node>
-  bgp enable|disable <cluster> [--quiet]
+  console <cluster> <node> [--no-follow] [--lines N]
+  bgp enable|disable|status <cluster> [--quiet]
   mirror offline [on|off]
-  cache pull|prune|warm|list [-o json]
-  system install|uninstall|restart [--force]|status
+  cache pull|prune|warm|list [<image-ref>] [-o json]
+  system install|uninstall|restart [--force]|status|logs
+  logs [cluster] [--follow] [--lines n]
   doctor
   version (also --version, -v)
 `

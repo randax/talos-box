@@ -31,6 +31,7 @@ import (
 // Server mirrors one upstream registry, caching immutable blobs on disk.
 type Server struct {
 	base             string // upstream base URL, e.g. https://registry-1.docker.io
+	namespace        string // canonical ns containerd asked for, e.g. docker.io
 	cacheDir         string
 	client           *http.Client
 	offline          *atomic.Bool
@@ -353,8 +354,38 @@ func (s *Server) serveCacheIfAvailable(w http.ResponseWriter, r *http.Request, d
 	served, err := s.replayCache(w, r, digest, isManifest)
 	if !served && err == nil && s.offlineEnabled() {
 		setReasonHeaders(w, reasonOfflineNotCached, offlineNotCachedMessage)
+		// containerd only surfaces the bare 503 to the kubelet event, so
+		// without this line an offline miss left no trace anywhere in tbx and
+		// the operator saw an unexplained ImagePullBackOff (#403).
+		log.Printf("mirror offline miss: %s (upstream namespace %s)",
+			offlineMissReference(r.URL.Path), s.upstreamNamespace())
 	}
 	return served, err
+}
+
+// upstreamNamespace names the registry the way containerd asked for it, which
+// is not always the host the base URL points at: docker.io is served from
+// registry-1.docker.io, and that alias keys a different cache directory. The
+// miss line is meant to be recomposed into "<namespace>/<ref>" and handed back
+// to tbx cache warm/list (#403), so it has to carry the namespace.
+func (s *Server) upstreamNamespace() string {
+	if s.namespace != "" {
+		return s.namespace
+	}
+	return upstreamHost(s.base)
+}
+
+// offlineMissReference names what was asked for the way an operator writes it,
+// without the upstream host the miss line reports separately.
+func offlineMissReference(requestPath string) string {
+	if match := manifestPathRe.FindStringSubmatch(requestPath); match != nil {
+		separator := ":"
+		if isDigestReference(match[2]) {
+			separator = "@"
+		}
+		return match[1] + separator + match[2]
+	}
+	return strings.TrimPrefix(requestPath, "/v2/")
 }
 
 func (s *Server) replayCache(w http.ResponseWriter, r *http.Request, digest string, isManifest bool) (bool, *cacheReplayError) {
@@ -597,6 +628,12 @@ type manifestMetadata struct {
 	ContentType         string `json:"contentType"`
 	ContentLength       int64  `json:"contentLength"`
 	DockerContentDigest string `json:"dockerContentDigest"`
+	// Repository and Reference record what the opaque `v2-<hash>` cache key
+	// stands for, so the on-disk mirror cache can be answered with grep
+	// instead of a hash reconstruction (#406). They are descriptive only:
+	// nothing is served from them.
+	Repository string `json:"repository,omitempty"`
+	Reference  string `json:"reference,omitempty"`
 }
 
 func (s *Server) manifestMetadataPath(requestPath string) string {
@@ -605,6 +642,9 @@ func (s *Server) manifestMetadataPath(requestPath string) string {
 
 func (s *Server) storeManifest(requestPath string, metadata manifestMetadata, data []byte) error {
 	path := s.manifestPath(requestPath)
+	if match := manifestPathRe.FindStringSubmatch(canonicalManifestRequestPath(requestPath)); match != nil {
+		metadata.Repository, metadata.Reference = match[1], match[2]
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create manifest cache directory: %w", err)
 	}

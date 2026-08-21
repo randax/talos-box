@@ -7,6 +7,7 @@ package bgp
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 )
 
@@ -72,6 +73,20 @@ func (r *Reconciler) Reconcile(desired []Route) error {
 		return errors.Join(errs...)
 	}
 	return nil
+}
+
+// Injected reports the routes currently in the FIB, sorted by prefix. It is
+// what `tbx bgp status` shows as the cluster's announced routes: the paths the
+// speaker learned and installed, not the ones it merely holds in its RIB.
+func (r *Reconciler) Injected() []Route {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	routes := make([]Route, 0, len(r.injected))
+	for prefix, nexthop := range r.injected {
+		routes = append(routes, Route{Prefix: prefix, Nexthop: nexthop})
+	}
+	sort.Slice(routes, func(i, j int) bool { return routes[i].Prefix < routes[j].Prefix })
+	return routes
 }
 
 // WithdrawAll removes every injected route — called when the BGP session ends

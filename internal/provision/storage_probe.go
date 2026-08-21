@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/shellquote"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -111,6 +113,9 @@ func runStorageProbe(ctx context.Context, dynamicClient dynamic.Interface, mappe
 
 	objects, err := renderStorageProbe(spec)
 	if err != nil {
+		return StorageProbeOutcome{}, err
+	}
+	if err := waitForDefaultStorageClass(ctx, client, spec.ExpectedStorageClass, interval); err != nil {
 		return StorageProbeOutcome{}, err
 	}
 	if err := applyAll(ctx, dynamicClient, mapper, objects[:3]); err != nil {
@@ -257,8 +262,59 @@ spec:
 	return objects, nil
 }
 
+// storageProbeDefaultClassTimeout bounds the wait below. The engine's class is
+// applied moments before the probe runs, so a default that has not landed
+// within this is not slow convergence — nobody is going to make it the default
+// — and waiting out the whole storage budget only hides which class is missing
+// behind a bare deadline (#386). A variable so tests can exercise the bound.
+var storageProbeDefaultClassTimeout = 2 * time.Minute
+
+// waitForDefaultStorageClass holds the probe back until the engine's class is
+// actually the cluster default. The probe claim deliberately omits
+// storageClassName so that binding it *proves* the default resolves to the
+// curated engine — but a claim created while no class is default is stamped
+// with none, and a PVC's class is immutable: it can never bind, never be
+// rebound, and the next pass inherits residue it can only delete (#386). A
+// switch between engines passes through exactly that window, so the wait is
+// what keeps the probe from creating a claim the cluster cannot serve.
+func waitForDefaultStorageClass(ctx context.Context, client kubernetes.Interface, expected string, interval time.Duration) error {
+	waitCtx, cancel := context.WithTimeout(ctx, storageProbeDefaultClassTimeout)
+	defer cancel()
+	err := poll(waitCtx, GateDefaultStorageClass, interval, func(ctx context.Context) error {
+		list, err := client.StorageV1().StorageClasses().List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return fmt.Errorf("list storage classes for storage probe: %w", err)
+		}
+		defaults := make([]string, 0, len(list.Items))
+		for i := range list.Items {
+			storageClass := &list.Items[i]
+			if !defaultStorageClass(storageClass) {
+				continue
+			}
+			if storageClass.Name == expected {
+				return nil
+			}
+			defaults = append(defaults, storageClass.Name)
+		}
+		if len(defaults) == 0 {
+			return fmt.Errorf("StorageClass %q is not the cluster default yet (the cluster has no default class)", expected)
+		}
+		return fmt.Errorf("StorageClass %q is not the cluster default yet (default: %s)", expected, strings.Join(defaults, ", "))
+	})
+	if err != nil && ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("StorageClass %q did not become the cluster default within %s: %w", expected, storageProbeDefaultClassTimeout, err)
+	}
+	return err
+}
+
+func defaultStorageClass(storageClass *storagev1.StorageClass) bool {
+	annotations := storageClass.Annotations
+	return annotations["storageclass.kubernetes.io/is-default-class"] == "true" ||
+		annotations["storageclass.beta.kubernetes.io/is-default-class"] == "true"
+}
+
 func waitForBoundPersistentVolumeClaim(ctx context.Context, client kubernetes.Interface, namespace, name, expectedStorageClass string, interval time.Duration) error {
-	return poll(ctx, interval, func(ctx context.Context) error {
+	return poll(ctx, GateStorageProbePVC, interval, func(ctx context.Context) error {
 		persistentVolumeClaim, err := client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return err
@@ -278,7 +334,7 @@ func waitForBoundPersistentVolumeClaim(ctx context.Context, client kubernetes.In
 }
 
 func waitForProbePod(ctx context.Context, client kubernetes.Interface, namespace, name string, interval time.Duration) error {
-	return poll(ctx, interval, func(ctx context.Context) error {
+	return poll(ctx, GateStorageProbePod, interval, func(ctx context.Context) error {
 		pod, err := client.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return err
@@ -361,13 +417,32 @@ func cleanupStorageProbe(ctx context.Context, client kubernetes.Interface, dynam
 	if err := deleteStorageProbePodAndWait(waitCtx, client, probeNamespace, storageProbeWriterPodName); err != nil {
 		errs = append(errs, err)
 	}
+	// The claim names its PersistentVolume, and that name is the Longhorn
+	// volume's. Reading it before the delete is the only moment both exist:
+	// deleting the claim takes the PersistentVolume with it, after which the
+	// residue sweep has nothing left to tie the volume object back to the
+	// probe and it lingers as an orphan an operator reads as damage (#428).
+	handles := storageProbeVolumeHandles(waitCtx, client)
 	if err := deleteStorageProbePVCAndWait(waitCtx, client, probeNamespace, storageProbePVCName); err != nil {
 		errs = append(errs, err)
 	}
-	if err := deleteStorageProbeVolumeResidue(ctx, client, dynamicClient, spec); err != nil {
+	if err := deleteStorageProbeVolumeResidue(ctx, client, dynamicClient, spec, handles); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
+}
+
+// storageProbeVolumeHandles reads the volume the probe claim is bound to. A
+// claim that is absent or unbound simply contributes nothing: the sweep still
+// has the PersistentVolume and claim-reference routes, and a cleanup must not
+// fail over a claim that has already gone.
+func storageProbeVolumeHandles(ctx context.Context, client kubernetes.Interface) map[string]bool {
+	handles := make(map[string]bool, 1)
+	claim, err := client.CoreV1().PersistentVolumeClaims(probeNamespace).Get(ctx, storageProbePVCName, metav1.GetOptions{})
+	if err == nil && claim.Spec.VolumeName != "" {
+		handles[claim.Spec.VolumeName] = true
+	}
+	return handles
 }
 
 // storageProbeWaitContext caps the terminating-object waits so the residue
@@ -391,13 +466,15 @@ func storageProbeWaitContext(ctx context.Context) (context.Context, context.Canc
 // behind: a Released PersistentVolume whose provisioner never caught up, and —
 // on Longhorn — a volume that stays attached and healthy with nothing bound to
 // it (#347). Both name the probe claim, so neither can belong to a workload.
-func deleteStorageProbeVolumeResidue(ctx context.Context, client kubernetes.Interface, dynamicClient dynamic.Interface, spec storageProbeSpec) error {
+func deleteStorageProbeVolumeResidue(ctx context.Context, client kubernetes.Interface, dynamicClient dynamic.Interface, spec storageProbeSpec, handles map[string]bool) error {
 	list, err := client.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return fmt.Errorf("list storage probe persistent volumes: %w", err)
 	}
 	var errs []error
-	handles := make(map[string]bool)
+	if handles == nil {
+		handles = make(map[string]bool)
+	}
 	for i := range list.Items {
 		persistentVolume := &list.Items[i]
 		if !storageProbePVResidue(persistentVolume) {
@@ -453,7 +530,7 @@ func deleteStorageProbePodAndWait(ctx context.Context, client kubernetes.Interfa
 	if err := deleteStorageProbePod(ctx, client, namespace, name); err != nil {
 		return err
 	}
-	return poll(ctx, 100*time.Millisecond, func(ctx context.Context) error {
+	return poll(ctx, GateStorageProbeCleanup, 100*time.Millisecond, func(ctx context.Context) error {
 		_, err := client.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
 			return nil
@@ -469,7 +546,7 @@ func deleteStorageProbePVCAndWait(ctx context.Context, client kubernetes.Interfa
 	if err := deleteStorageProbePVC(ctx, client, namespace, name); err != nil {
 		return err
 	}
-	return poll(ctx, 100*time.Millisecond, func(ctx context.Context) error {
+	return poll(ctx, GateStorageProbeCleanup, 100*time.Millisecond, func(ctx context.Context) error {
 		_, err := client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, name, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
 			return nil

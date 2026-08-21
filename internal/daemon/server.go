@@ -22,6 +22,7 @@ import (
 	"github.com/randax/talos-box/internal/hypervisor"
 	"github.com/randax/talos-box/internal/imagecache"
 	"github.com/randax/talos-box/internal/mirror"
+	"github.com/randax/talos-box/internal/provision"
 	"golang.org/x/sys/unix"
 )
 
@@ -54,6 +55,10 @@ type Server struct {
 	// a stall is aged from that transition rather than from VM uptime (#288).
 	reachability reachabilityLog
 	stalls       stallLog
+	// readiness records when a cluster's Kubernetes readiness probe started
+	// failing, so a momentary blip is not escalated into destroy-and-recreate
+	// advice (#418).
+	readiness readinessLog
 	// stallWatch* drive the daemon-side stall observation: without it a stall
 	// that nobody polls status for never reaches tbxd.log (#288).
 	stallScanInterval time.Duration
@@ -61,15 +66,24 @@ type Server struct {
 	stallWatchStop    chan struct{}
 	stallWatchDone    chan struct{}
 
-	provisions            map[string]activeProvision
-	storagePhases         map[string]StoragePhase
-	storageStatusProbes   map[string]activeStorageProbe
-	storageProbeFailures  map[string]storageProbeFailure
+	provisions           map[string]activeProvision
+	storagePhases        map[string]StoragePhase
+	storageStatusProbes  map[string]activeStorageProbe
+	storageProbeFailures map[string]storageProbeFailure
+	// provisionBlockers is what each running pass's convergence gates last
+	// reported they were waiting on, so status can name the gate that is
+	// actually holding the cluster instead of guessing at one (#391).
+	provisionBlockers map[string]provisionBlocker
+	// storageFailures carries the cause of a terminal StoragePhaseFailed, so an
+	// aborted provision's storage state says why it ended rather than reading
+	// as work still in progress (#395).
+	storageFailures       map[string]string
 	storageProbeSequence  uint64
 	provisionSequence     uint64
 	provisionReconcile    provisionReconcileFunc
 	storageProbe          func(context.Context, []byte) error
 	destroyVolumeCount    func(context.Context, cluster.Cluster) (int, error)
+	storageVolumeClaims   func(context.Context, cluster.Cluster) ([]string, error)
 	nodeVolumeCount       nodeVolumeCountFunc
 	storageEngineDelete   func(context.Context, cluster.Cluster) error
 	storageEngineValidate func(context.Context, cluster.Cluster) error
@@ -78,12 +92,27 @@ type Server struct {
 	nodeProbe             func(string) ProbeResult
 	hostFreeMemory        func() (int, error)
 	hostTotalMemory       func() (int, error)
-	helperCheck           func() error
-	maintenanceLoad       func(string) (cluster.Cluster, error)
-	lifecycleContext      context.Context
-	lifecycleCancel       context.CancelFunc
-	mirrors               *mirror.Manager
-	mirrorOffline         atomic.Bool
+	// balloonables is the balloon controller's view of the running guests,
+	// seamed so a test can supply it without the apid probe Balloonables runs
+	// on backends without balloon readback. Nil means the real one.
+	balloonables func() map[string]balloon.Balloonable
+	// balloonHold* is the pre-balloon taken at guest-start admission that the
+	// balloon manager must not hand back until the admitted guests have booted
+	// (#398). See holdBalloonReclaim.
+	balloonHoldMu sync.Mutex
+	balloonHolds  []balloonHold
+	// balloonTargets is the last balloon target this daemon applied per
+	// "cluster/node", so the provision-start gate measures what the running
+	// guests can still give back instead of assuming they are all still at
+	// their configured size (#398). Entries are dropped when the node stops.
+	balloonTargetMu  sync.Mutex
+	balloonTargets   map[string]int
+	helperCheck      func() error
+	maintenanceLoad  func(string) (cluster.Cluster, error)
+	lifecycleContext context.Context
+	lifecycleCancel  context.CancelFunc
+	mirrors          *mirror.Manager
+	mirrorOffline    atomic.Bool
 	// settingsPath is where daemon-wide modes are persisted so they survive a
 	// restart (#318). An empty path disables persistence, which is what a
 	// hand-built test server wants.
@@ -119,6 +148,14 @@ type activeProvision struct {
 type activeStorageProbe struct {
 	generation uint64
 	cancel     context.CancelFunc
+}
+
+// provisionBlocker is the last thing a running pass's convergence gates said
+// they were waiting on: which gate, and the observation that gate keeps making.
+type provisionBlocker struct {
+	gate    provision.Gate
+	message string
+	at      time.Time
 }
 
 // storageProbeFailure is the last probe pass the daemon has to back off
@@ -174,6 +211,8 @@ func NewServer(ctx context.Context) (*Server, error) {
 		storagePhases:         make(map[string]StoragePhase),
 		storageStatusProbes:   make(map[string]activeStorageProbe),
 		storageProbeFailures:  make(map[string]storageProbeFailure),
+		provisionBlockers:     make(map[string]provisionBlocker),
+		storageFailures:       make(map[string]string),
 		lifecycleContext:      lifecycleContext,
 		lifecycleCancel:       lifecycleCancel,
 		mirrors:               mirror.NewManager(mirror.DefaultDir(root)),
@@ -182,6 +221,7 @@ func NewServer(ctx context.Context) (*Server, error) {
 		hostFreeMemory:        balloon.HostFreeMiB,
 		hostTotalMemory:       balloon.HostTotalMiB,
 		destroyVolumeCount:    countDestroyStorageVolumes,
+		storageVolumeClaims:   listStorageVolumeClaims,
 		nodeVolumeCount:       countNodeRemovalStorageVolumes,
 		storageEngineDelete:   deleteConfiguredStorageEngine,
 		storageEngineValidate: validateConfiguredStorageEngine,
@@ -201,6 +241,7 @@ func NewServer(ctx context.Context) (*Server, error) {
 			Warmed:          summary.Warmed,
 			AlreadyComplete: summary.AlreadyComplete,
 			Failed:          summary.Failed,
+			ReResolvedTags:  summary.ReResolvedTags,
 			Entries:         make([]CacheWarmEntry, 0, len(summary.Results)),
 		}
 		for _, entry := range summary.Results {
@@ -211,9 +252,10 @@ func NewServer(ctx context.Context) (*Server, error) {
 				status = CacheWarmStatusAlreadyComplete
 			}
 			result.Entries = append(result.Entries, CacheWarmEntry{
-				Ref:    entry.Ref,
-				Status: status,
-				Reason: entry.Error,
+				Ref:           entry.Ref,
+				Status:        status,
+				Reason:        entry.Error,
+				ReResolvedTag: entry.ReResolvedTag,
 			})
 		}
 		return result, nil
@@ -441,7 +483,7 @@ func (s *Server) dispatchWithProgress(request Request, progress stageFunc) Respo
 	if request.Op == "cluster.destroy.inspect" {
 		return s.dispatchDestroyInspect(request)
 	}
-	s.opMu.Lock()
+	s.lockOperation(progress)
 	defer s.opMu.Unlock()
 
 	data, err := s.handle(request, progress)
@@ -532,11 +574,10 @@ func (s *Server) dispatchCreate(request Request, progress stageFunc) Response {
 	if err := decodeArgs(request.Args, &args); err != nil {
 		return failure(err)
 	}
-	lock := s.clusterMutationLock(args.Name)
-	lock.Lock()
+	lock := s.lockClusterMutation(args.Name, progress)
 	defer lock.Unlock()
 
-	s.opMu.Lock()
+	s.lockOperation(progress)
 	data, tasks, err := s.handleProvisioningLocked(request, nil, nil, progress)
 	s.opMu.Unlock()
 	if err != nil {
@@ -593,7 +634,7 @@ func (s *Server) dispatchProvisioning(request Request, progress stageFunc) Respo
 		if err != nil {
 			return failure(err)
 		}
-		s.opMu.Lock()
+		s.lockOperation(progress)
 		err = s.validateUp(request.Args, maintenance, storage)
 		s.opMu.Unlock()
 		if err != nil {
@@ -603,7 +644,7 @@ func (s *Server) dispatchProvisioning(request Request, progress stageFunc) Respo
 			return failure(err)
 		}
 	}
-	s.opMu.Lock()
+	s.lockOperation(progress)
 	data, tasks, err := s.handleProvisioningLocked(request, maintenance, storage, progress)
 	s.opMu.Unlock()
 	if err != nil {
@@ -642,8 +683,7 @@ func (s *Server) dispatchNodeMutation(request Request, progress stageFunc) Respo
 	// the other's node as the surviving replica holder and delete both copies
 	// of a volume, and a node added between another operation's observation and
 	// its disk deletions would lose its disk unobserved.
-	lock := s.clusterMutationLock(args.Cluster)
-	lock.Lock()
+	lock := s.lockClusterMutation(args.Cluster, progress)
 	var removalWarning string
 	if request.Op == "node.remove" {
 		log.Printf("node.remove %s/%s: begin", args.Cluster, args.Name)
@@ -655,7 +695,7 @@ func (s *Server) dispatchNodeMutation(request Request, progress stageFunc) Respo
 		}
 		removalWarning = warning
 	}
-	s.opMu.Lock()
+	s.lockOperation(progress)
 	data, tasks, err := s.handleNodeMutationLocked(request, progress)
 	s.opMu.Unlock()
 	if err != nil {
@@ -717,9 +757,8 @@ func (s *Server) dispatchBGP(request Request, progress stageFunc) Response {
 	if err := decodeArgs(request.Args, &args); err != nil {
 		return failure(err)
 	}
-	lock := s.clusterMutationLock(args.Name)
-	lock.Lock()
-	s.opMu.Lock()
+	lock := s.lockClusterMutation(args.Name, progress)
+	s.lockOperation(progress)
 	summary, tasks, err := s.setBGPLocked(request.Args, request.Op == "bgp.enable", progress)
 	s.opMu.Unlock()
 	lock.Unlock()
@@ -743,14 +782,13 @@ func (s *Server) dispatchSnapshotRestore(request Request, progress stageFunc) Re
 	// restore shares the node mutations' per-cluster lock: they all delete or
 	// add node disks, and no gate may observe a node another operation is
 	// about to delete as a copy holder.
-	lock := s.clusterMutationLock(args.Cluster)
-	lock.Lock()
+	lock := s.lockClusterMutation(args.Cluster, progress)
 	warning, err := s.gateSnapshotRestore(args)
 	if err != nil {
 		lock.Unlock()
 		return failure(err)
 	}
-	s.opMu.Lock()
+	s.lockOperation(progress)
 	status, err := s.snapshotRestore(request.Args, progress)
 	s.opMu.Unlock()
 	lock.Unlock()
@@ -799,6 +837,7 @@ func (s *Server) dispatchStatus(request Request) Response {
 	}
 	s.refreshNodeStatuses(statuses)
 	refreshKubernetesReadiness(statuses)
+	s.observeKubernetesReadiness(statuses, time.Now())
 	s.refreshStoragePhases(statuses)
 	return success(statuses)
 }
@@ -808,7 +847,7 @@ func (s *Server) handle(request Request, progress stageFunc) (any, error) {
 	case "daemon.ping":
 		return map[string]bool{"pong": true}, nil
 	case "daemon.info":
-		return Info{ProtocolVersion: ProtocolVersion}, nil
+		return Info{ProtocolVersion: ProtocolVersion, BalloonReserveMiB: balloon.DefaultConfig().ReserveMiB}, nil
 	case "up":
 		return s.up(request.Args)
 	case "down":
@@ -850,6 +889,8 @@ func (s *Server) handle(request Request, progress stageFunc) (any, error) {
 		// reconcile that puts the requested mechanism in effect; a locked path
 		// that only moves the host speaker must not exist (#344)
 		return nil, fmt.Errorf("operation %q must be dispatched as a BGP mode change", request.Op)
+	case "bgp.status":
+		return s.bgpStatus(request.Args)
 	case "cache.pull":
 		return s.pullCache(request.Args)
 	case "cache.warm":
@@ -917,7 +958,7 @@ func removeNodeFiles(clusterName, nodeName string) error {
 	// nothing left to restore into, and clusterHasSavedState only globs the
 	// directory — an orphaned save would keep reporting the whole cluster
 	// Suspended and keep the hint recommending a resume forever.
-	for _, suffix := range []string{".img", ".efi", ".console.sock", ".qga.sock", saveStateSuffix} {
+	for _, suffix := range []string{".img", ".efi", ".console.sock", ".qga.sock", saveStateSuffix, saveStateOwnerSuffix} {
 		if err := os.Remove(filepath.Join(dir, nodeName+suffix)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("remove node file: %w", err)
 		}

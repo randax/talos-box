@@ -43,6 +43,10 @@ func qemuCapabilities(version qemuVersion) Capabilities {
 	}
 	if version.Compare(qemuSuspendVersion) >= 0 {
 		capabilities.Suspend.Supported = true
+		// The save is a versioned file Launch feeds back in as -incoming; no
+		// handle from the writing process is involved, so a daemon restart
+		// costs the memory nothing.
+		capabilities.SuspendSurvivesDaemonRestart = true
 	} else {
 		capabilities.Suspend.Reason = fmt.Sprintf(
 			"suspend requires QEMU >= %d.%d (found %d.%d) — upgrade to Ubuntu 24.04+",

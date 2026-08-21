@@ -328,3 +328,82 @@ func TestNodeWithoutLeaseDoesNotUseWildcard(t *testing.T) {
 		t.Fatalf("Resolve() = %v, want nil", got)
 	}
 }
+
+// flagRA is the RECURSION-AVAILABLE bit. Guests reach our zones through the
+// cluster's CoreDNS, which forwards to us and prints ";; Got recursion not
+// available" for every response that leaves it clear, so every response we
+// build ourselves must set it.
+const flagRA = 0x0080
+
+func TestLocalResponsesAdvertiseRecursionAvailable(t *testing.T) {
+	t.Parallel()
+
+	hit := func(string) net.IP { return net.IPv4(172, 30, 0, 2) }
+	miss := func(string) net.IP { return nil }
+
+	for _, testCase := range []struct {
+		name     string
+		response func(t *testing.T) []byte
+	}{
+		{
+			name: "answer",
+			response: func(t *testing.T) []byte {
+				return mustAnswer(t, "node.demo.k8s.test", hit, "")
+			},
+		},
+		{
+			name: "nxdomain with SOA",
+			response: func(t *testing.T) []byte {
+				return mustAnswer(t, "missing.demo.k8s.test", miss, "demo.k8s.test")
+			},
+		},
+		{
+			name: "nodata",
+			response: func(t *testing.T) []byte {
+				query := mustEncodeQuery(t, "node.demo.k8s.test", 9)
+				binary.BigEndian.PutUint16(query[len(query)-4:], typeSOA)
+				response, err := answer(query, hit, "demo.k8s.test")
+				if err != nil {
+					t.Fatal(err)
+				}
+				return response
+			},
+		},
+		{
+			name: "servfail",
+			response: func(t *testing.T) []byte {
+				response, err := errorAnswer(mustEncodeQuery(t, "up.example.com", 11), 2)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return response
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			flags := binary.BigEndian.Uint16(testCase.response(t)[2:])
+			if flags&flagRA == 0 {
+				t.Fatalf("flags = %#04x, want RA set", flags)
+			}
+		})
+	}
+}
+
+func mustEncodeQuery(t *testing.T, name string, id uint16) []byte {
+	t.Helper()
+	query, err := encodeQuery(name, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return query
+}
+
+func mustAnswer(t *testing.T, name string, lookup func(string) net.IP, zone string) []byte {
+	t.Helper()
+	response, err := answer(mustEncodeQuery(t, name, 5), lookup, zone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return response
+}

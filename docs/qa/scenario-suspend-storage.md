@@ -26,7 +26,7 @@ BLOCKED unless: doctor clean and the platform suspend gate is open (macOS 14+; L
 
 Steps:
 1. `tbx cluster create qa-sus --cni cilium --csi longhorn`; wait for storage-ready.
-2. Create a PVC and a writer pod that appends timestamped lines to the volume every second; let it run ≥ 60 s; record the last line.
+2. Create a PVC and a writer pod that appends timestamped lines to the volume every second; let it run ≥ 60 s; record the last line. Base it on the [PSA-compliant test pod](deep-storage.md#psa-compliant-test-pod) (swap the command for the append loop) so the apply does not emit a `would violate PodSecurity "restricted:latest"` block — that block is a warning, not a rejection, and is not a finding.
 
 Pass criteria: data flowing, last-written line recorded.
 
@@ -53,8 +53,14 @@ Steps:
 2. Verify no reboot (console kernel timestamps continue; pods did not restart — check `kubectl get pods -o wide` RESTARTS unchanged).
 3. Verify the writer resumed appending; read the volume: the pre-suspend tail is present with no gap other than the suspended wall-clock window, no corruption (lines well-formed).
 4. Longhorn health: volumes report healthy replicas.
+5. Guest clock: `resume` warns that guest clocks come back behind the host by the length of the
+   suspend, and the guest clock is in fact behind by roughly that much (`date -u` on the host vs
+   `kubectl exec … date -u`). This is documented, not a defect — Talos closes the gap at its next
+   NTP poll and tbx has no API to force it (#416). Report a FAIL only if the warning is absent or
+   the measured gap contradicts it.
 
-Pass criteria: no reboot, writer continues, volume intact and healthy.
+Pass criteria: no reboot, writer continues, volume intact and healthy, clock drift warned about
+and consistent with the suspend length.
 
 On failure: capture console boot evidence, pod restarts, Longhorn volume state, the volume tail.
 

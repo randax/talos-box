@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/randax/talos-box/internal/balloon"
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/daemon"
 	"github.com/randax/talos-box/internal/extensions"
@@ -28,7 +30,21 @@ type doctorDependencies struct {
 	listConfig      func() ([]cluster.Cluster, error)
 	getStatus       func() ([]daemon.ClusterStatus, error)
 	listCache       func() (daemon.CacheListResult, error)
-	hostPressure    func() (hostpressure.Snapshot, error)
+	// mirrorOffline reports the mirror's offline mode, which persists across a
+	// daemon restart and changes how every pull on the host fails (#403).
+	mirrorOffline func() (bool, error)
+	hostPressure  func() (hostpressure.Snapshot, error)
+	// hostFreeMemory is the free-memory reading the provision-start gate
+	// refuses on. The host-pressure snapshot does not carry it — Assess never
+	// needed it — but the check is not self-attesting without it (#420). Nil
+	// reports free memory as unmeasured rather than guessing.
+	hostFreeMemory func() (int, error)
+	// balloonReserveMiB is the provision-start gate's host-memory reserve as
+	// the daemon itself reads it. TBX_BALLOON_RESERVE_MIB is read per process,
+	// so the CLI's own default is only a guess about the gate; asking the
+	// daemon is what makes the reported headroom the number that will decide
+	// the next bringup (#397, #420). Nil or an error falls back to the default.
+	balloonReserveMiB func() (int, error)
 	// guestAgentSupport is the host capability, not a running backend's, so the
 	// gate is explained even with the daemon down.
 	guestAgentSupport func() hypervisor.FeatureStatus
@@ -38,7 +54,83 @@ type doctorDependencies struct {
 	listenPacket      func(string, string) (net.PacketConn, error)
 	listenStream      func(string, string) (io.Closer, error)
 	doHTTP            httpDo
-	platform          func() []doctorFinding
+	// doVIPHTTP probes cluster VIPs. It is separate from doHTTP because those
+	// addresses are host-local and must never go through an HTTP proxy.
+	doVIPHTTP httpDo
+	platform  func() []doctorFinding
+}
+
+// doctorHelp answers `tbx doctor --help`. It names every check the command can
+// report and states the exit-code contract, which is the fact a script needs
+// and used to live only in the platform docs (#419).
+func doctorHelp() string {
+	var b strings.Builder
+	b.WriteString(`tbx doctor checks whether this host can run talos-box clusters, and whether the
+clusters that already exist are wired up. Every check is read-only: doctor
+reports, it never repairs. One line per finding, each PASS, WARN, FAIL, INFO, or
+SKIP (the probe did not apply here). Most checks report a single line, but a
+check may report several: host-pressure reports one per condition that fired,
+security-inventory one per activated system extension.
+
+Checks:
+  helper              privileged helper is installed and answers
+  resolver            per-domain resolver wiring for the cluster domains
+  DNS                 cluster names resolve against the daemon's DNS directly
+  forwarding          host IP forwarding for cluster traffic
+  host-pressure       host memory and disk headroom (the same gate that blocks
+                      cluster create)
+  system-dns          the system resolver returns each cluster's domain
+  routes              host routes reach the nodes of running clusters
+  inter-cluster       running clusters reach each other's ingress VIPs, from the
+                      host and from inside a sibling cluster
+  guest-agent         host support for clusters that baked qemu-guest-agent
+  mirror-health       registry-mirror listeners match the running clusters
+  mirror-offline      whether the registry mirror is serving from cache only
+  image-cache         cached Talos disk images, including incomplete pulls
+  egress              image-factory reachability for schematic builds
+  security-inventory  host security posture, informational only
+`)
+	if names := platformDoctorCheckNames(); len(names) > 0 {
+		fmt.Fprintf(&b, "\nOn this platform doctor also checks: %s.\n", strings.Join(names, ", "))
+	}
+	b.WriteString(`
+Exit code:
+  tbx doctor exits non-zero when any check reports FAIL. WARN, INFO, SKIP, and
+  PASS all leave the exit code 0, so a WARN never fails a scripted preflight.
+
+usage: tbx doctor
+`)
+	return b.String()
+}
+
+// doctorFreeMemoryMiB reads host free memory for the host-pressure summary. It
+// never fails the check: an unreadable probe reports the other two numbers and
+// says free memory was not measured.
+// doctorBalloonReserveMiB reports the reserve the daemon's provision-start gate
+// measures against, and whether it came from the daemon: a reserve the CLI had
+// to assume is worth saying so, because an env-set reserve in the daemon's
+// environment makes the printed headroom disagree with the gate.
+func doctorBalloonReserveMiB(deps doctorDependencies) (int, bool) {
+	if deps.balloonReserveMiB == nil {
+		return balloon.DefaultConfig().ReserveMiB, false
+	}
+	reserveMiB, err := deps.balloonReserveMiB()
+	// A daemon predating the field answers zero, which is no answer at all.
+	if err != nil || reserveMiB <= 0 {
+		return balloon.DefaultConfig().ReserveMiB, false
+	}
+	return reserveMiB, true
+}
+
+func doctorFreeMemoryMiB(deps doctorDependencies) int {
+	if deps.hostFreeMemory == nil {
+		return 0
+	}
+	freeMiB, err := deps.hostFreeMemory()
+	if err != nil {
+		return 0
+	}
+	return freeMiB
 }
 
 type doctorFinding struct {
@@ -56,6 +148,10 @@ func (c cli) runDoctor(args []string) error {
 }
 
 func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) error {
+	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help") {
+		_, err := fmt.Fprint(c.out, doctorHelp())
+		return err
+	}
 	if len(args) != 0 {
 		return errors.New("usage: tbx doctor")
 	}
@@ -118,7 +214,21 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 			return err
 		}
 	} else if findings := hostpressure.Assess(snapshot); len(findings) == 0 {
-		if err := writeFindings(doctorFinding{level: "PASS", check: "host-pressure"}); err != nil {
+		// A PASS states the three numbers it was decided on — free memory, swap
+		// in use, free space on the ~/.talosbox volume — plus the headroom the
+		// provision-start gate will measure the next bringup against, so the
+		// verdict can be attested without re-running memory_pressure, sysctl and
+		// df by hand, and so a host cannot read PASS here and still be refused a
+		// second cluster without warning (#420, #397).
+		snapshot.FreeMemoryMiB = doctorFreeMemoryMiB(deps)
+		reserveMiB, fromDaemon := doctorBalloonReserveMiB(deps)
+		detail := snapshot.Summary(reserveMiB)
+		if !fromDaemon {
+			detail += " (daemon unreachable; assuming the default reserve)"
+		}
+		if err := writeFindings(doctorFinding{
+			level: "PASS", check: "host-pressure", detail: detail,
+		}); err != nil {
 			return err
 		}
 	} else {
@@ -144,6 +254,7 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		if err := writeFindings(
 			doctorFinding{level: "SKIP", check: "system-dns", detail: detail},
 			doctorFinding{level: "SKIP", check: "routes", detail: detail},
+			doctorFinding{level: "SKIP", check: "inter-cluster", detail: detail},
 		); err != nil {
 			return err
 		}
@@ -152,6 +263,7 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		if err := writeFindings(
 			doctorFinding{level: "FAIL", check: "system-dns", detail: detail},
 			doctorFinding{level: "FAIL", check: "routes", detail: detail},
+			doctorFinding{level: "SKIP", check: "inter-cluster", detail: detail},
 		); err != nil {
 			return err
 		}
@@ -159,6 +271,7 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		if err := writeFindings(
 			doctorFinding{level: "SKIP", check: "system-dns", detail: "no clusters exist"},
 			doctorFinding{level: "SKIP", check: "routes", detail: "no clusters exist"},
+			doctorFinding{level: "SKIP", check: "inter-cluster", detail: "no clusters exist"},
 		); err != nil {
 			return err
 		}
@@ -179,7 +292,10 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		}
 		if !anyRunning {
 			// stopped clusters have no interfaces to route through
-			if err := writeFindings(doctorFinding{level: "SKIP", check: "routes", detail: "no clusters are running"}); err != nil {
+			if err := writeFindings(
+				doctorFinding{level: "SKIP", check: "routes", detail: "no clusters are running"},
+				doctorFinding{level: "SKIP", check: "inter-cluster", detail: "no clusters are running"},
+			); err != nil {
 				return err
 			}
 		} else {
@@ -199,6 +315,11 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 			if err := writeFindings(routeFinding); err != nil {
 				return err
 			}
+			// Routes and forwarding assert only that the host could carry the
+			// traffic; this asks whether it actually does (#388).
+			if err := writeFindings(interClusterFinding(statuses, statusErr, deps.doVIPHTTP)); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -207,6 +328,10 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 	}
 
 	if err := writeFindings(cacheFindings(deps.listCache, clusters, clusterErr)...); err != nil {
+		return err
+	}
+
+	if err := writeFindings(mirrorOfflineFinding(deps.mirrorOffline)); err != nil {
 		return err
 	}
 
@@ -421,6 +546,23 @@ func (c cli) doctorDependencies() doctorDependencies {
 			err := c.doctorCall("cache.list", struct{}{}, &result)
 			return result, err
 		},
+		// bounded like every other diagnostic subprocess: a stalled vm_stat
+		// must not hang doctor past its exit code
+		hostFreeMemory: func() (int, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), commandProbeTimeout)
+			defer cancel()
+			return balloon.HostFreeMiBContext(ctx)
+		},
+		balloonReserveMiB: func() (int, error) {
+			var result daemon.Info
+			err := c.doctorCall("daemon.info", struct{}{}, &result)
+			return result.BalloonReserveMiB, err
+		},
+		mirrorOffline: func() (bool, error) {
+			var result daemon.MirrorOfflineStatus
+			err := c.doctorCall("mirror.offline.get", struct{}{}, &result)
+			return result.Enabled, err
+		},
 		hostPressure: func() (hostpressure.Snapshot, error) {
 			home, err := os.UserHomeDir()
 			if err != nil {
@@ -443,7 +585,8 @@ func (c cli) doctorDependencies() doctorDependencies {
 		listenStream: func(network, address string) (io.Closer, error) {
 			return net.Listen(network, address)
 		},
-		doHTTP: newDoctorHTTPClient().Do,
+		doHTTP:    newDoctorHTTPClient().Do,
+		doVIPHTTP: newDoctorVIPHTTPClient().Do,
 	}
 	platformDoctorDependencies(&deps)
 	return deps

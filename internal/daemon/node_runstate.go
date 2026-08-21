@@ -13,7 +13,7 @@ import (
 // A node started into a cluster with nothing else running gets the same
 // cluster-start side effects the whole-cluster path performs, so the registry
 // mirrors are bound before the first node needs them (#322).
-func (s *Server) startNodeLocked(raw json.RawMessage) (NodeRunState, []provisionTask, error) {
+func (s *Server) startNodeLocked(raw json.RawMessage, progress stageFunc) (NodeRunState, []provisionTask, error) {
 	var args nodeArgs
 	if err := decodeArgs(raw, &args); err != nil {
 		return NodeRunState{}, nil, err
@@ -70,10 +70,21 @@ func (s *Server) startNodeLocked(raw json.RawMessage) (NodeRunState, []provision
 	// its allocation is entirely new to the free memory the gate measures. Its
 	// headroom rule works off that measurement, not off the running-guest sum,
 	// which only decides whether the gate applies at all (#334).
-	provisionStartWarnings, err := s.checkProvisionStart(dir, item.DefaultsFor(node.Role).MemoryMiB, args.Force)
+	// This node launches a few lines below, so the gate's own hold already
+	// starts at the launch it protects; nothing to re-arm.
+	provisionStartWarnings, preBalloonedMiB, err := s.checkProvisionStart(dir, item.DefaultsFor(node.Role).MemoryMiB, args.Force)
 	if err != nil {
 		return NodeRunState{}, nil, err
 	}
+	// A start that never reaches a booting guest must hand the pre-balloon back
+	// rather than hold the running guests at their reclaimed targets for the
+	// rest of the TTL (#398).
+	launched := false
+	defer func() {
+		if !launched {
+			s.releaseBalloonHold(preBalloonedMiB)
+		}
+	}()
 	hostPressureWarnings = append(hostPressureWarnings, provisionStartWarnings...)
 	nodes := s.vms[item.Name]
 	if nodes == nil {
@@ -87,10 +98,12 @@ func (s *Server) startNodeLocked(raw json.RawMessage) (NodeRunState, []provision
 		}
 		delete(nodes, node.Name)
 	}
+	progress.stage("starting node %s", node.Name)
 	machine, err := s.launchMachine(item, node, nil)
 	if err != nil {
 		return NodeRunState{}, nil, fmt.Errorf("create VM %s: %w", node.Name, err)
 	}
+	launched = true
 	nodes[node.Name] = machine
 	// node.start is a cold boot: suspended memory for this node is superseded
 	// by the fresh launch and must not be left to poison Suspended status or
@@ -116,13 +129,17 @@ func (s *Server) startNodeLocked(raw json.RawMessage) (NodeRunState, []provision
 	// Bringing members back up is the very act the deferred-reconcile warning
 	// asks for, so node.start does not repeat it back at the operator.
 	tasks, _ := s.beginNodeMutationProvisionLocked(item)
+	// The VM is up, the node is not: the boot and the rejoin both continue
+	// after this call returns, so the verb closes by naming where that is
+	// watched rather than leaving the operator to guess (#414).
+	progress.stage("%s", convergenceHint(item.Name))
 	return NodeRunState{NodeStatus: status}, tasks, nil
 }
 
 // stopNodeLocked powers one node's VM off, leaving it a cluster member with its
 // disk intact. Stopping the last running node leaves the cluster stopped, so it
 // performs the same teardown the whole-cluster stop does (#322).
-func (s *Server) stopNodeLocked(raw json.RawMessage) (NodeRunState, []provisionTask, error) {
+func (s *Server) stopNodeLocked(raw json.RawMessage, progress stageFunc) (NodeRunState, []provisionTask, error) {
 	var args nodeArgs
 	if err := decodeArgs(raw, &args); err != nil {
 		return NodeRunState{}, nil, err
@@ -143,6 +160,7 @@ func (s *Server) stopNodeLocked(raw json.RawMessage) (NodeRunState, []provisionT
 		return s.nodeRunning(item.Name, name)
 	})
 	log.Printf("node.stop %s/%s: begin", item.Name, node.Name)
+	progress.stage("stopping node %s", node.Name)
 	if err := s.closeNodes(item.Name, s.vms[item.Name], []string{node.Name}); err != nil {
 		log.Printf("node.stop %s/%s: stop VM failed: %v", item.Name, node.Name, err)
 		return NodeRunState{}, nil, err
@@ -156,6 +174,13 @@ func (s *Server) stopNodeLocked(raw json.RawMessage) (NodeRunState, []provisionT
 		s.cancelProvisionLocked(item.Name)
 		s.unbindMirrors(item.SubnetIndex)
 		log.Printf("node.stop %s/%s: last running node, cluster is stopped", item.Name, node.Name)
+		// Powering off the last member stops the cluster — a consequence the
+		// operator did not name and must not have to infer (#414).
+		progress.stage("%s was the last running node; cluster %s is now stopped", node.Name, item.Name)
+	} else {
+		// The VM is off before the answer, but etcd membership and the
+		// remaining nodes' view of it settle afterward (#414).
+		progress.stage("%s", stoppedNodeHint(item.Name))
 	}
 	log.Printf("node.stop %s/%s: VM stopped", item.Name, node.Name)
 	status := nodeStatus(node, item.SubnetIndex, false)

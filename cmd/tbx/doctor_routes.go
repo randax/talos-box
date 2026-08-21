@@ -40,7 +40,7 @@ func checkClusterRoutes(clusters []daemon.ClusterSummary, statuses []daemon.Clus
 		}
 		for _, node := range status.Nodes {
 			// a stopped node's IP is a stale DHCP lease, not a live route target
-			if node.IP != "" && node.Phase != daemon.PhaseStopped {
+			if node.IP != "" && !node.Phase.Stopped() {
 				firstNodeIP[status.Name] = node.IP
 				break
 			}

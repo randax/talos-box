@@ -26,7 +26,7 @@ BLOCKED unless: doctor clean; no cluster `qa-snap`; ≥ 10 GiB RAM; ≥ 60 GiB f
 
 Steps:
 1. `tbx cluster create qa-snap --cni cilium --csi longhorn`; wait for the full end state.
-2. Create namespace `epoch-one` with a PVC and write the string `epoch-one` to the volume; verify readback.
+2. Create namespace `epoch-one` with a PVC and write the string `epoch-one` to the volume; verify readback. Use the [PSA-compliant test pod](deep-storage.md#psa-compliant-test-pod) so the apply does not emit a `would violate PodSecurity "restricted:latest"` block — that block is a warning, not a rejection, and is not a finding.
 
 Pass criteria: end state reached; epoch-one data committed.
 
@@ -36,7 +36,7 @@ Pass criteria: end state reached; epoch-one data committed.
 
 Steps:
 1. `tbx snapshot create qa-snap epoch1 --yes` — cluster stops, snapshots, restarts.
-2. After restart: cluster reconverges to the full end state (VIP live, Longhorn healthy) without intervention; `epoch-one` data intact. Record reconvergence time. Longhorn needs a settle window: the volume comes back `degraded` and rebuilds to `healthy` within ~10 s, so poll `kubectl -n longhorn-system get volumes.longhorn.io` for up to 60 s before scoring it — a single early sample recording `degraded` is a false FAIL.
+2. After restart: cluster reconverges to the full end state (VIP live, Longhorn healthy) without intervention; `epoch-one` data intact. Record reconvergence time. Longhorn needs a settle window: the volume comes back `degraded` and rebuilds to `healthy` within ~10 s, so poll `kubectl -n longhorn-system get volumes.longhorn.io` for up to 60 s before scoring it — a single early sample recording `degraded` is a false FAIL. A second volume with no PVC or PV behind it may appear in `deleting`/`degraded` in the same window; it is Longhorn converging and clears itself, so score it only if it is still there after several minutes.
 
 Expected observations: a provisioned cluster survives its own snapshot cycle: etcd quorum returns, CNI and storage come back on their own.
 

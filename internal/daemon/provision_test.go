@@ -226,7 +226,7 @@ func TestProvisionCNICiliumStorageDriftBypassesFastNoop(t *testing.T) {
 			CSI: cluster.CSILonghorn,
 		},
 	}
-	_, _, phase, _, err := service.provisionCNI(context.Background(), item, false, false)
+	_, _, phase, _, err := service.provisionCNI(context.Background(), item, 0, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -351,7 +351,7 @@ func TestProvisionCNIAttachesStorageReconcilerForCilium(t *testing.T) {
 			}
 			return provision.Result{StoragePhase: provision.StoragePhaseLive, StorageLive: true}, nil
 		}}
-		if _, _, phase, _, err := service.provisionCNI(context.Background(), item, true, false); err != nil {
+		if _, _, phase, _, err := service.provisionCNI(context.Background(), item, 0, true, false); err != nil {
 			t.Fatal(err)
 		} else if phase != StoragePhaseLive {
 			t.Fatalf("csi=%s phase = %q, want %q", test.csi, phase, StoragePhaseLive)

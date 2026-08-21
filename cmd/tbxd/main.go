@@ -25,11 +25,30 @@ func main() {
 		return
 	}
 	if err := run(); err != nil {
-		log.Fatal(err)
+		// run() has already narrated err into the daemon log; stderr and the
+		// journal saw it too.
+		os.Exit(1)
 	}
 }
 
-func run() error {
+func run() (err error) {
+	// Own the log the runbooks point at, however tbxd was started: under
+	// systemd socket activation nothing redirects stderr into it.
+	if closer := startDaemonLog(); closer != nil {
+		defer func() { _ = closer.Close() }()
+	}
+	// Narrate the terminal error while the daemon log is still open: this
+	// defer runs before the closer's, so the one line explaining why tbxd
+	// exited reaches tbxd.log and not just the journal.
+	defer func() {
+		if err != nil {
+			log.Print(err)
+		}
+	}()
+	// Keep client-library chatter out of the log the runbooks point at (#401).
+	if closer := startKubernetesLogRouting(log.Printf); closer != nil {
+		defer func() { _ = closer.Close() }()
+	}
 	socketPath, err := daemon.SocketPath()
 	if err != nil {
 		return err
@@ -77,7 +96,11 @@ func run() error {
 	// registry mirrors are bound per cluster gateway by the daemon (see #39).
 
 	balloonStop := make(chan struct{})
-	go balloon.Run(balloon.DefaultConfig(), server.Balloonables, balloonStop)
+	balloonConfig := balloon.DefaultConfig()
+	// Hold the pre-balloon the provision-start gate takes for a booting guest,
+	// so the manager does not hand it straight back (#398).
+	balloonConfig.HoldMiB = server.BalloonHoldMiB
+	go balloon.Run(balloonConfig, server.Balloonables, balloonStop)
 	defer close(balloonStop)
 
 	serveErrors := make(chan error, 2)

@@ -110,6 +110,7 @@ func (m *Manager) Bind(gatewayIP string) error {
 			base = m.baseOverride
 		}
 		mirrorServer := NewServer(base, filepath.Join(m.cacheRoot, entry.Upstream))
+		mirrorServer.namespace = entry.Upstream
 		mirrorServer.offline = &m.offline
 		server := &http.Server{Handler: mirrorServer}
 		if m.serverFactory != nil {
@@ -186,6 +187,17 @@ func DefaultDir(cacheRoot string) string {
 }
 
 func (m *Manager) serveCatchAll(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "mirror is pull-only", http.StatusMethodNotAllowed)
+		return
+	}
+	if r.URL.Path == "/v2/" {
+		// The version check is the spec's liveness probe and carries no
+		// namespace of its own; only the content endpoints below need one.
+		w.Header().Set("Docker-Distribution-API-Version", "registry/2.0")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	authority, err := parseUpstreamAuthority(strings.TrimSpace(r.URL.Query().Get("ns")))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -193,10 +205,6 @@ func (m *Manager) serveCatchAll(w http.ResponseWriter, r *http.Request) {
 	}
 	clone := r.Clone(r.Context())
 	clone.URL = cloneURLWithoutQueryValue(r.URL, "ns")
-	if clone.Method != http.MethodGet && clone.Method != http.MethodHead || clone.URL.Path == "/v2/" {
-		m.cacheProbeServer(authority).ServeHTTP(w, clone)
-		return
-	}
 	if served, cacheErr := m.probeCacheOnly(authority, w, clone); served {
 		return
 	} else if cacheErr != nil {
@@ -255,6 +263,7 @@ func (m *Manager) cacheProbeServer(authority upstreamAuthority) *Server {
 		dialContext: m.dialContext,
 		blocked:     namespaceIPBlocked,
 	})
+	server.namespace = authority.canonicalHost
 	server.offline = &m.offline
 	return server
 }
@@ -368,6 +377,7 @@ func (m *Manager) newDynamicMirrorServer(base, cacheDir string, authority upstre
 		dialContext: m.dialContext,
 		blocked:     namespaceIPBlocked,
 	})
+	mirrorServer.namespace = authority.canonicalHost
 	mirrorServer.offline = &m.offline
 	mirrorServer.validateUpstream = func(ctx context.Context) error {
 		return m.validateResolvedAuthority(ctx, authority)

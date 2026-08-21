@@ -86,7 +86,7 @@ func removeNodeVolumesBlockRemoval(item cluster.Cluster, nodeName string, count 
 		nodeName,
 		count,
 		item.CSI,
-		volumeUnit(count),
+		Unit(count, "volume", "volumes"),
 	)
 }
 
@@ -96,7 +96,7 @@ func removeNodeDataLossWarning(item cluster.Cluster, nodeName string, count int)
 		nodeName,
 		count,
 		item.CSI,
-		volumeUnit(count),
+		Unit(count, "volume", "volumes"),
 	)
 }
 
@@ -110,11 +110,4 @@ func removeNodeUnverifiedDataWarning(item cluster.Cluster, nodeName string) stri
 		nodeName,
 		item.CSI,
 	)
-}
-
-func volumeUnit(count int) string {
-	if count == 1 {
-		return "volume"
-	}
-	return "volumes"
 }

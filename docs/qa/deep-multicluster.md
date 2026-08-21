@@ -16,7 +16,11 @@ You are running QA, not demos. For every charter: run the steps exactly, compare
 
 ## Preflight
 
-BLOCKED unless: `tbx version` recorded; `tbx doctor` exits 0 (including `port-179` free on Linux); no clusters `qa-a`/`qa-b`; ≥ 14 GiB free RAM (two 3-node clusters).
+BLOCKED unless: `tbx version` recorded; `tbx doctor` exits 0 (including `port-179` free on Linux); no clusters `qa-a`/`qa-b`; enough free RAM for the **second** create, not just for both clusters' nominal memory — see below.
+
+**Memory floor (macOS).** Two 3-node clusters are 12288 MiB of guests, but the binding constraint is the provision-start gate at the *second* `cluster create`: starting 6144 MiB must still leave the 6144 MiB balloon reserve free, so the host needs **12288 MiB free with `qa-a` already running** — roughly **18–19 GiB free before you start**, not 14 GiB. The `host-pressure` line of `tbx doctor` prints the reading and the arithmetic ("room for N MiB of new guests right now"), where N is measured free minus the reserve. The gate does not refuse at N below 6144, though: before blocking it credits what it can pre-balloon out of the running guests, down to a 1024 MiB per-node floor — for a default 3-node `qa-a` that is 3 × (2048 − 1024) = **3072 MiB**. So the second create is refused only when N *measured with `qa-a` already running* drops below **~3072 MiB**; equivalently, a **preflight** (no clusters running) N between **9216 and 12288 MiB** means the second create proceeds on a pre-balloon rather than being blocked. Mind which reading a threshold belongs to: a preflight N of 3072–6144 MiB is a host that is 6144 MiB short at the second create and will be hard-refused there. Still hold to the 18–19 GiB recommendation: a marginal admission pins every `qa-a` node at the 1024 MiB floor for the hold window, which is a poor state to run the rest of the charters in. Record the `host-pressure` numbers at preflight and again after C1.
+
+**Memory floor (Linux).** None of the above applies: `hostpressure.SystemSnapshot` and the host-memory readings are macOS-only, so `tbx doctor` prints `SKIP host-pressure` with no numbers (expected, not friction — see `docs/linux.md`), the provision-start gate never fires, and the overcommit check reads no host total and so cannot warn either. There is nothing to record at preflight and nothing to compare against, and nothing will ever report BLOCKED on memory — do not record BLOCKED on the strength of a gate that cannot fire. The 18–19 GiB physical recommendation still stands as advice (host swap pressure is what corrupts guest writes), it is simply unenforced here: self-police with `free -h` and `swapon --show`, record those at preflight and again after C1 in place of the `host-pressure` numbers, and keep watching them for the rest of the run.
 
 `port-179` is checked on both platforms, but macOS reports only an any-address squatter (`*:179`) and reports it as WARN, so `tbx doctor` still exits 0 with it. Read the `port-179` line, and confirm by hand with `netstat -an | grep '\.179'` (no foreign `LISTEN` line) or `sudo lsof -iTCP:179 -sTCP:LISTEN`. Note that unprivileged `lsof -iTCP:179` cannot see the root-owned helper socket, so an empty unprivileged listing is not evidence — use `netstat` or `sudo`.
 
@@ -43,7 +47,7 @@ On failure: capture status, subnet assignments, doctor routes section.
 
 Steps:
 1. From the host: ping a `qa-a` node and a `qa-b` node; curl both VIPs.
-2. From inside `qa-a` (a test pod or `kubectl debug` node shell): ping a `qa-b` node IP; curl `qa-b`'s VIP (`172.30.<m>.200`).
+2. From inside `qa-a` (a test pod or `kubectl debug` node shell): ping a `qa-b` node IP; curl `qa-b`'s VIP (`172.30.<m>.200`). Base a test pod on the [PSA-compliant test pod](deep-storage.md#psa-compliant-test-pod) so the apply does not emit a `would violate PodSecurity "restricted:latest"` block — that block is a warning, not a rejection, and is not a finding. A `kubectl debug` node shell is privileged by construction, so expect the warning block there instead.
 3. Reverse: from `qa-b`, reach `qa-a`'s node and VIP.
 
 Expected observations: all six paths work — the host routes between cluster subnets as a first-class contract; record round-trip times (gross anomalies are friction).
@@ -86,7 +90,8 @@ On failure: capture timing log and host route table during the gap.
 
 Steps:
 1. `tbx cluster destroy qa-a --force`; confirm `qa-b` is completely unaffected (VIP still answers, DNS intact).
-2. `tbx cluster destroy qa-b --force`; verify no residue: no leftover routes to either subnet, no resolver/resolved entries, no bridges (Linux), status clean.
+2. `tbx cluster destroy qa-b --force`; verify no residue: no leftover routes to either subnet, no **per-cluster** resolver/resolved entries, no bridges (Linux), status clean.
+   - Scope matters here: on macOS the shared `/etc/resolver/k8s.test` file is **install-scoped**, not per-cluster — it is created by `tbx system install`, `tbx doctor`'s `PASS resolver` depends on it, and it is expected to survive every destroy. Only a per-cluster custom-domain file (e.g. `/etc/resolver/lab.internal`) must be gone. On Linux the equivalent per-cluster artifact is the systemd-resolved route-only domain registration on the cluster bridge; the bridge and its registration both disappear with the cluster. A surviving `k8s.test` file is a correct system, never residue.
 
 Pass criteria: destroying one cluster never disturbs another; zero residue at the end.
 

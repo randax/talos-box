@@ -35,6 +35,7 @@ const (
 	snapshotCreateWarningProtocolVersion    = 7
 	nodeRunStateProtocolVersion             = 8
 	bgpReconcileProtocolVersion             = 10
+	bgpStatusProtocolVersion                = 14
 )
 
 func requiresProvisioningIntentHandshake(input cluster.ProvisioningIntentInput) bool {
@@ -112,6 +113,12 @@ func (c cli) ensurePerClusterTalosSupport() error {
 // the old way, with the BGP control plane disabled and its CRDs absent (#344).
 func (c cli) ensureBGPReconcileSupport(verb string) error {
 	return c.ensureProtocolAtLeast(bgpReconcileProtocolVersion, "bgp "+verb)
+}
+
+// ensureBGPStatusSupport refuses to ask a daemon that has no bgp.status for
+// one: it would answer with an unknown-operation error naming an internal op.
+func (c cli) ensureBGPStatusSupport() error {
+	return c.ensureProtocolAtLeast(bgpStatusProtocolVersion, "bgp status")
 }
 
 func (c cli) ensureCacheWarmSupport() error {
@@ -839,6 +846,14 @@ func (c cli) stages(quiet bool) func(string) {
 // as it arrives. A nil sink is the silent exchange every other verb makes
 // (#273).
 func (c cli) callNarrated(op string, args, destination any, onStage func(string)) error {
+	return c.callNarratedWithin(op, args, destination, onStage, 0)
+}
+
+// callNarratedWithin is callNarrated with an overall bound on the exchange. A
+// zero timeout is the unbounded lifecycle call; a blocking verb passes the
+// budget it narrated plus its grace, so a daemon-side gate that never returns
+// fails the verb instead of hanging it forever (#392).
+func (c cli) callNarratedWithin(op string, args, destination any, onStage func(string), timeout time.Duration) error {
 	if err := c.ensureDaemonProtocol(); err != nil {
 		return err
 	}
@@ -846,7 +861,7 @@ func (c cli) callNarrated(op string, args, destination any, onStage func(string)
 	if err != nil {
 		return err
 	}
-	response, err := exchangeNarrated(socketPath, op, args, onStage)
+	response, err := exchangeDeadlined(socketPath, op, args, timeout, onStage)
 	var connectionError dialError
 	if errors.As(err, &connectionError) {
 		logOffset, startErr := startDaemon()
@@ -858,7 +873,7 @@ func (c cli) callNarrated(op string, args, destination any, onStage func(string)
 		deadline := time.Now().Add(daemonWaitTimeout)
 		backoff := 50 * time.Millisecond
 		for {
-			response, err = exchangeNarrated(socketPath, op, args, onStage)
+			response, err = exchangeDeadlined(socketPath, op, args, timeout, onStage)
 			if !errors.As(err, &connectionError) || time.Now().After(deadline) {
 				break
 			}
@@ -897,11 +912,6 @@ func exchange(socketPath, op string, args any) (daemon.Response, error) {
 	return exchangeWithin(socketPath, op, args, 0)
 }
 
-// exchangeNarrated is exchange with a narration sink; a nil sink asks for none.
-func exchangeNarrated(socketPath, op string, args any, onStage func(string)) (daemon.Response, error) {
-	return exchangeDeadlined(socketPath, op, args, 0, onStage)
-}
-
 // exchangeWithin runs one request/response with an optional overall deadline,
 // which the restart paths need: their queries are served under the daemon's
 // operation lock and must never outlast a courtesy check.
@@ -915,10 +925,21 @@ func exchangeDeadlined(socketPath, op string, args any, timeout time.Duration, o
 		return daemon.Response{}, dialError{err: err}
 	}
 	defer func() { _ = connection.Close() }()
-	if timeout > 0 {
-		if err := connection.SetDeadline(time.Now().Add(timeout)); err != nil {
-			return daemon.Response{}, fmt.Errorf("set daemon deadline: %w", err)
+	// The deadline bounds silence, not the call: it is re-armed below on every
+	// stage the daemon narrates, so a request that is still reporting progress
+	// — a cold image fetch, a slow reconcile — is never mistaken for a hang,
+	// while one that stops talking altogether still fails (#392).
+	arm := func() error {
+		if timeout <= 0 {
+			return nil
 		}
+		if err := connection.SetDeadline(time.Now().Add(timeout)); err != nil {
+			return fmt.Errorf("set daemon deadline: %w", err)
+		}
+		return nil
+	}
+	if err := arm(); err != nil {
+		return daemon.Response{}, err
 	}
 
 	rawArgs, err := json.Marshal(args)
@@ -940,6 +961,9 @@ func exchangeDeadlined(socketPath, op string, args any, timeout time.Duration, o
 		if response.IsProgress() {
 			if onStage != nil {
 				onStage(response.Stage)
+			}
+			if err := arm(); err != nil {
+				return daemon.Response{}, err
 			}
 			continue
 		}
@@ -1016,7 +1040,7 @@ func daemonLogPath() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("find home directory: %w", err)
 	}
-	return filepath.Join(home, ".talosbox", "tbxd.log"), nil
+	return filepath.Join(home, ".talosbox", daemon.LogFile), nil
 }
 
 // startDaemon spawns tbxd and returns the daemon log's size before the spawn,

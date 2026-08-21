@@ -236,6 +236,7 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 		// lease would bake a planned address that may never exist into its
 		// peers, so wait for the leases instead of guessing.
 		if unleased := unleasedControlPlanes(request.Cluster, nodes); len(unleased) > 0 {
+			reportGate(ctx, GateDHCPLease, fmt.Errorf("no DHCP lease yet on %s", strings.Join(unleased, ", ")))
 			if expired := wait(ctx, request.PollInterval); expired != nil {
 				return Result{}, fmt.Errorf("waiting for a DHCP lease on %s: %w", strings.Join(unleased, ", "), expired)
 			}
@@ -289,6 +290,7 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 
 		controlPlane, allConfigured := configuredControlPlane(nodes)
 		if !allConfigured {
+			reportGate(ctx, GateMachineConfig, fmt.Errorf("nodes not configured yet: %s", strings.Join(unconfiguredNodes(nodes), ", ")))
 			if err := wait(ctx, request.PollInterval); err != nil {
 				return Result{}, err
 			}
@@ -382,9 +384,11 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 			result.Narration = append(result.Narration, loadBalancer.Narration...)
 		}
 		for {
-			if err := request.Client.KubernetesReady(ctx, kubeconfig, nodeNames(nodes)); err == nil {
+			ready := request.Client.KubernetesReady(ctx, kubeconfig, nodeNames(nodes))
+			if ready == nil {
 				break
 			}
+			reportGate(ctx, GateKubernetesReady, ready)
 			if err := wait(ctx, request.PollInterval); err != nil {
 				return Result{}, annotateAPIServerTimeout(err, request.MirrorOffline)
 			}
@@ -407,14 +411,17 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 		}
 		if request.Cluster.CSI != "" && !request.SkipStorage {
 			if request.Storage == nil {
-				return Result{}, errors.New("storage provisioning requires a Kubernetes reconciler")
+				return Result{}, StorageStageError(errors.New("storage provisioning requires a Kubernetes reconciler"))
 			}
 			storage, err := request.Storage.Reconcile(ctx, request.Cluster, kubeconfig)
 			if err != nil {
 				// Storage is reconciled the same way behind either CNI, so the
 				// failure names the engine that failed rather than the CNI the
 				// shared path was first written for (#347).
-				return Result{}, fmt.Errorf("reconcile %s storage: %w", request.Cluster.CSI, err)
+				// Marked as a storage-stage failure: it is the only failure
+				// that says anything about storage, and the daemon settles the
+				// terminal storage phase on that marker alone (#395).
+				return Result{}, StorageStageError(fmt.Errorf("reconcile %s storage: %w", request.Cluster.CSI, err))
 			}
 			result.StoragePhase = storage.Phase
 			result.StorageLive = storage.Live
@@ -604,7 +611,7 @@ func disableKubeProxy(config []byte) ([]byte, error) {
 }
 
 func addCatchAllMirror(config []byte, subnetIndex int) []byte {
-	return append(config, []byte(catchAllMirrorDocument(subnetIndex))...)
+	return append(config, []byte("---\n"+catchAllMirrorDocument(subnetIndex))...)
 }
 
 // machineCNIName is the value of cluster.network.cni.name for the cluster.
@@ -622,9 +629,12 @@ func ciliumDisablesKubeProxy(item cluster.Cluster) bool {
 	return item.CNI == cluster.CNICilium
 }
 
+// catchAllMirrorDocument is one YAML document with no leading separator: the
+// separator belongs to whoever concatenates it after another document, so a
+// single-section `tbx manifests <cluster> mirrors` render does not open with a
+// stray `---` (#424).
 func catchAllMirrorDocument(subnetIndex int) string {
-	return fmt.Sprintf(`---
-apiVersion: v1alpha1
+	return fmt.Sprintf(`apiVersion: v1alpha1
 kind: RegistryMirrorConfig
 name: "*"
 endpoints:
@@ -940,6 +950,19 @@ func clusterControlPlane(item cluster.Cluster) (Node, []string) {
 	return controlPlane, endpoints
 }
 
+// unconfiguredNodes names the nodes the config gate is still waiting on, so a
+// pass stalled there says which node never took its machine config rather than
+// just that something is not ready (#390).
+func unconfiguredNodes(nodes []Node) []string {
+	var pending []string
+	for _, node := range nodes {
+		if node.Phase != PhaseConfigured {
+			pending = append(pending, fmt.Sprintf("%s (%s)", node.Name, node.Phase))
+		}
+	}
+	return pending
+}
+
 func configuredControlPlane(nodes []Node) (Node, bool) {
 	var controlPlane Node
 	for _, node := range nodes {
@@ -985,7 +1008,7 @@ func alreadyBootstrapped(err error) bool {
 // immediate so a pass fails loudly, an expired budget names the address that
 // never answered, and an interrupted run is still always safely recoverable by
 // rerunning tbx up.
-func retryUnavailable[T any](ctx context.Context, node string, interval time.Duration, call func() (T, error)) (T, error) {
+func retryUnavailable[T any](ctx context.Context, gate Gate, node string, interval time.Duration, call func() (T, error)) (T, error) {
 	for {
 		value, err := call()
 		if err == nil {
@@ -994,6 +1017,10 @@ func retryUnavailable[T any](ctx context.Context, node string, interval time.Dur
 		var zero T
 		switch talosclient.StatusCode(err) {
 		case codes.Unavailable, codes.DeadlineExceeded, codes.Canceled:
+			// These retries are the pass's longest un-gated stretch: bringing
+			// up etcd and kube-apiserver takes minutes during which nothing
+			// else reports a gate, so the loop names itself (#390).
+			reportGate(ctx, gate, fmt.Errorf("%s is not answering yet: %w", node, err))
 			if expired := wait(ctx, interval); expired != nil {
 				return zero, unreachable(node, expired, err)
 			}
@@ -1004,13 +1031,13 @@ func retryUnavailable[T any](ctx context.Context, node string, interval time.Dur
 }
 
 func kubeconfigWithRetry(ctx context.Context, client TalosClient, node string, interval time.Duration) ([]byte, error) {
-	return retryUnavailable(ctx, node, interval, func() ([]byte, error) {
+	return retryUnavailable(ctx, GateAPIServer, node, interval, func() ([]byte, error) {
 		return client.Kubeconfig(ctx, node)
 	})
 }
 
 func machineConfigWithRetry(ctx context.Context, client TalosClient, node string, target ConfigTarget, interval time.Duration) (ConfigChanges, error) {
-	return retryUnavailable(ctx, node, interval, func() (ConfigChanges, error) {
+	return retryUnavailable(ctx, GateMachineConfig, node, interval, func() (ConfigChanges, error) {
 		return client.ReconcileMachineConfig(ctx, node, target)
 	})
 }
@@ -1020,7 +1047,7 @@ func machineConfigWithRetry(ctx context.Context, client TalosClient, node string
 // other authenticated call, because it runs right after config applies that can
 // take a node's API away for a moment.
 func bootstrapWithRetry(ctx context.Context, client TalosClient, node string, interval time.Duration) error {
-	_, err := retryUnavailable(ctx, node, interval, func() (struct{}, error) {
+	_, err := retryUnavailable(ctx, GateAPIServer, node, interval, func() (struct{}, error) {
 		err := client.Bootstrap(ctx, node)
 		if err != nil && alreadyBootstrapped(err) {
 			return struct{}{}, nil

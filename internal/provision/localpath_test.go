@@ -13,6 +13,7 @@ import (
 	"github.com/randax/talos-box/internal/cluster"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -111,7 +112,7 @@ func TestRunStorageProbeWritesReadsAndCleansUp(t *testing.T) {
 	dynamicClient.PrependReactor("patch", "pods", reactor)
 
 	mapper := storageProbeRESTMapper()
-	clientset := kubernetesfake.NewClientset()
+	clientset := kubernetesfake.NewClientset(defaultStorageClassObject(localPathStorageClass))
 	writerGets, readerGets := 0, 0
 	deleteKeys := []string{}
 	deleted := map[string]bool{}
@@ -186,7 +187,7 @@ func TestRunStorageProbeReturnsContextAndCleansUp(t *testing.T) {
 	dynamicClient.PrependReactor("patch", "pods", reactor)
 
 	mapper := storageProbeRESTMapper()
-	clientset := kubernetesfake.NewClientset()
+	clientset := kubernetesfake.NewClientset(defaultStorageClassObject(localPathStorageClass))
 	deleteKeys := []string{}
 	deleted := map[string]bool{}
 	clientset.PrependReactor("get", "persistentvolumeclaims", func(k8stesting.Action) (bool, runtime.Object, error) {
@@ -604,7 +605,7 @@ func newStorageProbeStallFixture(t *testing.T, stallFromStart bool) storageProbe
 		return false, nil, nil
 	})
 
-	clientset := kubernetesfake.NewClientset()
+	clientset := kubernetesfake.NewClientset(defaultStorageClassObject(localPathStorageClass))
 	probed := false
 	deleted := map[string]bool{}
 	clientset.PrependReactor("get", "persistentvolumeclaims", func(k8stesting.Action) (bool, runtime.Object, error) {
@@ -694,6 +695,43 @@ func TestCleanupStorageProbeReclaimsVolumeResidue(t *testing.T) {
 		if _, err := volumes.Get(context.Background(), name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 			t.Fatalf("longhorn volume %q get error = %v, want NotFound", name, err)
 		}
+	}
+	if _, err := volumes.Get(context.Background(), "pvc-workload-handle", metav1.GetOptions{}); err != nil {
+		t.Fatalf("workload longhorn volume was deleted: %v", err)
+	}
+}
+
+// Deleting the probe claim takes its PersistentVolume with it, and Longhorn
+// does not always have status.kubernetesStatus on the volume object by then —
+// so neither residue route can name it and the orphan lingers in `deleting`
+// for minutes, reading as damage to anyone watching volume health (#428). The
+// claim names its volume while both still exist, so cleanup reads it first.
+func TestCleanupStorageProbeDeletesTheVolumeItsClaimNames(t *testing.T) {
+	clientset := kubernetesfake.NewClientset(&corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: storageProbePVCName, Namespace: probeNamespace},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			StorageClassName: stringPointer(longhornStorageClass),
+			VolumeName:       "pvc-probe-bound",
+		},
+		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
+	})
+	dynamicClient := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{longhornVolumeResource: "VolumeList"},
+		longhornVolumeCR("pvc-probe-bound", "", ""),
+		longhornVolumeCR("pvc-workload-handle", "app", "data"),
+	)
+
+	if err := cleanupStorageProbe(context.Background(), clientset, dynamicClient, storageProbeSpec{
+		ExpectedStorageClass: longhornStorageClass,
+		Engine:               cluster.CSILonghorn,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	volumes := dynamicClient.Resource(longhornVolumeResource).Namespace(longhornNamespace)
+	if _, err := volumes.Get(context.Background(), "pvc-probe-bound", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("longhorn volume %q get error = %v, want NotFound", "pvc-probe-bound", err)
 	}
 	if _, err := volumes.Get(context.Background(), "pvc-workload-handle", metav1.GetOptions{}); err != nil {
 		t.Fatalf("workload longhorn volume was deleted: %v", err)
@@ -917,6 +955,64 @@ func TestStorageProbeRejectsDifferentDefaultStorageClass(t *testing.T) {
 }
 
 func stringPointer(value string) *string { return &value }
+
+// defaultStorageClassObject is the class the probe now waits for before it
+// creates its claim: a claim stamped with no class can never bind (#386).
+func defaultStorageClassObject(name string) *storagev1.StorageClass {
+	return &storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{
+		Name:        name,
+		Annotations: map[string]string{"storageclass.kubernetes.io/is-default-class": "true"},
+	}}
+}
+
+// A probe claim omits storageClassName so that binding it proves the default
+// resolves to the curated engine. Creating it while no class is default stamps
+// it with none for good, so the probe waits the window out instead (#386).
+func TestRunStorageProbeWaitsForTheEngineToBecomeTheDefaultClass(t *testing.T) {
+	clientset := kubernetesfake.NewClientset()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err := waitForDefaultStorageClass(ctx, clientset, localPathStorageClass, time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "no default class") {
+		t.Fatalf("waitForDefaultStorageClass() error = %v, want the absent default reported", err)
+	}
+
+	other := &storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{
+		Name:        longhornStorageClass,
+		Annotations: map[string]string{"storageclass.beta.kubernetes.io/is-default-class": "true"},
+	}}
+	clientset = kubernetesfake.NewClientset(other)
+	ctx, cancel = context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err = waitForDefaultStorageClass(ctx, clientset, localPathStorageClass, time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "default: "+longhornStorageClass) {
+		t.Fatalf("waitForDefaultStorageClass() error = %v, want the other default named", err)
+	}
+
+	clientset = kubernetesfake.NewClientset(defaultStorageClassObject(localPathStorageClass))
+	if err := waitForDefaultStorageClass(context.Background(), clientset, localPathStorageClass, time.Millisecond); err != nil {
+		t.Fatalf("waitForDefaultStorageClass() error = %v, want nil", err)
+	}
+}
+
+// The wait is bounded on its own so a transition where the default never lands
+// fails fast, naming the class that never became default, instead of spending
+// the whole storage budget on a deadline that says nothing (#386).
+func TestWaitForDefaultStorageClassFailsFastOnItsOwnTimeout(t *testing.T) {
+	previous := storageProbeDefaultClassTimeout
+	storageProbeDefaultClassTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { storageProbeDefaultClassTimeout = previous })
+
+	clientset := kubernetesfake.NewClientset()
+	started := time.Now()
+	err := waitForDefaultStorageClass(context.Background(), clientset, localPathStorageClass, time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), `StorageClass "`+localPathStorageClass+`" did not become the cluster default`) {
+		t.Fatalf("waitForDefaultStorageClass() error = %v, want the missing default class named", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("waitForDefaultStorageClass() took %s, want it bounded by its own timeout", elapsed)
+	}
+}
 
 func TestStorageProbeDeleteIgnoresMissingObjects(t *testing.T) {
 	clientset := kubernetesfake.NewClientset()

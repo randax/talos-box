@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"net"
 	"os"
@@ -211,6 +212,18 @@ func (n NodeStatus) UnreachableFor(now time.Time) time.Duration {
 	}
 }
 
+// suspendedPhase promotes a stopped node holding its own saved memory to
+// PhaseSuspended, so the JSON surface says what the table has said since #360
+// instead of the coarser "stopped" a consumer keying on phase alone misread
+// (#415). Suspended stays set beside it: it is the same fact, and older
+// clients read only the boolean.
+func (n NodeStatus) suspendedPhase() NodeStatus {
+	if n.Suspended && n.Phase == PhaseStopped {
+		n.Phase = PhaseSuspended
+	}
+	return n
+}
+
 // answeredSinceStart reports whether the node answered at least once since its
 // VM launched, which decides how its silence is described.
 func (n NodeStatus) answeredSinceStart() bool { return n.UnreachableSince != nil }
@@ -221,6 +234,10 @@ type StoragePhase string
 const (
 	StoragePhaseProvisioning StoragePhase = "provisioning"
 	StoragePhaseLive         StoragePhase = "live"
+	// StoragePhaseFailed is the terminal state an aborted provision settles
+	// into. Nothing is converging any more, so reporting `provisioning` would
+	// describe work no process is doing (#395).
+	StoragePhaseFailed StoragePhase = "failed"
 )
 
 // ClusterStatus is the status result for one cluster.
@@ -249,19 +266,43 @@ type ClusterStatus struct {
 	// Suspended reports saved VM memory on disk, the difference between a
 	// cluster that was stopped and one whose memory is waiting to be resumed —
 	// a distinction start would silently erase (#272).
-	Suspended       bool         `json:"suspended,omitempty"`
-	KubernetesReady bool         `json:"kubernetesReady"`
-	StoragePhase    StoragePhase `json:"storagePhase,omitempty"`
-	StorageError    string       `json:"storageError,omitempty"`
+	Suspended bool `json:"suspended,omitempty"`
+	// SavedStateStale reports suspended memory whose owning daemon process is
+	// gone on a backend that needs it. Where restore depends on the writing
+	// process (vz), `tbx system restart --force` has already lost the memory
+	// and a resume will cold-boot — which the suspend hint used to promise the
+	// opposite of (#413). Where restore reads the save file alone (QEMU), the
+	// memory outlives the daemon and this stays false.
+	SavedStateStale bool `json:"savedStateStale,omitempty"`
+	KubernetesReady bool `json:"kubernetesReady"`
+	// KubernetesNotReadySince is when the daemon first observed this cluster
+	// failing its Kubernetes readiness probe without a success since — and
+	// without a gap longer than unreadyRunAbandonWindow in which nobody looked,
+	// which starts a fresh run rather than crediting unwatched time. It is
+	// what keeps a momentary apiserver blip from being escalated into "destroy
+	// and recreate" (#418). Nil means ready now, or never observed.
+	KubernetesNotReadySince *time.Time `json:"kubernetesNotReadySince,omitempty"`
+	// Converging names what is still coming back on a cluster whose nodes are
+	// up and whose Kubernetes reports Ready — CSI drivers re-registering, a
+	// VIP announced but not answering. Empty means nothing outstanding, which
+	// is the only reading a single-sample check may treat as converged (#396).
+	Converging   []string     `json:"converging,omitempty"`
+	StoragePhase StoragePhase `json:"storagePhase,omitempty"`
+	StorageError string       `json:"storageError,omitempty"`
 	// StoragePending is the benign counterpart of StorageError: the readiness
 	// probe has not failed, it has not run yet because the daemon is still
 	// clearing the previous pass's objects. It reads as work in progress, so
 	// the operator is not shown a fault for a wait the daemon converges out of
 	// on its own (#347).
-	StoragePending string       `json:"storagePending,omitempty"`
-	VIP            string       `json:"vip,omitempty"`
-	VIPLive        bool         `json:"vipLive"`
-	Nodes          []NodeStatus `json:"nodes"`
+	StoragePending string `json:"storagePending,omitempty"`
+	// StorageGate names the convergence gate a running pass is currently held
+	// at. Storage cannot go live until every gate ahead of it passes, and the
+	// blocking one is frequently not the readiness probe at all — naming the
+	// probe regardless sent diagnosis at the wrong subsystem (#391).
+	StorageGate string       `json:"storageGate,omitempty"`
+	VIP         string       `json:"vip,omitempty"`
+	VIPLive     bool         `json:"vipLive"`
+	Nodes       []NodeStatus `json:"nodes"`
 	// Capabilities reports the host capabilities this cluster's configuration
 	// depends on, so a file stays portable across host substrates and the gate
 	// is visible instead of silently doing nothing.
@@ -272,6 +313,30 @@ type ClusterStatus struct {
 	ConfigOrigin cluster.ConfigOrigin `json:"configOrigin,omitempty"`
 	Hints        []string             `json:"hints,omitempty"`
 	subnetIndex  int
+}
+
+// kubernetesUnreadyFor reports how long the daemon has been watching this
+// cluster fail its readiness probe. Zero means it is ready, or that no
+// observation window exists at all.
+func (c ClusterStatus) kubernetesUnreadyFor(now time.Time) time.Duration {
+	if c.KubernetesNotReadySince == nil {
+		return 0
+	}
+	return now.Sub(*c.KubernetesNotReadySince)
+}
+
+// unreadyEscalationWindow is how long Kubernetes must stay unreachable before
+// status is willing to recommend destroying the cluster. QA's blip recovered
+// on its own inside a minute; anything shorter than this is a blip until
+// proven otherwise (#418).
+const unreadyEscalationWindow = 2 * time.Minute
+
+// KubernetesUnreadyBriefly reports an unreadiness the daemon has watched for
+// too little time to call it stuck. An unknown window is not brief: without an
+// observation the daemon cannot vouch for the cluster either way, and the
+// stuck-cluster advice is what the hint exists for.
+func (c ClusterStatus) KubernetesUnreadyBriefly(now time.Time) bool {
+	return c.KubernetesNotReadySince != nil && c.kubernetesUnreadyFor(now) < unreadyEscalationWindow
 }
 
 // CapabilityStatus is one host capability a cluster depends on, with the reason
@@ -319,6 +384,10 @@ type CacheWarmEntry struct {
 	Ref    string          `json:"ref"`
 	Status CacheWarmStatus `json:"status"`
 	Reason string          `json:"reason,omitempty"`
+	// ReResolvedTag records that the ref named a tag and the tag was
+	// resolved upstream again, which is where a no-op re-warm spends its
+	// time. An older daemon leaves it unset (#405).
+	ReResolvedTag bool `json:"reResolvedTag,omitempty"`
 }
 
 type CacheWarmResult struct {
@@ -326,6 +395,8 @@ type CacheWarmResult struct {
 	Warmed          int              `json:"warmed"`
 	AlreadyComplete int              `json:"alreadyComplete"`
 	Failed          int              `json:"failed"`
+	// ReResolvedTags counts the entries whose tag was re-resolved upstream.
+	ReResolvedTags int `json:"reResolvedTags,omitempty"`
 }
 
 const cacheWarmTimeout = 2 * time.Hour
@@ -361,6 +432,11 @@ type CacheImageEntry struct {
 	// daemon leaves them empty, which the client renders as no status.
 	Status   CacheImageStatus `json:"status,omitempty"`
 	Clusters []string         `json:"clusters,omitempty"`
+	// Reasons is every keep-reason that applies, strongest last, so the
+	// listing shows what a prune weighs instead of one masking reason
+	// (#407). Status stays the single strongest one. An older daemon
+	// reports none, which the client renders from Status alone.
+	Reasons []CacheImageStatus `json:"reasons,omitempty"`
 	// Incomplete marks a combination with prunable leftovers but no usable
 	// image. It is listed so the preview covers everything prune removes.
 	Incomplete bool `json:"incomplete,omitempty"`
@@ -448,17 +524,29 @@ func (s *Server) createCluster(raw json.RawMessage, progress stageFunc) (Cluster
 	if err := s.requireHelper(); err != nil {
 		return ClusterSummary{}, err
 	}
-	addMiB := (controlPlanes + workers) * memoryOr(args.Node.MemoryMiB, cluster.DefaultMemoryMiB)
+	// One gate, one arithmetic: charge each role what it will actually be
+	// created with, so a create admits exactly the clusters a later
+	// `cluster start` can reassemble (#398).
+	addMiB := controlPlanes*roleMemoryMiB(args.ControlPlane, args.Node) + workers*roleMemoryMiB(args.Worker, args.Node)
 	overcommitWarning, err := s.checkOvercommit(addMiB, args.Force)
 	if err != nil {
 		return ClusterSummary{}, err
 	}
 	// The projected-start gate runs before anything is written: a create that
 	// cannot safely boot must not leave a cluster directory behind (#334).
-	provisionStartWarnings, err := s.checkProvisionStart(dir, addMiB, args.Force)
+	provisionStartWarnings, preBalloonedMiB, err := s.checkProvisionStart(dir, addMiB, args.Force)
 	if err != nil {
 		return ClusterSummary{}, err
 	}
+	// Every step between the gate and the launch can fail — a domain clash, an
+	// image fetch, a disk clone — and a start that never happened must not keep
+	// memory out of the running guests for the rest of the hold's TTL (#398).
+	launched := false
+	defer func() {
+		if !launched {
+			s.releaseBalloonHold(preBalloonedMiB)
+		}
+	}()
 	hostPressureWarnings = append(hostPressureWarnings, provisionStartWarnings...)
 	clusters, err := cluster.List()
 	if err != nil {
@@ -546,9 +634,17 @@ func (s *Server) createCluster(raw json.RawMessage, progress stageFunc) (Cluster
 			log.Printf("resolver files for %s: %v", item.Name, err)
 		}
 	}
+	// The hold is a boot-window budget, so its clock has to start at the
+	// launch, not at the admission: the image fetch and disk clones above are
+	// unbounded and can outlast the TTL, and the balloon manager would then
+	// inflate the reclaimed guests back before these ones have booted — the
+	// squeeze the pre-balloon was taken to prevent (#398).
+	s.rearmBalloonHold(preBalloonedMiB)
 	progress.stage("starting %d node(s)", len(item.Nodes))
 	startWarnings, err := s.start(item)
 	if err != nil {
+		// start rolled back whatever it launched, so nothing is booting and
+		// the hold protects nothing — hand it back now, not at the TTL.
 		result := summary(item, false)
 		result.setWarnings(append([]string{talosVersionWarning, overcommitWarning}, append(hostPressureWarnings, longhornWarning, longhornCustomSchematicWarning, subnetWarning)...)...)
 		startErr := fmt.Errorf("cluster created but failed to start: %w", err)
@@ -560,6 +656,7 @@ func (s *Server) createCluster(raw json.RawMessage, progress stageFunc) (Cluster
 		}
 		return result, startErr
 	}
+	launched = true
 	result := summary(item, true)
 	result.setWarnings(append([]string{talosVersionWarning, overcommitWarning}, append(hostPressureWarnings, append([]string{longhornWarning, longhornCustomSchematicWarning, subnetWarning}, startWarnings...)...)...)...)
 	return result, nil
@@ -597,15 +694,22 @@ func (s *Server) startCluster(raw json.RawMessage) (ClusterSummary, error) {
 	// for the nodes this start actually boots, so a partly-running cluster —
 	// which start also boots the stopped half of — is gated too, and the
 	// members already running are not counted twice.
+	preBalloonedMiB := 0
 	if bootingMiB := s.stoppedNodeMemoryMiB(item); bootingMiB > 0 {
-		provisionStartWarnings, err := s.checkProvisionStart(dir, bootingMiB, args.Force)
+		provisionStartWarnings, held, err := s.checkProvisionStart(dir, bootingMiB, args.Force)
 		if err != nil {
 			return ClusterSummary{}, err
 		}
+		preBalloonedMiB = held
 		hostPressureWarnings = append(hostPressureWarnings, provisionStartWarnings...)
 	}
+	// The launch is right below, so the hold's clock already starts where it
+	// should; but a start that fails — and rolls its own launches back — must
+	// hand the pre-balloon back instead of pinning the running guests at their
+	// reclaimed targets for the rest of the TTL (#398).
 	startWarnings, err := s.start(item)
 	if err != nil {
+		s.releaseBalloonHold(preBalloonedMiB)
 		return ClusterSummary{}, err
 	}
 	result := summary(item, true)
@@ -880,41 +984,102 @@ func (s *Server) closeNodes(clusterName string, nodes map[string]hypervisor.Mach
 	return resultErr
 }
 
-func (s *Server) destroyCluster(raw json.RawMessage) (map[string]string, error) {
+// DestroySummary is cluster.destroy's response: what the destroy actually
+// removed. The most destructive verb in the CLI used to answer with the
+// cluster's name alone, which gave the operator nothing to check the scope of
+// the destruction against (#422). Every count is measured before anything is
+// deleted; a partially-destroyed cluster reports what could still be counted.
+type DestroySummary struct {
+	Name string `json:"name"`
+	// Nodes is nil when the node count could not be established — a
+	// partially-destroyed cluster whose cluster.json is gone still has its
+	// disks removed, and reporting that as zero nodes would understate the
+	// destruction. A count that is known is always sent, zero included.
+	Nodes     *int `json:"nodes,omitempty"`
+	Snapshots int  `json:"snapshots"`
+	// DiskBytes is the cluster's whole state directory — node disks, snapshots
+	// and configuration — as it stood before the removal. It is the sum of each
+	// file's allocated blocks, so blocks cloned from the image cache or shared
+	// with a snapshot count once per file: it reports state removed, not
+	// capacity the host gets back.
+	DiskBytes int64  `json:"diskBytes"`
+	Domain    string `json:"domain,omitempty"`
+	// ResolverWithdrawn is set only for a cluster whose own resolver file the
+	// destroy removed; a cluster on the default domain shares one that stays.
+	ResolverWithdrawn bool `json:"resolverWithdrawn,omitempty"`
+}
+
+func (s *Server) destroyCluster(raw json.RawMessage) (DestroySummary, error) {
 	var args destroyArgs
 	if err := decodeArgs(raw, &args); err != nil {
-		return nil, err
+		return DestroySummary{}, err
 	}
 	if !args.Force {
-		return nil, errors.New("cluster.destroy requires force=true")
+		return DestroySummary{}, errors.New("cluster.destroy requires force=true")
 	}
 	s.cancelProvisionLocked(args.Name)
 	dir, err := cluster.Dir(args.Name)
 	if err != nil {
-		return nil, err
+		return DestroySummary{}, err
 	}
 	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
-		return nil, ClusterMissingError(args.Name)
+		return DestroySummary{}, ClusterMissingError(args.Name)
 	}
 	if err := disableHostBGP(args.Name); err != nil {
 		log.Printf("disable host BGP for %s during force destroy: %v", args.Name, err)
 	}
+	// Everything the summary reports is measured here, while it still exists.
+	summary := DestroySummary{Name: args.Name, DiskBytes: directoryBytes(dir)}
+	if snapshots, listErr := cluster.ListSnapshots(args.Name); listErr == nil {
+		summary.Snapshots = len(snapshots)
+	}
+	var customDomain bool
 	// stop what we can, but a partially-destroyed cluster (state dir present,
-	// cluster.json gone) must still be removable
-	if _, loadErr := cluster.Load(args.Name); loadErr == nil {
+	// cluster.json gone) must still be removable — and still summarised
+	if item, loadErr := cluster.Load(args.Name); loadErr == nil {
+		nodes := len(item.Nodes)
+		summary.Nodes = &nodes
+		summary.Domain = item.EffectiveDomain()
+		customDomain = item.Domain != ""
 		if err := s.stop(args.Name); err != nil {
-			return nil, err
+			return DestroySummary{}, err
 		}
 	}
 	if err := cluster.Destroy(args.Name); err != nil {
-		return nil, err
+		return DestroySummary{}, err
 	}
 	s.forgetCluster(args.Name)
 	s.invalidateStoragePhaseLocked(args.Name)
 	if err := SyncResolverFiles(); err != nil {
 		log.Printf("resolver files after destroying %s: %v", args.Name, err)
+	} else {
+		summary.ResolverWithdrawn = customDomain
 	}
-	return map[string]string{"name": args.Name}, nil
+	return summary, nil
+}
+
+// directoryBytes sums what the files under dir occupy on disk. Node disks are
+// sparse, so their apparent size would overstate the state being removed; the
+// allocated block count is the closer number. It is a per-file sum, not a
+// measure of capacity the destroy frees: APFS reports cloned extents at full
+// size on both sides, so blocks a node disk shares with the image cache (which
+// a destroy never touches) or with a snapshot in the same tree are counted once
+// per file rather than once per physical block. Best effort: a file that cannot
+// be stat'ed must not fail the verb that removes it.
+func directoryBytes(dir string) int64 {
+	var total int64
+	_ = filepath.WalkDir(dir, func(_ string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return nil //nolint:nilerr // an unreadable entry is skipped, not fatal
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			return nil
+		}
+		total += imagecache.AllocatedSize(info)
+		return nil
+	})
+	return total
 }
 
 // resolverSyncMu makes SyncResolverFiles the single owner of resolver-file
@@ -997,17 +1162,27 @@ func (s *Server) addNodeLocked(raw json.RawMessage, progress stageFunc) (NodeSta
 		return NodeStatus{}, nil, err
 	}
 	running := s.clusterRunning(item.Name)
+	preBalloonedMiB := 0
 	if running {
 		// A node added to a running cluster boots immediately, which is the
 		// very allocation the projected-start gate exists for. A node added to
 		// a stopped cluster starts nothing, so there is nothing to project
 		// (#334).
-		provisionStartWarnings, err := s.checkProvisionStart(dir, addMiB, args.Force)
+		provisionStartWarnings, held, err := s.checkProvisionStart(dir, addMiB, args.Force)
 		if err != nil {
 			return NodeStatus{}, nil, err
 		}
+		preBalloonedMiB = held
 		hostPressureWarnings = append(hostPressureWarnings, provisionStartWarnings...)
 	}
+	// As in createCluster: an add that fails before it launches must hand the
+	// pre-balloon back rather than sit on it until the TTL runs out (#398).
+	launched := false
+	defer func() {
+		if !launched {
+			s.releaseBalloonHold(preBalloonedMiB)
+		}
+	}()
 	var subnetWarning string
 	if running {
 		// The subnet is already fixed and attached, so it is only inspected for
@@ -1018,6 +1193,10 @@ func (s *Server) addNodeLocked(raw json.RawMessage, progress stageFunc) (NodeSta
 			return NodeStatus{}, nil, err
 		}
 	}
+	// The image fetch is the long pole of an add against a cold cache, exactly
+	// as it is for a create, and it runs before any other stage — narrating it
+	// first is what re-arms the CLI's liveness deadline across it (#392).
+	progress.stage("%s", talosImageStage(item.TalosVersion))
 	cachedDisk, err := s.cachedDisk(item)
 	if err != nil {
 		return NodeStatus{}, nil, err
@@ -1036,11 +1215,17 @@ func (s *Server) addNodeLocked(raw json.RawMessage, progress stageFunc) (NodeSta
 		return NodeStatus{}, nil, err
 	}
 	if running {
+		// Re-armed at the launch for the same reason create does: the hold's
+		// TTL is a boot window, and the image fetch and disk clone above can
+		// outlast it (#398).
+		s.rearmBalloonHold(preBalloonedMiB)
 		progress.stage("starting node %s", node.Name)
 		machine, err := s.launchMachine(item, node, nil)
 		if err != nil {
+			// nothing booted; the deferred release hands the hold back
 			return nodeStatus(node, item.SubnetIndex, false), nil, fmt.Errorf("node added but failed to create VM: %w", err)
 		}
+		launched = true
 		s.vms[item.Name][node.Name] = machine
 	}
 	status := nodeStatus(node, item.SubnetIndex, s.nodeRunning(item.Name, node.Name))
@@ -1060,6 +1245,16 @@ func (s *Server) addNodeLocked(raw json.RawMessage, progress stageFunc) (NodeSta
 	}
 	status.setWarnings(append([]string{overcommitWarning}, append(hostPressureWarnings, subnetWarning, s.longhornCustomSchematicWarning(item, customSchematic), deferredWarning)...)...)
 	return status, tasks, nil
+}
+
+// talosImageStage names the image-prepare stage. Stored state predating the
+// recorded Talos version leaves the field empty, and a stage line with a hole
+// in it reads worse than one that simply omits the version.
+func talosImageStage(version string) string {
+	if version == "" {
+		return "preparing the Talos image"
+	}
+	return fmt.Sprintf("preparing the Talos %s image", version)
 }
 
 func (s *Server) removeNodeLocked(raw json.RawMessage, progress stageFunc) (NodeStatus, []provisionTask, error) {
@@ -1115,13 +1310,13 @@ func (s *Server) handleNodeMutationLocked(request Request, progress stageFunc) (
 		}
 		return result, tasks, nil
 	case "node.start":
-		result, tasks, err := s.startNodeLocked(request.Args)
+		result, tasks, err := s.startNodeLocked(request.Args, progress)
 		if err != nil {
 			return nil, nil, err
 		}
 		return result, tasks, nil
 	case "node.stop":
-		result, tasks, err := s.stopNodeLocked(request.Args)
+		result, tasks, err := s.stopNodeLocked(request.Args, progress)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1160,14 +1355,14 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), AllowUnsafeDomain: item.AllowUnsafeDomain, TalosVersion: item.TalosVersion, Schematic: item.Schematic, BaseSchematic: item.BaseSchematic, TalosExtensions: item.TalosExtensions, ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: running,
 			// derived from disk, not from daemon memory, so a restarted
 			// daemon still reports its predecessor's suspension
-			Suspended: !running && clusterHasSavedState(item.Name), Capabilities: s.clusterCapabilities(item), ConfigOrigin: item.ConfigOrigin, subnetIndex: item.SubnetIndex}
+			Suspended: !running && clusterHasSavedState(item.Name), SavedStateStale: !running && s.savedStateStale(item.Name), Capabilities: s.clusterCapabilities(item), ConfigOrigin: item.ConfigOrigin, subnetIndex: item.SubnetIndex}
 		for _, node := range item.Nodes {
 			running := s.nodeRunning(item.Name, node.Name)
 			clusterStatus.Nodes = append(clusterStatus.Nodes, NodeStatus{Name: node.Name, Role: node.Role, MAC: node.MAC, Phase: ClassifyPhase(running, ProbeResult{}), StartedAt: s.vmStartedAt(item.Name, node.Name),
 				// per-node, not per-cluster: suspend saves memory only for
 				// the nodes that were running, and the rest stay plain
 				// stopped rather than inheriting the cluster's flag
-				Suspended: !running && nodeHasSavedState(item.Name, node.Name)})
+				Suspended: !running && nodeHasSavedState(item.Name, node.Name)}.suspendedPhase())
 		}
 		clusterStatus.Hints = Hints(clusterStatus)
 		result = append(result, clusterStatus)
@@ -1202,13 +1397,14 @@ func (s *Server) refreshNodeStatuses(statuses []ClusterStatus) {
 	for i := range statuses {
 		for j, snapshot := range statuses[i].Nodes {
 			node := cluster.Node{Name: snapshot.Name, Role: snapshot.Role, MAC: snapshot.MAC}
-			refreshed := nodeStatusWith(node, statuses[i].subnetIndex, snapshot.Phase != PhaseStopped, lookupIP, probe)
+			refreshed := nodeStatusWith(node, statuses[i].subnetIndex, !snapshot.Phase.Stopped(), lookupIP, probe)
 			refreshed.StartedAt = snapshot.StartedAt
 			// Suspension is a disk fact the status handler already
 			// established; the refresh only re-derives the live phase, and
 			// dropping the flag here is what made a suspended cluster read as
 			// plain stopped in the PHASE column (#360).
 			refreshed.Suspended = snapshot.Suspended
+			refreshed = refreshed.suspendedPhase()
 			refreshed.UnreachableSince = s.reachability.observe(nodeKey(statuses[i].Name, node.Name), refreshed.Phase, now)
 			statuses[i].Nodes[j] = refreshed
 		}
@@ -1559,7 +1755,7 @@ func (s *Server) listCache() (CacheListResult, error) {
 		return CacheListResult{}, err
 	}
 	for _, entry := range entries {
-		status, clusters, err := classifier.status(imagecache.Combination{
+		reasons, clusters, err := classifier.statuses(imagecache.Combination{
 			Schematic:    entry.Schematic,
 			Version:      entry.Version,
 			Architecture: entry.Architecture,
@@ -1573,7 +1769,8 @@ func (s *Server) listCache() (CacheListResult, error) {
 			Architecture:  string(entry.Architecture),
 			Size:          entry.Size,
 			AllocatedSize: entry.AllocatedSize,
-			Status:        status,
+			Status:        primaryCacheImageStatus(reasons),
+			Reasons:       reasons,
 			Clusters:      clusters,
 			Incomplete:    entry.Incomplete,
 		})
@@ -1928,6 +2125,18 @@ func (s *Server) clusterImageArchitecture(item cluster.Cluster) (imagecache.Arch
 		return "", fmt.Errorf("cluster %q uses %s images, but the active hypervisor targets %s", item.Name, architecture, active)
 	}
 	return imagecache.Architecture(architecture), nil
+}
+
+// roleMemoryMiB resolves the memory one node of a role will be created with:
+// the per-role `controlPlane:`/`worker:` override when the spec carries one,
+// otherwise the cluster-wide node defaults. It is the pre-creation twin of
+// cluster.Cluster.DefaultsFor, which every other memory gate resolves through.
+func roleMemoryMiB(role *cluster.NodeDefaults, base cluster.NodeDefaults) int {
+	baseMiB := memoryOr(base.MemoryMiB, cluster.DefaultMemoryMiB)
+	if role != nil {
+		return memoryOr(role.MemoryMiB, baseMiB)
+	}
+	return baseMiB
 }
 
 func memoryOr(mib, fallback int) int {

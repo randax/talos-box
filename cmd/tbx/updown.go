@@ -12,6 +12,7 @@ import (
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/config"
 	"github.com/randax/talos-box/internal/daemon"
+	"github.com/randax/talos-box/internal/imagecache"
 )
 
 const defaultConfigFile = "talosbox.yaml"
@@ -25,11 +26,29 @@ const (
 	storageProvisionDeadline = daemon.StorageProvisionTimeout
 	nodeBootDeadline         = daemon.NodeBootTimeout
 	kubernetesReadyDeadline  = daemon.KubernetesReadyWaitTimeout
+	// A create also prepares the Talos image inside the same request — the
+	// Image Factory download, the decompression and the node disk clones all
+	// run before a node boots — and that phase has no budget of its own, so the
+	// stated deadline carries the cache's own allowance for it (#392).
+	imagePrepareDeadline = imagecache.PrepareAllowance
 )
 
 // livenessInterval is how often a blocking lifecycle call reports it is still
 // alive. Tests shorten it.
 var livenessInterval = time.Minute
+
+// livenessPreambleDelay is how long a --quiet call waits before announcing its
+// provisioning window. The window is worth stating up front for real work, but
+// a run the planner classifies as a no-op must not open by announcing work it
+// never does (#421), so the delay lets the usual no-op answer first and the
+// preamble stays conditional until the daemon has narrated a stage.
+var livenessPreambleDelay = 5 * time.Second
+
+// livenessGrace is how far past its stated deadline a blocking call may run
+// before the CLI stops waiting. The daemon enforces its own budgets; the grace
+// covers the round trip and the daemon's teardown, so this bound only ever
+// fires on a gate that hung past every budget it declared (#392).
+var livenessGrace = 2 * time.Minute
 
 // liveness keeps a blocking daemon call distinguishable from a hang. up,
 // cluster create, cluster start and node add all send one request that the
@@ -39,9 +58,25 @@ var livenessInterval = time.Minute
 // Everything it writes goes to stderr: stdout stays the scriptable result.
 type liveness struct {
 	// verb reads as "provisioning demo" in both the preamble and the beat.
-	verb     string
+	verb string
+	// subject is what the verb acts on — the cluster or the file's clusters —
+	// so the conditional preamble can name it without claiming the work (#421).
+	subject  string
 	deadline time.Duration
 	quiet    bool
+}
+
+// preambleText is the --quiet deadline announcement. Until the daemon has
+// narrated a stage the CLI does not know whether this run has any work to do,
+// so it states the window conditionally: a run that turns out to be a no-op
+// must not open by announcing a provisioning window it never uses (#421).
+func (l liveness) preambleText(working bool) string {
+	if working {
+		return fmt.Sprintf("%s; overall deadline %s; progress suppressed by --quiet",
+			l.verb, formatLivenessDuration(l.deadline))
+	}
+	return fmt.Sprintf("checking %s; if provisioning is needed it may take up to %s; progress suppressed by --quiet",
+		l.subject, formatLivenessDuration(l.deadline))
 }
 
 // narrator serializes the progress stream's two writers: the liveness
@@ -50,6 +85,24 @@ type liveness struct {
 type narrator struct {
 	mu     sync.Mutex
 	output io.Writer
+	// sawStage records that the daemon has reported work, which is what turns
+	// the --quiet preamble from conditional into a stated window (#421).
+	sawStage bool
+}
+
+// noteStage records that the daemon narrated a stage, whether or not the stage
+// itself is printed: a --quiet call drops the text but still learns that the
+// run is doing work.
+func (n *narrator) noteStage() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.sawStage = true
+}
+
+func (n *narrator) working() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.sawStage
 }
 
 // line writes one progress line, ignoring a write failure: an operation must
@@ -67,18 +120,23 @@ func (n *narrator) stages(quiet bool) func(string) {
 	if quiet {
 		return nil
 	}
-	return func(stage string) { n.line("%s\n", stage) }
+	return func(stage string) {
+		n.noteStage()
+		n.line("%s\n", stage)
+	}
 }
 
 // beat starts the heartbeat and returns the function that stops and joins it.
 // Everything else writing to the same stream must go through the narrator.
 func (l liveness) beat(output *narrator) func() {
-	if l.quiet {
-		// --quiet drops narration, not the fact that this will take a while.
-		output.line("%s; up to %s; progress suppressed by --quiet\n", l.verb, formatLivenessDuration(l.deadline))
-	}
 	started := time.Now()
 	ticker := time.NewTicker(livenessInterval)
+	// --quiet drops narration, not the fact that this will take a while — but
+	// the preamble waits out the no-op window first (#421).
+	preamble := time.NewTimer(livenessPreambleDelay)
+	if !l.quiet {
+		preamble.Stop()
+	}
 	stop := make(chan struct{})
 	stopped := make(chan struct{})
 	go func() {
@@ -87,17 +145,29 @@ func (l liveness) beat(output *narrator) func() {
 			select {
 			case <-stop:
 				return
+			case <-preamble.C:
+				output.line("%s\n", l.preambleText(output.working()))
 			case <-ticker.C:
-				output.line("still %s (elapsed %s, deadline %s)\n",
+				// "overall deadline" names this budget apart from the
+				// per-phase budgets the daemon narrates (#423).
+				output.line("still %s (elapsed %s, overall deadline %s)\n",
 					l.verb, formatLivenessDuration(time.Since(started)), formatLivenessDuration(l.deadline))
 			}
 		}
 	}()
 	return func() {
 		ticker.Stop()
+		preamble.Stop()
 		close(stop)
 		<-stopped
 	}
+}
+
+// bound is the wall-clock limit the CLI holds the call to: the deadline it
+// states plus the grace. Without it a gate that never returns leaves the verb
+// hanging behind a heartbeat forever (#392).
+func (l liveness) bound() time.Duration {
+	return l.deadline + livenessGrace
 }
 
 // callWithLiveness runs one blocking lifecycle call under a heartbeat. The
@@ -119,7 +189,29 @@ func (c cli) callWithLivenessNarrated(signal liveness, op string, args, destinat
 	stream := &narrator{output: c.err}
 	stop := signal.beat(stream)
 	defer stop()
-	return c.callNarrated(op, args, destination, stream.stages(!narrate || signal.quiet))
+	sink := stream.stages(!narrate || signal.quiet)
+	bound := signal.bound()
+	if sink == nil && bound > 0 {
+		// The bound measures silence between stages, and only a non-nil sink
+		// asks the daemon to send any. Suppressing the narration must not turn
+		// the bound into a hard total-elapsed limit that a healthy but slow
+		// call — a cold image fetch, a slow reconcile — trips where the same
+		// call with narration on survives, so keep asking for the stages and
+		// drop them on the floor instead (#392 #423).
+		sink = func(string) { stream.noteStage() }
+	}
+	err := c.callNarratedWithin(op, args, destination, sink, bound)
+	if err != nil && isTimeout(err) {
+		// The bound measures silence, not total elapsed: a narrated call
+		// re-arms it on every stage the daemon sends. Wording it as "did not
+		// finish within" contradicted the heartbeat printed on the same
+		// stream, which reports the real elapsed time (#423).
+		return fmt.Errorf("tbxd stopped reporting progress for %s (no sign of life for %s: "+
+			"overall deadline %s plus %s grace); the daemon may still be working — check: tbx status",
+			signal.verb, formatLivenessDuration(signal.bound()),
+			formatLivenessDuration(signal.deadline), formatLivenessDuration(livenessGrace))
+	}
+	return err
 }
 
 // formatLivenessDuration renders a budget the way the runbook states it: whole
@@ -149,12 +241,13 @@ func provisionDeadline(storage bool) time.Duration {
 	return cniProvisionDeadline
 }
 
-// createProvisionDeadline is provisionDeadline plus the boot wait a create runs
-// ahead of provisioning: the daemon holds a create for both, and a heartbeat
-// stating only the provisioning half reports an elapsed time past its own
-// deadline on any host where a node is slow to lease DHCP.
+// createProvisionDeadline is provisionDeadline plus the image prepare and boot
+// waits a create runs ahead of provisioning: the daemon holds a create for all
+// three, and a heartbeat stating only the provisioning half reports an elapsed
+// time past its own deadline on any host with a cold image cache or a node slow
+// to lease DHCP.
 func createProvisionDeadline(storage bool) time.Duration {
-	return provisionDeadline(storage) + nodeBootDeadline
+	return provisionDeadline(storage) + imagePrepareDeadline + nodeBootDeadline
 }
 
 // startedProvisionDeadline is createProvisionDeadline plus the Kubernetes
@@ -213,6 +306,7 @@ func (c cli) runUp(args []string) error {
 	// one pass's (#307).
 	signal := liveness{
 		verb:     "provisioning " + upSubject(cfg),
+		subject:  upSubject(cfg),
 		deadline: upProvisionDeadline(cfg),
 		quiet:    quiet,
 	}

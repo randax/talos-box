@@ -41,9 +41,15 @@ const (
 	// 40 * (1 / 5s) = 8 QPS. Do not undercut Cilium 1.19.6's 10/20 defaults.
 	ciliumClientQPS   = 10
 	ciliumClientBurst = 20
-	localPathVolume   = "/var/local-path-provisioner"
 	longhornVolume    = "/var/lib/longhorn"
 )
+
+// LocalPathVolume is the host path tbx's curated local-path CSI writes to and
+// the path the printed kubelet bind mount exposes. Upstream
+// local-path-provisioner ships a different default (/opt/local-path-provisioner),
+// so printed BYO guidance names the ConfigMap edit rather than silently
+// contradicting the mount (#409).
+const LocalPathVolume = "/var/local-path-provisioner"
 
 // ClusterASN is the BGP ASN for the cluster at the given subnet index.
 func ClusterASN(subnetIndex int) int { return clusterASNBase + subnetIndex }
@@ -285,9 +291,9 @@ type KubeletExtraMount struct {
 func StoragePrerequisiteKubeletExtraMounts() []KubeletExtraMount {
 	return []KubeletExtraMount{
 		{
-			Destination: localPathVolume,
+			Destination: LocalPathVolume,
 			Type:        "bind",
-			Source:      localPathVolume,
+			Source:      LocalPathVolume,
 			Options:     []string{"bind", "rshared", "rw"},
 		},
 		{

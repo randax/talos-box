@@ -57,3 +57,35 @@ The default ingress-VIP reachability mode in which the active cluster node annou
 ## BGP mode
 
 The optional ingress-VIP mode in which route advertisements integrate the cluster with routed networks. It supports ECMP and endpoint-local advertisement semantics.
+
+## Suspended
+
+The phase of a node whose VM is not running but whose guest memory is saved on disk, and of a cluster whose nodes are all in it. Suspended is a kind of stopped: nothing in the guest is executing. It is distinct from stopped because a resume can put the saved memory back rather than cold-booting, and that distinction only holds while whatever saved the memory is still able to restore it.
+
+## Balloon reserve
+
+The amount of host memory talosbox keeps out of the guests' hands. Guests are inflated — their memory handed back to the host — whenever free host memory falls below it, and a planned cluster whose memory exceeds what is left above it is what the overcommit warning is about.
+
+## Pre-balloon
+
+Memory reclaimed from the guests already running, before a new guest is admitted, so the new one starts against real free memory instead of pushing the host into swap. It is asked for at admission: a start that cannot be covered even after pre-ballooning is refused rather than attempted.
+
+## Balloon hold
+
+A claim on memory a pre-balloon just reclaimed, kept for as long as the guests it was taken for are still coming up. Without it the ordinary reconcile would hand that memory straight back to the guests it came from, re-creating the squeeze the pre-balloon was taken to prevent. A hold is released when the guests it covers are up, or when the operation that took it fails.
+
+## Convergence gate
+
+A named wait inside a provisioning pass that holds the pass until the cluster reaches one specific observed state. Every long stretch a provision can stall in is one of these, and a gate that can name itself is what makes a twenty-minute wait distinguishable from a hang.
+
+## Blocker
+
+What a convergence gate's last failed check observed — the reason the gate is still waiting. A blocker is a fact about right now, not a failure: it is only meaningful while it is fresh, and it goes away when the gate passes.
+
+## Settling
+
+The state of a cluster whose nodes are up but which still has things coming back on their own — an ingress VIP not yet announced, storage not yet proven live. A settling cluster needs no operator action, only time, which is why it reads apart from both converged and failed. Each thing still outstanding is a **converging** reason, and a single sample of `tbx status` can read green while they are in flight.
+
+## Inter-cluster path
+
+A route between two clusters on the same host — node to node, or node to the other cluster's ingress VIP — carried by the host rather than by either cluster. It is a first-class part of the multi-cluster contract, so it is checked in its own right and needs at least two running clusters to check.

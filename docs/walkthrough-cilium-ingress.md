@@ -143,4 +143,18 @@ the curated provisioning pipeline.
   guest reset, assume its unpacked EPHEMERAL snapshot is truncated. Re-pulling the image does
   not replace the pinned corrupt snapshot chain; destroy and recreate the affected node or
   cluster after relieving host pressure.
-- The default namespace's PodSecurity warning on the nginx deployment is harmless for a demo.
+- The default namespace's PodSecurity warning on the nginx deployment is harmless for a demo. Any
+  namespace without its own `pod-security.kubernetes.io/*` labels — `default` included — is
+  **enforced at `baseline`** and warned/audited at `restricted`, so `kubectl apply` prints a long
+  `Warning: would violate PodSecurity "restricted:latest"` block for a pod that is not
+  restricted-compliant. A violation of `restricted` alone is a warning, not a rejection: the
+  object is admitted (the nginx demo is this case). A pod that also violates `baseline` —
+  `hostNetwork`, `privileged`, host paths — is **rejected** in `default` with
+  `violates PodSecurity "baseline:latest"` and never created. For the warning, either make the pod
+  compliant (`runAsNonRoot: true`, `seccompProfile.type: RuntimeDefault`,
+  `allowPrivilegeEscalation: false`, `capabilities.drop: ["ALL"]`). For a workload that genuinely
+  needs privileges or `hostNetwork`, giving it its own labelled namespace is not cosmetic — it is
+  what makes the pod admissible at all: label that namespace the way
+  `tbx manifests <cluster> storage` prints for a BYO CSI namespace
+  (`pod-security.kubernetes.io/enforce=privileged` and the matching `audit`/`warn` labels).
+  Curated CNI/CSI namespaces carry those labels already.

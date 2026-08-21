@@ -13,6 +13,7 @@ import (
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/config"
 	"github.com/randax/talos-box/internal/daemon"
+	"github.com/randax/talos-box/internal/imagecache"
 )
 
 func TestLoadUpConfigFileAcceptsForce(t *testing.T) {
@@ -399,14 +400,15 @@ func TestRunUpRejectsOldDaemonWhenFileLevelExtensionsAreUsed(t *testing.T) {
 	}
 }
 
-// A create waits for its nodes to boot before the provisioning budget starts,
-// so the deadline the heartbeat states has to carry both halves — otherwise it
-// reports an elapsed time past its own stated deadline (#307).
-func TestCreateProvisionDeadlineIncludesTheNodeBootWait(t *testing.T) {
-	if got, want := createProvisionDeadline(false), daemon.CNIProvisionTimeout+daemon.NodeBootTimeout; got != want {
+// A create prepares the Talos image and waits for its nodes to boot before the
+// provisioning budget starts, so the deadline the heartbeat states has to carry
+// all three phases — otherwise it reports an elapsed time past its own stated
+// deadline, and the CLI's own bound aborts a healthy cold create (#307 #392).
+func TestCreateProvisionDeadlineIncludesTheImagePrepareAndNodeBootWaits(t *testing.T) {
+	if got, want := createProvisionDeadline(false), daemon.CNIProvisionTimeout+imagecache.PrepareAllowance+daemon.NodeBootTimeout; got != want {
 		t.Fatalf("createProvisionDeadline(false) = %v, want %v", got, want)
 	}
-	if got, want := createProvisionDeadline(true), daemon.StorageProvisionTimeout+daemon.NodeBootTimeout; got != want {
+	if got, want := createProvisionDeadline(true), daemon.StorageProvisionTimeout+imagecache.PrepareAllowance+daemon.NodeBootTimeout; got != want {
 		t.Fatalf("createProvisionDeadline(true) = %v, want %v", got, want)
 	}
 }

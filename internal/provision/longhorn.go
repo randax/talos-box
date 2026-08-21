@@ -36,9 +36,14 @@ const (
 	longhornNamespace          = "longhorn-system"
 	longhornStorageClass       = "longhorn"
 	longhornProvisioner        = "driver.longhorn.io"
+	longhornStaticStorageClass = "longhorn-static"
 	longhornManagerName        = "longhorn-manager"
 	longhornDriverDeployerName = "longhorn-driver-deployer"
 	longhornUIName             = "longhorn-ui"
+
+	longhornValidatingWebhookName   = "longhorn-webhook-validator"
+	longhornMutatingWebhookName     = "longhorn-webhook-mutator"
+	longhornAdmissionWebhookService = "longhorn-admission-webhook"
 )
 
 //go:embed assets/longhorn-1.12.0.tgz
@@ -408,7 +413,7 @@ func reconcileLonghornControlPlaneScheduling(ctx context.Context, client dynamic
 			continue
 		}
 		name := node.Name
-		if err := poll(ctx, interval, func(ctx context.Context) error {
+		if err := poll(ctx, GateLonghornScheduling, interval, func(ctx context.Context) error {
 			return setLonghornNodeScheduling(ctx, client, name, allowScheduling, nodeExpected)
 		}); err != nil {
 			return err
@@ -576,7 +581,7 @@ func partitionLonghornObjects(objects []unstructured.Unstructured) (namespaces, 
 }
 
 func waitForLonghorn(ctx context.Context, client kubernetes.Interface, interval time.Duration) error {
-	return poll(ctx, interval, func(ctx context.Context) error {
+	return poll(ctx, GateLonghorn, interval, func(ctx context.Context) error {
 		manager, err := client.AppsV1().DaemonSets(longhornNamespace).Get(ctx, longhornManagerName, metav1.GetOptions{})
 		if err != nil {
 			return err
@@ -594,4 +599,86 @@ func waitForLonghorn(ctx context.Context, client kubernetes.Interface, interval 
 		}
 		return nil
 	})
+}
+
+// longhornRuntimeObjects names the cluster-scoped objects longhorn-manager
+// installs for itself once it is running. The chart renders none of them, so a
+// teardown driven by the render alone leaves them behind — and the two
+// admission webhook configurations fail closed: with their Service gone they
+// reject every PVC bind in the cluster and hold the longhorn-system namespace
+// in Terminating for good (#386). longhorn-static is the second class the
+// driver deployer installs beside the rendered one and outlives the engine the
+// same way (#394), as does the CSIDriver the deployer registers for
+// driver.longhorn.io. They are rendered here as bare identities: teardown
+// needs only the name to delete and the kind to map.
+func longhornRuntimeObjects() []unstructured.Unstructured {
+	return []unstructured.Unstructured{
+		clusterScopedIdentity("admissionregistration.k8s.io/v1", "ValidatingWebhookConfiguration", longhornValidatingWebhookName),
+		clusterScopedIdentity("admissionregistration.k8s.io/v1", "MutatingWebhookConfiguration", longhornMutatingWebhookName),
+		clusterScopedIdentity("storage.k8s.io/v1", "StorageClass", longhornStaticStorageClass),
+		clusterScopedIdentity("storage.k8s.io/v1", "CSIDriver", longhornProvisioner),
+	}
+}
+
+func clusterScopedIdentity(apiVersion, kind, name string) unstructured.Unstructured {
+	return unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": apiVersion,
+		"kind":       kind,
+		"metadata":   map[string]any{"name": name},
+	}}
+}
+
+// longhornOwnedRuntimeObject recognizes a live cluster-scoped object as one
+// longhorn-manager created for itself. These carry neither the talosbox
+// managed label nor tbx's field manager — tbx never applied them — so without
+// a rule of their own the ownership guard refuses to remove them and the
+// switch away from Longhorn leaves the cluster deadlocked (#386, #394).
+//
+// The rule is fail-closed on identity rather than on the name alone: a webhook
+// configuration counts only while every webhook in it is served by Longhorn's
+// own admission Service, and longhorn-static only while it provisions through
+// Longhorn's driver. Anything else is a user's object under a familiar name,
+// and stays refused. The CSIDriver is the one exception to identity-over-name:
+// it carries no provisioner or endpoint field at all, so its name — which is
+// the driver name itself, driver.longhorn.io — is the whole identity there is.
+func longhornOwnedRuntimeObject(live *unstructured.Unstructured) bool {
+	switch live.GetKind() {
+	case "ValidatingWebhookConfiguration", "MutatingWebhookConfiguration":
+		if live.GetName() != longhornValidatingWebhookName && live.GetName() != longhornMutatingWebhookName {
+			return false
+		}
+		return longhornServesEveryWebhook(live)
+	case "StorageClass":
+		if live.GetName() != longhornStaticStorageClass {
+			return false
+		}
+		provisioner, _, err := unstructured.NestedString(live.Object, "provisioner")
+		return err == nil && provisioner == longhornProvisioner
+	case "CSIDriver":
+		return live.GetName() == longhornProvisioner
+	default:
+		return false
+	}
+}
+
+func longhornServesEveryWebhook(live *unstructured.Unstructured) bool {
+	webhooks, found, err := unstructured.NestedSlice(live.Object, "webhooks")
+	if err != nil || !found || len(webhooks) == 0 {
+		return false
+	}
+	for _, entry := range webhooks {
+		webhook, ok := entry.(map[string]any)
+		if !ok {
+			return false
+		}
+		name, _, err := unstructured.NestedString(webhook, "clientConfig", "service", "name")
+		if err != nil || name != longhornAdmissionWebhookService {
+			return false
+		}
+		namespace, _, err := unstructured.NestedString(webhook, "clientConfig", "service", "namespace")
+		if err != nil || namespace != longhornNamespace {
+			return false
+		}
+	}
+	return true
 }

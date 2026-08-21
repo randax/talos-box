@@ -25,6 +25,14 @@ const (
 	imageResponseHeaderTimeout = 30 * time.Second
 )
 
+// PrepareAllowance is how long a cold image prepare may reasonably take: the
+// Image Factory download (~100 MB), the decompression to a raw disk, and the
+// per-node disk clones that follow it. Nothing enforces it — the download is
+// bounded per-stall, not overall — but a caller stating an overall deadline for
+// a request that prepares an image has to cover the phase, so the allowance is
+// exported the way the daemon exports its provisioning budgets (#392).
+const PrepareAllowance = 10 * time.Minute
+
 var xzMagic = []byte{0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00}
 
 // Architecture identifies a Talos Image Factory machine architecture.
@@ -854,7 +862,7 @@ func cacheEntry(schematic, version string, architecture Architecture, path strin
 		Architecture:  architecture,
 		Path:          path,
 		Size:          info.Size(),
-		AllocatedSize: allocatedSize(info),
+		AllocatedSize: AllocatedSize(info),
 	}, true, nil
 }
 
@@ -937,7 +945,7 @@ func artifactStats(dir string, names []string) (int64, int64, bool, error) {
 		}
 		present = true
 		size += info.Size()
-		allocated += allocatedSize(info)
+		allocated += AllocatedSize(info)
 	}
 	return size, allocated, present, nil
 }

@@ -56,6 +56,17 @@ type ProvisionStart struct {
 	// ReserveMiB is the balloon controller's host-memory reserve: the headroom
 	// it tries to keep free once it can act at all.
 	ReserveMiB int
+	// ReclaimableMiB is how much host memory the balloon controller can take
+	// back from the guests already running — the sum of each balloonable
+	// guest's configured size above its per-node floor. It is the difference
+	// between a gate that can only refuse and one that can act: memory held by
+	// a *running* guest, unlike the allocation a booting guest is about to
+	// claim, can be given back on demand, and giving it back before the new
+	// guest boots is what turns a small shortfall into a start that is safe
+	// rather than one that needs --force (#398). Zero means nothing running can
+	// be shrunk, and the headroom rule is then the plain arithmetic it always
+	// was.
+	ReclaimableMiB int
 	// MemoryPressure is the kernel's own verdict on the host right now. It is
 	// what separates a swap file that is merely sticky from one the host is
 	// actively leaning on.
@@ -63,6 +74,23 @@ type ProvisionStart struct {
 	// Swap is the host swap file's capacity and free bytes. A zero TotalBytes
 	// means swap is disabled or unmeasurable, and the swap rule is skipped.
 	Swap Usage
+}
+
+// ProvisionStartPlan is the provision-start gate's verdict: what the caller must
+// do before the guests boot, and what it must refuse outright. Returning both in
+// one value is what keeps `up`, `cluster create`, `cluster start` and the node
+// verbs on one arithmetic — every one of them runs the same call and acts on the
+// same two fields (#398).
+type ProvisionStartPlan struct {
+	// Findings are the blocking and advisory conditions, as elsewhere in this
+	// package: callers refuse on SeverityBlock unless forced.
+	Findings []Finding
+	// ReclaimMiB is the host memory the caller must pre-balloon out of the
+	// already-running guests before starting the new ones. Zero means the host
+	// has the headroom as it stands. It is only ever set when the shortfall fits
+	// inside the reclaimable memory, so a caller that honours it never has to
+	// decide anything the gate did not already decide.
+	ReclaimMiB int
 }
 
 // AssessProvisionStart classifies whether it is safe to *start* the guests an
@@ -78,7 +106,12 @@ type ProvisionStart struct {
 //
 //   - Headroom: the binding constraint is measured free memory, not the
 //     configured ceiling. Starting NewVMMiB must leave at least the balloon
-//     reserve free.
+//     reserve free — after crediting whatever the balloon controller can take
+//     back from the guests already running (ReclaimableMiB). A shortfall inside
+//     that credit is not a refusal: the plan asks its caller to pre-balloon
+//     exactly the shortfall out of the running guests before the new one boots,
+//     which is the actionable path #398 asked for. Only a shortfall the running
+//     guests cannot cover blocks.
 //   - Swap: a host already deep into its swap file cannot absorb the
 //     allocation burst of a second bringup. "Deep" is two readings, not one:
 //     the file must be at least provisionStartSwapUsedPercent full *and* the
@@ -100,27 +133,33 @@ type ProvisionStart struct {
 // (#231, #284) and blocking on it would refuse healthy creates. Guests already
 // resident change both facts: free memory is genuinely spoken for, and a second
 // bringup's boot-time faults are what tip such a host into thrashing.
-func AssessProvisionStart(in ProvisionStart) []Finding {
+func AssessProvisionStart(in ProvisionStart) ProvisionStartPlan {
+	var plan ProvisionStartPlan
 	if in.RunningVMMiB <= 0 || in.NewVMMiB <= 0 {
-		return nil
+		return plan
 	}
-	var findings []Finding
 	if in.HostFreeMiB > 0 {
 		projectedFreeMiB := in.HostFreeMiB - in.NewVMMiB
-		if projectedFreeMiB < in.ReserveMiB {
-			findings = append(findings, Finding{
+		shortfallMiB := ProvisionStartShortfallMiB(in)
+		switch {
+		case shortfallMiB <= 0:
+			// the host has the headroom outright
+		case shortfallMiB <= in.ReclaimableMiB:
+			plan.ReclaimMiB = shortfallMiB
+		default:
+			plan.Findings = append(plan.Findings, Finding{
 				Severity: SeverityBlock,
 				Detail: fmt.Sprintf(
-					"starting %d MiB of guests while %d MiB of guests are already running leaves %d MiB free of the %d MiB measured now, below the %d MiB balloon reserve;"+
+					"starting %d MiB of guests while %d MiB of guests are already running leaves %d MiB free of the %d MiB measured now, below the %d MiB balloon reserve%s;"+
 						" a booting guest claims its full allocation before virtio_balloon can reclaim anything, so the host swaps and %s",
-					in.NewVMMiB, in.RunningVMMiB, projectedFreeMiB, in.HostFreeMiB, in.ReserveMiB, memoryConsequence,
+					in.NewVMMiB, in.RunningVMMiB, projectedFreeMiB, in.HostFreeMiB, in.ReserveMiB, reclaimShortfallClause(in), memoryConsequence,
 				),
 				Remedy: memoryRemedy,
 			})
 		}
 	}
 	if swapBlocksProvisionStart(in) {
-		findings = append(findings, Finding{
+		plan.Findings = append(plan.Findings, Finding{
 			Severity: SeverityBlock,
 			Detail: fmt.Sprintf(
 				"host swap is %d%% used (%.1f GiB of %.1f GiB, at or past the %d%% ceiling) with memory pressure %s and %d MiB of guests already running;"+
@@ -132,7 +171,31 @@ func AssessProvisionStart(in ProvisionStart) []Finding {
 			Remedy: memoryRemedy,
 		})
 	}
-	return findings
+	return plan
+}
+
+// ProvisionStartShortfallMiB is the headroom rule's shortfall before any
+// balloon credit: how far below the reserve starting NewVMMiB would leave the
+// host. Zero or less means the host has the headroom outright. It is exported
+// so a caller can decide whether measuring ReclaimableMiB is worth its cost —
+// that measurement probes every running guest — without duplicating the
+// arithmetic the gate itself applies.
+func ProvisionStartShortfallMiB(in ProvisionStart) int {
+	if in.RunningVMMiB <= 0 || in.NewVMMiB <= 0 || in.HostFreeMiB <= 0 {
+		return 0
+	}
+	return in.ReserveMiB - (in.HostFreeMiB - in.NewVMMiB)
+}
+
+// reclaimShortfallClause names the balloon credit inside a refusal that already
+// took it into account, so an operator reading the numbers can see that
+// pre-ballooning was tried and was not enough — otherwise the refusal looks
+// like the gate ignored the running guests it could have shrunk.
+func reclaimShortfallClause(in ProvisionStart) string {
+	if in.ReclaimableMiB <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(" even after pre-ballooning the %d MiB the running guests can give back", in.ReclaimableMiB)
 }
 
 // swapBlocksProvisionStart applies the swap rule's two-reading test: a swap

@@ -15,7 +15,17 @@ import (
 const (
 	// Version 2 added dns.syncDomains and the domain argument (with helper-side
 	// validation) on dns.listen/dns.register.
-	protocolVersion = 2
+	//
+	// Version 3 returns the speaker's injected routes from bgp.status (version 2
+	// answered with {active} alone) and mirrors speaker FIB writes into the frame
+	// router. A version 2 helper therefore reports no routes for a speaker that is
+	// announcing, and leaves the cross-cluster BGP-VIP path dead; refusing the
+	// handshake sends the operator to a reinstall instead of a wrong answer.
+	//
+	// Bumping this also means bumping the literal in nix/vm-test.nix: the NixOS
+	// smoke test's helper-probe performs this handshake against the packaged
+	// helper, and `nix flake check` fails on a mismatch.
+	protocolVersion = 3
 	helperInfoOp    = "helper.info"
 )
 

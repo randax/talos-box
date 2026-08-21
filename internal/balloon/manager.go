@@ -88,6 +88,16 @@ type Config struct {
 	ReserveMiB   int
 	FloorMiB     int
 	PollInterval time.Duration
+	// HoldMiB reports memory that has already been ballooned out of the running
+	// guests on purpose and must stay out — the pre-balloon the provision-start
+	// gate takes to make room for a guest that is booting (#398). It is a floor
+	// on the reconcile's deficit, not a debit against the host-free reading:
+	// the reclaim is *already* in that reading, so subtracting it just
+	// reproduces the pre-reclaim number and the manager hands every guest
+	// straight back to its configured size on the next poll — the concurrent
+	// bringup squeeze the pre-balloon exists to prevent. Nil means nothing is
+	// held.
+	HoldMiB func() int
 }
 
 // DefaultConfig is the G3-tuned default: 6 GiB host reserve, 1 GiB per-node
@@ -127,7 +137,29 @@ func RunWithLogger(cfg Config, vms func() map[string]Balloonable, stop <-chan st
 				m.log("balloon: read host memory: %v", err)
 				continue
 			}
+			if cfg.HoldMiB != nil {
+				free = holdAdjustedFreeMiB(free, cfg.ReserveMiB, cfg.HoldMiB())
+			}
 			m.Reconcile(vms(), free, cfg.ReserveMiB, cfg.FloorMiB)
 		}
 	}
+}
+
+// holdAdjustedFreeMiB is the host-free reading Reconcile must act on while a
+// pre-balloon is held: low enough that the reconcile's deficit
+// (reserve - free) is at least holdMiB, so the held reclaim stays out of the
+// guests until the hold expires. Debiting the hold from free instead cannot do
+// that: the reclaim is already in the measured reading, so free - hold is
+// algebraically the pre-reclaim reading, which on a host that was above the
+// reserve to begin with yields a deficit of zero and deflates every guest back
+// to configured while the admitted guest is still booting. Real pressure below
+// the cap still wins — the reading is only capped, never raised.
+func holdAdjustedFreeMiB(freeMiB, reserveMiB, holdMiB int) int {
+	if holdMiB <= 0 {
+		return freeMiB
+	}
+	if capped := reserveMiB - holdMiB; freeMiB > capped {
+		return capped
+	}
+	return freeMiB
 }

@@ -20,7 +20,8 @@ Never improvise recovery mid-charter: if a step fails, capture the evidence list
 
 Abort the run (report BLOCKED, not FAIL) if any of these don't hold:
 
-1. `tbx version` prints a version; record it. Record distro and QEMU version (`qemu-system-$(uname -m) --version`).
+1. `tbx version` prints its identity line; record it verbatim. A source build prints the commit it was built from, not a semver — e.g. `tbx aa4ba4f (linux/arm64, daemon protocol 13)` — so this line and the `git rev-parse HEAD` below can carry the same commit. That is expected, not friction. Record distro and QEMU version (`qemu-system-$(uname -m) --version`).
+   - **Record the host cache state too**, because C1's duration depends on it: `tbx cache list` (does a Talos disk image for the pinned version already exist?). Report it as `cold` (no matching disk image cached) or `warm` — a warm host skips the image download entirely, so a fast create is not evidence about first-run timing.
 2. `git -C <talos-box checkout> rev-parse HEAD` — record the commit if running from source.
 3. `test -r /dev/kvm -a -w /dev/kvm && echo kvm-ok` prints `kvm-ok`.
 4. `tbx doctor` exits 0. Expected on Linux: `helper-unit`, `helper-access`, `helper-capabilities`, `kvm`, `qemu`, `forwarding`, `bridge-netfilter`, `bridge-stp`, `rp-filter`, `port-53`/`port-67`/`port-179`, resolver checks, routes OK; `host-pressure: SKIP` is expected on Linux (not friction). Record any WARN as friction.
@@ -39,7 +40,7 @@ Steps:
 2. When it returns, `tbx status qa-smoke`
 
 Expected observations:
-- Create narrates stages and returns without error; first run may download the Talos image, and node disks are full raw copies (record actual duration — expect minutes, not seconds).
+- Create narrates stages and returns without error; first run may download the Talos image, and node disks are full raw copies (record actual duration **and the preflight cache state**). Minutes-not-seconds is the **cold**-cache expectation; on a **warm** host the image stage is a no-op and create can finish in seconds — a valid smoke run, but record it as `warm` so its timing is not compared against a cold one. A run that must exercise cold timing starts from `tbx cache prune --all` on an expendable cache.
 - Status lists `qa-smoke-cp-1`, `qa-smoke-worker-1`, `qa-smoke-worker-2`, each phase `maintenance`, each with an IP in one `172.30.<n>.0/24`.
 - A `br-tbx<n>` bridge exists (`ip link show | grep br-tbx`).
 - Status prints copy-pasteable next-step hints mentioning `talosctl --insecure`.
@@ -100,9 +101,9 @@ Steps:
 3. `ls ~/.talosbox/clusters/` — no `qa-smoke` directory.
 4. `ip link show | grep br-tbx` — the cluster's bridge is gone (no orphaned `br-tbx<n>` for this cluster).
 
-Expected observations: destroy prints a data-loss warning path (`--force` supplied — record what it printed); no `qa-smoke` remnants in status, on disk, or in host networking; `resolvectl domain` no longer lists the cluster's domain (when resolved is present).
+Expected observations: destroy prints a data-loss warning path (`--force` supplied — record what it printed); no `qa-smoke` remnants in status, on disk, or in host networking; `resolvectl domain` no longer lists the cluster's domain (when resolved is present) — the resolved registration is per-cluster and goes with the bridge; Linux has no install-scoped `/etc/resolver` file to check (that is the macOS equivalent, and there it is expected to persist).
 
-Pass criteria: no residue; no orphaned bridge or resolved registration.
+Pass criteria: no per-cluster residue; no orphaned bridge or resolved registration.
 
 On failure: list what was left behind, exactly.
 
@@ -111,8 +112,9 @@ On failure: list what was left behind, exactly.
 ```markdown
 ## QA smoke linux — <date>
 
-- tbx version / commit:
+- `tbx version` line (verbatim) / `git rev-parse HEAD`:
 - Distro, kernel, QEMU version, arch:
+- Cache state at preflight: cold | warm (`tbx cache list` evidence)
 - Preflight: OK | BLOCKED (<why>)
 
 | Charter | Verdict | Duration | Notes |

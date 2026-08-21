@@ -18,6 +18,13 @@ You are running QA, not demos. For every charter: run the steps exactly, compare
 
 BLOCKED unless: `tbx version` recorded; `tbx doctor` exits 0; no cluster `qa-sto`; ≥ 10 GiB free RAM and ≥ 30 GiB free disk; online.
 
+## Known transients (not findings)
+
+A `volumes.longhorn.io` object with no PVC or PV behind it, in `deleting` or `degraded`, is
+expected briefly after a probe pass, after deleting a PVC, and after a snapshot restart.
+Longhorn converges it away within about a minute. Record it as friction only if it is still
+there after several minutes — that is a leak, and a finding.
+
 ## Charters
 
 ### C1 — Longhorn end state: PVC write/readback
@@ -28,7 +35,42 @@ Steps:
 1. `tbx cluster create qa-sto --cni cilium --csi longhorn`
 2. Follow `tbx status qa-sto` to the storage-ready end state; export credentials.
 3. `kubectl get sc` — record which class is default.
-4. Create a 1Gi PVC + writer pod (write a known string to the volume), then a reader pod on a different node reading it back.
+4. Create a 1Gi PVC + writer pod (write a known string to the volume), then a reader pod on a different node reading it back. Use the PSA-compliant pod spec below so the apply is quiet.
+
+<a id="psa-compliant-test-pod"></a>
+**PSA-compliant test pod (canonical snippet — other runbooks link here).** Namespaces without their own `pod-security.kubernetes.io/*` labels — `default` included — are warned and audited at `restricted`, so any pod that is not restricted-compliant makes `kubectl apply` print a long `Warning: would violate PodSecurity "restricted:latest"` block. That block is a warning, not a rejection, and it is not a finding — but it is avoidable noise in every report, so keep test pods compliant:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: qa-writer
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    fsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: writer
+      image: docker.io/library/busybox:1.36
+      command: ["sh", "-c", "echo qa-data > /data/marker && sleep 3600"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: qa-pvc
+```
+
+A workload that genuinely needs `hostNetwork` or privileges (a hand-installed CNI, a BYO CSI) cannot be made compliant: label its own namespace instead, exactly as the `tbx manifests <cluster> storage` PSA guidance prints for a CSI namespace (`kubectl label namespace <ns> pod-security.kubernetes.io/enforce=privileged pod-security.kubernetes.io/audit=privileged pod-security.kubernetes.io/warn=privileged --overwrite`). Record the warning block only if it accompanies an actual rejection.
 
 Expected observations: Longhorn pods Running; the curated StorageClass is the cluster default; PVC binds; readback matches the written string; replicas = worker count (a defaults 3-node cluster has 2 workers, so `numberOfReplicas=2` — the workers are the only schedulable storage nodes) — check `kubectl -n longhorn-system get volumes.longhorn.io -o yaml` for the replica number and record it.
 

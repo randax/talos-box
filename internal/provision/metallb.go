@@ -64,9 +64,13 @@ type MetalLBReconciler struct {
 	HTTPClient   *http.Client
 }
 
-// LiveVIP returns the durable tbx probe VIP only after both Kubernetes has
-// assigned it and the host can receive a successful response through the
-// selected CNI's announcement path.
+// LiveVIP reports the durable tbx probe VIP and whether it is answering, as
+// two independent values. The string is the announced VIP: empty until
+// Kubernetes has assigned the expected 172.30.<subnet>.200 to the probe
+// LoadBalancer service, non-empty from that point on. The bool is true only
+// when the host also received a 200 back through the selected CNI's
+// announcement path, so a non-empty VIP with a false bool means "announced but
+// not yet answering" rather than "no VIP" (#427).
 func LiveVIP(ctx context.Context, item cluster.Cluster, kubeconfig []byte) (string, bool) {
 	if (item.CNI != cluster.CNIFlannel && item.CNI != cluster.CNICilium) || !item.LB {
 		return "", false
@@ -87,17 +91,22 @@ func LiveVIP(ctx context.Context, item cluster.Cluster, kubeconfig []byte) (stri
 	if vip != fmt.Sprintf("172.30.%d.200", item.SubnetIndex) {
 		return "", false
 	}
+	// From here the VIP is announced: the LoadBalancer service holds it. The
+	// probe below decides whether it is also live, and the address is reported
+	// either way — collapsing "announced but not answering" into "no VIP at
+	// all" is what left the ~10-20s window after a snapshot restore with
+	// nothing honest for a single-sample check to key on (#427).
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+vip+"/", nil)
 	if err != nil {
-		return "", false
+		return vip, false
 	}
 	response, err := vipHTTPClient(nil).Do(request)
 	if err != nil {
-		return "", false
+		return vip, false
 	}
 	respondedOK := response.StatusCode == http.StatusOK
 	if err := response.Body.Close(); err != nil {
-		return "", false
+		return vip, false
 	}
 	return vip, respondedOK
 }
@@ -385,7 +394,7 @@ func waitForCRDs(ctx context.Context, client dynamic.Interface, mapper *restmapp
 	if err != nil {
 		return fmt.Errorf("map %s CRDs: %w", component, err)
 	}
-	return poll(ctx, interval, func(ctx context.Context) error {
+	return poll(ctx, GateChartCRDs, interval, func(ctx context.Context) error {
 		for _, crd := range crds {
 			live, err := client.Resource(mapping.Resource).Get(ctx, crd.GetName(), metav1.GetOptions{})
 			if err != nil {
@@ -414,7 +423,7 @@ func conditionTrue(conditions []any, name string) bool {
 }
 
 func waitForMetalLB(ctx context.Context, client kubernetes.Interface, interval time.Duration) error {
-	return poll(ctx, interval, func(ctx context.Context) error {
+	return poll(ctx, GateMetalLB, interval, func(ctx context.Context) error {
 		controller, err := client.AppsV1().Deployments(metalLBNamespace).Get(ctx, "metallb-controller", metav1.GetOptions{})
 		if err != nil {
 			return err
@@ -436,7 +445,7 @@ func waitForMetalLB(ctx context.Context, client kubernetes.Interface, interval t
 
 func waitForProbe(ctx context.Context, client kubernetes.Interface, item cluster.Cluster, interval time.Duration, httpClient *http.Client) (string, error) {
 	var vip string
-	err := poll(ctx, interval, func(ctx context.Context) error {
+	err := poll(ctx, GateLoadBalancerVIP, interval, func(ctx context.Context) error {
 		service, err := client.CoreV1().Services(probeNamespace).Get(ctx, "lb-probe", metav1.GetOptions{})
 		if err != nil {
 			return err
@@ -525,7 +534,11 @@ func defaultProxylessTransport() *http.Transport {
 	return cloned
 }
 
-func poll(ctx context.Context, interval time.Duration, check func(context.Context) error) error {
+// poll drives one named convergence gate until its check passes. gate says what
+// the wait is for, and every failed check is handed to the context's gate
+// observer, so a pass that stalls here can say what it is blocked on instead of
+// going silent for the whole budget (#390).
+func poll(ctx context.Context, gate Gate, interval time.Duration, check func(context.Context) error) error {
 	var lastErr error
 	for {
 		if err := check(ctx); err == nil {
@@ -536,6 +549,7 @@ func poll(ctx context.Context, interval time.Duration, check func(context.Contex
 				return terminal.err
 			}
 			lastErr = err
+			reportGate(ctx, gate, err)
 		}
 		if err := wait(ctx, interval); err != nil {
 			if lastErr == nil {

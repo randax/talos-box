@@ -45,11 +45,13 @@ func (c cli) runCacheWarm(args []string) error {
 	if len(refs) == 0 {
 		return errors.New("cache warm list is empty")
 	}
-	// A deep check is the pre-venue verification, so it also answers for the
-	// images no warm list can name: nothing tbx renders references the CRI pod
-	// sandbox image, yet no pod starts without it. Adding it here means the
-	// gap is reported while it can still be pulled.
-	if *checkOnly && *deep {
+	// Every check is an offline-readiness verification, so it also answers for
+	// the images no warm list can name: nothing tbx renders references the CRI
+	// pod sandbox image, yet no pod starts without it. Adding it in both modes
+	// means the gap is reported while it can still be pulled, whether or not
+	// --deep was asked for (#404). --deep still adds what a plain --check does
+	// not do: rehashing cached blobs to catch on-disk corruption.
+	if *checkOnly {
 		refs = withBootstrapRequiredRefs(refs)
 	}
 	if err := c.ensureCacheWarmSupport(); err != nil {
@@ -57,10 +59,8 @@ func (c cli) runCacheWarm(args []string) error {
 	}
 	if *checkOnly {
 		bootstrapRequired := make(map[string]bool)
-		if *deep {
-			for _, ref := range provision.BootstrapRequiredImages() {
-				bootstrapRequired[ref] = true
-			}
+		for _, ref := range provision.BootstrapRequiredImages() {
+			bootstrapRequired[ref] = true
 		}
 		var complete, failed int
 		for _, ref := range refs {
@@ -104,7 +104,7 @@ func (c cli) runCacheWarm(args []string) error {
 		}
 		return nil
 	}
-	var warmed, alreadyComplete, failed int
+	var warmed, alreadyComplete, failed, reResolved int
 	for _, ref := range refs {
 		var result daemon.CacheWarmResult
 		if err := c.call("cache.warm", daemon.CacheWarmArgs{Refs: []string{ref}}, &result); err != nil {
@@ -113,6 +113,9 @@ func (c cli) runCacheWarm(args []string) error {
 		entry, err := cacheWarmEntryForRef(ref, result)
 		if err != nil {
 			return err
+		}
+		if entry.ReResolvedTag {
+			reResolved++
 		}
 		switch entry.Status {
 		case daemon.CacheWarmStatusWarmed:
@@ -134,6 +137,20 @@ func (c cli) runCacheWarm(args []string) error {
 	}
 	if _, err := fmt.Fprintf(c.out, "summary: %d warmed, %d already complete, %d failed\n", warmed, alreadyComplete, failed); err != nil {
 		return err
+	}
+	// A tag is resolved upstream on every run, so a re-warm of a complete list
+	// costs a full run's wall time while downloading nothing. Saying so keeps
+	// the cost explainable and points at the gate that is actually cheap (#405).
+	if reResolved > 0 {
+		downloads := fmt.Sprintf("%d ref(s) needed downloads", warmed)
+		if warmed == 0 {
+			downloads = "nothing was downloaded"
+		}
+		if _, err := fmt.Fprintf(c.out,
+			"note: re-resolved %d tag(s) upstream for freshness; %s. For a cheap offline-readiness gate run `tbx cache warm --check` instead\n",
+			reResolved, downloads); err != nil {
+			return err
+		}
 	}
 	if failed > 0 {
 		return fmt.Errorf("cache warm failed for %d ref(s)", failed)

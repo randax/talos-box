@@ -20,6 +20,8 @@ import (
 
 func intPointer(value int) *int { return &value }
 
+func volumeList(names ...string) *[]string { return &names }
+
 func TestCreateFromSpecWithoutCNIUsesLegacyProvisioningFields(t *testing.T) {
 	spec := config.ClusterSpec{Name: "demo"}
 	args := createArgsFromSpec(spec, false)
@@ -153,30 +155,74 @@ func TestReconcileProvisioningIntentMutationRules(t *testing.T) {
 	}
 }
 
+// At one volume a count is enough; at twenty it leaves the operator to go and
+// find the volumes themselves. The refusal names them, caps the list, and
+// inflects like the destroy warning beside it (#393).
+func TestStorageVolumesBlockChangeNamesTheBlockingVolumes(t *testing.T) {
+	item := cluster.Cluster{Name: "qa-sto", ProvisioningIntent: cluster.ProvisioningIntent{CSI: cluster.CSILonghorn}}
+	tests := []struct {
+		name    string
+		volumes []string
+		want    string
+		absent  string
+	}{
+		{
+			name:    "one volume reads singular",
+			volumes: []string{"default/data"},
+			want:    `cluster "qa-sto": cannot change csi from "longhorn" while it has 1 provisioned volume (default/data)`,
+		},
+		{
+			name:    "several volumes read plural",
+			volumes: []string{"app/data", "app/logs"},
+			want:    "2 provisioned volumes (app/data, app/logs)",
+		},
+		{
+			name:    "a long list is capped",
+			volumes: []string{"a/1", "a/2", "a/3", "a/4", "a/5", "a/6", "a/7"},
+			want:    "7 provisioned volumes (a/1, a/2, a/3, a/4, a/5, and 2 more)",
+			absent:  "a/6",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := storageVolumesBlockChange(item, test.volumes)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("storageVolumesBlockChange() = %v, want %q", err, test.want)
+			}
+			if test.absent != "" && strings.Contains(err.Error(), test.absent) {
+				t.Fatalf("storageVolumesBlockChange() = %v, want %q left out of the capped list", err, test.absent)
+			}
+			if !strings.Contains(err.Error(), "tbx cluster destroy qa-sto") {
+				t.Fatalf("storageVolumesBlockChange() = %v, want the destroy hint", err)
+			}
+		})
+	}
+}
+
 func TestReconcileProvisioningIntentStorageLifecycleRules(t *testing.T) {
 	item := cluster.Cluster{Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel}}
 	tests := []struct {
 		name    string
 		current cluster.CSI
 		desired cluster.CSI
-		count   *int
+		volumes *[]string
 		changed bool
 		want    cluster.CSI
 		errText []string
 	}{
 		{name: "add later", desired: cluster.CSILocalPath, changed: true, want: cluster.CSILocalPath},
 		{name: "same engine no-op", current: cluster.CSILonghorn, desired: cluster.CSILonghorn, want: cluster.CSILonghorn},
-		{name: "switch after zero volumes", current: cluster.CSILocalPath, desired: cluster.CSILonghorn, count: intPointer(0), changed: true, want: cluster.CSILonghorn},
-		{name: "remove after zero volumes", current: cluster.CSILonghorn, count: intPointer(0), changed: true},
+		{name: "switch after zero volumes", current: cluster.CSILocalPath, desired: cluster.CSILonghorn, volumes: volumeList(), changed: true, want: cluster.CSILonghorn},
+		{name: "remove after zero volumes", current: cluster.CSILonghorn, volumes: volumeList(), changed: true},
 		{name: "switch requires observation", current: cluster.CSILocalPath, desired: cluster.CSILonghorn, errText: []string{"volume count is verified"}},
-		{name: "volumes block switch", current: cluster.CSILocalPath, desired: cluster.CSILonghorn, count: intPointer(2), errText: []string{"delete the volumes first", "tbx cluster destroy demo"}},
+		{name: "volumes block switch", current: cluster.CSILocalPath, desired: cluster.CSILonghorn, volumes: volumeList("app/data", "app/logs"), errText: []string{"2 provisioned volumes (app/data, app/logs)", "delete the volumes first", "tbx cluster destroy demo"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			item.CSI = test.current
 			desired := config.ClusterSpec{Name: item.Name, ProvisioningIntent: item.ProvisioningIntent}
 			desired.CSI = test.desired
-			got, changed, err := reconcileProvisioningIntentWithVolumes(item, desired, false, test.count)
+			got, changed, err := reconcileProvisioningIntentWithVolumes(item, desired, false, test.volumes)
 			if len(test.errText) > 0 {
 				if err == nil {
 					t.Fatal("expected storage lifecycle error")
@@ -210,7 +256,7 @@ func TestStorageTeardownFailureLeavesOldIntentForConvergentRetry(t *testing.T) {
 	}
 	deleteCalls := 0
 	service := &Server{
-		destroyVolumeCount:    func(context.Context, cluster.Cluster) (int, error) { return 0, nil },
+		storageVolumeClaims:   func(context.Context, cluster.Cluster) ([]string, error) { return nil, nil },
 		storageEngineValidate: func(context.Context, cluster.Cluster) error { return nil },
 		storageEngineDelete: func(context.Context, cluster.Cluster) error {
 			deleteCalls++
@@ -224,7 +270,7 @@ func TestStorageTeardownFailureLeavesOldIntentForConvergentRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	observations := map[string]storageObservation{item.Name: {engine: item.CSI, count: 0, running: map[string]bool{item.Nodes[0].Name: false}}}
+	observations := map[string]storageObservation{item.Name: {engine: item.CSI, running: map[string]bool{item.Nodes[0].Name: false}}}
 	if err := service.deleteUpStorageTransitions(raw, observations); err == nil {
 		t.Fatal("expected interrupted teardown")
 	}
@@ -272,7 +318,7 @@ func TestUpAddsAndSwitchesCSIWithoutChangingMachineConfig(t *testing.T) {
 			deletes := 0
 			service := &Server{
 				vms:                   map[string]map[string]hypervisor.Machine{item.Name: {item.Nodes[0].Name: &fakeMachine{active: true}}},
-				destroyVolumeCount:    func(context.Context, cluster.Cluster) (int, error) { return 0, nil },
+				storageVolumeClaims:   func(context.Context, cluster.Cluster) ([]string, error) { return nil, nil },
 				storageEngineValidate: func(context.Context, cluster.Cluster) error { return nil },
 				storageEngineDelete: func(_ context.Context, old cluster.Cluster) error {
 					deletes++
@@ -330,11 +376,11 @@ func TestStorageTransitionsValidateEveryClusterBeforeAnyDelete(t *testing.T) {
 			t.Fatal(err)
 		}
 		specs = append(specs, config.ClusterSpec{Name: name, ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILonghorn}})
-		observations[name] = storageObservation{engine: cluster.CSILocalPath, count: 0, running: map[string]bool{item.Nodes[0].Name: false}}
+		observations[name] = storageObservation{engine: cluster.CSILocalPath, running: map[string]bool{item.Nodes[0].Name: false}}
 	}
 	deletes := 0
 	service := &Server{
-		destroyVolumeCount: func(context.Context, cluster.Cluster) (int, error) { return 0, nil },
+		storageVolumeClaims: func(context.Context, cluster.Cluster) ([]string, error) { return nil, nil },
 		storageEngineValidate: func(_ context.Context, item cluster.Cluster) error {
 			if item.Name == "second" {
 				return errors.New("unmanaged storage collision")

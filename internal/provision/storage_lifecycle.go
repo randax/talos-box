@@ -53,6 +53,43 @@ func countProvisionedStorageVolumes(ctx context.Context, client kubernetes.Inter
 	return len(persistentVolumes), nil
 }
 
+// ProvisionedStorageVolumeClaims names the claims behind the engine's
+// PersistentVolumes as "namespace/name", sorted, so a refusal can say which
+// volumes block it instead of only how many (#393). A volume whose claim
+// reference is gone is named by the PersistentVolume itself — the operator
+// still has to go and look at something.
+func ProvisionedStorageVolumeClaims(ctx context.Context, kubeconfig []byte, engine cluster.CSI) ([]string, error) {
+	config, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
+	if err != nil {
+		return nil, fmt.Errorf("parse kubeconfig for storage volume inspection: %w", err)
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("create Kubernetes client for storage volume inspection: %w", err)
+	}
+	return provisionedStorageVolumeClaims(ctx, clientset, engine)
+}
+
+func provisionedStorageVolumeClaims(ctx context.Context, client kubernetes.Interface, engine cluster.CSI) ([]string, error) {
+	persistentVolumes, err := enginePersistentVolumes(ctx, client, engine)
+	if err != nil {
+		return nil, err
+	}
+	claims := make([]string, 0, len(persistentVolumes))
+	for _, persistentVolume := range persistentVolumes {
+		claims = append(claims, storageVolumeClaimName(persistentVolume))
+	}
+	slices.Sort(claims)
+	return claims, nil
+}
+
+func storageVolumeClaimName(persistentVolume *corev1.PersistentVolume) string {
+	if claim := persistentVolume.Spec.ClaimRef; claim != nil && claim.Name != "" {
+		return claim.Namespace + "/" + claim.Name
+	}
+	return persistentVolume.Name
+}
+
 // DeleteStorageEngineObjects removes the rendered Kubernetes objects for the
 // requested curated storage engine only when the live objects are talosbox-
 // owned. PersistentVolumes and PersistentVolumeClaims are never deleted.
@@ -191,7 +228,7 @@ func replaceDriftedStorageClass(ctx context.Context, client dynamic.Interface, m
 			return fmt.Errorf("replace StorageClass %q: %w", object.GetName(), err)
 		}
 		name := object.GetName()
-		if err := poll(ctx, interval, func(ctx context.Context) error {
+		if err := poll(ctx, GateStorageClass, interval, func(ctx context.Context) error {
 			_, err := client.Resource(mapping.Resource).Get(ctx, name, metav1.GetOptions{})
 			if apierrors.IsNotFound(err) {
 				return nil
@@ -228,10 +265,17 @@ func storageObjectsForEngine(engine cluster.CSI) ([]unstructured.Unstructured, e
 	case cluster.CSILocalPath:
 		return renderLocalPath(cluster.Cluster{ProvisioningIntent: cluster.ProvisioningIntent{CSI: cluster.CSILocalPath}})
 	case cluster.CSILonghorn:
-		return renderLonghorn(cluster.Cluster{
+		objects, err := renderLonghorn(cluster.Cluster{
 			ProvisioningIntent: cluster.ProvisioningIntent{CSI: cluster.CSILonghorn},
 			Nodes:              make([]cluster.Node, 3),
 		})
+		if err != nil {
+			return nil, err
+		}
+		// The render is what tbx applied; the runtime objects are what
+		// longhorn-manager added to it. Both have to go, or the engine
+		// outlives the switch away from it (#386, #394).
+		return append(objects, longhornRuntimeObjects()...), nil
 	default:
 		return nil, fmt.Errorf("unsupported storage engine %q", engine)
 	}
@@ -263,7 +307,7 @@ func storageObjectOwnedByTalosbox(live, rendered *unstructured.Unstructured) boo
 			return true
 		}
 	}
-	return storageEngineOwnedStorageClass(live, rendered)
+	return storageEngineOwnedStorageClass(live, rendered) || longhornOwnedRuntimeObject(live)
 }
 
 // storageEngineOwnedStorageClass recognizes a StorageClass the curated engine
@@ -312,19 +356,64 @@ func storageEngineOwnedStorageClass(live, rendered *unstructured.Unstructured) b
 	return maps.Equal(liveParameters, renderedParameters)
 }
 
+// storageDeletionOrder tears an engine down in three moves, then the
+// namespace. Everything keeps its reverse install order within a move.
+//
+//  1. The controllers, so nothing is left running that re-creates what the
+//     next move deletes: longhorn-driver-deployer rewrites the StorageClass
+//     from its ConfigMap (#338), and longhorn-manager installs its own
+//     admission webhook configurations.
+//  2. What the engine reaches the whole cluster with — the admission webhook
+//     configurations, the StorageClasses, and the CSIDriver registration. A Longhorn webhook outliving its
+//     Service fails closed: it rejects every PVC bind in the cluster,
+//     including the storage probe's, and holds the longhorn-system namespace
+//     in Terminating for good (#386). A StorageClass outliving its engine
+//     advertises a provisioner nothing serves, as does a CSIDriver outliving
+//     its deployer (#394). All therefore go before the Service and the
+//     namespace that back them.
+//  3. Everything else — Services, RBAC, config, CRDs.
 func storageDeletionOrder(objects []unstructured.Unstructured) []unstructured.Unstructured {
+	controllers := make([]unstructured.Unstructured, 0, len(objects))
+	clusterWide := make([]unstructured.Unstructured, 0, len(objects))
 	namespaces := make([]unstructured.Unstructured, 0, len(objects))
 	others := make([]unstructured.Unstructured, 0, len(objects))
 	for _, object := range objects {
-		if object.GetKind() == "Namespace" {
+		switch {
+		case object.GetKind() == "Namespace":
 			namespaces = append(namespaces, object)
-			continue
+		case storageObjectRunsWorkload(object):
+			controllers = append(controllers, object)
+		case storageObjectReachesWholeCluster(object):
+			clusterWide = append(clusterWide, object)
+		default:
+			others = append(others, object)
 		}
-		others = append(others, object)
 	}
+	slices.Reverse(controllers)
+	slices.Reverse(clusterWide)
 	slices.Reverse(others)
 	slices.Reverse(namespaces)
-	return append(others, namespaces...)
+	ordered := append(controllers, clusterWide...)
+	ordered = append(ordered, others...)
+	return append(ordered, namespaces...)
+}
+
+func storageObjectRunsWorkload(object unstructured.Unstructured) bool {
+	switch object.GetKind() {
+	case "Deployment", "DaemonSet", "StatefulSet", "ReplicaSet", "Job", "CronJob", "Pod":
+		return true
+	default:
+		return false
+	}
+}
+
+func storageObjectReachesWholeCluster(object unstructured.Unstructured) bool {
+	switch object.GetKind() {
+	case "ValidatingWebhookConfiguration", "MutatingWebhookConfiguration", "StorageClass", "CSIDriver":
+		return true
+	default:
+		return false
+	}
 }
 
 func storageLifecycleSkipDelete(object unstructured.Unstructured) bool {

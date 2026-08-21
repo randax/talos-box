@@ -24,11 +24,12 @@ Never improvise recovery mid-charter: if a step fails, capture the evidence list
 
 Abort the run (report BLOCKED, not FAIL) if any of these don't hold:
 
-1. `tbx version` prints a version; record it.
+1. `tbx version` prints its identity line; record it verbatim. A source build prints the commit it was built from, not a semver — e.g. `tbx aa4ba4f (darwin/arm64, daemon protocol 13)` — so this line and step 2 can carry the same commit. That is expected, not friction.
 2. `git -C <talos-box checkout> rev-parse HEAD` — record the commit if running from source.
 3. `tbx doctor` exits 0. Expected: `helper`, `resolver` and `forwarding` PASS, `DNS` PASS or SKIP (see below), and `host-pressure` present — see the macOS check table in [docs/macos.md](../macos.md) for the full list. Record any WARN lines as friction.
    - Known BLOCKED cause — **helper protocol mismatch**: the LaunchDaemon plist (`/Library/LaunchDaemons/dev.talosbox.helper.plist`) pins the helper at an absolute path, so a moved/renamed checkout leaves an old helper running. Fix: `sudo <checkout>/bin/tbx system install` (full path — tbx may not be on PATH), then rerun doctor.
    - The `DNS` check is honest either way and never blocks the run: it `PASS`es when tbxd is already up, and `SKIP`s — never `FAIL`s — when the daemon isn't running, alongside the other daemon-dependent checks. Doctor exits 0 in both cases. On a fresh host `SKIP DNS` is the expected first-run reading, not friction: only a daemon-backed verb (`tbx status`, `tbx cluster list`, `tbx up`, …) starts the on-demand daemon, and neither of the earlier steps is one — `tbx version` is purely local, and `tbx doctor` deliberately refuses to spawn a daemon so diagnostics never change the state they report. Rerun `tbx doctor` after C1 and the check should `PASS`. A `FAIL` here means the daemon IS up and its embedded resolver is genuinely unreachable: real friction, record it.
+   - **Record the host cache state after doctor has run**, because C1's timing bar depends on it: the `image-cache` / `mirror-health` lines doctor just printed, plus `tbx cache list` (does a Talos disk image for the pinned version already exist?). Report it as `cold` (no matching disk image cached) or `warm` (image already cached) — a warm host skips the image download entirely and can finish C1 in seconds. Run this after doctor, not before: `tbx cache list` is a daemon-backed verb and starts tbxd, so running it first turns the expected first-run `SKIP DNS` into `PASS`.
 4. `tbx status` shows no cluster named `qa-smoke` (destroy leftovers first: `tbx cluster destroy qa-smoke --force`).
 5. Host has ≥ 8 GiB free RAM (`memory_pressure`: use the system-wide free percentage — macOS swap-used numbers stay high after pressure clears) — the default cluster wants 6 GiB.
 6. Host volume holding `~/.talosbox` has ≥ 25 GiB free (`df -h ~`) — node disks are 20 GB sparse and doctor warns that low storage can corrupt guest writes.
@@ -47,7 +48,7 @@ Steps:
 2. When it returns, `tbx status qa-smoke`
 
 Expected observations:
-- Create narrates stages and returns without error in < 5 min (record actual duration).
+- Create narrates stages and returns without error in < 5 min (record actual duration **and the preflight cache state**). The 5 min bar assumes a **cold** host — no cached Talos disk image for the pinned version, so `preparing the Talos <version> image` really downloads and unpacks it. On a **warm** host the stage is a no-op and create routinely finishes in seconds; that is a valid smoke run, but it says nothing about first-run timing, so record it as `warm` and do not read the fast time as evidence the bar holds. A run that must exercise the bar starts from `tbx cache prune --all` on an expendable cache (or an otherwise image-free host).
 - Status lists `qa-smoke-cp-1`, `qa-smoke-worker-1`, `qa-smoke-worker-2`, each phase `maintenance`, each with an IP in one `/24`.
 - Status prints copy-pasteable next-step hints mentioning `talosctl --insecure` (guided output contract).
 
@@ -106,9 +107,9 @@ Steps:
 2. `tbx status` — cluster gone.
 3. `ls ~/.talosbox/clusters/` — no `qa-smoke` directory.
 
-Expected observations: destroy warns about permanence (or proceeds silently under `--force` — record which); no `qa-smoke` remnants in status or on disk; `/etc/resolver/k8s.test` still present (shared default-domain file must survive).
+Expected observations: destroy warns about permanence (or proceeds silently under `--force` — record which); no per-cluster `qa-smoke` remnants in status or on disk; `/etc/resolver/k8s.test` still present — that file is install-scoped (written by `tbx system install`, required by `tbx doctor`'s `resolver` check), so it must survive every destroy and is never residue.
 
-Pass criteria: no residue; shared resolver file intact.
+Pass criteria: no per-cluster residue; the install-scoped resolver file intact.
 
 On failure: list what was left behind, exactly.
 
@@ -117,8 +118,9 @@ On failure: list what was left behind, exactly.
 ```markdown
 ## QA smoke macOS — <date>
 
-- tbx version / commit:
+- `tbx version` line (verbatim) / `git rev-parse HEAD`:
 - macOS version, hardware:
+- Cache state at preflight: cold | warm (`tbx cache list` evidence)
 - Preflight: OK | BLOCKED (<why>)
 
 | Charter | Verdict | Duration | Notes |

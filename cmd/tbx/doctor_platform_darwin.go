@@ -13,6 +13,12 @@ import (
 // doctorBGPPort is the port the host BGP speaker binds on each cluster gateway.
 const doctorBGPPort = 179
 
+// platformDoctorCheckNames names the macOS-only checks, so `tbx doctor --help`
+// lists exactly what this platform reports (#419).
+func platformDoctorCheckNames() []string {
+	return []string{fmt.Sprintf("port-%d", doctorBGPPort)}
+}
+
 func platformDoctorDependencies(deps *doctorDependencies) {
 	if deps == nil {
 		return

@@ -16,9 +16,13 @@ import (
 )
 
 // DestroyInspection is the best-effort storage data-loss warning surfaced
-// before a forced cluster destroy.
+// before a forced cluster destroy. Volumes and CSI carry the same finding in
+// countable form, so the destroy's own summary can account for the volumes it
+// warned about (#422); both are zero when the count could not be taken.
 type DestroyInspection struct {
-	Warning string `json:"warning,omitempty"`
+	Warning string      `json:"warning,omitempty"`
+	Volumes int         `json:"volumes,omitempty"`
+	CSI     cluster.CSI `json:"csi,omitempty"`
 }
 
 func (s *Server) destroyInspect(raw json.RawMessage) (DestroyInspection, error) {
@@ -73,7 +77,11 @@ func (s *Server) inspectDestroyCluster(item cluster.Cluster) DestroyInspection {
 	if count == 0 {
 		return DestroyInspection{}
 	}
-	return DestroyInspection{Warning: destroyInspectionCountWarning(item.Name, item.CSI, count)}
+	return DestroyInspection{
+		Warning: destroyInspectionCountWarning(item.Name, item.CSI, count),
+		Volumes: count,
+		CSI:     item.CSI,
+	}
 }
 
 func countDestroyStorageVolumes(ctx context.Context, item cluster.Cluster) (int, error) {
@@ -84,6 +92,29 @@ func countDestroyStorageVolumes(ctx context.Context, item cluster.Cluster) (int,
 	return defaultDestroyCountSchedule.count(ctx, func(probeCtx context.Context) (int, error) {
 		return provision.CountProvisionedStorageVolumes(probeCtx, kubeconfig, item.CSI)
 	})
+}
+
+// listStorageVolumeClaims names the claims a curated engine still serves. The
+// csi gate refuses on them, so the refusal can point at the volumes to delete
+// rather than only count them (#393); it shares the destroy probe's retry
+// schedule because it reads the same objects through the same cold API server.
+func listStorageVolumeClaims(ctx context.Context, item cluster.Cluster) ([]string, error) {
+	kubeconfig, err := clusterKubeconfig(item.Name)
+	if err != nil {
+		return nil, fmt.Errorf("read kubeconfig for storage volume inspection: %w", err)
+	}
+	var claims []string
+	if _, err := defaultDestroyCountSchedule.count(ctx, func(probeCtx context.Context) (int, error) {
+		found, err := provision.ProvisionedStorageVolumeClaims(probeCtx, kubeconfig, item.CSI)
+		if err != nil {
+			return 0, err
+		}
+		claims = found
+		return len(found), nil
+	}); err != nil {
+		return nil, err
+	}
+	return claims, nil
 }
 
 // destroyCountSchedule bounds the volume-count probe: every attempt gets its
@@ -192,7 +223,7 @@ func destroyInspectionCountWarning(name string, engine cluster.CSI, count int) s
 		name,
 		count,
 		strings.TrimSpace(string(engine)),
-		volumeUnit(count),
+		Unit(count, "volume", "volumes"),
 		volumePossessive(count),
 	)
 }
