@@ -42,9 +42,11 @@ for attempt in 1 2 3 4; do
 done
 [[ -n "$submission" ]] || { echo "sign-darwin: $binary could not be submitted" >&2; exit 1; }
 echo "sign-darwin: $binary submitted as $submission" >&2
-status=$(xcrun notarytool wait "$submission" --output-format json \
+# notarytool wait exits non-zero on its timeout; under pipefail that would
+# abort the script before the verdict below is examined (v0.1.1-rc.5).
+status=$( (xcrun notarytool wait "$submission" --output-format json \
   --key "$MACOS_NOTARY_KEY_FILE" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER_ID" \
-  --timeout "${MACOS_NOTARY_TIMEOUT:-60m}" 2>/dev/null | sed -n 's/.*"status" *: *"\([^"]*\)".*/\1/p' | head -1)
+  --timeout "${MACOS_NOTARY_TIMEOUT:-60m}" 2>/dev/null || true) | sed -n 's/.*"status" *: *"\([^"]*\)".*/\1/p' | head -1)
 case "$status" in
   Accepted)
     echo "sign-darwin: $binary notarized ($submission)" >&2 ;;
@@ -54,8 +56,8 @@ case "$status" in
     # fetches the ticket online whenever Apple issues it, so a slow queue is
     # not a reason to fail the release — only a verdict is. Surface the
     # submission so it can be checked with `notarytool info`.
-    status=$(xcrun notarytool info "$submission" --output-format json \
-      --key "$MACOS_NOTARY_KEY_FILE" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER_ID" 2>/dev/null \
+    status=$( (xcrun notarytool info "$submission" --output-format json \
+      --key "$MACOS_NOTARY_KEY_FILE" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER_ID" 2>/dev/null || true) \
       | sed -n 's/.*"status" *: *"\([^"]*\)".*/\1/p' | head -1)
     if [[ "$status" == "Accepted" ]]; then
       echo "sign-darwin: $binary notarized ($submission)" >&2
