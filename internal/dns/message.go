@@ -19,6 +19,14 @@ const (
 	// back to ~30s when the authority section is empty, which strands a node
 	// queried just before its DHCP lease lands.
 	negativeTTL = 5
+
+	// flagRecursionAvailable is the RA header bit. We are authoritative for our
+	// own zones and never recurse for them, but guests reach us through the
+	// cluster's CoreDNS, which forwards and then reports ";; Got recursion not
+	// available" on every response that leaves RA clear — noise that reads as a
+	// DNS failure. Setting RA is honest for the path as a whole: names outside
+	// our zones are in fact resolved recursively by the upstream we forward to.
+	flagRecursionAvailable = 0x0080
 )
 
 type question struct {
@@ -135,7 +143,7 @@ func answer(query []byte, lookup func(string) net.IP, zone string) ([]byte, erro
 	// is reserved for names we know nothing about.
 	nameExists := ip != nil
 	response := append([]byte(nil), query[:q.end]...)
-	flags := uint16(0x8400) | binary.BigEndian.Uint16(query[2:])&0x0100
+	flags := uint16(0x8400) | flagRecursionAvailable | binary.BigEndian.Uint16(query[2:])&0x0100
 	if !matched && !nameExists {
 		flags |= 3
 	}
@@ -173,7 +181,7 @@ func errorAnswer(query []byte, rcode uint16) ([]byte, error) {
 		return nil, err
 	}
 	response := append([]byte(nil), query[:q.end]...)
-	flags := uint16(0x8000) | binary.BigEndian.Uint16(query[2:])&0x0100 | rcode&0xf
+	flags := uint16(0x8000) | flagRecursionAvailable | binary.BigEndian.Uint16(query[2:])&0x0100 | rcode&0xf
 	binary.BigEndian.PutUint16(response[2:], flags)
 	binary.BigEndian.PutUint16(response[4:], 1)
 	binary.BigEndian.PutUint16(response[6:], 0)
