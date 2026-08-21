@@ -4,6 +4,8 @@ package balloon
 
 import (
 	"bufio"
+	"context"
+	"fmt"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -24,8 +26,18 @@ func HostTotalMiB() (int, error) {
 // speculative pages), parsed from vm_stat. This is what tbxd watches for
 // pressure — a low value triggers balloon inflation.
 func HostFreeMiB() (int, error) {
-	out, err := exec.Command("vm_stat").Output()
+	return HostFreeMiBContext(context.Background())
+}
+
+// HostFreeMiBContext is HostFreeMiB bounded by ctx. Callers on a foreground
+// path (doctor, cluster create) pass a deadline: vm_stat is a subprocess and a
+// stalled one would otherwise hang the command with no exit code.
+func HostFreeMiBContext(ctx context.Context) (int, error) {
+	out, err := exec.CommandContext(ctx, "vm_stat").Output()
 	if err != nil {
+		if ctx.Err() != nil {
+			return 0, fmt.Errorf("vm_stat: %w", ctx.Err())
+		}
 		return 0, err
 	}
 	pageSize := 4096

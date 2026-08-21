@@ -2,7 +2,11 @@
 
 package balloon
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"testing"
+)
 
 func TestHostMemReadsSaneValues(t *testing.T) {
 	total, err := HostTotalMiB()
@@ -14,4 +18,14 @@ func TestHostMemReadsSaneValues(t *testing.T) {
 		t.Fatalf("HostFreeMiB = %d, %v (want 0..total)", free, err)
 	}
 	t.Logf("host: total=%dMiB free=%dMiB", total, free)
+}
+
+func TestHostFreeMiBContextHonoursDeadline(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if free, err := HostFreeMiBContext(ctx); err == nil {
+		t.Fatalf("HostFreeMiBContext with a cancelled context = %d, nil (want an error)", free)
+	} else if !errors.Is(err, context.Canceled) {
+		t.Fatalf("HostFreeMiBContext error = %v (want context.Canceled)", err)
+	}
 }

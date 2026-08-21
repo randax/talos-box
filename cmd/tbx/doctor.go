@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -516,7 +517,13 @@ func (c cli) doctorDependencies() doctorDependencies {
 			err := c.doctorCall("cache.list", struct{}{}, &result)
 			return result, err
 		},
-		hostFreeMemory: balloon.HostFreeMiB,
+		// bounded like every other diagnostic subprocess: a stalled vm_stat
+		// must not hang doctor past its exit code
+		hostFreeMemory: func() (int, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), commandProbeTimeout)
+			defer cancel()
+			return balloon.HostFreeMiBContext(ctx)
+		},
 		mirrorOffline: func() (bool, error) {
 			var result daemon.MirrorOfflineStatus
 			err := c.doctorCall("mirror.offline.get", struct{}{}, &result)
