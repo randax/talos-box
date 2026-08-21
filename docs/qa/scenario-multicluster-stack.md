@@ -80,7 +80,7 @@ On failure: capture per-phase route table and reachability matrix.
 
 ### C5 — Destroy and cleanup (always run)
 
-Steps: `tbx down -f <file>` first (declarative inverse — record what it does to both), then `tbx cluster destroy qa-core --force` and `tbx cluster destroy qa-edge --force`; verify zero residue: routes, domains (`platform.internal` tree fully gone), bridges/attachments, status.
+Steps: `tbx down -f <file>` first (declarative inverse — record what it does to both), then `tbx cluster destroy qa-core --force` and `tbx cluster destroy qa-edge --force`; verify zero residue: routes, per-cluster domains (`platform.internal` tree fully gone), bridges/attachments, status. The shared `/etc/resolver/k8s.test` file (macOS) is install-scoped and is expected to persist — it is not residue.
 
 Pass criteria: no residue; down behaved as documented (stops, does not destroy).
 

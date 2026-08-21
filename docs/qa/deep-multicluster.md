@@ -86,7 +86,8 @@ On failure: capture timing log and host route table during the gap.
 
 Steps:
 1. `tbx cluster destroy qa-a --force`; confirm `qa-b` is completely unaffected (VIP still answers, DNS intact).
-2. `tbx cluster destroy qa-b --force`; verify no residue: no leftover routes to either subnet, no resolver/resolved entries, no bridges (Linux), status clean.
+2. `tbx cluster destroy qa-b --force`; verify no residue: no leftover routes to either subnet, no **per-cluster** resolver/resolved entries, no bridges (Linux), status clean.
+   - Scope matters here: on macOS the shared `/etc/resolver/k8s.test` file is **install-scoped**, not per-cluster — it is created by `tbx system install`, `tbx doctor`'s `PASS resolver` depends on it, and it is expected to survive every destroy. Only a per-cluster custom-domain file (e.g. `/etc/resolver/lab.internal`) must be gone. On Linux the equivalent per-cluster artifact is the systemd-resolved route-only domain registration on the cluster bridge; the bridge and its registration both disappear with the cluster. A surviving `k8s.test` file is a correct system, never residue.
 
 Pass criteria: destroying one cluster never disturbs another; zero residue at the end.
 

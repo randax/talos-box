@@ -82,7 +82,7 @@ On failure: list resolver/resolved state before and after.
 
 ### C5 — Destroy and cleanup (always run)
 
-Steps: destroy `qa-dom`, `qa-sub`, any `qa-bad` remnant with `--force`; verify no residue in status, disk, resolver/resolved state.
+Steps: destroy `qa-dom`, `qa-sub`, any `qa-bad` remnant with `--force`; verify no residue in status, disk, and **per-cluster** resolver/resolved state. The shared `/etc/resolver/k8s.test` file is install-scoped (created by `tbx system install`, required by `tbx doctor`'s `resolver` check) and is expected to persist — its survival is correct behaviour, not residue.
 
 Pass criteria: no residue.
 
