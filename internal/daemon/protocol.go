@@ -53,7 +53,12 @@ const (
 // re-admits the suspended cluster's whole memory footprint, so it answers to
 // the same host-pressure gate create and start do, with --force as the
 // override (#368).
-const ProtocolVersion = 13
+// Version 14 answers cluster.destroy with a summary of what it removed
+// instead of the cluster's name alone, narrates node.start/node.stop like the
+// other node verbs, and serves snapshot.list with no cluster as every
+// cluster's snapshots — the post-destroy residue check has no cluster name
+// left to pass (#410 #414 #417 #422).
+const ProtocolVersion = 14
 
 // Request is one newline-delimited daemon request.
 type Request struct {
