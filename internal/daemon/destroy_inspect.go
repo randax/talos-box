@@ -16,9 +16,13 @@ import (
 )
 
 // DestroyInspection is the best-effort storage data-loss warning surfaced
-// before a forced cluster destroy.
+// before a forced cluster destroy. Volumes and CSI carry the same finding in
+// countable form, so the destroy's own summary can account for the volumes it
+// warned about (#422); both are zero when the count could not be taken.
 type DestroyInspection struct {
-	Warning string `json:"warning,omitempty"`
+	Warning string      `json:"warning,omitempty"`
+	Volumes int         `json:"volumes,omitempty"`
+	CSI     cluster.CSI `json:"csi,omitempty"`
 }
 
 func (s *Server) destroyInspect(raw json.RawMessage) (DestroyInspection, error) {
@@ -73,7 +77,11 @@ func (s *Server) inspectDestroyCluster(item cluster.Cluster) DestroyInspection {
 	if count == 0 {
 		return DestroyInspection{}
 	}
-	return DestroyInspection{Warning: destroyInspectionCountWarning(item.Name, item.CSI, count)}
+	return DestroyInspection{
+		Warning: destroyInspectionCountWarning(item.Name, item.CSI, count),
+		Volumes: count,
+		CSI:     item.CSI,
+	}
 }
 
 func countDestroyStorageVolumes(ctx context.Context, item cluster.Cluster) (int, error) {

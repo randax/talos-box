@@ -474,31 +474,35 @@ func (c cli) destroyCluster(args []string) error {
 		Name  string `json:"name"`
 		Force bool   `json:"force"`
 	}{Name: positionals[0], Force: true}
-	if err := c.inspectDestroy(positionals[0], request); err != nil {
+	inspection, err := c.inspectDestroy(positionals[0], request)
+	if err != nil {
 		return err
 	}
-	if err := c.call("cluster.destroy", request, nil); err != nil {
+	var summary daemon.DestroySummary
+	if err := c.call("cluster.destroy", request, &summary); err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(c.out, "destroyed cluster %s\n", positionals[0])
-	return err
+	if _, err := fmt.Fprintf(c.out, "destroyed cluster %s\n", positionals[0]); err != nil {
+		return err
+	}
+	return printDestroySummary(c.out, summary, inspection)
 }
 
 func (c cli) inspectDestroy(name string, request struct {
 	Name  string `json:"name"`
 	Force bool   `json:"force"`
-}) error {
+}) (daemon.DestroyInspection, error) {
 	var inspection daemon.DestroyInspection
 	if err := c.call("cluster.destroy.inspect", request, &inspection); err != nil {
 		// A cluster that does not exist fails here rather than warning about
 		// data it cannot have; every other inspection failure still warns,
 		// since a partially-destroyed cluster may still hold volumes (#268).
 		if daemon.IsClusterMissing(err, name) {
-			return err
+			return daemon.DestroyInspection{}, err
 		}
-		return printWarning(c.err, daemon.DestroyInspectionDataLossWarning(name, ""))
+		return daemon.DestroyInspection{}, printWarning(c.err, daemon.DestroyInspectionDataLossWarning(name, ""))
 	}
-	return printWarning(c.err, inspection.Warning)
+	return inspection, printWarning(c.err, inspection.Warning)
 }
 
 func (c cli) runNode(args []string) error {
@@ -589,6 +593,8 @@ func (c cli) runNodeRunState(verb string, args []string) error {
 		flags.BoolVar(&force, "force", false, "proceed despite memory overcommit or host pressure")
 		usage += " [--force]"
 	}
+	quiet := flags.Bool("quiet", false, "suppress stage narration")
+	usage += " [--quiet]"
 	positionals, err := parseInterspersed(flags, args)
 	if err != nil {
 		return err
@@ -601,7 +607,10 @@ func (c cli) runNodeRunState(verb string, args []string) error {
 	}
 	request := map[string]any{"cluster": positionals[0], "name": positionals[1], "force": force}
 	var result daemon.NodeRunState
-	if err := c.call("node."+verb, request, &result); err != nil {
+	// Both verbs narrate like their siblings: a stop takes the node off the
+	// substrate and a start begins a boot that outlives the call, and neither
+	// was visible behind a single past-tense line (#414).
+	if err := c.callNarrated("node."+verb, request, &result, c.stages(*quiet)); err != nil {
 		return err
 	}
 	// The daemon reports whether it actually acted, so a node that was already
@@ -796,7 +805,7 @@ Commands:
   snapshot create|restore|list|delete
   status [cluster]
   manifests <cluster> [section] [--cni cilium|flannel]
-  console <cluster> <node>
+  console <cluster> <node> [--no-follow] [--lines N]
   bgp enable|disable|status <cluster> [--quiet]
   mirror offline [on|off]
   cache pull|prune|warm|list [<image-ref>] [-o json]

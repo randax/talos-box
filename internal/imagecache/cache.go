@@ -854,7 +854,7 @@ func cacheEntry(schematic, version string, architecture Architecture, path strin
 		Architecture:  architecture,
 		Path:          path,
 		Size:          info.Size(),
-		AllocatedSize: allocatedSize(info),
+		AllocatedSize: AllocatedSize(info),
 	}, true, nil
 }
 
@@ -937,7 +937,7 @@ func artifactStats(dir string, names []string) (int64, int64, bool, error) {
 		}
 		present = true
 		size += info.Size()
-		allocated += allocatedSize(info)
+		allocated += AllocatedSize(info)
 	}
 	return size, allocated, present, nil
 }

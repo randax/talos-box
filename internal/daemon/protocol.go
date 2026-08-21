@@ -56,7 +56,11 @@ const (
 // Version 14 serves bgp.status: a read-only report of a cluster's announcement
 // mode, the host speaker behind it and the routes that speaker announces, so a
 // refused or deferred mode change can be confirmed directly instead of through
-// `tbx doctor` (#399).
+// `tbx doctor` (#399). It also answers cluster.destroy with a summary of what
+// it removed instead of the cluster's name alone, narrates node.start/node.stop
+// like the other node verbs, and serves snapshot.list with no cluster as every
+// cluster's snapshots — the post-destroy residue check has no cluster name
+// left to pass (#410 #414 #417 #422).
 const ProtocolVersion = 14
 
 // Request is one newline-delimited daemon request.

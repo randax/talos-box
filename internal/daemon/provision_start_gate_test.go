@@ -277,7 +277,7 @@ func TestNodeMutationVerbsAnswerToTheProvisionStartGate(t *testing.T) {
 					if marshalErr != nil {
 						t.Fatal(marshalErr)
 					}
-					_, _, err = service.startNodeLocked(raw)
+					_, _, err = service.startNodeLocked(raw, nil)
 				}
 
 				if test.wantErr == "" {

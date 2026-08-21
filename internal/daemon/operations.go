@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"net"
 	"os"
@@ -952,41 +953,90 @@ func (s *Server) closeNodes(clusterName string, nodes map[string]hypervisor.Mach
 	return resultErr
 }
 
-func (s *Server) destroyCluster(raw json.RawMessage) (map[string]string, error) {
+// DestroySummary is cluster.destroy's response: what the destroy actually
+// removed. The most destructive verb in the CLI used to answer with the
+// cluster's name alone, which gave the operator nothing to check the scope of
+// the destruction against (#422). Every count is measured before anything is
+// deleted; a partially-destroyed cluster reports what could still be counted.
+type DestroySummary struct {
+	Name      string `json:"name"`
+	Nodes     int    `json:"nodes"`
+	Snapshots int    `json:"snapshots"`
+	// DiskBytes is the cluster's whole state directory — node disks, snapshots
+	// and configuration — as it stood before the removal.
+	DiskBytes int64  `json:"diskBytes"`
+	Domain    string `json:"domain,omitempty"`
+	// ResolverWithdrawn is set only for a cluster whose own resolver file the
+	// destroy removed; a cluster on the default domain shares one that stays.
+	ResolverWithdrawn bool `json:"resolverWithdrawn,omitempty"`
+}
+
+func (s *Server) destroyCluster(raw json.RawMessage) (DestroySummary, error) {
 	var args destroyArgs
 	if err := decodeArgs(raw, &args); err != nil {
-		return nil, err
+		return DestroySummary{}, err
 	}
 	if !args.Force {
-		return nil, errors.New("cluster.destroy requires force=true")
+		return DestroySummary{}, errors.New("cluster.destroy requires force=true")
 	}
 	s.cancelProvisionLocked(args.Name)
 	dir, err := cluster.Dir(args.Name)
 	if err != nil {
-		return nil, err
+		return DestroySummary{}, err
 	}
 	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
-		return nil, ClusterMissingError(args.Name)
+		return DestroySummary{}, ClusterMissingError(args.Name)
 	}
 	if err := disableHostBGP(args.Name); err != nil {
 		log.Printf("disable host BGP for %s during force destroy: %v", args.Name, err)
 	}
+	// Everything the summary reports is measured here, while it still exists.
+	summary := DestroySummary{Name: args.Name, DiskBytes: directoryBytes(dir)}
+	if snapshots, listErr := cluster.ListSnapshots(args.Name); listErr == nil {
+		summary.Snapshots = len(snapshots)
+	}
+	var customDomain bool
 	// stop what we can, but a partially-destroyed cluster (state dir present,
-	// cluster.json gone) must still be removable
-	if _, loadErr := cluster.Load(args.Name); loadErr == nil {
+	// cluster.json gone) must still be removable — and still summarised
+	if item, loadErr := cluster.Load(args.Name); loadErr == nil {
+		summary.Nodes = len(item.Nodes)
+		summary.Domain = item.EffectiveDomain()
+		customDomain = item.Domain != ""
 		if err := s.stop(args.Name); err != nil {
-			return nil, err
+			return DestroySummary{}, err
 		}
 	}
 	if err := cluster.Destroy(args.Name); err != nil {
-		return nil, err
+		return DestroySummary{}, err
 	}
 	s.forgetCluster(args.Name)
 	s.invalidateStoragePhaseLocked(args.Name)
 	if err := SyncResolverFiles(); err != nil {
 		log.Printf("resolver files after destroying %s: %v", args.Name, err)
+	} else {
+		summary.ResolverWithdrawn = customDomain
 	}
-	return map[string]string{"name": args.Name}, nil
+	return summary, nil
+}
+
+// directoryBytes sums what the files under dir occupy on disk. Node disks are
+// sparse, so their apparent size would overstate what the destroy gives back —
+// the block count is the only honest number for reclaimed capacity. Best
+// effort: a file that cannot be stat'ed must not fail the verb that removes it.
+func directoryBytes(dir string) int64 {
+	var total int64
+	_ = filepath.WalkDir(dir, func(_ string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return nil //nolint:nilerr // an unreadable entry is skipped, not fatal
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			return nil
+		}
+		total += imagecache.AllocatedSize(info)
+		return nil
+	})
+	return total
 }
 
 // resolverSyncMu makes SyncResolverFiles the single owner of resolver-file
@@ -1187,13 +1237,13 @@ func (s *Server) handleNodeMutationLocked(request Request, progress stageFunc) (
 		}
 		return result, tasks, nil
 	case "node.start":
-		result, tasks, err := s.startNodeLocked(request.Args)
+		result, tasks, err := s.startNodeLocked(request.Args, progress)
 		if err != nil {
 			return nil, nil, err
 		}
 		return result, tasks, nil
 	case "node.stop":
-		result, tasks, err := s.stopNodeLocked(request.Args)
+		result, tasks, err := s.stopNodeLocked(request.Args, progress)
 		if err != nil {
 			return nil, nil, err
 		}
