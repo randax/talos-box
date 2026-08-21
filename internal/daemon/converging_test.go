@@ -127,3 +127,30 @@ func TestHintsDistinguishAnnouncedVIPFromLiveVIP(t *testing.T) {
 		t.Fatalf("hints do not name the un-announced VIP:\n%s", joined)
 	}
 }
+
+// TestHintsStateTheSilentVIPOnce keeps the CNI hint and the settling hint from
+// printing the same fact in consecutive lines, while the machine-readable
+// converging array keeps naming it (#396, #427).
+func TestHintsStateTheSilentVIPOnce(t *testing.T) {
+	now := time.Now()
+	status := convergedStatus(now)
+	status.VIPLive = false
+	status.StoragePhase = StoragePhaseProvisioning
+
+	hints := hintsAt(status, now)
+	const fact = "172.30.0.200 is announced but not answering yet"
+	count := 0
+	for _, hint := range hints {
+		count += strings.Count(hint, fact)
+	}
+	if count != 1 {
+		t.Fatalf("hints state %q %d times, want once:\n%s", fact, count, strings.Join(hints, "\n"))
+	}
+	// The settling hint still carries the reasons that were not printed above.
+	if !strings.Contains(strings.Join(hints, "\n"), "longhorn CSI drivers") {
+		t.Fatalf("hints dropped the remaining settling reasons:\n%s", strings.Join(hints, "\n"))
+	}
+	if joined := strings.Join(convergingReasons(status, now), "; "); !strings.Contains(joined, fact) {
+		t.Fatalf("convergingReasons() = %q, must keep the VIP reason for the JSON surface", joined)
+	}
+}

@@ -388,6 +388,10 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 				first.IP),
 		)
 	}
+	// Whether a hint above has already named the announced-but-silent VIP. The
+	// converging hint below repeats the same fact otherwise, so tbx status
+	// printed it twice in consecutive hints (#427).
+	vipNoted := false
 	if len(configured) == len(status.Nodes) && len(status.Nodes) > 0 {
 		cp := status.controlPlaneOr(status.Nodes[0])
 		if status.CNI == cluster.CNIFlannel && status.LB && status.KubernetesReady {
@@ -399,6 +403,7 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 				hints = append(hints,
 					fmt.Sprintf("Kubernetes is Ready; %s. Flannel does not enforce NetworkPolicies; use cilium to exercise policies.%s", vipSettlingNote(status, "MetalLB L2"), credentialExports(status.Name)),
 				)
+				vipNoted = true
 			}
 		}
 		if status.CNI == cluster.CNIFlannel && !status.LB && status.KubernetesReady {
@@ -411,6 +416,7 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 				hints = append(hints, fmt.Sprintf("Kubernetes is Ready; Cilium LB-IPAM VIP is live at http://%s/.%s", status.VIP, credentialExports(status.Name)))
 			} else {
 				hints = append(hints, fmt.Sprintf("Kubernetes is Ready; %s.%s", vipSettlingNote(status, "Cilium LB-IPAM"), credentialExports(status.Name)))
+				vipNoted = true
 			}
 		}
 		if status.CNI == cluster.CNICilium && !status.LB && status.KubernetesReady {
@@ -430,7 +436,13 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 			)
 		}
 	}
-	if reasons := convergingReasons(status, now); len(reasons) > 0 {
+	// convergingReasons also feeds the machine-readable "converging" array, so
+	// the VIP reason is dropped here rather than at its source (#396, #427).
+	reasons := convergingReasons(status, now)
+	if vipNoted {
+		reasons = withoutReason(reasons, vipConvergingReason(status))
+	}
+	if len(reasons) > 0 {
 		hints = append(hints, fmt.Sprintf(
 			"nodes are up but the cluster is still settling — %s; a single sample of tbx status can read green while these are in flight",
 			strings.Join(reasons, "; ")))
@@ -484,8 +496,8 @@ func convergingReasons(status ClusterStatus, now time.Time) []string {
 	if status.CSI != "" && status.StoragePhase != StoragePhaseLive && status.StoragePhase != StoragePhaseFailed {
 		reasons = append(reasons, fmt.Sprintf("the %s CSI drivers have not passed the readiness probe yet, so PVC mounts can fail", status.CSI))
 	}
-	if status.LB && status.VIP != "" && !status.VIPLive {
-		reasons = append(reasons, fmt.Sprintf("the LoadBalancer VIP %s is announced but not answering yet", status.VIP))
+	if reason := vipConvergingReason(status); reason != "" {
+		reasons = append(reasons, reason)
 	}
 	if age, booting := youngestNodeAge(status, now); booting {
 		reasons = append(reasons, fmt.Sprintf(
@@ -493,6 +505,29 @@ func convergingReasons(status ClusterStatus, now time.Time) []string {
 			formatStallDuration(age), formatBootWindow(clusterSettleWindow)))
 	}
 	return reasons
+}
+
+// vipConvergingReason names an announced VIP that is not answering yet, or ""
+// when there is nothing outstanding to say about it.
+func vipConvergingReason(status ClusterStatus) string {
+	if !status.LB || status.VIP == "" || status.VIPLive {
+		return ""
+	}
+	return fmt.Sprintf("the LoadBalancer VIP %s is announced but not answering yet", status.VIP)
+}
+
+// withoutReason drops one already-printed reason from a converging list.
+func withoutReason(reasons []string, drop string) []string {
+	if drop == "" {
+		return reasons
+	}
+	kept := make([]string, 0, len(reasons))
+	for _, reason := range reasons {
+		if reason != drop {
+			kept = append(kept, reason)
+		}
+	}
+	return kept
 }
 
 // youngestNodeAge reports how long ago the most recently launched node's VM
