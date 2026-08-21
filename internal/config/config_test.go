@@ -170,7 +170,8 @@ func TestParseErrors(t *testing.T) {
 		yaml    string
 		wantErr string
 	}{
-		{"unsupported version", "version: 2\nclusters: [{name: a}]", "version"},
+		{"unsupported version", "version: 2\nclusters: [{name: a}]", "unsupported version 2 (this tbx understands version 1)"},
+		{"missing version", "clusters: [{name: a}]", "talosbox.yaml is missing 'version:'; add 'version: 1'"},
 		{"no clusters", "version: 1\n", "at least one cluster"},
 		{"empty name", "version: 1\nclusters: [{name: \"\"}]", "name"},
 		{"duplicate names", "version: 1\nclusters: [{name: a}, {name: a}]", "duplicate"},
