@@ -858,3 +858,28 @@ func TestStartClusterReleasesThePreBalloonHoldWhenTheLaunchFails(t *testing.T) {
 		t.Fatalf("BalloonHoldMiB() = %d after a start whose launch failed, want 0", got)
 	}
 }
+
+// node add arms the same hold as create and must hand it back the same way
+// when the VM never comes up: the guests it squeezed are the only ones
+// running, and nothing is booting that the squeeze protects.
+func TestAddNodeReleasesThePreBalloonHoldWhenTheLaunchFails(t *testing.T) {
+	const nodeMiB, shortfall = 2048, 512
+	reserve := balloon.DefaultConfig().ReserveMiB
+	service, item := balloonableFixture(t, nodeMiB)
+	stubNodeMutationReconcile(service)
+	service.hostFreeMemory = func() (int, error) { return reserve + nodeMiB - shortfall, nil }
+	service.hypervisor.(*fakeHypervisor).launch = func(context.Context, hypervisor.Spec) (hypervisor.Machine, error) {
+		return nil, errors.New("vz: failed to start the virtual machine")
+	}
+
+	raw, err := json.Marshal(nodeArgs{Cluster: item.Name, Role: cluster.RoleWorker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := service.addNodeLocked(raw, nil); err == nil {
+		t.Fatal("addNodeLocked() succeeded with a failing launch; the test no longer exercises an add that never booted a guest")
+	}
+	if got := service.BalloonHoldMiB(); got != 0 {
+		t.Fatalf("BalloonHoldMiB() = %d after a node add whose launch failed, want 0", got)
+	}
+}

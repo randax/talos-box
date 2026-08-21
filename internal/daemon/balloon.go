@@ -235,7 +235,7 @@ var (
 // that came before this one, exactly as checkOvercommit does.
 //
 // The returned heldMiB is the pre-balloon this admission took, for the caller
-// to re-arm with holdBalloonReclaim at the moment it actually launches the
+// to re-arm with rearmBalloonHold at the moment it actually launches the
 // guests: the hold is a boot-window budget, so its clock must not start while
 // work the launch still has to do (a cold image fetch, disk clones) is in
 // front of it. Callers that launch immediately can ignore it.
@@ -460,6 +460,31 @@ func (s *Server) holdBalloonReclaim(reclaimMiB int) {
 	now := time.Now()
 	s.dropExpiredBalloonHoldsLocked(now)
 	s.balloonHolds = append(s.balloonHolds, balloonHold{reclaimMiB: reclaimMiB, until: now.Add(balloonReclaimHoldTTL)})
+}
+
+// rearmBalloonHold restarts the clock on the hold checkProvisionStart armed at
+// admission, at the moment the guests actually launch: the work between the
+// two (a cold image fetch, disk clones) is unbounded and must not eat into the
+// boot window the TTL is for. It refreshes this start's own entry rather than
+// recording a second one, so a launch that then fails has exactly one hold to
+// release and BalloonHoldMiB never carries a duplicate. An entry that already
+// expired in the meantime is armed afresh.
+func (s *Server) rearmBalloonHold(reclaimMiB int) {
+	if reclaimMiB <= 0 {
+		return
+	}
+	s.balloonHoldMu.Lock()
+	defer s.balloonHoldMu.Unlock()
+	now := time.Now()
+	s.dropExpiredBalloonHoldsLocked(now)
+	until := now.Add(balloonReclaimHoldTTL)
+	for i := len(s.balloonHolds) - 1; i >= 0; i-- {
+		if s.balloonHolds[i].reclaimMiB == reclaimMiB {
+			s.balloonHolds[i].until = until
+			return
+		}
+	}
+	s.balloonHolds = append(s.balloonHolds, balloonHold{reclaimMiB: reclaimMiB, until: until})
 }
 
 // releaseBalloonHold drops a hold armed at admission for a start that never

@@ -639,11 +639,12 @@ func (s *Server) createCluster(raw json.RawMessage, progress stageFunc) (Cluster
 	// unbounded and can outlast the TTL, and the balloon manager would then
 	// inflate the reclaimed guests back before these ones have booted — the
 	// squeeze the pre-balloon was taken to prevent (#398).
-	s.holdBalloonReclaim(preBalloonedMiB)
-	launched = true
+	s.rearmBalloonHold(preBalloonedMiB)
 	progress.stage("starting %d node(s)", len(item.Nodes))
 	startWarnings, err := s.start(item)
 	if err != nil {
+		// start rolled back whatever it launched, so nothing is booting and
+		// the hold protects nothing — hand it back now, not at the TTL.
 		result := summary(item, false)
 		result.setWarnings(append([]string{talosVersionWarning, overcommitWarning}, append(hostPressureWarnings, longhornWarning, longhornCustomSchematicWarning, subnetWarning)...)...)
 		startErr := fmt.Errorf("cluster created but failed to start: %w", err)
@@ -655,6 +656,7 @@ func (s *Server) createCluster(raw json.RawMessage, progress stageFunc) (Cluster
 		}
 		return result, startErr
 	}
+	launched = true
 	result := summary(item, true)
 	result.setWarnings(append([]string{talosVersionWarning, overcommitWarning}, append(hostPressureWarnings, append([]string{longhornWarning, longhornCustomSchematicWarning, subnetWarning}, startWarnings...)...)...)...)
 	return result, nil
@@ -1216,13 +1218,14 @@ func (s *Server) addNodeLocked(raw json.RawMessage, progress stageFunc) (NodeSta
 		// Re-armed at the launch for the same reason create does: the hold's
 		// TTL is a boot window, and the image fetch and disk clone above can
 		// outlast it (#398).
-		s.holdBalloonReclaim(preBalloonedMiB)
-		launched = true
+		s.rearmBalloonHold(preBalloonedMiB)
 		progress.stage("starting node %s", node.Name)
 		machine, err := s.launchMachine(item, node, nil)
 		if err != nil {
+			// nothing booted; the deferred release hands the hold back
 			return nodeStatus(node, item.SubnetIndex, false), nil, fmt.Errorf("node added but failed to create VM: %w", err)
 		}
+		launched = true
 		s.vms[item.Name][node.Name] = machine
 	}
 	status := nodeStatus(node, item.SubnetIndex, s.nodeRunning(item.Name, node.Name))
