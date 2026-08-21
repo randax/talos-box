@@ -2,6 +2,11 @@
 # Virtualization.framework, while the Linux binaries are pure Go and
 # cross-compile with CGO_ENABLED=0. One run means one release, one checksum
 # file, and one brew formula that knows every platform.
+#
+# The darwin binaries are signed with the Developer ID identity and notarized
+# (notarize.macos below) when the signing secrets are present; a local
+# snapshot without them builds unsigned binaries, which is fine for rehearsal
+# but not for running against Virtualization.framework.
 version: 2
 project_name: tbx
 
@@ -19,7 +24,10 @@ builds:
     ldflags:
       - "-X github.com/randax/talos-box/internal/version.Version={{ .Tag }}"
     hooks:
-      post: codesign --force --sign - --entitlements build/entitlements.plist {{ .Path }}
+      # Go's external linker leaves an ad-hoc, linker-signed signature whose
+      # load command is not last, which the Developer ID signer cannot replace;
+      # strip it so the signature below is the only one.
+      post: codesign --remove-signature {{ .Path }}
   - id: tbxd-darwin
     main: ./cmd/tbxd
     binary: tbxd
@@ -29,7 +37,10 @@ builds:
     ldflags:
       - "-X github.com/randax/talos-box/internal/version.Version={{ .Tag }}"
     hooks:
-      post: codesign --force --sign - --entitlements build/entitlements.plist {{ .Path }}
+      # Go's external linker leaves an ad-hoc, linker-signed signature whose
+      # load command is not last, which the Developer ID signer cannot replace;
+      # strip it so the signature below is the only one.
+      post: codesign --remove-signature {{ .Path }}
   - id: tbx-helper-darwin
     main: ./cmd/tbx-helper
     binary: tbx-helper
@@ -38,6 +49,11 @@ builds:
     env: [CGO_ENABLED=1]
     ldflags:
       - "-X github.com/randax/talos-box/internal/version.Version={{ .Tag }}"
+    hooks:
+      # Go's external linker leaves an ad-hoc, linker-signed signature whose
+      # load command is not last, which the Developer ID signer cannot replace;
+      # strip it so the signature below is the only one.
+      post: codesign --remove-signature {{ .Path }}
   - id: tbx-linux
     main: ./cmd/tbx
     binary: tbx
@@ -62,6 +78,25 @@ builds:
     env: [CGO_ENABLED=0]
     ldflags:
       - "-X github.com/randax/talos-box/internal/version.Version={{ .Tag }}"
+
+# Developer ID signing + notarization of the darwin binaries (#19, #26). The
+# virtualization entitlement rides on the signature, as it did on the ad-hoc
+# one. Enabled only when the certificate is in the environment, so a snapshot
+# on a machine without the secrets still succeeds.
+notarize:
+  macos:
+    - enabled: '{{ isEnvSet "MACOS_SIGN_P12" }}'
+      ids: [tbx-darwin, tbxd-darwin, tbx-helper-darwin]
+      sign:
+        certificate: "{{ .Env.MACOS_SIGN_P12 }}"
+        password: "{{ .Env.MACOS_SIGN_PASSWORD }}"
+        entitlements: build/entitlements.plist
+      notarize:
+        issuer_id: "{{ .Env.MACOS_NOTARY_ISSUER_ID }}"
+        key_id: "{{ .Env.MACOS_NOTARY_KEY_ID }}"
+        key: "{{ .Env.MACOS_NOTARY_KEY }}"
+        wait: true
+        timeout: 20m
 
 archives:
   - id: default
