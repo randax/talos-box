@@ -524,7 +524,10 @@ func (s *Server) createCluster(raw json.RawMessage, progress stageFunc) (Cluster
 	if err := s.requireHelper(); err != nil {
 		return ClusterSummary{}, err
 	}
-	addMiB := (controlPlanes + workers) * memoryOr(args.Node.MemoryMiB, cluster.DefaultMemoryMiB)
+	// One gate, one arithmetic: charge each role what it will actually be
+	// created with, so a create admits exactly the clusters a later
+	// `cluster start` can reassemble (#398).
+	addMiB := controlPlanes*roleMemoryMiB(args.ControlPlane, args.Node) + workers*roleMemoryMiB(args.Worker, args.Node)
 	overcommitWarning, err := s.checkOvercommit(addMiB, args.Force)
 	if err != nil {
 		return ClusterSummary{}, err
@@ -2112,6 +2115,18 @@ func (s *Server) clusterImageArchitecture(item cluster.Cluster) (imagecache.Arch
 		return "", fmt.Errorf("cluster %q uses %s images, but the active hypervisor targets %s", item.Name, architecture, active)
 	}
 	return imagecache.Architecture(architecture), nil
+}
+
+// roleMemoryMiB resolves the memory one node of a role will be created with:
+// the per-role `controlPlane:`/`worker:` override when the spec carries one,
+// otherwise the cluster-wide node defaults. It is the pre-creation twin of
+// cluster.Cluster.DefaultsFor, which every other memory gate resolves through.
+func roleMemoryMiB(role *cluster.NodeDefaults, base cluster.NodeDefaults) int {
+	baseMiB := memoryOr(base.MemoryMiB, cluster.DefaultMemoryMiB)
+	if role != nil {
+		return memoryOr(role.MemoryMiB, baseMiB)
+	}
+	return baseMiB
 }
 
 func memoryOr(mib, fallback int) int {

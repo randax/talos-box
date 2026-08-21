@@ -767,3 +767,63 @@ func TestReleaseBalloonHoldLeavesAnOverlappingStartsHoldStanding(t *testing.T) {
 		t.Fatalf("BalloonHoldMiB() = %d after an overlapping start released its own hold, want A's 512 MiB still held while A's guests boot", got)
 	}
 }
+
+// #398 asks for one gate and one arithmetic across `up`, `cluster create` and
+// `cluster start`. A spec that raises one role above the cluster-wide `node:`
+// block must be charged at its real footprint on the create path too: charging
+// the flat node default admits a cluster that the later `cluster start` — which
+// resolves memory through Cluster.DefaultsFor — correctly refuses.
+func TestCreateClusterChargesPerRoleMemoryOverrides(t *testing.T) {
+	const nodeMiB, controlPlaneMiB = 4096, 8192
+	reserve := balloon.DefaultConfig().ReserveMiB
+	service, _ := runningLonghornClusterForNodeMutation(t, 1, 2)
+	service.hostPressure = noHostPressure
+	service.hostTotalMemory = plentifulHostMemory
+	service.helperCheck = func() error { return nil }
+	// Exactly enough for the flat charge (3 x 4096) and 4096 MiB short of the
+	// real footprint (8192 + 2 x 4096).
+	service.hostFreeMemory = func() (int, error) { return reserve + 3*nodeMiB, nil }
+	// Seeded so that an admitted create would go on to build the cluster from
+	// the local cache: this test must never reach the Image Factory, whichever
+	// way the gate rules.
+	schematic := "role-override-schematic"
+	seedCachedDisk(t, schematic, DefaultTalosVersion)
+	raw, err := json.Marshal(createArgs{
+		Name:          "second",
+		ControlPlanes: intPtr(1),
+		Workers:       intPtr(2),
+		Schematic:     schematic,
+		NodeDefaults:  cluster.NodeDefaults{MemoryMiB: nodeMiB, DiskGiB: 1},
+		ControlPlane:  &cluster.NodeDefaults{MemoryMiB: controlPlaneMiB, DiskGiB: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = service.createCluster(raw, nil)
+
+	if err == nil || !strings.Contains(err.Error(), "guests are already running") {
+		t.Fatalf("createCluster() error = %v, want the projected-start refusal: the gate must charge the controlPlane override, not the flat node default", err)
+	}
+	if _, loadErr := cluster.Load("second"); loadErr == nil {
+		t.Fatal("createCluster() persisted state despite the projected-start refusal")
+	}
+}
+
+// The mirror of the same rule: with no per-role override the create charges the
+// cluster-wide node defaults, unchanged.
+func TestRoleMemoryMiBFallsBackToNodeDefaults(t *testing.T) {
+	base := cluster.NodeDefaults{MemoryMiB: 4096}
+	if got := roleMemoryMiB(nil, base); got != 4096 {
+		t.Fatalf("roleMemoryMiB(nil, %d) = %d, want the node default", base.MemoryMiB, got)
+	}
+	if got := roleMemoryMiB(&cluster.NodeDefaults{MemoryMiB: 8192}, base); got != 8192 {
+		t.Fatalf("roleMemoryMiB(override) = %d, want the override", got)
+	}
+	if got := roleMemoryMiB(&cluster.NodeDefaults{CPUs: 4}, base); got != 4096 {
+		t.Fatalf("roleMemoryMiB(memory-less override) = %d, want the node default", got)
+	}
+	if got := roleMemoryMiB(nil, cluster.NodeDefaults{}); got != cluster.DefaultMemoryMiB {
+		t.Fatalf("roleMemoryMiB(nil, zero) = %d, want the built-in default", got)
+	}
+}
