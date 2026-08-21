@@ -56,6 +56,17 @@ func TestConvergingReasonsSeparateSettlingFromConverged(t *testing.T) {
 			wants:  []string{"kubelet serving certificates", "CSI driver registrations"},
 		},
 		{
+			// A pass that ended in failure is over: the storage hint already
+			// says what happened, and calling it "still settling" would put
+			// provisioning-in-progress wording back on finished work (#395).
+			name: "a terminal storage failure is not settling",
+			mutate: func(s *ClusterStatus) {
+				s.StoragePhase = StoragePhaseFailed
+				s.StorageError = "reconcile longhorn storage: longhorn manager is not Ready"
+			},
+			settled: true,
+		},
+		{
 			name:    "a stopped cluster is not settling",
 			mutate:  func(s *ClusterStatus) { s.Running = false; s.StoragePhase = "" },
 			settled: true,

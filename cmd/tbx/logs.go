@@ -162,11 +162,16 @@ func readAppended(path string, offset int64) (int64, string, error) {
 }
 
 // logLineMatches applies the cluster filter. The daemon narrates per-cluster
-// work with a "<cluster>/" prefix — `balloon qa-cil/qa-cil-cp-1: …` — so that
-// is what a cluster filter matches.
+// work under two conventions: node-scoped lines carry a "<cluster>/<node>"
+// subject — `balloon qa-cil/qa-cil-cp-1: …` — while cluster-scoped ones name
+// the cluster alone — `provision qa-cil: waiting on …`. Matching only the
+// slash form hid every gate, status and provision line the daemon writes, so
+// the filter accepts both (#402).
 func logLineMatches(line, cluster string) bool {
 	if cluster == "" {
 		return true
 	}
-	return strings.Contains(line, cluster+"/")
+	return strings.Contains(line, cluster+"/") ||
+		strings.Contains(line, cluster+":") ||
+		strings.Contains(line, cluster+" ")
 }

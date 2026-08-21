@@ -25,10 +25,16 @@ func writeDaemonLog(t *testing.T, content string) string {
 	return path
 }
 
+// The fixture carries both subject conventions the daemon writes: node-scoped
+// "<cluster>/<node>" lines and cluster-scoped "<verb> <cluster>:" ones. The
+// cluster filter has to keep both, or a stalled provision's own narration is
+// invisible to `tbx logs <cluster>` (#402).
 const sampleDaemonLog = `2026/08/19 13:37:01 balloon qa-cil/qa-cil-cp-1: target=2048MiB
-2026/08/19 13:37:02 node.remove qa-cil/qa-cil-worker-1: begin
-2026/08/19 13:37:03 balloon qa-sta/qa-sta-cp-1: target=1024MiB
-2026/08/19 13:37:04 node.remove qa-cil/qa-cil-worker-1: complete
+2026/08/19 13:37:02 provision qa-cil: waiting on Longhorn node scheduling: longhorn manager is not Ready
+2026/08/19 13:37:03 node.remove qa-cil/qa-cil-worker-1: begin
+2026/08/19 13:37:04 balloon qa-sta/qa-sta-cp-1: target=1024MiB
+2026/08/19 13:37:05 storage probe qa-sta: failed: context deadline exceeded
+2026/08/19 13:37:06 node.remove qa-cil/qa-cil-worker-1: complete
 `
 
 // TestLogsPrintsTheDaemonLog pins #402: the diagnostic path the docs point at
@@ -56,22 +62,26 @@ func TestLogsFiltersAndTails(t *testing.T) {
 		notWant []string
 	}{
 		{
-			name:    "positional cluster filter",
-			args:    []string{"logs", "qa-cil"},
-			want:    []string{"qa-cil/qa-cil-cp-1", "qa-cil/qa-cil-worker-1: complete"},
+			name: "positional cluster filter",
+			args: []string{"logs", "qa-cil"},
+			want: []string{
+				"qa-cil/qa-cil-cp-1",
+				"provision qa-cil: waiting on Longhorn node scheduling",
+				"qa-cil/qa-cil-worker-1: complete",
+			},
 			notWant: []string{"qa-sta"},
 		},
 		{
 			name:    "cluster flag",
 			args:    []string{"logs", "--cluster", "qa-sta"},
-			want:    []string{"qa-sta/qa-sta-cp-1"},
+			want:    []string{"qa-sta/qa-sta-cp-1", "storage probe qa-sta: failed"},
 			notWant: []string{"qa-cil"},
 		},
 		{
 			name:    "lines bounds the tail",
 			args:    []string{"logs", "--lines", "1"},
 			want:    []string{"qa-cil/qa-cil-worker-1: complete"},
-			notWant: []string{"13:37:01", "13:37:02", "13:37:03"},
+			notWant: []string{"13:37:01", "13:37:02", "13:37:03", "13:37:04", "13:37:05"},
 		},
 		{
 			name:    "filter and tail combine",

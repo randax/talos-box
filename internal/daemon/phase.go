@@ -477,7 +477,11 @@ func convergingReasons(status ClusterStatus, now time.Time) []string {
 		return nil
 	}
 	var reasons []string
-	if status.CSI != "" && status.StoragePhase != StoragePhaseLive {
+	// A terminal storage failure is not something that is still settling: the
+	// pass that owned it has ended and the storage hint already says so, so
+	// claiming the CSI probe has yet to pass would re-create the "provisioning
+	// in progress for work that has already ended" friction (#395).
+	if status.CSI != "" && status.StoragePhase != StoragePhaseLive && status.StoragePhase != StoragePhaseFailed {
 		reasons = append(reasons, fmt.Sprintf("the %s CSI drivers have not passed the readiness probe yet, so PVC mounts can fail", status.CSI))
 	}
 	if status.LB && status.VIP != "" && !status.VIPLive {

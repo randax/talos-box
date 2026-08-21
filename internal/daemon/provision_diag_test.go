@@ -84,7 +84,10 @@ func TestAbortedProvisionSettlesStorageIntoATerminalFailure(t *testing.T) {
 	defer cancel()
 	cancelledProbes := 0
 	service := &Server{
-		vms:                 make(map[string]map[string]hypervisor.Machine),
+		// The cluster has to look running, or beginStorageStatusProbe returns
+		// on its "not running" guard and the terminal-failure guard below is
+		// never exercised.
+		vms:                 map[string]map[string]hypervisor.Machine{"demo": {"demo-cp-1": &fakeMachine{active: true}}},
 		provisions:          make(map[string]activeProvision),
 		storagePhases:       make(map[string]StoragePhase),
 		storageStatusProbes: make(map[string]activeStorageProbe),

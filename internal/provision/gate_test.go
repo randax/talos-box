@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // A gate that keeps failing must say what it is failing on: a provisioning pass
@@ -88,5 +89,14 @@ func TestBlockerMessageFoldsAndCaps(t *testing.T) {
 	long := BlockerMessage(errors.New(strings.Repeat("x", 400)))
 	if len([]rune(long)) != 201 || !strings.HasSuffix(long, "…") {
 		t.Fatalf("BlockerMessage() length = %d, want a capped, elided line", len([]rune(long)))
+	}
+	// A multi-byte rune straddling the cut must not be sliced in half: the
+	// message ends up in tbxd.log and in the storageError JSON field.
+	multibyte := BlockerMessage(errors.New(strings.Repeat("a", 198) + "…tail"))
+	if !utf8.ValidString(multibyte) {
+		t.Fatalf("BlockerMessage() = %q, want valid UTF-8", multibyte)
+	}
+	if len([]rune(multibyte)) != 201 || !strings.HasSuffix(multibyte, "…") {
+		t.Fatalf("BlockerMessage() length = %d, want a capped, elided line", len([]rune(multibyte)))
 	}
 }

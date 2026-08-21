@@ -80,9 +80,11 @@ func BlockerMessage(blocker error) string {
 		}
 	}
 	message := strings.Join(lines, "; ")
+	// Cut on a rune boundary: slicing bytes can split a multi-byte rune and
+	// leave invalid UTF-8 in the daemon log and in the status JSON.
 	const blockerMessageMaxLen = 200
-	if len(message) > blockerMessageMaxLen {
-		message = message[:blockerMessageMaxLen] + "…"
+	if runes := []rune(message); len(runes) > blockerMessageMaxLen {
+		message = string(runes[:blockerMessageMaxLen]) + "…"
 	}
 	return message
 }
