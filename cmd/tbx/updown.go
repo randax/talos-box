@@ -12,6 +12,7 @@ import (
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/config"
 	"github.com/randax/talos-box/internal/daemon"
+	"github.com/randax/talos-box/internal/imagecache"
 )
 
 const defaultConfigFile = "talosbox.yaml"
@@ -25,6 +26,11 @@ const (
 	storageProvisionDeadline = daemon.StorageProvisionTimeout
 	nodeBootDeadline         = daemon.NodeBootTimeout
 	kubernetesReadyDeadline  = daemon.KubernetesReadyWaitTimeout
+	// A create also prepares the Talos image inside the same request — the
+	// Image Factory download, the decompression and the node disk clones all
+	// run before a node boots — and that phase has no budget of its own, so the
+	// stated deadline carries the cache's own allowance for it (#392).
+	imagePrepareDeadline = imagecache.PrepareAllowance
 )
 
 // livenessInterval is how often a blocking lifecycle call reports it is still
@@ -33,8 +39,10 @@ var livenessInterval = time.Minute
 
 // livenessPreambleDelay is how long a --quiet call waits before announcing its
 // provisioning window. The window is worth stating up front for real work, but
-// a run the planner classifies as a no-op answers well inside this delay and
-// must not open by announcing work it never does (#421). Tests shorten it.
+// a run the planner classifies as a no-op must not open by announcing work it
+// never does (#421). --quiet carries no stage stream to read the plan from, so
+// the delay is a heuristic: a no-op answers well inside it in the normal case,
+// while one held longer by slow node probes can still reach the preamble.
 var livenessPreambleDelay = 5 * time.Second
 
 // livenessGrace is how far past its stated deadline a blocking call may run
@@ -183,12 +191,13 @@ func provisionDeadline(storage bool) time.Duration {
 	return cniProvisionDeadline
 }
 
-// createProvisionDeadline is provisionDeadline plus the boot wait a create runs
-// ahead of provisioning: the daemon holds a create for both, and a heartbeat
-// stating only the provisioning half reports an elapsed time past its own
-// deadline on any host where a node is slow to lease DHCP.
+// createProvisionDeadline is provisionDeadline plus the image prepare and boot
+// waits a create runs ahead of provisioning: the daemon holds a create for all
+// three, and a heartbeat stating only the provisioning half reports an elapsed
+// time past its own deadline on any host with a cold image cache or a node slow
+// to lease DHCP.
 func createProvisionDeadline(storage bool) time.Duration {
-	return provisionDeadline(storage) + nodeBootDeadline
+	return provisionDeadline(storage) + imagePrepareDeadline + nodeBootDeadline
 }
 
 // startedProvisionDeadline is createProvisionDeadline plus the Kubernetes

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -309,4 +310,81 @@ func runSlowCLI(t *testing.T, responses []string, run func(cli) error) (string, 
 		}
 	}
 	return stdout.String(), stderr.String()
+}
+
+// The client-side bound exists to catch a hung gate, not to cap a call that is
+// working: the image prepare a cold create runs inside the same request has no
+// budget of its own, so a daemon that keeps narrating must keep its connection
+// deadline re-armed and only silence past the bound may fail (#392).
+func TestNarratedCallRearmsItsDeadlineOnEveryStage(t *testing.T) {
+	stages := 10
+	interval := 10 * time.Millisecond
+	bound := 40 * time.Millisecond
+
+	socket := narratingDaemon(t, stages, interval, true)
+	response, err := exchangeDeadlined(socket, "cluster.create", map[string]string{"name": "demo"}, bound, func(string) {})
+	if err != nil {
+		t.Fatalf("a call narrating past its bound failed: %v", err)
+	}
+	if !response.OK {
+		t.Fatalf("narrated call result = %+v, want OK", response)
+	}
+
+	// The same daemon that narrates and then goes quiet still fails: the bound
+	// measures silence, and silence past it is a hang.
+	silent := narratingDaemon(t, stages, interval, false)
+	if _, err := exchangeDeadlined(silent, "cluster.create", map[string]string{"name": "demo"}, bound, func(string) {}); err == nil {
+		t.Fatal("a call that stopped narrating past its bound returned no error")
+	} else if !isTimeout(err) {
+		t.Fatalf("silent call error = %v, want a timeout", err)
+	}
+}
+
+// narratingDaemon serves one request with `stages` progress responses spaced by
+// `interval`, then either answers or falls silent forever.
+func narratingDaemon(t *testing.T, stages int, interval time.Duration, answer bool) string {
+	t.Helper()
+	home, err := os.MkdirTemp("/tmp", "tbx-narrate-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	socket := filepath.Join(home, "tbxd.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	release := make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+	go func() {
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer func() { _ = connection.Close() }()
+		var request daemon.Request
+		if decodeErr := json.NewDecoder(connection).Decode(&request); decodeErr != nil {
+			return
+		}
+		encoder := json.NewEncoder(connection)
+		for index := 0; index < stages; index++ {
+			select {
+			case <-release:
+				return
+			case <-time.After(interval):
+			}
+			if encodeErr := encoder.Encode(daemon.Response{Stage: fmt.Sprintf("preparing the Talos image (%d)", index)}); encodeErr != nil {
+				return
+			}
+		}
+		if answer {
+			_ = encoder.Encode(daemon.Response{OK: true})
+			return
+		}
+		<-release
+	}()
+	return socket
 }

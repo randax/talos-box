@@ -925,10 +925,21 @@ func exchangeDeadlined(socketPath, op string, args any, timeout time.Duration, o
 		return daemon.Response{}, dialError{err: err}
 	}
 	defer func() { _ = connection.Close() }()
-	if timeout > 0 {
-		if err := connection.SetDeadline(time.Now().Add(timeout)); err != nil {
-			return daemon.Response{}, fmt.Errorf("set daemon deadline: %w", err)
+	// The deadline bounds silence, not the call: it is re-armed below on every
+	// stage the daemon narrates, so a request that is still reporting progress
+	// — a cold image fetch, a slow reconcile — is never mistaken for a hang,
+	// while one that stops talking altogether still fails (#392).
+	arm := func() error {
+		if timeout <= 0 {
+			return nil
 		}
+		if err := connection.SetDeadline(time.Now().Add(timeout)); err != nil {
+			return fmt.Errorf("set daemon deadline: %w", err)
+		}
+		return nil
+	}
+	if err := arm(); err != nil {
+		return daemon.Response{}, err
 	}
 
 	rawArgs, err := json.Marshal(args)
@@ -950,6 +961,9 @@ func exchangeDeadlined(socketPath, op string, args any, timeout time.Duration, o
 		if response.IsProgress() {
 			if onStage != nil {
 				onStage(response.Stage)
+			}
+			if err := arm(); err != nil {
+				return daemon.Response{}, err
 			}
 			continue
 		}
