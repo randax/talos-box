@@ -115,7 +115,8 @@ func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if err != nil {
 		return ClusterSummary{}, err
 	}
-	// Measured before the batch consumes the saves it dates.
+	// Measured before the batch consumes the saves it dates; only reported
+	// below if a node actually restored from one.
 	driftWarning := clockDriftWarning(dir, time.Now())
 	nodes := s.vms[item.Name]
 	if nodes == nil {
@@ -123,7 +124,7 @@ func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
 		s.vms[item.Name] = nodes
 	}
 	var attempted []string
-	warnings, err := resumeNodeBatch(item.Nodes, func(node cluster.Node) (resumedNode, error) {
+	warnings, restored, err := resumeNodeBatch(item.Nodes, func(node cluster.Node) (resumedNode, error) {
 		savePath := saveStatePath(dir, node.Name)
 		_, saveErr := os.Stat(savePath)
 		var fallbackErr error
@@ -144,7 +145,7 @@ func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
 			nodeWarning = coldBootWarning(node.Name, saveErr != nil, fallbackErr)
 			log.Printf("resume %s: %v", node.Name, fallbackErr)
 		}
-		return resumedNode{savePath: savePath, warning: nodeWarning}, nil
+		return resumedNode{savePath: savePath, warning: nodeWarning, restored: fallbackErr == nil}, nil
 	}, func() error {
 		return s.closeNodes(item.Name, nodes, attempted)
 	})
@@ -152,6 +153,12 @@ func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
 		return ClusterSummary{}, err
 	}
 	go s.bindMirrors(item.SubnetIndex) // resume bypasses start(); rebind the gateway
+	if !restored {
+		// Every node cold-booted, so every guest took its clock from the host
+		// at boot: there is no drift to report, and the warning's stop/start
+		// advice would name a reboot that has just happened (#416 review).
+		driftWarning = ""
+	}
 	result := summary(item, true)
 	result.setWarnings(append(append([]string{subnetWarning, overcommitWarning}, pressureWarnings...), append(warnings, driftWarning)...)...)
 	return result, nil
@@ -347,25 +354,33 @@ func closeTruncatedQuotes(summary string) string {
 type resumedNode struct {
 	savePath string
 	warning  string
+	// restored reports that this node came back from its save rather than
+	// cold-booting. Only a restored guest carries a stopped clock, so it is
+	// what the drift warning is gated on.
+	restored bool
 }
 
 // resumeNodeBatch is the cluster-wide commit boundary: a failed node rolls
 // back attempted VMs without consuming any saved states, while full success
-// consumes the complete batch together.
-func resumeNodeBatch[T any](nodes []T, resume func(T) (resumedNode, error), rollback func() error) ([]string, error) {
+// consumes the complete batch together. It also reports whether any node
+// actually restored from its save, which is what separates a resume that
+// carries stopped guest clocks from one that cold-booted the cluster.
+func resumeNodeBatch[T any](nodes []T, resume func(T) (resumedNode, error), rollback func() error) ([]string, bool, error) {
 	var savePaths, warnings []string
+	var restored bool
 	for _, node := range nodes {
 		result, err := resume(node)
 		if err != nil {
-			return nil, errors.Join(err, rollback())
+			return nil, false, errors.Join(err, rollback())
 		}
 		savePaths = append(savePaths, result.savePath)
+		restored = restored || result.restored
 		if result.warning != "" {
 			warnings = append(warnings, result.warning)
 		}
 	}
 	removeSaveStateFiles(savePaths)
-	return warnings, nil
+	return warnings, restored, nil
 }
 
 // removeSaveStateFiles commits a successful cluster-wide resume. Callers keep
@@ -418,6 +433,18 @@ func recordSaveStateOwner(savePath string) {
 	if err := os.WriteFile(owner, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
 		log.Printf("record saved state owner %s: %v", owner, err)
 	}
+}
+
+// savedStateStale reports memory a resume can no longer restore. Losing the
+// writing process only costs the memory on a backend whose restore needs that
+// process: QEMU restores from the versioned save file alone, so on Linux a
+// replaced daemon changes nothing and the save stays as good as it was (#413
+// review). The pid sidecar is therefore the vz-only signal it was written as.
+func (s *Server) savedStateStale(clusterName string) bool {
+	if s.hypervisor != nil && s.hypervisor.Capabilities().SuspendSurvivesDaemonRestart {
+		return false
+	}
+	return savedStateOwnerReplaced(clusterName)
 }
 
 // savedStateOwnerReplaced reports suspended memory this daemon process did not

@@ -210,7 +210,7 @@ func TestResumeNodeBatchCommitsSaveStatesOnlyAfterAllNodesResume(t *testing.T) {
 	}
 
 	rollbackCalled := false
-	_, err := resumeNodeBatch(
+	_, _, err := resumeNodeBatch(
 		[]string{"cp-1", "worker-1"},
 		func(node string) (resumedNode, error) {
 			if node == "worker-1" {
@@ -235,7 +235,7 @@ func TestResumeNodeBatchCommitsSaveStatesOnlyAfterAllNodesResume(t *testing.T) {
 		}
 	}
 
-	_, err = resumeNodeBatch(
+	_, _, err = resumeNodeBatch(
 		[]string{"cp-1", "worker-1"},
 		func(node string) (resumedNode, error) {
 			return resumedNode{savePath: paths[node]}, nil
@@ -371,6 +371,116 @@ func TestClockDriftWarning(t *testing.T) {
 			}
 			if !strings.Contains(warning, testCase.want) {
 				t.Fatalf("warning = %q, want it to mention %q", warning, testCase.want)
+			}
+		})
+	}
+}
+
+// TestResumeReportsClockDriftOnlyWhenANodeRestored pins the #416 review: the
+// drift is measured from the save files' mtimes before the batch runs, so a
+// resume in which every node cold-booted used to warn about clocks that had
+// just been taken from the host at boot — and advised a stop/start of a
+// cluster that had effectively just done one.
+func TestResumeReportsClockDriftOnlyWhenANodeRestored(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		coldBoot bool
+		wantWarn bool
+	}{
+		{name: "restored from its save", wantWarn: true},
+		{name: "cold-booted instead", coldBoot: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			item, err := cluster.New("drift", 0, 1, 0, cluster.NodeDefaults{CPUs: 1, MemoryMiB: 1024})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := cluster.Save(item); err != nil {
+				t.Fatal(err)
+			}
+			dir, err := cluster.Dir(item.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			save := saveStatePath(dir, item.Nodes[0].Name)
+			if err := os.WriteFile(save, []byte("saved"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			suspendedAt := time.Now().Add(-12 * time.Minute)
+			if err := os.Chtimes(save, suspendedAt, suspendedAt); err != nil {
+				t.Fatal(err)
+			}
+
+			backend := &fakeHypervisor{launch: func(_ context.Context, spec hypervisor.Spec) (hypervisor.Machine, error) {
+				if testCase.coldBoot {
+					spec.Restore.Fallback(hypervisor.ErrIncompatibleSave)
+				}
+				return &fakeMachine{active: true}, nil
+			}}
+			service := &Server{
+				hypervisor:    backend,
+				vms:           make(map[string]map[string]hypervisor.Machine),
+				subnetSources: emptySubnetSources(),
+			}
+
+			result, err := service.resumeCluster([]byte(`{"name":"drift"}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			drifted := strings.Contains(strings.Join(result.Warnings, "\n"), "behind the host")
+			if drifted != testCase.wantWarn {
+				t.Fatalf("clock-drift warning present = %t, want %t (warnings: %q)", drifted, testCase.wantWarn, result.Warnings)
+			}
+		})
+	}
+}
+
+// TestSavedStateStaleOnlyWhereRestoreNeedsTheWritingProcess pins the #413
+// review: the pid sidecar is a vz-only signal. QEMU restores from the
+// versioned save file alone, so a replaced daemon costs the memory nothing and
+// status must not tell the operator that resume and start now cost the same.
+func TestSavedStateStaleOnlyWhereRestoreNeedsTheWritingProcess(t *testing.T) {
+	for _, testCase := range []struct {
+		name      string
+		survives  bool
+		wantStale bool
+	}{
+		{name: "restore needs the writing process", wantStale: true},
+		{name: "restore reads the save file alone", survives: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			dir := seedStoppedCluster(t, "qa-own")
+			save := saveStatePath(dir, "qa-own-cp-1")
+			if err := os.WriteFile(save, []byte("saved"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(saveStateOwnerPath(save), []byte("999999"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			service := &Server{
+				hypervisor: &fakeHypervisor{capabilities: hypervisor.Capabilities{
+					Suspend:                      hypervisor.FeatureStatus{Supported: true},
+					SuspendSurvivesDaemonRestart: testCase.survives,
+				}},
+				vms: make(map[string]map[string]hypervisor.Machine),
+			}
+			statuses, err := service.status(mustRawJSON(t, statusArgs{Cluster: "qa-own"}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if statuses[0].SavedStateStale != testCase.wantStale {
+				t.Fatalf("SavedStateStale = %t, want %t", statuses[0].SavedStateStale, testCase.wantStale)
+			}
+			joined := strings.Join(statuses[0].Hints, "\n")
+			want := "will cold-boot the nodes"
+			if !testCase.wantStale {
+				want = "tbx cluster start discards the saved memory"
+			}
+			if !strings.Contains(joined, want) {
+				t.Fatalf("hints = %q, want %q", joined, want)
 			}
 		})
 	}

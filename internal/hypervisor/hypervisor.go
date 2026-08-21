@@ -26,8 +26,14 @@ type FeatureStatus struct {
 
 // Capabilities is the set of optional features detected for a backend.
 type Capabilities struct {
-	Suspend         FeatureStatus
-	BalloonReadback FeatureStatus
+	Suspend FeatureStatus
+	// SuspendSurvivesDaemonRestart reports whether a saved state outlives the
+	// process that wrote it. QEMU restores from the versioned file alone, so a
+	// save survives a daemon restart; vz restore needs the file-handle-backed
+	// device identity of the writing process, so it does not. Status uses this
+	// to decide whether replacing the daemon has already lost the memory.
+	SuspendSurvivesDaemonRestart bool
+	BalloonReadback              FeatureStatus
 	// GuestAgent reports whether the backend can expose the QEMU guest-agent
 	// channel a machine needs for the qemu-guest-agent extension to do anything.
 	GuestAgent FeatureStatus

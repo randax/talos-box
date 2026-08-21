@@ -268,10 +268,11 @@ type ClusterStatus struct {
 	// a distinction start would silently erase (#272).
 	Suspended bool `json:"suspended,omitempty"`
 	// SavedStateStale reports suspended memory whose owning daemon process is
-	// gone. A save is only restorable by the daemon that wrote it, so once
-	// `tbx system restart --force` replaced that process the memory is already
-	// lost and a resume will cold-boot — which the suspend hint used to
-	// promise the opposite of (#413).
+	// gone on a backend that needs it. Where restore depends on the writing
+	// process (vz), `tbx system restart --force` has already lost the memory
+	// and a resume will cold-boot — which the suspend hint used to promise the
+	// opposite of (#413). Where restore reads the save file alone (QEMU), the
+	// memory outlives the daemon and this stays false.
 	SavedStateStale bool `json:"savedStateStale,omitempty"`
 	KubernetesReady bool `json:"kubernetesReady"`
 	// KubernetesNotReadySince is when the daemon first observed this cluster
@@ -1282,7 +1283,7 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), AllowUnsafeDomain: item.AllowUnsafeDomain, TalosVersion: item.TalosVersion, Schematic: item.Schematic, BaseSchematic: item.BaseSchematic, TalosExtensions: item.TalosExtensions, ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: running,
 			// derived from disk, not from daemon memory, so a restarted
 			// daemon still reports its predecessor's suspension
-			Suspended: !running && clusterHasSavedState(item.Name), SavedStateStale: !running && savedStateOwnerReplaced(item.Name), Capabilities: s.clusterCapabilities(item), ConfigOrigin: item.ConfigOrigin, subnetIndex: item.SubnetIndex}
+			Suspended: !running && clusterHasSavedState(item.Name), SavedStateStale: !running && s.savedStateStale(item.Name), Capabilities: s.clusterCapabilities(item), ConfigOrigin: item.ConfigOrigin, subnetIndex: item.SubnetIndex}
 		for _, node := range item.Nodes {
 			running := s.nodeRunning(item.Name, node.Name)
 			clusterStatus.Nodes = append(clusterStatus.Nodes, NodeStatus{Name: node.Name, Role: node.Role, MAC: node.MAC, Phase: ClassifyPhase(running, ProbeResult{}), StartedAt: s.vmStartedAt(item.Name, node.Name),
