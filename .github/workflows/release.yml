@@ -62,6 +62,8 @@ jobs:
     name: GoReleaser
     needs: gate
     runs-on: macos-15
+    # Notarization waits up to 60m per binary (see .goreleaser.yaml).
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -76,11 +78,54 @@ jobs:
         run: |
           test -n "$HOMEBREW_TAP_TOKEN" || { echo "HOMEBREW_TAP_TOKEN secret is missing" >&2; exit 1; }
           curl -fsS -H "Authorization: Bearer $HOMEBREW_TAP_TOKEN" https://api.github.com/repos/randax/homebrew-tap >/dev/null
+      - name: Signing and notarization secrets are present
+        env:
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_P12_PASSWORD }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          # A release without these would ship unsigned darwin binaries that
+          # cannot use Virtualization.framework; refuse instead of publishing.
+          for name in MACOS_SIGN_P12 MACOS_SIGN_PASSWORD MACOS_NOTARY_KEY MACOS_NOTARY_KEY_ID MACOS_NOTARY_ISSUER_ID; do
+            test -n "${!name}" || { echo "$name secret is missing" >&2; exit 1; }
+          done
+      - name: Import the signing identity and notary key
+        env:
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_P12_PASSWORD }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+        run: |
+          # A throwaway keychain holds the Developer ID identity for codesign;
+          # the notary key goes to a file notarytool reads directly.
+          keychain=$RUNNER_TEMP/release.keychain-db
+          keychain_password=$(uuidgen)
+          printf '%s' "$MACOS_SIGN_P12" | base64 --decode -o "$RUNNER_TEMP/release.p12"
+          printf '%s' "$MACOS_NOTARY_KEY" | base64 --decode -o "$RUNNER_TEMP/notary.p8"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/release.p12" -P "$MACOS_SIGN_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          identity=$(security find-identity -v -p codesigning "$keychain" | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)
+          test -n "$identity" || { echo "no Developer ID Application identity in the imported .p12" >&2; exit 1; }
+          echo "MACOS_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+          echo "MACOS_NOTARY_KEY_FILE=$RUNNER_TEMP/notary.p8" >> "$GITHUB_ENV"
+          echo "MACOS_NOTARY_KEY_ID=${{ secrets.MACOS_NOTARY_KEY_ID }}" >> "$GITHUB_ENV"
+          echo "MACOS_NOTARY_ISSUER_ID=${{ secrets.MACOS_NOTARY_ISSUER_ID }}" >> "$GITHUB_ENV"
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           distribution: goreleaser
           version: v2.17.1
-          args: release --clean
+          # The darwin build hooks wait up to MACOS_NOTARY_TIMEOUT each for
+          # Apple's verdict (in parallel); GoReleaser's own deadline must outlast
+          # them or it cancels the run mid-wait (v0.1.1-rc.4).
+          args: release --clean --timeout 150m
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          # MACOS_SIGN_IDENTITY and MACOS_NOTARY_* reach the build hooks from
+          # GITHUB_ENV (scripts/release/sign-darwin.sh).
+          MACOS_NOTARY_TIMEOUT: 30m

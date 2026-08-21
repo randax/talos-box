@@ -2,6 +2,12 @@
 # Virtualization.framework, while the Linux binaries are pure Go and
 # cross-compile with CGO_ENABLED=0. One run means one release, one checksum
 # file, and one brew formula that knows every platform.
+#
+# Each darwin build's post hook signs it with the Developer ID identity and
+# notarizes it with Apple's notarytool (scripts/release/sign-darwin.sh);
+# GoReleaser's built-in notarize pipe was dropped after its submissions kept
+# failing with 401 from hosted runners while the same key worked elsewhere.
+# A local snapshot without MACOS_SIGN_IDENTITY ad-hoc signs instead.
 version: 2
 project_name: tbx
 
@@ -19,7 +25,7 @@ builds:
     ldflags:
       - "-X github.com/randax/talos-box/internal/version.Version={{ .Tag }}"
     hooks:
-      post: codesign --force --sign - --entitlements build/entitlements.plist {{ .Path }}
+      post: scripts/release/sign-darwin.sh {{ .Path }}
   - id: tbxd-darwin
     main: ./cmd/tbxd
     binary: tbxd
@@ -29,7 +35,7 @@ builds:
     ldflags:
       - "-X github.com/randax/talos-box/internal/version.Version={{ .Tag }}"
     hooks:
-      post: codesign --force --sign - --entitlements build/entitlements.plist {{ .Path }}
+      post: scripts/release/sign-darwin.sh {{ .Path }}
   - id: tbx-helper-darwin
     main: ./cmd/tbx-helper
     binary: tbx-helper
@@ -38,6 +44,8 @@ builds:
     env: [CGO_ENABLED=1]
     ldflags:
       - "-X github.com/randax/talos-box/internal/version.Version={{ .Tag }}"
+    hooks:
+      post: scripts/release/sign-darwin.sh {{ .Path }}
   - id: tbx-linux
     main: ./cmd/tbx
     binary: tbx
@@ -62,6 +70,7 @@ builds:
     env: [CGO_ENABLED=0]
     ldflags:
       - "-X github.com/randax/talos-box/internal/version.Version={{ .Tag }}"
+
 
 archives:
   - id: default
@@ -105,8 +114,10 @@ homebrew_casks:
         sudo tbx system install
     hooks:
       post:
-        # Ad-hoc signed, not notarized: strip quarantine so Gatekeeper lets the
-        # entitled binaries run.
+        # The binaries are Developer ID signed and notarized, but the notary
+        # ticket is issued asynchronously and Apple's queue has taken hours;
+        # stripping quarantine keeps an install working in that window. Drop
+        # this once tickets reliably precede the release.
         install: |
           if OS.mac?
             ["tbx", "tbxd", "tbx-helper"].each do |bin|
