@@ -2,7 +2,10 @@
 // writes unsafe even when the requested VM memory is not overcommitted.
 package hostpressure
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 const (
 	extremeSwapUsedPercent       = 90
@@ -58,6 +61,57 @@ type Snapshot struct {
 	Swap           Usage
 	DataVolume     Usage
 	MemoryPressure MemoryPressure
+	// FreeMemoryMiB is host memory available right now. Nothing in Assess reads
+	// it — the steady-state verdict is pressure and swap — but it is the number
+	// the provision-start gate refuses on, so a diagnostic that prints it lets
+	// an operator see a start coming before it is refused (#420, #397). Zero
+	// means it was not measured, and it is reported as such.
+	FreeMemoryMiB int
+}
+
+// Summary renders the numbers behind a host-pressure verdict — free memory,
+// swap in use, and free space on the volume holding ~/.talosbox — plus the
+// headroom arithmetic the provision-start gate will apply to the next bringup.
+// A PASS with no numbers has to be re-derived by hand with memory_pressure,
+// sysctl vm.swapusage and df before it can be attested, and it says nothing
+// about whether the *next* cluster will be admitted (#420, #397).
+func (s Snapshot) Summary(reserveMiB int) string {
+	parts := []string{"free memory unmeasured"}
+	if s.FreeMemoryMiB > 0 {
+		parts[0] = fmt.Sprintf("%d MiB free memory", s.FreeMemoryMiB)
+	}
+	if s.Swap.TotalBytes == 0 {
+		parts = append(parts, "swap disabled or unmeasurable")
+	} else {
+		parts = append(parts, fmt.Sprintf("%.1f GiB of %.1f GiB swap in use", gib(s.Swap.usedBytes()), gib(s.Swap.TotalBytes)))
+	}
+	if s.DataVolume.TotalBytes == 0 {
+		parts = append(parts, "~/.talosbox volume unmeasurable")
+	} else {
+		parts = append(parts, fmt.Sprintf("%.1f GiB free on the ~/.talosbox volume", gib(s.DataVolume.AvailableBytes)))
+	}
+	return strings.Join(parts, ", ") + "; " + s.headroomClause(reserveMiB)
+}
+
+// headroomClause states what the provision-start gate would admit from this
+// reading: starting guests beside running ones must leave the balloon reserve
+// free, so the room for the *next* cluster is measured free minus the reserve —
+// the arithmetic a host that reads PASS and is then refused a second cluster
+// never got to see (#397).
+func (s Snapshot) headroomClause(reserveMiB int) string {
+	if s.FreeMemoryMiB <= 0 || reserveMiB <= 0 {
+		return "starting guests beside running ones must leave the " +
+			fmt.Sprintf("%d MiB", reserveMiB) + " balloon reserve free, which needs a free-memory reading this host did not give"
+	}
+	roomMiB := s.FreeMemoryMiB - reserveMiB
+	if roomMiB < 0 {
+		roomMiB = 0
+	}
+	return fmt.Sprintf(
+		"starting guests beside running ones must leave the %d MiB balloon reserve free, so there is room for %d MiB of new guests right now,"+
+			" plus whatever the balloon controller can take back from the guests already running",
+		reserveMiB, roomMiB,
+	)
 }
 
 // Severity ranks a finding for the two consumers of Assess.
@@ -76,6 +130,12 @@ const (
 	memoryRemedy      = "free host memory: run `tbx down` to stop running clusters, or quit memory-heavy apps, then retry"
 	storageRemedy     = "free host storage: run `tbx cache prune --all`, or destroy unused clusters, then retry"
 )
+
+// MemoryRemedy is the runnable remediation every host-memory refusal carries.
+// It is exported so a caller that refuses on its own memory arithmetic — the
+// daemon, when a pre-balloon it was counting on fails to apply — ends its
+// message the same way this package's findings do.
+const MemoryRemedy = memoryRemedy
 
 // Finding is one host-pressure condition: what was measured, and what to run
 // about it.

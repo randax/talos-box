@@ -78,12 +78,22 @@ type Server struct {
 	nodeProbe             func(string) ProbeResult
 	hostFreeMemory        func() (int, error)
 	hostTotalMemory       func() (int, error)
-	helperCheck           func() error
-	maintenanceLoad       func(string) (cluster.Cluster, error)
-	lifecycleContext      context.Context
-	lifecycleCancel       context.CancelFunc
-	mirrors               *mirror.Manager
-	mirrorOffline         atomic.Bool
+	// balloonables is the balloon controller's view of the running guests,
+	// seamed so a test can supply it without the apid probe Balloonables runs
+	// on backends without balloon readback. Nil means the real one.
+	balloonables func() map[string]balloon.Balloonable
+	// balloonHold* is the pre-balloon taken at guest-start admission that the
+	// balloon manager must not hand back until the admitted guests have booted
+	// (#398). See holdBalloonReclaim.
+	balloonHoldMu    sync.Mutex
+	balloonHoldMiB   int
+	balloonHoldUntil time.Time
+	helperCheck      func() error
+	maintenanceLoad  func(string) (cluster.Cluster, error)
+	lifecycleContext context.Context
+	lifecycleCancel  context.CancelFunc
+	mirrors          *mirror.Manager
+	mirrorOffline    atomic.Bool
 	// settingsPath is where daemon-wide modes are persisted so they survive a
 	// restart (#318). An empty path disables persistence, which is what a
 	// hand-built test server wants.

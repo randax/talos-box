@@ -77,7 +77,11 @@ func run() error {
 	// registry mirrors are bound per cluster gateway by the daemon (see #39).
 
 	balloonStop := make(chan struct{})
-	go balloon.Run(balloon.DefaultConfig(), server.Balloonables, balloonStop)
+	balloonConfig := balloon.DefaultConfig()
+	// Hold the pre-balloon the provision-start gate takes for a booting guest,
+	// so the manager does not hand it straight back (#398).
+	balloonConfig.HoldMiB = server.BalloonHoldMiB
+	go balloon.Run(balloonConfig, server.Balloonables, balloonStop)
 	defer close(balloonStop)
 
 	serveErrors := make(chan error, 2)

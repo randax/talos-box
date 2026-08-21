@@ -11,6 +11,7 @@ func TestAssessProvisionStart(t *testing.T) {
 		name        string
 		in          ProvisionStart
 		wantBlocks  int
+		wantReclaim int
 		wantDetails []string
 	}{
 		{
@@ -40,6 +41,34 @@ func TestAssessProvisionStart(t *testing.T) {
 				RunningVMMiB: 6144, NewVMMiB: 6144, HostFreeMiB: 6144 + reserve - 1, ReserveMiB: reserve,
 			},
 			wantBlocks: 1,
+		},
+		{
+			// #398: the same one-MiB shortfall with running guests the balloon
+			// controller can shrink is not a refusal — it is a pre-balloon of
+			// exactly the shortfall, which is the --force-free path forward.
+			name: "a shortfall the running guests can give back is reclaimed, not refused (#398)",
+			in: ProvisionStart{
+				RunningVMMiB: 6144, NewVMMiB: 6144, HostFreeMiB: 6144 + reserve - 1, ReserveMiB: reserve,
+				ReclaimableMiB: 3072,
+			},
+			wantReclaim: 1,
+		},
+		{
+			name: "a shortfall exactly covered by the reclaimable memory is admitted (#398)",
+			in: ProvisionStart{
+				RunningVMMiB: 6144, NewVMMiB: 6144, HostFreeMiB: 6144 + reserve - 3072, ReserveMiB: reserve,
+				ReclaimableMiB: 3072,
+			},
+			wantReclaim: 3072,
+		},
+		{
+			name: "a shortfall past the reclaimable memory still refuses, and says so (#398)",
+			in: ProvisionStart{
+				RunningVMMiB: 6144, NewVMMiB: 6144, HostFreeMiB: 6144 + reserve - 3073, ReserveMiB: reserve,
+				ReclaimableMiB: 3072,
+			},
+			wantBlocks:  1,
+			wantDetails: []string{"3072 MiB the running guests can give back"},
 		},
 		{
 			name: "tight host with no guests running is the balloon controller's job",
@@ -193,7 +222,11 @@ func TestAssessProvisionStart(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			findings := AssessProvisionStart(test.in)
+			plan := AssessProvisionStart(test.in)
+			findings := plan.Findings
+			if plan.ReclaimMiB != test.wantReclaim {
+				t.Fatalf("AssessProvisionStart() ReclaimMiB = %d, want %d", plan.ReclaimMiB, test.wantReclaim)
+			}
 			blocks := 0
 			joined := ""
 			for _, finding := range findings {
@@ -242,14 +275,14 @@ func TestAssessProvisionStartSwapCeilingIsNotSteadyState(t *testing.T) {
 	admitted := AssessProvisionStart(ProvisionStart{
 		RunningVMMiB: 6144, NewVMMiB: 6144, HostFreeMiB: 1 << 20, ReserveMiB: 4096,
 		Swap: snapshot.Swap, MemoryPressure: snapshot.MemoryPressure,
-	})
+	}).Findings
 	if len(admitted) != 0 {
 		t.Fatalf("AssessProvisionStart() = %v, want no finding at 80%% swap use with normal pressure", admitted)
 	}
 	got := AssessProvisionStart(ProvisionStart{
 		RunningVMMiB: 6144, NewVMMiB: 6144, HostFreeMiB: 1 << 20, ReserveMiB: 4096,
 		Swap: snapshot.Swap, MemoryPressure: MemoryPressureWarning,
-	})
+	}).Findings
 	if len(got) != 1 || got[0].Severity != SeverityBlock {
 		t.Fatalf("AssessProvisionStart() = %v, want one blocking swap finding", got)
 	}

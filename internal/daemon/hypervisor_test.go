@@ -42,6 +42,7 @@ func (f *fakeHypervisor) Architecture() hypervisor.Architecture {
 type fakeMachine struct {
 	active        bool
 	setMemoryErr  error
+	memoryTargets []int
 	calls         []string
 	stopDeadline  bool
 	stopRemaining time.Duration
@@ -50,8 +51,14 @@ type fakeMachine struct {
 	onClose       func()
 }
 
-func (f *fakeMachine) Active() bool                 { return f.active }
-func (f *fakeMachine) SetMemoryTargetMiB(int) error { return f.setMemoryErr }
+func (f *fakeMachine) Active() bool { return f.active }
+func (f *fakeMachine) SetMemoryTargetMiB(targetMiB int) error {
+	if f.setMemoryErr != nil {
+		return f.setMemoryErr
+	}
+	f.memoryTargets = append(f.memoryTargets, targetMiB)
+	return nil
+}
 func (f *fakeMachine) Stop(ctx context.Context) error {
 	f.calls = append(f.calls, "stop")
 	if deadline, ok := ctx.Deadline(); ok {
