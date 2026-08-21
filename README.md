@@ -226,11 +226,12 @@ version — in this same list format, so `tbx manifests demo images | tbx cache 
 hand-maintained list at all.
 
 Blank lines and lines beginning with `#` are ignored. `--check` verifies the cached manifest
-graph and host-platform image offline; `--deep` is valid only with `--check` and additionally
-rehashes blobs. It does not run a live-cluster pull test. Because `--check --deep` is the
-pre-travel gate, it also verifies the images every node needs before any pod can start but that
-no list can name — the CRI pod sandbox (`registry.k8s.io/pause`) image — so a missing one is
-reported while it can still be pulled instead of deadlocking every static pod offline.
+graph and host-platform image offline; `--deep` is valid only with `--check` and adds only a
+rehash of the cached blobs. Neither runs a live-cluster pull test. Because every check is the
+pre-travel gate, both modes also verify the images every node needs before any pod can start but
+that no list can name — the CRI pod sandbox (`registry.k8s.io/pause`) image — so a missing one is
+reported while it can still be pulled instead of deadlocking every static pod offline, and a
+plain `--check` never hands out an all-clear that `--deep` would fail.
 
 `tbx mirror offline` reports whether the pull-through mirror may reach upstream registries;
 `tbx mirror offline on` serves cached content only (uncached content fails), and `off` restores

@@ -40,8 +40,9 @@ const sandboxImageKubernetesMinor = "1.36"
 
 // BootstrapRequiredImages is what every node must find in the cache before a
 // single static pod can start, and which no rendered object carries — so no
-// derived warm list can contain it. `cache warm --check --deep` verifies this
-// set on top of whatever list it was handed, so a venue finds out the sandbox
+// derived warm list can contain it. `cache warm --check`, with or without
+// `--deep`, verifies this set on top of whatever list it was handed, so a
+// venue finds out the sandbox
 // image is missing while it can still be pulled rather than from a bootstrap
 // that cannot recover.
 func BootstrapRequiredImages() []string {

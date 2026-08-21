@@ -119,7 +119,9 @@ end-to-end timing and cluster-up gate remains #97. The ISO+install path is dropp
   more lists (use `-` for stdin once); blank lines and `#` comments are ignored. Each entry is a
   fully qualified image reference with a non-`latest` tag or a `sha256`/`sha512` digest; a
   tag-plus-digest entry is the immutable list form. `tbx cache warm --check [--deep] <list>...`
-  verifies that content locally and offline; `--deep` also rehashes blobs and requires `--check`.
+  verifies that content locally and offline; `--deep` only adds a blob rehash and requires
+  `--check`. Both check modes also verify the implicit bootstrap-required set no list can name
+  (the CRI pod sandbox image), so a plain `--check` never gives a false all-clear.
   This verifies cache completeness, not a live-cluster pull.
 - Node disks: `~/.talosbox/clusters/<name>/<node>.img`, **20 GB sparse** default.
 - **Talos version matrix**: each tbx release pins one tested default Talos version (initially
