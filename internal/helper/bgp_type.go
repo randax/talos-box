@@ -27,6 +27,11 @@ type bgpRouteReporter interface {
 	Routes() []bgp.Route
 }
 
+// The real speaker must keep satisfying bgpRouteReporter: the map only demands
+// Stop(), so without this guard a rename or receiver change on Routes would
+// silently downgrade `tbx bgp status` to reporting no announced routes.
+var _ bgpRouteReporter = (*bgp.Speaker)(nil)
+
 // bgpState reads one speaker's reportable state. A speaker the server does not
 // own reports as stopped, and one that cannot report its routes reports none.
 func bgpState(speaker bgpSpeaker, active bool) BGPState {

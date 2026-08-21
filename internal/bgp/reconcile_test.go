@@ -128,3 +128,44 @@ func TestReconcileReportsAddFailure(t *testing.T) {
 		t.Error("route not retried after earlier failure")
 	}
 }
+
+func TestInjectedReportsInstalledRoutesSortedByPrefix(t *testing.T) {
+	fib := newFakeFIB()
+	r := NewReconciler(fib)
+	_ = r.Reconcile([]Route{
+		{Prefix: "172.30.0.201/32", Nexthop: "172.30.0.3"},
+		{Prefix: "172.30.0.200/32", Nexthop: "172.30.0.2"},
+	})
+	want := []Route{
+		{Prefix: "172.30.0.200/32", Nexthop: "172.30.0.2"},
+		{Prefix: "172.30.0.201/32", Nexthop: "172.30.0.3"},
+	}
+	if got := r.Injected(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Injected() = %v, want %v", got, want)
+	}
+
+	// a VIP failover is reflected in the reported nexthop
+	_ = r.Reconcile([]Route{
+		{Prefix: "172.30.0.200/32", Nexthop: "172.30.0.4"},
+		{Prefix: "172.30.0.201/32", Nexthop: "172.30.0.3"},
+	})
+	want[0].Nexthop = "172.30.0.4"
+	if got := r.Injected(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Injected() after failover = %v, want %v", got, want)
+	}
+
+	r.WithdrawAll()
+	if got := r.Injected(); len(got) != 0 {
+		t.Fatalf("Injected() after WithdrawAll = %v, want none", got)
+	}
+}
+
+func TestInjectedOmitsRoutesThatFailedToInstall(t *testing.T) {
+	fib := newFakeFIB()
+	fib.addErr = errors.New("route: permission denied")
+	r := NewReconciler(fib)
+	_ = r.Reconcile([]Route{{Prefix: "172.30.0.200/32", Nexthop: "172.30.0.2"}})
+	if got := r.Injected(); len(got) != 0 {
+		t.Fatalf("Injected() = %v, want none for a route that failed to install", got)
+	}
+}
