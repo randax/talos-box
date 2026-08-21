@@ -3,11 +3,13 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/hypervisor"
@@ -317,5 +319,59 @@ func TestSummaryReportsSuspensionFromSavedStateOnDisk(t *testing.T) {
 	}
 	if summary(item, true).Suspended {
 		t.Fatal("a running cluster is never suspended")
+	}
+}
+
+func TestClockDriftWarning(t *testing.T) {
+	now := time.Date(2026, 8, 21, 18, 48, 12, 0, time.UTC)
+
+	for _, testCase := range []struct {
+		name   string
+		saves  []time.Time
+		want   string
+		absent bool
+	}{
+		{
+			name:   "no saved state",
+			absent: true,
+		},
+		{
+			name:   "brief suspend stays quiet",
+			saves:  []time.Time{now.Add(-2 * time.Second)},
+			absent: true,
+		},
+		{
+			name:  "drift reported from the oldest save",
+			saves: []time.Time{now.Add(-30 * time.Second), now.Add(-2 * time.Minute)},
+			want:  "2m0s behind",
+		},
+		{
+			name:   "host clock moved backwards",
+			saves:  []time.Time{now.Add(time.Minute)},
+			absent: true,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for i, modTime := range testCase.saves {
+				path := saveStatePath(dir, fmt.Sprintf("node-%d", i))
+				if err := os.WriteFile(path, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chtimes(path, modTime, modTime); err != nil {
+					t.Fatal(err)
+				}
+			}
+			warning := clockDriftWarning(dir, now)
+			if testCase.absent {
+				if warning != "" {
+					t.Fatalf("warning = %q, want none", warning)
+				}
+				return
+			}
+			if !strings.Contains(warning, testCase.want) {
+				t.Fatalf("warning = %q, want it to mention %q", warning, testCase.want)
+			}
+		})
 	}
 }

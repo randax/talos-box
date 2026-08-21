@@ -152,6 +152,12 @@ Suspend/resume is capability-gated by the host backend:
 - Linux requires QEMU 8.2+. A save can survive a daemon restart, but restore requires the same
   QEMU version, architecture, and machine type; an incompatible save warns and safely
   cold-boots. QEMU 6.2–8.1 remains supported for every operation except suspend/resume.
+- A resumed guest's clock restarts where it stopped, so it comes back behind the host by the
+  length of the suspend. The Talos machine API offers no resync call, so `tbx` cannot correct
+  it: `resume` reports the expected gap as a warning, and Talos itself closes it at its next
+  NTP poll — minutes away, and not at all on an offline host. Stop and start the cluster
+  instead of resuming it when a workload cannot tolerate a clock jump (certificate validity
+  windows, leases, time-series writers).
 
 On macOS, `sudo tbx system uninstall` removes the helper and resolver integration. On Linux,
 remove or disable the systemd units installed by the selected installation method.
