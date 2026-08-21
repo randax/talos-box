@@ -21,7 +21,7 @@ func (*legacyBGPClient) DisableBGP(string) error                       { return 
 func (*legacyBGPClient) BGPStatus(string) (helper.BGPState, error) {
 	return helper.BGPState{Active: true}, nil
 }
-func (*legacyBGPClient) Close() error                                  { return nil }
+func (*legacyBGPClient) Close() error { return nil }
 
 func TestSetBGPRepairsMigratedLegacyState(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
@@ -109,7 +109,7 @@ func (c *fakeBGPClient) DisableBGP(cluster string) error {
 func (c *fakeBGPClient) BGPStatus(string) (helper.BGPState, error) {
 	return helper.BGPState{Active: c.active}, nil
 }
-func (c *fakeBGPClient) Close() error                { return nil }
+func (c *fakeBGPClient) Close() error { return nil }
 
 func TestDestroyDisablesHostBGPBeforeRemovingState(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
