@@ -102,6 +102,12 @@ type Server struct {
 	balloonHoldMu    sync.Mutex
 	balloonHoldMiB   int
 	balloonHoldUntil time.Time
+	// balloonTargets is the last balloon target this daemon applied per
+	// "cluster/node", so the provision-start gate measures what the running
+	// guests can still give back instead of assuming they are all still at
+	// their configured size (#398). Entries are dropped when the node stops.
+	balloonTargetMu  sync.Mutex
+	balloonTargets   map[string]int
 	helperCheck      func() error
 	maintenanceLoad  func(string) (cluster.Cluster, error)
 	lifecycleContext context.Context

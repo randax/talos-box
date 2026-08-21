@@ -69,8 +69,11 @@ Checks:
                       cluster create)
   system-dns          the system resolver returns each cluster's domain
   routes              host routes reach the nodes of running clusters
+  inter-cluster       running clusters reach each other's ingress VIPs, from the
+                      host and from inside a sibling cluster
   guest-agent         host support for clusters that baked qemu-guest-agent
   mirror-health       registry-mirror listeners match the running clusters
+  mirror-offline      whether the registry mirror is serving from cache only
   image-cache         cached Talos disk images, including incomplete pulls
   egress              image-factory reachability for schematic builds
   security-inventory  host security posture, informational only

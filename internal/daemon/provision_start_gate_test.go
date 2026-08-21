@@ -454,3 +454,68 @@ func TestProvisionStartGateRunsUnderOpMu(t *testing.T) {
 		t.Fatalf("checkProvisionStart() under opMu = %v, want admission after pre-ballooning", err)
 	}
 }
+
+// shrinkGuests puts every running guest at targetMiB the way the balloon
+// manager does — through the Balloonables the manager reconciles — so the
+// daemon records the target it applied.
+func shrinkGuests(t *testing.T, service *Server, targetMiB int) {
+	t.Helper()
+	for name, vm := range service.Balloonables() {
+		if err := vm.SetMemoryTargetMiB(targetMiB); err != nil {
+			t.Fatalf("SetMemoryTargetMiB(%s) = %v", name, err)
+		}
+	}
+}
+
+// Memory the balloon manager has already reclaimed is in the host-free reading
+// the gate measures, so counting each guest's whole configured size above the
+// floor as still-reclaimable credits it twice and admits starts on headroom
+// that does not exist.
+func TestProvisionStartCreditsOnlyMemoryTheGuestsStillHold(t *testing.T) {
+	const nodeMiB, shrunkMiB = 2048, 1200
+	floor := balloon.DefaultConfig().FloorMiB
+	service, _ := balloonableFixture(t, nodeMiB)
+	shrinkGuests(t, service, shrunkMiB)
+
+	nodes := len(service.vms["demo"])
+	want := nodes * (shrunkMiB - floor)
+	if got := service.balloonReclaim().availableMiB; got != want {
+		t.Fatalf("balloonReclaim().availableMiB = %d, want %d — only what the shrunk guests still hold above the floor", got, want)
+	}
+
+	// A shortfall past that credit must refuse rather than promise a reclaim
+	// the guests cannot make a second time.
+	reserve := balloon.DefaultConfig().ReserveMiB
+	service.hostFreeMemory = func() (int, error) { return reserve + nodeMiB - want - 1, nil }
+	if _, err := service.checkProvisionStart(t.TempDir(), nodeMiB, false); err == nil {
+		t.Fatal("checkProvisionStart() admitted a shortfall past the memory the guests still hold")
+	}
+}
+
+// A pre-balloon may only take memory back. Planning from the configured size
+// hands memory to guests the manager had already shrunk, lowering host free
+// memory in the moment the gate promised to raise it.
+func TestProvisionStartPreBalloonNeverInflatesAlreadyShrunkGuests(t *testing.T) {
+	const nodeMiB, shrunkMiB, shortfall = 2048, 1200, 256
+	reserve := balloon.DefaultConfig().ReserveMiB
+	service, _ := balloonableFixture(t, nodeMiB)
+	shrinkGuests(t, service, shrunkMiB)
+	service.hostFreeMemory = func() (int, error) { return reserve + nodeMiB - shortfall, nil }
+
+	if _, err := service.checkProvisionStart(t.TempDir(), nodeMiB, false); err != nil {
+		t.Fatalf("checkProvisionStart() = %v, want admission after pre-ballooning", err)
+	}
+
+	reclaimed := 0
+	for name, machine := range service.vms["demo"] {
+		fake := machine.(*fakeMachine)
+		target := fake.memoryTargets[len(fake.memoryTargets)-1]
+		if target > shrunkMiB {
+			t.Fatalf("node %s was inflated from %d MiB to %d MiB by a pre-balloon", name, shrunkMiB, target)
+		}
+		reclaimed += shrunkMiB - target
+	}
+	if reclaimed < shortfall {
+		t.Fatalf("pre-balloon reclaimed %d MiB, want at least the %d MiB shortfall", reclaimed, shortfall)
+	}
+}

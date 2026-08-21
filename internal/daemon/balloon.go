@@ -16,25 +16,70 @@ import (
 type balloonMachine struct {
 	machine                 hypervisor.Machine
 	configuredMiB           int
+	currentTargetMiB        int
 	tolerateDeviceNotActive bool
+	// recordTarget publishes a target the guest actually accepted, so the next
+	// pre-balloon measures what is left rather than assuming the guest is still
+	// at its configured size. Nil on a machine built outside the server.
+	recordTarget func(int)
 }
 
 func (m balloonMachine) ConfiguredMiB() int { return m.configuredMiB }
 
+// CurrentTargetMiB is the last balloon target this daemon applied to the guest,
+// falling back to the configured size for a guest nothing has ballooned yet.
+func (m balloonMachine) CurrentTargetMiB() int {
+	if m.currentTargetMiB > 0 {
+		return m.currentTargetMiB
+	}
+	return m.configuredMiB
+}
+
 func (m balloonMachine) SetMemoryTargetMiB(targetMiB int) error {
 	err := m.machine.SetMemoryTargetMiB(targetMiB)
-	if m.tolerateDeviceNotActive && errors.Is(err, hypervisor.ErrDeviceNotActive) {
-		return nil
+	if err != nil {
+		// A tolerated inactive balloon device is not a failure, but it is also
+		// not a guest that gave memory back: the driver is not loaded yet, so
+		// the target goes unrecorded and the node still counts as reclaimable.
+		if m.tolerateDeviceNotActive && errors.Is(err, hypervisor.ErrDeviceNotActive) {
+			return nil
+		}
+		return err
 	}
-	return err
+	if m.recordTarget != nil {
+		m.recordTarget(targetMiB)
+	}
+	return nil
+}
+
+// balloonCurrent is the optional current-target readback a Balloonable may
+// carry. The balloon package's interface is deliberately configured-size only —
+// its reconcile is anchored there — so the pre-balloon asks for the reading it
+// needs without forcing every implementation to have one.
+type balloonCurrent interface {
+	CurrentTargetMiB() int
+}
+
+// currentTargetMiB is how much memory a running guest holds right now as far as
+// this daemon knows: the last target it applied, or the configured size for a
+// guest nothing has ballooned.
+func currentTargetMiB(vm balloon.Balloonable) int {
+	if current, ok := vm.(balloonCurrent); ok {
+		if target := current.CurrentTargetMiB(); target > 0 {
+			return target
+		}
+	}
+	return vm.ConfiguredMiB()
 }
 
 // balloonCandidate is one running node as the balloon controller sees it,
 // captured from the VM inventory so the apid probe that decides eligibility can
 // run without holding opMu.
 type balloonCandidate struct {
+	key                     string
 	machine                 hypervisor.Machine
 	configuredMiB           int
+	currentTargetMiB        int
 	ip                      string
 	tolerateDeviceNotActive bool
 }
@@ -50,7 +95,7 @@ func (s *Server) Balloonables() map[string]balloon.Balloonable {
 	s.opMu.Lock()
 	candidates := s.balloonCandidatesLocked(balloonReadback)
 	s.opMu.Unlock()
-	return balloonablesFrom(candidates, balloonReadback)
+	return balloonablesFrom(candidates, balloonReadback, s.recordBalloonTarget)
 }
 
 // balloonablesLocked is Balloonables for a caller that already holds opMu —
@@ -61,7 +106,7 @@ func (s *Server) Balloonables() map[string]balloon.Balloonable {
 // and is bounded by its own dial timeout.
 func (s *Server) balloonablesLocked() map[string]balloon.Balloonable {
 	balloonReadback := s.hypervisor.Capabilities().BalloonReadback.Supported
-	return balloonablesFrom(s.balloonCandidatesLocked(balloonReadback), balloonReadback)
+	return balloonablesFrom(s.balloonCandidatesLocked(balloonReadback), balloonReadback, s.recordBalloonTarget)
 }
 
 // balloonCandidatesLocked reads the running, configured nodes out of the VM
@@ -82,27 +127,38 @@ func (s *Server) balloonCandidatesLocked(balloonReadback bool) map[string]balloo
 			if !ok || !machine.Active() {
 				continue
 			}
-			candidates[clusterName+"/"+nodeName] = balloonCandidate{
+			key := clusterName + "/" + nodeName
+			candidates[key] = balloonCandidate{
+				key:                     key,
 				machine:                 machine,
 				configuredMiB:           item.DefaultsFor(node.Role).MemoryMiB,
+				currentTargetMiB:        s.balloonTargetMiB(key),
 				ip:                      cluster.LookupIP(node.MAC, item.SubnetIndex),
 				tolerateDeviceNotActive: balloonReadback,
 			}
 		}
 	}
+	// A node that is no longer running boots at its configured size when it
+	// comes back, so its recorded target must not outlive it.
+	s.pruneBalloonTargets(candidates)
 	return candidates
 }
 
 // balloonablesFrom applies the eligibility rule to the captured candidates.
-func balloonablesFrom(candidates map[string]balloonCandidate, balloonReadback bool) map[string]balloon.Balloonable {
+func balloonablesFrom(candidates map[string]balloonCandidate, balloonReadback bool, record func(string, int)) map[string]balloon.Balloonable {
 	out := map[string]balloon.Balloonable{}
 	for key, e := range candidates {
 		if balloonReadback || (e.ip != "" && ClassifyPhase(true, probeAPID(e.ip)) == PhaseConfigured) {
-			out[key] = balloonMachine{
+			machine := balloonMachine{
 				machine:                 e.machine,
 				configuredMiB:           e.configuredMiB,
+				currentTargetMiB:        e.currentTargetMiB,
 				tolerateDeviceNotActive: e.tolerateDeviceNotActive,
 			}
+			if record != nil {
+				machine.recordTarget = func(targetMiB int) { record(key, targetMiB) }
+			}
+			out[key] = machine
 		}
 	}
 	return out
@@ -246,7 +302,9 @@ func (s *Server) checkProvisionStart(path string, addMiB int, force bool) ([]str
 // reserve — because the reclaim just put it there — computes no deficit, and
 // deflates every guest to its configured size in the seconds before the new
 // guest has claimed anything, which is exactly the concurrent-bringup squeeze
-// the gate admitted this start to avoid. The hold outlasts a Talos boot
+// the gate admitted this start to avoid. The hold covers that whole window
+// because it keeps the deficit at the reclaim regardless of what the host-free
+// reading does while the guest boots and claims its allocation. The hold outlasts a Talos boot
 // (~90s to virtio_balloon) with margin, and expires on its own so a start that
 // never happened cannot pin guest memory down forever.
 const balloonReclaimHoldTTL = 5 * time.Minute
@@ -283,7 +341,11 @@ func (s *Server) balloonReclaim() balloonReclaim {
 	vms := list()
 	availableMiB := 0
 	for _, vm := range vms {
-		if above := vm.ConfiguredMiB() - floorMiB; above > 0 {
+		// The current target, not the configured size: memory the balloon
+		// manager has already reclaimed is in the host-free reading the gate
+		// measured, so counting it again here would credit it twice and admit a
+		// start on headroom that does not exist.
+		if above := currentTargetMiB(vm) - floorMiB; above > 0 {
 			availableMiB += above
 		}
 	}
@@ -315,13 +377,17 @@ func (s *Server) reclaimCeilingMiB(floorMiB int) int {
 
 // apply asks the running guests for deficitMiB, sharing it out with the same
 // water-filling plan the balloon manager uses so a pre-balloon and a reconcile
-// can never disagree about where the memory comes from.
+// can never disagree about where the memory comes from. The plan is anchored on
+// each guest's *current* target rather than its configured size, so a
+// pre-balloon can only ever take memory back — anchoring on configured would
+// hand memory to guests the manager had already shrunk, lowering host free
+// memory in the moment the gate promised to raise it.
 func (r balloonReclaim) apply(deficitMiB int) error {
 	names := make([]string, 0, len(r.vms))
 	nodes := make([]balloon.Node, 0, len(r.vms))
 	for name, vm := range r.vms {
 		names = append(names, name)
-		nodes = append(nodes, balloon.Node{Name: name, ConfiguredMiB: vm.ConfiguredMiB()})
+		nodes = append(nodes, balloon.Node{Name: name, ConfiguredMiB: currentTargetMiB(vm)})
 	}
 	sort.Strings(names)
 	// PlanTargets drops the sub-MiB residual of its proportional split so a
@@ -357,9 +423,11 @@ func (s *Server) holdBalloonReclaim(reclaimMiB int) {
 }
 
 // BalloonHoldMiB is the outstanding pre-balloon the manager must not hand back
-// yet. The manager subtracts it from its host-free reading, which is the same
-// arithmetic as holding the guests at their reclaimed targets and needs no extra
-// state in the balloon package.
+// yet. The manager treats it as a floor on its reconcile deficit, which holds
+// the guests at their reclaimed targets and needs no extra state in the balloon
+// package. It cannot be a debit against the host-free reading: the reclaim is
+// already in that reading, so subtracting it reproduces the pre-reclaim number
+// and the very next poll deflates every guest back to configured.
 func (s *Server) BalloonHoldMiB() int {
 	s.balloonHoldMu.Lock()
 	defer s.balloonHoldMu.Unlock()
@@ -370,6 +438,39 @@ func (s *Server) BalloonHoldMiB() int {
 		s.balloonHoldMiB = 0
 	}
 	return s.balloonHoldMiB
+}
+
+// recordBalloonTarget remembers a target a guest accepted. Both the balloon
+// manager's reconcile and the gate's own pre-balloon go through the same
+// balloonMachine wrapper, so every applied target lands here.
+func (s *Server) recordBalloonTarget(key string, targetMiB int) {
+	s.balloonTargetMu.Lock()
+	defer s.balloonTargetMu.Unlock()
+	if s.balloonTargets == nil {
+		s.balloonTargets = map[string]int{}
+	}
+	s.balloonTargets[key] = targetMiB
+}
+
+// balloonTargetMiB is the last target applied to a node, or 0 for a node
+// nothing has ballooned.
+func (s *Server) balloonTargetMiB(key string) int {
+	s.balloonTargetMu.Lock()
+	defer s.balloonTargetMu.Unlock()
+	return s.balloonTargets[key]
+}
+
+// pruneBalloonTargets forgets nodes that are no longer running: a node that
+// stopped comes back at its configured size, and a stale target would make the
+// gate think memory it never reclaimed is already gone.
+func (s *Server) pruneBalloonTargets(live map[string]balloonCandidate) {
+	s.balloonTargetMu.Lock()
+	defer s.balloonTargetMu.Unlock()
+	for key := range s.balloonTargets {
+		if _, ok := live[key]; !ok {
+			delete(s.balloonTargets, key)
+		}
+	}
 }
 
 // stoppedNodeMemoryMiB sums the configured memory of the cluster's nodes that

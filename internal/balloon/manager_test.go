@@ -165,3 +165,52 @@ func TestRunLogsStartupLine(t *testing.T) {
 		}
 	}
 }
+
+// #398: the provision-start gate pre-balloons memory out of the running guests
+// and holds it while the admitted guest boots. The hold has to survive the very
+// next poll — the reclaim is already in the host-free reading, so debiting it
+// reproduces the pre-reclaim number and deflates every guest back to configured
+// seconds before the new guest claims anything.
+func TestHoldKeepsThePreBalloonedTargetsInPlace(t *testing.T) {
+	const reserve, floor, configured = 6144, 1024, 2048
+	// The gate's own numbers: 7680 MiB free, a 2048 MiB guest starting, so the
+	// shortfall against the reserve is 512 MiB and the reclaim puts host free
+	// at 8192 MiB — above the reserve.
+	const freeBefore, reclaim = 7680, 512
+	vms := map[string]Balloonable{
+		"a": &recordingVM{configured: configured, target: configured - reclaim/3},
+		"b": &recordingVM{configured: configured, target: configured - reclaim/3},
+		"c": &recordingVM{configured: configured, target: configured - reclaim/3},
+	}
+
+	Reconcile(vms, holdAdjustedFreeMiB(freeBefore+reclaim, reserve, reclaim), reserve, floor)
+
+	held := 0
+	for name, v := range vms {
+		target := v.(*recordingVM).target
+		if target >= configured {
+			t.Fatalf("node %s back at %d MiB: the reconcile handed the pre-balloon straight back", name, target)
+		}
+		if target < floor {
+			t.Fatalf("node %s target %d MiB is below the %d MiB floor", name, target, floor)
+		}
+		held += configured - target
+	}
+	// PlanTargets drops the sub-MiB residual of its proportional split, so the
+	// reconcile may land up to one MiB per node short of the reclaim.
+	if held < reclaim-len(vms) {
+		t.Fatalf("reconcile held %d MiB out of the guests, want the %d MiB pre-balloon less the per-node rounding", held, reclaim)
+	}
+}
+
+// The hold is a floor on the deficit, never a ceiling: a host under real
+// pressure still reclaims what the pressure calls for.
+func TestHoldNeverRaisesTheHostFreeReading(t *testing.T) {
+	const reserve = 6144
+	if got := holdAdjustedFreeMiB(4096, reserve, 512); got != 4096 {
+		t.Errorf("holdAdjustedFreeMiB(4096, %d, 512) = %d, want the measured reading under real pressure", reserve, got)
+	}
+	if got := holdAdjustedFreeMiB(8192, reserve, 0); got != 8192 {
+		t.Errorf("holdAdjustedFreeMiB(8192, %d, 0) = %d, want the reading untouched with nothing held", reserve, got)
+	}
+}
