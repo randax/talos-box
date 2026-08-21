@@ -416,8 +416,8 @@ func saveStatePath(dir, node string) string {
 	return filepath.Join(dir, node+saveStateSuffix)
 }
 
-// saveStateOwnerSuffix names the sidecar recording which daemon process wrote
-// a save. A save is only restorable by that process: once it is replaced — the
+// saveStateOwnerSuffix names the sidecar recording which daemon process
+// instance wrote a save. A save is only restorable by that process: once it is replaced — the
 // very thing `tbx system restart --force` does after refusing to — the memory
 // on disk is already lost, and only the recorded owner can tell status that
 // (#413).
@@ -425,12 +425,25 @@ const saveStateOwnerSuffix = saveStateSuffix + ".owner"
 
 func saveStateOwnerPath(savePath string) string { return savePath + ".owner" }
 
-// recordSaveStateOwner stamps a save with the pid of the daemon that wrote it.
-// A failure is logged and otherwise ignored: an unstamped save reads as an
-// owner status cannot judge, which is exactly the pre-#413 behaviour.
+// daemonInstanceStarted fixes the moment this process began, so the owner token
+// below identifies a process instance rather than a pid. Pids are recycled —
+// macOS wraps them at 99999 — and a bare pid would let a daemon handed its
+// predecessor's number claim memory that died with that predecessor.
+var daemonInstanceStarted = time.Now().UnixNano()
+
+// daemonInstanceToken identifies this daemon process instance uniquely: a pid
+// paired with the instant the process started. Two live daemons cannot share
+// it, and neither can a daemon that inherits a recycled pid.
+func daemonInstanceToken() string {
+	return strconv.Itoa(os.Getpid()) + "/" + strconv.FormatInt(daemonInstanceStarted, 10)
+}
+
+// recordSaveStateOwner stamps a save with the instance token of the daemon that
+// wrote it. A failure is logged and otherwise ignored: an unstamped save reads
+// as an owner status cannot judge, which is exactly the pre-#413 behaviour.
 func recordSaveStateOwner(savePath string) {
 	owner := saveStateOwnerPath(savePath)
-	if err := os.WriteFile(owner, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+	if err := os.WriteFile(owner, []byte(daemonInstanceToken()), 0o600); err != nil {
 		log.Printf("record saved state owner %s: %v", owner, err)
 	}
 }
@@ -439,7 +452,7 @@ func recordSaveStateOwner(savePath string) {
 // writing process only costs the memory on a backend whose restore needs that
 // process: QEMU restores from the versioned save file alone, so on Linux a
 // replaced daemon changes nothing and the save stays as good as it was (#413
-// review). The pid sidecar is therefore the vz-only signal it was written as.
+// review). The owner sidecar is therefore the vz-only signal it was written as.
 func (s *Server) savedStateStale(clusterName string) bool {
 	if s.hypervisor != nil && s.hypervisor.Capabilities().SuspendSurvivesDaemonRestart {
 		return false
@@ -448,8 +461,9 @@ func (s *Server) savedStateStale(clusterName string) bool {
 }
 
 // savedStateOwnerReplaced reports suspended memory this daemon process did not
-// write. The comparison is against the running process own pid, so it cannot
-// be fooled by pid reuse: a match means this very process is the owner, and
+// write. The comparison is against this process instance token — its pid paired
+// with its start instant — so a daemon handed a recycled pid does not inherit
+// its predecessor's saves: a match means this very process wrote them, and
 // anything else means the owner is gone. A save with no recorded owner — one
 // written by a tbx predating the sidecar — yields false: unknown, not stale.
 func savedStateOwnerReplaced(clusterName string) bool {
@@ -461,7 +475,7 @@ func savedStateOwnerReplaced(clusterName string) bool {
 	if err != nil {
 		return false
 	}
-	self := strconv.Itoa(os.Getpid())
+	self := daemonInstanceToken()
 	for _, path := range matches {
 		// The sidecar only counts while the save it describes is still there;
 		// a leftover would otherwise keep answering for memory nobody holds.

@@ -66,7 +66,8 @@ func TestSuspendHintNamesColdBootOnceTheOwningDaemonIsGone(t *testing.T) {
 		wantPhrase string
 	}{
 		{name: "owner replaced", owner: "999999", wantStale: true, wantPhrase: "will cold-boot the nodes"},
-		{name: "this daemon still owns it", owner: strconv.Itoa(os.Getpid()), wantPhrase: "tbx cluster start discards the saved memory"},
+		{name: "this daemon still owns it", owner: daemonInstanceToken(), wantPhrase: "tbx cluster start discards the saved memory"},
+		{name: "owner is a predecessor holding this pid", owner: strconv.Itoa(os.Getpid()), wantStale: true, wantPhrase: "will cold-boot the nodes"},
 		{name: "owner unknown", wantPhrase: "tbx cluster start discards the saved memory"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
