@@ -98,6 +98,28 @@ pinned shared-mode interfaces only intercommunicate within one subnet, `tbx-help
 `172.30.0.0/16` frames between its own attachments before they enter vmnet, learning node and
 VIP ownership from DHCP and ARP.
 
+### Node addressing
+
+Every node's MAC address is derived deterministically from its identity —
+`52:54:00` plus the first three bytes of `sha256("<cluster>/<node>")` — so a node keeps the same
+MAC across stop/start, destroy/recreate, and remove/re-add. On macOS the address itself comes
+from vmnet's own DHCP server, keyed by that MAC, not from a counter tbx controls: addresses are
+**stable per node identity but not sequential**. A fourth node added to a cluster whose nodes sit
+at `.31/.32/.33` may well come up at `.46`, and the same node gets `.46` again if it is removed
+and re-added. That is intended behaviour, not a leak or a collision — stability, not adjacency,
+is the contract. `tbx status` reports the address vmnet actually leased, read back from
+`/var/db/dhcpd_leases` by MAC. (On Linux the helper serves static reservations from the cluster model instead,
+starting at `172.30.<n>.2` and taking the lowest free host address, so addresses there are
+sequential.) Always read a node's current address from `tbx status`; never infer it by counting.
+
+### Checking tbx DNS
+
+Verify tbx names with `dscacheutil -q host -a name <node>.<cluster>.<domain>` or `ping`. Do
+**not** use `dig` or `nslookup`: they query the resolvers in `/etc/resolv.conf` directly and
+bypass `/etc/resolver/`, which is exactly where tbx installs its per-domain entries — so they
+return nothing for a perfectly healthy cluster. `scutil --dns` shows the per-domain resolver
+macOS actually consults.
+
 Cilium L2 announcements are the default ingress-VIP path and work here — ARP for addresses
 vmnet never assigned passes unfiltered — but macOS ignores gratuitous ARP through vmnet and
 converges only on its own ARP revalidation, so failover takes roughly 40–50 s. BGP mode is the

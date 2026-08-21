@@ -74,8 +74,11 @@ DNS, and image delivery); curated CNI and LoadBalancer provisioning are opt-in.
 On the substrate-only path you generate the machine config yourself, and Talos assigns each node a
 random `talos-*` hostname unless you set `machine.network.hostname`. That is expected Talos
 behavior: `kubectl get nodes` will then show `talos-*` names that do not match the `<cluster>-<role>-<i>`
-names in `tbx status`. Set `machine.network.hostname` per node in the generated config if you want
-the two views to line up.
+names in `tbx status`. Leaving that mismatch alone is the simplest path: on Talos 1.13,
+`talosctl gen config` already emits a `kind: HostnameConfig` (`auto: stable`) document, and adding
+`machine.network.hostname` alongside it makes every `apply-config` fail with `static hostname is
+already set in v1alpha1 config`. To line the two views up you must remove or replace that generated
+`HostnameConfig` document in the same bundle.
 
 Add `--csi longhorn` (multinode, replicated) or `--csi local-path` (lightweight, single-node)
 — or the `csi:` key in `talosbox.yaml` — for persistent storage; it requires a curated CNI.
@@ -143,6 +146,13 @@ tbx snapshot create demo before-upgrade
 tbx node add demo --role worker
 tbx cluster destroy demo --force   # permanent
 ```
+
+Node addresses are bound to node identity, not to creation order. Each node's MAC is derived from
+`sha256("<cluster>/<node>")`, and its address follows that MAC: on Linux the helper serves a static
+reservation from the cluster's `172.30.<n>.0/24` subnet, while on macOS vmnet's DHCP server picks
+the host number. So an added node can land anywhere in the subnet — a fourth node joining
+`.31/.32/.33` may come up at `.46` — and it keeps that address when removed and re-added. Stability
+per node, not sequential numbering, is the contract: read addresses from `tbx status`.
 
 Suspend/resume is capability-gated by the host backend:
 
