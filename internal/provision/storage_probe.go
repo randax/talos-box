@@ -262,6 +262,13 @@ spec:
 	return objects, nil
 }
 
+// storageProbeDefaultClassTimeout bounds the wait below. The engine's class is
+// applied moments before the probe runs, so a default that has not landed
+// within this is not slow convergence — nobody is going to make it the default
+// — and waiting out the whole storage budget only hides which class is missing
+// behind a bare deadline (#386). A variable so tests can exercise the bound.
+var storageProbeDefaultClassTimeout = 2 * time.Minute
+
 // waitForDefaultStorageClass holds the probe back until the engine's class is
 // actually the cluster default. The probe claim deliberately omits
 // storageClassName so that binding it *proves* the default resolves to the
@@ -271,7 +278,9 @@ spec:
 // switch between engines passes through exactly that window, so the wait is
 // what keeps the probe from creating a claim the cluster cannot serve.
 func waitForDefaultStorageClass(ctx context.Context, client kubernetes.Interface, expected string, interval time.Duration) error {
-	return poll(ctx, GateDefaultStorageClass, interval, func(ctx context.Context) error {
+	waitCtx, cancel := context.WithTimeout(ctx, storageProbeDefaultClassTimeout)
+	defer cancel()
+	err := poll(waitCtx, GateDefaultStorageClass, interval, func(ctx context.Context) error {
 		list, err := client.StorageV1().StorageClasses().List(ctx, metav1.ListOptions{})
 		if err != nil {
 			return fmt.Errorf("list storage classes for storage probe: %w", err)
@@ -292,6 +301,10 @@ func waitForDefaultStorageClass(ctx context.Context, client kubernetes.Interface
 		}
 		return fmt.Errorf("StorageClass %q is not the cluster default yet (default: %s)", expected, strings.Join(defaults, ", "))
 	})
+	if err != nil && ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("StorageClass %q did not become the cluster default within %s: %w", expected, storageProbeDefaultClassTimeout, err)
+	}
+	return err
 }
 
 func defaultStorageClass(storageClass *storagev1.StorageClass) bool {

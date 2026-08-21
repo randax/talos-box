@@ -995,6 +995,25 @@ func TestRunStorageProbeWaitsForTheEngineToBecomeTheDefaultClass(t *testing.T) {
 	}
 }
 
+// The wait is bounded on its own so a transition where the default never lands
+// fails fast, naming the class that never became default, instead of spending
+// the whole storage budget on a deadline that says nothing (#386).
+func TestWaitForDefaultStorageClassFailsFastOnItsOwnTimeout(t *testing.T) {
+	previous := storageProbeDefaultClassTimeout
+	storageProbeDefaultClassTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { storageProbeDefaultClassTimeout = previous })
+
+	clientset := kubernetesfake.NewClientset()
+	started := time.Now()
+	err := waitForDefaultStorageClass(context.Background(), clientset, localPathStorageClass, time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), `StorageClass "`+localPathStorageClass+`" did not become the cluster default`) {
+		t.Fatalf("waitForDefaultStorageClass() error = %v, want the missing default class named", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("waitForDefaultStorageClass() took %s, want it bounded by its own timeout", elapsed)
+	}
+}
+
 func TestStorageProbeDeleteIgnoresMissingObjects(t *testing.T) {
 	clientset := kubernetesfake.NewClientset()
 	if err := deleteStorageProbePod(context.Background(), clientset, probeNamespace, storageProbeWriterPodName); err != nil {
