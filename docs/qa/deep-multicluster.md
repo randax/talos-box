@@ -16,7 +16,9 @@ You are running QA, not demos. For every charter: run the steps exactly, compare
 
 ## Preflight
 
-BLOCKED unless: `tbx version` recorded; `tbx doctor` exits 0 (including `port-179` free on Linux); no clusters `qa-a`/`qa-b`; ≥ 14 GiB free RAM (two 3-node clusters).
+BLOCKED unless: `tbx version` recorded; `tbx doctor` exits 0 (including `port-179` free on Linux); no clusters `qa-a`/`qa-b`; enough free RAM for the **second** create, not just for both clusters' nominal memory — see below.
+
+**Memory floor.** Two 3-node clusters are 12288 MiB of guests, but the binding constraint is the provision-start gate at the *second* `cluster create`: starting 6144 MiB must still leave the 6144 MiB balloon reserve free, so the host needs **12288 MiB free with `qa-a` already running** — roughly **18–19 GiB free before you start**, not 14 GiB. The `host-pressure` line of `tbx doctor` prints the reading and the arithmetic ("room for N MiB of new guests right now"): if N is below 6144 with `qa-a` running, the second create is refused. The gate will pre-balloon the running guests down to cover a small shortfall (down to a 1024 MiB per-node floor) before refusing, so a host a few hundred MiB short still proceeds — a host several GiB short does not. Record the `host-pressure` numbers at preflight and again after C1.
 
 `port-179` is checked on both platforms, but macOS reports only an any-address squatter (`*:179`) and reports it as WARN, so `tbx doctor` still exits 0 with it. Read the `port-179` line, and confirm by hand with `netstat -an | grep '\.179'` (no foreign `LISTEN` line) or `sudo lsof -iTCP:179 -sTCP:LISTEN`. Note that unprivileged `lsof -iTCP:179` cannot see the root-owned helper socket, so an empty unprivileged listing is not evidence — use `netstat` or `sudo`.
 
