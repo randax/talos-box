@@ -95,8 +95,11 @@ notarize:
         issuer_id: "{{ .Env.MACOS_NOTARY_ISSUER_ID }}"
         key_id: "{{ .Env.MACOS_NOTARY_KEY_ID }}"
         key: "{{ .Env.MACOS_NOTARY_KEY }}"
+        # Apple's queue is slow for a new account and the three binaries are
+        # submitted one after another; the first rehearsal timed out at 20m
+        # with the submission still pending (v0.1.1-rc.1).
         wait: true
-        timeout: 20m
+        timeout: 60m
 
 archives:
   - id: default
