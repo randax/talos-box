@@ -46,3 +46,20 @@ func TestConfiguredConsoleTipIncludesEndpoint(t *testing.T) {
 		t.Fatalf("configuredConsoleTip() = %q, want %q", got, want)
 	}
 }
+
+func TestSuspendedConsoleErrorNamesAReachableCommand(t *testing.T) {
+	// A node can be suspended while its siblings run (cluster suspend, then
+	// node start on one node). `tbx cluster resume` refuses outright in that
+	// state, so the refusal must name `tbx node start` instead (#385-#440).
+	running := suspendedConsoleError("demo", "demo-cp-1", true).Error()
+	if !strings.Contains(running, "tbx node start demo demo-cp-1") {
+		t.Fatalf("running cluster should name node start, got %q", running)
+	}
+	if strings.Contains(running, "cluster resume") {
+		t.Fatalf("running cluster must not name cluster resume, got %q", running)
+	}
+	stopped := suspendedConsoleError("demo", "demo-cp-1", false).Error()
+	if !strings.Contains(stopped, "tbx cluster resume demo") {
+		t.Fatalf("stopped cluster should name cluster resume, got %q", stopped)
+	}
+}

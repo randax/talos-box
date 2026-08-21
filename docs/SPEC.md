@@ -460,18 +460,17 @@ The CLI stops waiting once that bound plus a grace passes **without any sign of 
 narrated call re-arms the wait on every stage the daemon sends, so only a gate that goes silent
 fails the verb instead of hanging it.
 
-**State-changing verbs narrate their stages.** `cluster create`, `snapshot create|restore` and
-`node add|remove` stream the daemon's stages to stderr as the work proceeds — stopping the
-cluster, cloning disks, restarting, waiting for nodes — closing with a convergence hint where
-the verb left nodes booting, and `--quiet` suppresses the stages while keeping the result and
+**State-changing verbs narrate their stages.** `cluster create`, `snapshot create|restore`,
+`node add|remove` and `node start|stop` stream the daemon's stages to stderr as the work
+proceeds — stopping the cluster, cloning disks, restarting, waiting for nodes — closing with a
+convergence hint where the verb left nodes booting, and `--quiet` suppresses the stages while keeping the result and
 its warnings. A verb's success line is past tense because it is true when printed: `cluster
 create` holds its answer until the nodes it started answer on apid (maintenance or configured),
 up to a bounded boot budget — when the budget runs out, or the daemon's lifecycle is cancelled,
 it answers anyway with an advisory naming the nodes that stayed silent, so a successful exit
-never proves the nodes answered. For these narrating verbs warnings print above the success
-line, not after it. Other
-state-changing verbs (`cluster start|stop|suspend|resume`, `node start|stop`) still print their
-warnings below their success line.
+never proves the nodes answered. `cluster create`, `snapshot create|restore` and `node
+add|remove` print their warnings above the success line, not after it; `cluster
+start|stop|suspend|resume` and `node start|stop` print theirs below it.
 
 **`tbx console <cluster> <node>`** attaches interactively to the node's serial console (hvc0)
 through the `tbxd`-owned socket — Talos renders its console dashboard and logs there, and

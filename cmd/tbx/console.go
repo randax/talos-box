@@ -124,7 +124,7 @@ func (c cli) runConsole(args []string) error {
 		return fmt.Errorf("node %q does not exist in cluster %q", nodeName, clusterName)
 	}
 	if target.Phase == daemon.PhaseSuspended {
-		return fmt.Errorf("node %s is suspended — resume the cluster first", nodeName)
+		return suspendedConsoleError(clusterName, nodeName, statuses[0].Running)
 	}
 	if target.Phase.Stopped() {
 		return fmt.Errorf("node %s is stopped — start the cluster first", nodeName)
@@ -259,6 +259,18 @@ func tailLines(data []byte, count int) []byte {
 		}
 	}
 	return data
+}
+
+// suspendedConsoleError says how to get a suspended node back, and the answer
+// depends on the rest of the cluster: `tbx cluster resume` refuses outright
+// once any sibling node is running, so with a live cluster the only command
+// that revives this one node is `tbx node start` — which cold-boots it and
+// drops its saved memory. Only a fully stopped cluster can be resumed.
+func suspendedConsoleError(clusterName, nodeName string, clusterRunning bool) error {
+	if clusterRunning {
+		return fmt.Errorf("node %s is suspended while the rest of the cluster runs — boot it with: tbx node start %s %s (that cold-boots the node and discards its saved memory)", nodeName, clusterName, nodeName)
+	}
+	return fmt.Errorf("node %s is suspended — resume the cluster first: tbx cluster resume %s", nodeName, clusterName)
 }
 
 func configuredConsoleTip(ip, talosconfig string) string {
