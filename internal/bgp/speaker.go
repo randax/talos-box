@@ -71,6 +71,9 @@ func startSpeakerOnPort(localASN, peerASN uint32, gatewayIP, peerCIDR string, fi
 	return speaker, nil
 }
 
+// Routes reports the LB /32 paths this speaker has installed in the host FIB.
+func (s *Speaker) Routes() []Route { return s.reconciler.Injected() }
+
 // watch re-reconciles the FIB from the full RIB whenever a path changes.
 func (s *Speaker) watch(ctx context.Context) {
 	reconcileFromRIB := func() {

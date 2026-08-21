@@ -80,6 +80,7 @@ in this order:
 | `host-pressure` | Host memory pressure, swap exhaustion, and free space on the volume holding `~/.talosbox` are outside the range that resets guests and corrupts Talos `EPHEMERAL` data | `FAIL`s where `tbx cluster create` would refuse and `WARN`s where it would only warn, printing the same runnable remediation — free host memory (`tbx down`) or host storage (`tbx cache prune --all`) — and noting that `--force` overrides the create gate at the risk of guest-disk corruption. A `PASS` prints the three numbers it was decided on — free memory, swap in use, free space on the `~/.talosbox` volume — and how much room is left for new guests once the balloon reserve is kept free, which is what the next `cluster create` or `cluster start` is gated on |
 | `system-dns` | macOS itself resolves `<node>.<domain>` to the cluster's addresses through the scoped resolver files, and each custom-domain cluster's `/etc/resolver/<domain>` file is present and talosbox-managed | Remove the unmanaged or non-regular resolver file `doctor` names — talosbox never touches those; otherwise suspect a DNS filtering agent or browser/system DoH bypassing the scoped resolver |
 | `routes` | Host routes to each running cluster's gateway and live nodes exit via a `bridge`/`vmnet` interface or `lo0`, not a tunnel | Disconnect or split-exclude the VPN/ZTNA client that captured `172.30.0.0/16`, then restart the cluster |
+| `inter-cluster` | With more than one cluster running, every cluster's ingress VIP answers from the host **and** from each sibling cluster — the sibling leg is dialled by the `lb-probe` behind each VIP, so it travels the same pod-to-sibling-VIP path a workload would. `SKIP`s with the reason when fewer than two running clusters report a live VIP | `FAIL` names the dead direction (`qa-edge → qa-core VIP 172.30.0.200`). Check the announcement mode of the *target* cluster (`tbx bgp status <cluster>`) and the host route to its VIP; `routes` and `forwarding` can both pass while this path is dead |
 | `guest-agent` | Clusters that requested the `qemu-guest-agent` extension have a working host channel | `WARN` only: the config stays valid and portable, the extension is simply inert on this host. `SKIP`s when no cluster requests it |
 | `mirror-health` | Pull-through mirror listeners are bound on exactly the running clusters' gateway IPs, and reports the registry-mirror cache totals | Restart the affected cluster (or `tbxd`) so the bind set is reconverged with cluster lifecycle |
 | `image-cache` | Reports the Talos disk-image cache totals, named apart from the registry-mirror cache so offline prep can tell the two stores under `~/.talosbox/cache` apart. Incomplete combinations — prunable leftovers with no usable image — are held out of the total and counted separately, and a cache holding nothing else is a `WARN` | Never `FAIL`s: a failed cache listing is reported once on `mirror-health` and skips this line. On `WARN`, rerun `tbx cache pull` before going offline; use `tbx cache list` for the per-combination breakdown |
@@ -124,6 +125,11 @@ Cilium L2 announcements are the default ingress-VIP path and work here — ARP f
 vmnet never assigned passes unfiltered — but macOS ignores gratuitous ARP through vmnet and
 converges only on its own ARP revalidation, so failover takes roughly 40–50 s. BGP mode is the
 fast-failover path on macOS for that reason.
+
+`tbx bgp enable|disable <cluster>` flips the announcement mode; it requires `--cni cilium` and
+refuses anything else without touching the speaker. `tbx bgp status <cluster>` reports where the
+mode actually stands: the recorded mode, whether the host speaker is running, the address it
+binds, and the routes it announces.
 
 The pull-through registry mirrors bind on each cluster gateway (`172.30.<n>.1`), never
 `0.0.0.0`, with the catch-all on port `5059`. Port 5000 is deliberately unused: macOS AirPlay

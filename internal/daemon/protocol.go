@@ -53,7 +53,11 @@ const (
 // re-admits the suspended cluster's whole memory footprint, so it answers to
 // the same host-pressure gate create and start do, with --force as the
 // override (#368).
-const ProtocolVersion = 13
+// Version 14 serves bgp.status: a read-only report of a cluster's announcement
+// mode, the host speaker behind it and the routes that speaker announces, so a
+// refused or deferred mode change can be confirmed directly instead of through
+// `tbx doctor` (#399).
+const ProtocolVersion = 14
 
 // Request is one newline-delimited daemon request.
 type Request struct {

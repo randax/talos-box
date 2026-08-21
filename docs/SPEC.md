@@ -343,7 +343,7 @@ tbx snapshot restore <cluster> <name> [--yes] [--force] [--quiet]
 tbx snapshot list <cluster> [-o json]      tbx snapshot delete <cluster> <name>
 tbx status [cluster]      tbx manifests <cluster> [section|images] [--cni cilium|flannel]
 tbx console <cluster> <node>
-tbx bgp enable|disable <cluster> [--quiet]
+tbx bgp enable|disable <cluster> [--quiet]      tbx bgp status <cluster>
 tbx mirror offline [on|off]
 tbx cache pull [-f talosbox.yaml] [--no-images]
                [--talos-version VERSION --schematic ID --extensions LIST]

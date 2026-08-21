@@ -91,7 +91,7 @@ On failure: capture the missing prerequisite precisely.
 
 Steps:
 1. `tbx manifests qa-fork objects` — expect the documented refusal naming `--cni` (CNI-derived sections need a curated CNI; this cluster declares none). Then `tbx manifests qa-fork objects --cni cilium` — expect the rendered Cilium objects tbx would apply, and `tbx manifests qa-fork machine` / `mirrors` to render without any flag.
-2. `tbx bgp enable qa-fork` — expect refusal (requires curated cilium).
+2. `tbx bgp enable qa-fork` — expect refusal (requires curated cilium), with no stage narration ahead of it; confirm the no-op with `tbx bgp status qa-fork` (speaker stopped).
 3. `tbx snapshot create qa-fork forked --yes` then restore it — substrate verbs must still work on a hand-built cluster; post-restore, the hand-built control plane comes back (cold boot) and Ready returns.
 
 Expected observations: curated-only surfaces refuse with specific errors; substrate verbs (snapshot, console, status, stop/start) work regardless of who configured the cluster.

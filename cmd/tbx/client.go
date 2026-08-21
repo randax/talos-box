@@ -35,6 +35,7 @@ const (
 	snapshotCreateWarningProtocolVersion    = 7
 	nodeRunStateProtocolVersion             = 8
 	bgpReconcileProtocolVersion             = 10
+	bgpStatusProtocolVersion                = 14
 )
 
 func requiresProvisioningIntentHandshake(input cluster.ProvisioningIntentInput) bool {
@@ -112,6 +113,12 @@ func (c cli) ensurePerClusterTalosSupport() error {
 // the old way, with the BGP control plane disabled and its CRDs absent (#344).
 func (c cli) ensureBGPReconcileSupport(verb string) error {
 	return c.ensureProtocolAtLeast(bgpReconcileProtocolVersion, "bgp "+verb)
+}
+
+// ensureBGPStatusSupport refuses to ask a daemon that has no bgp.status for
+// one: it would answer with an unknown-operation error naming an internal op.
+func (c cli) ensureBGPStatusSupport() error {
+	return c.ensureProtocolAtLeast(bgpStatusProtocolVersion, "bgp status")
 }
 
 func (c cli) ensureCacheWarmSupport() error {

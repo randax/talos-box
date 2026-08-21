@@ -41,10 +41,11 @@ On failure: capture status JSON, MetalLB pod logs, `kubectl get ipaddresspools,l
 **Goal**: the intent chain holds: bgp requires cilium.
 
 Steps:
-1. `tbx bgp enable qa-fla` — expect refusal.
+1. `tbx bgp enable qa-fla` — expect refusal, and nothing else on stdout.
 2. `tbx cluster create qa-bad --cni flannel --bgp` — expect refusal before mutation.
+3. `tbx bgp status qa-fla` — expect `announcement mode l2` with the host speaker stopped.
 
-Expected observations: both rejections name the actual constraint — the shipped message is `bgp requires cni: cilium` and deliberately does not also name `lb`; no `qa-bad` exists after; `qa-fla` unaffected.
+Expected observations: both rejections name the actual constraint — the shipped message is `bgp requires cni: cilium` and deliberately does not also name `lb`; the refused `bgp enable` narrates no stage at all, matching `cluster create --bgp` (#399); no `qa-bad` exists after; `qa-fla` unaffected.
 
 Pass criteria: both refused with specific errors; nothing created or changed.
 

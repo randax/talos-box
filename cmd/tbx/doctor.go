@@ -215,6 +215,7 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		if err := writeFindings(
 			doctorFinding{level: "SKIP", check: "system-dns", detail: detail},
 			doctorFinding{level: "SKIP", check: "routes", detail: detail},
+			doctorFinding{level: "SKIP", check: "inter-cluster", detail: detail},
 		); err != nil {
 			return err
 		}
@@ -223,6 +224,7 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		if err := writeFindings(
 			doctorFinding{level: "FAIL", check: "system-dns", detail: detail},
 			doctorFinding{level: "FAIL", check: "routes", detail: detail},
+			doctorFinding{level: "SKIP", check: "inter-cluster", detail: detail},
 		); err != nil {
 			return err
 		}
@@ -230,6 +232,7 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		if err := writeFindings(
 			doctorFinding{level: "SKIP", check: "system-dns", detail: "no clusters exist"},
 			doctorFinding{level: "SKIP", check: "routes", detail: "no clusters exist"},
+			doctorFinding{level: "SKIP", check: "inter-cluster", detail: "no clusters exist"},
 		); err != nil {
 			return err
 		}
@@ -250,7 +253,10 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		}
 		if !anyRunning {
 			// stopped clusters have no interfaces to route through
-			if err := writeFindings(doctorFinding{level: "SKIP", check: "routes", detail: "no clusters are running"}); err != nil {
+			if err := writeFindings(
+				doctorFinding{level: "SKIP", check: "routes", detail: "no clusters are running"},
+				doctorFinding{level: "SKIP", check: "inter-cluster", detail: "no clusters are running"},
+			); err != nil {
 				return err
 			}
 		} else {
@@ -268,6 +274,11 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 				routeFinding.level, routeFinding.detail = "FAIL", strings.Join(routeProblems, "; ")
 			}
 			if err := writeFindings(routeFinding); err != nil {
+				return err
+			}
+			// Routes and forwarding assert only that the host could carry the
+			// traffic; this asks whether it actually does (#388).
+			if err := writeFindings(interClusterFinding(statuses, statusErr, deps.doHTTP)); err != nil {
 				return err
 			}
 		}

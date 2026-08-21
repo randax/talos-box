@@ -180,6 +180,7 @@ configured bridge or running cluster report `SKIP` before one exists.
 | `port-53`, `port-67`, `port-179` | DNS, DHCP, and optional BGP ports are available on each cluster gateway or already owned by talosbox | Stop the conflicting listener or keep BGP disabled when port 179 is intentionally occupied |
 | `resolver`, `DNS`, `system-dns` | Guest DNS is listening and systemd-resolved routes `~<cluster>.k8s.test` to the cluster gateway | Run the per-link `resolvectl` command printed by `doctor` when resolved registration is unavailable |
 | `routes` | Host routes to live nodes and cluster subnets use the talosbox bridge | Resolve overlapping VPN or host routes and restart the cluster |
+| `inter-cluster` | With more than one cluster running, every cluster's ingress VIP answers from the host **and** from each sibling cluster — the sibling leg is dialled by the `lb-probe` behind each VIP, so it travels the same pod-to-sibling-VIP path a workload would. `SKIP`s with the reason when fewer than two running clusters report a live VIP | `FAIL` names the dead direction (`qa-edge → qa-core VIP 172.30.0.200`). Check the announcement mode of the *target* cluster (`tbx bgp status <cluster>`) and the host route to its VIP; `routes` and `forwarding` can both pass while this path is dead |
 | `host-pressure` | Currently reports `SKIP` because Linux host-pressure sampling is not implemented | Size the default cluster for at least 16 GB RAM and monitor the host separately |
 | `guest-agent` | Clusters that requested the `qemu-guest-agent` extension have a working host channel | `WARN` only: the config stays valid and portable, the extension is simply inert on this host. `SKIP`s when no cluster requests it |
 | `mirror-health` | Pull-through mirror listeners are bound on exactly the running clusters' gateway IPs, and reports the registry-mirror cache totals | Restart the affected cluster (or `tbxd`) so the bind set is reconverged with cluster lifecycle |
@@ -209,6 +210,11 @@ Cilium L2 announcements are the default ingress-VIP path and work directly on th
 BGP is optional on Linux: use it for routed upstreams, ECMP, or
 `externalTrafficPolicy: Local` when only nodes with local endpoints should advertise. It is not
 required for fast L2 failover on Linux.
+
+`tbx bgp enable|disable <cluster>` flips the announcement mode; it requires `--cni cilium` and
+refuses anything else without touching the speaker. `tbx bgp status <cluster>` reports where the
+mode actually stands: the recorded mode, whether the host speaker is running, the address it
+binds, and the routes it announces.
 
 After `tbx doctor` passes, continue with the common
 [Cilium ingress walkthrough](walkthrough-cilium-ingress.md).

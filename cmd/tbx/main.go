@@ -95,7 +95,7 @@ var groupUsages = map[string]string{
 	"cache":    "usage: tbx cache pull|prune|warm|list [<image-ref>] [-o json]",
 	"system":   "usage: tbx system install|uninstall|restart [--force]|status",
 	"mirror":   "usage: tbx mirror offline [on|off]",
-	"bgp":      "usage: tbx bgp enable|disable <cluster> [--quiet]",
+	"bgp":      "usage: tbx bgp enable|disable|status <cluster> [--quiet]",
 }
 
 // unknownVerbError refuses an unrecognized verb with the group's verb list
@@ -781,7 +781,7 @@ Commands:
   status [cluster]
   manifests <cluster> [section] [--cni cilium|flannel]
   console <cluster> <node>
-  bgp enable|disable <cluster> [--quiet]
+  bgp enable|disable|status <cluster> [--quiet]
   mirror offline [on|off]
   cache pull|prune|warm|list [<image-ref>] [-o json]
   system install|uninstall|restart [--force]|status

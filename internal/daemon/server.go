@@ -888,6 +888,8 @@ func (s *Server) handle(request Request, progress stageFunc) (any, error) {
 		// reconcile that puts the requested mechanism in effect; a locked path
 		// that only moves the host speaker must not exist (#344)
 		return nil, fmt.Errorf("operation %q must be dispatched as a BGP mode change", request.Op)
+	case "bgp.status":
+		return s.bgpStatus(request.Args)
 	case "cache.pull":
 		return s.pullCache(request.Args)
 	case "cache.warm":
