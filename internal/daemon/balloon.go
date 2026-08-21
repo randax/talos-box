@@ -326,6 +326,15 @@ func (s *Server) checkProvisionStart(path string, addMiB int, force bool) ([]str
 // never happened cannot pin guest memory down forever.
 const balloonReclaimHoldTTL = 5 * time.Minute
 
+// balloonHold is one start's pre-balloon: the memory it took out of the running
+// guests, measured from their configured size, and the deadline its boot window
+// runs to. Holds are per start so a start that never launched can drop its own
+// without touching an overlapping start's.
+type balloonHold struct {
+	reclaimMiB int
+	until      time.Time
+}
+
 // balloonReclaim is what the balloon controller can hand back right now: the
 // running guests it can shrink, how much host memory that is worth, and the
 // per-node floor it must not cross.
@@ -438,37 +447,53 @@ func (r balloonReclaim) apply(deficitMiB int) (int, error) {
 // reconcile uses — so overlapping starts hold the largest outstanding reclaim
 // rather than the sum: the second start's reclaim already contains the first's,
 // because it was applied on top of it.
+//
+// Each call records its own entry rather than raising a shared scalar, so a
+// start that fails can drop exactly the hold it took and leave an overlapping
+// start's hold standing (see releaseBalloonHold).
 func (s *Server) holdBalloonReclaim(reclaimMiB int) {
 	if reclaimMiB <= 0 {
 		return
 	}
 	s.balloonHoldMu.Lock()
 	defer s.balloonHoldMu.Unlock()
-	if time.Now().After(s.balloonHoldUntil) {
-		s.balloonHoldMiB = 0
-	}
-	if reclaimMiB > s.balloonHoldMiB {
-		s.balloonHoldMiB = reclaimMiB
-	}
-	s.balloonHoldUntil = time.Now().Add(balloonReclaimHoldTTL)
+	now := time.Now()
+	s.dropExpiredBalloonHoldsLocked(now)
+	s.balloonHolds = append(s.balloonHolds, balloonHold{reclaimMiB: reclaimMiB, until: now.Add(balloonReclaimHoldTTL)})
 }
 
 // releaseBalloonHold drops a hold armed at admission for a start that never
 // launched — every failure between the gate and the launch (a domain clash, an
 // image fetch, a disk clone) would otherwise leave memory held out of the
-// running guests for the whole TTL on behalf of guests that never booted. A
-// larger hold taken by an overlapping start in the meantime stays: it belongs
-// to that start, not this one.
+// running guests for the whole TTL on behalf of guests that never booted. Only
+// this start's own entry goes: a hold taken by an overlapping start stays,
+// because it belongs to that start's still-booting guests, not to this one.
 func (s *Server) releaseBalloonHold(reclaimMiB int) {
 	if reclaimMiB <= 0 {
 		return
 	}
 	s.balloonHoldMu.Lock()
 	defer s.balloonHoldMu.Unlock()
-	if s.balloonHoldMiB <= reclaimMiB {
-		s.balloonHoldMiB = 0
-		s.balloonHoldUntil = time.Time{}
+	s.dropExpiredBalloonHoldsLocked(time.Now())
+	// Newest first: operations are serialized under opMu, so the most recent
+	// entry of this size is the one this start armed.
+	for i := len(s.balloonHolds) - 1; i >= 0; i-- {
+		if s.balloonHolds[i].reclaimMiB == reclaimMiB {
+			s.balloonHolds = append(s.balloonHolds[:i], s.balloonHolds[i+1:]...)
+			return
+		}
 	}
+}
+
+// dropExpiredBalloonHoldsLocked forgets holds whose boot window has run out.
+func (s *Server) dropExpiredBalloonHoldsLocked(now time.Time) {
+	live := s.balloonHolds[:0]
+	for _, hold := range s.balloonHolds {
+		if now.Before(hold.until) {
+			live = append(live, hold)
+		}
+	}
+	s.balloonHolds = live
 }
 
 // BalloonHoldMiB is the outstanding pre-balloon the manager must not hand back
@@ -478,13 +503,19 @@ func (s *Server) releaseBalloonHold(reclaimMiB int) {
 // already in that reading, so subtracting it reproduces the pre-reclaim number
 // and the very next poll deflates every guest back to configured.
 //
-// The hold is clamped to what is *still* out of the running guests, because
-// the deficit it manufactures is spread over whatever is balloonable at that
-// tick — including guests that were never part of the reclaim. Without the
-// clamp, stopping or destroying the reclaimed cluster inside the window would
-// redirect the whole deficit onto the newly started one and pin it at the floor
-// on a host with memory to spare. A hold can therefore never outlive the guests
-// it was taken from.
+// The hold is clamped to what the running guests *could* give back — the same
+// inventory ceiling the gate credits, sum(configured − floor) over running
+// nodes — because the deficit it manufactures is spread over whatever is
+// balloonable at that tick. Without the clamp, stopping or destroying the
+// reclaimed cluster inside the window would redirect the whole deficit onto the
+// newly started one and pin it at the floor on a host with memory to spare. A
+// hold can therefore never outlive the guests it was taken from. The clamp is
+// against the ceiling and not against what is *currently* out, because the
+// manager may legitimately have handed a reclaim back (an expired hold that a
+// slow create then re-armed at its launch), and the hold is precisely the
+// instruction to take it again. It is also non-destructive: a clamped reading
+// never writes the lowered value back, so one transient inventory read cannot
+// disarm a live hold for good.
 func (s *Server) BalloonHoldMiB() int {
 	if !s.balloonHoldArmed() {
 		return 0
@@ -492,20 +523,20 @@ func (s *Server) BalloonHoldMiB() int {
 	// Measured before balloonHoldMu is taken: the admission path holds opMu
 	// while it arms the hold, so taking opMu under balloonHoldMu would invert
 	// the lock order.
-	outstanding := s.outstandingBalloonMiB()
+	ceiling := s.balloonReclaimCeilingMiB()
 	s.balloonHoldMu.Lock()
 	defer s.balloonHoldMu.Unlock()
-	if s.balloonHoldMiB == 0 {
-		return 0
+	s.dropExpiredBalloonHoldsLocked(time.Now())
+	held := 0
+	for _, hold := range s.balloonHolds {
+		if hold.reclaimMiB > held {
+			held = hold.reclaimMiB
+		}
 	}
-	if time.Now().After(s.balloonHoldUntil) {
-		s.balloonHoldMiB = 0
-		return 0
+	if held > ceiling {
+		return ceiling
 	}
-	if s.balloonHoldMiB > outstanding {
-		s.balloonHoldMiB = outstanding
-	}
-	return s.balloonHoldMiB
+	return held
 }
 
 // balloonHoldArmed is the cheap check that keeps a poll on an idle daemon from
@@ -513,31 +544,17 @@ func (s *Server) BalloonHoldMiB() int {
 func (s *Server) balloonHoldArmed() bool {
 	s.balloonHoldMu.Lock()
 	defer s.balloonHoldMu.Unlock()
-	return s.balloonHoldMiB > 0
+	s.dropExpiredBalloonHoldsLocked(time.Now())
+	return len(s.balloonHolds) > 0
 }
 
-// outstandingBalloonMiB is how much memory is actually out of the running
-// guests right now: the sum, over the nodes this daemon has ballooned, of the
-// distance between their configured size and the target they last accepted.
-// Nodes that stopped are gone from the inventory, so their share of a hold goes
-// with them.
-func (s *Server) outstandingBalloonMiB() int {
+// balloonReclaimCeilingMiB is how much the running balloonable guests could
+// give back in total, read from the cluster inventory under opMu the way every
+// other reader of s.vms does.
+func (s *Server) balloonReclaimCeilingMiB() int {
 	s.opMu.Lock()
-	// The eligibility flag only decides how a SetMemoryTargetMiB failure is
-	// tolerated, which this accounting never does, so it costs nothing to read
-	// the candidates without consulting the hypervisor.
-	candidates := s.balloonCandidatesLocked(false)
-	s.opMu.Unlock()
-	total := 0
-	for _, candidate := range candidates {
-		if candidate.currentTargetMiB <= 0 {
-			continue
-		}
-		if out := candidate.configuredMiB - candidate.currentTargetMiB; out > 0 {
-			total += out
-		}
-	}
-	return total
+	defer s.opMu.Unlock()
+	return s.reclaimCeilingMiB(balloon.DefaultConfig().FloorMiB)
 }
 
 // recordBalloonTarget remembers a target a guest accepted. Both the balloon

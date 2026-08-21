@@ -620,7 +620,9 @@ func TestCreateClusterRearmsThePreBalloonHoldAtLaunch(t *testing.T) {
 		}
 		cloned = true
 		service.balloonHoldMu.Lock()
-		service.balloonHoldUntil = time.Now().Add(-time.Second)
+		for i := range service.balloonHolds {
+			service.balloonHolds[i].until = time.Now().Add(-time.Second)
+		}
 		service.balloonHoldMu.Unlock()
 	})
 
@@ -706,5 +708,62 @@ func TestCreateClusterReleasesThePreBalloonHoldWhenItFailsBeforeLaunch(t *testin
 	}
 	if got := service.BalloonHoldMiB(); got != 0 {
 		t.Fatalf("BalloonHoldMiB() = %d after a create that never launched, want 0", got)
+	}
+}
+
+// #398: a create slow enough that the admission-time hold expires re-arms the
+// hold at its launch. By then the balloon manager has legitimately inflated the
+// reclaimed guests back to configured, so nothing is out of them any more — and
+// the re-armed hold is precisely the instruction to take it again. Clamping it
+// to what is currently out would zero it in exactly the case it was built for.
+func TestBalloonHoldSurvivesAReArmAfterTheManagerHandedTheReclaimBack(t *testing.T) {
+	const nodeMiB, shortfall = 2048, 512
+	reserve := balloon.DefaultConfig().ReserveMiB
+	service, _ := balloonableFixture(t, nodeMiB)
+	service.hostFreeMemory = func() (int, error) { return reserve + nodeMiB - shortfall, nil }
+
+	_, heldMiB, err := service.checkProvisionStart(t.TempDir(), nodeMiB, false)
+	if err != nil {
+		t.Fatalf("checkProvisionStart() = %v, want admission after pre-ballooning", err)
+	}
+	if heldMiB <= 0 {
+		t.Fatalf("checkProvisionStart() held %d MiB, want the pre-balloon it applied", heldMiB)
+	}
+
+	// The admission hold runs out while the create is still cloning disks, and
+	// the manager's next tick puts every guest back at its configured size.
+	service.balloonHoldMu.Lock()
+	for i := range service.balloonHolds {
+		service.balloonHolds[i].until = time.Now().Add(-time.Second)
+	}
+	service.balloonHoldMu.Unlock()
+	for name := range service.vms["demo"] {
+		service.recordBalloonTarget("demo/"+name, nodeMiB)
+	}
+
+	service.holdBalloonReclaim(heldMiB)
+
+	if got := service.BalloonHoldMiB(); got != heldMiB {
+		t.Fatalf("BalloonHoldMiB() = %d after the launch re-armed a %d MiB hold, want it live: the admitted guests boot on headroom the manager must take back", got, heldMiB)
+	}
+}
+
+// #398: the hold outlives the operation that took it while the admitted guests
+// boot, so two starts overlap. A start that fails before launching must hand
+// back only its own hold — dropping an earlier, still-live one lets the manager
+// inflate that start's guests back mid-boot.
+func TestReleaseBalloonHoldLeavesAnOverlappingStartsHoldStanding(t *testing.T) {
+	const nodeMiB = 2048
+	service, _ := balloonableFixture(t, nodeMiB)
+
+	// Start A pre-balloons 512 MiB and launches; its guests are booting.
+	service.holdBalloonReclaim(512)
+	// Start B runs the gate 30s later; its hold is cumulative, so it subsumes A's.
+	service.holdBalloonReclaim(900)
+	// B fails before it launches.
+	service.releaseBalloonHold(900)
+
+	if got := service.BalloonHoldMiB(); got != 512 {
+		t.Fatalf("BalloonHoldMiB() = %d after an overlapping start released its own hold, want A's 512 MiB still held while A's guests boot", got)
 	}
 }
