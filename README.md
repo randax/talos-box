@@ -173,12 +173,14 @@ tbx node add demo --role worker
 tbx cluster destroy demo --force   # permanent
 ```
 
-Node addresses are bound to node identity, not to creation order. Each node's MAC is derived from
-`sha256("<cluster>/<node>")`, and its address follows that MAC: on Linux the helper serves a static
-reservation from the cluster's `172.30.<n>.0/24` subnet, while on macOS vmnet's DHCP server picks
-the host number. So an added node can land anywhere in the subnet — a fourth node joining
-`.31/.32/.33` may come up at `.46` — and it keeps that address when removed and re-added. Stability
-per node, not sequential numbering, is the contract: read addresses from `tbx status`.
+Node addresses are not tied to creation order. Each node's MAC is derived from
+`sha256("<cluster>/<node>")` on both platforms, but the address behind it comes from a different
+allocator per platform. On macOS the address is vmnet's own DHCP lease keyed by that MAC: stable
+per node but not sequential, so a fourth node joining `.31/.32/.33` may come up at `.46`. On Linux
+the helper serves a static reservation taken as the lowest free host address in the cluster's
+`172.30.<n>.0/24` subnet, starting at `172.30.<n>.2`, so addresses normally read sequentially and a
+removed node's address returns to the free pool for the next node added. Either way, read a node's
+address from `tbx status` rather than inferring it from node order.
 
 Suspend/resume is capability-gated by the host backend:
 

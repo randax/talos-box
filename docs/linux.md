@@ -201,11 +201,12 @@ systemd-resolved when available. It does not modify foreign nftables tables or a
 
 Each node's MAC is derived deterministically from its identity — `52:54:00` plus the first three
 bytes of `sha256("<cluster>/<node>")` — and the helper's DHCP reservation follows that MAC, so a
-node keeps its address across stop/start and remove/re-add. Reservations are taken from the lowest
-free host address in the cluster subnet, starting at `172.30.<n>.2`, so on Linux they normally read
-sequentially; on macOS the address comes from vmnet's own DHCP server and is stable per node but
-not sequential. Either way, read a node's address from `tbx status` rather than inferring it from
-node order.
+node keeps its address across stop/start, and across a remove/re-add as long as nothing else claims
+it in between. Reservations are taken from the lowest free host address in the cluster subnet,
+starting at `172.30.<n>.2`, so on Linux they normally read sequentially, and a removed node's
+address goes back to the free pool for the next node added; on macOS the address comes from vmnet's
+own DHCP server and is stable per node but not sequential. Either way, read a node's address from
+`tbx status` rather than inferring it from node order.
 
 Cilium L2 announcements are the default ingress-VIP path and work directly on the Linux bridge.
 BGP is optional on Linux: use it for routed upstreams, ECMP, or

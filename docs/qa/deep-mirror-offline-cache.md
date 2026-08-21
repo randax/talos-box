@@ -61,7 +61,7 @@ On failure: capture the listener table verbatim.
 
 Steps:
 1. `tbx manifests qa-mir mirrors` — expect `"*"` → `http://172.30.<n>.1:5059`, `skipFallback: true`.
-2. From a test pod, pull an image that is NOT cached and NOT warmable (while online): confirm it arrives via the mirror (mirror stats change: `tbx cache list` before/after shows the upstream's counters grow). Confirm the image was novel first with `tbx cache list <image-ref>`, which answers `cached` / `not cached` for that one reference.
+2. From a test pod, pull an image that is NOT cached and NOT on any warm list (while online): confirm it arrives via the mirror (mirror stats change: `tbx cache list` before/after shows the upstream's counters grow). Confirm the image was novel first with `tbx cache list <image-ref>`, which answers `cached` / `not cached` for that one reference — pick a tag-pinned ref for this (not `:latest`, not tagless: `cache list <ref>` applies the same ref validation `cache warm` does and rejects those forms with an error rather than an answer).
 
 Expected observations: the rendered mirror config matches the live pull behavior; `cache list` per-upstream counters reflect the pull.
 
