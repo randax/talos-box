@@ -188,7 +188,10 @@ func printStatus(output io.Writer, clusters []daemon.ClusterStatus, quiet bool) 
 func printDestroySummary(output io.Writer, summary daemon.DestroySummary, inspection daemon.DestroyInspection) error {
 	lines := []string{
 		fmt.Sprintf("%d node(s) removed", summary.Nodes),
-		fmt.Sprintf("%s reclaimed (%d bytes)", humanBytes(summary.DiskBytes), summary.DiskBytes),
+		// deliberately not "reclaimed": blocks a node disk shares with the image
+		// cache (or with a snapshot) are counted per file, and the cache is not
+		// touched by a destroy, so this is state removed, not capacity freed
+		fmt.Sprintf("%s of cluster state removed (%d bytes)", humanBytes(summary.DiskBytes), summary.DiskBytes),
 	}
 	if summary.Snapshots > 0 {
 		lines = append(lines, fmt.Sprintf("%d snapshot(s) deleted", summary.Snapshots))

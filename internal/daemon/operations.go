@@ -964,7 +964,10 @@ type DestroySummary struct {
 	Nodes     int    `json:"nodes"`
 	Snapshots int    `json:"snapshots"`
 	// DiskBytes is the cluster's whole state directory — node disks, snapshots
-	// and configuration — as it stood before the removal.
+	// and configuration — as it stood before the removal. It is the sum of each
+	// file's allocated blocks, so blocks cloned from the image cache or shared
+	// with a snapshot count once per file: it reports state removed, not
+	// capacity the host gets back.
 	DiskBytes int64  `json:"diskBytes"`
 	Domain    string `json:"domain,omitempty"`
 	// ResolverWithdrawn is set only for a cluster whose own resolver file the
@@ -1021,9 +1024,13 @@ func (s *Server) destroyCluster(raw json.RawMessage) (DestroySummary, error) {
 }
 
 // directoryBytes sums what the files under dir occupy on disk. Node disks are
-// sparse, so their apparent size would overstate what the destroy gives back —
-// the block count is the only honest number for reclaimed capacity. Best
-// effort: a file that cannot be stat'ed must not fail the verb that removes it.
+// sparse, so their apparent size would overstate the state being removed; the
+// allocated block count is the closer number. It is a per-file sum, not a
+// measure of capacity the destroy frees: APFS reports cloned extents at full
+// size on both sides, so blocks a node disk shares with the image cache (which
+// a destroy never touches) or with a snapshot in the same tree are counted once
+// per file rather than once per physical block. Best effort: a file that cannot
+// be stat'ed must not fail the verb that removes it.
 func directoryBytes(dir string) int64 {
 	var total int64
 	_ = filepath.WalkDir(dir, func(_ string, entry fs.DirEntry, err error) error {

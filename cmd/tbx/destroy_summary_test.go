@@ -26,7 +26,7 @@ func TestDestroyClusterPrintsASummaryOfWhatWasRemoved(t *testing.T) {
 		"destroyed cluster demo",
 		"3 node(s) removed",
 		"1 snapshot(s) deleted",
-		"3.0 GiB",
+		"3.0 GiB of cluster state removed",
 		"3221225472 bytes",
 		"resolver entry for demo.example.test withdrawn",
 		"2 longhorn volume(s)",
@@ -34,6 +34,12 @@ func TestDestroyClusterPrintsASummaryOfWhatWasRemoved(t *testing.T) {
 		if !strings.Contains(out, wanted) {
 			t.Fatalf("destroy summary missing %q:\n%s", wanted, out)
 		}
+	}
+	// The byte figure is a per-file allocated-block sum, and node disks are
+	// APFS clones of the image cache the destroy never touches, so calling it
+	// "reclaimed" promises capacity the host does not get back.
+	if strings.Contains(out, "reclaimed") {
+		t.Fatalf("destroy summary claimed the disk figure was reclaimed capacity:\n%s", out)
 	}
 }
 

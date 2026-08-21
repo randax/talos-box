@@ -276,11 +276,13 @@ applies machine config only when a curated `cni:` is declared (§1). Hand-genera
 leave `machine.network.hostname` unset get random `talos-*` hostnames from Talos, so the names in
 `kubectl get nodes` will not match the `<cluster>-<role>-<i>` names `tbx status` shows; that is
 Talos behavior, and the operator sets `machine.network.hostname` if the two views should agree.
-`tbx status` reports each node's observed phase — `stopped`, `unreachable`, `maintenance`,
-`configured` — derived from a credential-free TLS probe of apid: **both** apid modes serve TLS
+`tbx status` reports each node's observed phase — `stopped`, `suspended`, `unreachable`,
+`maintenance`, `configured` — derived from a credential-free TLS probe of apid: **both** apid modes serve TLS
 (empirical correction, #31 — the earlier "insecure = maintenance" model was wrong);
 maintenance mode presents the well-known `maintenance-service.talos.dev` certificate, a
-configured node presents its cluster-CA identity and demands a client certificate.
+configured node presents its cluster-CA identity and demands a client certificate. `suspended`
+is not a probe verdict — no VM is running to probe — but a stopped node holding its own saved
+memory, and it still counts as "not running" for every rule keyed on stopped (#415).
 
 ## 7. Snapshots and reset
 
@@ -420,7 +422,9 @@ volume data. Cluster-level operations never delete user data except `tbx cluster
 switching or removing `csi:` is allowed only while the engine holds zero volumes (hard error
 otherwise), and the destroy confirmation reports a best-effort volume count without ever
 blocking the destroy of an unreachable cluster. A destroy closes with a summary of what it
-removed — nodes, disk bytes reclaimed, snapshots deleted, the DNS or resolver entry withdrawn,
+removed — nodes, bytes of cluster state removed (a per-file allocated-block sum, so extents
+cloned from the image cache or shared with a snapshot count once per file rather than once per
+physical block: it is not a measure of capacity freed), snapshots deleted, the DNS or resolver entry withdrawn,
 and any volumes it warned about — so the scope of the destruction can be checked without a
 residue check by hand. `tbx node remove` deletes that node's disk, so
 it is volume-gated the same best-effort way: when the engine reports the node holds the only
