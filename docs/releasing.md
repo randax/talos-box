@@ -2,9 +2,33 @@
 
 Releases are cut from `v*` tags by `.github/workflows/release.yml`, which runs
 GoReleaser (`.goreleaser.yaml`) on a macOS runner: darwin/arm64 is built
-natively (cgo for Virtualization.framework, ad-hoc codesigned with the
-virtualization entitlement), and linux/amd64 + linux/arm64 are cross-compiled
-with `CGO_ENABLED=0`.
+natively (cgo for Virtualization.framework), signed with the Developer ID
+Application identity (hardened runtime, virtualization entitlement) and
+notarized by Apple; linux/amd64 + linux/arm64 are cross-compiled with
+`CGO_ENABLED=0`.
+
+## Signing and notarization
+
+`notarize.macos` in `.goreleaser.yaml` signs `tbx`, `tbxd` and `tbx-helper`
+and submits them to the notary service, waiting for the ticket. Go's external
+linker leaves a linker-signed ad-hoc signature whose load command the signer
+cannot replace, so each darwin build strips it in a post hook first. The
+release gate refuses to publish when any of these secrets is missing:
+
+| Secret | Content |
+|---|---|
+| `MACOS_SIGN_P12` | base64 of the `Developer ID Application: Øyvind Randa (F469T889XJ)` identity as PKCS#12 |
+| `MACOS_SIGN_P12_PASSWORD` | the `.p12` password |
+| `MACOS_NOTARY_KEY` | base64 of the App Store Connect API key (`.p8`, role Developer) |
+| `MACOS_NOTARY_KEY_ID` | the key's ID |
+| `MACOS_NOTARY_ISSUER_ID` | the App Store Connect issuer UUID |
+
+The identity, key and `.p12` live outside the repo on the owner's machine
+(`~/Library/Application Support/talos-box-signing/`); the certificate expires
+2031-08-22. A local `goreleaser release --snapshot --skip=publish` without
+`MACOS_SIGN_P12` in the environment builds unsigned darwin binaries, which is
+fine for checking the pipeline but not for running them: Virtualization.framework
+needs the entitlement, so a local build for use goes through `make build`.
 
 ## Cutting a release
 
