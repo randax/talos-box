@@ -279,7 +279,11 @@ On the substrate-only path, nodes always come up **unconfigured** — talosbox g
 applies machine config only when a curated `cni:` is declared (§1). Hand-generated configs that
 leave `machine.network.hostname` unset get random `talos-*` hostnames from Talos, so the names in
 `kubectl get nodes` will not match the `<cluster>-<role>-<i>` names `tbx status` shows; that is
-Talos behavior, and the operator sets `machine.network.hostname` if the two views should agree.
+Talos behavior, and leaving the mismatch alone is the simplest path. On Talos 1.13 `talosctl gen
+config` already emits a `kind: HostnameConfig` (`auto: stable`) document, so adding
+`machine.network.hostname` alongside it makes every `apply-config` fail with `static hostname is
+already set in v1alpha1 config`; lining the two views up requires removing or replacing that
+generated document in the same bundle.
 `tbx status` reports each node's observed phase — `stopped`, `suspended`, `unreachable`,
 `maintenance`, `configured` — derived from a credential-free TLS probe of apid: **both** apid modes serve TLS
 (empirical correction, #31 — the earlier "insecure = maintenance" model was wrong);

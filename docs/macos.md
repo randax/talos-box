@@ -118,7 +118,13 @@ sequential.) Always read a node's current address from `tbx status`; never infer
 
 ### Checking tbx DNS
 
-Verify tbx names with `dscacheutil -q host -a name <node>.<cluster>.<domain>` or `ping`. Do
+Verify tbx names with `dscacheutil -q host -a name <node>.<cluster-domain>` or `ping`, where
+`<cluster-domain>` is the domain the cluster is actually reachable under: `<cluster>.k8s.test` on
+the default domain (so `<node>.<cluster>.k8s.test`), or exactly the `--domain` value for a cluster
+created with one (so `<node>.<domain>` — `qa-fork-cp-1.forge.internal`, not
+`qa-fork-cp-1.qa-fork.forge.internal`). A wrong three-part name is still a suffix of the owning
+domain, so it resolves to the ingress wildcard address instead of failing, and looks like a
+successful check. Do
 **not** use `dig` or `nslookup`: they query the resolvers in `/etc/resolv.conf` directly and
 bypass `/etc/resolver/`, which is exactly where tbx installs its per-domain entries — so they
 return nothing for a perfectly healthy cluster. `scutil --dns` shows the per-domain resolver
