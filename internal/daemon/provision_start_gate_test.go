@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -825,5 +826,35 @@ func TestRoleMemoryMiBFallsBackToNodeDefaults(t *testing.T) {
 	}
 	if got := roleMemoryMiB(nil, cluster.NodeDefaults{}); got != cluster.DefaultMemoryMiB {
 		t.Fatalf("roleMemoryMiB(nil, zero) = %d, want the built-in default", got)
+	}
+}
+
+// #398: cluster start takes the same pre-balloon out of the running guests, so
+// a start whose launch fails must hand it back. Left held, the guests it
+// squeezed sit at their reclaimed targets for the whole TTL on behalf of a node
+// that never booted.
+func TestStartClusterReleasesThePreBalloonHoldWhenTheLaunchFails(t *testing.T) {
+	const nodeMiB, shortfall = 2048, 512
+	reserve := balloon.DefaultConfig().ReserveMiB
+	service, item := balloonableFixture(t, nodeMiB)
+	stubNodeMutationReconcile(service)
+	service.hostFreeMemory = func() (int, error) { return reserve + nodeMiB - shortfall, nil }
+	// One member is powered off, so start has exactly one node to boot beside
+	// the two still-running guests the pre-balloon squeezes.
+	stopped := item.Nodes[len(item.Nodes)-1].Name
+	delete(service.vms[item.Name], stopped)
+	service.hypervisor.(*fakeHypervisor).launch = func(context.Context, hypervisor.Spec) (hypervisor.Machine, error) {
+		return nil, errors.New("vz: failed to start the virtual machine")
+	}
+
+	raw, err := json.Marshal(startArgs{Name: item.Name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.startCluster(raw); err == nil {
+		t.Fatal("startCluster() succeeded with a failing launch; the test no longer exercises a start that never booted a guest")
+	}
+	if got := service.BalloonHoldMiB(); got != 0 {
+		t.Fatalf("BalloonHoldMiB() = %d after a start whose launch failed, want 0", got)
 	}
 }

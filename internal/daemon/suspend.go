@@ -101,13 +101,24 @@ func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
 	// A resume re-admits every suspended node's full allocation beside whatever
 	// guests are already resident, which is the concurrent bringup the
 	// projected-start gate exists for (#334).
+	preBalloonedMiB := 0
 	if bootingMiB := s.stoppedNodeMemoryMiB(item); bootingMiB > 0 {
-		provisionStartWarnings, _, err := s.checkProvisionStart(dir, bootingMiB, args.Force)
+		provisionStartWarnings, held, err := s.checkProvisionStart(dir, bootingMiB, args.Force)
 		if err != nil {
 			return ClusterSummary{}, err
 		}
+		preBalloonedMiB = held
 		pressureWarnings = append(pressureWarnings, provisionStartWarnings...)
 	}
+	// A resume that fails before any guest is up — or that rolls its restores
+	// back — must hand the pre-balloon back rather than hold the running guests
+	// at their reclaimed targets for the rest of the TTL (#398).
+	launched := false
+	defer func() {
+		if !launched {
+			s.releaseBalloonHold(preBalloonedMiB)
+		}
+	}()
 	// Suspend deliberately leaves the cluster's bridge up, so its own subnet
 	// occupancy is expected here: inspect for advisory findings only, never
 	// re-decide a subnet the cluster already owns (#271).
@@ -155,6 +166,7 @@ func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if err != nil {
 		return ClusterSummary{}, err
 	}
+	launched = true
 	go s.bindMirrors(item.SubnetIndex) // resume bypasses start(); rebind the gateway
 	if !restored {
 		// Every node cold-booted, so every guest took its clock from the host

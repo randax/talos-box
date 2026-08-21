@@ -58,3 +58,46 @@ func TestRunDoctorHostPressurePassWithoutFreeMemoryReading(t *testing.T) {
 		t.Errorf("output missing the unmeasured free-memory summary:\n%s", output.String())
 	}
 }
+
+// #397/#420: TBX_BALLOON_RESERVE_MIB is read per process, so the reserve the
+// gate will apply is the daemon's, not the CLI's. The PASS quotes the daemon's
+// answer when there is one.
+func TestRunDoctorHostPressurePassUsesDaemonReportedReserve(t *testing.T) {
+	deps := passingDoctorDependencies()
+	deps.hostFreeMemory = func() (int, error) { return 12243, nil }
+	deps.balloonReserveMiB = func() (int, error) { return 4096, nil }
+
+	var output strings.Builder
+	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
+		t.Fatalf("runDoctorWithDependencies() = %v for a healthy host", err)
+	}
+
+	want := fmt.Sprintf("must leave the 4096 MiB balloon reserve free, so there is room for %d MiB of new guests right now", 12243-4096)
+	if !strings.Contains(output.String(), want) {
+		t.Errorf("output missing %q:\n%s", want, output.String())
+	}
+	if strings.Contains(output.String(), "daemon unreachable") {
+		t.Errorf("output claims the daemon was unreachable:\n%s", output.String())
+	}
+}
+
+// With no daemon to ask, the CLI's own default is a guess about the gate, and
+// the line says so rather than presenting it as the gate's number.
+func TestRunDoctorHostPressurePassSaysTheReserveWasAssumed(t *testing.T) {
+	deps := passingDoctorDependencies()
+	deps.hostFreeMemory = func() (int, error) { return 12243, nil }
+	deps.balloonReserveMiB = func() (int, error) { return 0, errors.New("daemon not running") }
+
+	var output strings.Builder
+	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
+		t.Fatalf("runDoctorWithDependencies() = %v for a healthy host", err)
+	}
+
+	want := fmt.Sprintf("must leave the %d MiB balloon reserve free", balloon.DefaultConfig().ReserveMiB)
+	if !strings.Contains(output.String(), want) {
+		t.Errorf("output missing %q:\n%s", want, output.String())
+	}
+	if !strings.Contains(output.String(), "(daemon unreachable; assuming the default reserve)") {
+		t.Errorf("output missing the assumed-reserve caveat:\n%s", output.String())
+	}
+}

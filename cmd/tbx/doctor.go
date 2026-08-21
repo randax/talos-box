@@ -39,6 +39,12 @@ type doctorDependencies struct {
 	// needed it — but the check is not self-attesting without it (#420). Nil
 	// reports free memory as unmeasured rather than guessing.
 	hostFreeMemory func() (int, error)
+	// balloonReserveMiB is the provision-start gate's host-memory reserve as
+	// the daemon itself reads it. TBX_BALLOON_RESERVE_MIB is read per process,
+	// so the CLI's own default is only a guess about the gate; asking the
+	// daemon is what makes the reported headroom the number that will decide
+	// the next bringup (#397, #420). Nil or an error falls back to the default.
+	balloonReserveMiB func() (int, error)
 	// guestAgentSupport is the host capability, not a running backend's, so the
 	// gate is explained even with the daemon down.
 	guestAgentSupport func() hypervisor.FeatureStatus
@@ -100,6 +106,22 @@ usage: tbx doctor
 // doctorFreeMemoryMiB reads host free memory for the host-pressure summary. It
 // never fails the check: an unreadable probe reports the other two numbers and
 // says free memory was not measured.
+// doctorBalloonReserveMiB reports the reserve the daemon's provision-start gate
+// measures against, and whether it came from the daemon: a reserve the CLI had
+// to assume is worth saying so, because an env-set reserve in the daemon's
+// environment makes the printed headroom disagree with the gate.
+func doctorBalloonReserveMiB(deps doctorDependencies) (int, bool) {
+	if deps.balloonReserveMiB == nil {
+		return balloon.DefaultConfig().ReserveMiB, false
+	}
+	reserveMiB, err := deps.balloonReserveMiB()
+	// A daemon predating the field answers zero, which is no answer at all.
+	if err != nil || reserveMiB <= 0 {
+		return balloon.DefaultConfig().ReserveMiB, false
+	}
+	return reserveMiB, true
+}
+
 func doctorFreeMemoryMiB(deps doctorDependencies) int {
 	if deps.hostFreeMemory == nil {
 		return 0
@@ -199,8 +221,13 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		// df by hand, and so a host cannot read PASS here and still be refused a
 		// second cluster without warning (#420, #397).
 		snapshot.FreeMemoryMiB = doctorFreeMemoryMiB(deps)
+		reserveMiB, fromDaemon := doctorBalloonReserveMiB(deps)
+		detail := snapshot.Summary(reserveMiB)
+		if !fromDaemon {
+			detail += " (daemon unreachable; assuming the default reserve)"
+		}
 		if err := writeFindings(doctorFinding{
-			level: "PASS", check: "host-pressure", detail: snapshot.Summary(balloon.DefaultConfig().ReserveMiB),
+			level: "PASS", check: "host-pressure", detail: detail,
 		}); err != nil {
 			return err
 		}
@@ -525,6 +552,11 @@ func (c cli) doctorDependencies() doctorDependencies {
 			ctx, cancel := context.WithTimeout(context.Background(), commandProbeTimeout)
 			defer cancel()
 			return balloon.HostFreeMiBContext(ctx)
+		},
+		balloonReserveMiB: func() (int, error) {
+			var result daemon.Info
+			err := c.doctorCall("daemon.info", struct{}{}, &result)
+			return result.BalloonReserveMiB, err
 		},
 		mirrorOffline: func() (bool, error) {
 			var result daemon.MirrorOfflineStatus

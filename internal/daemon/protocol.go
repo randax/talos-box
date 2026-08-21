@@ -95,6 +95,13 @@ func (r Response) IsProgress() bool { return r.Stage != "" }
 // Info reports daemon wire compatibility details.
 type Info struct {
 	ProtocolVersion int `json:"protocolVersion"`
+	// BalloonReserveMiB is the host-memory reserve the daemon's
+	// provision-start gate actually measures against. It is read in the daemon
+	// process, where TBX_BALLOON_RESERVE_MIB takes effect, so a CLI reporting
+	// headroom quotes the number that will decide the next bringup rather than
+	// its own process's default (#397, #420). Additive: an older daemon omits
+	// it and the CLI falls back to the compiled-in default.
+	BalloonReserveMiB int `json:"balloonReserveMiB,omitempty"`
 }
 
 // NodeRunState is the answer to node.start and node.stop: the node's status

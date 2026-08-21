@@ -72,10 +72,19 @@ func (s *Server) startNodeLocked(raw json.RawMessage, progress stageFunc) (NodeR
 	// which only decides whether the gate applies at all (#334).
 	// This node launches a few lines below, so the gate's own hold already
 	// starts at the launch it protects; nothing to re-arm.
-	provisionStartWarnings, _, err := s.checkProvisionStart(dir, item.DefaultsFor(node.Role).MemoryMiB, args.Force)
+	provisionStartWarnings, preBalloonedMiB, err := s.checkProvisionStart(dir, item.DefaultsFor(node.Role).MemoryMiB, args.Force)
 	if err != nil {
 		return NodeRunState{}, nil, err
 	}
+	// A start that never reaches a booting guest must hand the pre-balloon back
+	// rather than hold the running guests at their reclaimed targets for the
+	// rest of the TTL (#398).
+	launched := false
+	defer func() {
+		if !launched {
+			s.releaseBalloonHold(preBalloonedMiB)
+		}
+	}()
 	hostPressureWarnings = append(hostPressureWarnings, provisionStartWarnings...)
 	nodes := s.vms[item.Name]
 	if nodes == nil {
@@ -94,6 +103,7 @@ func (s *Server) startNodeLocked(raw json.RawMessage, progress stageFunc) (NodeR
 	if err != nil {
 		return NodeRunState{}, nil, fmt.Errorf("create VM %s: %w", node.Name, err)
 	}
+	launched = true
 	nodes[node.Name] = machine
 	// node.start is a cold boot: suspended memory for this node is superseded
 	// by the fresh launch and must not be left to poison Suspended status or

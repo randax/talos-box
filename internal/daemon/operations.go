@@ -692,15 +692,22 @@ func (s *Server) startCluster(raw json.RawMessage) (ClusterSummary, error) {
 	// for the nodes this start actually boots, so a partly-running cluster —
 	// which start also boots the stopped half of — is gated too, and the
 	// members already running are not counted twice.
+	preBalloonedMiB := 0
 	if bootingMiB := s.stoppedNodeMemoryMiB(item); bootingMiB > 0 {
-		provisionStartWarnings, _, err := s.checkProvisionStart(dir, bootingMiB, args.Force)
+		provisionStartWarnings, held, err := s.checkProvisionStart(dir, bootingMiB, args.Force)
 		if err != nil {
 			return ClusterSummary{}, err
 		}
+		preBalloonedMiB = held
 		hostPressureWarnings = append(hostPressureWarnings, provisionStartWarnings...)
 	}
+	// The launch is right below, so the hold's clock already starts where it
+	// should; but a start that fails — and rolls its own launches back — must
+	// hand the pre-balloon back instead of pinning the running guests at their
+	// reclaimed targets for the rest of the TTL (#398).
 	startWarnings, err := s.start(item)
 	if err != nil {
+		s.releaseBalloonHold(preBalloonedMiB)
 		return ClusterSummary{}, err
 	}
 	result := summary(item, true)

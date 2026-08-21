@@ -847,7 +847,7 @@ func (s *Server) handle(request Request, progress stageFunc) (any, error) {
 	case "daemon.ping":
 		return map[string]bool{"pong": true}, nil
 	case "daemon.info":
-		return Info{ProtocolVersion: ProtocolVersion}, nil
+		return Info{ProtocolVersion: ProtocolVersion, BalloonReserveMiB: balloon.DefaultConfig().ReserveMiB}, nil
 	case "up":
 		return s.up(request.Args)
 	case "down":
