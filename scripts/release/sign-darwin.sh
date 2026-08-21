@@ -44,10 +44,30 @@ done
 echo "sign-darwin: $binary submitted as $submission" >&2
 status=$(xcrun notarytool wait "$submission" --output-format json \
   --key "$MACOS_NOTARY_KEY_FILE" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER_ID" \
-  --timeout "${MACOS_NOTARY_TIMEOUT:-60m}" | sed -n 's/.*"status" *: *"\([^"]*\)".*/\1/p' | head -1)
-if [[ "$status" != "Accepted" ]]; then
-  echo "sign-darwin: $binary notarization ended with status '${status:-unknown}' (submission $submission):" >&2
-  xcrun notarytool log "$submission" --key "$MACOS_NOTARY_KEY_FILE" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER_ID" >&2 || true
-  exit 1
-fi
-echo "sign-darwin: $binary notarized ($submission)" >&2
+  --timeout "${MACOS_NOTARY_TIMEOUT:-60m}" 2>/dev/null | sed -n 's/.*"status" *: *"\([^"]*\)".*/\1/p' | head -1)
+case "$status" in
+  Accepted)
+    echo "sign-darwin: $binary notarized ($submission)" >&2 ;;
+  "In Progress"|"")
+    # The notary queue can sit on a submission for hours (a new account's
+    # first days especially). Bare binaries cannot be stapled: Gatekeeper
+    # fetches the ticket online whenever Apple issues it, so a slow queue is
+    # not a reason to fail the release — only a verdict is. Surface the
+    # submission so it can be checked with `notarytool info`.
+    status=$(xcrun notarytool info "$submission" --output-format json \
+      --key "$MACOS_NOTARY_KEY_FILE" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER_ID" 2>/dev/null \
+      | sed -n 's/.*"status" *: *"\([^"]*\)".*/\1/p' | head -1)
+    if [[ "$status" == "Accepted" ]]; then
+      echo "sign-darwin: $binary notarized ($submission)" >&2
+    elif [[ "$status" == "In Progress" ]]; then
+      echo "::warning::sign-darwin: $binary is still in Apple's notary queue after ${MACOS_NOTARY_TIMEOUT:-60m} (submission $submission); the ticket lands later, check with: xcrun notarytool info $submission" >&2
+    else
+      echo "sign-darwin: $binary notarization ended with status '${status:-unknown}' (submission $submission):" >&2
+      xcrun notarytool log "$submission" --key "$MACOS_NOTARY_KEY_FILE" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER_ID" >&2 || true
+      exit 1
+    fi ;;
+  *)
+    echo "sign-darwin: $binary notarization ended with status '$status' (submission $submission):" >&2
+    xcrun notarytool log "$submission" --key "$MACOS_NOTARY_KEY_FILE" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER_ID" >&2 || true
+    exit 1 ;;
+esac
