@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -81,6 +83,22 @@ func TestInterClusterFinding(t *testing.T) {
 			wantDetail: "host → qa-core VIP 172.30.0.200: i/o timeout",
 		},
 		{
+			// #388's actual shape: the path blackholes, so the dial request
+			// never comes back and our own deadline fires. The source VIP
+			// answered the host a moment earlier, so this is the sibling path,
+			// and doctor must fail on it rather than filing an advisory.
+			name:     "a sibling dial that never answers fails and names the direction",
+			statuses: liveClusterStatuses(),
+			do: func(request *http.Request) (*http.Response, error) {
+				if request.URL.Host == "172.30.1.200" && request.URL.Path == "/dial" {
+					return nil, context.DeadlineExceeded
+				}
+				return jsonResponse(`{"responses":["lb-probe-1"]}`), nil
+			},
+			wantLevel:  "FAIL",
+			wantDetail: "qa-edge → qa-core VIP 172.30.0.200: no answer within 20s from the lb-probe behind 172.30.1.200",
+		},
+		{
 			name:     "an lb-probe without a dial endpoint warns instead of failing",
 			statuses: liveClusterStatuses(),
 			do: func(request *http.Request) (*http.Response, error) {
@@ -111,5 +129,23 @@ func TestInterClusterFinding(t *testing.T) {
 				t.Fatalf("detail = %q, want it to contain %q", finding.detail, tt.wantDetail)
 			}
 		})
+	}
+}
+
+// The egress client honours HTTP_PROXY, which is right for factory.talos.dev
+// and wrong for a cluster VIP: those addresses are host-local, so a proxied
+// probe reports a dead path on a healthy host. The VIP client must never
+// consult the environment.
+func TestDoctorVIPHTTPClientIgnoresTheProxyEnvironment(t *testing.T) {
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:1/")
+	t.Setenv("http_proxy", "http://127.0.0.1:1/")
+	transport, ok := newDoctorVIPHTTPClient().Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("VIP client transport = %T, want *http.Transport", newDoctorVIPHTTPClient().Transport)
+	}
+	if transport.Proxy != nil {
+		request := &http.Request{Method: http.MethodGet, URL: &url.URL{Scheme: "http", Host: "172.30.0.200", Path: "/"}}
+		proxy, err := transport.Proxy(request)
+		t.Fatalf("VIP client proxies http://172.30.0.200/ via %v (err %v); it must dial the VIP directly", proxy, err)
 	}
 }

@@ -34,7 +34,7 @@ func TestRunDoctorFailsOnADeadInterClusterPath(t *testing.T) {
 			return nil, nil
 		}
 	}
-	deps.doHTTP = func(request *http.Request) (*http.Response, error) {
+	deps.doVIPHTTP = func(request *http.Request) (*http.Response, error) {
 		if request.URL.Host == "172.30.1.200" && request.URL.Path == "/dial" {
 			return jsonResponse(`{"errors":["dial tcp 172.30.0.200:80: i/o timeout"]}`), nil
 		}

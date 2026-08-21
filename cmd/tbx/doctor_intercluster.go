@@ -9,15 +9,23 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/randax/talos-box/internal/daemon"
 )
 
-// interClusterProbeTimeout bounds each reachability probe. The paths are all
-// host-local, so a probe that has not answered in this long is a dead path, not
-// a slow one.
+// interClusterProbeTimeout bounds the host leg of the probe. That path is
+// host-local, so a VIP that has not answered in this long is a dead path, not a
+// slow one.
 const interClusterProbeTimeout = 5 * time.Second
+
+// interClusterDialProbeTimeout bounds the sibling leg. That request is answered
+// only after the lb-probe behind the source VIP has itself dialled the sibling,
+// so the budget must clearly exceed the dialer's own dial timeout — otherwise a
+// blackholed path trips our deadline first and the real symptom (#388) reads as
+// "the probe could not be run" instead of "this direction is dead".
+const interClusterDialProbeTimeout = 20 * time.Second
 
 // interClusterProbeBodyLimit caps the dialer's answer; it is a short JSON
 // document, and an unbounded read would hand a stray listener the whole
@@ -83,6 +91,7 @@ func interClusterFinding(statuses []daemon.ClusterStatus, statusErr error, do ht
 		}
 		reachable[target.cluster] = true
 	}
+	var pairs []siblingProbe
 	for _, source := range targets {
 		if !reachable[source.cluster] {
 			// The dialer lives behind the VIP the host cannot reach, so its
@@ -95,15 +104,19 @@ func interClusterFinding(statuses []daemon.ClusterStatus, statusErr error, do ht
 			if sibling.cluster == source.cluster {
 				continue
 			}
-			switch err := probeVIPFromCluster(do, source.vip, sibling.vip); {
-			case err == nil:
-			case isInterClusterProbeUnavailable(err):
-				advisories = append(advisories, fmt.Sprintf(
-					"%s → %s VIP %s could not be probed: %v", source.cluster, sibling.cluster, sibling.vip, err))
-			default:
-				problems = append(problems, fmt.Sprintf(
-					"%s → %s VIP %s: %v", source.cluster, sibling.cluster, sibling.vip, err))
-			}
+			pairs = append(pairs, siblingProbe{source: source, sibling: sibling})
+		}
+	}
+	for i, err := range runSiblingProbes(do, pairs) {
+		pair := pairs[i]
+		switch {
+		case err == nil:
+		case isInterClusterProbeUnavailable(err):
+			advisories = append(advisories, fmt.Sprintf(
+				"%s → %s VIP %s could not be probed: %v", pair.source.cluster, pair.sibling.cluster, pair.sibling.vip, err))
+		default:
+			problems = append(problems, fmt.Sprintf(
+				"%s → %s VIP %s: %v", pair.source.cluster, pair.sibling.cluster, pair.sibling.vip, err))
 		}
 	}
 
@@ -119,8 +132,28 @@ func interClusterFinding(statuses []daemon.ClusterStatus, statusErr error, do ht
 	return finding
 }
 
+// siblingProbe is one direction of the cluster-to-cluster matrix.
+type siblingProbe struct{ source, sibling vipTarget }
+
+// runSiblingProbes runs the matrix concurrently and returns one result per
+// pair, in the order given. The sibling budget is long enough that running the
+// N·(N-1) probes in series would dominate the whole doctor run.
+func runSiblingProbes(do httpDo, pairs []siblingProbe) []error {
+	results := make([]error, len(pairs))
+	var wait sync.WaitGroup
+	for i, pair := range pairs {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			results[i] = probeVIPFromCluster(do, pair.source.vip, pair.sibling.vip)
+		}()
+	}
+	wait.Wait()
+	return results
+}
+
 func probeVIPFromHost(do httpDo, vip string) error {
-	response, err := getWithTimeout(do, "http://"+vip+"/")
+	response, err := getWithTimeout(do, "http://"+vip+"/", interClusterProbeTimeout)
 	if err != nil {
 		return err
 	}
@@ -150,9 +183,14 @@ func probeVIPFromCluster(do httpDo, sourceVIP, targetVIP string) error {
 		"protocol": {"http"},
 		"tries":    {"1"},
 	}
-	response, err := getWithTimeout(do, "http://"+sourceVIP+"/dial?"+query.Encode())
+	response, err := getWithTimeout(do, "http://"+sourceVIP+"/dial?"+query.Encode(), interClusterDialProbeTimeout)
 	if err != nil {
-		return interClusterProbeUnavailable{detail: fmt.Sprintf("dialer unreachable: %v", err)}
+		// The host leg already proved sourceVIP answers, so a dial request to
+		// that same VIP that never comes back is the sibling path dropping
+		// traffic, not an unreachable dialer. That is the #388 symptom, and it
+		// is a failure, not an advisory.
+		return fmt.Errorf("no answer within %s from the lb-probe behind %s, whose own VIP answers the host: %w",
+			interClusterDialProbeTimeout, sourceVIP, err)
 	}
 	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusOK {
@@ -179,8 +217,8 @@ func probeVIPFromCluster(do httpDo, sourceVIP, targetVIP string) error {
 	return nil
 }
 
-func getWithTimeout(do httpDo, target string) (*http.Response, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), interClusterProbeTimeout)
+func getWithTimeout(do httpDo, target string, timeout time.Duration) (*http.Response, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		cancel()
@@ -208,4 +246,28 @@ type cancelOnClose struct {
 func (c cancelOnClose) Close() error {
 	defer c.cancel()
 	return c.ReadCloser.Close()
+}
+
+// newDoctorVIPHTTPClient builds the client the VIP probes use. It is not the
+// egress client: cluster VIPs are host-local addresses that no HTTP proxy can
+// reach, so a client honouring HTTP_PROXY hands http://172.30.x.200/ to the
+// proxy and reports a dead path on a healthy host. Stripping the proxy mirrors
+// vipHTTPClient in internal/provision, which probes these same VIPs. The client
+// budget covers the longer sibling leg; each request carries its own deadline.
+func newDoctorVIPHTTPClient() *http.Client {
+	transport, ok := http.DefaultTransport.(*http.Transport)
+	if ok {
+		transport = transport.Clone()
+		transport.Proxy = nil
+	} else {
+		// DefaultTransport was replaced with a custom RoundTripper.
+		transport = &http.Transport{ForceAttemptHTTP2: true}
+	}
+	return &http.Client{
+		Transport: transport,
+		Timeout:   interClusterDialProbeTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 }

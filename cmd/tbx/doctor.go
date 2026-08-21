@@ -47,7 +47,10 @@ type doctorDependencies struct {
 	listenPacket      func(string, string) (net.PacketConn, error)
 	listenStream      func(string, string) (io.Closer, error)
 	doHTTP            httpDo
-	platform          func() []doctorFinding
+	// doVIPHTTP probes cluster VIPs. It is separate from doHTTP because those
+	// addresses are host-local and must never go through an HTTP proxy.
+	doVIPHTTP httpDo
+	platform  func() []doctorFinding
 }
 
 // doctorHelp answers `tbx doctor --help`. It names every check the command can
@@ -284,7 +287,7 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 			}
 			// Routes and forwarding assert only that the host could carry the
 			// traffic; this asks whether it actually does (#388).
-			if err := writeFindings(interClusterFinding(statuses, statusErr, deps.doHTTP)); err != nil {
+			if err := writeFindings(interClusterFinding(statuses, statusErr, deps.doVIPHTTP)); err != nil {
 				return err
 			}
 		}
@@ -541,7 +544,8 @@ func (c cli) doctorDependencies() doctorDependencies {
 		listenStream: func(network, address string) (io.Closer, error) {
 			return net.Listen(network, address)
 		},
-		doHTTP: newDoctorHTTPClient().Do,
+		doHTTP:    newDoctorHTTPClient().Do,
+		doVIPHTTP: newDoctorVIPHTTPClient().Do,
 	}
 	platformDoctorDependencies(&deps)
 	return deps

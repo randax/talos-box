@@ -918,6 +918,9 @@ func passingDoctorDependencies() doctorDependencies {
 		doHTTP: func(*http.Request) (*http.Response, error) {
 			return &http.Response{Body: http.NoBody}, nil
 		},
+		doVIPHTTP: func(*http.Request) (*http.Response, error) {
+			return jsonResponse(`{"responses":["lb-probe-1"]}`), nil
+		},
 	}
 }
 
