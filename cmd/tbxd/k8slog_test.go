@@ -29,8 +29,10 @@ func TestRouteKubernetesClientLogsKeepsKlogOutOfTheDaemonLog(t *testing.T) {
 	defer func() { _ = closer.Close() }()
 
 	log.Print("balloon qa-cil/qa-cil-cp-1: target=2048MiB")
-	klog.Info("Warning: spec.template.metadata.annotations deprecated since v1.30")
-	klog.Flush()
+	stderr := stderrDuringRouting(t, func() {
+		klog.Info("Warning: spec.template.metadata.annotations deprecated since v1.30")
+		klog.Flush()
+	})
 
 	content, err := os.ReadFile(path)
 	if err != nil {
@@ -45,6 +47,72 @@ func TestRouteKubernetesClientLogsKeepsKlogOutOfTheDaemonLog(t *testing.T) {
 	if got := daemonLog.String(); !strings.Contains(got, "balloon qa-cil/qa-cil-cp-1") {
 		t.Fatalf("daemon log = %q, want the tbx narration line", got)
 	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want nothing: klog's stderr is tbxd.log", stderr)
+	}
+}
+
+// klog's own stderr threshold defaults to ERROR, so the error severities
+// client-go emits while the API server is still coming up — the discovery
+// mapper's "couldn't get current server API group list" among them — kept
+// landing in tbxd.log even after LogToStderr(false) (#401 review). They belong
+// in the Kubernetes log, once each.
+func TestRouteKubernetesClientLogsDivertsErrorsAndWarningsToo(t *testing.T) {
+	var daemonLog bytes.Buffer
+	restoreLog := swapDefaultLogger(t, &daemonLog)
+	defer restoreLog()
+
+	path := filepath.Join(t.TempDir(), ".talosbox", kubernetesLogFile)
+	closer, err := routeKubernetesClientLogs(path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = closer.Close() }()
+
+	stderr := stderrDuringRouting(t, func() {
+		klog.Warning("chart values omit resources.limits")
+		klog.Error("couldn't get current server API group list")
+		klog.Flush()
+	})
+
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want nothing: klog's stderr is tbxd.log", stderr)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"chart values omit", "current server API group list"} {
+		if got := strings.Count(string(content), want); got != 1 {
+			t.Fatalf("%s holds %d copies of %q, want exactly 1", kubernetesLogFile, got, want)
+		}
+	}
+	if got := daemonLog.String(); got != "" {
+		t.Fatalf("daemon log = %q, want no klog line", got)
+	}
+}
+
+// stderrDuringRouting points os.Stderr — which for tbxd is tbxd.log — at a file
+// for the duration of run, and reports what klog wrote there.
+func stderrDuringRouting(t *testing.T, run func()) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "stderr")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := os.Stderr
+	os.Stderr = file
+	run()
+	os.Stderr = original
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(content)
 }
 
 // The API warning handler is what emitted the PodSecurity blocks, so it is off

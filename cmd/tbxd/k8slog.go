@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -41,6 +42,21 @@ func routeKubernetesClientLogs(path string, warningsEnabled bool) (io.Closer, er
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("create %s: %w", filepath.Dir(path), err)
 	}
+	// LogToStderr(false) alone diverts only Info and Warning: klog keeps a
+	// separate stderr threshold that defaults to ERROR, so every E-line would
+	// still be written to os.Stderr — which for tbxd is tbxd.log — on top of
+	// the file below, leaving #401's interleaving half fixed. one_output stops
+	// klog from also copying each line down into every lower severity's writer,
+	// which with a single writer means duplicates.
+	var klogFlags flag.FlagSet
+	klog.InitFlags(&klogFlags)
+	if err := klogFlags.Set("stderrthreshold", "FATAL"); err != nil {
+		return nil, fmt.Errorf("set klog stderr threshold: %w", err)
+	}
+	if err := klogFlags.Set("one_output", "true"); err != nil {
+		return nil, fmt.Errorf("set klog one_output: %w", err)
+	}
+
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", path, err)
