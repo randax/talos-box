@@ -24,7 +24,7 @@ Abort the run (report BLOCKED, not FAIL) if any of these don't hold:
    - **Record the host cache state too**, because C1's duration depends on it: `tbx cache list` (does a Talos disk image for the pinned version already exist?). Report it as `cold` (no matching disk image cached) or `warm` — a warm host skips the image download entirely, so a fast create is not evidence about first-run timing.
 2. `git -C <talos-box checkout> rev-parse HEAD` — record the commit if running from source.
 3. `test -r /dev/kvm -a -w /dev/kvm && echo kvm-ok` prints `kvm-ok`.
-4. `tbx doctor` exits 0. Expected on Linux: `helper-unit`, `helper-access`, `helper-capabilities`, `kvm`, `qemu`, `forwarding`, `bridge-netfilter`, `bridge-stp`, `rp-filter`, `port-53`/`port-67`/`port-179`, resolver checks, routes OK; `host-pressure: SKIP` is expected on Linux (not friction). Record any WARN as friction.
+4. `tbx doctor` exits 0 — on a host installed with `tbx system install`. On a host without systemd (a CI sandbox) see the appendix: the `helper-*` checks FAIL by construction there, and that is a harness deviation to record, not a BLOCKED preflight. Expected on Linux: `helper-unit`, `helper-access`, `helper-capabilities`, `kvm`, `qemu`, `forwarding`, `bridge-netfilter`, `bridge-stp`, `rp-filter`, `port-53`/`port-67`/`port-179`, resolver checks, routes OK; `host-pressure: SKIP` is expected on Linux (not friction). Record any WARN as friction.
 5. `tbx status` shows no cluster named `qa-smoke` (destroy leftovers first: `tbx cluster destroy qa-smoke --force`).
 6. Host has ≥ 8 GiB free RAM (`free -h`) — the default cluster wants 6 GiB. Note: no overcommit guard exists on Linux; nothing will warn you.
 7. Network can reach `factory.talos.dev` (smoke assumes online; offline behavior is a deep runbook).
@@ -70,6 +70,7 @@ On failure: capture `resolvectl status` (or `cat /etc/resolv.conf`), `tbx doctor
 
 Steps:
 1. `tbx console qa-smoke qa-smoke-cp-1`, watch ~10 s, detach with `Ctrl-]`.
+   - Without a TTY (scripted or SSH-driven runs): `tbx console qa-smoke qa-smoke-cp-1 --no-follow --lines 30` dumps the ring buffer and exits; record that you used the non-interactive path, and that the detach key was therefore not exercised.
 
 Expected observations: a session banner states the detach key; Talos kernel/machined log lines stream; detach returns your shell without killing the VM (verify: node still `maintenance` in status).
 
@@ -105,7 +106,27 @@ Expected observations: destroy prints a data-loss warning path (`--force` suppli
 
 Pass criteria: no per-cluster residue; no orphaned bridge or resolved registration.
 
+**Known failure**: as of `520bd70` Linux leaves `br-tbx<n>` and its `172.30.<n>.1/24` address behind after destroy, and the next create moves to the next subnet index ([#445](https://github.com/randax/talos-box/issues/445)). Record it as a FAIL on step 4 with the `ip addr show br-tbx<n>` evidence; it is a known, tracked failure, not new information, until #445 closes — then this note goes.
+
 On failure: list what was left behind, exactly.
+
+## Appendix: running on a host without systemd (CI sandbox)
+
+The Linux smoke was piloted on a Depot CI KVM sandbox (the host class the `E2E / KVM *` lanes use) driven over `depot ci ssh`. Such hosts have `/dev/kvm` but no systemd PID 1, so `tbx system install` is unavailable and the helper and daemon must be started the way `scripts/ci/linux-kvm-e2e.sh` does:
+
+```sh
+sudo env HOME="$HOME" TBX_HELPER_SOCKET="$PWD/tbx-helper.sock" bin/tbx-helper --allowed-uid "$(id -u)" >tbx-helper.log 2>&1 &
+export TBX_HELPER_SOCKET="$PWD/tbx-helper.sock"
+bin/tbxd >tbxd.log 2>&1 &
+```
+
+What this changes, so the deviations are recorded rather than filed:
+
+- `tbx doctor`: `FAIL helper-unit`, `FAIL helper-access`, `FAIL helper-capabilities` are expected — no units, no `tbx` group, helper under sudo with full root capabilities. Everything else in the doctor list must still hold. Run doctor as the same unprivileged user that runs the charters; if it is root, `bridge-netfilter` cannot show #448.
+- C2: there is usually no systemd-resolved, so host-level lookups fail and the gateway fallback (`dig @172.30.<n>.1`) is the path that proves the DNS contract. `tbxd.log` will carry `host DNS for cluster … is unavailable … manual step: sudo resolvectl …` on every reconcile; that is the daemon describing the host, not a defect.
+- C3: no TTY — use the `--no-follow` step.
+- Driving over `depot ci ssh`: the session lands as **root** (`runuser -u runner -- …` to run as the sandbox user) and **drops remote stderr** — merge it remotely (`exec 2>&1` at the top of the remote command) or the create narration and every error message silently vanish.
+- Always `depot ci cancel <run>` when done; the sandbox is billed until the idle step ends.
 
 ## Report template
 
