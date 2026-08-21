@@ -597,6 +597,12 @@ type manifestMetadata struct {
 	ContentType         string `json:"contentType"`
 	ContentLength       int64  `json:"contentLength"`
 	DockerContentDigest string `json:"dockerContentDigest"`
+	// Repository and Reference record what the opaque `v2-<hash>` cache key
+	// stands for, so the on-disk mirror cache can be answered with grep
+	// instead of a hash reconstruction (#406). They are descriptive only:
+	// nothing is served from them.
+	Repository string `json:"repository,omitempty"`
+	Reference  string `json:"reference,omitempty"`
 }
 
 func (s *Server) manifestMetadataPath(requestPath string) string {
@@ -605,6 +611,9 @@ func (s *Server) manifestMetadataPath(requestPath string) string {
 
 func (s *Server) storeManifest(requestPath string, metadata manifestMetadata, data []byte) error {
 	path := s.manifestPath(requestPath)
+	if match := manifestPathRe.FindStringSubmatch(canonicalManifestRequestPath(requestPath)); match != nil {
+		metadata.Repository, metadata.Reference = match[1], match[2]
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create manifest cache directory: %w", err)
 	}

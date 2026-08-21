@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"testing"
 
@@ -616,5 +617,58 @@ func TestListCachePreviewsOrphanedIncompleteCombinations(t *testing.T) {
 	}
 	if result.ImageCount != len(result.Images) || result.ImageCount != 2 {
 		t.Fatalf("ImageCount = %d with %d itemized combination(s), want both to be 2", result.ImageCount, len(result.Images))
+	}
+}
+
+// TestListCacheReportsEveryKeepReason: an image that is pinned and in use
+// survives a prune for both reasons; the listing has to report both so the
+// preview does not read as "prunable once the cluster is gone" (#407).
+func TestListCacheReportsEveryKeepReason(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	service := newCacheReferenceTestServer(t, root)
+
+	item, err := cluster.New("qa-mir", 0, 1, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.Schematic = "shared-schematic"
+	item.TalosVersion = "v1.2.3"
+	item.ImageArchitecture = "amd64"
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	writeCachedDisk(t, root, "shared-schematic", "v1.2.3", "amd64")
+	writeCachedDisk(t, root, "pinned-only", "v1.2.3", "amd64")
+	writeCachedDisk(t, root, "orphan-only", "v1.2.3", "amd64")
+	for _, schematic := range []string{"shared-schematic", "pinned-only"} {
+		if err := service.cache.Pin(schematic, "v1.2.3", imagecache.ArchitectureAMD64); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	listed, err := service.listCache()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reasons := make(map[string][]CacheImageStatus, len(listed.Images))
+	statuses := make(map[string]CacheImageStatus, len(listed.Images))
+	for _, image := range listed.Images {
+		reasons[image.Schematic] = image.Reasons
+		statuses[image.Schematic] = image.Status
+	}
+	want := map[string][]CacheImageStatus{
+		"shared-schematic": {CacheImageStatusPinned, CacheImageStatusInUse},
+		"pinned-only":      {CacheImageStatusPinned},
+		"orphan-only":      {CacheImageStatusOrphan},
+	}
+	for schematic, wantReasons := range want {
+		if !slices.Equal(reasons[schematic], wantReasons) {
+			t.Fatalf("%s reasons = %v, want %v", schematic, reasons[schematic], wantReasons)
+		}
+	}
+	// The single status stays the strongest reason, which prune acts on.
+	if statuses["shared-schematic"] != CacheImageStatusInUse {
+		t.Fatalf("shared status = %q, want %q", statuses["shared-schematic"], CacheImageStatusInUse)
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/randax/talos-box/internal/daemon"
+	"github.com/randax/talos-box/internal/provision"
 )
 
 func TestRunCacheWarmReadsFilesAndStdinThenPrintsSummary(t *testing.T) {
@@ -209,6 +210,7 @@ func TestRunCacheWarmEmitsEachResultAsItCompletes(t *testing.T) {
 		name         string
 		checkOnly    bool
 		op           string
+		refs         []string
 		firstResult  any
 		secondResult any
 		firstOutput  string
@@ -217,6 +219,7 @@ func TestRunCacheWarmEmitsEachResultAsItCompletes(t *testing.T) {
 		{
 			name:         "warm",
 			op:           "cache.warm",
+			refs:         []string{"docker.io/library/pause:3.10", "ghcr.io/example/app:v1.0.0"},
 			firstResult:  daemon.CacheWarmResult{Entries: []daemon.CacheWarmEntry{{Ref: "docker.io/library/pause:3.10", Status: daemon.CacheWarmStatusWarmed}}, Warmed: 1},
 			secondResult: daemon.CacheWarmResult{Entries: []daemon.CacheWarmEntry{{Ref: "ghcr.io/example/app:v1.0.0", Status: daemon.CacheWarmStatusAlreadyComplete}}, AlreadyComplete: 1},
 			firstOutput:  "\u2713 docker.io/library/pause:3.10 warmed\n",
@@ -225,14 +228,17 @@ func TestRunCacheWarmEmitsEachResultAsItCompletes(t *testing.T) {
 				"summary: 1 warmed, 1 already complete, 0 failed\n",
 		},
 		{
+			// A check also verifies the bootstrap-required set (#404), so the
+			// list already names it here to keep the request count at two.
 			name:         "check",
 			checkOnly:    true,
 			op:           "cache.check",
+			refs:         []string{"docker.io/library/pause:3.10", provision.KubernetesSandboxImage},
 			firstResult:  daemon.CacheCheckResult{Entries: []daemon.CacheCheckEntry{{Ref: "docker.io/library/pause:3.10", Status: daemon.CacheCheckStatusComplete}}, Complete: 1},
-			secondResult: daemon.CacheCheckResult{Entries: []daemon.CacheCheckEntry{{Ref: "ghcr.io/example/app:v1.0.0", Status: daemon.CacheCheckStatusComplete}}, Complete: 1},
+			secondResult: daemon.CacheCheckResult{Entries: []daemon.CacheCheckEntry{{Ref: provision.KubernetesSandboxImage, Status: daemon.CacheCheckStatusComplete}}, Complete: 1},
 			firstOutput:  "\u2713 docker.io/library/pause:3.10 complete\n",
 			fullOutput: "\u2713 docker.io/library/pause:3.10 complete\n" +
-				"\u2713 ghcr.io/example/app:v1.0.0 complete\n" +
+				"\u2713 " + provision.KubernetesSandboxImage + " complete\n" +
 				"summary: 2 complete, 0 failed\n",
 		},
 	} {
@@ -251,7 +257,7 @@ func TestRunCacheWarmEmitsEachResultAsItCompletes(t *testing.T) {
 			}
 			defer func() { _ = listener.Close() }()
 
-			refs := []string{"docker.io/library/pause:3.10", "ghcr.io/example/app:v1.0.0"}
+			refs := test.refs
 			listPath := filepath.Join(t.TempDir(), "images.txt")
 			if err := os.WriteFile(listPath, []byte(strings.Join(refs, "\n")+"\n"), 0o600); err != nil {
 				t.Fatal(err)
@@ -476,5 +482,103 @@ func TestRunCacheWarmReturnsErrorWhenAnyRefFails(t *testing.T) {
 	}
 	if stderr.Len() != 0 {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+// A re-warm of a fully cached list downloads nothing yet costs a full run's
+// wall time on upstream tag resolution; the summary has to distinguish the two
+// and point at the cheap gate (#405).
+func TestRunCacheWarmNotesReResolvedTagsWhenNothingWasDownloaded(t *testing.T) {
+	t.Setenv("HOME", shortTestHome(t))
+	socketPath, err := daemon.SocketPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	listPath := filepath.Join(t.TempDir(), "images.txt")
+	ref := "docker.io/library/pause:3.10"
+	if err := os.WriteFile(listPath, []byte(ref+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go serveDaemonRequests(t, listener, 1, func(_ int, request daemon.Request) daemon.Response {
+		if request.Op != "cache.warm" {
+			t.Fatalf("request op = %q, want cache.warm", request.Op)
+		}
+		return daemon.Response{OK: true, Data: mustJSON(t, daemon.CacheWarmResult{
+			Entries: []daemon.CacheWarmEntry{{
+				Ref: ref, Status: daemon.CacheWarmStatusAlreadyComplete, ReResolvedTag: true,
+			}},
+			AlreadyComplete: 1,
+			ReResolvedTags:  1,
+		})}
+	}, done)
+
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr, in: bytes.NewBuffer(nil)}
+	if err := command.run([]string{"cache", "warm", listPath}); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+
+	wantStdout := "" +
+		"✓ docker.io/library/pause:3.10 already complete\n" +
+		"summary: 0 warmed, 1 already complete, 0 failed\n" +
+		"note: re-resolved 1 tag(s) upstream for freshness; nothing was downloaded. " +
+		"For a cheap offline-readiness gate run `tbx cache warm --check` instead\n"
+	if got := stdout.String(); got != wantStdout {
+		t.Fatalf("stdout = %q, want %q", got, wantStdout)
+	}
+}
+
+// A daemon that reports no re-resolution (or an older one that cannot) prints
+// the pre-note summary unchanged.
+func TestRunCacheWarmOmitsTheNoteWithoutReResolvedTags(t *testing.T) {
+	t.Setenv("HOME", shortTestHome(t))
+	socketPath, err := daemon.SocketPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	listPath := filepath.Join(t.TempDir(), "images.txt")
+	ref := "ghcr.io/example/app@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+	if err := os.WriteFile(listPath, []byte(ref+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go serveDaemonRequests(t, listener, 1, func(_ int, request daemon.Request) daemon.Response {
+		return daemon.Response{OK: true, Data: mustJSON(t, daemon.CacheWarmResult{
+			Entries: []daemon.CacheWarmEntry{{Ref: ref, Status: daemon.CacheWarmStatusWarmed}},
+			Warmed:  1,
+		})}
+	}, done)
+
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr, in: bytes.NewBuffer(nil)}
+	if err := command.run([]string{"cache", "warm", listPath}); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+
+	if strings.Contains(stdout.String(), "note:") {
+		t.Fatalf("stdout = %q, want no re-resolution note", stdout.String())
 	}
 }

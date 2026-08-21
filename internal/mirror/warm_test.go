@@ -1840,3 +1840,59 @@ func TestOfflineManifestRefreshRequestServesCachedDigestManifest(t *testing.T) {
 		t.Fatalf("Docker-Content-Digest = %q, want %q", got, manifestDigest)
 	}
 }
+
+// A re-warm of a fully cached tag downloads nothing but still costs a full
+// upstream resolution per tag; the summary has to say so (#405).
+func TestWarmReportsReResolvedTagsSeparatelyFromDownloads(t *testing.T) {
+	configDigest := "sha256:" + sha256Hex([]byte("config"))
+	manifestBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"%s"},"layers":[]}`, configDigest)
+	manifestDigest := "sha256:" + sha256Hex([]byte(manifestBody))
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/demo/manifests/stable", "/v2/demo/manifests/" + manifestDigest:
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", manifestDigest)
+			_, _ = fmt.Fprint(w, manifestBody)
+		case "/v2/demo/blobs/" + configDigest:
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = io.WriteString(w, "config")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	manager := newManagerWithPorts(t.TempDir(), nil, freePort(t))
+	manager.baseOverride = aliasedURL(t, upstream.URL, "registry.example")
+	egress := egressForRoutes(aliasRoute(t, upstream.URL, "registry.example", "203.0.113.10"))
+	manager.resolveUpstreamIPs = egress.resolve
+	manager.hostOwnedIPs = egress.hostIPs
+	manager.dialContext = egress.dialContext
+	defer manager.Close()
+
+	refs := []string{"registry.example/demo:stable", "registry.example/demo@" + manifestDigest}
+	first, err := manager.Warm(context.Background(), refs, imagecache.ArchitectureAMD64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ReResolvedTags != 1 {
+		t.Fatalf("first warm ReResolvedTags = %d, want the one tag-pinned ref", first.ReResolvedTags)
+	}
+
+	second, err := manager.Warm(context.Background(), refs, imagecache.ArchitectureAMD64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Warmed != 0 || second.AlreadyComplete != 2 {
+		t.Fatalf("re-warm summary = %+v, want everything already complete", second)
+	}
+	if second.ReResolvedTags != 1 {
+		t.Fatalf("re-warm ReResolvedTags = %d, want the tag re-resolved upstream", second.ReResolvedTags)
+	}
+	for _, result := range second.Results {
+		if strings.Contains(result.Ref, "@") && result.ReResolvedTag {
+			t.Fatalf("digest-pinned ref reported as re-resolved: %+v", result)
+		}
+	}
+}

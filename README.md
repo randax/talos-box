@@ -183,6 +183,7 @@ tbx cache warm workshop-images.txt more-images.txt # any number of lists; `-` re
 tbx cache warm --check workshop-images.txt         # verify locally, without downloading
 tbx cache warm --check --deep workshop-images.txt  # also rehash cached blobs
 tbx cache list                                     # disk images and mirror-cache totals
+tbx cache list docker.io/library/busybox:1.37      # is this one image cached? (query, always exits 0)
 ```
 
 `tbx manifests demo images` prints the exact pinned image set a cluster will pull — the curated

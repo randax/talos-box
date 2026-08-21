@@ -62,6 +62,10 @@ curl -sI -H 'Accept: application/vnd.oci.image.index.v1+json' \
 
 Omitting `?ns=` returns `400 Bad Request` with the body `missing ns query parameter` — a malformed request, not a mirror failure. Omitting the Accept headers can still yield a 404 for an OCI-index image. Neither is a finding; log only a failure that survives the correct request above.
 
+The liveness probe needs no headers and no `ns`: `curl -sI http://<gateway>:5059/v2/` answers
+`200` with `Docker-Distribution-API-Version: registry/2.0`. Content endpoints (manifests, blobs)
+on the catch-all port still require `?ns=<upstream-registry>`.
+
 Pass criteria: hand-built cluster Ready on tbx's substrate with mirror-routed pulls.
 
 On failure: capture where the manual flow and the printed guidance diverged — this is the scenario's core finding surface.

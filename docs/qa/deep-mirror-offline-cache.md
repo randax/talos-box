@@ -26,9 +26,9 @@ BLOCKED unless: `tbx version` recorded; `tbx doctor` exits 0 (egress OK); no clu
 
 Steps:
 1. Write a list file with: one tag-pinned ref (`registry.k8s.io/pause:3.10` — `docker.io/library/pause` does NOT exist on Docker Hub and answers 401 to anonymous pulls, so it is not a valid probe), one tag-pinned ref on Docker Hub itself (`docker.io/library/alpine:3.20`, so the run exercises Hub's anonymous token flow), one digest-pinned ref, one tag+digest ref, a `#` comment, and a blank line. Run `tbx cache warm <file>`.
-2. Run again — record what a re-warm does (should be cheap/no-op-ish).
+2. Run again — record what a re-warm does. It downloads nothing but still re-resolves every tag-pinned ref upstream, so it costs about a full run's wall time; expect the summary to be followed by a `note: re-resolved <n> tag(s) upstream ...` line steering to `--check` for a cheap gate.
 3. Negative: a list containing `docker.io/library/alpine:latest` — expect rejection; a tagless ref — expect rejection; a tag+digest where the digest is wrong — expect a resolution-mismatch error.
-4. `tbx cache warm --check <file>` then `--check --deep <file>`; also `--deep` without `--check` — expect refusal.
+4. `tbx cache warm --check <file>` then `--check --deep <file>`; also `--deep` without `--check` — expect refusal. Both check modes also verify the implicit CRI pod sandbox image (`registry.k8s.io/pause:<v>`) that no warm list names, so the two modes must agree on offline readiness.
 
 Expected observations: per-image progress with continue-through-failures and non-zero exit on any gap; `latest`/tagless rejected by design; mismatch pinned-digest error names the ref; `--check` verifies offline (no upstream dials — verify by watching for network errors with upstream unreachable if feasible, else trust exit + wording); `--deep` requires `--check`.
 
@@ -61,7 +61,7 @@ On failure: capture the listener table verbatim.
 
 Steps:
 1. `tbx manifests qa-mir mirrors` — expect `"*"` → `http://172.30.<n>.1:5059`, `skipFallback: true`.
-2. From a test pod, pull an image that is NOT cached and NOT warmable (while online): confirm it arrives via the mirror (mirror stats change: `tbx cache list` before/after shows the upstream's counters grow).
+2. From a test pod, pull an image that is NOT cached and NOT warmable (while online): confirm it arrives via the mirror (mirror stats change: `tbx cache list` before/after shows the upstream's counters grow). Confirm the image was novel first with `tbx cache list <image-ref>`, which answers `cached` / `not cached` for that one reference.
 
 Expected observations: the rendered mirror config matches the live pull behavior; `cache list` per-upstream counters reflect the pull.
 
@@ -92,7 +92,7 @@ On failure: capture pod events (`kubectl describe pod`), mirror mode outputs.
 **Goal**: prune scope boundaries hold.
 
 Steps:
-1. `tbx cache list` — record disk images and mirror totals, and record each image's label (`in-use`, `pinned`, `default`, `orphan`) — this listing is the prune preview.
+1. `tbx cache list` — record disk images and mirror totals, and record each image's labels — every keep-reason that applies (`in-use`, `pinned`, `default`, e.g. `pinned, in-use (qa-mir)`), or `orphan` when none does — this listing is the prune preview.
 2. `tbx cache prune` (no flag) — reference-aware, so it removes only the `orphan` combinations and keeps every `in-use`, `pinned`, and `default` one; the mirror is untouched. Expect it to name each removed combination with its size, then a summary of the form `pruned disk cache: <n> image(s), <bytes> bytes (kept <m> image(s) in use, pinned, or default); mirror cache untouched`, with `<m>` matching the labels recorded in step 1. On a default cache with nothing orphaned, `<n>` is 0 and the default combination survives — that is the documented outcome, not a failure. Confirm with `cache list` that exactly the `orphan` rows disappeared.
 3. `tbx cache prune --mirror` — mirror content gone, remaining disk images (if any re-pulled) intact.
 4. `tbx cache prune --mirror --all` — expect flag-exclusivity refusal.

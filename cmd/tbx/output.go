@@ -203,17 +203,29 @@ func cacheImageLine(entry daemon.CacheImageEntry) string {
 	return line
 }
 
-// cacheImageStatusSuffix names why a combination is kept. An older daemon
-// reports no status at all, which prints as the pre-status line.
+// cacheImageStatusSuffix names every reason a combination is kept, so the
+// preview matches what a prune would weigh: an image can be pinned *and* in
+// use, and showing one reason alone reads as if it becomes prunable when the
+// other lapses (#407). An older daemon reports no reasons, in which case its
+// single status is all there is to print; no status at all prints as the
+// pre-status line.
 func cacheImageStatusSuffix(entry daemon.CacheImageEntry) string {
-	switch {
-	case entry.Status == "":
-		return ""
-	case entry.Status == daemon.CacheImageStatusInUse && len(entry.Clusters) > 0:
-		return fmt.Sprintf(" in-use (%s)", strings.Join(entry.Clusters, ", "))
-	default:
-		return " " + string(entry.Status)
+	reasons := entry.Reasons
+	if len(reasons) == 0 {
+		if entry.Status == "" {
+			return ""
+		}
+		reasons = []daemon.CacheImageStatus{entry.Status}
 	}
+	rendered := make([]string, 0, len(reasons))
+	for _, reason := range reasons {
+		if reason == daemon.CacheImageStatusInUse && len(entry.Clusters) > 0 {
+			rendered = append(rendered, fmt.Sprintf("in-use (%s)", strings.Join(entry.Clusters, ", ")))
+			continue
+		}
+		rendered = append(rendered, string(reason))
+	}
+	return " " + strings.Join(rendered, ", ")
 }
 
 // printPrunedImages names every combination a prune removes, with its size,

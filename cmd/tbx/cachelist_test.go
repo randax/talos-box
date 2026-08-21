@@ -3,6 +3,9 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -62,5 +65,93 @@ func TestCacheListTableMarksIncompleteCombinations(t *testing.T) {
 	}
 	if strings.Contains(got, "abc v1.13.6 arm64 10 bytes (4 bytes on disk) (incomplete)") {
 		t.Fatalf("stdout = %q, want the ready image left unmarked", got)
+	}
+}
+
+// `cache list` is aggregate-only, which cannot answer "is this ref cached";
+// naming a ref answers it from the same verification `--check` performs (#406).
+func TestCacheListRefAnswersCachedAndNotCached(t *testing.T) {
+	for _, testCase := range []struct {
+		name  string
+		entry daemon.CacheCheckEntry
+		count daemon.CacheCheckResult
+		want  string
+	}{
+		{
+			name:  "cached",
+			entry: daemon.CacheCheckEntry{Ref: "docker.io/library/busybox:1.37", Status: daemon.CacheCheckStatusComplete},
+			count: daemon.CacheCheckResult{Complete: 1},
+			want:  "docker.io/library/busybox:1.37: cached\n",
+		},
+		{
+			name: "not cached",
+			entry: daemon.CacheCheckEntry{
+				Ref: "docker.io/library/busybox:1.37", Status: daemon.CacheCheckStatusFailed,
+				Reason: "/v2/library/busybox/manifests/1.37 not cached",
+			},
+			count: daemon.CacheCheckResult{Failed: 1},
+			want:  "docker.io/library/busybox:1.37: not cached (/v2/library/busybox/manifests/1.37 not cached)\n",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Setenv("HOME", shortTestHome(t))
+			socketPath, err := daemon.SocketPath()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			listener, err := net.Listen("unix", socketPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = listener.Close() }()
+
+			done := make(chan struct{})
+			go serveDaemonRequests(t, listener, 1, func(_ int, request daemon.Request) daemon.Response {
+				if request.Op != "cache.check" {
+					t.Fatalf("request op = %q, want cache.check", request.Op)
+				}
+				var args daemon.CacheCheckArgs
+				if err := json.Unmarshal(request.Args, &args); err != nil {
+					t.Fatal(err)
+				}
+				if args.Deep {
+					t.Fatal("cache list <ref> asked for a deep check")
+				}
+				if len(args.Refs) != 1 || args.Refs[0] != testCase.entry.Ref {
+					t.Fatalf("refs = %v, want [%q]", args.Refs, testCase.entry.Ref)
+				}
+				result := testCase.count
+				result.Entries = []daemon.CacheCheckEntry{testCase.entry}
+				return daemon.Response{OK: true, Data: mustJSON(t, result)}
+			}, done)
+
+			var stdout, stderr bytes.Buffer
+			command := cli{out: &stdout, err: &stderr, in: bytes.NewBuffer(nil)}
+			if err := command.run([]string{"cache", "list", testCase.entry.Ref}); err != nil {
+				t.Fatalf("cache list %s err = %v, want nil: a lookup reports, it does not gate", testCase.entry.Ref, err)
+			}
+			<-done
+			if got := stdout.String(); got != testCase.want {
+				t.Fatalf("stdout = %q, want %q", got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestCacheListRefRejectsAnInvalidReferenceBeforeCallingTheDaemon(t *testing.T) {
+	command := cli{out: &bytes.Buffer{}, err: &bytes.Buffer{}, in: bytes.NewBuffer(nil)}
+	if err := command.runCache([]string{"list", "not a ref"}); err == nil {
+		t.Fatal("cache list accepted an invalid image reference")
+	}
+}
+
+func TestCacheListRejectsMoreThanOneReference(t *testing.T) {
+	command := cli{out: &bytes.Buffer{}, err: &bytes.Buffer{}, in: bytes.NewBuffer(nil)}
+	err := command.runCache([]string{"list", "docker.io/library/busybox:1.37", "docker.io/library/busybox:1.36"})
+	if err == nil || !strings.Contains(err.Error(), "usage: tbx cache list") {
+		t.Fatalf("err = %v, want the cache list usage", err)
 	}
 }
