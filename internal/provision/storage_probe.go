@@ -301,7 +301,7 @@ func defaultStorageClass(storageClass *storagev1.StorageClass) bool {
 }
 
 func waitForBoundPersistentVolumeClaim(ctx context.Context, client kubernetes.Interface, namespace, name, expectedStorageClass string, interval time.Duration) error {
-	return poll(ctx, interval, func(ctx context.Context) error {
+	return poll(ctx, GateStorageProbePVC, interval, func(ctx context.Context) error {
 		persistentVolumeClaim, err := client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return err
@@ -321,7 +321,7 @@ func waitForBoundPersistentVolumeClaim(ctx context.Context, client kubernetes.In
 }
 
 func waitForProbePod(ctx context.Context, client kubernetes.Interface, namespace, name string, interval time.Duration) error {
-	return poll(ctx, interval, func(ctx context.Context) error {
+	return poll(ctx, GateStorageProbePod, interval, func(ctx context.Context) error {
 		pod, err := client.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return err
@@ -517,7 +517,7 @@ func deleteStorageProbePodAndWait(ctx context.Context, client kubernetes.Interfa
 	if err := deleteStorageProbePod(ctx, client, namespace, name); err != nil {
 		return err
 	}
-	return poll(ctx, 100*time.Millisecond, func(ctx context.Context) error {
+	return poll(ctx, GateStorageProbeCleanup, 100*time.Millisecond, func(ctx context.Context) error {
 		_, err := client.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
 			return nil
@@ -533,7 +533,7 @@ func deleteStorageProbePVCAndWait(ctx context.Context, client kubernetes.Interfa
 	if err := deleteStorageProbePVC(ctx, client, namespace, name); err != nil {
 		return err
 	}
-	return poll(ctx, 100*time.Millisecond, func(ctx context.Context) error {
+	return poll(ctx, GateStorageProbeCleanup, 100*time.Millisecond, func(ctx context.Context) error {
 		_, err := client.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, name, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
 			return nil

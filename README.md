@@ -119,7 +119,12 @@ tbx manifests demo         # exact machine patch, chart values/objects, and LB/B
 
 `status` is state-aware: it distinguishes provisioning, Ready-without-LB, a live VIP, and
 storage provisioning from probe-verified live storage, while
-printing credential exports and the flannel NetworkPolicy limitation. Hints never execute
+printing credential exports and the flannel NetworkPolicy limitation. While a provisioning
+pass is running, the storage hint and `-o json`'s `storageGate`/`storageError` name the
+convergence gate the pass is actually held at — the CSI readiness probe is only one of them —
+and `tbxd.log` narrates the same blocker periodically, so a long wait says what it is waiting
+on. When a pass aborts, storage settles at `storagePhase: failed` carrying the cause, instead
+of reporting provisioning that nothing is doing any more. Hints never execute
 anything; suppress them with `--quiet`. `tbx up --quiet` and `tbx cluster create --quiet` keep
 their final result and facts, suppress stage narration, state the operation's deadline up
 front, and emit a once-a-minute liveness line on stderr so a long provision never looks hung. `tbx manifests` is the exact inspection/fork

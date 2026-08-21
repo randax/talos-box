@@ -385,7 +385,7 @@ func waitForCRDs(ctx context.Context, client dynamic.Interface, mapper *restmapp
 	if err != nil {
 		return fmt.Errorf("map %s CRDs: %w", component, err)
 	}
-	return poll(ctx, interval, func(ctx context.Context) error {
+	return poll(ctx, GateChartCRDs, interval, func(ctx context.Context) error {
 		for _, crd := range crds {
 			live, err := client.Resource(mapping.Resource).Get(ctx, crd.GetName(), metav1.GetOptions{})
 			if err != nil {
@@ -414,7 +414,7 @@ func conditionTrue(conditions []any, name string) bool {
 }
 
 func waitForMetalLB(ctx context.Context, client kubernetes.Interface, interval time.Duration) error {
-	return poll(ctx, interval, func(ctx context.Context) error {
+	return poll(ctx, GateMetalLB, interval, func(ctx context.Context) error {
 		controller, err := client.AppsV1().Deployments(metalLBNamespace).Get(ctx, "metallb-controller", metav1.GetOptions{})
 		if err != nil {
 			return err
@@ -436,7 +436,7 @@ func waitForMetalLB(ctx context.Context, client kubernetes.Interface, interval t
 
 func waitForProbe(ctx context.Context, client kubernetes.Interface, item cluster.Cluster, interval time.Duration, httpClient *http.Client) (string, error) {
 	var vip string
-	err := poll(ctx, interval, func(ctx context.Context) error {
+	err := poll(ctx, GateLoadBalancerVIP, interval, func(ctx context.Context) error {
 		service, err := client.CoreV1().Services(probeNamespace).Get(ctx, "lb-probe", metav1.GetOptions{})
 		if err != nil {
 			return err
@@ -525,7 +525,11 @@ func defaultProxylessTransport() *http.Transport {
 	return cloned
 }
 
-func poll(ctx context.Context, interval time.Duration, check func(context.Context) error) error {
+// poll drives one named convergence gate until its check passes. gate says what
+// the wait is for, and every failed check is handed to the context's gate
+// observer, so a pass that stalls here can say what it is blocked on instead of
+// going silent for the whole budget (#390).
+func poll(ctx context.Context, gate Gate, interval time.Duration, check func(context.Context) error) error {
 	var lastErr error
 	for {
 		if err := check(ctx); err == nil {
@@ -536,6 +540,7 @@ func poll(ctx context.Context, interval time.Duration, check func(context.Contex
 				return terminal.err
 			}
 			lastErr = err
+			reportGate(ctx, gate, err)
 		}
 		if err := wait(ctx, interval); err != nil {
 			if lastErr == nil {
