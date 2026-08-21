@@ -103,3 +103,47 @@ func TestObserveKubernetesReadinessStampsOnlyProvisionedRunningClusters(t *testi
 		t.Fatal("a running provisioned cluster failing readiness was not stamped")
 	}
 }
+
+// TestReadinessLogStartsFreshRunAfterAnUnwatchedGap pins the staleness rule:
+// observations only happen when a client polls, so a cluster can fail, recover,
+// and fail again between two polls. A gap the daemon did not watch is not
+// evidence that the failure persisted through it, and inheriting the old clock
+// let a brand-new blip escalate straight to the #418 destroy advice.
+func TestReadinessLogStartsFreshRunAfterAnUnwatchedGap(t *testing.T) {
+	var log readinessLog
+	start := time.Now()
+	if first := log.observe("qa-host", false, start); first == nil || !first.Equal(start) {
+		t.Fatalf("first failure = %v, want %v", first, start)
+	}
+	// The cluster recovers with nobody polling, then blips again much later.
+	gap := start.Add(unreadyEscalationWindow + 5*time.Minute)
+	again := log.observe("qa-host", false, gap)
+	if again == nil || !again.Equal(gap) {
+		t.Fatalf("failure after an unwatched gap = %v, want a fresh clock %v", again, gap)
+	}
+	// Inside the window the run still accumulates, so a genuinely stuck
+	// cluster still escalates.
+	within := gap.Add(unreadyEscalationWindow - time.Second)
+	if run := log.observe("qa-host", false, within); run == nil || !run.Equal(gap) {
+		t.Fatalf("failure inside the window = %v, want the run's start %v", run, gap)
+	}
+}
+
+// TestBlipAfterAnUnwatchedRecoveryDoesNotEscalate walks the whole path #418
+// cares about: two unrelated blips straddling a poll gap must not add up to a
+// destroy recommendation.
+func TestBlipAfterAnUnwatchedRecoveryDoesNotEscalate(t *testing.T) {
+	service := &Server{}
+	start := time.Now()
+	blip := func(now time.Time) string {
+		statuses := []ClusterStatus{unresumableStatus()}
+		service.observeKubernetesReadiness(statuses, now)
+		return provisioningRecoveryHintAt(statuses[0], now)
+	}
+	if got := blip(start); strings.Contains(got, "tbx cluster destroy") {
+		t.Fatalf("first blip escalated to destroy: %s", got)
+	}
+	if got := blip(start.Add(unreadyEscalationWindow + 5*time.Minute)); strings.Contains(got, "tbx cluster destroy") {
+		t.Fatalf("a fresh blip after an unwatched recovery escalated to destroy: %s", got)
+	}
+}

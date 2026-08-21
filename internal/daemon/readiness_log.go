@@ -15,11 +15,26 @@ import (
 // connection, so it carries its own lock.
 type readinessLog struct {
 	mu       sync.Mutex
-	clusters map[string]time.Time
+	clusters map[string]unreadyRun
+}
+
+// unreadyRun is one uninterrupted run of readiness failures: when it started
+// and when the daemon last actually looked. The last-observation time is what
+// keeps the run honest — observations only happen when a client polls, so a
+// cluster can fail, recover, and fail again entirely between two polls.
+type unreadyRun struct {
+	since time.Time
+	last  time.Time
 }
 
 // observe records one readiness observation and reports when the current run of
 // failures began, or nil when the cluster is ready.
+//
+// A gap longer than the escalation window starts a fresh run: the daemon was
+// not watching across it, so it cannot claim the failure persisted through it,
+// and inheriting the old clock would let a brand-new blip escalate straight to
+// "destroy and recreate" — exactly the #418 advice the debounce exists to
+// prevent.
 func (l *readinessLog) observe(name string, ready bool, now time.Time) *time.Time {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -28,13 +43,15 @@ func (l *readinessLog) observe(name string, ready bool, now time.Time) *time.Tim
 		return nil
 	}
 	if l.clusters == nil {
-		l.clusters = make(map[string]time.Time)
+		l.clusters = make(map[string]unreadyRun)
 	}
-	since, seen := l.clusters[name]
-	if !seen {
-		since = now
-		l.clusters[name] = since
+	run, seen := l.clusters[name]
+	if !seen || now.Sub(run.last) > unreadyEscalationWindow || now.Before(run.since) {
+		run.since = now
 	}
+	run.last = now
+	l.clusters[name] = run
+	since := run.since
 	return &since
 }
 

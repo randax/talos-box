@@ -276,7 +276,9 @@ type ClusterStatus struct {
 	SavedStateStale bool `json:"savedStateStale,omitempty"`
 	KubernetesReady bool `json:"kubernetesReady"`
 	// KubernetesNotReadySince is when the daemon first observed this cluster
-	// failing its Kubernetes readiness probe without a success since. It is
+	// failing its Kubernetes readiness probe without a success since — and
+	// without a gap longer than unreadyEscalationWindow in which nobody looked,
+	// which starts a fresh run rather than crediting unwatched time. It is
 	// what keeps a momentary apiserver blip from being escalated into "destroy
 	// and recreate" (#418). Nil means ready now, or never observed.
 	KubernetesNotReadySince *time.Time `json:"kubernetesNotReadySince,omitempty"`
