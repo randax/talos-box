@@ -64,7 +64,7 @@ func printLogTail(w io.Writer, path string, count int, cluster string) (int64, e
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return 0, fmt.Errorf("no daemon log at %s yet; start the daemon (tbx system status) and retry", path)
+			return 0, fmt.Errorf("no daemon log at %s yet; run a daemon-backed command such as `tbx status` to start tbxd, then retry", path)
 		}
 		return 0, err
 	}

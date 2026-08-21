@@ -136,6 +136,14 @@ func TestLogsExplainsAMissingDaemonLog(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "no daemon log at") {
 		t.Fatalf("logs error = %v, want the missing-log explanation", err)
 	}
+	// the hint has to name a verb that actually spawns tbxd; `tbx system
+	// status` deliberately does not, so following it left logs failing
+	if !strings.Contains(err.Error(), "tbx status") {
+		t.Fatalf("logs error = %v, want a hint naming a daemon-backed verb", err)
+	}
+	if strings.Contains(err.Error(), "tbx system status") {
+		t.Fatalf("logs error = %v, must not point at a command that never starts tbxd", err)
+	}
 }
 
 func TestLogsRejectsBadArgs(t *testing.T) {
