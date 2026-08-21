@@ -233,7 +233,13 @@ var (
 //
 // Probe failures never block: an unmeasurable host falls back to the guards
 // that came before this one, exactly as checkOvercommit does.
-func (s *Server) checkProvisionStart(path string, addMiB int, force bool) ([]string, error) {
+//
+// The returned heldMiB is the pre-balloon this admission took, for the caller
+// to re-arm with holdBalloonReclaim at the moment it actually launches the
+// guests: the hold is a boot-window budget, so its clock must not start while
+// work the launch still has to do (a cold image fetch, disk clones) is in
+// front of it. Callers that launch immediately can ignore it.
+func (s *Server) checkProvisionStart(path string, addMiB int, force bool) ([]string, int, error) {
 	freeMiB := 0
 	measureFree := s.hostFreeMemory
 	if measureFree == nil {
@@ -283,10 +289,10 @@ func (s *Server) checkProvisionStart(path string, addMiB int, force bool) ([]str
 	plan := hostpressure.AssessProvisionStart(in)
 	warnings, err := applyPressureFindings(plan.Findings, force)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if plan.ReclaimMiB == 0 {
-		return warnings, nil
+		return warnings, 0, nil
 	}
 	heldMiB, err := reclaim.apply(plan.ReclaimMiB)
 	if err != nil {
@@ -295,16 +301,16 @@ func (s *Server) checkProvisionStart(path string, addMiB int, force bool) ([]str
 		// did not happen puts it back where an unaided host would be.
 		detail := fmt.Sprintf("pre-ballooning %d MiB out of the %d MiB of guests already running failed: %v", plan.ReclaimMiB, runningMiB, err)
 		if !force {
-			return nil, fmt.Errorf("%s; %s (use --force to override)", detail, hostpressure.MemoryRemedy)
+			return nil, 0, fmt.Errorf("%s; %s (use --force to override)", detail, hostpressure.MemoryRemedy)
 		}
-		return append(warnings, detail+" (forced)"), nil
+		return append(warnings, detail+" (forced)"), 0, nil
 	}
 	s.holdBalloonReclaim(heldMiB)
 	return append(warnings, fmt.Sprintf(
 		"pre-ballooned %d MiB out of the %d MiB of guests already running so the %d MiB starting now still leaves the %d MiB balloon reserve free of the %d MiB measured;"+
 			" the balloon controller holds that reclaim for %s while the new guests boot, then hands it back",
 		plan.ReclaimMiB, runningMiB, addMiB, reserveMiB, freeMiB, balloonReclaimHoldTTL,
-	)), nil
+	)), heldMiB, nil
 }
 
 // balloonReclaimHoldTTL is how long a pre-balloon taken at admission is held

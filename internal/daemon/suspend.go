@@ -102,7 +102,7 @@ func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
 	// guests are already resident, which is the concurrent bringup the
 	// projected-start gate exists for (#334).
 	if bootingMiB := s.stoppedNodeMemoryMiB(item); bootingMiB > 0 {
-		provisionStartWarnings, err := s.checkProvisionStart(dir, bootingMiB, args.Force)
+		provisionStartWarnings, _, err := s.checkProvisionStart(dir, bootingMiB, args.Force)
 		if err != nil {
 			return ClusterSummary{}, err
 		}

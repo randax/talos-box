@@ -531,7 +531,7 @@ func (s *Server) createCluster(raw json.RawMessage, progress stageFunc) (Cluster
 	}
 	// The projected-start gate runs before anything is written: a create that
 	// cannot safely boot must not leave a cluster directory behind (#334).
-	provisionStartWarnings, err := s.checkProvisionStart(dir, addMiB, args.Force)
+	provisionStartWarnings, preBalloonedMiB, err := s.checkProvisionStart(dir, addMiB, args.Force)
 	if err != nil {
 		return ClusterSummary{}, err
 	}
@@ -622,6 +622,12 @@ func (s *Server) createCluster(raw json.RawMessage, progress stageFunc) (Cluster
 			log.Printf("resolver files for %s: %v", item.Name, err)
 		}
 	}
+	// The hold is a boot-window budget, so its clock has to start at the
+	// launch, not at the admission: the image fetch and disk clones above are
+	// unbounded and can outlast the TTL, and the balloon manager would then
+	// inflate the reclaimed guests back before these ones have booted — the
+	// squeeze the pre-balloon was taken to prevent (#398).
+	s.holdBalloonReclaim(preBalloonedMiB)
 	progress.stage("starting %d node(s)", len(item.Nodes))
 	startWarnings, err := s.start(item)
 	if err != nil {
@@ -674,7 +680,7 @@ func (s *Server) startCluster(raw json.RawMessage) (ClusterSummary, error) {
 	// which start also boots the stopped half of — is gated too, and the
 	// members already running are not counted twice.
 	if bootingMiB := s.stoppedNodeMemoryMiB(item); bootingMiB > 0 {
-		provisionStartWarnings, err := s.checkProvisionStart(dir, bootingMiB, args.Force)
+		provisionStartWarnings, _, err := s.checkProvisionStart(dir, bootingMiB, args.Force)
 		if err != nil {
 			return ClusterSummary{}, err
 		}
@@ -1129,15 +1135,17 @@ func (s *Server) addNodeLocked(raw json.RawMessage, progress stageFunc) (NodeSta
 		return NodeStatus{}, nil, err
 	}
 	running := s.clusterRunning(item.Name)
+	preBalloonedMiB := 0
 	if running {
 		// A node added to a running cluster boots immediately, which is the
 		// very allocation the projected-start gate exists for. A node added to
 		// a stopped cluster starts nothing, so there is nothing to project
 		// (#334).
-		provisionStartWarnings, err := s.checkProvisionStart(dir, addMiB, args.Force)
+		provisionStartWarnings, held, err := s.checkProvisionStart(dir, addMiB, args.Force)
 		if err != nil {
 			return NodeStatus{}, nil, err
 		}
+		preBalloonedMiB = held
 		hostPressureWarnings = append(hostPressureWarnings, provisionStartWarnings...)
 	}
 	var subnetWarning string
@@ -1172,6 +1180,10 @@ func (s *Server) addNodeLocked(raw json.RawMessage, progress stageFunc) (NodeSta
 		return NodeStatus{}, nil, err
 	}
 	if running {
+		// Re-armed at the launch for the same reason create does: the hold's
+		// TTL is a boot window, and the image fetch and disk clone above can
+		// outlast it (#398).
+		s.holdBalloonReclaim(preBalloonedMiB)
 		progress.stage("starting node %s", node.Name)
 		machine, err := s.launchMachine(item, node, nil)
 		if err != nil {

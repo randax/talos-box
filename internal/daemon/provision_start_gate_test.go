@@ -3,8 +3,11 @@ package daemon
 import (
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/randax/talos-box/internal/balloon"
 	"github.com/randax/talos-box/internal/cluster"
@@ -155,7 +158,7 @@ func TestCheckProvisionStart(t *testing.T) {
 			service.hostFreeMemory = func() (int, error) { return test.freeMiB, nil }
 			service.hostTotalMemory = plentifulHostMemory
 
-			warnings, err := service.checkProvisionStart(t.TempDir(), test.addMiB, test.force)
+			warnings, _, err := service.checkProvisionStart(t.TempDir(), test.addMiB, test.force)
 
 			if test.wantErr == "" && err != nil {
 				t.Fatalf("checkProvisionStart() = %v, want admission", err)
@@ -230,7 +233,7 @@ func TestCreateClusterForcedConcurrentBringupWarns(t *testing.T) {
 	service.hostTotalMemory = plentifulHostMemory
 	service.hostFreeMemory = func() (int, error) { return balloon.DefaultConfig().ReserveMiB, nil }
 	service.helperCheck = func() error { return nil }
-	warnings, err := service.checkProvisionStart(t.TempDir(), clusterMemoryMiB(item)+2048, true)
+	warnings, _, err := service.checkProvisionStart(t.TempDir(), clusterMemoryMiB(item)+2048, true)
 	if err != nil {
 		t.Fatalf("forced checkProvisionStart() = %v, want admission", err)
 	}
@@ -369,7 +372,7 @@ func TestProvisionStartPreBalloonsRunningGuestsInsteadOfRefusing(t *testing.T) {
 	const shortfall = 512
 	service.hostFreeMemory = func() (int, error) { return reserve + nodeMiB - shortfall, nil }
 
-	warnings, err := service.checkProvisionStart(t.TempDir(), nodeMiB, false)
+	warnings, _, err := service.checkProvisionStart(t.TempDir(), nodeMiB, false)
 
 	if err != nil {
 		t.Fatalf("checkProvisionStart() = %v, want admission after pre-ballooning", err)
@@ -417,7 +420,7 @@ func TestProvisionStartHoldsTheCumulativeReclaimNotJustTheShortfall(t *testing.T
 	const shortfall = 512
 	service.hostFreeMemory = func() (int, error) { return reserve + nodeMiB - shortfall, nil }
 
-	if _, err := service.checkProvisionStart(t.TempDir(), nodeMiB, false); err != nil {
+	if _, _, err := service.checkProvisionStart(t.TempDir(), nodeMiB, false); err != nil {
 		t.Fatalf("checkProvisionStart() = %v, want admission after pre-ballooning", err)
 	}
 
@@ -451,7 +454,7 @@ func TestProvisionStartSkipsTheBalloonCreditWhenTheHostHasHeadroom(t *testing.T)
 		return nil
 	}
 
-	if _, err := service.checkProvisionStart(t.TempDir(), nodeMiB, false); err != nil {
+	if _, _, err := service.checkProvisionStart(t.TempDir(), nodeMiB, false); err != nil {
 		t.Fatalf("checkProvisionStart() = %v, want admission on a roomy host", err)
 	}
 	if measured != 0 {
@@ -470,7 +473,7 @@ func TestProvisionStartRefusesShortfallBeyondReclaimableMemory(t *testing.T) {
 	reclaimable := 3 * (nodeMiB - floor)
 	service.hostFreeMemory = func() (int, error) { return reserve + nodeMiB - reclaimable - 1, nil }
 
-	_, err := service.checkProvisionStart(t.TempDir(), nodeMiB, false)
+	_, _, err := service.checkProvisionStart(t.TempDir(), nodeMiB, false)
 
 	if err == nil {
 		t.Fatal("checkProvisionStart() admitted a shortfall past the reclaimable memory")
@@ -494,7 +497,7 @@ func TestProvisionStartRefusesWhenThePreBalloonFails(t *testing.T) {
 		machine.(*fakeMachine).setMemoryErr = errors.New("virtio_balloon not ready")
 	}
 
-	_, err := service.checkProvisionStart(t.TempDir(), nodeMiB, false)
+	_, _, err := service.checkProvisionStart(t.TempDir(), nodeMiB, false)
 
 	if err == nil || !strings.Contains(err.Error(), "virtio_balloon not ready") {
 		t.Fatalf("checkProvisionStart() error = %v, want the failed pre-balloon to refuse", err)
@@ -512,7 +515,7 @@ func TestProvisionStartGateRunsUnderOpMu(t *testing.T) {
 	service.opMu.Lock()
 	defer service.opMu.Unlock()
 
-	if _, err := service.checkProvisionStart(t.TempDir(), nodeMiB, false); err != nil {
+	if _, _, err := service.checkProvisionStart(t.TempDir(), nodeMiB, false); err != nil {
 		t.Fatalf("checkProvisionStart() under opMu = %v, want admission after pre-ballooning", err)
 	}
 }
@@ -549,7 +552,7 @@ func TestProvisionStartCreditsOnlyMemoryTheGuestsStillHold(t *testing.T) {
 	// the guests cannot make a second time.
 	reserve := balloon.DefaultConfig().ReserveMiB
 	service.hostFreeMemory = func() (int, error) { return reserve + nodeMiB - want - 1, nil }
-	if _, err := service.checkProvisionStart(t.TempDir(), nodeMiB, false); err == nil {
+	if _, _, err := service.checkProvisionStart(t.TempDir(), nodeMiB, false); err == nil {
 		t.Fatal("checkProvisionStart() admitted a shortfall past the memory the guests still hold")
 	}
 }
@@ -564,7 +567,7 @@ func TestProvisionStartPreBalloonNeverInflatesAlreadyShrunkGuests(t *testing.T) 
 	shrinkGuests(t, service, shrunkMiB)
 	service.hostFreeMemory = func() (int, error) { return reserve + nodeMiB - shortfall, nil }
 
-	if _, err := service.checkProvisionStart(t.TempDir(), nodeMiB, false); err != nil {
+	if _, _, err := service.checkProvisionStart(t.TempDir(), nodeMiB, false); err != nil {
 		t.Fatalf("checkProvisionStart() = %v, want admission after pre-ballooning", err)
 	}
 
@@ -579,5 +582,73 @@ func TestProvisionStartPreBalloonNeverInflatesAlreadyShrunkGuests(t *testing.T) 
 	}
 	if reclaimed < shortfall {
 		t.Fatalf("pre-balloon reclaimed %d MiB, want at least the %d MiB shortfall", reclaimed, shortfall)
+	}
+}
+
+// #398: the pre-balloon hold is a boot-window budget, so its clock has to start
+// at the launch rather than at the admission. A cold create spends an unbounded
+// image fetch and a disk clone per node between the two; if the hold expires in
+// there, the balloon manager inflates the reclaimed guests back before the
+// admitted ones have booted — exactly the concurrent-bringup squeeze the
+// pre-balloon was taken to prevent.
+func TestCreateClusterRearmsThePreBalloonHoldAtLaunch(t *testing.T) {
+	const nodeMiB, shortfall = 2048, 512
+	reserve := balloon.DefaultConfig().ReserveMiB
+	service, _ := balloonableFixture(t, nodeMiB)
+	stubNodeMutationReconcile(service)
+	service.helperCheck = func() error { return nil }
+	service.hostFreeMemory = func() (int, error) { return reserve + nodeMiB - shortfall, nil }
+	schematic := "second-schematic"
+	seedCachedDisk(t, schematic, DefaultTalosVersion)
+
+	raw, err := json.Marshal(createArgs{
+		Name:          "second",
+		ControlPlanes: intPtr(1),
+		Workers:       intPtr(0),
+		Schematic:     schematic,
+		NodeDefaults:  cluster.NodeDefaults{MemoryMiB: nodeMiB, DiskGiB: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Stands in for the slow cold create: the admission-time hold runs out
+	// while the create is still cloning disks, before anything has launched.
+	cloned := false
+	expireHold := stageFunc(func(line string) {
+		if !strings.Contains(line, "cloning") {
+			return
+		}
+		cloned = true
+		service.balloonHoldMu.Lock()
+		service.balloonHoldUntil = time.Now().Add(-time.Second)
+		service.balloonHoldMu.Unlock()
+	})
+
+	if _, err := service.createCluster(raw, expireHold); err != nil {
+		t.Fatalf("createCluster() = %v, want admission after pre-ballooning", err)
+	}
+
+	if !cloned {
+		t.Fatal("the create never reached the disk-clone stage; the fixture no longer exercises the window this test is about")
+	}
+	if got := service.BalloonHoldMiB(); got <= 0 {
+		t.Fatalf("BalloonHoldMiB() = %d after the create launched its guests, want the pre-balloon still held: an expired hold lets the balloon manager hand the reclaim back before the admitted guests boot", got)
+	}
+}
+
+func intPtr(v int) *int { return &v }
+
+// seedCachedDisk puts a cached image where cache.Ensure will find it, so a
+// create in these tests never reaches the Image Factory.
+func seedCachedDisk(t *testing.T, schematic, version string) {
+	t.Helper()
+	// The shared fixture roots its cache at $HOME/cache, and HOME is the test's
+	// own temp dir, so this stays inside the sandbox.
+	path := filepath.Join(os.Getenv("HOME"), "cache", schematic, version, string(hypervisor.ArchitectureARM64), "disk.raw")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("disk"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -70,7 +70,9 @@ func (s *Server) startNodeLocked(raw json.RawMessage, progress stageFunc) (NodeR
 	// its allocation is entirely new to the free memory the gate measures. Its
 	// headroom rule works off that measurement, not off the running-guest sum,
 	// which only decides whether the gate applies at all (#334).
-	provisionStartWarnings, err := s.checkProvisionStart(dir, item.DefaultsFor(node.Role).MemoryMiB, args.Force)
+	// This node launches a few lines below, so the gate's own hold already
+	// starts at the launch it protects; nothing to re-arm.
+	provisionStartWarnings, _, err := s.checkProvisionStart(dir, item.DefaultsFor(node.Role).MemoryMiB, args.Force)
 	if err != nil {
 		return NodeRunState{}, nil, err
 	}
