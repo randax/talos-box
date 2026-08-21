@@ -242,3 +242,52 @@ func shortSocketPath(t *testing.T, prefix string) string {
 	t.Helper()
 	return fmt.Sprintf("/tmp/%s-%d.sock", prefix, os.Getpid())
 }
+
+// A helper built before bgp.status reported routes answers with {active} alone,
+// so trusting it would report "announced routes: none" for a speaker that is
+// announcing. The handshake must refuse it and ask for a reinstall.
+func TestConnectRejectsHelperPredatingBGPRouteReporting(t *testing.T) {
+	const preRouteReportingVersion = 2
+	if protocolVersion <= preRouteReportingVersion {
+		t.Fatalf("protocolVersion = %d, want a version past the bgp.status route contract change", protocolVersion)
+	}
+
+	socketPath := shortSocketPath(t, "helper-stale-bgp")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		connection, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = connection.Close() }()
+
+		var request Request
+		if err := json.NewDecoder(connection).Decode(&request); err != nil {
+			return
+		}
+		if err := sendResponse(connection.(*net.UnixConn), success(Info{ProtocolVersion: preRouteReportingVersion}), -1); err != nil {
+			t.Errorf("send response: %v", err)
+		}
+	}()
+
+	t.Setenv(helperSocketEnv, socketPath)
+	client, err := Connect()
+	if client != nil {
+		_ = client.Close()
+		t.Fatal("Connect() succeeded against a helper that cannot report BGP routes")
+	}
+	if !errors.Is(err, errProtocolMismatch) {
+		t.Fatalf("Connect() error = %v, want a protocol mismatch", err)
+	}
+	if !strings.Contains(err.Error(), "tbx system install") {
+		t.Fatalf("Connect() error = %v, want reinstall guidance", err)
+	}
+	<-done
+}

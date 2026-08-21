@@ -30,7 +30,9 @@ macOS requires:
 - 16 GB RAM minimum for the default 1-control-plane + 2-worker topology;
 - 25 GB free on the volume holding `~/.talosbox` (node disks are 20 GB sparse);
 - the Xcode command line tools and [Go 1.26](https://go.dev/doc/install) for the source build;
-- one-time administrator rights for `sudo tbx system install`.
+- administrator rights for `sudo tbx system install`, once per helper protocol version. Upgrading
+  `tbx` does not replace the installed helper: when a release changes the helper protocol, every
+  helper call fails with a protocol mismatch naming the `sudo … system install` to rerun.
 
 Suspend/resume is capability-gated rather than version-gated here: memory is preserved while
 the same `tbxd` process stays alive, and a resume after a daemon restart warns and safely
