@@ -392,8 +392,70 @@ func TestProvisionStartPreBalloonsRunningGuestsInsteadOfRefusing(t *testing.T) {
 	if reclaimed < shortfall {
 		t.Fatalf("pre-balloon reclaimed %d MiB, want at least the %d MiB shortfall", reclaimed, shortfall)
 	}
-	if got := service.BalloonHoldMiB(); got != shortfall {
-		t.Fatalf("BalloonHoldMiB() = %d, want the %d MiB hold that keeps the manager from handing it straight back", got, shortfall)
+	// The hold must cover the memory that is actually out of the guests measured
+	// from their configured size — the manager's reconcile anchors there, so a
+	// hold of only the incremental shortfall lets the next poll inflate them back.
+	if got := service.BalloonHoldMiB(); got != reclaimed {
+		t.Fatalf("BalloonHoldMiB() = %d, want the %d MiB actually ballooned out so the manager cannot hand it straight back", got, reclaimed)
+	}
+}
+
+// The hold is measured from the configured size, not from the shortfall this
+// admission asked for: the balloon manager recomputes every target from
+// ConfiguredMiB, so a hold covering only the increment hands back whatever an
+// earlier reclaim had already taken, dropping the host below the reserve the
+// gate just promised.
+func TestProvisionStartHoldsTheCumulativeReclaimNotJustTheShortfall(t *testing.T) {
+	const nodeMiB = 2048
+	reserve := balloon.DefaultConfig().ReserveMiB
+	service, _ := balloonableFixture(t, nodeMiB)
+	// Every guest already sits 300 MiB below configured from an earlier reclaim.
+	const alreadyOut = 300
+	for name := range service.vms["demo"] {
+		service.recordBalloonTarget("demo/"+name, nodeMiB-alreadyOut)
+	}
+	const shortfall = 512
+	service.hostFreeMemory = func() (int, error) { return reserve + nodeMiB - shortfall, nil }
+
+	if _, err := service.checkProvisionStart(t.TempDir(), nodeMiB, false); err != nil {
+		t.Fatalf("checkProvisionStart() = %v, want admission after pre-ballooning", err)
+	}
+
+	reclaimed := 0
+	for _, machine := range service.vms["demo"] {
+		fake, ok := machine.(*fakeMachine)
+		if !ok || len(fake.memoryTargets) == 0 {
+			t.Fatalf("node was never ballooned down: %#v", machine)
+		}
+		reclaimed += nodeMiB - fake.memoryTargets[len(fake.memoryTargets)-1]
+	}
+	if reclaimed < shortfall+3*alreadyOut {
+		t.Fatalf("pre-balloon left only %d MiB out of the guests, want the earlier %d MiB plus the %d MiB shortfall", reclaimed, 3*alreadyOut, shortfall)
+	}
+	if got := service.BalloonHoldMiB(); got != reclaimed {
+		t.Fatalf("BalloonHoldMiB() = %d, want the cumulative %d MiB that is actually out of the guests", got, reclaimed)
+	}
+}
+
+// #398 follow-up: measuring the balloon credit dials apid on every running node
+// on backends without balloon readback, and the whole gate runs under opMu. A
+// host with headroom to spare must never pay for a credit no shortfall can
+// spend.
+func TestProvisionStartSkipsTheBalloonCreditWhenTheHostHasHeadroom(t *testing.T) {
+	const nodeMiB = 2048
+	service, _ := balloonableFixture(t, nodeMiB)
+	service.hostFreeMemory = func() (int, error) { return 1 << 20, nil }
+	measured := 0
+	service.balloonables = func() map[string]balloon.Balloonable {
+		measured++
+		return nil
+	}
+
+	if _, err := service.checkProvisionStart(t.TempDir(), nodeMiB, false); err != nil {
+		t.Fatalf("checkProvisionStart() = %v, want admission on a roomy host", err)
+	}
+	if measured != 0 {
+		t.Fatalf("balloon credit was measured %d times on a host with no shortfall, want 0", measured)
 	}
 }
 

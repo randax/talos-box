@@ -140,7 +140,7 @@ func AssessProvisionStart(in ProvisionStart) ProvisionStartPlan {
 	}
 	if in.HostFreeMiB > 0 {
 		projectedFreeMiB := in.HostFreeMiB - in.NewVMMiB
-		shortfallMiB := in.ReserveMiB - projectedFreeMiB
+		shortfallMiB := ProvisionStartShortfallMiB(in)
 		switch {
 		case shortfallMiB <= 0:
 			// the host has the headroom outright
@@ -172,6 +172,19 @@ func AssessProvisionStart(in ProvisionStart) ProvisionStartPlan {
 		})
 	}
 	return plan
+}
+
+// ProvisionStartShortfallMiB is the headroom rule's shortfall before any
+// balloon credit: how far below the reserve starting NewVMMiB would leave the
+// host. Zero or less means the host has the headroom outright. It is exported
+// so a caller can decide whether measuring ReclaimableMiB is worth its cost —
+// that measurement probes every running guest — without duplicating the
+// arithmetic the gate itself applies.
+func ProvisionStartShortfallMiB(in ProvisionStart) int {
+	if in.RunningVMMiB <= 0 || in.NewVMMiB <= 0 || in.HostFreeMiB <= 0 {
+		return 0
+	}
+	return in.ReserveMiB - (in.HostFreeMiB - in.NewVMMiB)
 }
 
 // reclaimShortfallClause names the balloon credit inside a refusal that already

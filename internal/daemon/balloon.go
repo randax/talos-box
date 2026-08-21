@@ -102,8 +102,9 @@ func (s *Server) Balloonables() map[string]balloon.Balloonable {
 // which every guest-start gate does, since the whole provisioning dispatch runs
 // under it. Taking opMu again there would deadlock, so the lock stays with the
 // caller and only the apid probe (which Balloonables runs outside the lock)
-// moves inside it. That probe only ever runs when the gate is short of headroom
-// and is bounded by its own dial timeout.
+// moves inside it. The gate calls this only once it has already computed a
+// shortfall against the measured host, so the roomy-host path never probes, and
+// the probe is bounded by its own dial timeout.
 func (s *Server) balloonablesLocked() map[string]balloon.Balloonable {
 	balloonReadback := s.hypervisor.Capabilities().BalloonReadback.Supported
 	return balloonablesFrom(s.balloonCandidatesLocked(balloonReadback), balloonReadback, s.recordBalloonTarget)
@@ -260,17 +261,26 @@ func (s *Server) checkProvisionStart(path string, addMiB int, force bool) ([]str
 	}
 	reserveMiB := balloon.DefaultConfig().ReserveMiB
 	runningMiB := s.runningVMMemoryMiB()
-	reclaim := s.balloonReclaim()
-	plan := hostpressure.AssessProvisionStart(hostpressure.ProvisionStart{
+	in := hostpressure.ProvisionStart{
 		RunningVMMiB:   runningMiB,
 		NewVMMiB:       addMiB,
 		HostFreeMiB:    freeMiB,
 		HostTotalMiB:   totalMiB,
 		ReserveMiB:     reserveMiB,
-		ReclaimableMiB: reclaim.availableMiB,
 		Swap:           swap,
 		MemoryPressure: pressure,
-	})
+	}
+	// The balloon credit is measured only when the host is actually short.
+	// Measuring it dials apid on every running node on backends without balloon
+	// readback — seconds, on a host whose siblings are mid-bringup — and this
+	// gate runs under opMu, so the roomy-host path must never pay for a credit
+	// no shortfall will ever spend.
+	var reclaim balloonReclaim
+	if hostpressure.ProvisionStartShortfallMiB(in) > 0 {
+		reclaim = s.balloonReclaim()
+		in.ReclaimableMiB = reclaim.availableMiB
+	}
+	plan := hostpressure.AssessProvisionStart(in)
 	warnings, err := applyPressureFindings(plan.Findings, force)
 	if err != nil {
 		return nil, err
@@ -278,7 +288,8 @@ func (s *Server) checkProvisionStart(path string, addMiB int, force bool) ([]str
 	if plan.ReclaimMiB == 0 {
 		return warnings, nil
 	}
-	if err := reclaim.apply(plan.ReclaimMiB); err != nil {
+	heldMiB, err := reclaim.apply(plan.ReclaimMiB)
+	if err != nil {
 		// Memory nothing gave back is not headroom. The gate admitted this
 		// start only because the reclaim was going to happen, so a reclaim that
 		// did not happen puts it back where an unaided host would be.
@@ -288,7 +299,7 @@ func (s *Server) checkProvisionStart(path string, addMiB int, force bool) ([]str
 		}
 		return append(warnings, detail+" (forced)"), nil
 	}
-	s.holdBalloonReclaim(plan.ReclaimMiB)
+	s.holdBalloonReclaim(heldMiB)
 	return append(warnings, fmt.Sprintf(
 		"pre-ballooned %d MiB out of the %d MiB of guests already running so the %d MiB starting now still leaves the %d MiB balloon reserve free of the %d MiB measured;"+
 			" the balloon controller holds that reclaim for %s while the new guests boot, then hands it back",
@@ -326,9 +337,11 @@ type balloonReclaim struct {
 // made the gate terminal — an 81 MiB shortfall stood between a host and a start
 // it could have made room for.
 //
-// The cheap ceiling runs first so the common path never probes: with nothing
-// running above the per-node floor there is nothing to reclaim, and Balloonables
-// — which dials apid on backends without balloon readback — is never called.
+// Callers must reach this only when the headroom rule is actually short (see
+// checkProvisionStart): Balloonables dials apid on backends without balloon
+// readback, which is too expensive to spend on a host that has the headroom
+// outright. The cheap inventory ceiling then short-circuits the rest when
+// nothing running sits above the per-node floor.
 func (s *Server) balloonReclaim() balloonReclaim {
 	floorMiB := balloon.DefaultConfig().FloorMiB
 	if s.reclaimCeilingMiB(floorMiB) <= 0 {
@@ -382,7 +395,7 @@ func (s *Server) reclaimCeilingMiB(floorMiB int) int {
 // pre-balloon can only ever take memory back — anchoring on configured would
 // hand memory to guests the manager had already shrunk, lowering host free
 // memory in the moment the gate promised to raise it.
-func (r balloonReclaim) apply(deficitMiB int) error {
+func (r balloonReclaim) apply(deficitMiB int) (int, error) {
 	names := make([]string, 0, len(r.vms))
 	nodes := make([]balloon.Node, 0, len(r.vms))
 	for name, vm := range r.vms {
@@ -396,17 +409,29 @@ func (r balloonReclaim) apply(deficitMiB int) error {
 	// for one MiB per node more absorbs that residual and is itself far below
 	// the granularity of any of these readings.
 	targets := balloon.PlanTargets(nodes, deficitMiB+len(nodes), r.floorMiB)
+	heldMiB := 0
 	for _, name := range names {
 		if err := r.vms[name].SetMemoryTargetMiB(targets[name]); err != nil {
-			return fmt.Errorf("balloon %s down to %d MiB: %w", name, targets[name], err)
+			return 0, fmt.Errorf("balloon %s down to %d MiB: %w", name, targets[name], err)
+		}
+		// The hold is measured from the CONFIGURED size, not from the deficit
+		// this call asked for: the balloon manager's reconcile anchors on
+		// configured, so a hold that only covered the increment would let the
+		// next poll inflate the guests back past everything an earlier reclaim
+		// had already taken.
+		if out := r.vms[name].ConfiguredMiB() - targets[name]; out > 0 {
+			heldMiB += out
 		}
 	}
-	return nil
+	return heldMiB, nil
 }
 
 // holdBalloonReclaim records a pre-balloon so the balloon manager keeps it in
-// place while the admitted guests boot. Overlapping starts hold the largest
-// outstanding reclaim, not the sum: each was measured against the same host.
+// place while the admitted guests boot. reclaimMiB is the memory now out of the
+// guests measured from their configured size — the same anchor the manager's
+// reconcile uses — so overlapping starts hold the largest outstanding reclaim
+// rather than the sum: the second start's reclaim already contains the first's,
+// because it was applied on top of it.
 func (s *Server) holdBalloonReclaim(reclaimMiB int) {
 	if reclaimMiB <= 0 {
 		return
