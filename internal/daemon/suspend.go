@@ -143,7 +143,10 @@ func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
 		var nodeWarning string
 		if fallbackErr != nil {
 			nodeWarning = coldBootWarning(node.Name, saveErr != nil, fallbackErr)
-			log.Printf("resume %s: %v", node.Name, fallbackErr)
+			// Cluster-scoped subject: `tbx logs <cluster>` filters on the
+			// cluster name, so a bare node name would hide the very line
+			// the cold-boot warning sends the operator to read (#411).
+			log.Printf("resume %s/%s: %v", item.Name, node.Name, fallbackErr)
 		}
 		return resumedNode{savePath: savePath, warning: nodeWarning, restored: fallbackErr == nil}, nil
 	}, func() error {
