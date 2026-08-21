@@ -105,3 +105,23 @@ func swapDefaultLoggerOutput(t *testing.T) func() {
 	original := log.Writer()
 	return func() { log.SetOutput(original) }
 }
+
+// The daemon's terminal error is logged after the deferred close of the log
+// file (main reports it once run returns), so closing must put the logger back
+// on stderr rather than leave it pointing at a closed file.
+func TestRouteDaemonLogCloseRestoresStderr(t *testing.T) {
+	restore := swapDefaultLoggerOutput(t)
+	defer restore()
+
+	path := filepath.Join(t.TempDir(), "state", daemonLogFile)
+	closer, err := routeDaemonLog(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := closer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if log.Writer() != os.Stderr {
+		t.Fatal("standard logger still points at the closed daemon log; lines after close would be dropped")
+	}
+}

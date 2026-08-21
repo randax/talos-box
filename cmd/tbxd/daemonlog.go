@@ -42,7 +42,17 @@ func routeDaemonLog(path string) (io.Closer, error) {
 		return file, nil
 	}
 	log.SetOutput(io.MultiWriter(os.Stderr, file))
-	return file, nil
+	return &teedDaemonLog{file: file}, nil
+}
+
+// teedDaemonLog puts the standard logger back on stderr before closing the file
+// it tees into, so a line logged after the daemon's deferred close is not handed
+// to a closed *os.File and silently dropped.
+type teedDaemonLog struct{ file *os.File }
+
+func (t *teedDaemonLog) Close() error {
+	log.SetOutput(os.Stderr)
+	return t.file.Close()
 }
 
 // sameFile reports whether two open files are the same file on disk, so the
