@@ -340,6 +340,10 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 		}
 	}
 	if len(status.Nodes) > 0 && len(stopped) == len(status.Nodes) {
+		// Hints are meant to be pasted, and a cluster name is only validated as
+		// a single path element, so quote it like every other command-bearing
+		// hint in this file.
+		name := shellquote.Quote(status.Name)
 		// Saved memory outranks the stopped reading: start boots the nodes
 		// cold and drops the suspended state on the floor, so the hint names
 		// resume and says what start would cost (#272).
@@ -351,11 +355,11 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 			if status.SavedStateStale {
 				return append(hints, fmt.Sprintf(
 					"cluster is suspended, but the daemon that saved its memory has been replaced — the saved memory will not survive, so tbx cluster resume %[1]s will cold-boot the nodes (tbx cluster start %[1]s does the same)",
-					status.Name))
+					name))
 			}
-			return append(hints, fmt.Sprintf("cluster is suspended — resume it with: tbx cluster resume %s (tbx cluster start discards the saved memory)", status.Name))
+			return append(hints, fmt.Sprintf("cluster is suspended — resume it with: tbx cluster resume %s (tbx cluster start discards the saved memory)", name))
 		}
-		return append(hints, fmt.Sprintf("cluster is stopped — start it with: tbx cluster start %s", status.Name))
+		return append(hints, fmt.Sprintf("cluster is stopped — start it with: tbx cluster start %s", name))
 	}
 	if hint := storageHint(status); hint != "" {
 		hints = append(hints, hint)

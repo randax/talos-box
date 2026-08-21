@@ -563,3 +563,41 @@ func TestConvergenceHintQuotesClusterName(t *testing.T) {
 		t.Fatalf("convergenceHint() left the cluster name unquoted: %s", got)
 	}
 }
+
+// TestStoppedClusterHintsQuoteClusterName pins the same paste-safety rule for
+// the all-stopped hints: stale save, plain suspend, and plain stopped all name
+// a command, so a cluster name carrying shell metacharacters must be quoted.
+func TestStoppedClusterHintsQuoteClusterName(t *testing.T) {
+	const name = "demo; rm -rf ~"
+	const quoted = "'demo; rm -rf ~'"
+	for _, test := range []struct {
+		label  string
+		status ClusterStatus
+		want   []string
+	}{
+		{
+			label:  "stale save",
+			status: ClusterStatus{Name: name, Suspended: true, SavedStateStale: true, Nodes: []NodeStatus{{Phase: PhaseSuspended}}},
+			want:   []string{"tbx cluster resume " + quoted, "tbx cluster start " + quoted},
+		},
+		{
+			label:  "suspended",
+			status: ClusterStatus{Name: name, Suspended: true, Nodes: []NodeStatus{{Phase: PhaseSuspended}}},
+			want:   []string{"tbx cluster resume " + quoted},
+		},
+		{
+			label:  "stopped",
+			status: ClusterStatus{Name: name, Nodes: []NodeStatus{{Phase: PhaseStopped}}},
+			want:   []string{"tbx cluster start " + quoted},
+		},
+	} {
+		t.Run(test.label, func(t *testing.T) {
+			got := strings.Join(Hints(test.status), "\n")
+			for _, want := range test.want {
+				if !strings.Contains(got, want) {
+					t.Fatalf("hints = %q, want %q", got, want)
+				}
+			}
+		})
+	}
+}
