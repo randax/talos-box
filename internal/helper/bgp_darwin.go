@@ -33,7 +33,7 @@ func (s *Server) enableBGP(raw json.RawMessage) error {
 	}
 	gateway := fmt.Sprintf("172.30.%d.1", *args.SubnetIndex)
 	peerCIDR := fmt.Sprintf("172.30.%d.0/24", *args.SubnetIndex)
-	speaker, err := bgp.StartSpeaker(args.LocalASN, args.PeerASN, gateway, peerCIDR, routeFIB{})
+	speaker, err := bgp.StartSpeaker(args.LocalASN, args.PeerASN, gateway, peerCIDR, speakerFIB())
 	if err != nil {
 		return fmt.Errorf("start bgp speaker for %s: %w", args.Cluster, err)
 	}

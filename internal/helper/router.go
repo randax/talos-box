@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 )
 
@@ -37,6 +38,14 @@ type frameRouter struct {
 	nextPort int
 	ports    map[int]*routerPort
 	ipToPort map[routerIP]*routerPort
+	// routedVIPs binds a BGP-announced VIP to the node advertising it. L2
+	// announcement is observable on the segment — the owning node ARPs for the
+	// VIP and ipToPort learns it — but BGP mode turns L2 announcements off and
+	// the VIP is then only ever named to the host, in the BGP speaker's FIB
+	// writes. Without this second binding the router has no owner for such a
+	// VIP and drops both directions of a sibling cluster's traffic to it, even
+	// though the host itself reaches it over the injected host route (#387).
+	routedVIPs map[routerIP]routerIP
 }
 
 type routerPort struct {
@@ -60,8 +69,9 @@ type routerMAC [6]byte
 
 func newFrameRouter() *frameRouter {
 	return &frameRouter{
-		ports:    make(map[int]*routerPort),
-		ipToPort: make(map[routerIP]*routerPort),
+		ports:      make(map[int]*routerPort),
+		ipToPort:   make(map[routerIP]*routerPort),
+		routedVIPs: make(map[routerIP]routerIP),
 	}
 }
 
@@ -121,7 +131,7 @@ func (r *frameRouter) route(port *routerPort, frame []byte) (bool, error) {
 	}
 
 	srcKey, ok := routerIPKey(srcIP)
-	if !ok || r.ipToPort[srcKey] != port {
+	if !ok || r.owner(srcKey, port.subnet) != port {
 		r.mu.Unlock()
 		return false, nil
 	}
@@ -269,10 +279,84 @@ func (r *frameRouter) learnVIPIP(port *routerPort, ip net.IP) {
 }
 
 func (r *frameRouter) targetFor(ip routerIP, subnet int) *routerPort {
-	if target := r.ipToPort[ip]; target != nil && target.subnet == subnet && target.macSet {
+	if target := r.owner(ip, subnet); target != nil && target.macSet {
 		return target
 	}
 	return nil
+}
+
+// owner resolves which port holds ip on subnet: the port that learned the
+// address itself, or, for a BGP-announced VIP, the port of the node the host
+// speaker named as its nexthop. Resolving the nexthop on every frame rather
+// than binding the VIP to a port at learn time keeps the two learning paths
+// independent: the route may be injected before the node's lease is seen, and
+// a node whose port goes away stops owning its VIPs with it.
+func (r *frameRouter) owner(ip routerIP, subnet int) *routerPort {
+	if port := r.ipToPort[ip]; port != nil && port.subnet == subnet {
+		return port
+	}
+	if nexthop, ok := r.routedVIPs[ip]; ok {
+		if port := r.ipToPort[nexthop]; port != nil && port.subnet == subnet {
+			return port
+		}
+	}
+	return nil
+}
+
+// learnRoutedVIP records a host route the BGP speaker injected: prefix is a
+// /32 VIP, nexthop the node advertising it. Both must be talosbox addresses of
+// the same cluster subnet — the speaker only ever peers with one cluster's
+// nodes, and anything else is not ours to route between segments.
+func (r *frameRouter) learnRoutedVIP(prefix, nexthop string) {
+	vipIP, nexthopIP, ok := routedVIPPair(prefix, nexthop)
+	if !ok {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.routedVIPs[vipIP] = nexthopIP
+}
+
+// forgetRoutedVIP drops a withdrawn host route. A VIP the segment also ARPs
+// for keeps its ipToPort binding; only the routed one is forgotten.
+func (r *frameRouter) forgetRoutedVIP(prefix string) {
+	vipIP, _, ok := routedVIPPair(prefix, "")
+	if !ok {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.routedVIPs, vipIP)
+}
+
+// routedVIPPair validates a speaker FIB write. An empty nexthop is a withdrawal,
+// which only needs the prefix.
+func routedVIPPair(prefix, nexthop string) (vipIP, nexthopIP routerIP, ok bool) {
+	address, suffix, found := strings.Cut(prefix, "/")
+	if !found || suffix != "32" {
+		return routerIP{}, routerIP{}, false
+	}
+	vip := net.ParseIP(address).To4()
+	subnet, ok := talosboxSubnet(vip)
+	if !ok || !isVIP(vip, subnet) {
+		return routerIP{}, routerIP{}, false
+	}
+	vipIP, ok = routerIPKey(vip)
+	if !ok {
+		return routerIP{}, routerIP{}, false
+	}
+	if nexthop == "" {
+		return vipIP, routerIP{}, true
+	}
+	node := net.ParseIP(nexthop).To4()
+	if !isNodeIP(node, subnet) {
+		return routerIP{}, routerIP{}, false
+	}
+	nexthopIP, ok = routerIPKey(node)
+	if !ok {
+		return routerIP{}, routerIP{}, false
+	}
+	return vipIP, nexthopIP, true
 }
 
 func (p *routerPort) sourceMAC() routerMAC {
