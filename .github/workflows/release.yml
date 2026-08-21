@@ -91,16 +91,30 @@ jobs:
           for name in MACOS_SIGN_P12 MACOS_SIGN_PASSWORD MACOS_NOTARY_KEY MACOS_NOTARY_KEY_ID MACOS_NOTARY_ISSUER_ID; do
             test -n "${!name}" || { echo "$name secret is missing" >&2; exit 1; }
           done
-      - name: Sync the runner clock for the notary JWT
-        # App Store Connect rejects API JWTs whose issue time disagrees with
-        # Apple's clock (401 Unauthenticated), and hosted macOS runners drift;
-        # two rehearsals failed on exactly that while the same key worked
-        # locally. Print the skew, then step the clock.
+      - name: Import the signing identity and notary key
+        env:
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_P12_PASSWORD }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
         run: |
-          apple=$(curl -sI https://appstoreconnect.apple.com | awk -F': ' 'tolower($1)=="date"{print $2}' | tr -d '\r')
-          echo "runner: $(date -u); apple: $apple"
-          sudo sntp -sS time.apple.com || true
-          echo "after sync: $(date -u)"
+          # A throwaway keychain holds the Developer ID identity for codesign;
+          # the notary key goes to a file notarytool reads directly.
+          keychain=$RUNNER_TEMP/release.keychain-db
+          keychain_password=$(uuidgen)
+          printf '%s' "$MACOS_SIGN_P12" | base64 --decode -o "$RUNNER_TEMP/release.p12"
+          printf '%s' "$MACOS_NOTARY_KEY" | base64 --decode -o "$RUNNER_TEMP/notary.p8"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/release.p12" -P "$MACOS_SIGN_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          identity=$(security find-identity -v -p codesigning "$keychain" | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)
+          test -n "$identity" || { echo "no Developer ID Application identity in the imported .p12" >&2; exit 1; }
+          echo "MACOS_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+          echo "MACOS_NOTARY_KEY_FILE=$RUNNER_TEMP/notary.p8" >> "$GITHUB_ENV"
+          echo "MACOS_NOTARY_KEY_ID=${{ secrets.MACOS_NOTARY_KEY_ID }}" >> "$GITHUB_ENV"
+          echo "MACOS_NOTARY_ISSUER_ID=${{ secrets.MACOS_NOTARY_ISSUER_ID }}" >> "$GITHUB_ENV"
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           distribution: goreleaser
@@ -109,10 +123,5 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          # Developer ID signing + notarization (see notarize.macos in
-          # .goreleaser.yaml). The .p12 and .p8 are base64 in the secrets.
-          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
-          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_P12_PASSWORD }}
-          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
-          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
-          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+          # MACOS_SIGN_IDENTITY and MACOS_NOTARY_* reach the build hooks from
+          # GITHUB_ENV (scripts/release/sign-darwin.sh).

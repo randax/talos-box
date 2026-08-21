@@ -9,11 +9,16 @@ notarized by Apple; linux/amd64 + linux/arm64 are cross-compiled with
 
 ## Signing and notarization
 
-`notarize.macos` in `.goreleaser.yaml` signs `tbx`, `tbxd` and `tbx-helper`
-and submits them to the notary service, waiting for the ticket. Go's external
-linker leaves a linker-signed ad-hoc signature whose load command the signer
-cannot replace, so each darwin build strips it in a post hook first. The
-release gate refuses to publish when any of these secrets is missing:
+Each darwin build's post hook, `scripts/release/sign-darwin.sh`, signs the
+binary with the Developer ID identity (hardened runtime, virtualization
+entitlement) and submits it to the notary service with `xcrun notarytool`,
+waiting for acceptance; the three submissions overlap because the builds do.
+Bare binaries cannot be stapled, so Gatekeeper fetches the ticket online. The
+workflow imports the identity into a throwaway keychain first. (GoReleaser's
+own `notarize.macos` pipe was tried and dropped: its submissions failed with
+`401 Unauthenticated` from hosted runners while the same key worked
+elsewhere.) The release gate refuses to publish when any of these secrets is
+missing:
 
 | Secret | Content |
 |---|---|
