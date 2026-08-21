@@ -48,8 +48,9 @@ func (c cli) runCacheWarm(args []string) error {
 	// Every check is an offline-readiness verification, so it also answers for
 	// the images no warm list can name: nothing tbx renders references the CRI
 	// pod sandbox image, yet no pod starts without it. Adding it in both modes
-	// means the gap is reported while it can still be pulled, and a plain
-	// --check never hands out an all-clear a deep check would fail (#404).
+	// means the gap is reported while it can still be pulled, whether or not
+	// --deep was asked for (#404). --deep still adds what a plain --check does
+	// not do: rehashing cached blobs to catch on-disk corruption.
 	if *checkOnly {
 		refs = withBootstrapRequiredRefs(refs)
 	}

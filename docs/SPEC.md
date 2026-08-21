@@ -121,7 +121,9 @@ end-to-end timing and cluster-up gate remains #97. The ISO+install path is dropp
   tag-plus-digest entry is the immutable list form. `tbx cache warm --check [--deep] <list>...`
   verifies that content locally and offline; `--deep` only adds a blob rehash and requires
   `--check`. Both check modes also verify the implicit bootstrap-required set no list can name
-  (the CRI pod sandbox image), so a plain `--check` never gives a false all-clear.
+  (the CRI pod sandbox image), so neither mode reports the cache complete while that image is
+  missing; only `--deep` detects a cached blob whose bytes no longer match its digest, so
+  `--check --deep` remains the pre-travel gate.
   This verifies cache completeness, not a live-cluster pull.
 - Node disks: `~/.talosbox/clusters/<name>/<node>.img`, **20 GB sparse** default.
 - **Talos version matrix**: each tbx release pins one tested default Talos version (initially
