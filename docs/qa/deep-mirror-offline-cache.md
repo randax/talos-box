@@ -36,7 +36,7 @@ Pass criteria: all accept/reject behaviors as documented.
 
 On failure: capture full command output per case.
 
-**Open QA task**: re-run C1 for `docker.io` on a host with working Docker Hub anonymous access. On the 2026-08-17 run, Hub anonymous auth was broken host-wide, so the `docker.io/library/alpine:3.20` leg could not validate the [#242](https://github.com/randax/talos-box/issues/242) anonymous-auth fix either way — neither confirmed nor refuted. Before running, sanity-check Hub anonymous auth outside tbx (a plain anonymous token fetch + manifest HEAD); if that fails, record the leg as BLOCKED on the host rather than FAIL, and leave this task open.
+**Closed QA task** (no action needed): the [#242](https://github.com/randax/talos-box/issues/242) Docker Hub anonymous-auth fix was confirmed on 2026-08-19 — the `docker.io/library/alpine:3.20` leg warmed cleanly on the first run. Do not re-investigate it. If the Hub leg ever fails again, sanity-check Hub anonymous auth outside tbx first (a plain anonymous token fetch + `HEAD /v2/library/alpine/manifests/3.20`); a failure there is a host/network problem — record the leg as BLOCKED on the host rather than FAIL.
 
 ### C2 — Gateway-only binds and port layout (depends on a running cluster)
 
@@ -78,7 +78,8 @@ Steps:
 2. From a test pod, pull the warmed image by tag — succeeds from cache. Pull it by digest — also succeeds (digest/tag parity).
 3. Pull an uncached image — expect a hard failure mentioning offline/not-cached (skipFallback means the node cannot bypass; the pull fails, it does not hang).
 4. Restart the daemon itself with `tbx system restart --force` (`--force` is required here: `qa-mir` is running, and a plain restart refuses rather than stop it; on a supervised install — packaged Linux units — restart the tbxd service via the service manager instead). If neither is available, exercise the cluster path: `tbx cluster stop qa-mir && tbx cluster start qa-mir`. Afterwards `tbx mirror offline` still reports `on`.
-5. `tbx mirror offline off`; the previously failing pull now succeeds.
+5. `tbx system restart --force` stops running clusters and does **not** bring them back (it narrates `stopped clusters: qa-mir`), so start the cluster again before the next step: `tbx cluster start qa-mir`, then wait for the API to answer — allow ~1 min to settle. Skip this step only if step 4 took the `cluster stop`/`start` path, which already leaves the cluster running.
+6. `tbx mirror offline off`; the previously failing pull now succeeds.
 
 Expected observations: cached tag AND digest served offline; miss = clear hard failure, not a hang; mode persists; `off` restores pull-through.
 
