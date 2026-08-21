@@ -18,6 +18,13 @@ You are running QA, not demos. For every charter: run the steps exactly, compare
 
 BLOCKED unless: `tbx version` recorded; `tbx doctor` exits 0; no cluster `qa-sto`; ≥ 10 GiB free RAM and ≥ 30 GiB free disk; online.
 
+## Known transients (not findings)
+
+A `volumes.longhorn.io` object with no PVC or PV behind it, in `deleting` or `degraded`, is
+expected briefly after a probe pass, after deleting a PVC, and after a snapshot restart.
+Longhorn converges it away within about a minute. Record it as friction only if it is still
+there after several minutes — that is a leak, and a finding.
+
 ## Charters
 
 ### C1 — Longhorn end state: PVC write/readback
