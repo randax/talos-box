@@ -41,6 +41,44 @@ type doctorDependencies struct {
 	platform          func() []doctorFinding
 }
 
+// doctorHelp answers `tbx doctor --help`. It names every check the command can
+// report and states the exit-code contract, which is the fact a script needs
+// and used to live only in the platform docs (#419).
+func doctorHelp() string {
+	var b strings.Builder
+	b.WriteString(`tbx doctor checks whether this host can run talos-box clusters, and whether the
+clusters that already exist are wired up. Every check is read-only: doctor
+reports, it never repairs. One line per check, each PASS, WARN, FAIL, INFO, or
+SKIP (the probe did not apply here).
+
+Checks:
+  helper              privileged helper is installed and answers
+  resolver            per-domain resolver wiring for the cluster domains
+  DNS                 cluster names resolve against the daemon's DNS directly
+  forwarding          host IP forwarding for cluster traffic
+  host-pressure       host memory and disk headroom (the same gate that blocks
+                      cluster create)
+  system-dns          the system resolver returns each cluster's domain
+  routes              host routes reach the nodes of running clusters
+  guest-agent         host support for clusters that baked qemu-guest-agent
+  mirror-health       registry-mirror listeners match the running clusters
+  image-cache         cached Talos disk images, including incomplete pulls
+  egress              image-factory reachability for schematic builds
+  security-inventory  host security posture, informational only
+`)
+	if names := platformDoctorCheckNames(); len(names) > 0 {
+		fmt.Fprintf(&b, "\nOn this platform doctor also checks: %s.\n", strings.Join(names, ", "))
+	}
+	b.WriteString(`
+Exit code:
+  tbx doctor exits non-zero when any check reports FAIL. WARN, INFO, SKIP, and
+  PASS all leave the exit code 0, so a WARN never fails a scripted preflight.
+
+usage: tbx doctor
+`)
+	return b.String()
+}
+
 type doctorFinding struct {
 	level  string
 	check  string
@@ -56,6 +94,10 @@ func (c cli) runDoctor(args []string) error {
 }
 
 func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) error {
+	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help") {
+		_, err := fmt.Fprint(c.out, doctorHelp())
+		return err
+	}
 	if len(args) != 0 {
 		return errors.New("usage: tbx doctor")
 	}
