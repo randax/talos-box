@@ -114,8 +114,10 @@ homebrew_casks:
         sudo tbx system install
     hooks:
       post:
-        # Ad-hoc signed, not notarized: strip quarantine so Gatekeeper lets the
-        # entitled binaries run.
+        # The binaries are Developer ID signed and notarized, but the notary
+        # ticket is issued asynchronously and Apple's queue has taken hours;
+        # stripping quarantine keeps an install working in that window. Drop
+        # this once tickets reliably precede the release.
         install: |
           if OS.mac?
             ["tbx", "tbxd", "tbx-helper"].each do |bin|
