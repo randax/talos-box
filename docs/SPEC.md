@@ -470,9 +470,10 @@ its warnings. A verb's success line is past tense because it is true when printe
 create` holds its answer until the nodes it started answer on apid (maintenance or configured),
 up to a bounded boot budget — when the budget runs out, or the daemon's lifecycle is cancelled,
 it answers anyway with an advisory naming the nodes that stayed silent, so a successful exit
-never proves the nodes answered. `cluster create`, `snapshot create|restore` and `node
-add|remove` print their warnings above the success line, not after it; `cluster
-start|stop|suspend|resume` and `node start|stop` print theirs below it.
+never proves the nodes answered. `cluster create`, `cluster resume`, `snapshot create|restore`
+and `node add|remove` print their warnings above the success line, not after it; `cluster
+start|stop|suspend` and `node start|stop` print theirs below it. `cluster resume` warns first
+because its success line carries the cold-booted count, which the warnings explain.
 
 **`tbx console <cluster> <node>`** attaches interactively to the node's serial console (hvc0)
 through the `tbxd`-owned socket — Talos renders its console dashboard and logs there, and
