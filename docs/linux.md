@@ -159,6 +159,9 @@ Log out and back in so the new `tbx` and `kvm` memberships apply, then run:
 tbx doctor
 ```
 
+A socket-activated `tbxd` writes its narration to `~/.talosbox/tbxd.log` — the file `tbx logs`
+reads — as well as to the journal, so both `tbx logs` and `journalctl --user -u tbxd` work.
+
 Do not use `tbx system install` on Linux. That command currently installs the macOS launchd
 helper; Linux installation is owned by packages and systemd units.
 

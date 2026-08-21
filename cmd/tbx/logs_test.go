@@ -144,6 +144,11 @@ func TestLogsExplainsAMissingDaemonLog(t *testing.T) {
 	if strings.Contains(err.Error(), "tbx system status") {
 		t.Fatalf("logs error = %v, must not point at a command that never starts tbxd", err)
 	}
+	// a supervised tbxd (systemd socket activation) predating the daemon-owned
+	// log writes only to the journal, so retrying can never succeed there
+	if !strings.Contains(err.Error(), "journalctl --user -u tbxd") {
+		t.Fatalf("logs error = %v, want the supervised-daemon case named", err)
+	}
 }
 
 func TestLogsRejectsBadArgs(t *testing.T) {

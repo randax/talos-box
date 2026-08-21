@@ -30,6 +30,11 @@ func main() {
 }
 
 func run() error {
+	// Own the log the runbooks point at, however tbxd was started: under
+	// systemd socket activation nothing redirects stderr into it.
+	if closer := startDaemonLog(); closer != nil {
+		defer func() { _ = closer.Close() }()
+	}
 	// Keep client-library chatter out of the log the runbooks point at (#401).
 	if closer := startKubernetesLogRouting(log.Printf); closer != nil {
 		defer func() { _ = closer.Close() }()
