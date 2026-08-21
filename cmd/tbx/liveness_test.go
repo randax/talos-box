@@ -490,3 +490,89 @@ func TestNodeAddQuietStatesTheImagePrepareAllowance(t *testing.T) {
 		}
 	}
 }
+
+// Suppressing the narration must not change what the bound measures: the CLI
+// still asks the daemon for stages so each one re-arms the silence window, it
+// just prints none of them. Otherwise a healthy --quiet call dies at its bound
+// where the identical loud call succeeds (#392 #423).
+func TestQuietNarratedCallStillArmsOnStages(t *testing.T) {
+	previousInterval := livenessInterval
+	livenessInterval = time.Hour
+	previousGrace := livenessGrace
+	livenessGrace = 20 * time.Millisecond
+	previousPreamble := livenessPreambleDelay
+	livenessPreambleDelay = time.Hour
+	t.Cleanup(func() {
+		livenessInterval = previousInterval
+		livenessGrace = previousGrace
+		livenessPreambleDelay = previousPreamble
+	})
+
+	home, err := os.MkdirTemp("/tmp", "tbx-quiet-bound-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	t.Setenv("HOME", home)
+	socket := filepath.Join(home, ".talosbox", "tbxd.sock")
+	if err := os.MkdirAll(filepath.Dir(socket), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	progressAsked := make(chan bool, 4)
+	go func() {
+		for {
+			connection, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			var request daemon.Request
+			if decodeErr := json.NewDecoder(connection).Decode(&request); decodeErr != nil {
+				_ = connection.Close()
+				return
+			}
+			progressAsked <- request.Progress
+			go func() {
+				encoder := json.NewEncoder(connection)
+				for i := 0; i < 4; i++ {
+					time.Sleep(20 * time.Millisecond)
+					if encodeErr := encoder.Encode(daemon.Response{OK: true, Stage: "working"}); encodeErr != nil {
+						break
+					}
+				}
+				<-release
+				_ = connection.Close()
+			}()
+		}
+	}()
+
+	var stdout, stderr bytes.Buffer
+	signal := liveness{verb: "provisioning demo", deadline: 20 * time.Millisecond, quiet: true}
+	started := time.Now()
+	err = (cli{out: &stdout, err: &stderr}).callWithLivenessNarrated(
+		signal, "cluster.create", map[string]string{"name": "demo"}, nil, true)
+	if err == nil {
+		t.Fatal("a quiet call whose stages stopped returned no error")
+	}
+	if elapsed := time.Since(started); elapsed <= signal.bound() {
+		t.Fatalf("the quiet call failed after %s, so its stages never re-armed the %s bound", elapsed, signal.bound())
+	}
+	select {
+	case asked := <-progressAsked:
+		if !asked {
+			t.Fatal("the quiet call told the daemon not to report progress, then blamed it for not reporting progress")
+		}
+	default:
+		t.Fatal("no request reached the stub daemon")
+	}
+	if strings.Contains(stderr.String(), "working") {
+		t.Fatalf("--quiet printed the daemon's stages:\n%s", stderr.String())
+	}
+}

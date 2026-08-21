@@ -169,7 +169,12 @@ func TestNodeAddNarratesAndQuietSuppressesIt(t *testing.T) {
 	}, func(command cli) error {
 		return command.runNode([]string{"add", "demo", "--quiet"})
 	})
-	if requests[0].Progress || strings.Contains(output, "starting node demo-worker-3") {
+	// The stages still arrive — they re-arm the client's silence bound — they
+	// are just not printed (#392).
+	if !requests[0].Progress {
+		t.Fatal("quiet node add told the daemon not to report progress, turning its bound into a total-elapsed limit")
+	}
+	if strings.Contains(output, "starting node demo-worker-3") {
 		t.Fatalf("quiet node add narrated:\n%s", output)
 	}
 }
@@ -223,8 +228,8 @@ func TestClusterCreateQuietSuppressesNarration(t *testing.T) {
 		return command.createCluster([]string{"demo", "--schematic=test-schematic", "--quiet"})
 	})
 
-	if requests[0].Progress {
-		t.Fatal("quiet cluster.create still asked the daemon for progress")
+	if !requests[0].Progress {
+		t.Fatal("quiet cluster.create told the daemon not to report progress, turning its bound into a total-elapsed limit")
 	}
 	if strings.Contains(output, "starting 3 node(s)") {
 		t.Fatalf("quiet create printed narration:\n%s", output)

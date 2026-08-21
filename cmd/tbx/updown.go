@@ -154,7 +154,18 @@ func (c cli) callWithLivenessNarrated(signal liveness, op string, args, destinat
 	stream := &narrator{output: c.err}
 	stop := signal.beat(stream)
 	defer stop()
-	err := c.callNarratedWithin(op, args, destination, stream.stages(!narrate || signal.quiet), signal.bound())
+	sink := stream.stages(!narrate || signal.quiet)
+	bound := signal.bound()
+	if sink == nil && bound > 0 {
+		// The bound measures silence between stages, and only a non-nil sink
+		// asks the daemon to send any. Suppressing the narration must not turn
+		// the bound into a hard total-elapsed limit that a healthy but slow
+		// call — a cold image fetch, a slow reconcile — trips where the same
+		// call with narration on survives, so keep asking for the stages and
+		// drop them on the floor instead (#392 #423).
+		sink = func(string) {}
+	}
+	err := c.callNarratedWithin(op, args, destination, sink, bound)
 	if err != nil && isTimeout(err) {
 		// The bound measures silence, not total elapsed: a narrated call
 		// re-arms it on every stage the daemon sends. Wording it as "did not

@@ -56,8 +56,12 @@ func TestBGPDisableQuietSuppressesNarration(t *testing.T) {
 		return command.runBGP([]string{"disable", "demo", "--quiet"})
 	})
 
-	if requests[1].Progress {
-		t.Fatal("quiet bgp disable still asked the daemon for progress")
+	// --quiet drops the stages from the terminal, not from the wire: the
+	// client bound measures silence between them, so a suppressed call must
+	// keep receiving them or it degrades into a hard total-elapsed limit
+	// (#392).
+	if !requests[1].Progress {
+		t.Fatal("quiet bgp disable told the daemon not to report progress, turning its bound into a total-elapsed limit")
 	}
 	if strings.Contains(output, "host BGP speaker") {
 		t.Fatalf("quiet bgp disable printed narration:\n%s", output)
