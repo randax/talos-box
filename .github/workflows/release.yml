@@ -91,6 +91,16 @@ jobs:
           for name in MACOS_SIGN_P12 MACOS_SIGN_PASSWORD MACOS_NOTARY_KEY MACOS_NOTARY_KEY_ID MACOS_NOTARY_ISSUER_ID; do
             test -n "${!name}" || { echo "$name secret is missing" >&2; exit 1; }
           done
+      - name: Sync the runner clock for the notary JWT
+        # App Store Connect rejects API JWTs whose issue time disagrees with
+        # Apple's clock (401 Unauthenticated), and hosted macOS runners drift;
+        # two rehearsals failed on exactly that while the same key worked
+        # locally. Print the skew, then step the clock.
+        run: |
+          apple=$(curl -sI https://appstoreconnect.apple.com | awk -F': ' 'tolower($1)=="date"{print $2}' | tr -d '\r')
+          echo "runner: $(date -u); apple: $apple"
+          sudo sntp -sS time.apple.com || true
+          echo "after sync: $(date -u)"
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           distribution: goreleaser
