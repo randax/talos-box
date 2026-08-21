@@ -68,7 +68,10 @@ func (c cli) runConsole(args []string) error {
 	if target == nil {
 		return fmt.Errorf("node %q does not exist in cluster %q", nodeName, clusterName)
 	}
-	if target.Phase == daemon.PhaseStopped {
+	if target.Phase == daemon.PhaseSuspended {
+		return fmt.Errorf("node %s is suspended — resume the cluster first", nodeName)
+	}
+	if target.Phase.Stopped() {
 		return fmt.Errorf("node %s is stopped — start the cluster first", nodeName)
 	}
 

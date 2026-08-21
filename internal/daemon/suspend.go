@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -43,6 +44,9 @@ func (s *Server) suspendCluster(raw json.RawMessage) (ClusterSummary, error) {
 	for name, machine := range nodes {
 		savePath := saveStatePath(dir, name)
 		retain, err := prepareSavedMachine(machine, savePath)
+		if err == nil {
+			recordSaveStateOwner(savePath)
+		}
 		if err != nil {
 			errs = append(errs, fmt.Errorf("suspend %s: %w", name, err))
 			_ = os.Remove(savePath) // no partial save left behind
@@ -250,6 +254,7 @@ func resumeNodeBatch[T any](nodes []T, resume func(T) (resumedNode, error), roll
 func removeSaveStateFiles(paths []string) {
 	for _, path := range paths {
 		_ = os.Remove(path)
+		_ = os.Remove(saveStateOwnerPath(path))
 	}
 }
 
@@ -277,6 +282,57 @@ func saveStatePath(dir, node string) string {
 	return filepath.Join(dir, node+saveStateSuffix)
 }
 
+// saveStateOwnerSuffix names the sidecar recording which daemon process wrote
+// a save. A save is only restorable by that process: once it is replaced — the
+// very thing `tbx system restart --force` does after refusing to — the memory
+// on disk is already lost, and only the recorded owner can tell status that
+// (#413).
+const saveStateOwnerSuffix = saveStateSuffix + ".owner"
+
+func saveStateOwnerPath(savePath string) string { return savePath + ".owner" }
+
+// recordSaveStateOwner stamps a save with the pid of the daemon that wrote it.
+// A failure is logged and otherwise ignored: an unstamped save reads as an
+// owner status cannot judge, which is exactly the pre-#413 behaviour.
+func recordSaveStateOwner(savePath string) {
+	owner := saveStateOwnerPath(savePath)
+	if err := os.WriteFile(owner, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		log.Printf("record saved state owner %s: %v", owner, err)
+	}
+}
+
+// savedStateOwnerReplaced reports suspended memory this daemon process did not
+// write. The comparison is against the running process own pid, so it cannot
+// be fooled by pid reuse: a match means this very process is the owner, and
+// anything else means the owner is gone. A save with no recorded owner — one
+// written by a tbx predating the sidecar — yields false: unknown, not stale.
+func savedStateOwnerReplaced(clusterName string) bool {
+	dir, err := cluster.Dir(clusterName)
+	if err != nil {
+		return false
+	}
+	matches, err := filepath.Glob(filepath.Join(dir, "*"+saveStateOwnerSuffix))
+	if err != nil {
+		return false
+	}
+	self := strconv.Itoa(os.Getpid())
+	for _, path := range matches {
+		// The sidecar only counts while the save it describes is still there;
+		// a leftover would otherwise keep answering for memory nobody holds.
+		if _, err := os.Stat(strings.TrimSuffix(path, ".owner")); err != nil {
+			continue
+		}
+		recorded, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(string(recorded)) != self {
+			return true
+		}
+	}
+	return false
+}
+
 // discardSavedState drops a node's suspended memory before it cold-boots. A
 // save is only consumed by a successful resume, so a start that boots the node
 // from disk would otherwise leave a stale save behind: status keeps reporting
@@ -302,6 +358,7 @@ func discardSavedState(dir, nodeName string) (bool, string) {
 		log.Printf("discard saved state %s: %v", path, err)
 		return false, undiscardedSaveStateWarning(nodeName, err)
 	}
+	_ = os.Remove(saveStateOwnerPath(path))
 	log.Printf("discarded saved state %s: cold boot", path)
 	return true, ""
 }
@@ -330,6 +387,7 @@ func discardClusterSavedStates(dir string) (bool, []string) {
 			failures = append(failures, undiscardedSaveStateWarning(node, err))
 			continue
 		}
+		_ = os.Remove(saveStateOwnerPath(path))
 		log.Printf("discarded saved state %s: disks were replaced", path)
 		discarded = true
 	}

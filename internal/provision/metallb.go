@@ -87,17 +87,22 @@ func LiveVIP(ctx context.Context, item cluster.Cluster, kubeconfig []byte) (stri
 	if vip != fmt.Sprintf("172.30.%d.200", item.SubnetIndex) {
 		return "", false
 	}
+	// From here the VIP is announced: the LoadBalancer service holds it. The
+	// probe below decides whether it is also live, and the address is reported
+	// either way — collapsing "announced but not answering" into "no VIP at
+	// all" is what left the ~10-20s window after a snapshot restore with
+	// nothing honest for a single-sample check to key on (#427).
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+vip+"/", nil)
 	if err != nil {
-		return "", false
+		return vip, false
 	}
 	response, err := vipHTTPClient(nil).Do(request)
 	if err != nil {
-		return "", false
+		return vip, false
 	}
 	respondedOK := response.StatusCode == http.StatusOK
 	if err := response.Body.Close(); err != nil {
-		return "", false
+		return vip, false
 	}
 	return vip, respondedOK
 }

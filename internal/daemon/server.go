@@ -54,6 +54,10 @@ type Server struct {
 	// a stall is aged from that transition rather than from VM uptime (#288).
 	reachability reachabilityLog
 	stalls       stallLog
+	// readiness records when a cluster's Kubernetes readiness probe started
+	// failing, so a momentary blip is not escalated into destroy-and-recreate
+	// advice (#418).
+	readiness readinessLog
 	// stallWatch* drive the daemon-side stall observation: without it a stall
 	// that nobody polls status for never reaches tbxd.log (#288).
 	stallScanInterval time.Duration
@@ -799,6 +803,7 @@ func (s *Server) dispatchStatus(request Request) Response {
 	}
 	s.refreshNodeStatuses(statuses)
 	refreshKubernetesReadiness(statuses)
+	s.observeKubernetesReadiness(statuses, time.Now())
 	s.refreshStoragePhases(statuses)
 	return success(statuses)
 }
@@ -917,7 +922,7 @@ func removeNodeFiles(clusterName, nodeName string) error {
 	// nothing left to restore into, and clusterHasSavedState only globs the
 	// directory — an orphaned save would keep reporting the whole cluster
 	// Suspended and keep the hint recommending a resume forever.
-	for _, suffix := range []string{".img", ".efi", ".console.sock", ".qga.sock", saveStateSuffix} {
+	for _, suffix := range []string{".img", ".efi", ".console.sock", ".qga.sock", saveStateSuffix, saveStateOwnerSuffix} {
 		if err := os.Remove(filepath.Join(dir, nodeName+suffix)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("remove node file: %w", err)
 		}

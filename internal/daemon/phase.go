@@ -29,7 +29,18 @@ const (
 	PhaseUnreachable Phase = "unreachable"
 	PhaseMaintenance Phase = "maintenance"
 	PhaseConfigured  Phase = "configured"
+	// PhaseSuspended is a stopped node whose own memory is saved on disk. It
+	// is not a probe verdict — no VM is running to probe — but a promotion of
+	// PhaseStopped applied where suspension is known, so the JSON surface
+	// reports what the table has shown since #360 instead of the coarser
+	// "stopped" a consumer keying on phase alone misread (#415).
+	PhaseSuspended Phase = "suspended"
 )
+
+// Stopped reports a phase with no running VM behind it: plain stopped, or
+// stopped with saved memory. Every rule that keyed on PhaseStopped means this,
+// because the suspended promotion changed the spelling and not the fact.
+func (p Phase) Stopped() bool { return p == PhaseStopped || p == PhaseSuspended }
 
 // ProbeResult is what one apid probe observed.
 type ProbeResult struct {
@@ -309,7 +320,7 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 	var stopped, unreachable, maintenance, configured []NodeStatus
 	for _, node := range status.Nodes {
 		switch node.Phase {
-		case PhaseStopped:
+		case PhaseStopped, PhaseSuspended:
 			stopped = append(stopped, node)
 		case PhaseUnreachable:
 			unreachable = append(unreachable, node)
@@ -333,6 +344,15 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 		// cold and drops the suspended state on the floor, so the hint names
 		// resume and says what start would cost (#272).
 		if status.Suspended {
+			// Saved memory the owning daemon no longer backs is memory in name
+			// only: resume will cold-boot every node, so the hint must stop
+			// contrasting resume with start as if there were something to lose
+			// (#413).
+			if status.SavedStateStale {
+				return append(hints, fmt.Sprintf(
+					"cluster is suspended, but the daemon that saved its memory has been replaced — the saved memory will not survive, so tbx cluster resume %[1]s will cold-boot the nodes (tbx cluster start %[1]s does the same)",
+					status.Name))
+			}
 			return append(hints, fmt.Sprintf("cluster is suspended — resume it with: tbx cluster resume %s (tbx cluster start discards the saved memory)", status.Name))
 		}
 		return append(hints, fmt.Sprintf("cluster is stopped — start it with: tbx cluster start %s", status.Name))
@@ -350,7 +370,7 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 	// would race tbx (#366).
 	provisioning := status.CNI != "" && !status.KubernetesReady
 	if provisioning {
-		hints = append(hints, fmt.Sprintf("%s provisioning is in progress; tbx will apply machine config, bootstrap, and reconcile the CNI. %s;%s", status.CNI, provisioningRecoveryHint(status), credentialExports(status.Name)))
+		hints = append(hints, fmt.Sprintf("%s provisioning is in progress; tbx will apply machine config, bootstrap, and reconcile the CNI. %s;%s", status.CNI, provisioningRecoveryHintAt(status, now), credentialExports(status.Name)))
 	}
 	if len(maintenance) > 0 {
 		first := maintenance[0]
@@ -371,7 +391,7 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 				)
 			} else {
 				hints = append(hints,
-					"Kubernetes is Ready; waiting for the MetalLB L2 LoadBalancer VIP probe to respond. Flannel does not enforce NetworkPolicies; use cilium to exercise policies."+credentialExports(status.Name),
+					fmt.Sprintf("Kubernetes is Ready; %s. Flannel does not enforce NetworkPolicies; use cilium to exercise policies.%s", vipSettlingNote(status, "MetalLB L2"), credentialExports(status.Name)),
 				)
 			}
 		}
@@ -384,7 +404,7 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 			if status.VIPLive {
 				hints = append(hints, fmt.Sprintf("Kubernetes is Ready; Cilium LB-IPAM VIP is live at http://%s/.%s", status.VIP, credentialExports(status.Name)))
 			} else {
-				hints = append(hints, "Kubernetes is Ready; waiting for the Cilium LoadBalancer VIP probe to respond."+credentialExports(status.Name))
+				hints = append(hints, fmt.Sprintf("Kubernetes is Ready; %s.%s", vipSettlingNote(status, "Cilium LB-IPAM"), credentialExports(status.Name)))
 			}
 		}
 		if status.CNI == cluster.CNICilium && !status.LB && status.KubernetesReady {
@@ -404,6 +424,11 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 			)
 		}
 	}
+	if reasons := convergingReasons(status, now); len(reasons) > 0 {
+		hints = append(hints, fmt.Sprintf(
+			"nodes are up but the cluster is still settling — %s; a single sample of tbx status can read green while these are in flight",
+			strings.Join(reasons, "; ")))
+	}
 	booting, stalled := splitStalledNodes(unreachable, now)
 	if len(booting) > 0 {
 		hints = append(hints,
@@ -416,6 +441,71 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 	return hints
 }
 
+// vipSettlingNote separates "no VIP announced yet" from "announced but not
+// answering". The probe used to collapse both into a bare wait, and after a
+// snapshot restore the VIP is announced ~10-20s before it answers — the window
+// a single-sample check had nothing honest to key on (#427).
+func vipSettlingNote(status ClusterStatus, announcer string) string {
+	if status.VIP == "" {
+		return fmt.Sprintf("waiting for the %s LoadBalancer VIP to be announced", announcer)
+	}
+	return fmt.Sprintf("the %s LoadBalancer VIP %s is announced but not answering yet", announcer, status.VIP)
+}
+
+// clusterSettleWindow is how long after a node's VM launched the cluster is
+// still described as settling even when everything the daemon can probe reads
+// green. It covers the two windows QA measured at ~2.5 minutes each: kubelet
+// serving certificates being re-issued after a cold boot, and CSI drivers
+// re-registering with the kubelet after a snapshot restore (#396). Neither is
+// observable from the daemon's Kubernetes client — nodes report Ready
+// throughout — so the honest signal is the age of the boot, stated as such.
+const clusterSettleWindow = 3 * time.Minute
+
+// convergingReasons names what is still coming back on a cluster whose nodes
+// are up and whose Kubernetes reports Ready. It is the difference between
+// "converged" and "nodes up, still settling": empty means the daemon has
+// nothing outstanding, and every entry is derived from a fact status already
+// holds, so it costs no extra probe.
+func convergingReasons(status ClusterStatus, now time.Time) []string {
+	if !status.Running || !status.KubernetesReady {
+		return nil
+	}
+	var reasons []string
+	if status.CSI != "" && status.StoragePhase != StoragePhaseLive {
+		reasons = append(reasons, fmt.Sprintf("the %s CSI drivers have not passed the readiness probe yet, so PVC mounts can fail", status.CSI))
+	}
+	if status.LB && status.VIP != "" && !status.VIPLive {
+		reasons = append(reasons, fmt.Sprintf("the LoadBalancer VIP %s is announced but not answering yet", status.VIP))
+	}
+	if age, booting := youngestNodeAge(status, now); booting {
+		reasons = append(reasons, fmt.Sprintf(
+			"a node booted %s ago, and kubelet serving certificates and CSI driver registrations can take ~%s to settle (kubectl exec and PVC mounts may fail until they do)",
+			formatStallDuration(age), formatBootWindow(clusterSettleWindow)))
+	}
+	return reasons
+}
+
+// youngestNodeAge reports how long ago the most recently launched node's VM
+// started, and whether that is still inside the settle window. A cluster whose
+// launches this daemon never saw reports no age at all — it cannot prove the
+// cluster is fresh, so it stays quiet.
+func youngestNodeAge(status ClusterStatus, now time.Time) (time.Duration, bool) {
+	youngest := time.Duration(-1)
+	for _, node := range status.Nodes {
+		if node.StartedAt == nil {
+			continue
+		}
+		age := now.Sub(*node.StartedAt)
+		if youngest < 0 || age < youngest {
+			youngest = age
+		}
+	}
+	if youngest < 0 || youngest >= clusterSettleWindow {
+		return 0, false
+	}
+	return youngest, true
+}
+
 // provisioningRecoveryHint names the recovery an unfinished provisioning pass
 // can actually take. `tbx up` needs a talosbox.yaml; a cluster created
 // imperatively has none, so pointing at up would dead-end and the honest path
@@ -424,6 +514,12 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 // may well be sitting right there, and guessing "imperative" would advise
 // destroying a cluster a later up could simply resume.
 func provisioningRecoveryHint(status ClusterStatus) string {
+	return provisioningRecoveryHintAt(status, time.Now())
+}
+
+// provisioningRecoveryHintAt is provisioningRecoveryHint with an injectable
+// observation time, which the destruction debounce below is measured against.
+func provisioningRecoveryHintAt(status ClusterStatus, now time.Time) string {
 	// A node whose kubelet cannot start is not a pass that failed to finish;
 	// it is a node that will never join. Rerunning up against it only burns
 	// another provisioning deadline, so the crashloop names the node and the
@@ -433,6 +529,21 @@ func provisioningRecoveryHint(status ClusterStatus) string {
 	}
 	if status.ConfigOrigin != cluster.OriginImperative {
 		return "Rerun: tbx up"
+	}
+	// Destroying a cluster is the most expensive advice status gives, and a
+	// single unreachable observation is not evidence for it: an apiserver blip
+	// on a converged cluster read exactly like a provisioning pass that never
+	// finished, and the hint told the operator to destroy a working cluster
+	// (#418). Escalate only once the daemon has watched the condition persist;
+	// until then name the cheap moves. An unknown observation window — an
+	// older daemon, a status built outside the readiness log — keeps the
+	// escalation, because suppressing it there would silence the hint for the
+	// stuck cluster it exists for.
+	if status.KubernetesUnreadyBriefly(now) {
+		return fmt.Sprintf(
+			"Kubernetes has been unreachable for %s, which is short enough to be a transient control-plane blip: rerun tbx status %s in a moment, and if it persists check tbx console %s <node> or ~/.talosbox/tbxd.log before considering a destroy",
+			formatStallDuration(status.kubernetesUnreadyFor(now)), shellquote.Quote(status.Name), shellquote.Quote(status.Name),
+		)
 	}
 	// No concrete `tbx cluster create` line: status carries the intent but not
 	// the node sizing, so a rendered command would rebuild a materially

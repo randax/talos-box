@@ -52,6 +52,7 @@ func (s *Server) forgetNode(clusterName, nodeName string) {
 // forgetCluster drops the observations of every node in a cluster.
 func (s *Server) forgetCluster(clusterName string) {
 	delete(s.vmStarts, clusterName)
+	s.readiness.forget(clusterName)
 	prefix := clusterName + "/"
 	s.reachability.forgetPrefix(prefix)
 	s.stalls.forgetPrefix(prefix)
@@ -63,6 +64,7 @@ func (s *Server) forgetAllNodeTracking() {
 	s.vmStarts = nil
 	s.reachability.forgetAll()
 	s.stalls.forgetAll()
+	s.readiness.forgetAll()
 }
 
 // nodeReachability is what the daemon has observed about one node since its VM
@@ -93,7 +95,7 @@ func (l *reachabilityLog) observe(key string, phase Phase, now time.Time) *time.
 		l.nodes = make(map[string]nodeReachability)
 	}
 	switch phase {
-	case PhaseStopped:
+	case PhaseStopped, PhaseSuspended:
 		// A stopped VM starts over: its next boot is aged from its own launch.
 		delete(l.nodes, key)
 		return nil
@@ -312,7 +314,7 @@ func (s *Server) observeNodeStalls() {
 func (s *Server) logNodeStalls(statuses []ClusterStatus, now time.Time) {
 	for _, status := range statuses {
 		for _, node := range status.Nodes {
-			if node.Phase == PhaseStopped {
+			if node.Phase.Stopped() {
 				// A stopped node is not a stalled node; forget it silently
 				// so a later boot reports its own stall from scratch.
 				s.stalls.forget(nodeKey(status.Name, node.Name))
