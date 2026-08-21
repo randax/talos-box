@@ -31,6 +31,7 @@ import (
 // Server mirrors one upstream registry, caching immutable blobs on disk.
 type Server struct {
 	base             string // upstream base URL, e.g. https://registry-1.docker.io
+	namespace        string // canonical ns containerd asked for, e.g. docker.io
 	cacheDir         string
 	client           *http.Client
 	offline          *atomic.Bool
@@ -357,9 +358,21 @@ func (s *Server) serveCacheIfAvailable(w http.ResponseWriter, r *http.Request, d
 		// without this line an offline miss left no trace anywhere in tbx and
 		// the operator saw an unexplained ImagePullBackOff (#403).
 		log.Printf("mirror offline miss: %s (upstream namespace %s)",
-			offlineMissReference(r.URL.Path), upstreamHost(s.base))
+			offlineMissReference(r.URL.Path), s.upstreamNamespace())
 	}
 	return served, err
+}
+
+// upstreamNamespace names the registry the way containerd asked for it, which
+// is not always the host the base URL points at: docker.io is served from
+// registry-1.docker.io, and that alias keys a different cache directory. The
+// miss line is meant to be recomposed into "<namespace>/<ref>" and handed back
+// to tbx cache warm/list (#403), so it has to carry the namespace.
+func (s *Server) upstreamNamespace() string {
+	if s.namespace != "" {
+		return s.namespace
+	}
+	return upstreamHost(s.base)
 }
 
 // offlineMissReference names what was asked for the way an operator writes it,

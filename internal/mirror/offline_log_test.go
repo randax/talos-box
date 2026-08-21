@@ -121,3 +121,29 @@ func (b *lockedBuffer) String() string {
 	defer b.mu.Unlock()
 	return b.buffer.String()
 }
+
+// The miss line is meant to be recomposed into "<namespace>/<ref>" and handed
+// to tbx cache warm/list, so it must name the namespace containerd sent, not
+// the CDN alias the base URL points at: docker.io is served from
+// registry-1.docker.io, which keys a different cache directory (#403).
+func TestOfflineMissLogsRequestedNamespace(t *testing.T) {
+	manager := newManagerWithPorts(t.TempDir(), nil, freePort(t))
+	manager.offline.Store(true)
+	defer manager.Close()
+	mirror := httptest.NewServer(http.HandlerFunc(manager.serveCatchAll))
+	defer mirror.Close()
+
+	logged := captureDaemonLog(t)
+	resp, err := http.Get(mirror.URL + "/v2/library/nginx/manifests/1.27.3?ns=docker.io")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	want := "mirror offline miss: library/nginx:1.27.3 (upstream namespace docker.io)"
+	if got := logged.String(); !strings.Contains(got, want) {
+		t.Fatalf("daemon log = %q, want substring %q", got, want)
+	}
+}

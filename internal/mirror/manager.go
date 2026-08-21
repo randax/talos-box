@@ -110,6 +110,7 @@ func (m *Manager) Bind(gatewayIP string) error {
 			base = m.baseOverride
 		}
 		mirrorServer := NewServer(base, filepath.Join(m.cacheRoot, entry.Upstream))
+		mirrorServer.namespace = entry.Upstream
 		mirrorServer.offline = &m.offline
 		server := &http.Server{Handler: mirrorServer}
 		if m.serverFactory != nil {
@@ -262,6 +263,7 @@ func (m *Manager) cacheProbeServer(authority upstreamAuthority) *Server {
 		dialContext: m.dialContext,
 		blocked:     namespaceIPBlocked,
 	})
+	server.namespace = authority.canonicalHost
 	server.offline = &m.offline
 	return server
 }
@@ -375,6 +377,7 @@ func (m *Manager) newDynamicMirrorServer(base, cacheDir string, authority upstre
 		dialContext: m.dialContext,
 		blocked:     namespaceIPBlocked,
 	})
+	mirrorServer.namespace = authority.canonicalHost
 	mirrorServer.offline = &m.offline
 	mirrorServer.validateUpstream = func(ctx context.Context) error {
 		return m.validateResolvedAuthority(ctx, authority)
