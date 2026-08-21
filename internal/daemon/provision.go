@@ -367,8 +367,12 @@ func (s *Server) runProvisionTasks(data any, tasks []provisionTask, progress sta
 		// budget (#273). It reports no intermediate progress of its own, so the
 		// stage names the work and the bound the daemon holds the request to.
 		if reconcilesCNI(task.item) {
-			progress.stage("reconciling %s on cluster %s (up to %s)",
-				task.item.CNI, task.item.Name, formatBootWindow(provisionTimeout(task.item)))
+			// The budget is named, not just stated: the CLI narrates the
+			// request-wide bound in the same stream, and two bare "up to"
+			// numbers a few lines apart cannot be told apart (#423).
+			progress.stage("reconciling %s on cluster %s (%s budget %s)",
+				task.item.CNI, task.item.Name, provisionBudgetName(task.item),
+				formatBudget(provisionTimeout(task.item)))
 		}
 		narration, warnings, phase, fullPass, err := s.provisionCNI(task.ctx, task.item, task.force, task.skipStorage)
 		if task.item.CSI != "" && !task.skipStorage {
@@ -450,6 +454,16 @@ func tasksReconcile(tasks []provisionTask) bool {
 }
 
 // provisionTimeout budgets one provisioning pass by what it must converge.
+// provisionBudgetName says which budget a reconcile is being held to, so the
+// stated number can be attributed to a phase rather than read as yet another
+// overall deadline (#423).
+func provisionBudgetName(item cluster.Cluster) string {
+	if item.CSI != "" {
+		return "CNI+storage"
+	}
+	return "CNI"
+}
+
 func provisionTimeout(item cluster.Cluster) time.Duration {
 	if item.CSI != "" {
 		return storageProvisionTimeout

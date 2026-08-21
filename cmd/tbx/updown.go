@@ -31,6 +31,18 @@ const (
 // alive. Tests shorten it.
 var livenessInterval = time.Minute
 
+// livenessPreambleDelay is how long a --quiet call waits before announcing its
+// provisioning window. The window is worth stating up front for real work, but
+// a run the planner classifies as a no-op answers well inside this delay and
+// must not open by announcing work it never does (#421). Tests shorten it.
+var livenessPreambleDelay = 5 * time.Second
+
+// livenessGrace is how far past its stated deadline a blocking call may run
+// before the CLI stops waiting. The daemon enforces its own budgets; the grace
+// covers the round trip and the daemon's teardown, so this bound only ever
+// fires on a gate that hung past every budget it declared (#392).
+var livenessGrace = 2 * time.Minute
+
 // liveness keeps a blocking daemon call distinguishable from a hang. up,
 // cluster create, cluster start and node add all send one request that the
 // daemon answers only after provisioning converges — up to the deadline below —
@@ -73,12 +85,14 @@ func (n *narrator) stages(quiet bool) func(string) {
 // beat starts the heartbeat and returns the function that stops and joins it.
 // Everything else writing to the same stream must go through the narrator.
 func (l liveness) beat(output *narrator) func() {
-	if l.quiet {
-		// --quiet drops narration, not the fact that this will take a while.
-		output.line("%s; up to %s; progress suppressed by --quiet\n", l.verb, formatLivenessDuration(l.deadline))
-	}
 	started := time.Now()
 	ticker := time.NewTicker(livenessInterval)
+	// --quiet drops narration, not the fact that this will take a while — but
+	// the preamble waits out the no-op window first (#421).
+	preamble := time.NewTimer(livenessPreambleDelay)
+	if !l.quiet {
+		preamble.Stop()
+	}
 	stop := make(chan struct{})
 	stopped := make(chan struct{})
 	go func() {
@@ -87,17 +101,30 @@ func (l liveness) beat(output *narrator) func() {
 			select {
 			case <-stop:
 				return
+			case <-preamble.C:
+				output.line("%s; overall deadline %s; progress suppressed by --quiet\n",
+					l.verb, formatLivenessDuration(l.deadline))
 			case <-ticker.C:
-				output.line("still %s (elapsed %s, deadline %s)\n",
+				// "overall deadline" names this budget apart from the
+				// per-phase budgets the daemon narrates (#423).
+				output.line("still %s (elapsed %s, overall deadline %s)\n",
 					l.verb, formatLivenessDuration(time.Since(started)), formatLivenessDuration(l.deadline))
 			}
 		}
 	}()
 	return func() {
 		ticker.Stop()
+		preamble.Stop()
 		close(stop)
 		<-stopped
 	}
+}
+
+// bound is the wall-clock limit the CLI holds the call to: the deadline it
+// states plus the grace. Without it a gate that never returns leaves the verb
+// hanging behind a heartbeat forever (#392).
+func (l liveness) bound() time.Duration {
+	return l.deadline + livenessGrace
 }
 
 // callWithLiveness runs one blocking lifecycle call under a heartbeat. The
@@ -119,7 +146,14 @@ func (c cli) callWithLivenessNarrated(signal liveness, op string, args, destinat
 	stream := &narrator{output: c.err}
 	stop := signal.beat(stream)
 	defer stop()
-	return c.callNarrated(op, args, destination, stream.stages(!narrate || signal.quiet))
+	err := c.callNarratedWithin(op, args, destination, stream.stages(!narrate || signal.quiet), signal.bound())
+	if err != nil && isTimeout(err) {
+		return fmt.Errorf("tbxd did not finish %s within %s (overall deadline %s plus %s grace); "+
+			"the daemon may still be working — check: tbx status",
+			signal.verb, formatLivenessDuration(signal.bound()),
+			formatLivenessDuration(signal.deadline), formatLivenessDuration(livenessGrace))
+	}
+	return err
 }
 
 // formatLivenessDuration renders a budget the way the runbook states it: whole

@@ -839,6 +839,14 @@ func (c cli) stages(quiet bool) func(string) {
 // as it arrives. A nil sink is the silent exchange every other verb makes
 // (#273).
 func (c cli) callNarrated(op string, args, destination any, onStage func(string)) error {
+	return c.callNarratedWithin(op, args, destination, onStage, 0)
+}
+
+// callNarratedWithin is callNarrated with an overall bound on the exchange. A
+// zero timeout is the unbounded lifecycle call; a blocking verb passes the
+// budget it narrated plus its grace, so a daemon-side gate that never returns
+// fails the verb instead of hanging it forever (#392).
+func (c cli) callNarratedWithin(op string, args, destination any, onStage func(string), timeout time.Duration) error {
 	if err := c.ensureDaemonProtocol(); err != nil {
 		return err
 	}
@@ -846,7 +854,7 @@ func (c cli) callNarrated(op string, args, destination any, onStage func(string)
 	if err != nil {
 		return err
 	}
-	response, err := exchangeNarrated(socketPath, op, args, onStage)
+	response, err := exchangeDeadlined(socketPath, op, args, timeout, onStage)
 	var connectionError dialError
 	if errors.As(err, &connectionError) {
 		logOffset, startErr := startDaemon()
@@ -858,7 +866,7 @@ func (c cli) callNarrated(op string, args, destination any, onStage func(string)
 		deadline := time.Now().Add(daemonWaitTimeout)
 		backoff := 50 * time.Millisecond
 		for {
-			response, err = exchangeNarrated(socketPath, op, args, onStage)
+			response, err = exchangeDeadlined(socketPath, op, args, timeout, onStage)
 			if !errors.As(err, &connectionError) || time.Now().After(deadline) {
 				break
 			}
@@ -895,11 +903,6 @@ func (c cli) callNarrated(op string, args, destination any, onStage func(string)
 func exchange(socketPath, op string, args any) (daemon.Response, error) {
 	// no deadline: a lifecycle verb legitimately runs for minutes
 	return exchangeWithin(socketPath, op, args, 0)
-}
-
-// exchangeNarrated is exchange with a narration sink; a nil sink asks for none.
-func exchangeNarrated(socketPath, op string, args any, onStage func(string)) (daemon.Response, error) {
-	return exchangeDeadlined(socketPath, op, args, 0, onStage)
 }
 
 // exchangeWithin runs one request/response with an optional overall deadline,
