@@ -114,6 +114,104 @@ func TestFrameRouterLearnsAndMovesVIPViaARP(t *testing.T) {
 	}
 }
 
+// A BGP-announced VIP is never ARPed for on the cluster segment — BGP mode
+// turns Cilium's L2 announcements off — so the router only ever hears about it
+// from the host speaker's FIB writes. Without that binding a sibling cluster's
+// pod can resolve the VIP and never reach it (#387).
+func TestFrameRouterForwardsBGPLearnedVIPBothWays(t *testing.T) {
+	router := newFrameRouter()
+
+	sourceMAC := mustMAC(t, "02:00:00:00:f0:31")
+	sourceIP := hostIP(240, 2)
+	var forwardedBack [][]byte
+	source := router.addPort(240, func(frame []byte) error {
+		forwardedBack = append(forwardedBack, append([]byte(nil), frame...))
+		return nil
+	})
+	learnNodeOwner(t, router, source, sourceMAC, sourceIP)
+
+	nodeMAC := mustMAC(t, "02:00:00:00:f1:31")
+	nodeIP := hostIP(241, 68)
+	var forwarded [][]byte
+	node := router.addPort(241, func(frame []byte) error {
+		forwarded = append(forwarded, append([]byte(nil), frame...))
+		return nil
+	})
+	learnNodeOwner(t, router, node, nodeMAC, nodeIP)
+
+	vip := hostIP(241, 200)
+	toVIP := func() []byte {
+		return buildICMPEchoFrameWithTTL(sourceMAC, mustMAC(t, "02:00:00:00:f0:01"), sourceIP, vip, 0x2301, 1, nil, 64)
+	}
+	fromVIP := func() []byte {
+		return buildICMPEchoFrameWithTTL(nodeMAC, mustMAC(t, "02:00:00:00:f1:01"), vip, sourceIP, 0x2302, 2, nil, 64)
+	}
+
+	handled, err := router.route(source, toVIP())
+	if err != nil {
+		t.Fatalf("route() error = %v", err)
+	}
+	if handled {
+		t.Fatal("an unannounced VIP must fall through to vmnet")
+	}
+
+	router.learnRoutedVIP("172.30.241.200/32", nodeIP.String())
+
+	handled, err = router.route(source, toVIP())
+	if err != nil {
+		t.Fatalf("route() error = %v", err)
+	}
+	if !handled || len(forwarded) != 1 {
+		t.Fatalf("BGP-learned VIP not forwarded: handled=%v forwarded=%d", handled, len(forwarded))
+	}
+	assertForwardedIPv4Frame(t, forwarded[0], nodeMAC, routerGatewayMAC(241), sourceIP, vip, 63)
+
+	// The reply carries the VIP as its source; dropping it as a spoof would
+	// leave the request half of the path working and the connection dead.
+	handled, err = router.route(node, fromVIP())
+	if err != nil {
+		t.Fatalf("route() error = %v", err)
+	}
+	if !handled || len(forwardedBack) != 1 {
+		t.Fatalf("VIP-sourced reply not forwarded: handled=%v forwarded=%d", handled, len(forwardedBack))
+	}
+	// The source port has by now learned the gateway MAC its own node addresses
+	// frames to, so the reply is delivered from that rather than the synthetic one.
+	assertForwardedIPv4Frame(t, forwardedBack[0], sourceMAC, mustMAC(t, "02:00:00:00:f0:01"), vip, sourceIP, 63)
+
+	forwarded = nil
+	router.forgetRoutedVIP("172.30.241.200/32")
+	handled, err = router.route(source, toVIP())
+	if err != nil {
+		t.Fatalf("route() error = %v", err)
+	}
+	if handled || len(forwarded) != 0 {
+		t.Fatalf("withdrawn VIP still routed: handled=%v forwarded=%d", handled, len(forwarded))
+	}
+}
+
+func TestFrameRouterIgnoresMalformedRoutedVIPs(t *testing.T) {
+	router := newFrameRouter()
+	node := router.addPort(241, func([]byte) error { return nil })
+	learnNodeOwner(t, router, node, mustMAC(t, "02:00:00:00:f1:41"), hostIP(241, 68))
+
+	for _, testCase := range []struct{ name, prefix, nexthop string }{
+		{"not a prefix", "172.30.241.200", "172.30.241.68"},
+		{"not a host route", "172.30.241.0/24", "172.30.241.68"},
+		{"destination is not a VIP", "172.30.241.68/32", "172.30.241.68"},
+		{"nexthop is not a node", "172.30.241.200/32", "172.30.241.201"},
+		{"nexthop in another subnet", "172.30.241.200/32", "172.30.240.68"},
+		{"junk", "not-an-ip/32", "172.30.241.68"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			router.learnRoutedVIP(testCase.prefix, testCase.nexthop)
+			if len(router.routedVIPs) != 0 {
+				t.Fatalf("routedVIPs = %v, want the binding rejected", router.routedVIPs)
+			}
+		})
+	}
+}
+
 func TestFrameRouterRejectsSpoofedSourceSubnet(t *testing.T) {
 	router := newFrameRouter()
 

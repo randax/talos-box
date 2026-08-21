@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/hypervisor"
@@ -110,6 +111,8 @@ func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if err != nil {
 		return ClusterSummary{}, err
 	}
+	// Measured before the batch consumes the saves it dates.
+	driftWarning := clockDriftWarning(dir, time.Now())
 	nodes := s.vms[item.Name]
 	if nodes == nil {
 		nodes = make(map[string]hypervisor.Machine)
@@ -146,8 +149,48 @@ func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
 	}
 	go s.bindMirrors(item.SubnetIndex) // resume bypasses start(); rebind the gateway
 	result := summary(item, true)
-	result.setWarnings(append(append([]string{subnetWarning, overcommitWarning}, pressureWarnings...), warnings...)...)
+	result.setWarnings(append(append([]string{subnetWarning, overcommitWarning}, pressureWarnings...), append(warnings, driftWarning)...)...)
 	return result, nil
+}
+
+// minReportedClockDrift is the suspend window below which the guest clocks are
+// close enough to the host that saying so would be noise.
+const minReportedClockDrift = 5 * time.Second
+
+// clockDriftWarning tells the operator how far the restored guests' clocks are
+// behind the host. A saved guest's clock stops with it and restarts from the
+// saved value, so the drift is exactly the wall-clock length of the suspend —
+// which the save files themselves date, no extra state needed. The Talos
+// machine API of the supported window (machinery v1.13) exposes only Time and
+// TimeCheck, both read-only comparisons against an NTP server: there is no RPC
+// that steps or slews the guest clock, so tbx cannot force the resync and says
+// so instead of pretending (#416). Reported from the oldest save, the node that
+// has been frozen longest.
+func clockDriftWarning(dir string, now time.Time) string {
+	matches, err := filepath.Glob(filepath.Join(dir, "*"+saveStateSuffix))
+	if err != nil || len(matches) == 0 {
+		return ""
+	}
+	var suspendedAt time.Time
+	for _, path := range matches {
+		info, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		if suspendedAt.IsZero() || info.ModTime().Before(suspendedAt) {
+			suspendedAt = info.ModTime()
+		}
+	}
+	drift := now.Sub(suspendedAt).Round(time.Second)
+	if suspendedAt.IsZero() || drift < minReportedClockDrift {
+		return ""
+	}
+	return fmt.Sprintf(
+		"guest clocks resume about %s behind the host and tbx cannot force a resync; "+
+			"Talos corrects them at its next NTP poll (minutes away, and never on an offline host) — "+
+			"reboot the cluster with stop/start if a workload cannot tolerate the gap",
+		drift,
+	)
 }
 
 // coldBootWarning explains a cold boot the way the daemon log already does:

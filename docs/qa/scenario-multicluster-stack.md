@@ -61,7 +61,13 @@ Expected observations: cross-cluster node↔VIP traffic flows both ways through 
 
 Pass criteria: both directions serve HTTP 200 by IP.
 
-On failure: capture which leg fails, host routing table, doctor forwarding/rp-filter lines.
+On failure: capture which leg fails, host routing table, doctor forwarding/rp-filter lines. The
+sibling-pod → BGP-VIP leg specifically regressed once (#387): on macOS that leg does not use the
+host FIB at all — guest-to-guest traffic crosses subnets through the helper's userspace frame
+router, which learns an L2-announced VIP from the owning node's ARP but can only learn a
+BGP-announced one from the speaker's host-route writes. If it fails again, record whether the
+host itself still reaches the VIP (it will, over the injected route) and whether the sibling
+reaches the *node* IP, since that pair separates the router binding from real routing.
 
 ### C4 — Asymmetry survives lifecycle churn (depends on C3)
 
