@@ -77,11 +77,3 @@ func classifySystemDNSFailure(err error) (string, string) {
 	}
 	return "FAIL", err.Error()
 }
-
-func resolvedUnavailableDetail(cause error) string {
-	clusters, err := cluster.List()
-	if err != nil {
-		return hostDNSUnavailableDetail(cause, nil)
-	}
-	return hostDNSUnavailableDetail(cause, clusters)
-}

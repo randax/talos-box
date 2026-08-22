@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -1012,6 +1013,11 @@ type DestroySummary struct {
 	// vmnet-owned, or one that never built it. Reporting the name is what lets
 	// an operator tell residue from design (#445).
 	BridgeRemoved string `json:"bridgeRemoved,omitempty"`
+	// BridgeWarning carries why a bridge that should have come down did not.
+	// Without it a failed teardown reads exactly like a host that had nothing
+	// to remove — the summary line is simply absent — and the operator has no
+	// reason to go looking (#445).
+	BridgeWarning string `json:"bridgeWarning,omitempty"`
 }
 
 func (s *Server) destroyCluster(raw json.RawMessage) (DestroySummary, error) {
@@ -1059,10 +1065,11 @@ func (s *Server) destroyCluster(raw json.RawMessage) (DestroySummary, error) {
 	}
 	s.forgetCluster(args.Name)
 	s.invalidateStoragePhaseLocked(args.Name)
-	if subnetIndex >= 0 {
+	if subnetIndex >= 0 && hostBridgeGOOS == "linux" {
 		bridge, err := releaseSubnetBridge(subnetIndex)
 		if err != nil {
 			log.Printf("release host bridge for %s subnet %s: %v", args.Name, cluster.SubnetCIDR(subnetIndex), err)
+			summary.BridgeWarning = bridgeReleaseWarning(subnetIndex, err)
 		}
 		summary.BridgeRemoved = bridge
 	}
@@ -1072,6 +1079,22 @@ func (s *Server) destroyCluster(raw json.RawMessage) (DestroySummary, error) {
 		summary.ResolverWithdrawn = customDomain
 	}
 	return summary, nil
+}
+
+// hostBridgeGOOS is the host platform the destroy's bridge release applies to.
+// Only Linux owns a per-cluster bridge; macOS hands the subnet to vmnet, so
+// there is nothing to take down and nothing to warn about. It is a variable so
+// a test can exercise the Linux path from any host.
+var hostBridgeGOOS = runtime.GOOS
+
+// bridgeReleaseWarning phrases a failed teardown for the operator. A missing
+// summary line reads exactly like a host that had nothing to remove, so the
+// reason has to travel with the answer rather than only to tbxd.log (#445).
+func bridgeReleaseWarning(subnetIndex int, cause error) string {
+	return fmt.Sprintf(
+		"the host bridge for subnet %s was not removed: %v; a leftover bridge keeps the gateway address, so the next create moves to another subnet",
+		cluster.SubnetCIDR(subnetIndex), cause,
+	)
 }
 
 // releaseSubnetBridge removes the host bridge a destroyed cluster's subnet
@@ -1093,6 +1116,13 @@ func releaseSubnetBridge(subnetIndex int) (string, error) {
 		return "", fmt.Errorf("skip host bridge release: %w", err)
 	}
 	defer func() { _ = client.Close() }()
+	// Withdraw the resolver registration before the link it names disappears.
+	// The DNS reconciler would withdraw it anyway, and tolerates an absent
+	// link, but doing it in order keeps the host's resolver state ahead of the
+	// teardown instead of behind it.
+	if err := client.UnregisterDNS(subnetIndex); err != nil {
+		log.Printf("withdraw DNS registration for subnet %s before host bridge release: %v", cluster.SubnetCIDR(subnetIndex), err)
+	}
 	removed, err := client.TeardownSubnet(subnetIndex)
 	if err != nil {
 		return "", err

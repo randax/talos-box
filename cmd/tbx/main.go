@@ -486,7 +486,12 @@ func (c cli) destroyCluster(args []string) error {
 	if _, err := fmt.Fprintf(c.out, "destroyed cluster %s\n", positionals[0]); err != nil {
 		return err
 	}
-	return printDestroySummary(c.out, summary, inspection)
+	if err := printDestroySummary(c.out, summary, inspection); err != nil {
+		return err
+	}
+	// A bridge that should have come down and did not is host residue the
+	// operator has to clear by hand, so it is a warning, not a summary line.
+	return printWarning(c.err, summary.BridgeWarning)
 }
 
 func (c cli) inspectDestroy(name string, request struct {

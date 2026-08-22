@@ -2,8 +2,10 @@ package daemon
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -118,5 +120,22 @@ func TestSubnetAllocatedGuardsTheBridgeRelease(t *testing.T) {
 	}
 	if subnetAllocated(nil, 0) {
 		t.Fatal("subnetAllocated() = true with no clusters left")
+	}
+}
+
+// A failed teardown used to be logged and nothing else, so the answer looked
+// exactly like a host that had no bridge to remove (#445).
+func TestBridgeReleaseWarningNamesTheSubnetAndTheReason(t *testing.T) {
+	t.Parallel()
+
+	warning := bridgeReleaseWarning(0, errors.New("bridge br-tbx0 still has tbx0-deadbeef attached"))
+	for _, wanted := range []string{
+		"the host bridge for subnet " + cluster.SubnetCIDR(0),
+		"was not removed",
+		"still has tbx0-deadbeef attached",
+	} {
+		if !strings.Contains(warning, wanted) {
+			t.Fatalf("warning %q missing %q", warning, wanted)
+		}
 	}
 }

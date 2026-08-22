@@ -400,7 +400,7 @@ func TestLinuxPlatformDoctorFindingsBridgeNetfilterWarnsWithoutRoot(t *testing.T
 		},
 	)
 	if finding.level != "WARN" ||
-		!strings.Contains(finding.detail, "cannot be read without root") ||
+		!strings.Contains(finding.detail, "the FORWARD policy cannot be read") ||
 		!strings.Contains(finding.detail, "sudo iptables -S FORWARD") {
 		t.Fatalf("finding = %+v", finding)
 	}
@@ -420,13 +420,31 @@ func TestLinuxPlatformDoctorFindingsBridgeNetfilterWarnsOnPermissionTextWithOthe
 	}
 }
 
+// A host without iptables cannot be inspected through it: that is a "cannot
+// inspect" case, not evidence of a broken FORWARD policy (#448).
+func TestLinuxPlatformDoctorFindingsBridgeNetfilterWarnsWithoutIPTables(t *testing.T) {
+	t.Parallel()
+
+	finding := linuxBridgeNetfilterFinding(
+		func(string) ([]byte, error) { return []byte("1\n"), nil },
+		func(string, ...string) ([]byte, error) {
+			return nil, fmt.Errorf("run iptables: %w", exec.ErrNotFound)
+		},
+	)
+	if finding.level != "WARN" ||
+		!strings.Contains(finding.detail, "iptables is not installed") ||
+		!strings.Contains(finding.detail, "sudo nft list chain ip filter FORWARD") {
+		t.Fatalf("finding = %+v", finding)
+	}
+}
+
 func TestLinuxPlatformDoctorFindingsBridgeNetfilterFailsOnUnreadableIPTables(t *testing.T) {
 	t.Parallel()
 
 	finding := linuxBridgeNetfilterFinding(
 		func(string) ([]byte, error) { return []byte("1\n"), nil },
 		func(string, ...string) ([]byte, error) {
-			return nil, errors.New("executable file not found in $PATH")
+			return nil, errors.New("iptables: unknown option \"-S\"")
 		},
 	)
 	if finding.level != "FAIL" || !strings.Contains(finding.detail, "inspect FORWARD policy") {
@@ -434,16 +452,18 @@ func TestLinuxPlatformDoctorFindingsBridgeNetfilterFailsOnUnreadableIPTables(t *
 	}
 }
 
-func TestIPTablesPermissionDenied(t *testing.T) {
+func TestIPTablesPolicyUnreadable(t *testing.T) {
 	t.Parallel()
 
-	if iptablesPermissionDenied([]byte("-P FORWARD ACCEPT\n"), nil) {
-		t.Fatal("a successful run is not a permission failure")
+	if iptablesPolicyUnreadable([]byte("-P FORWARD ACCEPT\n"), nil) {
+		t.Fatal("a successful run is not an unreadable policy")
 	}
-	if !iptablesPermissionDenied(nil, exitStatusError(t, 4)) {
-		t.Fatal("exit status 4 is iptables' permission failure")
+	// Exit 4 is xtables RESOURCE_PROBLEM: a missing permission, a missing
+	// table, or a contended lock — none of it evidence about the policy.
+	if !iptablesPolicyUnreadable([]byte("iptables v1.8.10 (nf_tables): Table does not exist (do you need to insmod?)\n"), exitStatusError(t, 4)) {
+		t.Fatal("exit status 4 leaves the FORWARD policy unread")
 	}
-	if iptablesPermissionDenied([]byte("Table does not exist\n"), exitStatusError(t, 3)) {
+	if iptablesPolicyUnreadable([]byte("iptables: Bad argument `FORWARDX'\n"), exitStatusError(t, 2)) {
 		t.Fatal("an unrelated failure must stay a failure")
 	}
 }

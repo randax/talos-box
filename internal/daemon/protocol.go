@@ -65,7 +65,12 @@ const (
 // converging (#396) and storageGate (#391) fields, cache.list's reasons array
 // (#407), cache.warm's reResolvedTag/reResolvedTags (#405), and
 // cluster.destroy.inspect's volumes/csi (#422).
-const ProtocolVersion = 14
+// Version 15 takes the host bridge down with the cluster on cluster.destroy,
+// so the freed subnet index is reused instead of climbed past, and adds these
+// additive cluster.destroy response fields: bridgeRemoved, naming the bridge
+// the destroy took down, and bridgeWarning, carrying why one that should have
+// come down did not (#445).
+const ProtocolVersion = 15
 
 // Request is one newline-delimited daemon request.
 type Request struct {

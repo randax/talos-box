@@ -22,21 +22,22 @@ import (
 )
 
 const (
-	doctorKVMDevice                     = "/dev/kvm"
-	doctorHelperSocketUnit              = "tbx-helper.socket"
-	doctorHelperServiceUnit             = "tbx-helper.service"
-	doctorBridgeNFCall                  = "/proc/sys/net/bridge/bridge-nf-call-iptables"
-	doctorForwardPolicyFix              = "sudo iptables -I FORWARD 1 -i br-tbx+ -j ACCEPT && sudo iptables -I FORWARD 1 -o br-tbx+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
-	doctorForwardPolicyInspect          = "sudo iptables -S FORWARD"
-	doctorHelperGroupFix                = "sudo usermod -aG tbx $USER"
-	doctorKVMGroupFix                   = "sudo usermod -aG kvm $USER"
-	doctorRPFilterLooseFix              = "sudo sysctl -w net.ipv4.conf.all.rp_filter=2"
-	doctorIPTablesPermissionExit        = 4
-	doctorQEMUMinimumMajor              = 6
-	doctorQEMUMinimumMinor              = 2
-	doctorQEMUSuspendMajor              = 8
-	doctorQEMUSuspendMinor              = 2
-	doctorHelperCapabilityMask   uint64 = 1<<10 | 1<<12 | 1<<13
+	doctorKVMDevice                          = "/dev/kvm"
+	doctorHelperSocketUnit                   = "tbx-helper.socket"
+	doctorHelperServiceUnit                  = "tbx-helper.service"
+	doctorBridgeNFCall                       = "/proc/sys/net/bridge/bridge-nf-call-iptables"
+	doctorForwardPolicyFix                   = "sudo iptables -I FORWARD 1 -i br-tbx+ -j ACCEPT && sudo iptables -I FORWARD 1 -o br-tbx+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+	doctorForwardPolicyInspect               = "sudo iptables -S FORWARD"
+	doctorNFTForwardPolicyInspect            = "sudo nft list chain ip filter FORWARD"
+	doctorHelperGroupFix                     = "sudo usermod -aG tbx $USER"
+	doctorKVMGroupFix                        = "sudo usermod -aG kvm $USER"
+	doctorRPFilterLooseFix                   = "sudo sysctl -w net.ipv4.conf.all.rp_filter=2"
+	doctorIPTablesResourceProblemExit        = 4
+	doctorQEMUMinimumMajor                   = 6
+	doctorQEMUMinimumMinor                   = 2
+	doctorQEMUSuspendMajor                   = 8
+	doctorQEMUSuspendMinor                   = 2
+	doctorHelperCapabilityMask        uint64 = 1<<10 | 1<<12 | 1<<13
 )
 
 type doctorQEMUSystem struct {
@@ -356,14 +357,26 @@ func linuxBridgeNetfilterFinding(readFile func(string) ([]byte, error), command 
 	}
 	rules, err := command("iptables", "-S", "FORWARD")
 	if err != nil {
-		// Doctor runs as the invoking user, and iptables refuses to list a
-		// chain without root. That says nothing about how FORWARD is
-		// configured, so it must not fail an otherwise healthy host (#448).
-		if iptablesPermissionDenied(rules, err) {
+		// A host without iptables cannot be inspected through it at all. That
+		// says nothing about how FORWARD is configured, so it must not fail an
+		// otherwise healthy host (#448).
+		if errors.Is(err, exec.ErrNotFound) {
 			finding.level = "WARN"
 			finding.detail = fmt.Sprintf(
-				"br_netfilter is active but the FORWARD policy cannot be read without root; re-run `sudo tbx doctor`, or inspect it with `%s`",
-				doctorForwardPolicyInspect,
+				"br_netfilter is active but iptables is not installed, so the FORWARD policy cannot be read; install iptables and re-run, or inspect the chain with `%s`",
+				doctorNFTForwardPolicyInspect,
+			)
+			return finding
+		}
+		// Doctor runs as the invoking user, and iptables refuses to list a
+		// chain without root; the same exit status also covers a missing table
+		// or a contended xtables lock. None of that is evidence about the
+		// policy either (#448).
+		if iptablesPolicyUnreadable(rules, err) {
+			finding.level = "WARN"
+			finding.detail = fmt.Sprintf(
+				"br_netfilter is active but the FORWARD policy cannot be read (%v); inspect it with `%s` (listing the chain needs root)",
+				err, doctorForwardPolicyInspect,
 			)
 			return finding
 		}
@@ -385,16 +398,17 @@ func linuxBridgeNetfilterFinding(readFile func(string) ([]byte, error), command 
 	return finding
 }
 
-// iptablesPermissionDenied reports whether an `iptables -S` failure was the
-// invoking user lacking root rather than a broken firewall. Exit status 4 is
-// iptables' own permission failure; the nftables-backed binary can exit with
-// other statuses, so the message it printed counts too.
-func iptablesPermissionDenied(output []byte, err error) bool {
+// iptablesPolicyUnreadable reports whether an `iptables -S` failure means the
+// chain could not be read rather than that the firewall is broken. Exit status
+// 4 is xtables' RESOURCE_PROBLEM — a missing permission, a missing table, or a
+// contended lock; the nftables-backed binary can also exit with other statuses,
+// so the message it printed counts too.
+func iptablesPolicyUnreadable(output []byte, err error) bool {
 	if err == nil {
 		return false
 	}
 	var exit *exec.ExitError
-	if errors.As(err, &exit) && exit.ExitCode() == doctorIPTablesPermissionExit {
+	if errors.As(err, &exit) && exit.ExitCode() == doctorIPTablesResourceProblemExit {
 		return true
 	}
 	lowered := strings.ToLower(string(output) + " " + err.Error())

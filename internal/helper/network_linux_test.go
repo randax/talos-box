@@ -86,3 +86,54 @@ func helperLinkNotFoundError(t *testing.T) error {
 	}
 	return err
 }
+
+// The bridge goes down with the cluster that owned it, so the daemon's DNS
+// reconciler withdraws registrations whose link is already gone. That used to
+// log an "exit status 1: … No such device" line on every Linux destroy (#445).
+func TestRevertResolvedLinkTreatsAnAbsentLinkAsSuccess(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+	err := revertResolvedLink(0, func(string, ...string) error {
+		calls++
+		return errors.New("exit status 1: Failed to resolve interface \"br-tbx0\": No such device\n")
+	})
+	if err != nil {
+		t.Fatalf("revert of an absent link = %v, want success", err)
+	}
+	if calls != 1 {
+		t.Fatalf("resolvectl calls = %d, want 1", calls)
+	}
+}
+
+func TestRevertResolvedLinkKeepsOtherFailures(t *testing.T) {
+	t.Parallel()
+
+	err := revertResolvedLink(0, func(string, ...string) error {
+		return errors.New("exit status 1: Failed to revert interface: Access denied")
+	})
+	if err == nil || !strings.Contains(err.Error(), "Access denied") {
+		t.Fatalf("revert error = %v, want the refusal preserved", err)
+	}
+}
+
+func TestResolvedLinkAbsentClassification(t *testing.T) {
+	t.Parallel()
+
+	if resolvedLinkAbsent(nil) {
+		t.Fatal("a successful revert is not an absent link")
+	}
+	for _, output := range []string{
+		"exit status 1: Failed to resolve interface \"br-tbx3\": No such device",
+		"exit status 1: Unknown interface br-tbx3",
+		"exit status 1: Cannot find device \"br-tbx3\"",
+		"exit status 1: Link not found",
+	} {
+		if !resolvedLinkAbsent(errors.New(output)) {
+			t.Fatalf("resolvedLinkAbsent(%q) = false", output)
+		}
+	}
+	if resolvedLinkAbsent(errors.New("exit status 1: Interactive authentication required")) {
+		t.Fatal("a polkit refusal must stay a failure")
+	}
+}

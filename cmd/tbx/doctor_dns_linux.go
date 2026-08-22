@@ -9,6 +9,7 @@ import (
 	"net"
 	"strings"
 
+	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/daemon"
 )
 
@@ -48,9 +49,25 @@ func checkSystemDNS(clusters []daemon.ClusterSummary, command commandOutput) err
 		return nil
 	}
 	if resolvedErr != nil {
-		return optionalHostDNSError{detail: resolvedUnavailableDetail(resolvedErr)}
+		// The manual step and fallback are phrased from the clusters this check
+		// just probed, so the detail follows the probe rather than a second,
+		// independent listing of cluster state.
+		return optionalHostDNSError{detail: hostDNSUnavailableDetail(resolvedErr, probedClusters(clusters))}
 	}
 	return errors.New(strings.Join(problems, "; "))
+}
+
+// probedClusters restates the daemon's cluster summaries as the cluster records
+// the resolved advice is phrased from. EffectiveDomain is already resolved on
+// the summary, so carrying it as the explicit domain keeps the two identical.
+func probedClusters(clusters []daemon.ClusterSummary) []cluster.Cluster {
+	result := make([]cluster.Cluster, 0, len(clusters))
+	for _, item := range clusters {
+		result = append(result, cluster.Cluster{
+			Name: item.Name, Domain: item.EffectiveDomain(), SubnetIndex: item.SubnetIndex,
+		})
+	}
+	return result
 }
 
 func parseGetentAddresses(output []byte) []net.IP {

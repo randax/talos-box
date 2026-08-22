@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -46,11 +47,37 @@ func platformRegisterDNS(clusterDomain string, subnetIndex int) DNSRegistration 
 }
 
 func platformUnregisterDNS(subnetIndex int) error {
-	err := runResolvedCommand("resolvectl", "revert", bridgeNameForSubnet(subnetIndex))
-	if errors.Is(err, exec.ErrNotFound) {
+	return revertResolvedLink(subnetIndex, runResolvedCommand)
+}
+
+func revertResolvedLink(subnetIndex int, run dnsCommandRunner) error {
+	err := run("resolvectl", "revert", bridgeNameForSubnet(subnetIndex))
+	// The bridge is removed with the cluster that owned it (#445), so the
+	// daemon's DNS reconciler routinely withdraws a registration whose link is
+	// already gone. Nothing can stay registered against a link that does not
+	// exist, so already gone is success — the same rule DeleteBridge follows.
+	if errors.Is(err, exec.ErrNotFound) || resolvedLinkAbsent(err) {
 		return nil
 	}
 	return err
+}
+
+// resolvedLinkAbsent reports whether a resolvectl failure was the link itself
+// being gone rather than resolved refusing the change. resolvectl resolves the
+// interface name before it talks to resolved and prints the kernel's own
+// wording — `Failed to resolve interface "br-tbx0": No such device` — which
+// runResolvedCommand keeps in the error it returns.
+func resolvedLinkAbsent(err error) bool {
+	if err == nil {
+		return false
+	}
+	lowered := strings.ToLower(err.Error())
+	for _, absent := range []string{"no such device", "unknown interface", "cannot find device", "link not found"} {
+		if strings.Contains(lowered, absent) {
+			return true
+		}
+	}
+	return false
 }
 
 func runResolvedCommand(name string, args ...string) error {

@@ -440,8 +440,12 @@ func (s *Server) attach(raw json.RawMessage) (any, int, func(), error) {
 }
 
 // teardownNetwork removes the host networking a subnet's last cluster leaves
-// behind. The subnet index is enough: it is allocated to one cluster at a time,
-// and the caller has already established that the cluster owning it is gone.
+// behind. The socket boundary cannot prove the owning cluster is gone — cluster
+// state lives in the calling user's home, not the helper's — so the guarantee
+// is the primitive's own: DeleteBridge refuses a bridge that still has links
+// enslaved (a live VM's only path), and an absent bridge is success. The
+// destroy path stops the cluster's VMs, which detaches their taps, before it
+// asks for this.
 func teardownNetwork(raw json.RawMessage) (any, int, func(), error) {
 	var args struct {
 		SubnetIndex *int `json:"subnetIndex"`

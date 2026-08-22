@@ -363,7 +363,10 @@ func shouldReconnect(op string, err error) bool {
 func safeRetryOperation(op string) bool {
 	switch op {
 	// net.teardown is idempotent: a retry that finds the bridge already gone
-	// succeeds, reporting only that it removed nothing.
+	// succeeds, reporting only that it removed nothing. The ambiguity is
+	// benign — a retry after a lost response reports removed:false for a
+	// bridge the first attempt did remove, so the destroy summary omits the
+	// bridge line rather than inventing one.
 	case helperInfoOp, "ping", "net.detach", "net.teardown", "dns.install", "dns.uninstall", "dns.syncDomains", "dns.register", "dns.unregister", "forwarding.enable", "bgp.enable", "bgp.disable":
 		return true
 	default:
