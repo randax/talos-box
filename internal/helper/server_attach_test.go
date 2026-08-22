@@ -213,9 +213,15 @@ func testPlatformAttachment(fd int, stop func(int) error) *platformAttachment {
 type testDHCPManager struct {
 	convergeErr error
 	closeErr    error
+	released    []int
 }
 
 func (m *testDHCPManager) Converge() error { return m.convergeErr }
+
+func (m *testDHCPManager) Release(subnetIndex int) error {
+	m.released = append(m.released, subnetIndex)
+	return nil
+}
 
 func (m *testDHCPManager) Close() error { return m.closeErr }
 
@@ -264,6 +270,59 @@ func TestTeardownReportsAnAbsentBridgeAsSuccess(t *testing.T) {
 	}
 	if string(reply.response.Data) != `{"removed":false}` {
 		t.Fatalf("net.teardown data = %s, want {\"removed\":false}", reply.response.Data)
+	}
+}
+
+func TestTeardownReleasesTheSubnetDHCPServerOnlyWhenTheBridgeIsGone(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		teardown     func(int) (bool, error)
+		wantOK       bool
+		wantReleased []int
+	}{
+		{
+			name:         "bridge removed",
+			teardown:     func(int) (bool, error) { return true, nil },
+			wantOK:       true,
+			wantReleased: []int{3},
+		},
+		{
+			name:         "bridge already absent",
+			teardown:     func(int) (bool, error) { return false, nil },
+			wantOK:       true,
+			wantReleased: []int{3},
+		},
+		{
+			name: "teardown refused",
+			teardown: func(int) (bool, error) {
+				return false, errors.New("bridge br-tbx3 still has tbx3-cp-1 attached; stop the VM before removing it")
+			},
+			wantOK:       false,
+			wantReleased: nil,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			originalTeardown := teardownSubnet
+			teardownSubnet = test.teardown
+			t.Cleanup(func() { teardownSubnet = originalTeardown })
+
+			server := NewServer(nil)
+			dhcp := &testDHCPManager{}
+			server.dhcp = dhcp
+
+			reply := server.dispatch(Request{Op: "net.teardown", Args: json.RawMessage(`{"subnetIndex":3}`)})
+			if reply.response.OK != test.wantOK {
+				t.Fatalf("net.teardown response = %+v, want OK = %t", reply.response, test.wantOK)
+			}
+			if len(dhcp.released) != len(test.wantReleased) {
+				t.Fatalf("released subnets = %v, want %v", dhcp.released, test.wantReleased)
+			}
+			for i, subnetIndex := range test.wantReleased {
+				if dhcp.released[i] != subnetIndex {
+					t.Fatalf("released subnets = %v, want %v", dhcp.released, test.wantReleased)
+				}
+			}
+		})
 	}
 }
 
