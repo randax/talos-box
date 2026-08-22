@@ -248,15 +248,15 @@ func (realLinuxNetworkOps) EnsureBridge(name string) error {
 }
 
 func (realLinuxNetworkOps) DeleteBridge(name string) (bool, error) {
-	if _, err := netlink.LinkByName(name); err != nil {
+	// A single lookup keeps absent-is-success race-free: requireLinuxBridge
+	// wraps the netlink error, so a bridge that is already gone surfaces here
+	// rather than failing a second lookup.
+	bridge, err := requireLinuxBridge(name)
+	if err != nil {
 		var notFound netlink.LinkNotFoundError
 		if errors.As(err, &notFound) {
 			return false, nil
 		}
-		return false, fmt.Errorf("inspect bridge %s: %w", name, err)
-	}
-	bridge, err := requireLinuxBridge(name)
-	if err != nil {
 		return false, err
 	}
 	links, err := netlink.LinkList()
