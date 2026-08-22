@@ -9,3 +9,5 @@ func enableForwarding() error {
 }
 
 func convergeNetworking() error { return nil }
+
+func TeardownSubnet(int) (bool, error) { return false, nil }

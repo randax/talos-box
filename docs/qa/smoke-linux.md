@@ -24,7 +24,7 @@ Abort the run (report BLOCKED, not FAIL) if any of these don't hold:
    - **Record the host cache state too**, because C1's duration depends on it: `tbx cache list` (does a Talos disk image for the pinned version already exist?). Report it as `cold` (no matching disk image cached) or `warm` — a warm host skips the image download entirely, so a fast create is not evidence about first-run timing.
 2. `git -C <talos-box checkout> rev-parse HEAD` — record the commit if running from source.
 3. `test -r /dev/kvm -a -w /dev/kvm && echo kvm-ok` prints `kvm-ok`.
-4. `tbx doctor` exits 0. Expected on Linux: `helper-unit`, `helper-access`, `helper-capabilities`, `kvm`, `qemu`, `forwarding`, `bridge-netfilter`, `bridge-stp`, `rp-filter`, `port-53`/`port-67`/`port-179`, resolver checks, routes OK; `host-pressure: SKIP` is expected on Linux (not friction). Record any WARN as friction.
+4. `tbx doctor` exits 0. Expected on Linux: `helper-unit`, `helper-access`, `helper-capabilities`, `kvm`, `qemu`, `forwarding`, `bridge-netfilter`, `bridge-stp`, `rp-filter`, `port-53`/`port-67`/`port-179`, resolver checks, routes OK; `host-pressure: SKIP` is expected on Linux (not friction). `bridge-netfilter: WARN` is expected when `doctor` runs unprivileged on a host with bridge netfilter active — it cannot read the `FORWARD` chain without root (not friction); inspect the chain with `sudo iptables -S FORWARD` to get the verdict. Before any cluster exists, `resolver`, `DNS` and `system-dns` report `SKIP` (there is nothing to resolve yet) — that is expected, not friction. On a host **without systemd-resolved**, `resolver` (and `system-dns` once a cluster runs) report `WARN` naming the missing resolved plus the `sudo resolvectl dns …`/`resolvectl domain …` manual step and the `dig @<gateway> <node>.<domain>` fallback — expected on such a host, not friction; a `PASS` there would be friction, because it would claim cluster names resolve when they do not. `DNS` still `PASS`es on such a host: it probes the daemon's own resolver on the cluster gateway, which is exactly the `dig` fallback. Record any other WARN as friction.
 5. `tbx status` shows no cluster named `qa-smoke` (destroy leftovers first: `tbx cluster destroy qa-smoke --force`).
 6. Host has ≥ 8 GiB free RAM (`free -h`) — the default cluster wants 6 GiB. Note: no overcommit guard exists on Linux; nothing will warn you.
 7. Network can reach `factory.talos.dev` (smoke assumes online; offline behavior is a deep runbook).
@@ -62,7 +62,7 @@ Expected observations: node names resolve to the IPs status reported; ping gets 
 
 Pass criteria: both node lookups resolve to the status-reported IPs (via resolved or the gateway fallback).
 
-On failure: capture `resolvectl status` (or `cat /etc/resolv.conf`), `tbx doctor` DNS lines, and `dig` output against the gateway.
+On failure: capture `resolvectl status` (or `cat /etc/resolv.conf`), `tbx doctor` DNS lines, and `dig` output against the gateway. On a host without systemd-resolved the host lookups (steps 1-2 via resolved) are expected to fail while the gateway fallback answers: `tbx doctor` must say so — `resolver`/`system-dns: WARN` with the manual step and the `dig @<gateway>` fallback. `PASS resolver`/`PASS system-dns` with failing `getent hosts` is a FAIL of this charter (#447).
 
 ### C3 — Console attach (depends on C1)
 
@@ -100,10 +100,11 @@ Steps:
 2. `tbx status` — cluster gone.
 3. `ls ~/.talosbox/clusters/` — no `qa-smoke` directory.
 4. `ip link show | grep br-tbx` — the cluster's bridge is gone (no orphaned `br-tbx<n>` for this cluster).
+5. `tbx cluster create qa-subnet-reuse`, check `tbx status` — it lands back on the subnet the destroy freed (`172.30.0.0/24` when nothing else is running), not the next index up — then `tbx cluster destroy qa-subnet-reuse --force`.
 
-Expected observations: destroy prints a data-loss warning path (`--force` supplied — record what it printed); no `qa-smoke` remnants in status, on disk, or in host networking; `resolvectl domain` no longer lists the cluster's domain (when resolved is present) — the resolved registration is per-cluster and goes with the bridge; Linux has no install-scoped `/etc/resolver` file to check (that is the macOS equivalent, and there it is expected to persist).
+Expected observations: destroy prints a data-loss warning path (`--force` supplied — record what it printed) and a `host bridge br-tbx<n> removed` line in its summary; no `qa-smoke` remnants in status, on disk, or in host networking; `resolvectl domain` no longer lists the cluster's domain (when resolved is present) — the resolved registration is per-cluster and goes with the bridge; Linux has no install-scoped `/etc/resolver` file to check (that is the macOS equivalent, and there it is expected to persist).
 
-Pass criteria: no per-cluster residue; no orphaned bridge or resolved registration.
+Pass criteria: no per-cluster residue; no orphaned bridge or resolved registration; the freed subnet index is reused by the next create. A teardown that failed says so: destroy prints `warning: the host bridge for subnet … was not removed: <reason>` instead of the removal line — record it as a FAIL of this charter with the reason.
 
 On failure: list what was left behind, exactly.
 

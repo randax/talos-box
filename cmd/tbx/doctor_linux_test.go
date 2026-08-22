@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"runtime"
 	"strings"
 	"testing"
@@ -77,10 +78,15 @@ func TestLinuxResolverChecksPerLinkState(t *testing.T) {
 		func(string) ([]byte, error) { return []byte("5\n"), nil },
 		func(name string, args ...string) ([]byte, error) {
 			calls = append(calls, name+" "+strings.Join(args, " "))
-			if name != "resolvectl" || fmt.Sprint(args) != "[status br-tbx7]" {
+			switch {
+			case name == "resolvectl" && fmt.Sprint(args) == "[status]":
+				return []byte("Global\n"), nil
+			case name == "resolvectl" && fmt.Sprint(args) == "[status br-tbx7]":
+				return []byte("Link 5 (br-tbx7)\n    DNS Servers: 172.30.8.1\n    DNS Domain: ~other.k8s.test\n"), nil
+			default:
 				t.Fatalf("unexpected command %s %v", name, args)
+				return nil, nil
 			}
-			return []byte("Link 5 (br-tbx7)\n    DNS Servers: 172.30.8.1\n    DNS Domain: ~other.k8s.test\n"), nil
 		},
 	)
 	level, detail := classifyResolverFailure(err)
@@ -90,8 +96,76 @@ func TestLinuxResolverChecksPerLinkState(t *testing.T) {
 	if !strings.Contains(detail, "DNS server 172.30.7.1") || !strings.Contains(detail, "~demo.k8s.test") {
 		t.Fatalf("detail = %q", detail)
 	}
-	if fmt.Sprint(calls) != "[resolvectl status br-tbx7]" {
+	if !strings.Contains(detail, "dig @172.30.7.1 <node>.demo.k8s.test") {
+		t.Fatalf("detail = %q, want the by-gateway fallback", detail)
+	}
+	if fmt.Sprint(calls) != "[resolvectl status resolvectl status br-tbx7]" {
 		t.Fatalf("calls = %v", calls)
+	}
+}
+
+// #447: a host without systemd-resolved cannot resolve cluster names, so the
+// resolver check must WARN with the daemon's manual step, never PASS.
+func TestLinuxResolverWarnsWhenResolvedIsUnavailable(t *testing.T) {
+	t.Parallel()
+
+	err := checkLinuxResolver(
+		func() ([]cluster.Cluster, error) { return []cluster.Cluster{{Name: "demo", SubnetIndex: 7}}, nil },
+		func(string) ([]byte, error) { return []byte("5\n"), nil },
+		func(string, ...string) ([]byte, error) {
+			return nil, errors.New("sd_bus_open_system: No such file or directory")
+		},
+	)
+	level, detail := classifyResolverFailure(err)
+	if level != "WARN" {
+		t.Fatalf("level = %q, want WARN (%v)", level, err)
+	}
+	for _, want := range []string{
+		"systemd-resolved is unavailable",
+		"cluster names do not resolve on this host",
+		"sudo resolvectl dns br-tbx7 172.30.7.1",
+		"dig @172.30.7.1 <node>.demo.k8s.test",
+	} {
+		if !strings.Contains(detail, want) {
+			t.Fatalf("detail = %q, want %q", detail, want)
+		}
+	}
+}
+
+// #447: the verdict is whether the host resolves the names, not whether
+// resolved is present — an absent resolved with working lookups still passes.
+func TestLinuxSystemDNSPassesWithoutResolvedWhenNamesResolve(t *testing.T) {
+	t.Parallel()
+
+	err := checkSystemDNS(
+		[]daemon.ClusterSummary{{Name: "demo", SubnetIndex: 7}},
+		func(name string, _ ...string) ([]byte, error) {
+			if name == "resolvectl" {
+				return nil, errors.New("sd_bus_open_system: No such file or directory")
+			}
+			return []byte("172.30.7.200 STREAM doctor-probe.demo.k8s.test\n"), nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("err = %v, want PASS", err)
+	}
+}
+
+// #447: resolved absent and the names do not resolve — WARN with the reason,
+// the manual step, and the by-gateway fallback.
+func TestLinuxSystemDNSWarnsWhenNamesDoNotResolve(t *testing.T) {
+	t.Parallel()
+
+	err := checkSystemDNS(
+		[]daemon.ClusterSummary{{Name: "demo", SubnetIndex: 7}},
+		func(string, ...string) ([]byte, error) { return nil, errors.New("exit status 2") },
+	)
+	level, detail := classifySystemDNSFailure(err)
+	if level != "WARN" {
+		t.Fatalf("level = %q, want WARN (%v)", level, err)
+	}
+	if !strings.Contains(detail, "systemd-resolved is unavailable") {
+		t.Fatalf("detail = %q", detail)
 	}
 }
 
@@ -109,8 +183,13 @@ func TestLinuxResolverSkipsStoppedClusterWithoutBridge(t *testing.T) {
 			return nil, nil
 		},
 	)
-	if err != nil {
-		t.Fatal(err)
+	// Nothing was probed, so the check skips rather than passing (#447).
+	var skipped skippedDoctorCheck
+	if !errors.As(err, &skipped) {
+		t.Fatalf("err = %v, want a skipped check", err)
+	}
+	if skipped.Error() != "no clusters are running" {
+		t.Fatalf("detail = %q", skipped.Error())
 	}
 }
 
@@ -128,8 +207,10 @@ func TestLinuxDirectDNSSkipsStoppedClusterWithoutBridge(t *testing.T) {
 			return nil
 		},
 	)
-	if err != nil {
-		t.Fatal(err)
+	// Nothing was probed, so the check skips rather than passing (#447).
+	var skipped skippedDoctorCheck
+	if !errors.As(err, &skipped) {
+		t.Fatalf("err = %v, want a skipped check", err)
 	}
 }
 
@@ -294,6 +375,100 @@ func TestLinuxPlatformDoctorFindingsBridgeNetfilterRejectsMismatchedBridgeRules(
 	)
 	if finding.level != "FAIL" {
 		t.Fatalf("finding = %+v", finding)
+	}
+}
+
+// exitStatusError produces a real *exec.ExitError with the given status, the
+// only honest stand-in for what iptables hands back.
+func exitStatusError(t *testing.T, status int) error {
+	t.Helper()
+	err := exec.Command("/bin/sh", "-c", fmt.Sprintf("exit %d", status)).Run()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != status {
+		t.Fatalf("exit %d probe = %v", status, err)
+	}
+	return err
+}
+
+func TestLinuxPlatformDoctorFindingsBridgeNetfilterWarnsWithoutRoot(t *testing.T) {
+	t.Parallel()
+
+	finding := linuxBridgeNetfilterFinding(
+		func(string) ([]byte, error) { return []byte("1\n"), nil },
+		func(string, ...string) ([]byte, error) {
+			return []byte("iptables v1.8.10 (nf_tables): Permission denied (you must be root)\n"), exitStatusError(t, 4)
+		},
+	)
+	if finding.level != "WARN" ||
+		!strings.Contains(finding.detail, "the FORWARD policy cannot be read") ||
+		!strings.Contains(finding.detail, "sudo iptables -S FORWARD") {
+		t.Fatalf("finding = %+v", finding)
+	}
+}
+
+func TestLinuxPlatformDoctorFindingsBridgeNetfilterWarnsOnPermissionTextWithOtherStatus(t *testing.T) {
+	t.Parallel()
+
+	finding := linuxBridgeNetfilterFinding(
+		func(string) ([]byte, error) { return []byte("1\n"), nil },
+		func(string, ...string) ([]byte, error) {
+			return []byte("iptables/1.8.7 Failed to initialize nft: Operation not permitted\n"), exitStatusError(t, 1)
+		},
+	)
+	if finding.level != "WARN" {
+		t.Fatalf("finding = %+v", finding)
+	}
+}
+
+// A host whose PATH has no iptables cannot be inspected through it: that is a
+// "cannot inspect" case, not evidence of a broken FORWARD policy (#448). The
+// wording must stay at "not found on PATH" — a missing binary and a shell
+// without /usr/sbin are indistinguishable here.
+func TestLinuxPlatformDoctorFindingsBridgeNetfilterWarnsWithoutIPTables(t *testing.T) {
+	t.Parallel()
+
+	finding := linuxBridgeNetfilterFinding(
+		func(string) ([]byte, error) { return []byte("1\n"), nil },
+		func(string, ...string) ([]byte, error) {
+			return nil, fmt.Errorf("run iptables: %w", exec.ErrNotFound)
+		},
+	)
+	if finding.level != "WARN" ||
+		!strings.Contains(finding.detail, "iptables was not found on PATH") ||
+		strings.Contains(finding.detail, "not installed") ||
+		!strings.Contains(finding.detail, "sudo iptables -S FORWARD") ||
+		!strings.Contains(finding.detail, "sudo nft list chain ip filter FORWARD") {
+		t.Fatalf("finding = %+v", finding)
+	}
+}
+
+func TestLinuxPlatformDoctorFindingsBridgeNetfilterFailsOnUnreadableIPTables(t *testing.T) {
+	t.Parallel()
+
+	finding := linuxBridgeNetfilterFinding(
+		func(string) ([]byte, error) { return []byte("1\n"), nil },
+		func(string, ...string) ([]byte, error) {
+			return nil, errors.New("iptables: unknown option \"-S\"")
+		},
+	)
+	if finding.level != "FAIL" || !strings.Contains(finding.detail, "inspect FORWARD policy") {
+		t.Fatalf("finding = %+v", finding)
+	}
+}
+
+func TestIPTablesPolicyUnreadable(t *testing.T) {
+	t.Parallel()
+
+	if iptablesPolicyUnreadable([]byte("-P FORWARD ACCEPT\n"), nil) {
+		t.Fatal("a successful run is not an unreadable policy")
+	}
+	// Exit 4 is xtables RESOURCE_PROBLEM: a missing permission, a missing
+	// table, or a contended lock — none of it evidence about the policy.
+	if !iptablesPolicyUnreadable([]byte("iptables v1.8.10 (nf_tables): Table does not exist (do you need to insmod?)\n"), exitStatusError(t, 4)) {
+		t.Fatal("exit status 4 leaves the FORWARD policy unread")
+	}
+	if iptablesPolicyUnreadable([]byte("iptables: Bad argument `FORWARDX'\n"), exitStatusError(t, 2)) {
+		t.Fatal("an unrelated failure must stay a failure")
 	}
 }
 

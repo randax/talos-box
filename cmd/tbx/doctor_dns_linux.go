@@ -9,15 +9,18 @@ import (
 	"net"
 	"strings"
 
+	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/daemon"
 )
 
 const resolverBypassMessage = "systemd-resolved route-only domain is missing or being bypassed"
 
 func checkSystemDNS(clusters []daemon.ClusterSummary, command commandOutput) error {
-	if _, err := command("resolvectl", "status"); err != nil {
-		return optionalHostDNSError{detail: resolvedUnavailableDetail(err)}
-	}
+	// An unavailable resolved is not by itself the finding: the verdict is
+	// whether the host resolves cluster names. So probe resolved for the
+	// *reason*, then always run the lookups, and let their result decide
+	// PASS versus WARN (#447).
+	_, resolvedErr := command("resolvectl", "status")
 	var problems []string
 	for _, item := range clusters {
 		name := "doctor-probe." + item.EffectiveDomain()
@@ -40,10 +43,31 @@ func checkSystemDNS(clusters []daemon.ClusterSummary, command commandOutput) err
 				item.Name, resolverBypassMessage, name, formatAddresses(addresses), expected))
 		}
 	}
-	if len(problems) != 0 {
-		return errors.New(strings.Join(problems, "; "))
+	if len(problems) == 0 {
+		// The names resolve, whichever resolver did it — a genuine PASS even
+		// when resolved is absent.
+		return nil
 	}
-	return nil
+	if resolvedErr != nil {
+		// The manual step and fallback are phrased from the clusters this check
+		// just probed, so the detail follows the probe rather than a second,
+		// independent listing of cluster state.
+		return optionalHostDNSError{detail: hostDNSUnavailableDetail(resolvedErr, probedClusters(clusters))}
+	}
+	return errors.New(strings.Join(problems, "; "))
+}
+
+// probedClusters restates the daemon's cluster summaries as the cluster records
+// the resolved advice is phrased from. EffectiveDomain is already resolved on
+// the summary, so carrying it as the explicit domain keeps the two identical.
+func probedClusters(clusters []daemon.ClusterSummary) []cluster.Cluster {
+	result := make([]cluster.Cluster, 0, len(clusters))
+	for _, item := range clusters {
+		result = append(result, cluster.Cluster{
+			Name: item.Name, Domain: item.EffectiveDomain(), SubnetIndex: item.SubnetIndex,
+		})
+	}
+	return result
 }
 
 func parseGetentAddresses(output []byte) []net.IP {

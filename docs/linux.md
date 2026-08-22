@@ -165,6 +165,12 @@ reads — as well as to the journal, so both `tbx logs` and `journalctl --user -
 Do not use `tbx system install` on Linux. That command currently installs the macOS launchd
 helper; Linux installation is owned by packages and systemd units.
 
+Upgrading `tbx`/`tbxd` can also require a new `tbx-helper`: the helper speaks a versioned
+protocol, and a mismatch is refused with `helper protocol mismatch`. Recover by upgrading the
+`tbx-helper` package (or reinstalling the binary and units as above) and restarting the socket:
+`sudo systemctl restart tbx-helper.socket`. Restarting alone is not enough — the unit relaunches
+the same stale binary.
+
 ## What `tbx doctor` checks on Linux
 
 Run `tbx doctor` once after host setup and again after creating a cluster. Checks that need a
@@ -177,11 +183,11 @@ configured bridge or running cluster report `SKIP` before one exists.
 | `kvm` | `/dev/kvm` exists and is readable+writable | Enable KVM or add the user to the device's group |
 | `qemu` | QEMU meets the 6.2 floor, provides the required machine, and reports suspend availability | Install/upgrade the architecture-specific QEMU package |
 | `forwarding` | IPv4 forwarding is enabled | Repair the host sysctl or restart the helper so desired state is reconverged |
-| `bridge-netfilter` | Docker or another firewall has not combined bridge filtering with a default-DROP `FORWARD` policy | Apply the targeted rule printed by `doctor`; talosbox never edits foreign firewall tables |
+| `bridge-netfilter` | Docker or another firewall has not combined bridge filtering with a default-DROP `FORWARD` policy. Listing the `FORWARD` chain needs root, and a host without `iptables` cannot be inspected at all, so a run that cannot read the chain is a `WARN`, never a `FAIL` | Apply the targeted rule printed by `doctor`; talosbox never edits foreign firewall tables. On the `WARN`, inspect the chain with `sudo iptables -S FORWARD` (or `sudo nft list chain ip filter FORWARD` where `iptables` is not installed) |
 | `bridge-stp` | Each `br-tbx<n>` bridge has STP disabled | Run the exact `ip link ... stp_state 0` command printed by `doctor` |
 | `rp-filter` | Strict reverse-path filtering will not discard VIP traffic on a multi-homed or VPN host | Set loose mode (`2`) as directed, including per-interface values |
 | `port-53`, `port-67`, `port-179` | DNS, DHCP, and optional BGP ports are available on each cluster gateway or already owned by talosbox | Stop the conflicting listener or keep BGP disabled when port 179 is intentionally occupied |
-| `resolver`, `DNS`, `system-dns` | Guest DNS is listening and systemd-resolved routes `~<cluster>.k8s.test` to the cluster gateway | Run the per-link `resolvectl` command printed by `doctor` when resolved registration is unavailable |
+| `resolver`, `DNS`, `system-dns` | Guest DNS is listening and the host actually resolves cluster names — systemd-resolved routes `~<cluster>.k8s.test` to the cluster gateway. `PASS` means the names resolve, and an absent or unreachable systemd-resolved is a `WARN`, never a `PASS`. `resolver` and `DNS` `SKIP` unless a cluster is running (nothing was probed); `system-dns` probes every cluster, so it `SKIP`s only when no cluster exists at all and can `FAIL` while a cluster is merely stopped | Run the per-link `resolvectl` command printed by `doctor` — the same manual step `tbxd` logs. Without systemd-resolved, use the `dig @<gateway> <node>.<domain>` fallback `doctor` prints; guest DNS and by-IP access are unaffected |
 | `routes` | Host routes to live nodes and cluster subnets use the talosbox bridge | Resolve overlapping VPN or host routes and restart the cluster |
 | `inter-cluster` | With more than one cluster running, every cluster's ingress VIP answers from the host **and** from each sibling cluster — the sibling leg is dialled by the `lb-probe` behind each VIP, so it travels the same pod-to-sibling-VIP path a workload would. `SKIP`s with the reason when fewer than two running clusters report a live VIP | `FAIL` names the dead direction (`qa-edge → qa-core VIP 172.30.0.200`). Check the announcement mode of the *target* cluster (`tbx bgp status <cluster>`) and the host route to its VIP; `routes` and `forwarding` can both pass while this path is dead |
 | `host-pressure` | Currently reports `SKIP` because Linux host-pressure sampling is not implemented | Size the default cluster for at least 16 GB RAM and monitor the host separately |
@@ -194,9 +200,17 @@ configured bridge or running cluster report `SKIP` before one exists.
 `FAIL` makes `tbx doctor` exit non-zero. `WARN` identifies a degraded but usable configuration,
 such as QEMU 6.2 without suspend or a host without automatic systemd-resolved registration.
 
+Host-memory readings are macOS-only for the same reason, so memory ballooning is inactive on
+Linux: `tbxd` records one `balloon: manager inactive: …` line in `tbx logs` at startup and never
+polls, and the provision-start host-pressure gate stands down silently instead of warning on every
+operation. Size clusters against the host by hand and watch `free -h` and `swapon --show`.
+
 ## Linux networking and ingress
 
-Each cluster gets a `br-tbx<n>` bridge at `172.30.<n>.1/24` and one tap per node. The helper
+Each cluster gets a `br-tbx<n>` bridge at `172.30.<n>.1/24` and one tap per node. The bridge lives
+exactly as long as the cluster: `tbx cluster destroy` takes it down with the cluster's state — the
+destroy summary reports `host bridge br-tbx<n> removed` — and the freed subnet index goes back to
+the pool, so the next create reuses it instead of climbing to a new subnet. The helper
 serves static DHCP reservations, maintains the talosbox-owned `table inet tbx` for NAT and
 forwarding, binds the cluster DNS listener, and registers the route-only DNS domain with
 systemd-resolved when available. It does not modify foreign nftables tables or a Docker-owned

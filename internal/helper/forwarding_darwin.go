@@ -17,3 +17,8 @@ func enableForwarding() error {
 }
 
 func convergeNetworking() error { return nil }
+
+// TeardownSubnet has nothing to remove on macOS: vmnet owns the shared bridge
+// and reclaims it when the last interface on it goes away, so a destroyed
+// cluster leaves no per-subnet host link behind.
+func TeardownSubnet(int) (bool, error) { return false, nil }

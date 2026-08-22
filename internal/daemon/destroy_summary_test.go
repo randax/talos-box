@@ -2,8 +2,10 @@ package daemon
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -100,5 +102,40 @@ func TestDestroySummaryOfAPartiallyDestroyedClusterCountsWhatIsLeft(t *testing.T
 	}
 	if summary.DiskBytes < 4096 {
 		t.Fatalf("summary diskBytes = %d, want the state that was removed", summary.DiskBytes)
+	}
+}
+
+// Removing a bridge decides whether a live cluster keeps its only link, so the
+// "last cluster on the subnet" condition is checked against remaining state
+// rather than assumed from the destroy that just ran (#445).
+func TestSubnetAllocatedGuardsTheBridgeRelease(t *testing.T) {
+	t.Parallel()
+
+	remaining := []cluster.Cluster{{Name: "other", SubnetIndex: 1}}
+	if subnetAllocated(remaining, 0) {
+		t.Fatal("subnetAllocated() = true for a freed subnet index")
+	}
+	if !subnetAllocated(remaining, 1) {
+		t.Fatal("subnetAllocated() = false for an index another cluster still owns")
+	}
+	if subnetAllocated(nil, 0) {
+		t.Fatal("subnetAllocated() = true with no clusters left")
+	}
+}
+
+// A failed teardown used to be logged and nothing else, so the answer looked
+// exactly like a host that had no bridge to remove (#445).
+func TestBridgeReleaseWarningNamesTheSubnetAndTheReason(t *testing.T) {
+	t.Parallel()
+
+	warning := bridgeReleaseWarning(0, errors.New("bridge br-tbx0 still has tbx0-deadbeef attached"))
+	for _, wanted := range []string{
+		"the host bridge for subnet " + cluster.SubnetCIDR(0),
+		"was not removed",
+		"still has tbx0-deadbeef attached",
+	} {
+		if !strings.Contains(warning, wanted) {
+			t.Fatalf("warning %q missing %q", warning, wanted)
+		}
 	}
 }

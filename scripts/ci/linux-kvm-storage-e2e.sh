@@ -65,6 +65,10 @@ dump_failure_diagnostics() (
   sudo ip neigh show >&2
   sudo bridge link show >&2
   sudo bridge fdb show >&2
+  # The helper's DHCP sockets bind with SO_BINDTODEVICE, so a listener on a
+  # bridge that no longer exists is invisible except here (ip address show
+  # prints each bridge's current ifindex above).
+  sudo ss -ulpn 'sport = :67' >&2
   printf '\n===== host firewall =====\n' >&2
   sudo nft list ruleset >&2
   sudo iptables-save >&2

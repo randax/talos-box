@@ -8,4 +8,6 @@ func newPlatformDHCPManager() dhcpManager { return noopDHCPManager{} }
 
 func (noopDHCPManager) Converge() error { return nil }
 
+func (noopDHCPManager) Release(int) error { return nil }
+
 func (noopDHCPManager) Close() error { return nil }

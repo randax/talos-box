@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -1007,6 +1008,16 @@ type DestroySummary struct {
 	// ResolverWithdrawn is set only for a cluster whose own resolver file the
 	// destroy removed; a cluster on the default domain shares one that stays.
 	ResolverWithdrawn bool `json:"resolverWithdrawn,omitempty"`
+	// BridgeRemoved names the host bridge the destroy took down, and is empty
+	// wherever there was none to take down — a host whose subnet bridge is
+	// vmnet-owned, or one that never built it. Reporting the name is what lets
+	// an operator tell residue from design (#445).
+	BridgeRemoved string `json:"bridgeRemoved,omitempty"`
+	// BridgeWarning carries why a bridge that should have come down did not.
+	// Without it a failed teardown reads exactly like a host that had nothing
+	// to remove — the summary line is simply absent — and the operator has no
+	// reason to go looking (#445).
+	BridgeWarning string `json:"bridgeWarning,omitempty"`
 }
 
 func (s *Server) destroyCluster(raw json.RawMessage) (DestroySummary, error) {
@@ -1034,6 +1045,9 @@ func (s *Server) destroyCluster(raw json.RawMessage) (DestroySummary, error) {
 		summary.Snapshots = len(snapshots)
 	}
 	var customDomain bool
+	// A partially-destroyed cluster (state dir present, cluster.json gone) has
+	// no recorded subnet, so there is no bridge this destroy can claim to own.
+	subnetIndex := -1
 	// stop what we can, but a partially-destroyed cluster (state dir present,
 	// cluster.json gone) must still be removable — and still summarised
 	if item, loadErr := cluster.Load(args.Name); loadErr == nil {
@@ -1041,6 +1055,7 @@ func (s *Server) destroyCluster(raw json.RawMessage) (DestroySummary, error) {
 		summary.Nodes = &nodes
 		summary.Domain = item.EffectiveDomain()
 		customDomain = item.Domain != ""
+		subnetIndex = item.SubnetIndex
 		if err := s.stop(args.Name); err != nil {
 			return DestroySummary{}, err
 		}
@@ -1050,12 +1065,104 @@ func (s *Server) destroyCluster(raw json.RawMessage) (DestroySummary, error) {
 	}
 	s.forgetCluster(args.Name)
 	s.invalidateStoragePhaseLocked(args.Name)
+	if subnetIndex >= 0 && hostBridgeGOOS == "linux" {
+		bridge, err := releaseSubnetBridge(subnetIndex)
+		if err != nil {
+			log.Printf("release host bridge for %s subnet %s: %v", args.Name, cluster.SubnetCIDR(subnetIndex), err)
+			summary.BridgeWarning = bridgeReleaseWarning(subnetIndex, err)
+		}
+		summary.BridgeRemoved = bridge
+	}
 	if err := SyncResolverFiles(); err != nil {
 		log.Printf("resolver files after destroying %s: %v", args.Name, err)
 	} else {
 		summary.ResolverWithdrawn = customDomain
 	}
 	return summary, nil
+}
+
+// hostBridgeGOOS is the host platform the destroy's bridge release applies to.
+// Only Linux owns a per-cluster bridge; macOS hands the subnet to vmnet, so
+// there is nothing to take down and nothing to warn about. It is a variable so
+// a test can exercise the Linux path from any host.
+var hostBridgeGOOS = runtime.GOOS
+
+// bridgeReleaseWarning phrases a failed teardown for the operator. A missing
+// summary line reads exactly like a host that had nothing to remove, so the
+// reason has to travel with the answer rather than only to tbxd.log (#445).
+func bridgeReleaseWarning(subnetIndex int, cause error) string {
+	return fmt.Sprintf(
+		"the host bridge for subnet %s was not removed: %v; a leftover bridge keeps the gateway address, so the next create moves to another subnet",
+		cluster.SubnetCIDR(subnetIndex), cause,
+	)
+}
+
+// bridgeReleaseHelper is the slice of the host helper a bridge release uses:
+// withdraw the subnet's resolver registration, then take the link down.
+type bridgeReleaseHelper interface {
+	UnregisterDNS(subnetIndex int) error
+	TeardownSubnet(subnetIndex int) (bool, error)
+	Close() error
+}
+
+// connectBridgeHelper is the release's helper connection, and the seam tests
+// pin it through — the same shape as connectBGPHelper. It has to be a seam
+// rather than a direct helper.Connect: the Linux client socket lives in
+// /run/user/<uid>, not under $HOME, so the daemon tests' HOME isolation cannot
+// contain it, and `go test ./internal/daemon` on a host with the helper
+// installed would send a real dns.unregister and net.teardown for a live
+// cluster's subnet (#445 follow-up). The package's TestMain pins it, so every
+// test is hermetic by default and a test about the wiring installs its own
+// recording client.
+var connectBridgeHelper = func() (bridgeReleaseHelper, error) { return helper.Connect() }
+
+// releaseSubnetBridge removes the host bridge a destroyed cluster's subnet
+// leaves behind, and returns its name when there was one to remove. Without
+// this the bridge keeps the subnet's gateway address, subnet allocation reads
+// that address as a collision, and every create climbs to a fresh index
+// (#445). Best-effort: the state is already gone, so a helper that cannot take
+// the bridge down must not fail the destroy.
+func releaseSubnetBridge(subnetIndex int) (string, error) {
+	clusters, err := cluster.List()
+	if err != nil {
+		return "", fmt.Errorf("skip host bridge release: %w", err)
+	}
+	if subnetAllocated(clusters, subnetIndex) {
+		return "", nil
+	}
+	client, err := connectBridgeHelper()
+	if err != nil {
+		return "", fmt.Errorf("skip host bridge release: %w", err)
+	}
+	defer func() { _ = client.Close() }()
+	// Withdraw the resolver registration before the link it names disappears.
+	// The DNS reconciler would withdraw it anyway, and tolerates an absent
+	// link, but doing it in order keeps the host's resolver state ahead of the
+	// teardown instead of behind it.
+	if err := client.UnregisterDNS(subnetIndex); err != nil {
+		log.Printf("withdraw DNS registration for subnet %s before host bridge release: %v", cluster.SubnetCIDR(subnetIndex), err)
+	}
+	removed, err := client.TeardownSubnet(subnetIndex)
+	if err != nil {
+		return "", err
+	}
+	if !removed {
+		return "", nil
+	}
+	return cluster.LinuxBridgeName(subnetIndex), nil
+}
+
+// subnetAllocated reports whether any remaining cluster still owns a subnet
+// index. Allocation gives an index to one cluster at a time, so this is only
+// ever true for a destroy racing a create — checked rather than assumed,
+// because the answer decides whether a live cluster's bridge comes down.
+func subnetAllocated(clusters []cluster.Cluster, subnetIndex int) bool {
+	for _, item := range clusters {
+		if item.SubnetIndex == subnetIndex {
+			return true
+		}
+	}
+	return false
 }
 
 // directoryBytes sums what the files under dir occupy on disk. Node disks are

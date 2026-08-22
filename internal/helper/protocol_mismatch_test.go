@@ -2,11 +2,26 @@ package helper
 
 import (
 	"errors"
+	"runtime"
 	"strings"
 	"testing"
 )
 
-func TestProtocolMismatchErrorRecommendsSystemInstall(t *testing.T) {
+// hostAdviceCommand is the command this host's advice has to carry: macOS
+// reinstalls the launchd helper through `tbx system install`, Linux upgrades
+// the package and restarts the socket (docs/linux.md forbids `system install`
+// there). The message tests pin this alongside protocolMismatchAdvice(),
+// because comparing a message against the advice function is a tautology — it
+// holds even if the advice loses its command entirely — while this fails on
+// whichever GOOS runs the tests.
+func hostAdviceCommand() string {
+	if runtime.GOOS == "linux" {
+		return "systemctl restart tbx-helper.socket"
+	}
+	return "tbx system install"
+}
+
+func TestProtocolMismatchErrorRecommendsAHelperReinstall(t *testing.T) {
 	t.Parallel()
 
 	err := protocolMismatchError(2, 1)
@@ -17,8 +32,11 @@ func TestProtocolMismatchErrorRecommendsSystemInstall(t *testing.T) {
 	if !strings.Contains(message, "(client 2, helper 1)") {
 		t.Errorf("message %q missing version facts", message)
 	}
-	if !strings.Contains(message, "tbx system install") {
-		t.Errorf("message %q missing system install remediation", message)
+	if !strings.Contains(message, protocolMismatchAdvice()) {
+		t.Errorf("message %q missing the host's reinstall remediation", message)
+	}
+	if !strings.Contains(message, hostAdviceCommand()) {
+		t.Errorf("message %q missing the host's remediation command %q", message, hostAdviceCommand())
 	}
 	if strings.Contains(message, "restart the helper") {
 		t.Errorf("message %q still recommends restarting the helper", message)
@@ -41,8 +59,11 @@ func TestProtocolHandshakeFailureDoesNotDoubleWrapMismatch(t *testing.T) {
 	if !strings.Contains(message, "(client 2, helper 1)") {
 		t.Errorf("message %q missing version facts", message)
 	}
-	if !strings.Contains(message, "tbx system install") {
-		t.Errorf("message %q missing system install remediation", message)
+	if !strings.Contains(message, protocolMismatchAdvice()) {
+		t.Errorf("message %q missing the host's reinstall remediation", message)
+	}
+	if !strings.Contains(message, hostAdviceCommand()) {
+		t.Errorf("message %q missing the host's remediation command %q", message, hostAdviceCommand())
 	}
 	if strings.Contains(message, "restart the helper") {
 		t.Errorf("message %q still recommends restarting the helper", message)
@@ -58,8 +79,11 @@ func TestProtocolHandshakeFailureDoesNotDoubleWrapCurrentMismatch(t *testing.T) 
 	if count := strings.Count(message, "helper protocol mismatch"); count != 1 {
 		t.Errorf("message %q repeats the mismatch prefix %d times, want 1", message, count)
 	}
-	if count := strings.Count(message, "tbx system install"); count != 1 {
+	if count := strings.Count(message, protocolMismatchAdvice()); count != 1 {
 		t.Errorf("message %q repeats the remediation %d times, want 1", message, count)
+	}
+	if count := strings.Count(message, hostAdviceCommand()); count != 1 {
+		t.Errorf("message %q repeats the remediation command %d times, want 1", message, count)
 	}
 	if !strings.Contains(message, "(client 2, helper 3)") {
 		t.Errorf("message %q missing version facts", message)
@@ -77,8 +101,11 @@ func TestProtocolHandshakeFailureWrapsForeignDetailOnce(t *testing.T) {
 	if !strings.Contains(message, `unknown operation "helper.info"`) {
 		t.Errorf("message %q missing helper detail", message)
 	}
-	if !strings.Contains(message, "tbx system install") {
-		t.Errorf("message %q missing system install remediation", message)
+	if !strings.Contains(message, protocolMismatchAdvice()) {
+		t.Errorf("message %q missing the host's reinstall remediation", message)
+	}
+	if !strings.Contains(message, hostAdviceCommand()) {
+		t.Errorf("message %q missing the host's remediation command %q", message, hostAdviceCommand())
 	}
 }
 
@@ -101,6 +128,30 @@ func TestProtocolMismatchAdviceQuotesPathsWithSpaces(t *testing.T) {
 	}
 }
 
+// `tbx system install` installs the macOS launchd helper, which docs/linux.md
+// forbids on Linux: a Linux upgrader hitting the protocol bump has to be sent
+// to the package/systemd path instead (#448 follow-up).
+func TestProtocolMismatchAdviceFollowsTheHostInstallMechanism(t *testing.T) {
+	t.Parallel()
+
+	linux := protocolMismatchAdviceForGOOS("linux", "/usr/bin/tbxd", nil)
+	if strings.Contains(linux, "system install") {
+		t.Errorf("Linux advice %q sends the operator to `tbx system install`", linux)
+	}
+	if !strings.Contains(linux, "tbx-helper") || !strings.Contains(linux, "systemctl restart tbx-helper.socket") {
+		t.Errorf("Linux advice %q missing the package upgrade and socket restart", linux)
+	}
+
+	darwin := protocolMismatchAdviceForGOOS("darwin", "/opt/talosbox/bin/tbxd", nil)
+	if !strings.Contains(darwin, "sudo /opt/talosbox/bin/tbx system install") {
+		t.Errorf("macOS advice %q changed", darwin)
+	}
+
+	if runtime.GOOS == "linux" && protocolMismatchAdvice() != linux {
+		t.Errorf("advice on this host = %q, want the Linux advice", protocolMismatchAdvice())
+	}
+}
+
 func TestProtocolHandshakeFailureEmptyDetail(t *testing.T) {
 	t.Parallel()
 
@@ -108,7 +159,10 @@ func TestProtocolHandshakeFailureEmptyDetail(t *testing.T) {
 	if !strings.Contains(message, "helper rejected the version handshake") {
 		t.Errorf("message %q missing default detail", message)
 	}
-	if !strings.Contains(message, "tbx system install") {
-		t.Errorf("message %q missing system install remediation", message)
+	if !strings.Contains(message, protocolMismatchAdvice()) {
+		t.Errorf("message %q missing the host's reinstall remediation", message)
+	}
+	if !strings.Contains(message, hostAdviceCommand()) {
+		t.Errorf("message %q missing the host's remediation command %q", message, hostAdviceCommand())
 	}
 }

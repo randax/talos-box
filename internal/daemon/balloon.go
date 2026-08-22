@@ -204,6 +204,14 @@ func (s *Server) checkOvercommit(addMiB int, force bool) (string, error) {
 func (s *Server) checkHostPressure(path string, force bool) ([]string, error) {
 	snapshot, err := s.pressureSnapshot(path)
 	if err != nil {
+		// A platform with no host-pressure probe has not failed a measurement,
+		// it has none to take — `tbx doctor` reports that as SKIP. Warning on
+		// it would put the same line on every single operation, so the gate
+		// stands down silently and only a real probe failure on a platform that
+		// does have one still warns (#446).
+		if errors.Is(err, hostpressure.ErrUnsupported) {
+			return nil, nil
+		}
 		return []string{fmt.Sprintf("host-pressure probe failed: %v; proceeding without host-pressure protection", err)}, nil
 	}
 	// hostpressure.Assess is the shared classification: tbx doctor reports the

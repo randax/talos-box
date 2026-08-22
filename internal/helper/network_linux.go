@@ -43,6 +43,13 @@ func StartInterface(subnetIndex int, clusterName, node string) (*platformAttachm
 	}, nil
 }
 
+// TeardownSubnet removes the host bridge for a subnet no cluster owns any more,
+// taking its gateway address with it. It reports whether a bridge was removed,
+// so a caller can tell residue from a host that never had one.
+func TeardownSubnet(subnetIndex int) (bool, error) {
+	return teardownLinuxBridge(linuxNetwork, subnetIndex)
+}
+
 func convergeNetworking() error {
 	configured, err := configuredLinuxSubnetIndexes()
 	if err != nil {
@@ -238,6 +245,36 @@ func (realLinuxNetworkOps) EnsureBridge(name string) error {
 		return fmt.Errorf("interface %s is not owned by Talos Box; refusing to modify it", name)
 	}
 	return nil
+}
+
+func (realLinuxNetworkOps) DeleteBridge(name string) (bool, error) {
+	// A single lookup keeps absent-is-success race-free: requireLinuxBridge
+	// wraps the netlink error, so a bridge that is already gone surfaces here
+	// rather than failing a second lookup.
+	bridge, err := requireLinuxBridge(name)
+	if err != nil {
+		var notFound netlink.LinkNotFoundError
+		if errors.As(err, &notFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	links, err := netlink.LinkList()
+	if err != nil {
+		return false, fmt.Errorf("dump links while removing bridge %s: %w", name, err)
+	}
+	// Subnets are allocated one cluster at a time, so a tap still enslaved here
+	// belongs to a VM that outlived its cluster state; deleting the bridge under
+	// it would cut a live guest's only link.
+	for _, link := range links {
+		if link.Attrs().MasterIndex == bridge.Attrs().Index {
+			return false, fmt.Errorf("bridge %s still has %s attached; stop the VM before removing it", name, link.Attrs().Name)
+		}
+	}
+	if err := netlink.LinkDel(bridge); err != nil {
+		return false, fmt.Errorf("delete bridge %s: %w", name, err)
+	}
+	return true, nil
 }
 
 func (realLinuxNetworkOps) EnsureBridgeSTP(name string, enabled bool) error {

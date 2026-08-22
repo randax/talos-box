@@ -2,6 +2,9 @@ package helper
 
 type dhcpManager interface {
 	Converge() error
+	// Release stops the DHCP server bound to a subnet's bridge, so a bridge
+	// rebuilt under the same name is served by a freshly bound socket.
+	Release(subnetIndex int) error
 	Close() error
 }
 

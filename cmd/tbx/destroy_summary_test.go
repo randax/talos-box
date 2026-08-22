@@ -105,6 +105,64 @@ func TestDestroyClusterSummaryKeepsAKnownZeroNodeCount(t *testing.T) {
 	}
 }
 
+// The Linux bridge and its gateway address used to survive a destroy, and the
+// summary said nothing about it — leaving an operator no way to tell residue
+// from design (#445).
+func TestDestroyClusterSummaryReportsTheHostBridgeItRemoved(t *testing.T) {
+	_, command := newDestroyTestCLI(t, []daemon.Response{
+		{OK: true, Data: json.RawMessage(`{}`)},
+		{OK: true, Data: json.RawMessage(`{"name":"demo","nodes":3,"diskBytes":4096,"bridgeRemoved":"br-tbx0"}`)},
+	})
+
+	if err := command.destroyCluster([]string{"demo", "--force"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if out := command.out.(*bytes.Buffer).String(); !strings.Contains(out, "host bridge br-tbx0 removed") {
+		t.Fatalf("destroy summary missing the bridge line:\n%s", out)
+	}
+}
+
+// macOS has no per-cluster host bridge to remove, so the summary must not
+// invent a line for one.
+func TestDestroyClusterSummaryOmitsTheBridgeLineWhenThereWasNone(t *testing.T) {
+	_, command := newDestroyTestCLI(t, []daemon.Response{
+		{OK: true, Data: json.RawMessage(`{}`)},
+		{OK: true, Data: json.RawMessage(`{"name":"demo","nodes":3,"diskBytes":4096}`)},
+	})
+
+	if err := command.destroyCluster([]string{"demo", "--force"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if out := command.out.(*bytes.Buffer).String(); strings.Contains(out, "host bridge") {
+		t.Fatalf("destroy summary invented a bridge line:\n%s", out)
+	}
+}
+
+// A failed teardown used to reach tbxd.log alone, so the CLI output was
+// identical to a host that had nothing to remove (#445).
+func TestDestroyClusterWarnsWhenTheHostBridgeCouldNotBeRemoved(t *testing.T) {
+	_, command := newDestroyTestCLI(t, []daemon.Response{
+		{OK: true, Data: json.RawMessage(`{}`)},
+		{OK: true, Data: json.RawMessage(`{"name":"demo","nodes":3,"diskBytes":4096,` +
+			`"bridgeWarning":"the host bridge for subnet 172.30.0.0/24 was not removed: bridge br-tbx0 still has tbx0-deadbeef attached"}`)},
+	})
+
+	if err := command.destroyCluster([]string{"demo", "--force"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if out := command.out.(*bytes.Buffer).String(); strings.Contains(out, "host bridge br-tbx0 removed") {
+		t.Fatalf("destroy summary claimed a removal that failed:\n%s", out)
+	}
+	warnings := command.err.(*bytes.Buffer).String()
+	if !strings.Contains(warnings, "warning: the host bridge for subnet 172.30.0.0/24 was not removed") ||
+		!strings.Contains(warnings, "still has tbx0-deadbeef attached") {
+		t.Fatalf("destroy hid the teardown failure:\n%s", warnings)
+	}
+}
+
 func TestHumanBytes(t *testing.T) {
 	for _, test := range []struct {
 		bytes int64

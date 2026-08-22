@@ -1,6 +1,7 @@
 package balloon
 
 import (
+	"errors"
 	"log"
 	"os"
 	"sort"
@@ -98,6 +99,10 @@ type Config struct {
 	// bringup squeeze the pre-balloon exists to prevent. Nil means nothing is
 	// held.
 	HoldMiB func() int
+	// HostFreeMiB is the host-memory probe the poll loop reads. Nil means the
+	// platform probe (HostFreeMiB). It is a seam so a build that *has* a probe
+	// can still exercise the platform that has none (#446).
+	HostFreeMiB func() (int, error)
 }
 
 // DefaultConfig is the G3-tuned default: 6 GiB host reserve, 1 GiB per-node
@@ -121,9 +126,23 @@ func Run(cfg Config, vms func() map[string]Balloonable, stop <-chan struct{}) {
 
 // RunWithLogger is Run with an explicit telemetry sink. It emits a startup
 // line so tbxd.log attests that the subsystem is running even while every
-// node sits at its configured size, then one line per target change.
+// node sits at its configured size, then one line per target change. On a
+// platform whose host-memory probe is unsupported it emits a single inactivity
+// line instead and returns.
 func RunWithLogger(cfg Config, vms func() map[string]Balloonable, stop <-chan struct{}, logger Logger) {
 	m := NewManager(logger)
+	probe := cfg.HostFreeMiB
+	if probe == nil {
+		probe = HostFreeMiB
+	}
+	// The capability is checked once, before the loop: on a platform with no
+	// host-memory probe there is nothing to poll, so the manager states it is
+	// inactive and stands down rather than logging a failing read every poll
+	// forever on the file `tbx logs` points operators at (#446).
+	if _, err := probe(); errors.Is(err, ErrUnsupported) {
+		m.log("balloon: manager inactive: %v", err)
+		return
+	}
 	m.log("balloon: manager started (reserve=%dMiB floor=%dMiB poll=%s)", cfg.ReserveMiB, cfg.FloorMiB, cfg.PollInterval)
 	ticker := time.NewTicker(cfg.PollInterval)
 	defer ticker.Stop()
@@ -132,7 +151,7 @@ func RunWithLogger(cfg Config, vms func() map[string]Balloonable, stop <-chan st
 		case <-stop:
 			return
 		case <-ticker.C:
-			free, err := HostFreeMiB()
+			free, err := probe()
 			if err != nil {
 				m.log("balloon: read host memory: %v", err)
 				continue

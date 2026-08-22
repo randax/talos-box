@@ -153,7 +153,11 @@ func TestRunLogsStartupLine(t *testing.T) {
 	rec := &recordingLog{}
 	stop := make(chan struct{})
 	close(stop)
-	RunWithLogger(Config{ReserveMiB: 6144, FloorMiB: 1024, PollInterval: time.Hour},
+	// The probe is stubbed because the manager capability-checks it before it
+	// logs anything: this test is about the startup line on a platform that has
+	// a host-memory probe, and only a darwin build has the real one.
+	RunWithLogger(Config{ReserveMiB: 6144, FloorMiB: 1024, PollInterval: time.Hour,
+		HostFreeMiB: func() (int, error) { return 8192, nil }},
 		func() map[string]Balloonable { return nil }, stop, rec.Printf)
 	got := rec.snapshot()
 	if len(got) != 1 || !strings.Contains(got[0], "balloon: manager started") {
@@ -212,5 +216,97 @@ func TestHoldNeverRaisesTheHostFreeReading(t *testing.T) {
 	}
 	if got := holdAdjustedFreeMiB(8192, reserve, 0); got != 8192 {
 		t.Errorf("holdAdjustedFreeMiB(8192, %d, 0) = %d, want the reading untouched with nothing held", reserve, got)
+	}
+}
+
+// #446: on a platform with no host-memory probe the manager must not poll. It
+// used to log a failing read every 5s forever, which drowned tbxd.log — the
+// file `tbx logs` points operators at — on every non-macOS host.
+func TestRunStandsDownWhenTheHostProbeIsUnsupported(t *testing.T) {
+	rec := &recordingLog{}
+	probes := 0
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		RunWithLogger(Config{
+			ReserveMiB:   6144,
+			FloorMiB:     1024,
+			PollInterval: time.Millisecond,
+			HostFreeMiB:  func() (int, error) { probes++; return 0, ErrUnsupported },
+		}, func() map[string]Balloonable { return nil }, make(chan struct{}), rec.Printf)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunWithLogger kept polling an unsupported host probe; want it to stand down")
+	}
+	got := rec.snapshot()
+	if len(got) != 1 || !strings.Contains(got[0], "balloon: manager inactive") {
+		t.Fatalf("lines = %v, want one manager-inactive line", got)
+	}
+	if !strings.Contains(got[0], ErrUnsupported.Error()) {
+		t.Errorf("inactive line %q does not state why", got[0])
+	}
+	if probes != 1 {
+		t.Errorf("probed the host %d times, want exactly the one capability check", probes)
+	}
+}
+
+// A wrapped sentinel still counts as a missing capability: probes wrap their
+// errors, and string matching is what this replaced.
+func TestRunStandsDownOnAWrappedUnsupportedError(t *testing.T) {
+	rec := &recordingLog{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		RunWithLogger(Config{PollInterval: time.Millisecond,
+			HostFreeMiB: func() (int, error) { return 0, fmt.Errorf("host memory: %w", ErrUnsupported) },
+		}, func() map[string]Balloonable { return nil }, make(chan struct{}), rec.Printf)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunWithLogger did not stand down on a wrapped ErrUnsupported")
+	}
+	if got := rec.snapshot(); len(got) != 1 || !strings.Contains(got[0], "manager inactive") {
+		t.Fatalf("lines = %v, want one manager-inactive line", got)
+	}
+}
+
+// A real probe failure on a platform that HAS a probe is transient: the manager
+// starts, reports the failed read, and keeps polling.
+func TestRunKeepsPollingAfterARealProbeFailure(t *testing.T) {
+	rec := &recordingLog{}
+	stop := make(chan struct{})
+	reads := make(chan struct{}, 8)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		RunWithLogger(Config{ReserveMiB: 6144, FloorMiB: 1024, PollInterval: time.Millisecond,
+			HostFreeMiB: func() (int, error) {
+				select {
+				case reads <- struct{}{}:
+				default:
+				}
+				return 0, errors.New("vm_stat: signal: killed")
+			},
+		}, func() map[string]Balloonable { return nil }, stop, rec.Printf)
+	}()
+	// Two polls past the startup capability check prove the loop is running.
+	for i := 0; i < 3; i++ {
+		select {
+		case <-reads:
+		case <-time.After(2 * time.Second):
+			t.Fatal("the manager stopped polling after a transient probe failure")
+		}
+	}
+	close(stop)
+	<-done
+	got := rec.snapshot()
+	if len(got) < 2 || !strings.Contains(got[0], "balloon: manager started") {
+		t.Fatalf("lines = %v, want a manager-started line then read failures", got)
+	}
+	if !strings.Contains(got[1], "balloon: read host memory") {
+		t.Errorf("second line = %q, want the read failure reported", got[1])
 	}
 }

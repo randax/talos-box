@@ -23,7 +23,10 @@ const (
 	shutdownStopInitialRetryDelay = 25 * time.Millisecond
 )
 
-var startInterface = StartInterface
+var (
+	startInterface = StartInterface
+	teardownSubnet = TeardownSubnet
+)
 
 type attachmentKey struct {
 	cluster string
@@ -312,6 +315,8 @@ func (s *Server) handle(request Request) (any, int, func(), error) {
 		return s.attach(request.Args)
 	case "net.detach":
 		return nil, -1, nil, s.detach(request.Args)
+	case "net.teardown":
+		return s.teardownNetwork(request.Args)
 	case "dns.install":
 		var args struct {
 			Port int `json:"port"`
@@ -432,6 +437,43 @@ func (s *Server) attach(raw json.RawMessage) (any, int, func(), error) {
 		}
 	}
 	return map[string]any{"cluster": args.Cluster, "node": args.Node, "kind": attachment.Kind}, attachment.FD, cleanup, nil
+}
+
+// teardownNetwork removes the host networking a subnet's last cluster leaves
+// behind. The socket boundary cannot prove the owning cluster is gone — cluster
+// state lives in the calling user's home, not the helper's — so the guarantee
+// is the primitive's own: DeleteBridge refuses a bridge that still has links
+// enslaved (a live VM's only path), and an absent bridge is success. The
+// destroy path stops the cluster's VMs, which detaches their taps, before it
+// asks for this.
+//
+// The subnet's DHCP server goes with the bridge: its socket is bound to that
+// bridge's ifindex, so a bridge rebuilt under the same name — the point of
+// removing it, subnet indexes are reused — would be served by a socket
+// listening on an interface that no longer exists. The release only follows a
+// bridge that is gone (removed, or already absent); a refusal means a live VM
+// is still enslaved, and that cluster keeps its DHCP.
+func (s *Server) teardownNetwork(raw json.RawMessage) (any, int, func(), error) {
+	var args struct {
+		SubnetIndex *int `json:"subnetIndex"`
+	}
+	if err := decodeArgs(raw, &args); err != nil {
+		return nil, -1, nil, err
+	}
+	if args.SubnetIndex == nil {
+		return nil, -1, nil, errors.New("subnetIndex is required")
+	}
+	if *args.SubnetIndex < 0 || *args.SubnetIndex > 255 {
+		return nil, -1, nil, fmt.Errorf("subnet index %d is outside 0..255", *args.SubnetIndex)
+	}
+	removed, err := teardownSubnet(*args.SubnetIndex)
+	if err != nil {
+		return nil, -1, nil, err
+	}
+	if err := s.dhcp.Release(*args.SubnetIndex); err != nil {
+		return nil, -1, nil, err
+	}
+	return map[string]bool{"removed": removed}, -1, nil, nil
 }
 
 func validateBGPEnableArgs(cluster string, subnetIndex *int, localASN, peerASN uint32) error {

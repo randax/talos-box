@@ -48,7 +48,7 @@ func TestConnectRejectsProtocolVersionMismatch(t *testing.T) {
 		_ = client.Close()
 		t.Fatal("Connect() succeeded")
 	}
-	if err == nil || !strings.Contains(err.Error(), "tbx system install") {
+	if err == nil || !strings.Contains(err.Error(), hostAdviceCommand()) {
 		t.Fatalf("Connect() error = %v, want reinstall guidance", err)
 	}
 	<-done
@@ -286,7 +286,7 @@ func TestConnectRejectsHelperPredatingBGPRouteReporting(t *testing.T) {
 	if !errors.Is(err, errProtocolMismatch) {
 		t.Fatalf("Connect() error = %v, want a protocol mismatch", err)
 	}
-	if !strings.Contains(err.Error(), "tbx system install") {
+	if !strings.Contains(err.Error(), hostAdviceCommand()) {
 		t.Fatalf("Connect() error = %v, want reinstall guidance", err)
 	}
 	<-done
