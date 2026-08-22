@@ -420,8 +420,10 @@ func TestLinuxPlatformDoctorFindingsBridgeNetfilterWarnsOnPermissionTextWithOthe
 	}
 }
 
-// A host without iptables cannot be inspected through it: that is a "cannot
-// inspect" case, not evidence of a broken FORWARD policy (#448).
+// A host whose PATH has no iptables cannot be inspected through it: that is a
+// "cannot inspect" case, not evidence of a broken FORWARD policy (#448). The
+// wording must stay at "not found on PATH" — a missing binary and a shell
+// without /usr/sbin are indistinguishable here.
 func TestLinuxPlatformDoctorFindingsBridgeNetfilterWarnsWithoutIPTables(t *testing.T) {
 	t.Parallel()
 
@@ -432,7 +434,9 @@ func TestLinuxPlatformDoctorFindingsBridgeNetfilterWarnsWithoutIPTables(t *testi
 		},
 	)
 	if finding.level != "WARN" ||
-		!strings.Contains(finding.detail, "iptables is not installed") ||
+		!strings.Contains(finding.detail, "iptables was not found on PATH") ||
+		strings.Contains(finding.detail, "not installed") ||
+		!strings.Contains(finding.detail, "sudo iptables -S FORWARD") ||
 		!strings.Contains(finding.detail, "sudo nft list chain ip filter FORWARD") {
 		t.Fatalf("finding = %+v", finding)
 	}

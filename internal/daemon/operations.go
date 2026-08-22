@@ -1097,6 +1097,25 @@ func bridgeReleaseWarning(subnetIndex int, cause error) string {
 	)
 }
 
+// bridgeReleaseHelper is the slice of the host helper a bridge release uses:
+// withdraw the subnet's resolver registration, then take the link down.
+type bridgeReleaseHelper interface {
+	UnregisterDNS(subnetIndex int) error
+	TeardownSubnet(subnetIndex int) (bool, error)
+	Close() error
+}
+
+// connectBridgeHelper is the release's helper connection, and the seam tests
+// pin it through — the same shape as connectBGPHelper. It has to be a seam
+// rather than a direct helper.Connect: the Linux client socket lives in
+// /run/user/<uid>, not under $HOME, so the daemon tests' HOME isolation cannot
+// contain it, and `go test ./internal/daemon` on a host with the helper
+// installed would send a real dns.unregister and net.teardown for a live
+// cluster's subnet (#445 follow-up). The package's TestMain pins it, so every
+// test is hermetic by default and a test about the wiring installs its own
+// recording client.
+var connectBridgeHelper = func() (bridgeReleaseHelper, error) { return helper.Connect() }
+
 // releaseSubnetBridge removes the host bridge a destroyed cluster's subnet
 // leaves behind, and returns its name when there was one to remove. Without
 // this the bridge keeps the subnet's gateway address, subnet allocation reads
@@ -1111,7 +1130,7 @@ func releaseSubnetBridge(subnetIndex int) (string, error) {
 	if subnetAllocated(clusters, subnetIndex) {
 		return "", nil
 	}
-	client, err := helper.Connect()
+	client, err := connectBridgeHelper()
 	if err != nil {
 		return "", fmt.Errorf("skip host bridge release: %w", err)
 	}

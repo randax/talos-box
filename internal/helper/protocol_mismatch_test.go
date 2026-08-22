@@ -7,6 +7,20 @@ import (
 	"testing"
 )
 
+// hostAdviceCommand is the command this host's advice has to carry: macOS
+// reinstalls the launchd helper through `tbx system install`, Linux upgrades
+// the package and restarts the socket (docs/linux.md forbids `system install`
+// there). The message tests pin this alongside protocolMismatchAdvice(),
+// because comparing a message against the advice function is a tautology — it
+// holds even if the advice loses its command entirely — while this fails on
+// whichever GOOS runs the tests.
+func hostAdviceCommand() string {
+	if runtime.GOOS == "linux" {
+		return "systemctl restart tbx-helper.socket"
+	}
+	return "tbx system install"
+}
+
 func TestProtocolMismatchErrorRecommendsAHelperReinstall(t *testing.T) {
 	t.Parallel()
 
@@ -20,6 +34,9 @@ func TestProtocolMismatchErrorRecommendsAHelperReinstall(t *testing.T) {
 	}
 	if !strings.Contains(message, protocolMismatchAdvice()) {
 		t.Errorf("message %q missing the host's reinstall remediation", message)
+	}
+	if !strings.Contains(message, hostAdviceCommand()) {
+		t.Errorf("message %q missing the host's remediation command %q", message, hostAdviceCommand())
 	}
 	if strings.Contains(message, "restart the helper") {
 		t.Errorf("message %q still recommends restarting the helper", message)
@@ -45,6 +62,9 @@ func TestProtocolHandshakeFailureDoesNotDoubleWrapMismatch(t *testing.T) {
 	if !strings.Contains(message, protocolMismatchAdvice()) {
 		t.Errorf("message %q missing the host's reinstall remediation", message)
 	}
+	if !strings.Contains(message, hostAdviceCommand()) {
+		t.Errorf("message %q missing the host's remediation command %q", message, hostAdviceCommand())
+	}
 	if strings.Contains(message, "restart the helper") {
 		t.Errorf("message %q still recommends restarting the helper", message)
 	}
@@ -61,6 +81,9 @@ func TestProtocolHandshakeFailureDoesNotDoubleWrapCurrentMismatch(t *testing.T) 
 	}
 	if count := strings.Count(message, protocolMismatchAdvice()); count != 1 {
 		t.Errorf("message %q repeats the remediation %d times, want 1", message, count)
+	}
+	if count := strings.Count(message, hostAdviceCommand()); count != 1 {
+		t.Errorf("message %q repeats the remediation command %d times, want 1", message, count)
 	}
 	if !strings.Contains(message, "(client 2, helper 3)") {
 		t.Errorf("message %q missing version facts", message)
@@ -80,6 +103,9 @@ func TestProtocolHandshakeFailureWrapsForeignDetailOnce(t *testing.T) {
 	}
 	if !strings.Contains(message, protocolMismatchAdvice()) {
 		t.Errorf("message %q missing the host's reinstall remediation", message)
+	}
+	if !strings.Contains(message, hostAdviceCommand()) {
+		t.Errorf("message %q missing the host's remediation command %q", message, hostAdviceCommand())
 	}
 }
 
@@ -135,5 +161,8 @@ func TestProtocolHandshakeFailureEmptyDetail(t *testing.T) {
 	}
 	if !strings.Contains(message, protocolMismatchAdvice()) {
 		t.Errorf("message %q missing the host's reinstall remediation", message)
+	}
+	if !strings.Contains(message, hostAdviceCommand()) {
+		t.Errorf("message %q missing the host's remediation command %q", message, hostAdviceCommand())
 	}
 }

@@ -357,14 +357,18 @@ func linuxBridgeNetfilterFinding(readFile func(string) ([]byte, error), command 
 	}
 	rules, err := command("iptables", "-S", "FORWARD")
 	if err != nil {
-		// A host without iptables cannot be inspected through it at all. That
-		// says nothing about how FORWARD is configured, so it must not fail an
-		// otherwise healthy host (#448).
+		// A host whose PATH has no iptables cannot be inspected through it at
+		// all. That says nothing about how FORWARD is configured, so it must
+		// not fail an otherwise healthy host (#448). "not on PATH" is as much
+		// as the probe knows: on Debian and Ubuntu the binary usually exists
+		// and it is a non-root shell's PATH that omits /usr/sbin, so claiming
+		// it is not installed would send the operator to install what they
+		// already have.
 		if errors.Is(err, exec.ErrNotFound) {
 			finding.level = "WARN"
 			finding.detail = fmt.Sprintf(
-				"br_netfilter is active but iptables is not installed, so the FORWARD policy cannot be read; install iptables and re-run, or inspect the chain with `%s`",
-				doctorNFTForwardPolicyInspect,
+				"br_netfilter is active but iptables was not found on PATH, so the FORWARD policy cannot be read; read it with `%s` (a non-root shell often omits /usr/sbin), or inspect the chain with `%s`",
+				doctorForwardPolicyInspect, doctorNFTForwardPolicyInspect,
 			)
 			return finding
 		}
