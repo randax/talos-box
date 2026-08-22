@@ -30,6 +30,12 @@ func checkLinuxDirectDNS(
 	if err != nil {
 		return fmt.Errorf("list clusters: %w", err)
 	}
+	if len(clusters) == 0 {
+		// Nothing was probed, so there is nothing to pass: a PASS here reads as
+		// "cluster names resolve", which is exactly the claim doctor must not
+		// make without evidence (#447).
+		return skippedDoctorCheck{detail: "no clusters are running"}
+	}
 	var result error
 	for _, item := range clusters {
 		bridge := cluster.LinuxBridgeName(item.SubnetIndex)
@@ -74,23 +80,8 @@ func classifySystemDNSFailure(err error) (string, string) {
 
 func resolvedUnavailableDetail(cause error) string {
 	clusters, err := cluster.List()
-	if err != nil || len(clusters) == 0 {
-		return fmt.Sprintf("systemd-resolved is unavailable (%v); host cluster names require resolved, while guests and by-IP access remain available", cause)
+	if err != nil {
+		return hostDNSUnavailableDetail(cause, nil)
 	}
-	return fmt.Sprintf(
-		"systemd-resolved is unavailable (%v); guests and by-IP access remain available; manual step: %s",
-		cause, strings.Join(resolvedManualSteps(clusters), "; "),
-	)
-}
-
-func resolvedManualSteps(clusters []cluster.Cluster) []string {
-	steps := make([]string, 0, len(clusters))
-	for _, item := range clusters {
-		bridge := cluster.LinuxBridgeName(item.SubnetIndex)
-		steps = append(steps, fmt.Sprintf(
-			"sudo resolvectl dns %s %s && sudo resolvectl domain %s %q",
-			bridge, cluster.Gateway(item.SubnetIndex), bridge, "~"+item.EffectiveDomain(),
-		))
-	}
-	return steps
+	return hostDNSUnavailableDetail(cause, clusters)
 }

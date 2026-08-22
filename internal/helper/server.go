@@ -23,7 +23,10 @@ const (
 	shutdownStopInitialRetryDelay = 25 * time.Millisecond
 )
 
-var startInterface = StartInterface
+var (
+	startInterface = StartInterface
+	teardownSubnet = TeardownSubnet
+)
 
 type attachmentKey struct {
 	cluster string
@@ -312,6 +315,8 @@ func (s *Server) handle(request Request) (any, int, func(), error) {
 		return s.attach(request.Args)
 	case "net.detach":
 		return nil, -1, nil, s.detach(request.Args)
+	case "net.teardown":
+		return teardownNetwork(request.Args)
 	case "dns.install":
 		var args struct {
 			Port int `json:"port"`
@@ -432,6 +437,29 @@ func (s *Server) attach(raw json.RawMessage) (any, int, func(), error) {
 		}
 	}
 	return map[string]any{"cluster": args.Cluster, "node": args.Node, "kind": attachment.Kind}, attachment.FD, cleanup, nil
+}
+
+// teardownNetwork removes the host networking a subnet's last cluster leaves
+// behind. The subnet index is enough: it is allocated to one cluster at a time,
+// and the caller has already established that the cluster owning it is gone.
+func teardownNetwork(raw json.RawMessage) (any, int, func(), error) {
+	var args struct {
+		SubnetIndex *int `json:"subnetIndex"`
+	}
+	if err := decodeArgs(raw, &args); err != nil {
+		return nil, -1, nil, err
+	}
+	if args.SubnetIndex == nil {
+		return nil, -1, nil, errors.New("subnetIndex is required")
+	}
+	if *args.SubnetIndex < 0 || *args.SubnetIndex > 255 {
+		return nil, -1, nil, fmt.Errorf("subnet index %d is outside 0..255", *args.SubnetIndex)
+	}
+	removed, err := teardownSubnet(*args.SubnetIndex)
+	if err != nil {
+		return nil, -1, nil, err
+	}
+	return map[string]bool{"removed": removed}, -1, nil, nil
 }
 
 func validateBGPEnableArgs(cluster string, subnetIndex *int, localASN, peerASN uint32) error {

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"runtime"
 	"slices"
 	"strconv"
@@ -21,19 +22,21 @@ import (
 )
 
 const (
-	doctorKVMDevice                   = "/dev/kvm"
-	doctorHelperSocketUnit            = "tbx-helper.socket"
-	doctorHelperServiceUnit           = "tbx-helper.service"
-	doctorBridgeNFCall                = "/proc/sys/net/bridge/bridge-nf-call-iptables"
-	doctorForwardPolicyFix            = "sudo iptables -I FORWARD 1 -i br-tbx+ -j ACCEPT && sudo iptables -I FORWARD 1 -o br-tbx+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
-	doctorHelperGroupFix              = "sudo usermod -aG tbx $USER"
-	doctorKVMGroupFix                 = "sudo usermod -aG kvm $USER"
-	doctorRPFilterLooseFix            = "sudo sysctl -w net.ipv4.conf.all.rp_filter=2"
-	doctorQEMUMinimumMajor            = 6
-	doctorQEMUMinimumMinor            = 2
-	doctorQEMUSuspendMajor            = 8
-	doctorQEMUSuspendMinor            = 2
-	doctorHelperCapabilityMask uint64 = 1<<10 | 1<<12 | 1<<13
+	doctorKVMDevice                     = "/dev/kvm"
+	doctorHelperSocketUnit              = "tbx-helper.socket"
+	doctorHelperServiceUnit             = "tbx-helper.service"
+	doctorBridgeNFCall                  = "/proc/sys/net/bridge/bridge-nf-call-iptables"
+	doctorForwardPolicyFix              = "sudo iptables -I FORWARD 1 -i br-tbx+ -j ACCEPT && sudo iptables -I FORWARD 1 -o br-tbx+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+	doctorForwardPolicyInspect          = "sudo iptables -S FORWARD"
+	doctorHelperGroupFix                = "sudo usermod -aG tbx $USER"
+	doctorKVMGroupFix                   = "sudo usermod -aG kvm $USER"
+	doctorRPFilterLooseFix              = "sudo sysctl -w net.ipv4.conf.all.rp_filter=2"
+	doctorIPTablesPermissionExit        = 4
+	doctorQEMUMinimumMajor              = 6
+	doctorQEMUMinimumMinor              = 2
+	doctorQEMUSuspendMajor              = 8
+	doctorQEMUSuspendMinor              = 2
+	doctorHelperCapabilityMask   uint64 = 1<<10 | 1<<12 | 1<<13
 )
 
 type doctorQEMUSystem struct {
@@ -152,7 +155,17 @@ func checkLinuxResolver(
 		return fmt.Errorf("list clusters: %w", err)
 	}
 	if len(clusters) == 0 {
-		return nil
+		// Nothing was probed, so there is nothing to pass: a PASS here reads as
+		// "cluster names resolve", which is exactly the claim doctor must not
+		// make without evidence (#447).
+		return skippedDoctorCheck{detail: "no clusters are running"}
+	}
+	// Separate "resolved is not there at all" from "resolved is there but this
+	// link is unregistered": the first is the host-DNS-unavailable WARN the
+	// daemon already logs, with the same manual step and the by-gateway
+	// fallback (#447).
+	if _, err := command("resolvectl", "status"); err != nil {
+		return optionalHostDNSError{detail: hostDNSUnavailableDetail(err, clusters)}
 	}
 	var missing []string
 	for _, item := range clusters {
@@ -164,10 +177,11 @@ func checkLinuxResolver(
 		if err != nil {
 			return optionalHostDNSError{
 				detail: fmt.Sprintf(
-					"systemd-resolved is reachable, but %s is not registered: %v; manual step: %s",
+					"systemd-resolved is reachable, but %s is not registered: %v; manual step: %s; fallback: %s",
 					bridge,
 					err,
 					strings.Join(resolvedManualSteps(clusters), "; "),
+					strings.Join(resolvedDigFallbacks(clusters), "; "),
 				),
 			}
 		}
@@ -182,9 +196,10 @@ func checkLinuxResolver(
 	}
 	return optionalHostDNSError{
 		detail: fmt.Sprintf(
-			"systemd-resolved is reachable, but %s; manual step: %s",
+			"systemd-resolved is reachable, but %s; manual step: %s; fallback: %s",
 			strings.Join(missing, "; "),
 			strings.Join(resolvedManualSteps(clusters), "; "),
+			strings.Join(resolvedDigFallbacks(clusters), "; "),
 		),
 	}
 }
@@ -341,6 +356,17 @@ func linuxBridgeNetfilterFinding(readFile func(string) ([]byte, error), command 
 	}
 	rules, err := command("iptables", "-S", "FORWARD")
 	if err != nil {
+		// Doctor runs as the invoking user, and iptables refuses to list a
+		// chain without root. That says nothing about how FORWARD is
+		// configured, so it must not fail an otherwise healthy host (#448).
+		if iptablesPermissionDenied(rules, err) {
+			finding.level = "WARN"
+			finding.detail = fmt.Sprintf(
+				"br_netfilter is active but the FORWARD policy cannot be read without root; re-run `sudo tbx doctor`, or inspect it with `%s`",
+				doctorForwardPolicyInspect,
+			)
+			return finding
+		}
 		finding.level, finding.detail = "FAIL", fmt.Sprintf("inspect FORWARD policy: %v", err)
 		return finding
 	}
@@ -357,6 +383,24 @@ func linuxBridgeNetfilterFinding(readFile func(string) ([]byte, error), command 
 		doctorForwardPolicyFix,
 	)
 	return finding
+}
+
+// iptablesPermissionDenied reports whether an `iptables -S` failure was the
+// invoking user lacking root rather than a broken firewall. Exit status 4 is
+// iptables' own permission failure; the nftables-backed binary can exit with
+// other statuses, so the message it printed counts too.
+func iptablesPermissionDenied(output []byte, err error) bool {
+	if err == nil {
+		return false
+	}
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.ExitCode() == doctorIPTablesPermissionExit {
+		return true
+	}
+	lowered := strings.ToLower(string(output) + " " + err.Error())
+	return strings.Contains(lowered, "permission denied") ||
+		strings.Contains(lowered, "operation not permitted") ||
+		strings.Contains(lowered, "must be root")
 }
 
 func linuxRoutedForwardRulesPresent(text string) bool {

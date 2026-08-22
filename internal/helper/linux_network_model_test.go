@@ -280,12 +280,57 @@ func TestLinuxClusterSourcesTreatManagedBridgeAsTalosBoxBridge(t *testing.T) {
 	}
 }
 
+func TestTeardownLinuxBridgeDeletesTheSubnetBridge(t *testing.T) {
+	t.Parallel()
+
+	ops := &fakeLinuxNetworkOps{}
+	removed, err := teardownLinuxBridge(ops, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !removed {
+		t.Fatal("teardownLinuxBridge() removed = false, want true")
+	}
+	if want := []string{"delete-bridge:" + bridgeNameForSubnet(3)}; !reflect.DeepEqual(ops.calls, want) {
+		t.Fatalf("network calls = %#v, want %#v", ops.calls, want)
+	}
+}
+
+func TestTeardownLinuxBridgeIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	ops := &fakeLinuxNetworkOps{deleteAbsent: true}
+	removed, err := teardownLinuxBridge(ops, 0)
+	if err != nil {
+		t.Fatalf("teardownLinuxBridge() error = %v, want nil for an absent bridge", err)
+	}
+	if removed {
+		t.Fatal("teardownLinuxBridge() removed = true, want false for an absent bridge")
+	}
+}
+
+func TestTeardownLinuxBridgeRejectsOutOfRangeSubnet(t *testing.T) {
+	t.Parallel()
+
+	for _, index := range []int{-1, cluster.MaxSubnetIndex + 1} {
+		ops := &fakeLinuxNetworkOps{}
+		if _, err := teardownLinuxBridge(ops, index); err == nil {
+			t.Fatalf("teardownLinuxBridge(%d) error = nil, want out-of-range refusal", index)
+		}
+		if len(ops.calls) != 0 {
+			t.Fatalf("network operations were attempted for subnet %d: %v", index, ops.calls)
+		}
+	}
+}
+
 type fakeLinuxNetworkOps struct {
 	links        []linuxLinkState
 	routes       map[string]cluster.HostRoute
 	defaultRoute cluster.HostRoute
 	tap          *os.File
 	calls        []string
+	deleteAbsent bool
+	deleteErr    error
 }
 
 func (f *fakeLinuxNetworkOps) ListLinks() ([]linuxLinkState, error) { return f.links, nil }
@@ -317,6 +362,13 @@ func (f *fakeLinuxNetworkOps) EnsureManagedTaps(indexes []int) error {
 func (f *fakeLinuxNetworkOps) EnsureBridge(name string) error {
 	f.calls = append(f.calls, "bridge:"+name)
 	return nil
+}
+func (f *fakeLinuxNetworkOps) DeleteBridge(name string) (bool, error) {
+	f.calls = append(f.calls, "delete-bridge:"+name)
+	if f.deleteErr != nil {
+		return false, f.deleteErr
+	}
+	return !f.deleteAbsent, nil
 }
 func (f *fakeLinuxNetworkOps) EnsureBridgeSTP(name string, enabled bool) error {
 	f.calls = append(f.calls, "stp:"+name+"="+strconv.FormatBool(enabled))

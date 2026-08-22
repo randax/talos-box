@@ -22,10 +22,16 @@ const (
 	// announcing, and leaves the cross-cluster BGP-VIP path dead; refusing the
 	// handshake sends the operator to a reinstall instead of a wrong answer.
 	//
+	// Version 4 added net.teardown, which removes the br-tbx<n> bridge (and with
+	// it the gateway address) when the last cluster on a subnet is destroyed. A
+	// version 3 helper has no such op, so every destroy leaks the bridge and the
+	// next create climbs to a fresh subnet index; refusing the handshake sends
+	// the operator to a reinstall instead of accumulating host residue.
+	//
 	// Bumping this also means bumping the literal in nix/vm-test.nix: the NixOS
 	// smoke test's helper-probe performs this handshake against the packaged
 	// helper, and `nix flake check` fails on a mismatch.
-	protocolVersion = 3
+	protocolVersion = 4
 	helperInfoOp    = "helper.info"
 )
 

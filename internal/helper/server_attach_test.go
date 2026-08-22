@@ -3,6 +3,7 @@ package helper
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -217,3 +218,77 @@ type testDHCPManager struct {
 func (m *testDHCPManager) Converge() error { return m.convergeErr }
 
 func (m *testDHCPManager) Close() error { return m.closeErr }
+
+func TestTeardownRemovesTheSubnetBridge(t *testing.T) {
+	server := NewServer(nil)
+	calls := 0
+
+	originalTeardown := teardownSubnet
+	teardownSubnet = func(subnetIndex int) (bool, error) {
+		if subnetIndex != 7 {
+			t.Fatalf("teardownSubnet subnet = %d, want 7", subnetIndex)
+		}
+		calls++
+		return true, nil
+	}
+	t.Cleanup(func() { teardownSubnet = originalTeardown })
+
+	reply := server.dispatch(Request{Op: "net.teardown", Args: json.RawMessage(`{"subnetIndex":7}`)})
+	if !reply.response.OK {
+		t.Fatalf("net.teardown response = %+v", reply.response)
+	}
+	var data struct {
+		Removed bool `json:"removed"`
+	}
+	if err := json.Unmarshal(reply.response.Data, &data); err != nil {
+		t.Fatal(err)
+	}
+	if !data.Removed {
+		t.Fatal("net.teardown removed = false, want true")
+	}
+	if calls != 1 {
+		t.Fatalf("teardownSubnet calls = %d, want 1", calls)
+	}
+}
+
+func TestTeardownReportsAnAbsentBridgeAsSuccess(t *testing.T) {
+	server := NewServer(nil)
+
+	originalTeardown := teardownSubnet
+	teardownSubnet = func(int) (bool, error) { return false, nil }
+	t.Cleanup(func() { teardownSubnet = originalTeardown })
+
+	reply := server.dispatch(Request{Op: "net.teardown", Args: json.RawMessage(`{"subnetIndex":0}`)})
+	if !reply.response.OK {
+		t.Fatalf("net.teardown response = %+v", reply.response)
+	}
+	if string(reply.response.Data) != `{"removed":false}` {
+		t.Fatalf("net.teardown data = %s, want {\"removed\":false}", reply.response.Data)
+	}
+}
+
+func TestTeardownRejectsInvalidArguments(t *testing.T) {
+	originalTeardown := teardownSubnet
+	teardownSubnet = func(int) (bool, error) {
+		t.Fatal("teardownSubnet was called for invalid arguments")
+		return false, nil
+	}
+	t.Cleanup(func() { teardownSubnet = originalTeardown })
+
+	for _, test := range []struct {
+		name    string
+		args    string
+		wantErr string
+	}{
+		{name: "subnet is required", args: `{}`, wantErr: "subnetIndex is required"},
+		{name: "negative subnet", args: `{"subnetIndex":-1}`, wantErr: "outside 0..255"},
+		{name: "subnet above IPv4 octet", args: `{"subnetIndex":256}`, wantErr: "outside 0..255"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			reply := NewServer(nil).dispatch(Request{Op: "net.teardown", Args: json.RawMessage(test.args)})
+			if reply.response.OK || !strings.Contains(reply.response.Error, test.wantErr) {
+				t.Fatalf("net.teardown response = %+v, want error containing %q", reply.response, test.wantErr)
+			}
+		})
+	}
+}

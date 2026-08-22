@@ -100,6 +100,23 @@ func (c *Client) Detach(cluster, node string) error {
 	return err
 }
 
+// TeardownSubnet removes the host bridge for a subnet whose last cluster is
+// gone, so the next create reuses the freed index instead of climbing to a new
+// one. It reports whether a bridge was there to remove.
+func (c *Client) TeardownSubnet(subnetIndex int) (bool, error) {
+	response, _, err := c.call("net.teardown", map[string]int{"subnetIndex": subnetIndex}, false)
+	if err != nil {
+		return false, err
+	}
+	var data struct {
+		Removed bool `json:"removed"`
+	}
+	if err := json.Unmarshal(response.Data, &data); err != nil {
+		return false, fmt.Errorf("decode teardown response: %w", err)
+	}
+	return data.Removed, nil
+}
+
 // InstallDNS installs the k8s.test scoped resolver.
 func (c *Client) InstallDNS(port int) error {
 	_, _, err := c.call("dns.install", map[string]int{"port": port}, false)
@@ -345,7 +362,9 @@ func shouldReconnect(op string, err error) bool {
 
 func safeRetryOperation(op string) bool {
 	switch op {
-	case helperInfoOp, "ping", "net.detach", "dns.install", "dns.uninstall", "dns.syncDomains", "dns.register", "dns.unregister", "forwarding.enable", "bgp.enable", "bgp.disable":
+	// net.teardown is idempotent: a retry that finds the bridge already gone
+	// succeeds, reporting only that it removed nothing.
+	case helperInfoOp, "ping", "net.detach", "net.teardown", "dns.install", "dns.uninstall", "dns.syncDomains", "dns.register", "dns.unregister", "forwarding.enable", "bgp.enable", "bgp.disable":
 		return true
 	default:
 		return false

@@ -102,3 +102,21 @@ func TestDestroySummaryOfAPartiallyDestroyedClusterCountsWhatIsLeft(t *testing.T
 		t.Fatalf("summary diskBytes = %d, want the state that was removed", summary.DiskBytes)
 	}
 }
+
+// Removing a bridge decides whether a live cluster keeps its only link, so the
+// "last cluster on the subnet" condition is checked against remaining state
+// rather than assumed from the destroy that just ran (#445).
+func TestSubnetAllocatedGuardsTheBridgeRelease(t *testing.T) {
+	t.Parallel()
+
+	remaining := []cluster.Cluster{{Name: "other", SubnetIndex: 1}}
+	if subnetAllocated(remaining, 0) {
+		t.Fatal("subnetAllocated() = true for a freed subnet index")
+	}
+	if !subnetAllocated(remaining, 1) {
+		t.Fatal("subnetAllocated() = false for an index another cluster still owns")
+	}
+	if subnetAllocated(nil, 0) {
+		t.Fatal("subnetAllocated() = true with no clusters left")
+	}
+}

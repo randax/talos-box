@@ -15,9 +15,11 @@ import (
 const resolverBypassMessage = "systemd-resolved route-only domain is missing or being bypassed"
 
 func checkSystemDNS(clusters []daemon.ClusterSummary, command commandOutput) error {
-	if _, err := command("resolvectl", "status"); err != nil {
-		return optionalHostDNSError{detail: resolvedUnavailableDetail(err)}
-	}
+	// An unavailable resolved is not by itself the finding: the verdict is
+	// whether the host resolves cluster names. So probe resolved for the
+	// *reason*, then always run the lookups, and let their result decide
+	// PASS versus WARN (#447).
+	_, resolvedErr := command("resolvectl", "status")
 	var problems []string
 	for _, item := range clusters {
 		name := "doctor-probe." + item.EffectiveDomain()
@@ -40,10 +42,15 @@ func checkSystemDNS(clusters []daemon.ClusterSummary, command commandOutput) err
 				item.Name, resolverBypassMessage, name, formatAddresses(addresses), expected))
 		}
 	}
-	if len(problems) != 0 {
-		return errors.New(strings.Join(problems, "; "))
+	if len(problems) == 0 {
+		// The names resolve, whichever resolver did it — a genuine PASS even
+		// when resolved is absent.
+		return nil
 	}
-	return nil
+	if resolvedErr != nil {
+		return optionalHostDNSError{detail: resolvedUnavailableDetail(resolvedErr)}
+	}
+	return errors.New(strings.Join(problems, "; "))
 }
 
 func parseGetentAddresses(output []byte) []net.IP {

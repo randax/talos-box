@@ -421,3 +421,37 @@ func TestAttachedSubnetWarningSurfacesForeignConflict(t *testing.T) {
 		t.Fatalf("warning = %q, want a foreign-conflict warning naming utun7", warning)
 	}
 }
+
+// A destroyed cluster's bridge keeps the subnet's gateway address, and
+// allocation reads that address as a collision — which is why a leaked bridge
+// made every create climb to a new index (#445). Removing the bridge is what
+// frees the index; allocation itself needs no memory of it.
+func TestLowestUsableSubnetIndexReusesAFreedIndexOnceItsBridgeIsGone(t *testing.T) {
+	t.Parallel()
+
+	leaked := SubnetSources{
+		Interfaces: func() ([]HostInterface, error) {
+			return []HostInterface{{Name: "br-tbx0", Addrs: []net.Addr{hostAddress("172.30.0.1/24")}}}, nil
+		},
+		Route: routeByThirdOctet(map[byte]HostRoute{0: routeValue("br-tbx0", "172.30.0.0/24")}),
+	}
+	index, _, err := LowestUsableSubnetIndex(nil, leaked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if index != 1 {
+		t.Fatalf("LowestUsableSubnetIndex() with a leaked bridge = %d, want 1", index)
+	}
+
+	torndown := SubnetSources{
+		Interfaces: func() ([]HostInterface, error) { return nil, nil },
+		Route:      routeByThirdOctet(nil),
+	}
+	index, _, err = LowestUsableSubnetIndex(nil, torndown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if index != 0 {
+		t.Fatalf("LowestUsableSubnetIndex() after teardown = %d, want 0", index)
+	}
+}

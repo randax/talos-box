@@ -206,6 +206,11 @@ func printDestroySummary(output io.Writer, summary daemon.DestroySummary, inspec
 		// own records went with it
 		lines = append(lines, fmt.Sprintf("DNS records for %s withdrawn", summary.Domain))
 	}
+	if summary.BridgeRemoved != "" {
+		// the subnet index goes back to the free pool with the bridge, so the
+		// next create reuses it instead of climbing (#445)
+		lines = append(lines, fmt.Sprintf("host bridge %s removed", summary.BridgeRemoved))
+	}
 	if inspection.Volumes > 0 {
 		engine := strings.TrimSpace(string(inspection.CSI))
 		if engine != "" {

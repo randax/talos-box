@@ -1007,6 +1007,11 @@ type DestroySummary struct {
 	// ResolverWithdrawn is set only for a cluster whose own resolver file the
 	// destroy removed; a cluster on the default domain shares one that stays.
 	ResolverWithdrawn bool `json:"resolverWithdrawn,omitempty"`
+	// BridgeRemoved names the host bridge the destroy took down, and is empty
+	// wherever there was none to take down — a host whose subnet bridge is
+	// vmnet-owned, or one that never built it. Reporting the name is what lets
+	// an operator tell residue from design (#445).
+	BridgeRemoved string `json:"bridgeRemoved,omitempty"`
 }
 
 func (s *Server) destroyCluster(raw json.RawMessage) (DestroySummary, error) {
@@ -1034,6 +1039,9 @@ func (s *Server) destroyCluster(raw json.RawMessage) (DestroySummary, error) {
 		summary.Snapshots = len(snapshots)
 	}
 	var customDomain bool
+	// A partially-destroyed cluster (state dir present, cluster.json gone) has
+	// no recorded subnet, so there is no bridge this destroy can claim to own.
+	subnetIndex := -1
 	// stop what we can, but a partially-destroyed cluster (state dir present,
 	// cluster.json gone) must still be removable — and still summarised
 	if item, loadErr := cluster.Load(args.Name); loadErr == nil {
@@ -1041,6 +1049,7 @@ func (s *Server) destroyCluster(raw json.RawMessage) (DestroySummary, error) {
 		summary.Nodes = &nodes
 		summary.Domain = item.EffectiveDomain()
 		customDomain = item.Domain != ""
+		subnetIndex = item.SubnetIndex
 		if err := s.stop(args.Name); err != nil {
 			return DestroySummary{}, err
 		}
@@ -1050,12 +1059,61 @@ func (s *Server) destroyCluster(raw json.RawMessage) (DestroySummary, error) {
 	}
 	s.forgetCluster(args.Name)
 	s.invalidateStoragePhaseLocked(args.Name)
+	if subnetIndex >= 0 {
+		bridge, err := releaseSubnetBridge(subnetIndex)
+		if err != nil {
+			log.Printf("release host bridge for %s subnet %s: %v", args.Name, cluster.SubnetCIDR(subnetIndex), err)
+		}
+		summary.BridgeRemoved = bridge
+	}
 	if err := SyncResolverFiles(); err != nil {
 		log.Printf("resolver files after destroying %s: %v", args.Name, err)
 	} else {
 		summary.ResolverWithdrawn = customDomain
 	}
 	return summary, nil
+}
+
+// releaseSubnetBridge removes the host bridge a destroyed cluster's subnet
+// leaves behind, and returns its name when there was one to remove. Without
+// this the bridge keeps the subnet's gateway address, subnet allocation reads
+// that address as a collision, and every create climbs to a fresh index
+// (#445). Best-effort: the state is already gone, so a helper that cannot take
+// the bridge down must not fail the destroy.
+func releaseSubnetBridge(subnetIndex int) (string, error) {
+	clusters, err := cluster.List()
+	if err != nil {
+		return "", fmt.Errorf("skip host bridge release: %w", err)
+	}
+	if subnetAllocated(clusters, subnetIndex) {
+		return "", nil
+	}
+	client, err := helper.Connect()
+	if err != nil {
+		return "", fmt.Errorf("skip host bridge release: %w", err)
+	}
+	defer func() { _ = client.Close() }()
+	removed, err := client.TeardownSubnet(subnetIndex)
+	if err != nil {
+		return "", err
+	}
+	if !removed {
+		return "", nil
+	}
+	return cluster.LinuxBridgeName(subnetIndex), nil
+}
+
+// subnetAllocated reports whether any remaining cluster still owns a subnet
+// index. Allocation gives an index to one cluster at a time, so this is only
+// ever true for a destroy racing a create — checked rather than assumed,
+// because the answer decides whether a live cluster's bridge comes down.
+func subnetAllocated(clusters []cluster.Cluster, subnetIndex int) bool {
+	for _, item := range clusters {
+		if item.SubnetIndex == subnetIndex {
+			return true
+		}
+	}
+	return false
 }
 
 // directoryBytes sums what the files under dir occupy on disk. Node disks are

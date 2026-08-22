@@ -34,6 +34,7 @@ type linuxNetworkOps interface {
 	EnsureInterfaceForwarding(name string) error
 	EnsureManagedTaps(subnetIndexes []int) error
 	EnsureBridge(name string) error
+	DeleteBridge(name string) (bool, error)
 	EnsureBridgeSTP(name string, enabled bool) error
 	EnsureBridgeAddress(name, cidr string) error
 	EnsureLinkUp(name string) error
@@ -234,6 +235,18 @@ func startLinuxAttachment(netOps linuxNetworkOps, nft linuxNFTConverger, configu
 		return nil, err
 	}
 	return file, nil
+}
+
+// teardownLinuxBridge removes the bridge that carries a subnet's gateway
+// address, once the last cluster on that subnet is gone. It reports whether a
+// bridge was there to remove: an absent bridge is a success, so a repeated
+// destroy — or a destroy on a host that never built the bridge — is a no-op
+// rather than an error.
+func teardownLinuxBridge(netOps linuxNetworkOps, subnetIndex int) (bool, error) {
+	if subnetIndex < 0 || subnetIndex > cluster.MaxSubnetIndex {
+		return false, fmt.Errorf("subnet index %d is outside 0..%d", subnetIndex, cluster.MaxSubnetIndex)
+	}
+	return netOps.DeleteBridge(bridgeNameForSubnet(subnetIndex))
 }
 
 func normalizeLinuxSubnetIndexes(indexes []int) []int {

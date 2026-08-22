@@ -3,6 +3,7 @@ package daemon
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -234,5 +235,46 @@ func TestCheckHostPressureForcedRendersEachBlockingFindingSeparately(t *testing.
 		if !strings.Contains(warning, "(forced)") {
 			t.Fatalf("forced warning %q does not carry the forced marker", warning)
 		}
+	}
+}
+
+// #446: a platform with no host-pressure probe has no measurement to fail. It
+// used to put "host-pressure probe failed: … proceeding without host-pressure
+// protection" on every single create; tbx doctor reports the same absence as
+// SKIP, and the gate must stand down as quietly.
+func TestCheckHostPressureStandsDownSilentlyWhenTheProbeIsUnsupported(t *testing.T) {
+	for name, probe := range map[string]func(string) (hostpressure.Snapshot, error){
+		"sentinel": func(string) (hostpressure.Snapshot, error) {
+			return hostpressure.Snapshot{}, hostpressure.ErrUnsupported
+		},
+		"wrapped": func(string) (hostpressure.Snapshot, error) {
+			return hostpressure.Snapshot{}, fmt.Errorf("host pressure: %w", hostpressure.ErrUnsupported)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			service := &Server{hostPressure: probe}
+			warnings, err := service.checkHostPressure(t.TempDir(), false)
+			if err != nil {
+				t.Fatalf("checkHostPressure() = %v, want no refusal for a missing capability", err)
+			}
+			if len(warnings) != 0 {
+				t.Fatalf("checkHostPressure() warnings = %q, want silence for a missing capability", warnings)
+			}
+		})
+	}
+}
+
+// A real probe failure on a platform that HAS a probe still warns exactly as
+// before: that is an unmeasurable host, not a missing capability.
+func TestCheckHostPressureStillWarnsOnARealProbeFailure(t *testing.T) {
+	service := &Server{hostPressure: func(string) (hostpressure.Snapshot, error) {
+		return hostpressure.Snapshot{}, errors.New("statfs unavailable")
+	}}
+	warnings, err := service.checkHostPressure(t.TempDir(), false)
+	if err != nil {
+		t.Fatalf("checkHostPressure() = %v, want no refusal", err)
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "host-pressure probe failed: statfs unavailable") {
+		t.Fatalf("checkHostPressure() warnings = %q, want the probe-failure warning", warnings)
 	}
 }

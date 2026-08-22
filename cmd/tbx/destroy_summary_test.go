@@ -105,6 +105,41 @@ func TestDestroyClusterSummaryKeepsAKnownZeroNodeCount(t *testing.T) {
 	}
 }
 
+// The Linux bridge and its gateway address used to survive a destroy, and the
+// summary said nothing about it — leaving an operator no way to tell residue
+// from design (#445).
+func TestDestroyClusterSummaryReportsTheHostBridgeItRemoved(t *testing.T) {
+	_, command := newDestroyTestCLI(t, []daemon.Response{
+		{OK: true, Data: json.RawMessage(`{}`)},
+		{OK: true, Data: json.RawMessage(`{"name":"demo","nodes":3,"diskBytes":4096,"bridgeRemoved":"br-tbx0"}`)},
+	})
+
+	if err := command.destroyCluster([]string{"demo", "--force"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if out := command.out.(*bytes.Buffer).String(); !strings.Contains(out, "host bridge br-tbx0 removed") {
+		t.Fatalf("destroy summary missing the bridge line:\n%s", out)
+	}
+}
+
+// macOS has no per-cluster host bridge to remove, so the summary must not
+// invent a line for one.
+func TestDestroyClusterSummaryOmitsTheBridgeLineWhenThereWasNone(t *testing.T) {
+	_, command := newDestroyTestCLI(t, []daemon.Response{
+		{OK: true, Data: json.RawMessage(`{}`)},
+		{OK: true, Data: json.RawMessage(`{"name":"demo","nodes":3,"diskBytes":4096}`)},
+	})
+
+	if err := command.destroyCluster([]string{"demo", "--force"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if out := command.out.(*bytes.Buffer).String(); strings.Contains(out, "host bridge") {
+		t.Fatalf("destroy summary invented a bridge line:\n%s", out)
+	}
+}
+
 func TestHumanBytes(t *testing.T) {
 	for _, test := range []struct {
 		bytes int64
