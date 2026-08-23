@@ -40,7 +40,7 @@ env)
   if [ "$MEM_KB" -lt 10000000 ]; then
     echo "!! MemTotal < ~10 GiB. Before continuing, on WINDOWS create" | tee -a "$REPORT"
     echo "!! %UserProfile%\\.wslconfig with:" | tee -a "$REPORT"
-    printf '[wsl2]\nmemory=12GB\nautoMemoryReclaim=disabled\n' | tee -a "$REPORT"
+    printf '[wsl2]\nmemory=12GB\n\n[experimental]\nautoMemoryReclaim=disabled\n' | tee -a "$REPORT"
     echo "!! then run 'wsl --shutdown' from PowerShell, reopen this shell, rerun phase env." | tee -a "$REPORT"
     exit 1
   fi

@@ -13,6 +13,8 @@ PowerShell avoids both mistakes:
 @"
 [wsl2]
 memory=12GB
+
+[experimental]
 autoMemoryReclaim=disabled
 "@ | Set-Content "$env:USERPROFILE\.wslconfig" -Encoding ascii
 ```
