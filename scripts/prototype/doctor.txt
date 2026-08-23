@@ -1,0 +1,35 @@
+
+==================== [doctor] tbx doctor (pre-cluster) — 2026-08-23T14:59:26+02:00 ====================
+$ id
+uid=1000(oyr) gid=1000(oyr) groups=1000(oyr),4(adm),24(cdrom),27(sudo),30(dip),46(plugdev),100(users)
+(exit 0)
+$ tbx doctor
+FAIL helper: connect to helper at /var/run/tbx-helper.sock: dial unix /var/run/tbx-helper.sock: connect: permission denied
+SKIP resolver: daemon unavailable: dial unix /home/oyr/.talosbox/tbxd.sock: connect: no such file or directory
+SKIP DNS: daemon unavailable: dial unix /home/oyr/.talosbox/tbxd.sock: connect: no such file or directory
+FAIL forwarding: net.ipv4.ip_forward is "0", want 1
+FAIL kvm: /dev/kvm is not readable+writable by this user: open /dev/kvm: permission denied; add your user to the kvm group with `sudo usermod -aG kvm $USER`, then log out and back in
+PASS qemu: qemu-system-x86_64 8.2.2 provides q35 and supports suspend
+WARN bridge-netfilter: br_netfilter is active but the FORWARD policy cannot be read (exit status 4); inspect it with `sudo iptables -S FORWARD` (listing the chain needs root)
+SKIP bridge-stp: no clusters exist
+SKIP rp-filter: single-homed host
+SKIP port-53: no clusters exist
+SKIP port-67: no clusters exist
+SKIP port-179: no clusters exist
+PASS helper-unit
+FAIL helper-access: current user is not in group tbx; run `sudo usermod -aG tbx $USER`, then log out and back in
+FAIL helper-capabilities: inspect helper capabilities: connect to helper at /var/run/tbx-helper.sock: dial unix /var/run/tbx-helper.sock: connect: permission denied
+SKIP host-pressure: host-pressure measurement is only implemented on macOS
+SKIP system-dns: daemon unavailable: dial unix /home/oyr/.talosbox/tbxd.sock: connect: no such file or directory
+SKIP routes: daemon unavailable: dial unix /home/oyr/.talosbox/tbxd.sock: connect: no such file or directory
+SKIP inter-cluster: daemon unavailable: dial unix /home/oyr/.talosbox/tbxd.sock: connect: no such file or directory
+SKIP guest-agent: no cluster requests qemu-guest-agent
+SKIP mirror-health: daemon unavailable: dial unix /home/oyr/.talosbox/tbxd.sock: connect: no such file or directory
+SKIP image-cache: daemon unavailable: dial unix /home/oyr/.talosbox/tbxd.sock: connect: no such file or directory
+SKIP mirror-offline: daemon unavailable: dial unix /home/oyr/.talosbox/tbxd.sock: connect: no such file or directory
+PASS egress
+INFO security-inventory: system extension inventory unavailable: fork/exec /usr/bin/systemextensionsctl: no such file or directory
+tbx: one or more doctor checks failed
+(exit 0)
+doctor captured (non-zero exit is a finding, not a script failure)
+next: bash scripts/prototype/wsl2-smoke.sh cluster
