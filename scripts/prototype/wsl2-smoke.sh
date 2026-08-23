@@ -10,6 +10,7 @@
 # Each phase appends to ~/tbx-wsl2-smoke-report.txt. Rerunning a phase is fine.
 
 set -u
+cd "$(dirname "$0")/../.."   # repo root, wherever the script is invoked from
 REPORT="$HOME/tbx-wsl2-smoke-report.txt"
 PHASE="${1:-env}"
 
