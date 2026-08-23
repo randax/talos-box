@@ -1,0 +1,23 @@
+Aug 23 15:04:09 pc-MVuTWzRMBubA systemd[1]: Started tbx-helper.service - Talos Box privileged helper.
+Aug 23 15:04:09 pc-MVuTWzRMBubA tbx-helper[439]: 2026/08/23 15:04:09 resolve helper socket path: linux runtime directory /run/user/989 is unavailable: stat /run/user/989: no such file or directory; set TBX_HELPER_SOCKET to an accessible absolute path
+Aug 23 15:04:09 pc-MVuTWzRMBubA systemd[1]: tbx-helper.service: Main process exited, code=exited, status=1/FAILURE
+Aug 23 15:04:09 pc-MVuTWzRMBubA systemd[1]: tbx-helper.service: Failed with result 'exit-code'.
+Aug 23 15:04:09 pc-MVuTWzRMBubA systemd[1]: Started tbx-helper.service - Talos Box privileged helper.
+Aug 23 15:04:09 pc-MVuTWzRMBubA tbx-helper[445]: 2026/08/23 15:04:09 resolve helper socket path: linux runtime directory /run/user/989 is unavailable: stat /run/user/989: no such file or directory; set TBX_HELPER_SOCKET to an accessible absolute path
+Aug 23 15:04:09 pc-MVuTWzRMBubA systemd[1]: tbx-helper.service: Main process exited, code=exited, status=1/FAILURE
+Aug 23 15:04:09 pc-MVuTWzRMBubA systemd[1]: tbx-helper.service: Failed with result 'exit-code'.
+Aug 23 15:04:09 pc-MVuTWzRMBubA systemd[1]: Started tbx-helper.service - Talos Box privileged helper.
+Aug 23 15:04:09 pc-MVuTWzRMBubA tbx-helper[451]: 2026/08/23 15:04:09 resolve helper socket path: linux runtime directory /run/user/989 is unavailable: stat /run/user/989: no such file or directory; set TBX_HELPER_SOCKET to an accessible absolute path
+Aug 23 15:04:09 pc-MVuTWzRMBubA systemd[1]: tbx-helper.service: Main process exited, code=exited, status=1/FAILURE
+Aug 23 15:04:09 pc-MVuTWzRMBubA systemd[1]: tbx-helper.service: Failed with result 'exit-code'.
+Aug 23 15:04:09 pc-MVuTWzRMBubA systemd[1]: Started tbx-helper.service - Talos Box privileged helper.
+Aug 23 15:04:09 pc-MVuTWzRMBubA tbx-helper[457]: 2026/08/23 15:04:09 resolve helper socket path: linux runtime directory /run/user/989 is unavailable: stat /run/user/989: no such file or directory; set TBX_HELPER_SOCKET to an accessible absolute path
+Aug 23 15:04:09 pc-MVuTWzRMBubA systemd[1]: tbx-helper.service: Main process exited, code=exited, status=1/FAILURE
+Aug 23 15:04:09 pc-MVuTWzRMBubA systemd[1]: tbx-helper.service: Failed with result 'exit-code'.
+Aug 23 15:04:09 pc-MVuTWzRMBubA systemd[1]: Started tbx-helper.service - Talos Box privileged helper.
+Aug 23 15:04:09 pc-MVuTWzRMBubA tbx-helper[463]: 2026/08/23 15:04:09 resolve helper socket path: linux runtime directory /run/user/989 is unavailable: stat /run/user/989: no such file or directory; set TBX_HELPER_SOCKET to an accessible absolute path
+Aug 23 15:04:09 pc-MVuTWzRMBubA systemd[1]: tbx-helper.service: Main process exited, code=exited, status=1/FAILURE
+Aug 23 15:04:09 pc-MVuTWzRMBubA systemd[1]: tbx-helper.service: Failed with result 'exit-code'.
+Aug 23 15:04:09 pc-MVuTWzRMBubA systemd[1]: tbx-helper.service: Start request repeated too quickly.
+Aug 23 15:04:09 pc-MVuTWzRMBubA systemd[1]: tbx-helper.service: Failed with result 'exit-code'.
+Aug 23 15:04:09 pc-MVuTWzRMBubA systemd[1]: Failed to start tbx-helper.service - Talos Box privileged helper.
