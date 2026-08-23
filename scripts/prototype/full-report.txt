@@ -1,0 +1,152 @@
+oyr@pc-MVuTWzRMBubA:~/talos-box/scripts/prototype$ ./wsl2-smoke.sh doctor
+
+==================== [doctor] tbx doctor (pre-cluster) — 2026-08-23T15:04:08+02:00 ====================
+$ id
+uid=1000(oyr) gid=1000(oyr) groups=1000(oyr),4(adm),24(cdrom),27(sudo),30(dip),46(plugdev),100(users),989(tbx),993(kvm)
+(exit 0)
+$ tbx doctor
+FAIL helper: read helper response: read unix @->/run/tbx-helper.sock: recvmsg: connection reset by peer
+SKIP resolver: no clusters are running
+SKIP DNS: no clusters are running
+FAIL forwarding: net.ipv4.ip_forward is "0", want 1
+PASS kvm
+PASS qemu: qemu-system-x86_64 8.2.2 provides q35 and supports suspend
+WARN bridge-netfilter: br_netfilter is active but the FORWARD policy cannot be read (exit status 4); inspect it with `sudo iptables -S FORWARD` (listing the chain needs root)
+SKIP bridge-stp: no clusters exist
+SKIP rp-filter: single-homed host
+SKIP port-53: no clusters exist
+SKIP port-67: no clusters exist
+SKIP port-179: no clusters exist
+PASS helper-unit
+PASS helper-access
+FAIL helper-capabilities: inspect helper capabilities: connect to helper at /run/user/1000/tbx-helper.sock: dial unix /run/user/1000/tbx-helper.sock: connect: no such file or directory
+SKIP host-pressure: host-pressure measurement is only implemented on macOS
+SKIP system-dns: no clusters exist
+SKIP routes: no clusters exist
+SKIP inter-cluster: no clusters exist
+SKIP guest-agent: no cluster requests qemu-guest-agent
+SKIP mirror-health: no clusters exist; registry-mirror cache 0 bytes (0 blob(s), 0 manifest(s))
+PASS image-cache: image cache 0 bytes (0 image(s))
+PASS mirror-offline: off; pulls reach the upstream registry
+PASS egress
+INFO security-inventory: system extension inventory unavailable: fork/exec /usr/bin/systemextensionsctl: no such file or directory
+tbx: one or more doctor checks failed
+(exit 0)
+doctor captured (non-zero exit is a finding, not a script failure)
+next: bash scripts/prototype/wsl2-smoke.sh cluster
+oyr@pc-MVuTWzRMBubA:~/talos-box/scripts/prototype$ ./wsl2-smoke.sh cluster
+
+==================== [cluster] Cluster create smoke (small topology for the WSL memory cap) — 2026-08-23T15:06:07+02:00 ====================
+$ tbx cluster create wslproto --cp 1 --workers 1
+tbx: network helper unavailable; run `sudo tbx system install`: connect to helper at /run/user/1000/tbx-helper.sock: dial unix /run/user/1000/tbx-helper.sock: connect: no such file or directory
+(exit 0)
+$ tbx cluster list
+No clusters.
+(exit 0)
+$ tbx doctor
+FAIL helper: connect to helper at /run/user/1000/tbx-helper.sock: dial unix /run/user/1000/tbx-helper.sock: connect: no such file or directory
+SKIP resolver: no clusters are running
+SKIP DNS: no clusters are running
+FAIL forwarding: net.ipv4.ip_forward is "0", want 1
+PASS kvm
+PASS qemu: qemu-system-x86_64 8.2.2 provides q35 and supports suspend
+WARN bridge-netfilter: br_netfilter is active but the FORWARD policy cannot be read (exit status 4); inspect it with `sudo iptables -S FORWARD` (listing the chain needs root)
+SKIP bridge-stp: no clusters exist
+SKIP rp-filter: single-homed host
+SKIP port-53: no clusters exist
+SKIP port-67: no clusters exist
+SKIP port-179: no clusters exist
+PASS helper-unit
+PASS helper-access
+FAIL helper-capabilities: inspect helper capabilities: connect to helper at /run/user/1000/tbx-helper.sock: dial unix /run/user/1000/tbx-helper.sock: connect: no such file or directory
+SKIP host-pressure: host-pressure measurement is only implemented on macOS
+SKIP system-dns: no clusters exist
+SKIP routes: no clusters exist
+SKIP inter-cluster: no clusters exist
+SKIP guest-agent: no cluster requests qemu-guest-agent
+SKIP mirror-health: no clusters exist; registry-mirror cache 0 bytes (0 blob(s), 0 manifest(s))
+PASS image-cache: image cache 0 bytes (0 image(s))
+PASS mirror-offline: off; pulls reach the upstream registry
+PASS egress
+INFO security-inventory: system extension inventory unavailable: fork/exec /usr/bin/systemextensionsctl: no such file or directory
+tbx: one or more doctor checks failed
+(exit 0)
+next: bash scripts/prototype/wsl2-smoke.sh probes
+oyr@pc-MVuTWzRMBubA:~/talos-box/scripts/prototype$ ./wsl2-smoke.sh probes
+
+==================== [probes] In-WSL data-path probes — 2026-08-23T15:06:32+02:00 ====================
+$ ip -4 addr show
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000
+    inet 127.0.0.1/8 scope host lo
+       valid_lft forever preferred_lft forever
+    inet 10.255.255.254/32 brd 10.255.255.254 scope global lo
+       valid_lft forever preferred_lft forever
+2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP group default qlen 1000
+    inet 172.19.146.224/20 brd 172.19.159.255 scope global eth0
+       valid_lft forever preferred_lft forever
+(exit 0)
+$ ip route
+default via 172.19.144.1 dev eth0 proto kernel
+172.19.144.0/20 dev eth0 proto kernel scope link src 172.19.146.224
+(exit 0)
+$ sudo nft list ruleset
+[sudo] password for oyr:
+(exit 0)
+$ resolvectl status --no-pager
+Global
+         Protocols: -LLMNR -mDNS -DNSOverTLS DNSSEC=no/unsupported
+  resolv.conf mode: foreign
+Current DNS Server: 10.255.255.254
+       DNS Servers: 10.255.255.254
+        DNS Domain: ad.nextgentel.net hq.telio.no randa.tech
+
+Link 2 (eth0)
+    Current Scopes: none
+         Protocols: -DefaultRoute -LLMNR -mDNS -DNSOverTLS DNSSEC=no/unsupported
+(exit 0)
+$ dig +short @172.30.0.1 wslproto-cp-1.wslproto.k8s.test
+./wsl2-smoke.sh: line 23: dig: command not found
+(exit 0)
+$ dig +short wslproto-cp-1.wslproto.k8s.test
+./wsl2-smoke.sh: line 23: dig: command not found
+(exit 0)
+$ cat /etc/resolv.conf
+# This file was automatically generated by WSL. To stop automatic generation of this file, add the following entry to /etc/wsl.conf:
+# [network]
+# generateResolvConf = false
+nameserver 10.255.255.254
+search ad.nextgentel.net hq.telio.no randa.tech
+(exit 0)
+$ tbx bgp status wslproto
+tbx: read cluster state: open /home/oyr/.talosbox/clusters/wslproto/cluster.json: no such file or directory
+(exit 0)
+>> If an ingress VIP exists, curl it and note the result manually.
+next: bash scripts/prototype/wsl2-smoke.sh windows (prints PowerShell steps)
+oyr@pc-MVuTWzRMBubA:~/talos-box/scripts/prototype$ ./wsl2-smoke.sh windows
+
+==================== [windows] Windows-side probes (run these in PowerShell as admin, paste results into the report) — 2026-08-23T15:07:02+02:00 ====================
+# WSL eth0 IP right now: 172.19.146.224
+route add 172.30.0.0 mask 255.255.0.0 172.19.146.224
+Test-NetConnection 172.30.0.1 -Port 53
+nslookup wslproto-cp-1.wslproto.k8s.test 172.19.146.224
+Test-NetConnection <ingress-VIP-if-any> -Port 443
+# then open https://<something>.k8s.test in the Windows browser and note what happens
+# also note: does the Hyper-V firewall need an allow rule first?
+next: bash scripts/prototype/wsl2-smoke.sh keepalive
+oyr@pc-MVuTWzRMBubA:~/talos-box/scripts/prototype$ ./wsl2-smoke.sh keepalive
+
+==================== [keepalive] VM-idle keepalive experiment — 2026-08-23T15:08:03+02:00 ====================
+$ tbx cluster list
+No clusters.
+(exit 0)
+$ pgrep -a qemu
+(exit 0)
+>> Now: close EVERY WSL terminal window. Wait 3+ minutes.
+>> Reopen a WSL shell and run:
+>>   bash scripts/prototype/wsl2-smoke.sh keepalive
+>> again. Compare: did the distro restart (uptime reset)? Are the QEMU
+>> processes gone? What does 'tbx cluster list' say?
+$ uptime
+ 15:08:03 up 4 min,  1 user,  load average: 0.01, 0.05, 0.02
+(exit 0)
+oyr@pc-MVuTWzRMBubA:~/talos-box/scripts/prototype$
