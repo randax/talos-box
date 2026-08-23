@@ -124,16 +124,43 @@ probes)
   echo "next: bash scripts/prototype/wsl2-smoke.sh windows (prints PowerShell steps)"
   ;;
 windows)
-  section "Windows-side probes (run these in PowerShell as admin, paste results into the report)"
+  section "Windows-side probes (run these in PowerShell; only the route needs admin)"
   ETH0=$(ip -4 addr show eth0 | awk '/inet /{sub(/\/.*/,"",$2); print $2}')
   cat <<EOW | tee -a "$REPORT"
-# WSL eth0 IP right now: $ETH0
+# WSL eth0 IP right now: $ETH0 (re-randomizes per WSL restart — refresh the route if it changed)
+
+# 1. Static route into the cluster subnet. ADMIN PowerShell, once per eth0 IP change.
 route add 172.30.0.0 mask 255.255.0.0 $ETH0
-Test-NetConnection 172.30.0.1 -Port 53
-nslookup wslproto-cp-1.wslproto.k8s.test $ETH0
+
+# 2. DNS. Query the BRIDGE address, not eth0 — tbxd binds 172.30.0.1:53 only,
+#    and UDP only. A '-Port 53' TCP test therefore always fails and proves nothing.
+Resolve-DnsName wslproto-cp-1.wslproto.k8s.test -Server 172.30.0.1 -Type A -DnsOnly
+#    expect: 172.30.0.2   (nslookup works too, but can log spurious 2s timeouts on a cold path)
+#
+#    Windows' SYSTEM resolver does NOT know *.k8s.test — it sends the query to the
+#    corporate DNS servers, which answer NXDOMAIN, so a bare name (no -Server) fails
+#    and 'Test-NetConnection <node>.k8s.test' fails with it. Only the IP works until
+#    an NRPT rule points the zone at the bridge. ADMIN PowerShell, UNVERIFIED (#466 ran
+#    unelevated) — and this is exactly the kind of rule corporate policy may override:
+# Add-DnsClientNrptRule -Namespace ".k8s.test" -NameServers "172.30.0.1"
+
+# 3. TCP into a node. Talos apid on 50000 is up as soon as the node boots, so it
+#    tests the Windows -> WSL -> node forwarding path without needing a bootstrapped
+#    cluster. 6443 only answers after a machine config is applied AND bootstrapped —
+#    'tbx status <cluster>' must show the node past 'maintenance' phase first, else a
+#    6443 timeout/refusal is the missing apiserver, not the network.
+Test-NetConnection 172.30.0.2 -Port 50000 -InformationLevel Quiet   # expect: True
+Test-NetConnection 172.30.0.2 -Port 6443  -InformationLevel Quiet   # only meaningful post-bootstrap
+
+# 4. Ingress, if a VIP exists.
 Test-NetConnection <ingress-VIP-if-any> -Port 443
 # then open https://<something>.k8s.test in the Windows browser and note what happens
-# also note: does the Hyper-V firewall need an allow rule first?
+
+# Hyper-V firewall: no allow rule needed for host -> WSL. Verified 2026-08-23 (#466):
+# DefaultInboundAction=Block but LoopbackEnabled=True, which permits host-to-VM
+# traffic, so all of the above pass unelevated with no rule change. Confirm with:
+Get-NetFirewallHyperVVMSetting -PolicyStore ActiveStore |
+  Format-List Name,DefaultInboundAction,Enabled,LoopbackEnabled
 EOW
   echo "next: bash scripts/prototype/wsl2-smoke.sh keepalive"
   ;;
