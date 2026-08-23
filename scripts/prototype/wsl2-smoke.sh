@@ -51,7 +51,7 @@ deps)
   section "Host dependencies (docs/linux.md, Ubuntu amd64)"
   run sudo apt update
   run sudo apt install -y ca-certificates curl git make openssl policykit-1 \
-    qemu-system-x86 ovmf iproute2 iptables
+    qemu-system-x86 ovmf iproute2 iptables dnsutils
   run test -r /dev/kvm
   run test -w /dev/kvm
   run qemu-system-x86_64 --version
@@ -82,7 +82,14 @@ install)
   run sudo systemd-sysusers /usr/lib/sysusers.d/talos-box.conf
   run sudo usermod -aG tbx "$USER"
   run sudo usermod -aG kvm "$USER"
+  # PROTOTYPE WORKAROUND for the helper socket-path bug (see wayfinder #461):
+  # the packaged non-root helper resolves /run/user/<tbx-uid>, which never
+  # exists for a no-login system user, and fatals before using the activated FD.
+  run sudo mkdir -p /etc/systemd/system/tbx-helper.service.d
+  printf '[Service]\nEnvironment=TBX_HELPER_SOCKET=/var/run/tbx-helper.sock\n' | \
+    sudo tee /etc/systemd/system/tbx-helper.service.d/prototype-workaround.conf | tee -a "$REPORT"
   run sudo systemctl daemon-reload
+  run sudo systemctl reset-failed tbx-helper.service tbx-helper.socket
   run sudo systemctl enable --now tbx-helper.socket
   run systemctl --user daemon-reload
   run systemctl --user enable --now tbxd.socket
