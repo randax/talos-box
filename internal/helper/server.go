@@ -266,7 +266,7 @@ func (s *Server) serveConnection(connection *net.UnixConn) {
 			return
 		}
 		s.opMu.Lock()
-		reply := s.dispatch(request)
+		reply := s.dispatchFrom(uid, request)
 		err := sendResponse(connection, reply.response, reply.fd)
 		if err != nil && reply.cleanup != nil {
 			reply.cleanup()
@@ -330,18 +330,27 @@ func sendResponse(connection *net.UnixConn, response Response, fd int) error {
 	return nil
 }
 
+// dispatch serves a request on behalf of uid 0. Tests use it; connections go
+// through dispatchFrom with the peer's real uid.
 func (s *Server) dispatch(request Request) serverReply {
+	return s.dispatchFrom(0, request)
+}
+
+// dispatchFrom serves one request from the peer with the given uid. The uid
+// is the SO_PEERCRED identity, so an op that partitions state by owner
+// (net.sync) can trust it.
+func (s *Server) dispatchFrom(uid uint32, request Request) serverReply {
 	if request.Op == "dns.listen" {
 		return s.dnsListenerReply(request.Args)
 	}
-	data, fd, cleanup, err := s.handle(request)
+	data, fd, cleanup, err := s.handle(uid, request)
 	if err != nil {
 		return serverReply{response: failure(err), fd: -1}
 	}
 	return serverReply{response: success(data), fd: fd, cleanup: cleanup}
 }
 
-func (s *Server) handle(request Request) (any, int, func(), error) {
+func (s *Server) handle(uid uint32, request Request) (any, int, func(), error) {
 	switch request.Op {
 	case "net.attach":
 		return s.attach(request.Args)
@@ -350,7 +359,7 @@ func (s *Server) handle(request Request) (any, int, func(), error) {
 	case "net.teardown":
 		return s.teardownNetwork(request.Args)
 	case "net.sync":
-		return s.sync(request.Args)
+		return s.sync(uid, request.Args)
 	case "dns.install":
 		var args struct {
 			Port int `json:"port"`
@@ -421,14 +430,17 @@ func (s *Server) handle(request Request) (any, int, func(), error) {
 // sync adopts the reservations tbxd pushes and reconverges the host state they
 // describe. tbxd owns cluster state; the helper only holds this copy, so it can
 // serve DHCP and rebuild bridges without ever reading a user's home.
-func (s *Server) sync(raw json.RawMessage) (any, int, func(), error) {
+// sync replaces the calling user's reservations — only theirs: each tbx
+// group member's daemon pushes the clusters in its own home, and the helper
+// converges over the union of every user's partition.
+func (s *Server) sync(owner uint32, raw json.RawMessage) (any, int, func(), error) {
 	var args struct {
 		Clusters []SyncedCluster `json:"clusters"`
 	}
 	if err := decodeArgs(raw, &args); err != nil {
 		return nil, -1, nil, err
 	}
-	if err := s.state.Replace(args.Clusters); err != nil {
+	if err := s.state.Replace(owner, args.Clusters); err != nil {
 		return nil, -1, nil, err
 	}
 	if err := convergeHostNetworking(s.desiredSubnetIndexes()); err != nil {

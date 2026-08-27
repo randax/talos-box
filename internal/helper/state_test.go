@@ -3,6 +3,7 @@ package helper
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -27,7 +28,7 @@ func TestHelperStateRoundTripsThroughDisk(t *testing.T) {
 
 	dir := t.TempDir()
 	state := NewState(dir)
-	if err := state.Replace(syncedFixture()); err != nil {
+	if err := state.Replace(0, syncedFixture()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -75,7 +76,7 @@ func TestHelperStateReplaceRejectsInvalidReservations(t *testing.T) {
 
 	dir := t.TempDir()
 	state := NewState(dir)
-	if err := state.Replace(syncedFixture()); err != nil {
+	if err := state.Replace(0, syncedFixture()); err != nil {
 		t.Fatal(err)
 	}
 	duplicate := []SyncedCluster{{
@@ -86,7 +87,7 @@ func TestHelperStateReplaceRejectsInvalidReservations(t *testing.T) {
 			{Name: "b", MAC: "52:54:00:00:00:09", IP: "172.30.0.22"},
 		},
 	}}
-	if err := state.Replace(duplicate); err == nil {
+	if err := state.Replace(0, duplicate); err == nil {
 		t.Fatal("Replace accepted a duplicate MAC")
 	}
 	if got := state.Clusters(); len(got) != 2 || got[0].Name != "alpha" {
@@ -108,7 +109,7 @@ func TestHelperStateWithoutDirectoryKeepsStateInMemory(t *testing.T) {
 	if err := state.Load(); err != nil {
 		t.Fatal(err)
 	}
-	if err := state.Replace(syncedFixture()); err != nil {
+	if err := state.Replace(0, syncedFixture()); err != nil {
 		t.Fatal(err)
 	}
 	if got := state.Clusters(); len(got) != 2 {
@@ -163,5 +164,64 @@ func TestHelperStateLoadTreatsACorruptFileAsEmpty(t *testing.T) {
 	}
 	if got := state.SubnetIndexes(); len(got) != 0 {
 		t.Fatalf("subnets after corrupt load = %v, want none", got)
+	}
+}
+
+// Two tbx group members each run a daemon over their own home. A sync from
+// one replaces only that user's partition; the helper serves the union.
+func TestHelperStateKeepsEachOwnersPartitionApart(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	state := NewState(dir)
+	alice := []SyncedCluster{{Name: "alpha", SubnetIndex: 0, Nodes: []SyncedNode{{Name: "alpha-cp-1", MAC: "52:54:00:00:00:01", IP: "172.30.0.11"}}}}
+	bob := []SyncedCluster{{Name: "beta", SubnetIndex: 5, Nodes: []SyncedNode{{Name: "beta-cp-1", MAC: "52:54:00:00:05:01", IP: "172.30.5.11"}}}}
+	if err := state.Replace(1000, alice); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.Replace(1001, bob); err != nil {
+		t.Fatal(err)
+	}
+	if got := state.SubnetIndexes(); len(got) != 2 || got[0] != 0 || got[1] != 5 {
+		t.Fatalf("subnets after two owners synced = %v, want [0 5]", got)
+	}
+
+	// Alice's daemon restarts with no clusters: Bob's must survive.
+	if err := state.Replace(1000, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := state.SubnetIndexes(); len(got) != 1 || got[0] != 5 {
+		t.Fatalf("subnets after alice emptied hers = %v, want [5]", got)
+	}
+
+	// And so must both partitions across a helper restart.
+	if err := state.Replace(1000, alice); err != nil {
+		t.Fatal(err)
+	}
+	reloaded := NewState(dir)
+	if err := reloaded.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.SubnetIndexes(); len(got) != 2 || got[0] != 0 || got[1] != 5 {
+		t.Fatalf("subnets after reload = %v, want [0 5]", got)
+	}
+}
+
+// A second user cannot take over an IP or MAC the first already reserved.
+func TestHelperStateRejectsACrossOwnerCollision(t *testing.T) {
+	t.Parallel()
+
+	state := NewState("")
+	alice := []SyncedCluster{{Name: "alpha", SubnetIndex: 0, Nodes: []SyncedNode{{Name: "alpha-cp-1", MAC: "52:54:00:00:00:01", IP: "172.30.0.11"}}}}
+	bob := []SyncedCluster{{Name: "beta", SubnetIndex: 0, Nodes: []SyncedNode{{Name: "beta-cp-1", MAC: "52:54:00:00:00:02", IP: "172.30.0.11"}}}}
+	if err := state.Replace(1000, alice); err != nil {
+		t.Fatal(err)
+	}
+	err := state.Replace(1001, bob)
+	if err == nil || !strings.Contains(err.Error(), "another user") {
+		t.Fatalf("Replace() error = %v, want a cross-owner collision", err)
+	}
+	if got := state.Clusters(); len(got) != 1 || got[0].Name != "alpha" {
+		t.Fatalf("clusters after rejected sync = %+v, want alice's alone", got)
 	}
 }

@@ -253,7 +253,7 @@ func TestSyncRejectsInconsistentReservationsAndKeepsState(t *testing.T) {
 	server := NewServer(state, nil)
 	manager := &recordingDHCPManager{subnets: server.desiredSubnetIndexes}
 	server.dhcp = manager
-	if err := state.Replace([]SyncedCluster{{
+	if err := state.Replace(0, []SyncedCluster{{
 		Name:        "demo",
 		SubnetIndex: 7,
 		Nodes:       []SyncedNode{{Name: "demo-cp-1", MAC: "52:54:00:00:07:01", IP: "172.30.7.11"}},
@@ -272,5 +272,31 @@ func TestSyncRejectsInconsistentReservationsAndKeepsState(t *testing.T) {
 	}
 	if len(manager.converged) != 0 {
 		t.Fatalf("DHCP converges = %v, want none after a rejected sync", manager.converged)
+	}
+}
+
+// net.sync carries the peer's uid: a second user's push must not erase the
+// first user's reservations, and the converge covers both.
+func TestSyncFromTwoPeersConvergesOverBothPartitions(t *testing.T) {
+	server := NewServer(NewState(t.TempDir()), nil)
+	manager := &recordingDHCPManager{subnets: server.desiredSubnetIndexes}
+	server.dhcp = manager
+	originalConverge := convergeHostNetworking
+	convergeHostNetworking = func([]int) error { return nil }
+	t.Cleanup(func() { convergeHostNetworking = originalConverge })
+
+	alice := Request{Op: "net.sync", Args: json.RawMessage(
+		`{"clusters":[{"name":"alpha","subnetIndex":2,"nodes":[{"name":"alpha-cp-1","mac":"52:54:00:00:02:01","ip":"172.30.2.11"}]}]}`)}
+	bob := Request{Op: "net.sync", Args: json.RawMessage(
+		`{"clusters":[{"name":"beta","subnetIndex":9,"nodes":[{"name":"beta-cp-1","mac":"52:54:00:00:09:01","ip":"172.30.9.11"}]}]}`)}
+	if reply := server.dispatchFrom(1000, alice); !reply.response.OK {
+		t.Fatalf("alice net.sync = %+v", reply.response)
+	}
+	if reply := server.dispatchFrom(1001, bob); !reply.response.OK {
+		t.Fatalf("bob net.sync = %+v", reply.response)
+	}
+	last := manager.converged[len(manager.converged)-1]
+	if len(last) != 2 || last[0] != 2 || last[1] != 9 {
+		t.Fatalf("DHCP converge after both synced = %v, want [2 9]", last)
 	}
 }

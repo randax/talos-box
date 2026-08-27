@@ -1330,13 +1330,24 @@ func (s *Server) addNodeLocked(raw json.RawMessage, progress stageFunc) (NodeSta
 		_ = removeNodeFiles(item.Name, node.Name)
 		return NodeStatus{}, nil, err
 	}
-	if err := cluster.Save(item); err != nil {
+	// The new node needs its reservation served before it attaches, exactly as
+	// a cluster start does — and before the record is committed: a sync that
+	// fails after the save would leave a node on disk the helper never heard
+	// of, with nothing to roll it back.
+	proposed, err := proposedClusterSet(item)
+	if err != nil {
 		_ = removeNodeFiles(item.Name, node.Name)
 		return NodeStatus{}, nil, err
 	}
-	// The new node needs its reservation served before it attaches, exactly as
-	// a cluster start does.
-	if err := SyncHelperState(); err != nil {
+	if err := SyncHelperClusters(proposed); err != nil {
+		_ = removeNodeFiles(item.Name, node.Name)
+		return NodeStatus{}, nil, err
+	}
+	if err := cluster.Save(item); err != nil {
+		_ = removeNodeFiles(item.Name, node.Name)
+		// The helper holds a reservation the record never took; hand it the
+		// committed set again.
+		logHelperSyncFailure("node add: revert helper reservations after a failed save")
 		return NodeStatus{}, nil, err
 	}
 	if running {

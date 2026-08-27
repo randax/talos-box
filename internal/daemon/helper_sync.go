@@ -29,6 +29,13 @@ func SyncHelperState() error {
 	if err != nil {
 		return fmt.Errorf("sync helper state: %w", err)
 	}
+	return SyncHelperClusters(clusters)
+}
+
+// SyncHelperClusters pushes an explicit reservation set. A mutation that must
+// not be committed without its reservation (node add) syncs the proposed set
+// first and saves only once the helper holds it.
+func SyncHelperClusters(clusters []cluster.Cluster) error {
 	client, err := connectSyncHelper()
 	if err != nil {
 		return fmt.Errorf("sync helper state: %w", helperInstallError(err))
@@ -38,6 +45,25 @@ func SyncHelperState() error {
 		return fmt.Errorf("sync helper state: %w", err)
 	}
 	return nil
+}
+
+// proposedClusterSet is the persisted set with one cluster replaced by (or, if
+// new, extended with) its proposed successor.
+func proposedClusterSet(item cluster.Cluster) ([]cluster.Cluster, error) {
+	clusters, err := listClustersForSync()
+	if err != nil {
+		return nil, fmt.Errorf("sync helper state: %w", err)
+	}
+	replaced := false
+	for i := range clusters {
+		if clusters[i].Name == item.Name {
+			clusters[i], replaced = item, true
+		}
+	}
+	if !replaced {
+		clusters = append(clusters, item)
+	}
+	return clusters, nil
 }
 
 // logHelperSyncFailure records a sync that could not be delivered on a teardown

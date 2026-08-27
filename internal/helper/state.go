@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -36,23 +38,28 @@ type SyncedNode struct {
 	IP   string `json:"ip"`
 }
 
+// syncedState is the on-disk form: one partition per owner uid. Several tbx
+// group members can each run a daemon over their own home, and a sync from one
+// must only ever replace that user's own reservations.
 type syncedState struct {
-	Clusters []SyncedCluster `json:"clusters"`
+	Owners map[string][]SyncedCluster `json:"owners"`
 }
 
-// State is the helper's copy of the reservations tbxd owns. A state with
-// no directory keeps them in memory only, which loses host networking across a
-// helper restart but never fails an otherwise working helper.
+// State is the helper's copy of the reservations every local tbxd owns,
+// partitioned by the syncing peer's uid. A state with no directory keeps them
+// in memory only, which loses host networking across a helper restart but
+// never fails an otherwise working helper.
 type State struct {
-	mu       sync.RWMutex
-	clusters []cluster.Cluster
-	path     string
+	mu         sync.RWMutex
+	partitions map[uint32][]SyncedCluster
+	clusters   []cluster.Cluster // union of all partitions, validated together
+	path       string
 }
 
 // NewState creates the helper's reservation state. An empty dir keeps the
 // reservations in memory only.
 func NewState(dir string) *State {
-	state := &State{}
+	state := &State{partitions: make(map[uint32][]SyncedCluster)}
 	if dir != "" {
 		state.path = filepath.Join(dir, reservationsFileName)
 	}
@@ -82,57 +89,95 @@ func helperStateDir(getenv func(string) string) string {
 func (s *State) Load() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.partitions = make(map[uint32][]SyncedCluster)
+	s.clusters = nil
 	if s.path == "" {
 		return nil
 	}
 	raw, err := os.ReadFile(s.path)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			s.clusters = nil
-			return nil
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Printf("read helper reservations %s: %v; starting with no reservations until tbxd syncs", s.path, err)
 		}
-		s.clusters = nil
-		log.Printf("read helper reservations %s: %v; starting with no reservations until tbxd syncs", s.path, err)
 		return nil
 	}
 	var stored syncedState
 	if err := json.Unmarshal(raw, &stored); err != nil {
-		s.clusters = nil
 		log.Printf("decode helper reservations %s: %v; starting with no reservations until tbxd syncs", s.path, err)
 		return nil
 	}
-	clusters, err := syncedClusters(stored.Clusters)
+	partitions := make(map[uint32][]SyncedCluster, len(stored.Owners))
+	for key, synced := range stored.Owners {
+		owner, err := strconv.ParseUint(key, 10, 32)
+		if err != nil {
+			log.Printf("helper reservations %s: owner %q is not a uid; dropped", s.path, key)
+			continue
+		}
+		partitions[uint32(owner)] = synced
+	}
+	union, err := unionClusters(partitions)
 	if err != nil {
-		s.clusters = nil
 		log.Printf("validate helper reservations %s: %v; starting with no reservations until tbxd syncs", s.path, err)
 		return nil
 	}
-	s.clusters = clusters
+	s.partitions, s.clusters = partitions, union
 	return nil
 }
 
-// Replace validates and adopts a pushed reservation set, persisting it when the
-// helper has a state directory. A rejected set leaves the previous one in place
-// on disk and in memory.
-func (s *State) Replace(in []SyncedCluster) error {
-	clusters, err := syncedClusters(in)
-	if err != nil {
+// Replace validates and adopts one owner's pushed reservation set, leaving
+// every other owner's partition as it was, and persists the whole when the
+// helper has a state directory. A set that is inconsistent on its own or
+// collides with another owner's reservations is rejected and leaves the
+// previous state in place on disk and in memory.
+func (s *State) Replace(owner uint32, in []SyncedCluster) error {
+	if _, err := syncedClusters(in); err != nil {
 		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.persist(in); err != nil {
+	proposed := make(map[uint32][]SyncedCluster, len(s.partitions)+1)
+	for uid, synced := range s.partitions {
+		proposed[uid] = synced
+	}
+	proposed[owner] = in
+	union, err := unionClusters(proposed)
+	if err != nil {
+		return fmt.Errorf("reservations collide with another user's clusters: %w", err)
+	}
+	if err := s.persist(proposed); err != nil {
 		return err
 	}
-	s.clusters = clusters
+	s.partitions, s.clusters = proposed, union
 	return nil
 }
 
-func (s *State) persist(in []SyncedCluster) error {
+// unionClusters validates every owner's partition alone, then all of them as
+// one reservation table: two users cannot both hand out an IP or a MAC.
+func unionClusters(partitions map[uint32][]SyncedCluster) ([]cluster.Cluster, error) {
+	owners := slices.Sorted(maps.Keys(partitions))
+	var union []cluster.Cluster
+	for _, owner := range owners {
+		clusters, err := syncedClusters(partitions[owner])
+		if err != nil {
+			return nil, fmt.Errorf("uid %d: %w", owner, err)
+		}
+		union = append(union, clusters...)
+	}
+	if _, err := cluster.NewReservationTable(union); err != nil {
+		return nil, err
+	}
+	return union, nil
+}
+
+func (s *State) persist(partitions map[uint32][]SyncedCluster) error {
 	if s.path == "" {
 		return nil
 	}
-	raw, err := json.Marshal(syncedState{Clusters: in})
+	stored := syncedState{Owners: make(map[string][]SyncedCluster, len(partitions))}
+	for owner, synced := range partitions {
+		stored.Owners[strconv.FormatUint(uint64(owner), 10)] = synced
+	}
+	raw, err := json.Marshal(stored)
 	if err != nil {
 		return fmt.Errorf("encode helper reservations: %w", err)
 	}
