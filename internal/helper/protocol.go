@@ -44,6 +44,11 @@ const (
 
 var errProtocolMismatch = errors.New("helper protocol mismatch")
 
+// IsProtocolMismatch reports whether err is the version-handshake refusal. It
+// already carries the reinstall advice, so callers must not stack the
+// "helper unavailable" remediation in front of it.
+func IsProtocolMismatch(err error) bool { return errors.Is(err, errProtocolMismatch) }
+
 // linuxHelperReinstallAdvice is the Linux recovery for a stale helper. Linux
 // installation is owned by packages and systemd units — `tbx system install`
 // installs the macOS launchd helper there, which docs/linux.md forbids — so the

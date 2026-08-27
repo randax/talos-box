@@ -1,11 +1,14 @@
 [Unit]
 Description=Talos Box privileged helper
+# A helper started by hand still gets the socket's descriptor; without this a
+# `systemctl start tbx-helper.service` before the socket is enabled would try
+# to bind under /run/user/<tbx-uid>, which a nologin system user never has.
+Requires=tbx-helper.socket
+After=tbx-helper.socket
 
 [Service]
-# "+" runs as root regardless of User=/capabilities; "-" tolerates a source
-# install that skipped the drop-in (the helper then reports the sysctl itself).
-ExecStartPre=-+/usr/lib/systemd/systemd-sysctl /usr/lib/sysctl.d/50-talos-box.conf
 ExecStart=/usr/bin/tbx-helper
+Environment=TBX_HELPER_SOCKET=/var/run/tbx-helper.sock
 User=tbx
 Group=tbx
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
@@ -16,6 +19,10 @@ NoNewPrivileges=yes
 DynamicUser=no
 PrivateNetwork=no
 ProtectSystem=strict
+# The helper never reads a user's home: cluster state reaches it over net.sync.
+ProtectHome=yes
+PrivateTmp=yes
+RestrictSUIDSGID=yes
 ProtectControlGroups=yes
 ProtectKernelLogs=yes
 ProtectKernelModules=yes

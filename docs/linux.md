@@ -142,13 +142,10 @@ sudo install -Dm0644 packaging/linux/usr/lib/systemd/user/tbxd.service \
   /usr/lib/systemd/user/tbxd.service
 sudo install -Dm0644 packaging/linux/usr/lib/sysusers.d/talos-box.conf \
   /usr/lib/sysusers.d/talos-box.conf
-sudo install -Dm0644 packaging/linux/usr/lib/sysctl.d/50-talos-box.conf \
-  /usr/lib/sysctl.d/50-talos-box.conf
 sudo install -Dm0644 packaging/linux/usr/share/polkit-1/rules.d/90-talos-box-resolved.rules \
   /usr/share/polkit-1/rules.d/90-talos-box-resolved.rules
 
 sudo systemd-sysusers /usr/lib/sysusers.d/talos-box.conf
-sudo systemd-sysctl /usr/lib/sysctl.d/50-talos-box.conf
 sudo usermod -aG tbx "$USER"
 getent group kvm >/dev/null && sudo usermod -aG kvm "$USER"
 
@@ -199,7 +196,7 @@ configured bridge or running cluster report `SKIP` before one exists.
 
 | Check | What it proves | Typical remediation |
 |---|---|---|
-| `helper`, `helper-unit`, `helper-access` | The helper socket is enabled, reachable, and accessible to the current `tbx` group member | Enable `tbx-helper.socket`; add the user to `tbx`; log out and back in |
+| `helper`, `helper-unit`, `helper-access` | The helper socket is enabled, reachable, and accessible to the current `tbx` group member | Enable `tbx-helper.socket`; add the user to `tbx`; then apply the group as `doctor` says: log out and back in, `loginctl terminate-user $USER` under a lingering session, or `wsl --shutdown` under WSL |
 | `helper-capabilities` | The helper has exactly `CAP_NET_ADMIN`, `CAP_NET_BIND_SERVICE`, and `CAP_NET_RAW` | Reinstall the current service unit and restart the helper |
 | `kvm` | `/dev/kvm` exists and is readable+writable | Enable KVM or add the user to the device's group |
 | `qemu` | QEMU meets the 6.2 floor, provides the required machine, and reports suspend availability | Install/upgrade the architecture-specific QEMU package |

@@ -883,6 +883,11 @@ func guestAgentSocketPath(item cluster.Cluster, dir string, node cluster.Node) s
 }
 
 func helperInstallError(err error) error {
+	if helper.IsProtocolMismatch(err) {
+		// The mismatch names the real fix (upgrade the helper); an "enable
+		// the socket" preamble would be the wrong remediation read first.
+		return err
+	}
 	return fmt.Errorf("network helper unavailable; %s: %w", helper.UnavailableAdvice(), err)
 }
 

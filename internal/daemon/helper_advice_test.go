@@ -24,3 +24,19 @@ func TestHelperInstallErrorCarriesTheHostsAdvice(t *testing.T) {
 		t.Errorf("message %q missing the host's advice %q", err, helper.UnavailableAdvice())
 	}
 }
+
+// A stale helper is refused at the handshake with its own advice (upgrade the
+// helper). Prefixing that with "enable the socket" would put the wrong
+// remediation first, on the one release where every upgrade hits it.
+func TestHelperInstallErrorLeavesAProtocolMismatchAlone(t *testing.T) {
+	t.Parallel()
+
+	cause := helper.ProtocolMismatchErrorForTest(5, 4)
+	err := helperInstallError(cause)
+	if err != cause {
+		t.Fatalf("helperInstallError() = %v, want the mismatch returned unchanged", err)
+	}
+	if strings.Contains(err.Error(), helper.UnavailableAdvice()) {
+		t.Errorf("message %q stacks the unavailable advice on a mismatch", err)
+	}
+}
