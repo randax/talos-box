@@ -93,7 +93,9 @@ qemu-system-x86_64 --version  # amd64
 
 If `/dev/kvm` is missing, enable virtualization in firmware and load the appropriate KVM
 kernel module. If it exists but is not writable, add the current user to the group that owns
-the device (normally `kvm`), then log out and back in.
+the device (normally `kvm`), then start a session that carries the new membership: log out and
+back in, `loginctl terminate-user $USER` where the user lingers (`loginctl enable-linger`), or
+`wsl --shutdown` from Windows under WSL. `tbx doctor` prints whichever step applies to the host.
 
 The source preview requires Go 1.26. Install the repository's current toolchain from the
 official Go archive when the distribution package is older:
