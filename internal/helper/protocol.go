@@ -29,10 +29,16 @@ const (
 	// next create climbs to a fresh subnet index; refusing the handshake sends
 	// the operator to a reinstall instead of accumulating host residue.
 	//
+	// Version 5 added net.sync, which pushes the cluster reservations tbxd owns
+	// into the helper. The packaged Linux helper runs as an unprivileged system
+	// user that cannot read a caller's home, so without this op it serves no
+	// DHCP and reconverges no bridges; a version 4 helper would silently leave
+	// every cluster without addresses.
+	//
 	// Bumping this also means bumping the literal in nix/vm-test.nix: the NixOS
 	// smoke test's helper-probe performs this handshake against the packaged
 	// helper, and `nix flake check` fails on a mismatch.
-	protocolVersion = 4
+	protocolVersion = 5
 	helperInfoOp    = "helper.info"
 )
 

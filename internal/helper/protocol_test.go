@@ -3,9 +3,12 @@ package helper
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -210,5 +213,28 @@ func TestDetachRequiresNames(t *testing.T) {
 
 	if err := NewServer(nil, nil).detach(json.RawMessage("{}")); err == nil {
 		t.Fatal("detach accepted missing cluster and node")
+	}
+}
+
+// The NixOS smoke test performs the handshake against the packaged helper with
+// a literal version, so a bump that misses nix/vm-test.nix fails `nix flake
+// check` instead of this test.
+func TestProtocolVersionMatchesTheNixSmokeTest(t *testing.T) {
+	t.Parallel()
+
+	if protocolVersion != 5 {
+		t.Fatalf("protocolVersion = %d, want 5 (net.sync)", protocolVersion)
+	}
+	raw, err := os.ReadFile(filepath.Join("..", "..", "nix", "vm-test.nix"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		fmt.Sprintf(`"args": {"protocolVersion": %d}`, protocolVersion),
+		fmt.Sprintf(`response["data"]["protocolVersion"] == %d`, protocolVersion),
+	} {
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf("nix/vm-test.nix does not contain %q", want)
+		}
 	}
 }

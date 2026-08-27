@@ -346,6 +346,8 @@ func (s *Server) handle(request Request) (any, int, func(), error) {
 		return nil, -1, nil, s.detach(request.Args)
 	case "net.teardown":
 		return s.teardownNetwork(request.Args)
+	case "net.sync":
+		return s.sync(request.Args)
 	case "dns.install":
 		var args struct {
 			Port int `json:"port"`
@@ -411,6 +413,28 @@ func (s *Server) handle(request Request) (any, int, func(), error) {
 	default:
 		return nil, -1, nil, fmt.Errorf("unknown operation %q", request.Op)
 	}
+}
+
+// sync adopts the reservations tbxd pushes and reconverges the host state they
+// describe. tbxd owns cluster state; the helper only holds this copy, so it can
+// serve DHCP and rebuild bridges without ever reading a user's home.
+func (s *Server) sync(raw json.RawMessage) (any, int, func(), error) {
+	var args struct {
+		Clusters []SyncedCluster `json:"clusters"`
+	}
+	if err := decodeArgs(raw, &args); err != nil {
+		return nil, -1, nil, err
+	}
+	if err := s.state.Replace(args.Clusters); err != nil {
+		return nil, -1, nil, err
+	}
+	if err := convergeNetworking(s.desiredSubnetIndexes()); err != nil {
+		return nil, -1, nil, fmt.Errorf("converge helper networking: %w", err)
+	}
+	if err := s.dhcp.Converge(); err != nil {
+		return nil, -1, nil, err
+	}
+	return struct{}{}, -1, nil, nil
 }
 
 func (s *Server) attach(raw json.RawMessage) (any, int, func(), error) {

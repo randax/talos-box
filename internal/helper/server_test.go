@@ -217,3 +217,50 @@ func TestAttachConvergesDHCPForASubnetTheSyncedStateDoesNotCover(t *testing.T) {
 		t.Fatalf("converged subnets = %v, want [5]", got)
 	}
 }
+
+func TestSyncReplacesStateAndConvergesDHCP(t *testing.T) {
+	state := NewState(t.TempDir())
+	server := NewServer(state, nil)
+	manager := &recordingDHCPManager{subnets: server.desiredSubnetIndexes}
+	server.dhcp = manager
+
+	reply := server.dispatch(Request{Op: "net.sync", Args: json.RawMessage(
+		`{"clusters":[{"name":"demo","subnetIndex":7,"nodes":[{"name":"demo-cp-1","mac":"52:54:00:00:07:01","ip":"172.30.7.11"}]}]}`,
+	)})
+	if !reply.response.OK {
+		t.Fatalf("net.sync response = %+v", reply.response)
+	}
+	if got := state.SubnetIndexes(); len(got) != 1 || got[0] != 7 {
+		t.Fatalf("state subnets = %v, want [7]", got)
+	}
+	if len(manager.converged) != 1 || len(manager.converged[0]) != 1 || manager.converged[0][0] != 7 {
+		t.Fatalf("DHCP converges = %v, want one converge over [7]", manager.converged)
+	}
+}
+
+func TestSyncRejectsInconsistentReservationsAndKeepsState(t *testing.T) {
+	state := NewState(t.TempDir())
+	server := NewServer(state, nil)
+	manager := &recordingDHCPManager{subnets: server.desiredSubnetIndexes}
+	server.dhcp = manager
+	if err := state.Replace([]SyncedCluster{{
+		Name:        "demo",
+		SubnetIndex: 7,
+		Nodes:       []SyncedNode{{Name: "demo-cp-1", MAC: "52:54:00:00:07:01", IP: "172.30.7.11"}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	reply := server.dispatch(Request{Op: "net.sync", Args: json.RawMessage(
+		`{"clusters":[{"name":"broken","subnetIndex":1,"nodes":[{"name":"a","mac":"not-a-mac","ip":"172.30.1.11"}]}]}`,
+	)})
+	if reply.response.OK {
+		t.Fatal("net.sync accepted an invalid reservation set")
+	}
+	if got := state.SubnetIndexes(); len(got) != 1 || got[0] != 7 {
+		t.Fatalf("state subnets = %v, want the previous [7]", got)
+	}
+	if len(manager.converged) != 0 {
+		t.Fatalf("DHCP converges = %v, want none after a rejected sync", manager.converged)
+	}
+}
