@@ -225,7 +225,7 @@ func linuxPlatformDoctorFindings(
 		linuxPortFinding(67, "udp", deps.listConfig, deps.readFile, deps.command, deps.listenPacket, deps.listenStream),
 		linuxPortFinding(179, "tcp", deps.listConfig, deps.readFile, deps.command, deps.listenPacket, deps.listenStream),
 		linuxHelperUnitFinding(deps.command),
-		linuxHelperAccessFinding(deps.command),
+		linuxHelperAccessFinding(deps.command, doctorOSRelease(deps.readFile)),
 		linuxHelperCapabilitiesFinding(helperCaps),
 	}
 	return findings
@@ -815,7 +815,7 @@ func linuxHelperUnitFinding(command commandOutput) doctorFinding {
 	return finding
 }
 
-func linuxHelperAccessFinding(command commandOutput) doctorFinding {
+func linuxHelperAccessFinding(command commandOutput, osrelease string) doctorFinding {
 	finding := doctorFinding{level: "PASS", check: "helper-access"}
 	output, err := command("id", "-Gn")
 	if err != nil {
@@ -828,7 +828,7 @@ func linuxHelperAccessFinding(command commandOutput) doctorFinding {
 		}
 	}
 	finding.level = "FAIL"
-	finding.detail = fmt.Sprintf("current user is not in group tbx; run `%s`, then log out and back in", doctorHelperGroupFix)
+	finding.detail = fmt.Sprintf("current user is not in group tbx; run `%s`, then %s", doctorHelperGroupFix, linuxSessionRefreshHint(osrelease))
 	return finding
 }
 

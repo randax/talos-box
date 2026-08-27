@@ -766,8 +766,8 @@ func TestLinuxPlatformDoctorFindingsHelperAccessSuggestsUsermod(t *testing.T) {
 			t.Fatalf("unexpected command %s %v", name, args)
 		}
 		return []byte("wheel kvm\n"), nil
-	})
-	if finding.level != "FAIL" || !strings.Contains(finding.detail, doctorHelperGroupFix) {
+	}, "5.15.167.4-microsoft-standard-WSL2")
+	if finding.level != "FAIL" || !strings.Contains(finding.detail, doctorHelperGroupFix) || !strings.Contains(finding.detail, "wsl --shutdown") {
 		t.Fatalf("finding = %+v", finding)
 	}
 }

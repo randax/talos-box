@@ -28,6 +28,7 @@ func TestDetachKeepsAttachmentOnStopFailure(t *testing.T) {
 
 func TestAttachCleanupDropsAttachmentOnRetainedStopFailure(t *testing.T) {
 	server := NewServer(nil, nil)
+	server.dhcp = &recordingDHCPManager{subnets: server.attachedSubnetIndexes}
 	startCalls := 0
 	stopCalls := make(map[int]int)
 

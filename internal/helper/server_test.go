@@ -223,6 +223,13 @@ func TestSyncReplacesStateAndConvergesDHCP(t *testing.T) {
 	server := NewServer(state, nil)
 	manager := &recordingDHCPManager{subnets: server.desiredSubnetIndexes}
 	server.dhcp = manager
+	var convergedHost [][]int
+	originalConverge := convergeHostNetworking
+	convergeHostNetworking = func(subnets []int) error {
+		convergedHost = append(convergedHost, subnets)
+		return nil
+	}
+	t.Cleanup(func() { convergeHostNetworking = originalConverge })
 
 	reply := server.dispatch(Request{Op: "net.sync", Args: json.RawMessage(
 		`{"clusters":[{"name":"demo","subnetIndex":7,"nodes":[{"name":"demo-cp-1","mac":"52:54:00:00:07:01","ip":"172.30.7.11"}]}]}`,
@@ -235,6 +242,9 @@ func TestSyncReplacesStateAndConvergesDHCP(t *testing.T) {
 	}
 	if len(manager.converged) != 1 || len(manager.converged[0]) != 1 || manager.converged[0][0] != 7 {
 		t.Fatalf("DHCP converges = %v, want one converge over [7]", manager.converged)
+	}
+	if len(convergedHost) != 1 || len(convergedHost[0]) != 1 || convergedHost[0][0] != 7 {
+		t.Fatalf("host converges = %v, want one converge over [7]", convergedHost)
 	}
 }
 

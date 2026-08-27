@@ -26,7 +26,10 @@ const (
 
 var (
 	startInterface = StartInterface
-	teardownSubnet = TeardownSubnet
+	// convergeHostNetworking is the sync-time bridge/nftables convergence; a
+	// variable so tests stay off the real netlink socket.
+	convergeHostNetworking = convergeNetworking
+	teardownSubnet         = TeardownSubnet
 )
 
 type attachmentKey struct {
@@ -428,7 +431,7 @@ func (s *Server) sync(raw json.RawMessage) (any, int, func(), error) {
 	if err := s.state.Replace(args.Clusters); err != nil {
 		return nil, -1, nil, err
 	}
-	if err := convergeNetworking(s.desiredSubnetIndexes()); err != nil {
+	if err := convergeHostNetworking(s.desiredSubnetIndexes()); err != nil {
 		return nil, -1, nil, fmt.Errorf("converge helper networking: %w", err)
 	}
 	if err := s.dhcp.Converge(); err != nil {
