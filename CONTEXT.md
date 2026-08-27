@@ -42,6 +42,10 @@ The platform-specific VM, networking, DNS, and service-manager implementation be
 
 A host feature whose availability is detected at runtime and reported with a reason. An unavailable capability disables only that feature rather than making the whole host unsupported.
 
+## Size-by-hand host
+
+A host substrate whose memory readings cannot be trusted for automatic management, so balloon and host-pressure features stand down permanently there and the user sizes resources manually. Declared per substrate, not detected: being size-by-hand is a property of the platform, not a capability gate.
+
 ## Synced reservations
 
 The copy of every cluster's DHCP reservations — subnet plus each node's MAC and IP — that the daemon pushes to the privileged helper, which is the helper's only source of cluster state. The helper persists it and reconverges host networking from it, so it never reads the user's cluster state itself.
@@ -93,3 +97,7 @@ The state of a cluster whose nodes are up but which still has things coming back
 ## Inter-cluster path
 
 A route between two clusters on the same host — node to node, or node to the other cluster's ingress VIP — carried by the host rather than by either cluster. It is a first-class part of the multi-cluster contract, so it is checked in its own right and needs at least two running clusters to check.
+
+## Project name
+
+The project is written **talos-box** in every user-facing place — the public site (talos-box.dev), the repository, and prose. `tbx` is the command, not a name for the project. The one-word spelling is legacy and not used for anything new.
