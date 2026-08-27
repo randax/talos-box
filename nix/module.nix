@@ -110,6 +110,8 @@ in
         Group = "tbx";
         AmbientCapabilities = helperCapabilities;
         CapabilityBoundingSet = helperCapabilities;
+        StateDirectory = "tbx";
+        StateDirectoryMode = "0700";
         NoNewPrivileges = true;
         DynamicUser = false;
         PrivateNetwork = false;

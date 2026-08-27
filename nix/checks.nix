@@ -78,6 +78,8 @@ in
     assert helperService.Environment == "TBX_HELPER_SOCKET=/var/run/tbx-helper.sock";
     assert helperService.AmbientCapabilities == capabilities;
     assert helperService.CapabilityBoundingSet == capabilities;
+    assert helperService.StateDirectory == "tbx";
+    assert helperService.StateDirectoryMode == "0700";
     assert helperService.NoNewPrivileges;
     assert !helperService.DynamicUser;
     assert !helperService.PrivateNetwork;

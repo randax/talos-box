@@ -171,6 +171,22 @@ protocol, and a mismatch is refused with `helper protocol mismatch`. Recover by 
 `sudo systemctl restart tbx-helper.socket`. Restarting alone is not enough — the unit relaunches
 the same stale binary.
 
+## Helper state
+
+`tbxd` owns cluster state under `~/.talosbox`; the helper never reads it. The helper runs as the
+unprivileged `tbx` system user, which cannot open another user's home, so `tbxd` pushes the
+clusters' DHCP reservations (name, subnet, and each node's MAC and IP) to the helper over the
+`net.sync` operation — at daemon start and after every change to cluster state.
+
+The helper persists that copy as `/var/lib/tbx/reservations.json` (the unit's
+`StateDirectory=tbx`, mode `0700`) and reconverges from it at startup, so bridges, nftables rules,
+and DHCP listeners survive a helper restart with no daemon running. Running the helper by hand
+without a state directory is supported — set `TBX_HELPER_STATE_DIR` to keep the file elsewhere, or
+leave both unset and the reservations live in memory only until the next sync.
+
+A cluster start fails if the helper cannot be synced: without its reservations the nodes would boot
+onto a subnet with no DHCP and never get addresses.
+
 ## What `tbx doctor` checks on Linux
 
 Run `tbx doctor` once after host setup and again after creating a cluster. Checks that need a

@@ -42,6 +42,10 @@ The platform-specific VM, networking, DNS, and service-manager implementation be
 
 A host feature whose availability is detected at runtime and reported with a reason. An unavailable capability disables only that feature rather than making the whole host unsupported.
 
+## Synced reservations
+
+The copy of every cluster's DHCP reservations — subnet plus each node's MAC and IP — that the daemon pushes to the privileged helper, which is the helper's only source of cluster state. The helper persists it and reconverges host networking from it, so it never reads the user's cluster state itself.
+
 ## Cluster domain
 
 The DNS domain a cluster is reachable under on the host, from which its node records and ingress wildcard both derive. Chosen at cluster create and immutable thereafter; every cluster has exactly one, and no two clusters share one. A substrate concept — it exists regardless of provisioning path.
