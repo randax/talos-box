@@ -57,15 +57,17 @@ On failure: capture the listener table verbatim.
 
 ### C3 — skipFallback contract on the node (depends on C2)
 
-**Goal**: machine config points all pulls at the single catch-all with no upstream bypass.
+**Goal**: machine config points public/upstream pulls at the single catch-all with no bypass,
+while syntactic loopback registries deliberately redirect back into the node.
 
 Steps:
 1. `tbx manifests qa-mir mirrors` — expect `"*"` → `http://172.30.<n>.1:5059`, `skipFallback: true`.
 2. From a test pod, pull an image that is NOT cached and NOT on any warm list (while online): confirm it arrives via the mirror (mirror stats change: `tbx cache list` before/after shows the upstream's counters grow). Confirm the image was novel first with `tbx cache list <image-ref>`, which answers `cached` / `not cached` for that one reference — pick a tag-pinned ref for this (not `:latest`, not tagless: `cache list <ref>` applies the same ref validation `cache warm` does and rejects those forms with an error rather than an answer). Base the test pod on the [PSA-compliant test pod](deep-storage.md#psa-compliant-test-pod) (swap in the image under test) so the apply does not emit a `would violate PodSecurity "restricted:latest"` block — that block is a warning, not a rejection, and is not a finding.
+3. Run pinned Talos/containerd pulls from anonymous and authenticated registries exposed at `localhost:<nodeport>`. Both must succeed. Compare `tbx cache list` and `tbx logs` before and after: neither pull may create mirror cache activity or an upstream request. This live check is required because an HTTP unit test proves the `307` response but not containerd's redirect and credential behavior.
 
-Expected observations: the rendered mirror config matches the live pull behavior; `cache list` per-upstream counters reflect the pull.
+Expected observations: the rendered mirror config matches the live pull behavior; `cache list` per-upstream counters reflect only the public pull; both loopback pulls remain direct.
 
-Pass criteria: pulls route through the mirror; config matches.
+Pass criteria: public pulls route through the mirror; anonymous and authenticated loopback pulls do not; config matches.
 
 On failure: capture `manifests mirrors` output and `cache list` before/after.
 
@@ -77,13 +79,14 @@ Steps:
 1. Warm one specific tag-pinned image (C1's list). `tbx mirror offline on`; `tbx mirror offline` reports `on`.
 2. From the C3 test pod (the [PSA-compliant test pod](deep-storage.md#psa-compliant-test-pod) again), pull the warmed image by tag — succeeds from cache. Pull it by digest — also succeeds (digest/tag parity).
 3. Pull an uncached image — expect a hard failure mentioning offline/not-cached (skipFallback means the node cannot bypass; the pull fails, it does not hang).
-4. Restart the daemon itself with `tbx system restart --force` (`--force` is required here: `qa-mir` is running, and a plain restart refuses rather than stop it; on a supervised install — packaged Linux units — restart the tbxd service via the service manager instead). If neither is available, exercise the cluster path: `tbx cluster stop qa-mir && tbx cluster start qa-mir`. Afterwards `tbx mirror offline` still reports `on`.
-5. `tbx system restart --force` stops running clusters and does **not** bring them back (it narrates `stopped clusters: qa-mir`), so start the cluster again before the next step: `tbx cluster start qa-mir`, then wait for the API to answer — allow ~1 min to settle. Skip this step only if step 4 took the `cluster stop`/`start` path, which already leaves the cluster running.
-6. `tbx mirror offline off`; the previously failing pull now succeeds.
+4. Repeat one `localhost:<nodeport>` pull from C3 — it still succeeds because syntactic loopback passthrough performs no public-upstream mirror access.
+5. Restart the daemon itself with `tbx system restart --force` (`--force` is required here: `qa-mir` is running, and a plain restart refuses rather than stop it; on a supervised install — packaged Linux units — restart the tbxd service via the service manager instead). If neither is available, exercise the cluster path: `tbx cluster stop qa-mir && tbx cluster start qa-mir`. Afterwards `tbx mirror offline` still reports `on`.
+6. `tbx system restart --force` stops running clusters and does **not** bring them back (it narrates `stopped clusters: qa-mir`), so start the cluster again before the next step: `tbx cluster start qa-mir`, then wait for the API to answer — allow ~1 min to settle. Skip this step only if step 5 took the `cluster stop`/`start` path, which already leaves the cluster running.
+7. `tbx mirror offline off`; the previously failing public pull now succeeds.
 
-Expected observations: cached tag AND digest served offline; miss = clear hard failure, not a hang; mode persists; `off` restores pull-through.
+Expected observations: cached tag AND digest served offline; public miss = clear hard failure, not a hang; loopback remains direct; mode persists; `off` restores pull-through.
 
-Pass criteria: all five behaviors exact.
+Pass criteria: all behaviors exact.
 
 On failure: capture pod events (`kubectl describe pod`), mirror mode outputs.
 

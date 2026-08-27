@@ -205,6 +205,9 @@ func (m *Manager) serveCatchAll(w http.ResponseWriter, r *http.Request) {
 	}
 	clone := r.Clone(r.Context())
 	clone.URL = cloneURLWithoutQueryValue(r.URL, "ns")
+	if redirectLoopbackAuthority(w, r, clone.URL, authority) {
+		return
+	}
 	if served, cacheErr := m.probeCacheOnly(authority, w, clone); served {
 		return
 	} else if cacheErr != nil {
@@ -273,6 +276,7 @@ type upstreamAuthority struct {
 	canonicalHost      string
 	canonicalAuthority string
 	base               string
+	port               string
 }
 
 func parseUpstreamAuthority(raw string) (upstreamAuthority, error) {
@@ -307,7 +311,26 @@ func parseUpstreamAuthority(raw string) (upstreamAuthority, error) {
 		canonicalHost:      canonicalHost,
 		canonicalAuthority: canonicalAuthority,
 		base:               "https://" + urlHost,
+		port:               port,
 	}, nil
+}
+
+func redirectLoopbackAuthority(w http.ResponseWriter, r *http.Request, target *url.URL, authority upstreamAuthority) bool {
+	ip := net.ParseIP(authority.canonicalHost)
+	if authority.canonicalHost != "localhost" && (ip == nil || !ip.IsLoopback()) {
+		return false
+	}
+
+	// containerd treats localhost registries on explicit non-TLS ports as
+	// plain HTTP. Match that convention so the redirect preserves local
+	// development registries without weakening public-registry fallback.
+	target.Scheme = "https"
+	if authority.port != "" && authority.port != "443" {
+		target.Scheme = "http"
+	}
+	target.Host = canonicalURLHost(authority.canonicalHost, authority.port)
+	http.Redirect(w, r, target.String(), http.StatusTemporaryRedirect)
+	return true
 }
 
 func (m *Manager) validateResolvedAuthority(ctx context.Context, authority upstreamAuthority) error {
