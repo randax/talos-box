@@ -3,6 +3,7 @@ package daemon
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
 )
@@ -29,6 +30,67 @@ func TestHintsSuppressManualBootstrapWhileTbxProvisions(t *testing.T) {
 	// The dashboard is an inspection, not a competing plan, so it stays.
 	if !strings.Contains(joined, "talosctl dashboard") {
 		t.Fatalf("dashboard hint lost with the bootstrap hint:\n%s", joined)
+	}
+}
+
+func TestHintsNameStalledServicesAndQuoteRecoveryCommands(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	since := now.Add(-4 * time.Minute)
+	status := ClusterStatus{
+		Name: "qa core",
+		Nodes: []NodeStatus{{
+			Name: "my node", Phase: PhaseConfigured, IP: "172.30.0.2",
+			StalledServices: []StalledService{{Service: "kubelet", State: "Preparing", Since: since}},
+		}},
+	}
+	joined := strings.Join(hintsAt(status, now), "\n")
+	for _, want := range []string{
+		"my node: kubelet has remained Preparing for 4m0s",
+		"image pull may be stalled",
+		"tbx console 'qa core' 'my node'",
+		"tbx node stop 'qa core' 'my node' && tbx node start 'qa core' 'my node'",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("service stall hint missing %q:\n%s", want, joined)
+		}
+	}
+}
+
+func TestHintsExplainMissingTalosCredentialsOnly(t *testing.T) {
+	t.Parallel()
+	missing := ServiceProbe{Status: ServiceProbeMissingCredentials}
+	failed := ServiceProbe{Status: ServiceProbeFailed, Error: "authentication failed"}
+	status := ClusterStatus{Name: "demo", Nodes: []NodeStatus{
+		{Name: "demo-cp-1", Phase: PhaseConfigured, ServiceProbe: &missing},
+		{Name: "demo-worker-1", Phase: PhaseConfigured, ServiceProbe: &missing},
+	}}
+	joined := strings.Join(Hints(status), "\n")
+	for _, want := range []string{`no talosconfig context "demo" was found`, "talosctl config merge", `lists exactly "demo"`} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("credential hint missing %q:\n%s", want, joined)
+		}
+	}
+	if strings.Count(joined, "talosctl config merge") != 1 {
+		t.Fatalf("credential hint repeated per node:\n%s", joined)
+	}
+
+	status.Nodes = []NodeStatus{{Name: "demo-cp-1", Phase: PhaseConfigured, ServiceProbe: &failed}}
+	if joined = strings.Join(Hints(status), "\n"); strings.Contains(joined, "talosctl config merge") {
+		t.Fatalf("probe failure was mislabeled as missing credentials:\n%s", joined)
+	}
+}
+
+func TestHintsIgnoreFreshServiceStartup(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	status := ClusterStatus{Name: "demo", Nodes: []NodeStatus{{
+		Name: "demo-cp-1", Phase: PhaseConfigured,
+		Services: []NodeService{{Name: "kubelet", State: "Preparing", Since: timePointer(now.Add(-time.Minute))}},
+	}}}
+	joined := strings.Join(hintsAt(status, now), "\n")
+	if strings.Contains(joined, "image pull may be stalled") || strings.Contains(joined, "node stop") {
+		t.Fatalf("fresh startup raised a stall hint:\n%s", joined)
 	}
 }
 

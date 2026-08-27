@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -184,7 +185,16 @@ type NodeStatus struct {
 	// well — without this it reads `configured` while being dead to
 	// Kubernetes (#357). Nil means no reading, never "healthy".
 	Kubelet *NodeService `json:"kubelet,omitempty"`
-	Warning string       `json:"warning,omitempty"`
+	// Services is the complete machine-API service list. Kubelet above remains
+	// a compatibility projection for protocol-v11 clients.
+	Services []NodeService `json:"services,omitempty"`
+	// StalledServices contains only startup states with a trustworthy age over
+	// the threshold. It is a list because one frozen pull must not hide another.
+	StalledServices []StalledService `json:"stalledServices,omitempty"`
+	// ServiceProbe distinguishes an inspected node with no services from one
+	// the daemon could not inspect. Nil means the node was not eligible.
+	ServiceProbe *ServiceProbe `json:"serviceProbe,omitempty"`
+	Warning      string        `json:"warning,omitempty"`
 	// Warnings is the same advisory set as Warning, one entry per finding.
 	// Warning stays populated for older clients that only read it.
 	Warnings []string `json:"warnings,omitempty"`
@@ -197,6 +207,29 @@ type NodeStatus struct {
 	// (#288). Nil means it has not answered since its VM launched, so StartedAt
 	// is the only honest clock — and nil for a node that is answering now.
 	UnreachableSince *time.Time `json:"unreachableSince,omitempty"`
+}
+
+type ServiceProbeStatus string
+
+const (
+	ServiceProbeSucceeded          ServiceProbeStatus = "succeeded"
+	ServiceProbeMissingCredentials ServiceProbeStatus = "missingCredentials"
+	ServiceProbeFailed             ServiceProbeStatus = "failed"
+)
+
+// ServiceProbe records whether the service list was actually inspected.
+type ServiceProbe struct {
+	Status ServiceProbeStatus `json:"status"`
+	Source string             `json:"source,omitempty"`
+	Error  string             `json:"error,omitempty"`
+}
+
+// StalledService is a Talos service whose current startup run has exceeded
+// the operator-action threshold.
+type StalledService struct {
+	Service string    `json:"service"`
+	State   string    `json:"state"`
+	Since   time.Time `json:"since"`
 }
 
 // UnreachableFor reports how long the node has been silent: since it stopped
@@ -1545,7 +1578,7 @@ func (s *Server) refreshNodeStatuses(statuses []ClusterStatus) {
 			refreshed.UnreachableSince = s.reachability.observe(nodeKey(statuses[i].Name, node.Name), refreshed.Phase, now)
 			statuses[i].Nodes[j] = refreshed
 		}
-		refreshNodeServices(&statuses[i])
+		refreshNodeServices(&statuses[i], now)
 		statuses[i].Hints = hintsAt(statuses[i], now)
 	}
 	s.logNodeStalls(statuses, now)
@@ -1557,7 +1590,7 @@ func (s *Server) refreshNodeStatuses(statuses []ClusterStatus) {
 // configured nodes are asked — the periodic stall sweep builds statuses with
 // Running unset, so it stays probe-free — and the probes run concurrently, so
 // one silent node cannot add its timeout to every other node's.
-func refreshNodeServices(status *ClusterStatus) {
+func refreshNodeServices(status *ClusterStatus, now time.Time) {
 	if !status.Running {
 		return
 	}
@@ -1570,12 +1603,53 @@ func refreshNodeServices(status *ClusterStatus) {
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
-			if service, ok := probeNodeService(status.Name, node.IP, kubeletService); ok {
-				node.Kubelet = &service
+			services, probe := probeNodeServices(status.Name, node.IP, now)
+			node.ServiceProbe = &probe
+			sort.Slice(services, func(i, j int) bool { return services[i].Name < services[j].Name })
+			node.Services = services
+			for i := range node.Services {
+				if node.StartedAt != nil && node.Services[i].Since != nil && node.Services[i].Since.Before(*node.StartedAt) {
+					started := *node.StartedAt
+					node.Services[i].Since = &started
+				}
+				if node.Services[i].Name == kubeletService {
+					service := node.Services[i]
+					node.Kubelet = &service
+				}
 			}
+			node.StalledServices = stalledServices(node.Services, node.StartedAt, now)
 		}()
 	}
 	wait.Wait()
+}
+
+const serviceStallThreshold = 3 * time.Minute
+
+func stalledServices(services []NodeService, startedAt *time.Time, now time.Time) []StalledService {
+	var stalled []StalledService
+	for _, service := range services {
+		if !strings.EqualFold(service.State, "Preparing") && !strings.EqualFold(service.State, "Starting") {
+			continue
+		}
+		if service.Since == nil || service.Since.After(now) {
+			continue
+		}
+		since := *service.Since
+		if startedAt != nil && since.Before(*startedAt) {
+			since = *startedAt
+		}
+		if now.Sub(since) <= serviceStallThreshold {
+			continue
+		}
+		stalled = append(stalled, StalledService{Service: service.Name, State: service.State, Since: since})
+	}
+	sort.Slice(stalled, func(i, j int) bool {
+		if stalled[i].Since.Equal(stalled[j].Since) {
+			return stalled[i].Service < stalled[j].Service
+		}
+		return stalled[i].Since.Before(stalled[j].Since)
+	})
+	return stalled
 }
 
 func refreshKubernetesReadiness(statuses []ClusterStatus) {

@@ -1,10 +1,16 @@
 package daemon
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
+	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/helper"
@@ -26,6 +32,18 @@ func TestMain(m *testing.M) {
 	// port 179 must not add an advisory to a `bgp enable` a test is asserting
 	// on. Tests about the inventory stub it themselves.
 	bgpPortListeners = nil
+	// Status must never inherit a developer's talosconfig or dial a real node.
+	// Tests about service state replace these seams explicitly, as #355's host
+	// readings do above.
+	lookupNodeTalosContext = func(string) (string, *clientconfig.Context, error) {
+		return "", nil, errTalosContextMissing
+	}
+	listNodeServices = func(context.Context, *clientconfig.Context, string) (*machineapi.ServiceListResponse, error) {
+		return nil, errors.New("live Talos service list disabled in package tests")
+	}
+	probeNodeServices = func(string, string, time.Time) ([]NodeService, ServiceProbe) {
+		return nil, ServiceProbe{Status: ServiceProbeMissingCredentials}
+	}
 	socketDir, err := containHostHelper()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
