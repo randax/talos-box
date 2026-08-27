@@ -97,6 +97,7 @@ in
 
     # The helper runs without CAP_DAC_OVERRIDE and cannot set this itself.
     boot.kernel.sysctl."net.ipv4.ip_forward" = 1;
+    boot.kernel.sysctl."net.ipv4.conf.default.forwarding" = 1;
 
     systemd.services.tbx-helper = {
       description = "Talos Box privileged network helper";

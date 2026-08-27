@@ -190,10 +190,24 @@ func lowestSafeLinuxSubnet(inspector linuxSubnetInspector, reserved []int) (int,
 func convergeLinuxManagedState(netOps linuxNetworkOps, nft linuxNFTConverger, configured []int) error {
 	reserved := normalizeLinuxSubnetIndexes(configured)
 	inspector := linuxSubnetInspector{Interfaces: netOps.ListLinks, Route: netOps.Route}
+	links, err := netOps.ListLinks()
+	if err != nil {
+		return err
+	}
+	owned := managedSubnetIndexes(links)
 	desired := make([]int, 0, len(reserved))
 	var skipped []int
 	var preflightErrs []error
 	for _, index := range reserved {
+		// Preflight gates creation. A subnet whose bridge the helper already
+		// owns is kept whatever the routing table says now: dropping it would
+		// strip a running cluster's nftables rules while its bridge and DHCP
+		// stayed up. The same call holds for that cluster's own attach
+		// (cluster.AttachedSubnetWarning).
+		if slices.Contains(owned, index) {
+			desired = append(desired, index)
+			continue
+		}
 		if _, err := preflightLinuxSubnet(index, inspector, reserved); err != nil {
 			skipped = append(skipped, index)
 			preflightErrs = append(preflightErrs, err)

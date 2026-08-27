@@ -54,11 +54,7 @@ func run(args []string) error {
 	if !activated {
 		defer func() { _ = os.Remove(socketPath) }()
 	}
-	state, err := loadHelperState()
-	if err != nil {
-		_ = listener.Close()
-		return err
-	}
+	state := loadHelperState()
 	// Startup convergence is best-effort: a failure here is logged and
 	// reported again, with its remedy, to the next net.sync. Exiting instead
 	// would trip the unit's start limit and take the socket down with it —
@@ -126,16 +122,15 @@ func openHelperListener(
 // helper reconverges host networking without waiting for a daemon. Without a
 // state directory the helper keeps them in memory only: it still serves, but a
 // restart forgets them until tbxd syncs again.
-func loadHelperState() (*helper.State, error) {
+func loadHelperState() *helper.State {
 	directory := helper.StateDir()
 	if directory == "" && runtime.GOOS == "linux" {
 		log.Print("no helper state directory (StateDirectory= or TBX_HELPER_STATE_DIR); reservations are in-memory only")
 	}
 	state := helper.NewState(directory)
-	if err := state.Load(); err != nil {
-		return nil, fmt.Errorf("load helper state: %w", err)
-	}
-	return state, nil
+	// Load never fails: an unusable file is logged and treated as empty.
+	_ = state.Load()
+	return state
 }
 
 func serverAllowedUID(resolved *uint32, explicit, activated bool) *uint32 {

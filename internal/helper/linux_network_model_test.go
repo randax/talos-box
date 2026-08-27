@@ -426,3 +426,22 @@ func mustRoute(name, cidr string) cluster.HostRoute {
 	}
 	return cluster.HostRoute{Interface: name, Network: network}
 }
+
+func TestConvergeLinuxManagedStateKeepsAnOwnedBridgeOnACapturedSubnet(t *testing.T) {
+	t.Parallel()
+
+	ops := &fakeLinuxNetworkOps{
+		links: []linuxLinkState{{Name: bridgeNameForSubnet(7), Alias: bridgeAliasForSubnet(7)}},
+		routes: map[string]cluster.HostRoute{
+			"172.30.0.2": mustRoute("eth0", "0.0.0.0/0"),
+			"172.30.7.2": mustRoute("vpn0", "172.30.6.0/23"),
+		},
+	}
+	nft := &fakeLinuxNFTConverger{}
+	if err := convergeLinuxManagedState(ops, nft, []int{0, 7}); err != nil {
+		t.Fatalf("convergeLinuxManagedState() error = %v, want the owned subnet kept without complaint", err)
+	}
+	if got := nft.subnetIndexes; !reflect.DeepEqual(got, []int{0, 7}) {
+		t.Fatalf("nft subnet indexes = %v, want [0 7]: a running cluster keeps its rules", got)
+	}
+}
