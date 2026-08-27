@@ -839,7 +839,7 @@ func TestCheckClusterRoutesChecksGatewayAndNodeForEveryCluster(t *testing.T) {
 		targets = append(targets, args[2])
 		return []byte("interface: vmnet8\n"), nil
 	}
-	if err := checkClusterRoutes(clusters, statuses, command); err != nil {
+	if err := checkClusterRoutes(clusters, statuses, platformRouteProbe(command)); err != nil {
 		t.Fatalf("checkClusterRoutes() = %v", err)
 	}
 	want := []string{"172.30.2.1", "172.30.2.7", "172.30.9.1", "172.30.9.4"}
@@ -865,7 +865,7 @@ func TestCheckClusterRoutesSkipsStoppedClustersAndNodes(t *testing.T) {
 		targets = append(targets, args[len(args)-1])
 		return []byte("interface: bridge100\n"), nil
 	}
-	if err := checkClusterRoutes(clusters, statuses, command); err != nil {
+	if err := checkClusterRoutes(clusters, statuses, platformRouteProbe(command)); err != nil {
 		t.Fatalf("checkClusterRoutes() = %v", err)
 	}
 	want := []string{"172.30.2.1", "172.30.2.8"}
@@ -938,14 +938,14 @@ func TestCheckRoutesAllowsLoopbackGatewayButNotLoopbackNode(t *testing.T) {
 		}
 		return []byte("interface: " + iface + "\n"), nil
 	}
-	if err := checkClusterRoutes(clusters, statuses, gatewayLocal); err != nil {
+	if err := checkClusterRoutes(clusters, statuses, platformRouteProbe(gatewayLocal)); err != nil {
 		t.Fatalf("checkClusterRoutes() = %v; lo0 gateway must be healthy", err)
 	}
 
 	nodeLocal := func(_ string, _ ...string) ([]byte, error) {
 		return []byte("interface: lo0\n"), nil
 	}
-	if err := checkClusterRoutes(clusters, statuses, nodeLocal); err == nil {
+	if err := checkClusterRoutes(clusters, statuses, platformRouteProbe(nodeLocal)); err == nil {
 		t.Fatal("checkClusterRoutes() succeeded for a node route via lo0")
 	}
 }
@@ -965,7 +965,7 @@ func TestCheckRoutesDetectsCapturedSubnet(t *testing.T) {
 		return []byte("interface: " + iface + "\n"), nil
 	}
 
-	err := checkClusterRoutes(clusters, statuses, command)
+	err := checkClusterRoutes(clusters, statuses, platformRouteProbe(command))
 	if err == nil {
 		t.Fatal("checkClusterRoutes() succeeded for VPN-captured node route")
 	}

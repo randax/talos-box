@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -29,10 +28,20 @@ func execCombinedOutput(name string, args ...string) ([]byte, error) {
 	return output, err
 }
 
+// routeProbe is the per-GOOS half of the route check: how this host names the
+// interface an address routes through, which interface names belong to
+// talosbox, and what the host calls its loopback. Doctor must never exec
+// another platform's tools, so the probe is built by platformRouteProbe (#468).
+type routeProbe struct {
+	iface        func(ip string) (string, error)
+	clusterIface func(string) bool
+	loopback     string
+}
+
 // checkClusterRoutes verifies routes only for running clusters: a stopped
-// cluster has no bridge/vmnet interface, so its subnet legitimately resolves
-// via the default route and would read as a false VPN/ZTNA capture.
-func checkClusterRoutes(clusters []daemon.ClusterSummary, statuses []daemon.ClusterStatus, command commandOutput) error {
+// cluster has no bridge interface, so its subnet legitimately resolves via the
+// default route and would read as a false VPN/ZTNA capture.
+func checkClusterRoutes(clusters []daemon.ClusterSummary, statuses []daemon.ClusterStatus, probe routeProbe) error {
 	firstNodeIP := make(map[string]string, len(statuses))
 	for _, status := range statuses {
 		if !status.Running {
@@ -49,7 +58,7 @@ func checkClusterRoutes(clusters []daemon.ClusterSummary, statuses []daemon.Clus
 
 	type routeTarget struct {
 		ip      string
-		localOK bool // the gateway is a host-local address; macOS routes it via lo0
+		localOK bool // the gateway is a host-local address; the host routes it via loopback
 	}
 	var problems []string
 	for _, item := range clusters {
@@ -61,17 +70,12 @@ func checkClusterRoutes(clusters []daemon.ClusterSummary, statuses []daemon.Clus
 			targets = append(targets, routeTarget{ip: nodeIP})
 		}
 		for _, target := range targets {
-			output, err := command("/sbin/route", "-n", "get", target.ip)
+			iface, err := probe.iface(target.ip)
 			if err != nil {
 				problems = append(problems, fmt.Sprintf("%s route to %s: %v", item.Name, target.ip, err))
 				continue
 			}
-			iface, err := parseRouteInterface(output)
-			if err != nil {
-				problems = append(problems, fmt.Sprintf("%s route to %s: %v", item.Name, target.ip, err))
-				continue
-			}
-			if isClusterInterface(iface) || (target.localOK && iface == "lo0") {
+			if probe.clusterIface(iface) || (target.localOK && iface == probe.loopback) {
 				continue
 			}
 			problems = append(problems, fmt.Sprintf(
@@ -83,25 +87,4 @@ func checkClusterRoutes(clusters []daemon.ClusterSummary, statuses []daemon.Clus
 		return errors.New(strings.Join(problems, "; "))
 	}
 	return nil
-}
-
-func parseRouteInterface(output []byte) (string, error) {
-	scanner := bufio.NewScanner(strings.NewReader(string(output)))
-	for scanner.Scan() {
-		key, value, ok := strings.Cut(strings.TrimSpace(scanner.Text()), ":")
-		if ok && key == "interface" {
-			fields := strings.Fields(value)
-			if len(fields) != 0 {
-				return fields[0], nil
-			}
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return "", fmt.Errorf("parse route output: %w", err)
-	}
-	return "", errors.New("route output has no interface")
-}
-
-func isClusterInterface(iface string) bool {
-	return strings.HasPrefix(iface, "bridge") || strings.HasPrefix(iface, "vmnet")
 }
