@@ -32,6 +32,17 @@ func TestHelperServiceAsset(t *testing.T) {
 		"DynamicUser=no",
 		"PrivateNetwork=no",
 		"ExecStart=/usr/bin/tbx-helper",
+		// The helper keeps the reservations tbxd pushes here; without a state
+		// directory a restart forgets them and serves no DHCP until the next
+		// sync, and ProtectSystem=strict leaves nowhere else writable.
+		"StateDirectory=tbx",
+		"StateDirectoryMode=0700",
+		// A hand-started service must still inherit the socket's descriptor.
+		"Requires=tbx-helper.socket",
+		"After=tbx-helper.socket",
+		"Environment=TBX_HELPER_SOCKET=/var/run/tbx-helper.sock",
+		// The helper never reads a user home; the unit enforces it.
+		"ProtectHome=yes",
 	} {
 		if !strings.Contains(content, want) {
 			t.Fatalf("helper service asset missing %q", want)

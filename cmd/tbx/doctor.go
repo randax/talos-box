@@ -306,7 +306,7 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 				routeProblems = append(routeProblems,
 					fmt.Sprintf("cluster status unavailable; node routes could not be checked: %v", statusErr))
 			}
-			if err := checkClusterRoutes(clusters, statuses, deps.command); err != nil {
+			if err := checkClusterRoutes(clusters, statuses, platformRouteProbe(deps.command)); err != nil {
 				routeProblems = append(routeProblems, err.Error())
 			}
 			if len(routeProblems) != 0 {

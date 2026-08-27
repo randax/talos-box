@@ -100,12 +100,12 @@ func decodeDNSSubnet(raw []byte) (int, error) {
 	return *args.SubnetIndex, nil
 }
 
-func dnsListenerReply(raw []byte) serverReply {
+func (s *Server) dnsListenerReply(raw []byte) serverReply {
 	clusterDomain, subnetIndex, err := decodeDNSIdentity(raw)
 	if err != nil {
 		return serverReply{response: failure(err), fd: -1}
 	}
-	file, err := bindDNS(subnetIndex)
+	file, err := bindDNS(s.desiredSubnetIndexes(), subnetIndex)
 	if err != nil {
 		return serverReply{response: failure(err), fd: -1}
 	}

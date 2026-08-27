@@ -726,6 +726,13 @@ func (s *Server) longhornCustomSchematicWarning(item cluster.Cluster, custom boo
 }
 
 func (s *Server) start(item cluster.Cluster) ([]string, error) {
+	// The helper serves this cluster's DHCP from the copy tbxd pushes, and the
+	// nodes below take their addresses from it: a node that attaches to a
+	// subnet the helper has never heard of never gets one. The push therefore
+	// precedes the first attach, and a failure fails the start.
+	if err := SyncHelperState(); err != nil {
+		return nil, err
+	}
 	// The subnet was decided at create time and belongs to this cluster, so it
 	// is only inspected for advisory routing findings. Re-running the
 	// create-time collision guard would refuse the cluster's own bridge, which
@@ -876,7 +883,12 @@ func guestAgentSocketPath(item cluster.Cluster, dir string, node cluster.Node) s
 }
 
 func helperInstallError(err error) error {
-	return fmt.Errorf("network helper unavailable; run `sudo tbx system install`: %w", err)
+	if helper.IsProtocolMismatch(err) {
+		// The mismatch names the real fix (upgrade the helper); an "enable
+		// the socket" preamble would be the wrong remediation read first.
+		return err
+	}
+	return fmt.Errorf("network helper unavailable; %s: %w", helper.UnavailableAdvice(), err)
 }
 
 // requireHelper checks the network helper is reachable; the injected
@@ -1065,6 +1077,7 @@ func (s *Server) destroyCluster(raw json.RawMessage) (DestroySummary, error) {
 	}
 	s.forgetCluster(args.Name)
 	s.invalidateStoragePhaseLocked(args.Name)
+	logHelperSyncFailure(fmt.Sprintf("sync helper state after destroying %s", args.Name))
 	if subnetIndex >= 0 && hostBridgeGOOS == "linux" {
 		bridge, err := releaseSubnetBridge(subnetIndex)
 		if err != nil {
@@ -1317,8 +1330,24 @@ func (s *Server) addNodeLocked(raw json.RawMessage, progress stageFunc) (NodeSta
 		_ = removeNodeFiles(item.Name, node.Name)
 		return NodeStatus{}, nil, err
 	}
+	// The new node needs its reservation served before it attaches, exactly as
+	// a cluster start does — and before the record is committed: a sync that
+	// fails after the save would leave a node on disk the helper never heard
+	// of, with nothing to roll it back.
+	proposed, err := proposedClusterSet(item)
+	if err != nil {
+		_ = removeNodeFiles(item.Name, node.Name)
+		return NodeStatus{}, nil, err
+	}
+	if err := SyncHelperClusters(proposed); err != nil {
+		_ = removeNodeFiles(item.Name, node.Name)
+		return NodeStatus{}, nil, err
+	}
 	if err := cluster.Save(item); err != nil {
 		_ = removeNodeFiles(item.Name, node.Name)
+		// The helper holds a reservation the record never took; hand it the
+		// committed set again.
+		logHelperSyncFailure("node add: revert helper reservations after a failed save")
 		return NodeStatus{}, nil, err
 	}
 	if running {
@@ -1390,6 +1419,7 @@ func (s *Server) removeNodeLocked(raw json.RawMessage, progress stageFunc) (Node
 	if err := cluster.Save(item); err != nil {
 		return NodeStatus{}, nil, err
 	}
+	logHelperSyncFailure(fmt.Sprintf("sync helper state after removing %s/%s", item.Name, node.Name))
 	progress.stage("deleting the disk for node %s", node.Name)
 	if err := removeNodeFiles(item.Name, node.Name); err != nil {
 		return NodeStatus{}, nil, err

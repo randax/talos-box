@@ -23,8 +23,10 @@ func TestLinuxClientSocketPath(t *testing.T) {
 		want     string
 		wantErr  string
 	}{
-		{name: "non-root runtime directory", euid: 501, want: "/run/user/501/tbx-helper.sock"},
-		{name: "non-root ignores sudo uid", euid: 501, sudoUID: "502", want: "/run/user/501/tbx-helper.sock"},
+		// No socket anywhere: the packaged path, so the failure names the unit
+		// to enable rather than a missing /run/user/<uid>.
+		{name: "non-root without any socket uses system socket", euid: 501, want: systemHelperSocketPath},
+		{name: "non-root ignores sudo uid", euid: 501, sudoUID: "502", want: systemHelperSocketPath},
 		{name: "root system socket", euid: 0, want: systemHelperSocketPath},
 		{name: "sudo root runtime directory", euid: 0, sudoUID: "501", want: "/run/user/501/tbx-helper.sock"},
 		{name: "sudo root uid zero uses system socket", euid: 0, sudoUID: "0", want: systemHelperSocketPath},
@@ -94,7 +96,7 @@ func TestLinuxSocketOverrideIsSharedByClientAndServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := NewServer(&allowedUID)
+	server := NewServer(nil, &allowedUID)
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()
 	t.Cleanup(func() {

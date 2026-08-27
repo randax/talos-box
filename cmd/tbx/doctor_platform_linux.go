@@ -23,6 +23,7 @@ import (
 
 const (
 	doctorKVMDevice                          = "/dev/kvm"
+	doctorOSReleaseFile                      = "/proc/sys/kernel/osrelease"
 	doctorHelperSocketUnit                   = "tbx-helper.socket"
 	doctorHelperServiceUnit                  = "tbx-helper.service"
 	doctorBridgeNFCall                       = "/proc/sys/net/bridge/bridge-nf-call-iptables"
@@ -215,7 +216,7 @@ func linuxPlatformDoctorFindings(
 	helperCaps func() (helperCapabilityReport, error),
 ) []doctorFinding {
 	findings := []doctorFinding{
-		linuxKVMFinding(deps.accessRW),
+		linuxKVMFinding(deps.accessRW, doctorOSRelease(deps.readFile)),
 		linuxQEMUFinding(deps.command),
 		linuxBridgeNetfilterFinding(deps.readFile, deps.command),
 		linuxBridgeSTPFinding(deps.listConfig, deps.readFile),
@@ -224,13 +225,39 @@ func linuxPlatformDoctorFindings(
 		linuxPortFinding(67, "udp", deps.listConfig, deps.readFile, deps.command, deps.listenPacket, deps.listenStream),
 		linuxPortFinding(179, "tcp", deps.listConfig, deps.readFile, deps.command, deps.listenPacket, deps.listenStream),
 		linuxHelperUnitFinding(deps.command),
-		linuxHelperAccessFinding(deps.command),
+		linuxHelperAccessFinding(deps.command, doctorOSRelease(deps.readFile)),
 		linuxHelperCapabilitiesFinding(helperCaps),
 	}
 	return findings
 }
 
-func linuxKVMFinding(accessRW func(string) error) doctorFinding {
+// doctorOSRelease reads the running kernel's release string. An unreadable
+// file is not a finding of its own: it only costs the remediation its WSL
+// branch, so it degrades to the empty string.
+func doctorOSRelease(readFile func(string) ([]byte, error)) string {
+	if readFile == nil {
+		return ""
+	}
+	content, err := readFile(doctorOSReleaseFile)
+	if err != nil {
+		return ""
+	}
+	return string(content)
+}
+
+// linuxSessionRefreshHint names the step that actually applies a new group
+// membership on this host. "Log out and back in" is wrong under WSL — there is
+// no login session to cycle — and insufficient when the user lingers
+// (`loginctl enable-linger`), because the lingering session outlives every
+// logout and keeps handing out the old supplementary groups (#468).
+func linuxSessionRefreshHint(osrelease string) string {
+	if strings.Contains(strings.ToLower(osrelease), "microsoft") {
+		return "run `wsl --shutdown` from Windows, then reopen the distro"
+	}
+	return "log out and back in (a lingering user session — `loginctl enable-linger` — needs `loginctl terminate-user $USER`)"
+}
+
+func linuxKVMFinding(accessRW func(string) error, osrelease string) doctorFinding {
 	finding := doctorFinding{level: "PASS", check: "kvm"}
 	if accessRW == nil {
 		finding.level, finding.detail = "FAIL", "KVM probe is unavailable"
@@ -242,7 +269,7 @@ func linuxKVMFinding(accessRW func(string) error) doctorFinding {
 			finding.detail = "/dev/kvm is missing; enable hardware virtualization and load the KVM kernel modules"
 			return finding
 		}
-		finding.detail = fmt.Sprintf("%s is not readable+writable by this user: %v; add your user to the kvm group with `%s`, then log out and back in", doctorKVMDevice, err, doctorKVMGroupFix)
+		finding.detail = fmt.Sprintf("%s is not readable+writable by this user: %v; add your user to the kvm group with `%s`, then %s", doctorKVMDevice, err, doctorKVMGroupFix, linuxSessionRefreshHint(osrelease))
 	}
 	return finding
 }
@@ -788,7 +815,7 @@ func linuxHelperUnitFinding(command commandOutput) doctorFinding {
 	return finding
 }
 
-func linuxHelperAccessFinding(command commandOutput) doctorFinding {
+func linuxHelperAccessFinding(command commandOutput, osrelease string) doctorFinding {
 	finding := doctorFinding{level: "PASS", check: "helper-access"}
 	output, err := command("id", "-Gn")
 	if err != nil {
@@ -801,7 +828,7 @@ func linuxHelperAccessFinding(command commandOutput) doctorFinding {
 		}
 	}
 	finding.level = "FAIL"
-	finding.detail = fmt.Sprintf("current user is not in group tbx; run `%s`, then log out and back in", doctorHelperGroupFix)
+	finding.detail = fmt.Sprintf("current user is not in group tbx; run `%s`, then %s", doctorHelperGroupFix, linuxSessionRefreshHint(osrelease))
 	return finding
 }
 

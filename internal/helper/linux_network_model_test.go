@@ -205,7 +205,7 @@ func TestConvergeLinuxManagedStateRecreatesColdBootBridgesFromInventory(t *testi
 	}
 }
 
-func TestConvergeLinuxManagedStatePreflightsBeforeMutationAndSkipsAllocatedHint(t *testing.T) {
+func TestConvergeLinuxManagedStateSkipsACapturedSubnetAndConvergesTheRest(t *testing.T) {
 	t.Parallel()
 
 	ops := &fakeLinuxNetworkOps{routes: map[string]cluster.HostRoute{
@@ -223,8 +223,17 @@ func TestConvergeLinuxManagedStatePreflightsBeforeMutationAndSkipsAllocatedHint(
 			t.Fatalf("error = %q, want %q", err, fragment)
 		}
 	}
-	if len(ops.calls) != 0 || nft.calls != 0 {
-		t.Fatalf("mutation after preflight failure: network=%v nft=%d", ops.calls, nft.calls)
+	var preflight *SubnetPreflightError
+	if !errors.As(err, &preflight) || !reflect.DeepEqual(preflight.Skipped, []int{7}) {
+		t.Fatalf("error = %#v, want a SubnetPreflightError skipping [7]", err)
+	}
+	if got := nft.subnetIndexes; !reflect.DeepEqual(got, []int{0}) {
+		t.Fatalf("nft subnet indexes = %v, want [0]: the captured subnet must not stop the others", got)
+	}
+	for _, call := range ops.calls {
+		if strings.Contains(call, bridgeNameForSubnet(7)) {
+			t.Fatalf("captured subnet was mutated: %v", ops.calls)
+		}
 	}
 }
 
@@ -416,4 +425,23 @@ func mustRoute(name, cidr string) cluster.HostRoute {
 		panic(err)
 	}
 	return cluster.HostRoute{Interface: name, Network: network}
+}
+
+func TestConvergeLinuxManagedStateKeepsAnOwnedBridgeOnACapturedSubnet(t *testing.T) {
+	t.Parallel()
+
+	ops := &fakeLinuxNetworkOps{
+		links: []linuxLinkState{{Name: bridgeNameForSubnet(7), Alias: bridgeAliasForSubnet(7)}},
+		routes: map[string]cluster.HostRoute{
+			"172.30.0.2": mustRoute("eth0", "0.0.0.0/0"),
+			"172.30.7.2": mustRoute("vpn0", "172.30.6.0/23"),
+		},
+	}
+	nft := &fakeLinuxNFTConverger{}
+	if err := convergeLinuxManagedState(ops, nft, []int{0, 7}); err != nil {
+		t.Fatalf("convergeLinuxManagedState() error = %v, want the owned subnet kept without complaint", err)
+	}
+	if got := nft.subnetIndexes; !reflect.DeepEqual(got, []int{0, 7}) {
+		t.Fatalf("nft subnet indexes = %v, want [0 7]: a running cluster keeps its rules", got)
+	}
 }

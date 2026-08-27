@@ -93,7 +93,9 @@ qemu-system-x86_64 --version  # amd64
 
 If `/dev/kvm` is missing, enable virtualization in firmware and load the appropriate KVM
 kernel module. If it exists but is not writable, add the current user to the group that owns
-the device (normally `kvm`), then log out and back in.
+the device (normally `kvm`), then start a session that carries the new membership: log out and
+back in, `loginctl terminate-user $USER` where the user lingers (`loginctl enable-linger`), or
+`wsl --shutdown` from Windows under WSL. `tbx doctor` prints whichever step applies to the host.
 
 The source preview requires Go 1.26. Install the repository's current toolchain from the
 official Go archive when the distribution package is older:
@@ -167,9 +169,25 @@ helper; Linux installation is owned by packages and systemd units.
 
 Upgrading `tbx`/`tbxd` can also require a new `tbx-helper`: the helper speaks a versioned
 protocol, and a mismatch is refused with `helper protocol mismatch`. Recover by upgrading the
-`tbx-helper` package (or reinstalling the binary and units as above) and restarting the socket:
-`sudo systemctl restart tbx-helper.socket`. Restarting alone is not enough — the unit relaunches
-the same stale binary.
+`tbx-helper` package (or reinstalling the binary and units as above) and restarting the service:
+`sudo systemctl restart tbx-helper.service`. Restart the *service*, not the socket: restarting
+`tbx-helper.socket` leaves an already-running helper — and its stale binary — in place.
+
+## Helper state
+
+`tbxd` owns cluster state under `~/.talosbox`; the helper never reads it. The helper runs as the
+unprivileged `tbx` system user, which cannot open another user's home, so `tbxd` pushes the
+clusters' DHCP reservations (name, subnet, and each node's MAC and IP) to the helper over the
+`net.sync` operation — at daemon start and after every change to cluster state.
+
+The helper persists that copy as `/var/lib/tbx/reservations.json` (the unit's
+`StateDirectory=tbx`, mode `0700`) and reconverges from it at startup, so bridges, nftables rules,
+and DHCP listeners survive a helper restart with no daemon running. Running the helper by hand
+without a state directory is supported — set `TBX_HELPER_STATE_DIR` to keep the file elsewhere, or
+leave both unset and the reservations live in memory only until the next sync.
+
+A cluster start fails if the helper cannot be synced: without its reservations the nodes would boot
+onto a subnet with no DHCP and never get addresses.
 
 ## What `tbx doctor` checks on Linux
 
@@ -178,7 +196,7 @@ configured bridge or running cluster report `SKIP` before one exists.
 
 | Check | What it proves | Typical remediation |
 |---|---|---|
-| `helper`, `helper-unit`, `helper-access` | The helper socket is enabled, reachable, and accessible to the current `tbx` group member | Enable `tbx-helper.socket`; add the user to `tbx`; log out and back in |
+| `helper`, `helper-unit`, `helper-access` | The helper socket is enabled, reachable, and accessible to the current `tbx` group member | Enable `tbx-helper.socket`; add the user to `tbx`; then apply the group as `doctor` says: log out and back in, `loginctl terminate-user $USER` under a lingering session, or `wsl --shutdown` under WSL |
 | `helper-capabilities` | The helper has exactly `CAP_NET_ADMIN`, `CAP_NET_BIND_SERVICE`, and `CAP_NET_RAW` | Reinstall the current service unit and restart the helper |
 | `kvm` | `/dev/kvm` exists and is readable+writable | Enable KVM or add the user to the device's group |
 | `qemu` | QEMU meets the 6.2 floor, provides the required machine, and reports suspend availability | Install/upgrade the architecture-specific QEMU package |
@@ -188,14 +206,14 @@ configured bridge or running cluster report `SKIP` before one exists.
 | `rp-filter` | Strict reverse-path filtering will not discard VIP traffic on a multi-homed or VPN host | Set loose mode (`2`) as directed, including per-interface values |
 | `port-53`, `port-67`, `port-179` | DNS, DHCP, and optional BGP ports are available on each cluster gateway or already owned by talosbox | Stop the conflicting listener or keep BGP disabled when port 179 is intentionally occupied |
 | `resolver`, `DNS`, `system-dns` | Guest DNS is listening and the host actually resolves cluster names — systemd-resolved routes `~<cluster>.k8s.test` to the cluster gateway. `PASS` means the names resolve, and an absent or unreachable systemd-resolved is a `WARN`, never a `PASS`. `resolver` and `DNS` `SKIP` unless a cluster is running (nothing was probed); `system-dns` probes every cluster, so it `SKIP`s only when no cluster exists at all and can `FAIL` while a cluster is merely stopped | Run the per-link `resolvectl` command printed by `doctor` — the same manual step `tbxd` logs. Without systemd-resolved, use the `dig @<gateway> <node>.<domain>` fallback `doctor` prints; guest DNS and by-IP access are unaffected |
-| `routes` | Host routes to live nodes and cluster subnets use the talosbox bridge | Resolve overlapping VPN or host routes and restart the cluster |
+| `routes` | Host routes to live nodes and cluster subnets use the talosbox bridge — each address is probed with `ip -o route get` and must leave via `br-tbx<n>` (a cluster gateway may also resolve via `lo`) | Resolve overlapping VPN or host routes and restart the cluster |
 | `inter-cluster` | With more than one cluster running, every cluster's ingress VIP answers from the host **and** from each sibling cluster — the sibling leg is dialled by the `lb-probe` behind each VIP, so it travels the same pod-to-sibling-VIP path a workload would. `SKIP`s with the reason when fewer than two running clusters report a live VIP | `FAIL` names the dead direction (`qa-edge → qa-core VIP 172.30.0.200`). Check the announcement mode of the *target* cluster (`tbx bgp status <cluster>`) and the host route to its VIP; `routes` and `forwarding` can both pass while this path is dead |
 | `host-pressure` | Currently reports `SKIP` because Linux host-pressure sampling is not implemented | Size the default cluster for at least 16 GB RAM and monitor the host separately |
 | `guest-agent` | Clusters that requested the `qemu-guest-agent` extension have a working host channel | `WARN` only: the config stays valid and portable, the extension is simply inert on this host. `SKIP`s when no cluster requests it |
 | `mirror-health` | Pull-through mirror listeners are bound on exactly the running clusters' gateway IPs, and reports the registry-mirror cache totals | Restart the affected cluster (or `tbxd`) so the bind set is reconverged with cluster lifecycle |
 | `image-cache` | Reports the Talos disk-image cache totals, named apart from the registry-mirror cache so offline prep can tell the two stores under `~/.talosbox/cache` apart. Incomplete combinations — prunable leftovers with no usable image — are held out of the total and counted separately, and a cache holding nothing else is a `WARN` | Never `FAIL`s: a failed cache listing is reported once on `mirror-health` and skips this line. On `WARN`, rerun `tbx cache pull` before going offline; use `tbx cache list` for the per-combination breakdown |
 | `mirror-offline` | Whether `tbx mirror offline` is on. The mode persists across a daemon restart and makes every uncached pull fail, so it is named rather than left to be remembered | `WARN` only: run `tbx mirror offline off` to restore upstream pulls; each miss is also logged as `mirror offline miss: …` in `tbx logs` |
-| `egress`, `security-inventory` | Image Factory access is usable and relevant security/VPN software is visible | Follow the specific warning or failure detail |
+| `egress` | Image Factory access is usable | Follow the specific warning or failure detail. There is no `security-inventory` line here: the system-extension inventory it reports is macOS-only |
 
 `FAIL` makes `tbx doctor` exit non-zero. `WARN` identifies a degraded but usable configuration,
 such as QEMU 6.2 without suspend or a host without automatic systemd-resolved registration.

@@ -383,7 +383,7 @@ var vmnetInterfaces = struct {
 var helperFrameRouter = newFrameRouter()
 
 // StartInterface starts one shared-mode vmnet interface for a cluster subnet.
-func StartInterface(subnetIndex int, _, _ string) (*platformAttachment, error) {
+func StartInterface(_ []int, subnetIndex int, _, _ string) (*platformAttachment, error) {
 	if subnetIndex < 0 || subnetIndex > 255 {
 		return nil, fmt.Errorf("subnet index %d is outside 0..255", subnetIndex)
 	}

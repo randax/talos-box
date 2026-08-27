@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/randax/talos-box/internal/cluster"
 )
 
 // The helper only performs short admin operations, so every interaction is
@@ -115,6 +117,26 @@ func (c *Client) TeardownSubnet(subnetIndex int) (bool, error) {
 		return false, fmt.Errorf("decode teardown response: %w", err)
 	}
 	return data.Removed, nil
+}
+
+// Sync pushes the cluster reservations tbxd owns to the helper, which persists
+// them and reconverges the host networking they describe. It is the helper's
+// only source of cluster state.
+func (c *Client) Sync(clusters []cluster.Cluster) error {
+	synced := make([]SyncedCluster, 0, len(clusters))
+	for _, item := range clusters {
+		converted := SyncedCluster{
+			Name:        item.Name,
+			SubnetIndex: item.SubnetIndex,
+			Nodes:       make([]SyncedNode, 0, len(item.Nodes)),
+		}
+		for _, node := range item.Nodes {
+			converted.Nodes = append(converted.Nodes, SyncedNode{Name: node.Name, MAC: node.MAC, IP: node.IP})
+		}
+		synced = append(synced, converted)
+	}
+	_, _, err := c.call("net.sync", map[string]any{"clusters": synced}, false)
+	return err
 }
 
 // InstallDNS installs the k8s.test scoped resolver.
@@ -367,7 +389,9 @@ func safeRetryOperation(op string) bool {
 	// benign — a retry after a lost response reports removed:false for a
 	// bridge the first attempt did remove, so the destroy summary omits the
 	// bridge line rather than inventing one.
-	case helperInfoOp, "ping", "net.detach", "net.teardown", "dns.install", "dns.uninstall", "dns.syncDomains", "dns.register", "dns.unregister", "forwarding.enable", "bgp.enable", "bgp.disable":
+	// net.sync replaces the helper's whole reservation set, so a retry after a
+	// lost response converges on the same state.
+	case helperInfoOp, "ping", "net.sync", "net.detach", "net.teardown", "dns.install", "dns.uninstall", "dns.syncDomains", "dns.register", "dns.unregister", "forwarding.enable", "bgp.enable", "bgp.disable":
 		return true
 	default:
 		return false

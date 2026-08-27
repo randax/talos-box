@@ -2,9 +2,13 @@
 
 package helper
 
+import "github.com/randax/talos-box/internal/cluster"
+
 type noopDHCPManager struct{}
 
-func newPlatformDHCPManager() dhcpManager { return noopDHCPManager{} }
+func newPlatformDHCPManager(func() []cluster.Cluster, func() []int) dhcpManager {
+	return noopDHCPManager{}
+}
 
 func (noopDHCPManager) Converge() error { return nil }
 

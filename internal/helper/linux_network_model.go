@@ -1,6 +1,7 @@
 package helper
 
 import (
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"net"
@@ -187,13 +188,43 @@ func lowestSafeLinuxSubnet(inspector linuxSubnetInspector, reserved []int) (int,
 }
 
 func convergeLinuxManagedState(netOps linuxNetworkOps, nft linuxNFTConverger, configured []int) error {
-	desired := normalizeLinuxSubnetIndexes(configured)
+	reserved := normalizeLinuxSubnetIndexes(configured)
 	inspector := linuxSubnetInspector{Interfaces: netOps.ListLinks, Route: netOps.Route}
-	for _, index := range desired {
-		if _, err := preflightLinuxSubnet(index, inspector, desired); err != nil {
-			return err
-		}
+	links, err := netOps.ListLinks()
+	if err != nil {
+		return err
 	}
+	owned := managedSubnetIndexes(links)
+	desired := make([]int, 0, len(reserved))
+	var skipped []int
+	var preflightErrs []error
+	for _, index := range reserved {
+		// Preflight gates creation. A subnet whose bridge the helper already
+		// owns is kept whatever the routing table says now: dropping it would
+		// strip a running cluster's nftables rules while its bridge and DHCP
+		// stayed up. The same call holds for that cluster's own attach
+		// (cluster.AttachedSubnetWarning).
+		if slices.Contains(owned, index) {
+			desired = append(desired, index)
+			continue
+		}
+		if _, err := preflightLinuxSubnet(index, inspector, reserved); err != nil {
+			skipped = append(skipped, index)
+			preflightErrs = append(preflightErrs, err)
+			continue
+		}
+		desired = append(desired, index)
+	}
+	if err := convergeLinuxSubnets(netOps, nft, desired); err != nil {
+		return err
+	}
+	if len(skipped) != 0 {
+		return &SubnetPreflightError{Skipped: skipped, Err: errors.Join(preflightErrs...)}
+	}
+	return nil
+}
+
+func convergeLinuxSubnets(netOps linuxNetworkOps, nft linuxNFTConverger, desired []int) error {
 	if err := netOps.EnsureIPv4Forwarding(); err != nil {
 		return err
 	}

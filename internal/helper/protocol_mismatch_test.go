@@ -16,7 +16,7 @@ import (
 // whichever GOOS runs the tests.
 func hostAdviceCommand() string {
 	if runtime.GOOS == "linux" {
-		return "systemctl restart tbx-helper.socket"
+		return "systemctl restart tbx-helper.service"
 	}
 	return "tbx system install"
 }
@@ -138,7 +138,7 @@ func TestProtocolMismatchAdviceFollowsTheHostInstallMechanism(t *testing.T) {
 	if strings.Contains(linux, "system install") {
 		t.Errorf("Linux advice %q sends the operator to `tbx system install`", linux)
 	}
-	if !strings.Contains(linux, "tbx-helper") || !strings.Contains(linux, "systemctl restart tbx-helper.socket") {
+	if !strings.Contains(linux, "tbx-helper") || !strings.Contains(linux, "systemctl restart tbx-helper.service") {
 		t.Errorf("Linux advice %q missing the package upgrade and socket restart", linux)
 	}
 
@@ -164,5 +164,35 @@ func TestProtocolHandshakeFailureEmptyDetail(t *testing.T) {
 	}
 	if !strings.Contains(message, hostAdviceCommand()) {
 		t.Errorf("message %q missing the host's remediation command %q", message, hostAdviceCommand())
+	}
+}
+
+// An unreachable helper is not a stale helper: on Linux the socket unit is
+// simply not enabled, or the caller is not in the `tbx` group. `tbx system
+// install` installs the macOS launchd helper and must never be printed there
+// (#468).
+func TestUnavailableAdviceFollowsTheHostInstallMechanism(t *testing.T) {
+	t.Parallel()
+
+	linux := unavailableAdviceForGOOS("linux")
+	if strings.Contains(linux, "tbx system install") {
+		t.Errorf("Linux advice %q sends the operator to `tbx system install`", linux)
+	}
+	for _, fragment := range []string{"systemctl enable --now tbx-helper.socket", "tbx", "docs/linux.md"} {
+		if !strings.Contains(linux, fragment) {
+			t.Errorf("Linux advice %q missing %q", linux, fragment)
+		}
+	}
+
+	darwin := unavailableAdviceForGOOS("darwin")
+	if !strings.Contains(darwin, "sudo tbx system install") {
+		t.Errorf("darwin advice %q missing the launchd install command", darwin)
+	}
+	if strings.Contains(darwin, "systemctl") {
+		t.Errorf("darwin advice %q names systemctl", darwin)
+	}
+
+	if UnavailableAdvice() != unavailableAdviceForGOOS(runtime.GOOS) {
+		t.Errorf("UnavailableAdvice() = %q, want this host's advice", UnavailableAdvice())
 	}
 }

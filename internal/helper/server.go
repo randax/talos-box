@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -25,10 +26,17 @@ const (
 
 var (
 	startInterface = StartInterface
-	teardownSubnet = TeardownSubnet
+	// convergeHostNetworking is the sync-time bridge/nftables convergence; a
+	// variable so tests stay off the real netlink socket.
+	convergeHostNetworking = convergeNetworking
+	teardownSubnet         = TeardownSubnet
 )
 
+// attachmentKey names one node's attachment. The owner is the attaching
+// peer's uid: two tbx group members may both run a cluster called "demo",
+// and neither may detach or block the other's.
 type attachmentKey struct {
+	owner   uint32
 	cluster string
 	node    string
 }
@@ -47,6 +55,7 @@ type Server struct {
 	pendingStops map[int]*platformAttachment
 	speakers     map[string]bgpSpeaker
 	dhcp         dhcpManager
+	state        *State
 	allowedUID   *uint32
 	allowAnyUID  bool
 
@@ -57,13 +66,18 @@ type Server struct {
 	connectionWG sync.WaitGroup
 }
 
-// NewServer creates an empty helper server.
-func NewServer(allowedUID *uint32, allowAnyUID ...bool) *Server {
+// NewServer creates an empty helper server over the reservation state tbxd
+// pushes. A nil state serves an empty, memory-only set.
+func NewServer(state *State, allowedUID *uint32, allowAnyUID ...bool) *Server {
+	if state == nil {
+		state = NewState("")
+	}
 	server := &Server{
 		attachments:  make(map[attachmentKey]*platformAttachment),
 		pendingStops: make(map[int]*platformAttachment),
-		dhcp:         newPlatformDHCPManager(),
+		state:        state,
 	}
+	server.dhcp = newPlatformDHCPManager(state.Clusters, server.attachedSubnetIndexes)
 	if allowedUID != nil {
 		uid := *allowedUID
 		server.allowedUID = &uid
@@ -256,7 +270,7 @@ func (s *Server) serveConnection(connection *net.UnixConn) {
 			return
 		}
 		s.opMu.Lock()
-		reply := s.dispatch(request)
+		reply := s.dispatchFrom(uid, request)
 		err := sendResponse(connection, reply.response, reply.fd)
 		if err != nil && reply.cleanup != nil {
 			reply.cleanup()
@@ -269,6 +283,28 @@ func (s *Server) serveConnection(connection *net.UnixConn) {
 			return
 		}
 	}
+}
+
+// desiredSubnetIndexes is every subnet the helper must keep host networking
+// for: the synced reservations plus the live attachments. The caller holds
+// opMu.
+func (s *Server) desiredSubnetIndexes() []int {
+	indexes := append(s.state.SubnetIndexes(), s.attachedSubnetIndexes()...)
+	slices.Sort(indexes)
+	return slices.Compact(indexes)
+}
+
+// attachedSubnetIndexes reports the subnets live attachments occupy. DHCP must
+// serve them even when the synced state does not name them yet — a node cannot
+// boot on a subnet with no listener. The caller holds opMu; this must not take
+// it again.
+func (s *Server) attachedSubnetIndexes() []int {
+	indexes := make([]int, 0, len(s.attachments))
+	for _, attachment := range s.attachments {
+		indexes = append(indexes, attachment.subnetIndex)
+	}
+	slices.Sort(indexes)
+	return slices.Compact(indexes)
 }
 
 func isAuthorizedUID(uid uint32, allowedUID *uint32, allowAnyUID bool) bool {
@@ -298,25 +334,36 @@ func sendResponse(connection *net.UnixConn, response Response, fd int) error {
 	return nil
 }
 
+// dispatch serves a request on behalf of uid 0. Tests use it; connections go
+// through dispatchFrom with the peer's real uid.
 func (s *Server) dispatch(request Request) serverReply {
+	return s.dispatchFrom(0, request)
+}
+
+// dispatchFrom serves one request from the peer with the given uid. The uid
+// is the SO_PEERCRED identity, so an op that partitions state by owner
+// (net.sync) can trust it.
+func (s *Server) dispatchFrom(uid uint32, request Request) serverReply {
 	if request.Op == "dns.listen" {
-		return dnsListenerReply(request.Args)
+		return s.dnsListenerReply(request.Args)
 	}
-	data, fd, cleanup, err := s.handle(request)
+	data, fd, cleanup, err := s.handle(uid, request)
 	if err != nil {
 		return serverReply{response: failure(err), fd: -1}
 	}
 	return serverReply{response: success(data), fd: fd, cleanup: cleanup}
 }
 
-func (s *Server) handle(request Request) (any, int, func(), error) {
+func (s *Server) handle(uid uint32, request Request) (any, int, func(), error) {
 	switch request.Op {
 	case "net.attach":
-		return s.attach(request.Args)
+		return s.attach(uid, request.Args)
 	case "net.detach":
-		return nil, -1, nil, s.detach(request.Args)
+		return nil, -1, nil, s.detach(uid, request.Args)
 	case "net.teardown":
 		return s.teardownNetwork(request.Args)
+	case "net.sync":
+		return s.sync(uid, request.Args)
 	case "dns.install":
 		var args struct {
 			Port int `json:"port"`
@@ -384,7 +431,52 @@ func (s *Server) handle(request Request) (any, int, func(), error) {
 	}
 }
 
-func (s *Server) attach(raw json.RawMessage) (any, int, func(), error) {
+// sync adopts the reservations tbxd pushes and reconverges the host state they
+// describe. tbxd owns cluster state; the helper only holds this copy, so it can
+// serve DHCP and rebuild bridges without ever reading a user's home.
+// sync replaces the calling user's reservations — only theirs: each tbx
+// group member's daemon pushes the clusters in its own home, and the helper
+// converges over the union of every user's partition.
+func (s *Server) sync(owner uint32, raw json.RawMessage) (any, int, func(), error) {
+	var args struct {
+		Clusters []SyncedCluster `json:"clusters"`
+	}
+	if err := decodeArgs(raw, &args); err != nil {
+		return nil, -1, nil, err
+	}
+	previous := s.state.Partition(owner)
+	if err := s.state.Replace(owner, args.Clusters); err != nil {
+		return nil, -1, nil, err
+	}
+	if err := s.convergeSynced(); err != nil {
+		// The push is a transaction: tbxd commits its record only once the
+		// helper serves the set, so a set the host could not converge must
+		// not stay behind either. Hand back the owner's previous partition
+		// and converge that; the caller sees the original failure.
+		if restoreErr := s.state.Replace(owner, previous); restoreErr != nil {
+			log.Printf("net.sync: restore uid %d reservations after failed convergence: %v", owner, restoreErr)
+		} else if reconvergeErr := s.convergeSynced(); reconvergeErr != nil {
+			log.Printf("net.sync: reconverge after failed convergence: %v", reconvergeErr)
+		}
+		return nil, -1, nil, err
+	}
+	return struct{}{}, -1, nil, nil
+}
+
+// convergeSynced brings host networking and DHCP to the synced ∪ attached
+// set. A captured subnet's preflight failure is that cluster's problem,
+// reported by its own attach; it must not fail the sync of another cluster.
+func (s *Server) convergeSynced() error {
+	if err := convergeHostNetworking(s.desiredSubnetIndexes()); err != nil {
+		if !isSubnetPreflightError(err) {
+			return fmt.Errorf("converge helper networking: %w", err)
+		}
+		log.Printf("net.sync: %v", err)
+	}
+	return s.dhcp.Converge()
+}
+
+func (s *Server) attach(owner uint32, raw json.RawMessage) (any, int, func(), error) {
 	var args struct {
 		Cluster     string `json:"cluster"`
 		SubnetIndex *int   `json:"subnetIndex"`
@@ -402,18 +494,20 @@ func (s *Server) attach(raw json.RawMessage) (any, int, func(), error) {
 	if *args.SubnetIndex < 0 || *args.SubnetIndex > 255 {
 		return nil, -1, nil, fmt.Errorf("subnet index %d is outside 0..255", *args.SubnetIndex)
 	}
-	key := attachmentKey{cluster: args.Cluster, node: args.Node}
+	key := attachmentKey{owner: owner, cluster: args.Cluster, node: args.Node}
 	if _, exists := s.attachments[key]; exists {
 		return nil, -1, nil, fmt.Errorf("network interface for %s/%s is already attached", args.Cluster, args.Node)
 	}
-	attachment, err := startInterface(*args.SubnetIndex, args.Cluster, args.Node)
+	attachment, err := startInterface(s.desiredSubnetIndexes(), *args.SubnetIndex, args.Cluster, args.Node)
 	if err != nil {
 		return nil, -1, nil, err
 	}
+	attachment.subnetIndex = *args.SubnetIndex
+	s.attachments[key] = attachment
 	if err := s.dhcp.Converge(); err != nil {
+		delete(s.attachments, key)
 		return nil, -1, nil, errors.Join(err, attachment.close())
 	}
-	s.attachments[key] = attachment
 	cleanup := func() {
 		if current, ok := s.attachments[key]; ok && current == attachment {
 			err := attachment.close()
@@ -440,8 +534,8 @@ func (s *Server) attach(raw json.RawMessage) (any, int, func(), error) {
 }
 
 // teardownNetwork removes the host networking a subnet's last cluster leaves
-// behind. The socket boundary cannot prove the owning cluster is gone — cluster
-// state lives in the calling user's home, not the helper's — so the guarantee
+// behind. The synced set is tbxd's word, not proof — destroy syncs after the
+// state is gone, and a stale copy must not pin a bridge — so the guarantee
 // is the primitive's own: DeleteBridge refuses a bridge that still has links
 // enslaved (a live VM's only path), and an absent bridge is success. The
 // destroy path stops the cluster's VMs, which detaches their taps, before it
@@ -499,7 +593,7 @@ func validateBGPCluster(cluster string) error {
 	return nil
 }
 
-func (s *Server) detach(raw json.RawMessage) error {
+func (s *Server) detach(owner uint32, raw json.RawMessage) error {
 	var args struct {
 		Cluster string `json:"cluster"`
 		Node    string `json:"node"`
@@ -510,7 +604,7 @@ func (s *Server) detach(raw json.RawMessage) error {
 	if args.Cluster == "" || args.Node == "" {
 		return errors.New("cluster and node are required")
 	}
-	key := attachmentKey{cluster: args.Cluster, node: args.Node}
+	key := attachmentKey{owner: owner, cluster: args.Cluster, node: args.Node}
 	attachment, ok := s.attachments[key]
 	if !ok {
 		// Idempotent: the descriptor owner may already have released a

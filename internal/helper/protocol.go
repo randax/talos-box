@@ -29,14 +29,25 @@ const (
 	// next create climbs to a fresh subnet index; refusing the handshake sends
 	// the operator to a reinstall instead of accumulating host residue.
 	//
+	// Version 5 added net.sync, which pushes the cluster reservations tbxd owns
+	// into the helper. The packaged Linux helper runs as an unprivileged system
+	// user that cannot read a caller's home, so without this op it serves no
+	// DHCP and reconverges no bridges; a version 4 helper would silently leave
+	// every cluster without addresses.
+	//
 	// Bumping this also means bumping the literal in nix/vm-test.nix: the NixOS
 	// smoke test's helper-probe performs this handshake against the packaged
 	// helper, and `nix flake check` fails on a mismatch.
-	protocolVersion = 4
+	protocolVersion = 5
 	helperInfoOp    = "helper.info"
 )
 
 var errProtocolMismatch = errors.New("helper protocol mismatch")
+
+// IsProtocolMismatch reports whether err is the version-handshake refusal. It
+// already carries the reinstall advice, so callers must not stack the
+// "helper unavailable" remediation in front of it.
+func IsProtocolMismatch(err error) bool { return errors.Is(err, errProtocolMismatch) }
 
 // linuxHelperReinstallAdvice is the Linux recovery for a stale helper. Linux
 // installation is owned by packages and systemd units — `tbx system install`
@@ -44,7 +55,7 @@ var errProtocolMismatch = errors.New("helper protocol mismatch")
 // advice names the package upgrade and the socket restart instead.
 const linuxHelperReinstallAdvice = "reinstall the helper: upgrade the tbx-helper package " +
 	"(or reinstall the binary and units as in docs/linux.md, \"Build and install the source preview\"), " +
-	"then run `sudo systemctl restart tbx-helper.socket`"
+	"then run `sudo systemctl restart tbx-helper.service`"
 
 // The installed helper binary is pinned at an absolute path by its service
 // definition, so restarting it relaunches the same stale binary; only a
@@ -131,4 +142,22 @@ func success(data any) Response {
 
 func failure(err error) Response {
 	return Response{OK: false, Error: err.Error()}
+}
+
+// UnavailableAdvice is what to tell an operator whose helper cannot be reached
+// at all — a different failure from a stale helper, which protocolMismatch-
+// Advice covers. Every caller shares this so no platform ever reads another
+// platform's remediation: on Linux the helper is a packaged systemd socket
+// unit gated on the `tbx` group, and `tbx system install` (which installs the
+// macOS launchd helper) must never be printed there (#468).
+func UnavailableAdvice() string {
+	return unavailableAdviceForGOOS(runtime.GOOS)
+}
+
+func unavailableAdviceForGOOS(goos string) string {
+	if goos == "linux" {
+		return "enable the helper: `sudo systemctl enable --now tbx-helper.socket` " +
+			"and add your user to the `tbx` group (docs/linux.md)"
+	}
+	return "run `sudo tbx system install`"
 }

@@ -7,7 +7,7 @@ import (
 	"os"
 )
 
-func platformBindDNS(subnetIndex int) (*os.File, error) {
+func platformBindDNS(_ []int, subnetIndex int) (*os.File, error) {
 	return nil, fmt.Errorf("binding DNS for subnet %d is unsupported on this platform", subnetIndex)
 }
 

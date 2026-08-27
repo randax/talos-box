@@ -236,7 +236,7 @@ func TestRunningLinuxClustersFiltersStoppedConfigs(t *testing.T) {
 func TestLinuxPlatformDoctorFindingsKVMMissing(t *testing.T) {
 	t.Parallel()
 
-	finding := linuxKVMFinding(func(string) error { return os.ErrNotExist })
+	finding := linuxKVMFinding(func(string) error { return os.ErrNotExist }, "6.8.0-45-generic")
 	if finding.level != "FAIL" || !strings.Contains(finding.detail, "/dev/kvm is missing") {
 		t.Fatalf("finding = %+v", finding)
 	}
@@ -245,9 +245,70 @@ func TestLinuxPlatformDoctorFindingsKVMMissing(t *testing.T) {
 func TestLinuxPlatformDoctorFindingsKVMAccessHint(t *testing.T) {
 	t.Parallel()
 
-	finding := linuxKVMFinding(func(string) error { return errors.New("permission denied") })
+	finding := linuxKVMFinding(func(string) error { return errors.New("permission denied") }, "6.8.0-45-generic")
 	if finding.level != "FAIL" || !strings.Contains(finding.detail, doctorKVMGroupFix) {
 		t.Fatalf("finding = %+v", finding)
+	}
+}
+
+// "log out and back in" is wrong on WSL (there is no session to log out of)
+// and insufficient under a lingering user session, which survives every
+// logout; the kvm-group remediation names the step that actually applies the
+// new membership (#468).
+func TestLinuxSessionRefreshHint(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		osrelease string
+		want      []string
+	}{
+		{
+			name:      "wsl",
+			osrelease: "5.15.167.4-microsoft-standard-WSL2",
+			want:      []string{"wsl --shutdown"},
+		},
+		{
+			name:      "wsl mixed case",
+			osrelease: "5.15.167.4-Microsoft-standard-WSL2\n",
+			want:      []string{"wsl --shutdown"},
+		},
+		{
+			name:      "native",
+			osrelease: "6.8.0-45-generic",
+			want:      []string{"log out and back in", "loginctl terminate-user"},
+		},
+		{
+			name:      "unreadable",
+			osrelease: "",
+			want:      []string{"log out and back in", "loginctl terminate-user"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := linuxSessionRefreshHint(tt.osrelease)
+			for _, fragment := range tt.want {
+				if !strings.Contains(got, fragment) {
+					t.Fatalf("linuxSessionRefreshHint(%q) = %q, want %q", tt.osrelease, got, fragment)
+				}
+			}
+		})
+	}
+}
+
+func TestLinuxPlatformDoctorFindingsKVMHintFollowsTheSessionKind(t *testing.T) {
+	t.Parallel()
+
+	denied := func(string) error { return errors.New("permission denied") }
+	wsl := linuxKVMFinding(denied, "5.15.167.4-microsoft-standard-WSL2")
+	if !strings.Contains(wsl.detail, "wsl --shutdown") {
+		t.Fatalf("WSL finding = %+v, want the wsl --shutdown step", wsl)
+	}
+	native := linuxKVMFinding(denied, "6.8.0-45-generic")
+	if !strings.Contains(native.detail, "loginctl terminate-user") {
+		t.Fatalf("native finding = %+v, want the linger step", native)
 	}
 }
 
@@ -705,8 +766,8 @@ func TestLinuxPlatformDoctorFindingsHelperAccessSuggestsUsermod(t *testing.T) {
 			t.Fatalf("unexpected command %s %v", name, args)
 		}
 		return []byte("wheel kvm\n"), nil
-	})
-	if finding.level != "FAIL" || !strings.Contains(finding.detail, doctorHelperGroupFix) {
+	}, "5.15.167.4-microsoft-standard-WSL2")
+	if finding.level != "FAIL" || !strings.Contains(finding.detail, doctorHelperGroupFix) || !strings.Contains(finding.detail, "wsl --shutdown") {
 		t.Fatalf("finding = %+v", finding)
 	}
 }
@@ -762,6 +823,21 @@ func TestRPFilterRelevantInterfacesIgnoresUnrelatedVirtualLinks(t *testing.T) {
 	)
 	if fmt.Sprint(got) != "[eth0]" {
 		t.Fatalf("interfaces = %v, want [eth0]", got)
+	}
+}
+
+// systemextensionsctl is a macOS binary; Linux has no system-extension
+// inventory to take, so doctor must emit no security-inventory line at all
+// rather than an INFO reporting a missing tool (#468).
+func TestLinuxDoctorEmitsNoSecurityInventoryFinding(t *testing.T) {
+	t.Parallel()
+
+	findings := securityInventoryFindings(func(name string, args ...string) ([]byte, error) {
+		t.Fatalf("security inventory execed %s %v on Linux", name, args)
+		return nil, nil
+	})
+	if len(findings) != 0 {
+		t.Fatalf("findings = %+v, want none on Linux", findings)
 	}
 }
 

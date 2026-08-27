@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/helper"
 )
 
@@ -47,6 +48,10 @@ func TestMain(m *testing.M) {
 //     nothing binds, so a connection can only fail. That covers the call sites
 //     with no seam of their own — requireHelper, the resolver-file sync, and
 //     the host BGP disable, which leaked before this change too.
+//   - connectSyncHelper answers as a helper that accepts every reservation
+//     push, so the start paths — which refuse to launch a node the helper
+//     could not be told about — behave as they do beside a running helper. A
+//     test about the push installs its own recording client.
 //   - connectBridgeHelper answers as a host that has no bridge for the subnet,
 //     so the destroy path stays quiet on every GOOS instead of decorating
 //     every summary with a connection-failure warning. A test about the
@@ -61,6 +66,7 @@ func containHostHelper() (string, error) {
 		return dir, fmt.Errorf("pin TBX_HELPER_SOCKET: %w", err)
 	}
 	connectBridgeHelper = func() (bridgeReleaseHelper, error) { return noBridgeHelper{}, nil }
+	connectSyncHelper = func() (helperSyncClient, error) { return acceptingSyncHelper{}, nil }
 	return dir, nil
 }
 
@@ -71,6 +77,12 @@ type noBridgeHelper struct{}
 func (noBridgeHelper) UnregisterDNS(int) error          { return nil }
 func (noBridgeHelper) TeardownSubnet(int) (bool, error) { return false, nil }
 func (noBridgeHelper) Close() error                     { return nil }
+
+// acceptingSyncHelper answers like a helper that accepted the reservations.
+type acceptingSyncHelper struct{}
+
+func (acceptingSyncHelper) Sync([]cluster.Cluster) error { return nil }
+func (acceptingSyncHelper) Close() error                 { return nil }
 
 // The containment is only worth as much as its proof: if a refactor drops the
 // TBX_HELPER_SOCKET pin, this fails here instead of the next Linux runner

@@ -96,7 +96,7 @@ func TestDispatchDNSListenReturnsOwnedDescriptorAndRegistration(t *testing.T) {
 
 	originalBind := bindDNS
 	originalRegister := registerDNS
-	bindDNS = func(subnetIndex int) (*os.File, error) {
+	bindDNS = func(_ []int, subnetIndex int) (*os.File, error) {
 		if subnetIndex != 7 {
 			t.Fatalf("bind subnet = %d, want 7", subnetIndex)
 		}
@@ -114,7 +114,7 @@ func TestDispatchDNSListenReturnsOwnedDescriptorAndRegistration(t *testing.T) {
 		_ = file.Close()
 	})
 
-	reply := NewServer(nil).dispatch(Request{
+	reply := NewServer(nil, nil).dispatch(Request{
 		Op:   "dns.listen",
 		Args: json.RawMessage(`{"cluster":"demo","subnetIndex":7}`),
 	})

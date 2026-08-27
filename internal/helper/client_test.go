@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/randax/talos-box/internal/cluster"
 )
 
 func TestConnectRejectsProtocolVersionMismatch(t *testing.T) {
@@ -290,4 +293,89 @@ func TestConnectRejectsHelperPredatingBGPRouteReporting(t *testing.T) {
 		t.Fatalf("Connect() error = %v, want reinstall guidance", err)
 	}
 	<-done
+}
+
+func TestSyncSendsEveryClusterReservation(t *testing.T) {
+	socketPath := shortSocketPath(t, "helper-sync")
+	t.Setenv(helperSocketEnv, socketPath)
+
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	received := make(chan Request, 1)
+	go func() {
+		connection, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		unixConnection := connection.(*net.UnixConn)
+		defer func() { _ = unixConnection.Close() }()
+		decoder := json.NewDecoder(unixConnection)
+
+		var handshake Request
+		if err := decoder.Decode(&handshake); err != nil {
+			return
+		}
+		if err := sendResponse(unixConnection, success(Info{ProtocolVersion: protocolVersion}), -1); err != nil {
+			return
+		}
+		var request Request
+		if err := decoder.Decode(&request); err != nil {
+			return
+		}
+		received <- request
+		_ = sendResponse(unixConnection, success(struct{}{}), -1)
+	}()
+
+	client, err := Connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = client.Close() }()
+
+	clusters := []cluster.Cluster{{
+		Name:        "demo",
+		SubnetIndex: 7,
+		Nodes: []cluster.Node{
+			{Name: "demo-cp-1", MAC: "52:54:00:00:07:01", IP: "172.30.7.11"},
+		},
+	}}
+	if err := client.Sync(clusters); err != nil {
+		t.Fatal(err)
+	}
+
+	var request Request
+	select {
+	case request = <-received:
+	case <-time.After(time.Second):
+		t.Fatal("helper did not receive the sync request")
+	}
+	if request.Op != "net.sync" {
+		t.Fatalf("op = %q, want net.sync", request.Op)
+	}
+	var args struct {
+		Clusters []SyncedCluster `json:"clusters"`
+	}
+	if err := json.Unmarshal(request.Args, &args); err != nil {
+		t.Fatal(err)
+	}
+	want := []SyncedCluster{{
+		Name:        "demo",
+		SubnetIndex: 7,
+		Nodes:       []SyncedNode{{Name: "demo-cp-1", MAC: "52:54:00:00:07:01", IP: "172.30.7.11"}},
+	}}
+	if !reflect.DeepEqual(args.Clusters, want) {
+		t.Fatalf("synced clusters = %+v, want %+v", args.Clusters, want)
+	}
+}
+
+func TestSyncIsRetriedAfterAHelperRestart(t *testing.T) {
+	t.Parallel()
+
+	if !safeRetryOperation("net.sync") {
+		t.Fatal("net.sync is not retried after a helper restart, so the first push after one is lost")
+	}
 }

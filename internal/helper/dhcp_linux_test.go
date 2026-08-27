@@ -44,7 +44,7 @@ func testDHCPManagerOnSubnet(t *testing.T, subnetIndex int, ifindexes map[string
 	listeners := make([]*fakeDHCPListener, 0, 2)
 	manager := &linuxDHCPManager{
 		servers: make(map[int]dhcpEntry),
-		load:    func() ([]cluster.Cluster, error) { return []cluster.Cluster{item}, nil },
+		load:    func() []cluster.Cluster { return []cluster.Cluster{item} },
 		listen: func(int, server4.Handler) (dhcpListener, error) {
 			listener := newFakeDHCPListener()
 			listeners = append(listeners, listener)
@@ -110,7 +110,7 @@ func TestConvergeKeepsDHCPWhenTheBridgeIsUnchanged(t *testing.T) {
 	}
 }
 
-func TestConvergeRebindsDHCPWhenTheBridgeIsMissing(t *testing.T) {
+func TestConvergeStopsDHCPWhenTheBridgeIsMissingAndRebindsWhenItReturns(t *testing.T) {
 	ifindexes := map[string]int{bridgeNameForSubnet(2): 7}
 	manager, listeners := testDHCPManagerOnSubnet(t, 2, ifindexes)
 
@@ -121,16 +121,21 @@ func TestConvergeRebindsDHCPWhenTheBridgeIsMissing(t *testing.T) {
 	if err := manager.Converge(); err != nil {
 		t.Fatal(err)
 	}
-	if len(*listeners) != 2 {
-		t.Fatalf("listeners after missing bridge = %d, want 2", len(*listeners))
+	if len(*listeners) != 1 {
+		t.Fatalf("listeners after missing bridge = %d, want 1: nothing binds to an absent bridge", len(*listeners))
 	}
 	if (*listeners)[0].closed != 1 {
 		t.Fatalf("stale listener closes = %d, want 1", (*listeners)[0].closed)
 	}
-	// An unknown ifindex stays stale, so the entry rebinds again once the
-	// bridge is back.
-	if entry := manager.servers[2]; entry.ifindex != 0 {
-		t.Fatalf("entry ifindex after missing bridge = %d, want 0", entry.ifindex)
+	if _, exists := manager.servers[2]; exists {
+		t.Fatal("entry survived a missing bridge")
+	}
+	ifindexes[bridgeNameForSubnet(2)] = 8
+	if err := manager.Converge(); err != nil {
+		t.Fatal(err)
+	}
+	if entry := manager.servers[2]; len(*listeners) != 2 || entry.ifindex != 8 {
+		t.Fatalf("entry after the bridge returned = %+v (listeners %d), want a fresh listener on ifindex 8", entry, len(*listeners))
 	}
 }
 
@@ -200,5 +205,26 @@ func TestReleasedSubnetRebindsOnTheNextConverge(t *testing.T) {
 	}
 	if entry := manager.servers[0]; entry.ifindex != 22 {
 		t.Fatalf("entry ifindex after rebind = %d, want 22", entry.ifindex)
+	}
+}
+
+func TestConvergeServesSyncedAndAttachedSubnets(t *testing.T) {
+	manager, listeners := testDHCPManagerOnSubnet(t, 0, map[string]int{
+		bridgeNameForSubnet(0): 11,
+		bridgeNameForSubnet(3): 12,
+	})
+	manager.extra = func() []int { return []int{3} }
+
+	if err := manager.Converge(); err != nil {
+		t.Fatal(err)
+	}
+	if len(*listeners) != 2 {
+		t.Fatalf("listeners = %d, want 2", len(*listeners))
+	}
+	if _, served := manager.servers[0]; !served {
+		t.Fatal("synced subnet 0 has no DHCP listener")
+	}
+	if _, served := manager.servers[3]; !served {
+		t.Fatal("attached subnet 3 has no DHCP listener")
 	}
 }
