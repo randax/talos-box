@@ -50,7 +50,7 @@ var errProtocolMismatch = errors.New("helper protocol mismatch")
 // advice names the package upgrade and the socket restart instead.
 const linuxHelperReinstallAdvice = "reinstall the helper: upgrade the tbx-helper package " +
 	"(or reinstall the binary and units as in docs/linux.md, \"Build and install the source preview\"), " +
-	"then run `sudo systemctl restart tbx-helper.socket`"
+	"then run `sudo systemctl restart tbx-helper.service`"
 
 // The installed helper binary is pinned at an absolute path by its service
 // definition, so restarting it relaunches the same stale binary; only a

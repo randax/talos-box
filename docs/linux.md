@@ -142,10 +142,13 @@ sudo install -Dm0644 packaging/linux/usr/lib/systemd/user/tbxd.service \
   /usr/lib/systemd/user/tbxd.service
 sudo install -Dm0644 packaging/linux/usr/lib/sysusers.d/talos-box.conf \
   /usr/lib/sysusers.d/talos-box.conf
+sudo install -Dm0644 packaging/linux/usr/lib/sysctl.d/50-talos-box.conf \
+  /usr/lib/sysctl.d/50-talos-box.conf
 sudo install -Dm0644 packaging/linux/usr/share/polkit-1/rules.d/90-talos-box-resolved.rules \
   /usr/share/polkit-1/rules.d/90-talos-box-resolved.rules
 
 sudo systemd-sysusers /usr/lib/sysusers.d/talos-box.conf
+sudo systemd-sysctl /usr/lib/sysctl.d/50-talos-box.conf
 sudo usermod -aG tbx "$USER"
 getent group kvm >/dev/null && sudo usermod -aG kvm "$USER"
 
@@ -169,9 +172,9 @@ helper; Linux installation is owned by packages and systemd units.
 
 Upgrading `tbx`/`tbxd` can also require a new `tbx-helper`: the helper speaks a versioned
 protocol, and a mismatch is refused with `helper protocol mismatch`. Recover by upgrading the
-`tbx-helper` package (or reinstalling the binary and units as above) and restarting the socket:
-`sudo systemctl restart tbx-helper.socket`. Restarting alone is not enough — the unit relaunches
-the same stale binary.
+`tbx-helper` package (or reinstalling the binary and units as above) and restarting the service:
+`sudo systemctl restart tbx-helper.service`. Restart the *service*, not the socket: restarting
+`tbx-helper.socket` leaves an already-running helper — and its stale binary — in place.
 
 ## Helper state
 

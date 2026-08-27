@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"slices"
@@ -74,7 +75,10 @@ func helperStateDir(getenv func(string) string) string {
 }
 
 // Load reads the persisted reservations. A missing file is an empty set: a
-// helper that has never been synced still serves.
+// helper that has never been synced still serves. So is an unreadable,
+// undecodable, or invalid one, logged rather than fatal: tbxd re-pushes the
+// full set on its next start, whereas a fatal load takes the socket unit down
+// with the start limit — the failure #467 was about.
 func (s *State) Load() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -87,15 +91,21 @@ func (s *State) Load() error {
 			s.clusters = nil
 			return nil
 		}
-		return fmt.Errorf("read helper reservations %s: %w", s.path, err)
+		s.clusters = nil
+		log.Printf("read helper reservations %s: %v; starting with no reservations until tbxd syncs", s.path, err)
+		return nil
 	}
 	var stored syncedState
 	if err := json.Unmarshal(raw, &stored); err != nil {
-		return fmt.Errorf("decode helper reservations %s: %w", s.path, err)
+		s.clusters = nil
+		log.Printf("decode helper reservations %s: %v; starting with no reservations until tbxd syncs", s.path, err)
+		return nil
 	}
 	clusters, err := syncedClusters(stored.Clusters)
 	if err != nil {
-		return fmt.Errorf("validate helper reservations %s: %w", s.path, err)
+		s.clusters = nil
+		log.Printf("validate helper reservations %s: %v; starting with no reservations until tbxd syncs", s.path, err)
+		return nil
 	}
 	s.clusters = clusters
 	return nil

@@ -37,6 +37,9 @@ func TestHelperServiceAsset(t *testing.T) {
 		// sync, and ProtectSystem=strict leaves nowhere else writable.
 		"StateDirectory=tbx",
 		"StateDirectoryMode=0700",
+		// Without CAP_DAC_OVERRIDE the helper cannot flip ip_forward itself;
+		// the drop-in is applied as root before the helper starts.
+		"ExecStartPre=-+/usr/lib/systemd/systemd-sysctl /usr/lib/sysctl.d/50-talos-box.conf",
 	} {
 		if !strings.Contains(content, want) {
 			t.Fatalf("helper service asset missing %q", want)
@@ -44,6 +47,13 @@ func TestHelperServiceAsset(t *testing.T) {
 	}
 	if strings.Contains(content, "ProtectKernelTunables=yes") {
 		t.Fatal("helper service asset blocks required sysctl writes")
+	}
+}
+
+func TestSysctlAsset(t *testing.T) {
+	content := readAsset(t, "usr/lib/sysctl.d/50-talos-box.conf")
+	if !strings.Contains(content, "net.ipv4.ip_forward = 1") {
+		t.Fatal("sysctl asset does not enable IPv4 forwarding")
 	}
 }
 

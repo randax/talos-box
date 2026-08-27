@@ -77,10 +77,20 @@ func (m *linuxDHCPManager) Converge() error {
 		// old one and never notice.
 		ifindex, err := m.ifindex(bridgeNameForSubnet(subnetIndex))
 		if err != nil {
-			// An absent bridge fails the bind below with the canonical error.
-			// Until then ifindex 0 — never a real interface — keeps the entry
-			// marked stale so a later Converge rebinds it.
-			ifindex = 0
+			// No bridge, no listener: convergence skipped the subnet (its
+			// preflight failed) or has not built it yet. Drop a stale
+			// listener and let the next Converge bind once the bridge exists;
+			// failing here would fail every sync for a subnet nothing can use.
+			if entry, exists := m.servers[subnetIndex]; exists {
+				log.Printf("stopping DHCP on %s: bridge is gone", bridgeNameForSubnet(subnetIndex))
+				if err := closeDHCPListener(subnetIndex, entry.listener); err != nil {
+					closeDHCPEntries(started)
+					return err
+				}
+				delete(m.servers, subnetIndex)
+			}
+			log.Printf("DHCP on %s waits for its bridge: %v", bridgeNameForSubnet(subnetIndex), err)
+			continue
 		}
 		if entry, exists := m.servers[subnetIndex]; exists {
 			if entry.ifindex == ifindex {

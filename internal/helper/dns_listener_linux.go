@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -21,7 +22,14 @@ const resolvedCommandTimeout = 10 * time.Second
 func platformBindDNS(configured []int, subnetIndex int) (*os.File, error) {
 	desired := normalizeLinuxSubnetIndexes(append(slices.Clone(configured), subnetIndex))
 	if err := convergeNetworking(desired); err != nil {
-		return nil, fmt.Errorf("converge host networking before DNS bind: %w", err)
+		if !isSubnetPreflightError(err) {
+			return nil, fmt.Errorf("converge host networking before DNS bind: %w", err)
+		}
+		var preflight *SubnetPreflightError
+		if errors.As(err, &preflight) && slices.Contains(preflight.Skipped, subnetIndex) {
+			return nil, fmt.Errorf("converge host networking before DNS bind: %w", preflight.Err)
+		}
+		log.Printf("DNS bind for subnet %d: %v", subnetIndex, err)
 	}
 	address := &net.UDPAddr{IP: net.ParseIP(cluster.Gateway(subnetIndex)).To4(), Port: 53}
 	connection, err := net.ListenUDP("udp4", address)

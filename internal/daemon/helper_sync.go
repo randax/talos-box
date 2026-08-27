@@ -31,7 +31,7 @@ func SyncHelperState() error {
 	}
 	client, err := connectSyncHelper()
 	if err != nil {
-		return fmt.Errorf("sync helper state: %w", err)
+		return fmt.Errorf("sync helper state: %w", helperInstallError(err))
 	}
 	defer func() { _ = client.Close() }()
 	if err := client.Sync(clusters); err != nil {

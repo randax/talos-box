@@ -178,6 +178,12 @@ func ensureLinuxSysctl(path string) error {
 		return nil
 	}
 	if err := os.WriteFile(path, []byte("1\n"), 0); err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			// The packaged helper runs without CAP_DAC_OVERRIDE, so a sysctl
+			// the host has not already set is out of its reach: the package's
+			// sysctl.d drop-in (applied by the unit's ExecStartPre) is the fix.
+			return fmt.Errorf("enable IPv4 forwarding in %s: %w; set net.ipv4.ip_forward=1 on the host (install packaging/linux/usr/lib/sysctl.d/50-talos-box.conf and run `sudo systemctl restart tbx-helper.service`)", path, err)
+		}
 		return fmt.Errorf("enable IPv4 forwarding in %s: %w", path, err)
 	}
 	return nil

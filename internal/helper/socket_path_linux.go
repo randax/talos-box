@@ -42,10 +42,9 @@ func linuxClientSocketPath(effectiveUID uint32, sudoUID, override string) (strin
 		if socketPresent(userPath) {
 			return userPath, nil
 		}
-		if socketPresent(systemHelperSocketPath) {
-			return systemHelperSocketPath, nil
-		}
-		return userPath, nil
+		// Neither socket exists: name the packaged one, so the failure reads
+		// "enable tbx-helper.socket" rather than a missing /run/user/<uid>.
+		return systemHelperSocketPath, nil
 	}
 	return systemHelperSocketPath, nil
 }

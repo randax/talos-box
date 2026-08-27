@@ -110,7 +110,7 @@ func TestConvergeKeepsDHCPWhenTheBridgeIsUnchanged(t *testing.T) {
 	}
 }
 
-func TestConvergeRebindsDHCPWhenTheBridgeIsMissing(t *testing.T) {
+func TestConvergeStopsDHCPWhenTheBridgeIsMissingAndRebindsWhenItReturns(t *testing.T) {
 	ifindexes := map[string]int{bridgeNameForSubnet(2): 7}
 	manager, listeners := testDHCPManagerOnSubnet(t, 2, ifindexes)
 
@@ -121,16 +121,21 @@ func TestConvergeRebindsDHCPWhenTheBridgeIsMissing(t *testing.T) {
 	if err := manager.Converge(); err != nil {
 		t.Fatal(err)
 	}
-	if len(*listeners) != 2 {
-		t.Fatalf("listeners after missing bridge = %d, want 2", len(*listeners))
+	if len(*listeners) != 1 {
+		t.Fatalf("listeners after missing bridge = %d, want 1: nothing binds to an absent bridge", len(*listeners))
 	}
 	if (*listeners)[0].closed != 1 {
 		t.Fatalf("stale listener closes = %d, want 1", (*listeners)[0].closed)
 	}
-	// An unknown ifindex stays stale, so the entry rebinds again once the
-	// bridge is back.
-	if entry := manager.servers[2]; entry.ifindex != 0 {
-		t.Fatalf("entry ifindex after missing bridge = %d, want 0", entry.ifindex)
+	if _, exists := manager.servers[2]; exists {
+		t.Fatal("entry survived a missing bridge")
+	}
+	ifindexes[bridgeNameForSubnet(2)] = 8
+	if err := manager.Converge(); err != nil {
+		t.Fatal(err)
+	}
+	if entry := manager.servers[2]; len(*listeners) != 2 || entry.ifindex != 8 {
+		t.Fatalf("entry after the bridge returned = %+v (listeners %d), want a fresh listener on ifindex 8", entry, len(*listeners))
 	}
 }
 

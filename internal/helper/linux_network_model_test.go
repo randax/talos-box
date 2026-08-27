@@ -205,7 +205,7 @@ func TestConvergeLinuxManagedStateRecreatesColdBootBridgesFromInventory(t *testi
 	}
 }
 
-func TestConvergeLinuxManagedStatePreflightsBeforeMutationAndSkipsAllocatedHint(t *testing.T) {
+func TestConvergeLinuxManagedStateSkipsACapturedSubnetAndConvergesTheRest(t *testing.T) {
 	t.Parallel()
 
 	ops := &fakeLinuxNetworkOps{routes: map[string]cluster.HostRoute{
@@ -223,8 +223,17 @@ func TestConvergeLinuxManagedStatePreflightsBeforeMutationAndSkipsAllocatedHint(
 			t.Fatalf("error = %q, want %q", err, fragment)
 		}
 	}
-	if len(ops.calls) != 0 || nft.calls != 0 {
-		t.Fatalf("mutation after preflight failure: network=%v nft=%d", ops.calls, nft.calls)
+	var preflight *SubnetPreflightError
+	if !errors.As(err, &preflight) || !reflect.DeepEqual(preflight.Skipped, []int{7}) {
+		t.Fatalf("error = %#v, want a SubnetPreflightError skipping [7]", err)
+	}
+	if got := nft.subnetIndexes; !reflect.DeepEqual(got, []int{0}) {
+		t.Fatalf("nft subnet indexes = %v, want [0]: the captured subnet must not stop the others", got)
+	}
+	for _, call := range ops.calls {
+		if strings.Contains(call, bridgeNameForSubnet(7)) {
+			t.Fatalf("captured subnet was mutated: %v", ops.calls)
+		}
 	}
 }
 

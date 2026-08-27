@@ -149,3 +149,19 @@ func TestHelperStateDirTakesTheFirstSystemdDirectory(t *testing.T) {
 		t.Fatalf("state dir = %q, want /var/lib/tbx", got)
 	}
 }
+
+func TestHelperStateLoadTreatsACorruptFileAsEmpty(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "reservations.json"), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state := NewState(dir)
+	if err := state.Load(); err != nil {
+		t.Fatalf("Load() error = %v, want a corrupt file to be tolerated", err)
+	}
+	if got := state.SubnetIndexes(); len(got) != 0 {
+		t.Fatalf("subnets after corrupt load = %v, want none", got)
+	}
+}

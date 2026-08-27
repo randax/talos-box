@@ -2,6 +2,9 @@
 Description=Talos Box privileged helper
 
 [Service]
+# "+" runs as root regardless of User=/capabilities; "-" tolerates a source
+# install that skipped the drop-in (the helper then reports the sysctl itself).
+ExecStartPre=-+/usr/lib/systemd/systemd-sysctl /usr/lib/sysctl.d/50-talos-box.conf
 ExecStart=/usr/bin/tbx-helper
 User=tbx
 Group=tbx

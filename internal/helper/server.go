@@ -281,10 +281,6 @@ func (s *Server) serveConnection(connection *net.UnixConn) {
 	}
 }
 
-// attachedSubnetIndexes reports the subnets live attachments occupy. DHCP must
-// serve them even when the synced state does not name them yet — a node cannot
-// boot on a subnet with no listener. The caller holds opMu; this must not take
-// it again.
 // desiredSubnetIndexes is every subnet the helper must keep host networking
 // for: the synced reservations plus the live attachments. The caller holds
 // opMu.
@@ -294,6 +290,10 @@ func (s *Server) desiredSubnetIndexes() []int {
 	return slices.Compact(indexes)
 }
 
+// attachedSubnetIndexes reports the subnets live attachments occupy. DHCP must
+// serve them even when the synced state does not name them yet — a node cannot
+// boot on a subnet with no listener. The caller holds opMu; this must not take
+// it again.
 func (s *Server) attachedSubnetIndexes() []int {
 	indexes := make([]int, 0, len(s.attachments))
 	for _, attachment := range s.attachments {
@@ -432,7 +432,12 @@ func (s *Server) sync(raw json.RawMessage) (any, int, func(), error) {
 		return nil, -1, nil, err
 	}
 	if err := convergeHostNetworking(s.desiredSubnetIndexes()); err != nil {
-		return nil, -1, nil, fmt.Errorf("converge helper networking: %w", err)
+		if !isSubnetPreflightError(err) {
+			return nil, -1, nil, fmt.Errorf("converge helper networking: %w", err)
+		}
+		// A captured subnet is that cluster's problem, reported by its own
+		// attach; the sync must not fail the unrelated cluster that sent it.
+		log.Printf("net.sync: %v", err)
 	}
 	if err := s.dhcp.Converge(); err != nil {
 		return nil, -1, nil, err
@@ -498,8 +503,8 @@ func (s *Server) attach(raw json.RawMessage) (any, int, func(), error) {
 }
 
 // teardownNetwork removes the host networking a subnet's last cluster leaves
-// behind. The socket boundary cannot prove the owning cluster is gone — cluster
-// state lives in the calling user's home, not the helper's — so the guarantee
+// behind. The synced set is tbxd's word, not proof — destroy syncs after the
+// state is gone, and a stale copy must not pin a bridge — so the guarantee
 // is the primitive's own: DeleteBridge refuses a bridge that still has links
 // enslaved (a live VM's only path), and an absent bridge is success. The
 // destroy path stops the cluster's VMs, which detaches their taps, before it

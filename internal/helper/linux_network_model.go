@@ -1,6 +1,7 @@
 package helper
 
 import (
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"net"
@@ -187,13 +188,29 @@ func lowestSafeLinuxSubnet(inspector linuxSubnetInspector, reserved []int) (int,
 }
 
 func convergeLinuxManagedState(netOps linuxNetworkOps, nft linuxNFTConverger, configured []int) error {
-	desired := normalizeLinuxSubnetIndexes(configured)
+	reserved := normalizeLinuxSubnetIndexes(configured)
 	inspector := linuxSubnetInspector{Interfaces: netOps.ListLinks, Route: netOps.Route}
-	for _, index := range desired {
-		if _, err := preflightLinuxSubnet(index, inspector, desired); err != nil {
-			return err
+	desired := make([]int, 0, len(reserved))
+	var skipped []int
+	var preflightErrs []error
+	for _, index := range reserved {
+		if _, err := preflightLinuxSubnet(index, inspector, reserved); err != nil {
+			skipped = append(skipped, index)
+			preflightErrs = append(preflightErrs, err)
+			continue
 		}
+		desired = append(desired, index)
 	}
+	if err := convergeLinuxSubnets(netOps, nft, desired); err != nil {
+		return err
+	}
+	if len(skipped) != 0 {
+		return &SubnetPreflightError{Skipped: skipped, Err: errors.Join(preflightErrs...)}
+	}
+	return nil
+}
+
+func convergeLinuxSubnets(netOps linuxNetworkOps, nft linuxNFTConverger, desired []int) error {
 	if err := netOps.EnsureIPv4Forwarding(); err != nil {
 		return err
 	}

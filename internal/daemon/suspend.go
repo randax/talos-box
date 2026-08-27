@@ -79,6 +79,11 @@ func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if s.clusterRunning(item.Name) {
 		return ClusterSummary{}, fmt.Errorf("cluster %q is already running", item.Name)
 	}
+	// resume bypasses start(), so it pushes the reservations itself: a node
+	// whose save is unusable cold-boots and needs a lease like any first boot.
+	if err := SyncHelperState(); err != nil {
+		return ClusterSummary{}, err
+	}
 	dir, err := cluster.Dir(item.Name)
 	if err != nil {
 		return ClusterSummary{}, err

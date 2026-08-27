@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"syscall"
 
@@ -58,15 +59,18 @@ func run(args []string) error {
 		_ = listener.Close()
 		return err
 	}
+	// Startup convergence is best-effort: a failure here is logged and
+	// reported again, with its remedy, to the next net.sync. Exiting instead
+	// would trip the unit's start limit and take the socket down with it —
+	// the crash loop #467 describes — for a condition that needs the operator,
+	// not a restart.
 	if err := helper.ConvergeNetworking(state.SubnetIndexes()); err != nil {
-		_ = listener.Close()
-		return fmt.Errorf("converge helper networking: %w", err)
+		log.Printf("converge helper networking at startup: %v", err)
 	}
 
 	server := helper.NewServer(state, serverAllowedUID(allowedUID, explicitAllowedUID, activated), activated)
 	if err := server.ConvergeServices(); err != nil {
-		_ = listener.Close()
-		return fmt.Errorf("converge helper services: %w", err)
+		log.Printf("converge helper services at startup: %v", err)
 	}
 	serveErrors := make(chan error, 1)
 	go func() { serveErrors <- server.Serve(listener) }()
@@ -124,7 +128,7 @@ func openHelperListener(
 // restart forgets them until tbxd syncs again.
 func loadHelperState() (*helper.State, error) {
 	directory := helper.StateDir()
-	if directory == "" {
+	if directory == "" && runtime.GOOS == "linux" {
 		log.Print("no helper state directory (StateDirectory= or TBX_HELPER_STATE_DIR); reservations are in-memory only")
 	}
 	state := helper.NewState(directory)
