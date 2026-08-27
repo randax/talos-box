@@ -171,13 +171,12 @@ func TestCatchAllMirrorRoutesByNamespaceCachesUnderUpstreamAndMapsDockerIO(t *te
 }
 
 func TestCatchAllMirrorRefusesNonPublicNamespaces(t *testing.T) {
-	catchAllPort := freePort(t)
 	var dials atomic.Int64
 
-	m := newManagerWithPorts(t.TempDir(), nil, catchAllPort)
+	m := newManagerWithPorts(t.TempDir(), nil, 0)
 	m.resolveUpstreamIPs = func(_ context.Context, host string) ([]net.IP, error) {
 		switch host {
-		case "localhost":
+		case "loopback.registry.example":
 			return []net.IP{net.ParseIP("127.0.0.1")}, nil
 		case "10.0.0.7", "100.64.0.7", "169.254.1.7":
 			return []net.IP{net.ParseIP(host)}, nil
@@ -186,27 +185,125 @@ func TestCatchAllMirrorRefusesNonPublicNamespaces(t *testing.T) {
 		}
 	}
 	m.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
-	m.dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+	m.dialContext = func(context.Context, string, string) (net.Conn, error) {
 		dials.Add(1)
-		return (&net.Dialer{}).DialContext(ctx, network, address)
+		return nil, fmt.Errorf("unexpected dial")
 	}
 	defer m.Close()
 
-	if err := m.Bind("127.0.0.1"); err != nil {
-		t.Fatal(err)
-	}
-
-	for _, ns := range []string{"localhost", "10.0.0.7", "100.64.0.7", "169.254.1.7"} {
+	for _, ns := range []string{"loopback.registry.example", "10.0.0.7", "100.64.0.7", "169.254.1.7"} {
 		t.Run(ns, func(t *testing.T) {
-			resp, _ := get(t, fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/latest?ns=%s", catchAllPort, url.QueryEscape(ns)))
-			if resp.StatusCode != http.StatusForbidden {
-				t.Fatalf("status for ns=%s = %d, want 403", ns, resp.StatusCode)
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, "/v2/app/manifests/latest?ns="+url.QueryEscape(ns), nil)
+			m.serveCatchAll(recorder, request)
+			if recorder.Code != http.StatusForbidden {
+				t.Fatalf("status for ns=%s = %d, want 403", ns, recorder.Code)
 			}
 		})
 	}
 
 	if dials.Load() != 0 {
 		t.Fatalf("blocked namespaces dialed upstream %d times, want 0", dials.Load())
+	}
+}
+
+func TestCatchAllMirrorRedirectsSyntacticLoopbackAuthorities(t *testing.T) {
+	tests := []struct {
+		name         string
+		method       string
+		namespace    string
+		wantLocation string
+		offline      bool
+	}{
+		{
+			name:         "localhost node port",
+			method:       http.MethodGet,
+			namespace:    "localhost:30500",
+			wantLocation: "http://localhost:30500/v2/app/manifests/latest?platform=linux%2Famd64",
+		},
+		{
+			name:         "loopback IPv4",
+			method:       http.MethodHead,
+			namespace:    "127.0.0.2:5000",
+			wantLocation: "http://127.0.0.2:5000/v2/app/manifests/latest?platform=linux%2Famd64",
+		},
+		{
+			name:         "loopback IPv6 while mirror offline",
+			method:       http.MethodGet,
+			namespace:    "[::1]:5000",
+			wantLocation: "http://[::1]:5000/v2/app/manifests/latest?platform=linux%2Famd64",
+			offline:      true,
+		},
+		{
+			name:         "default TLS port",
+			method:       http.MethodGet,
+			namespace:    "localhost:443",
+			wantLocation: "https://localhost:443/v2/app/manifests/latest?platform=linux%2Famd64",
+		},
+		{
+			name:         "implicit TLS port",
+			method:       http.MethodGet,
+			namespace:    "localhost",
+			wantLocation: "https://localhost/v2/app/manifests/latest?platform=linux%2Famd64",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manager := newManagerWithPorts(t.TempDir(), nil, 0)
+			manager.offline.Store(test.offline)
+			manager.resolveUpstreamIPs = func(context.Context, string) ([]net.IP, error) {
+				t.Fatal("loopback redirect resolved the authority")
+				return nil, nil
+			}
+			manager.hostOwnedIPs = func() ([]net.IP, error) {
+				t.Fatal("loopback redirect inspected host addresses")
+				return nil, nil
+			}
+			manager.dialContext = func(context.Context, string, string) (net.Conn, error) {
+				t.Fatal("loopback redirect dialed from the host")
+				return nil, nil
+			}
+			defer manager.Close()
+
+			requestURL := "/v2/app/manifests/latest?platform=linux%2Famd64&ns=" + url.QueryEscape(test.namespace)
+			recorder := httptest.NewRecorder()
+			manager.serveCatchAll(recorder, httptest.NewRequest(test.method, requestURL, nil))
+
+			if recorder.Code != http.StatusTemporaryRedirect {
+				t.Fatalf("%s ns=%s = %d %q, want 307", test.method, test.namespace, recorder.Code, recorder.Body.String())
+			}
+			if got := recorder.Header().Get("Location"); got != test.wantLocation {
+				t.Fatalf("Location = %q, want %q", got, test.wantLocation)
+			}
+		})
+	}
+}
+
+func TestCatchAllMirrorOfflineStillRejectsUncachedPublicPull(t *testing.T) {
+	var upstreamHandlers atomic.Int64
+	manager := newManagerWithPorts(t.TempDir(), nil, 0)
+	manager.offline.Store(true)
+	manager.serverFactory = func(string, string, string) http.Handler {
+		upstreamHandlers.Add(1)
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		})
+	}
+	defer manager.Close()
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/v2/app/manifests/latest?ns=registry.example", nil)
+	manager.serveCatchAll(recorder, request)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("offline public pull = %d %q, want 503", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "mirror offline: content not cached") {
+		t.Fatalf("offline public pull body = %q, want cache-miss reason", recorder.Body.String())
+	}
+	if upstreamHandlers.Load() != 0 {
+		t.Fatalf("offline public pull created %d upstream handlers, want 0", upstreamHandlers.Load())
 	}
 }
 
@@ -601,30 +698,35 @@ func TestCatchAllMirrorDistinctAcceptedAuthoritiesDoNotShareHandlersOrCacheDirs(
 }
 
 func TestCatchAllMirrorRejectsBlockedHostPortAuthorities(t *testing.T) {
-	catchAllPort := freePort(t)
-	m := newManagerWithPorts(t.TempDir(), nil, catchAllPort)
+	var dials atomic.Int64
+	m := newManagerWithPorts(t.TempDir(), nil, 0)
 	m.resolveUpstreamIPs = func(_ context.Context, host string) ([]net.IP, error) {
 		switch canonicalLookupHost(host) {
-		case "localhost":
+		case "loopback.registry.example":
 			return []net.IP{net.ParseIP("127.0.0.1")}, nil
 		default:
 			return []net.IP{net.ParseIP(canonicalLookupHost(host))}, nil
 		}
 	}
 	m.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	m.dialContext = func(context.Context, string, string) (net.Conn, error) {
+		dials.Add(1)
+		return nil, fmt.Errorf("unexpected dial")
+	}
 	defer m.Close()
 
-	if err := m.Bind("127.0.0.1"); err != nil {
-		t.Fatal(err)
-	}
-
-	for _, ns := range []string{"127.0.0.1:5000", "10.0.0.7:5000", "localhost:5000", "[::1]:5000"} {
+	for _, ns := range []string{"10.0.0.7:5000", "172.16.0.7:5000", "192.168.0.7:5000", "loopback.registry.example:5000"} {
 		t.Run(ns, func(t *testing.T) {
-			resp, _ := get(t, fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/latest?ns=%s", catchAllPort, url.QueryEscape(ns)))
-			if resp.StatusCode != http.StatusForbidden {
-				t.Fatalf("status for blocked ns=%s = %d, want 403", ns, resp.StatusCode)
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, "/v2/app/manifests/latest?ns="+url.QueryEscape(ns), nil)
+			m.serveCatchAll(recorder, request)
+			if recorder.Code != http.StatusForbidden {
+				t.Fatalf("status for blocked ns=%s = %d, want 403", ns, recorder.Code)
 			}
 		})
+	}
+	if dials.Load() != 0 {
+		t.Fatalf("blocked authorities dialed upstream %d times, want 0", dials.Load())
 	}
 }
 
@@ -783,7 +885,7 @@ func TestCatchAllMirrorInvalidNamespacesDoNotAllocateDynamicHandlers(t *testing.
 		switch canonicalLookupHost(host) {
 		case "registry-ok.example":
 			return []net.IP{net.ParseIP("203.0.113.10")}, nil
-		case "127.0.0.1":
+		case "loopback.registry.example":
 			return []net.IP{net.ParseIP("127.0.0.1")}, nil
 		default:
 			return nil, fmt.Errorf("unexpected host %q", host)
@@ -815,7 +917,7 @@ func TestCatchAllMirrorInvalidNamespacesDoNotAllocateDynamicHandlers(t *testing.
 	}
 
 	for i := 0; i < 3; i++ {
-		resp, _ := get(t, fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/latest?ns=%s", catchAllPort, url.QueryEscape("127.0.0.1")))
+		resp, _ := get(t, fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/latest?ns=%s", catchAllPort, url.QueryEscape("loopback.registry.example")))
 		if resp.StatusCode != http.StatusForbidden {
 			t.Fatalf("invalid ns request %d = %d, want 403", i, resp.StatusCode)
 		}
