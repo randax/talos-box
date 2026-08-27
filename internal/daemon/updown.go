@@ -374,6 +374,9 @@ func persistIntentUpdates(updates []intentUpdate) error {
 			return fmt.Errorf("persist provisioning intent for %s: %w", update.next.Name, err)
 		}
 	}
+	if len(updates) != 0 {
+		logHelperSyncFailure("sync helper state after persisting provisioning intent")
+	}
 	return nil
 }
 

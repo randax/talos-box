@@ -263,6 +263,7 @@ func (s *Server) setBGP(raw json.RawMessage, enable bool) (ClusterSummary, error
 	if err := cluster.Save(item); err != nil {
 		return ClusterSummary{}, err
 	}
+	logHelperSyncFailure(fmt.Sprintf("sync helper state after the BGP change for %s", item.Name))
 	result := summary(item, s.clusterRunning(item.Name))
 	if enable {
 		// The speaker is up; a foreign listener already holding the port is

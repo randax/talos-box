@@ -92,6 +92,11 @@ func run() (err error) {
 		return err
 	}
 	configureHostNetworking()
+	// The helper holds tbxd's copy of the cluster reservations; a helper that
+	// restarted (or has never been synced) serves none until this lands.
+	if err := daemon.SyncHelperState(); err != nil {
+		log.Printf("startup helper state sync: %v", err)
+	}
 	stopHostNetworkingMaintenance := startHostNetworkingMaintenance()
 	// registry mirrors are bound per cluster gateway by the daemon (see #39).
 
