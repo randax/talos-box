@@ -211,7 +211,7 @@ configured bridge or running cluster report `SKIP` before one exists.
 | `mirror-health` | Pull-through mirror listeners are bound on exactly the running clusters' gateway IPs, and reports the registry-mirror cache totals | Restart the affected cluster (or `tbxd`) so the bind set is reconverged with cluster lifecycle |
 | `image-cache` | Reports the Talos disk-image cache totals, named apart from the registry-mirror cache so offline prep can tell the two stores under `~/.talosbox/cache` apart. Incomplete combinations — prunable leftovers with no usable image — are held out of the total and counted separately, and a cache holding nothing else is a `WARN` | Never `FAIL`s: a failed cache listing is reported once on `mirror-health` and skips this line. On `WARN`, rerun `tbx cache pull` before going offline; use `tbx cache list` for the per-combination breakdown |
 | `mirror-offline` | Whether `tbx mirror offline` is on. The mode persists across a daemon restart and makes every uncached pull fail, so it is named rather than left to be remembered | `WARN` only: run `tbx mirror offline off` to restore upstream pulls; each miss is also logged as `mirror offline miss: …` in `tbx logs` |
-| `egress`, `security-inventory` | Image Factory access is usable and relevant security/VPN software is visible | Follow the specific warning or failure detail |
+| `egress` | Image Factory access is usable | Follow the specific warning or failure detail. There is no `security-inventory` line here: the system-extension inventory it reports is macOS-only |
 
 `FAIL` makes `tbx doctor` exit non-zero. `WARN` identifies a degraded but usable configuration,
 such as QEMU 6.2 without suspend or a host without automatic systemd-resolved registration.

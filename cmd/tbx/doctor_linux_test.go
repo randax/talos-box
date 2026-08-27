@@ -765,6 +765,21 @@ func TestRPFilterRelevantInterfacesIgnoresUnrelatedVirtualLinks(t *testing.T) {
 	}
 }
 
+// systemextensionsctl is a macOS binary; Linux has no system-extension
+// inventory to take, so doctor must emit no security-inventory line at all
+// rather than an INFO reporting a missing tool (#468).
+func TestLinuxDoctorEmitsNoSecurityInventoryFinding(t *testing.T) {
+	t.Parallel()
+
+	findings := securityInventoryFindings(func(name string, args ...string) ([]byte, error) {
+		t.Fatalf("security inventory execed %s %v on Linux", name, args)
+		return nil, nil
+	})
+	if len(findings) != 0 {
+		t.Fatalf("findings = %+v, want none on Linux", findings)
+	}
+}
+
 type noopCloser struct{}
 
 func (noopCloser) Close() error { return nil }
