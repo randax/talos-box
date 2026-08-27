@@ -213,36 +213,38 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		if err := writeFindings(doctorFinding{level: "SKIP", check: "host-pressure", detail: err.Error()}); err != nil {
 			return err
 		}
-	} else if findings := hostpressure.Assess(snapshot); len(findings) == 0 {
-		// A PASS states the three numbers it was decided on — free memory, swap
-		// in use, free space on the ~/.talosbox volume — plus the headroom the
-		// provision-start gate will measure the next bringup against, so the
-		// verdict can be attested without re-running memory_pressure, sysctl and
-		// df by hand, and so a host cannot read PASS here and still be refused a
-		// second cluster without warning (#420, #397).
+	} else {
+		// Free memory and the daemon's reserve are classification inputs, not
+		// PASS-only decoration: enough present RAM is what distinguishes stale
+		// allocated swap from the active swapping that corrupted guests (#483).
 		snapshot.FreeMemoryMiB = doctorFreeMemoryMiB(deps)
 		reserveMiB, fromDaemon := doctorBalloonReserveMiB(deps)
-		detail := snapshot.Summary(reserveMiB)
-		if !fromDaemon {
-			detail += " (daemon unreachable; assuming the default reserve)"
-		}
-		if err := writeFindings(doctorFinding{
-			level: "PASS", check: "host-pressure", detail: detail,
-		}); err != nil {
-			return err
-		}
-	} else {
-		// Same classification the daemon's start gate uses: a blocking finding
-		// is what makes cluster create refuse, so it fails here too.
-		for _, finding := range findings {
-			level := "WARN"
-			if finding.Severity == hostpressure.SeverityBlock {
-				level = "FAIL"
+		findings := hostpressure.Assess(snapshot, reserveMiB)
+		if len(findings) == 0 {
+			// A PASS states the three numbers it was decided on — free memory,
+			// swap, data-volume space — plus the next bringup's headroom.
+			detail := snapshot.Summary(reserveMiB)
+			if !fromDaemon {
+				detail += " (daemon unreachable; assuming the default reserve)"
 			}
 			if err := writeFindings(doctorFinding{
-				level: level, check: "host-pressure", detail: finding.DoctorDetail(),
+				level: "PASS", check: "host-pressure", detail: detail,
 			}); err != nil {
 				return err
+			}
+		} else {
+			// Same classification the daemon's start gate uses: a blocking
+			// finding is what makes cluster create refuse, so it fails here too.
+			for _, finding := range findings {
+				level := "WARN"
+				if finding.Severity == hostpressure.SeverityBlock {
+					level = "FAIL"
+				}
+				if err := writeFindings(doctorFinding{
+					level: level, check: "host-pressure", detail: finding.DoctorDetail(),
+				}); err != nil {
+					return err
+				}
 			}
 		}
 	}

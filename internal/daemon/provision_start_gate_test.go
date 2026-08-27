@@ -90,14 +90,13 @@ func TestCheckProvisionStart(t *testing.T) {
 			pressure:       noHostPressure,
 		},
 		{
-			// The incident shape: the footprint is out on disk *and* the host has
-			// less than half its RAM free, which is what separates live pressure
-			// from a swap file macOS never returned. plentifulHostMemory is the
-			// stubbed host total, so just under half of it is the scarce reading.
+			// The incident shape: the footprint is out on disk and free RAM cannot
+			// cover this bringup plus the reserve. That present shortfall keeps the
+			// old swap allocation armed even after pressure returned to normal.
 			name:           "the #334 swap footprint refuses a second bringup while RAM is scarce (#334)",
 			clusterRunning: true,
 			addMiB:         2048,
-			freeMiB:        1<<19 - 1,
+			freeMiB:        2048 + reserve - 1,
 			pressure:       nearlyFullSwap,
 			wantErr:        "host swap is 91% used",
 		},
@@ -118,10 +117,17 @@ func TestCheckProvisionStart(t *testing.T) {
 			pressure:       smallStickySwapfile,
 		},
 		{
-			name:           "a small sticky swapfile under elevated pressure refuses",
+			name:           "a small sticky swapfile under elevated pressure admits with headroom",
 			clusterRunning: true,
 			addMiB:         2048,
 			freeMiB:        1 << 20,
+			pressure:       elevatedPressureSmallSwap,
+		},
+		{
+			name:           "a small sticky swapfile under elevated pressure refuses with low free memory",
+			clusterRunning: true,
+			addMiB:         2048,
+			freeMiB:        1 << 10,
 			pressure:       elevatedPressureSmallSwap,
 			wantErr:        "host swap is 82% used",
 		},

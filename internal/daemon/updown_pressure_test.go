@@ -21,8 +21,9 @@ func TestUpForceSurfacesHostPressureWarning(t *testing.T) {
 		t.Fatal(err)
 	}
 	service := &Server{
-		vms:          make(map[string]map[string]hypervisor.Machine),
-		hostPressure: extremeSwapPressure,
+		vms:            make(map[string]map[string]hypervisor.Machine),
+		hostPressure:   extremeSwapPressure,
+		hostFreeMemory: scarceHostMemory,
 		subnetSources: cluster.SubnetSources{
 			Interfaces: func() ([]cluster.HostInterface, error) { return nil, nil },
 			Route:      func(net.IP) (cluster.HostRoute, error) { return cluster.HostRoute{}, nil },
