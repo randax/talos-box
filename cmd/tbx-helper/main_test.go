@@ -80,7 +80,9 @@ func TestOpenHelperListenerSkipsPathResolutionWhenActivated(t *testing.T) {
 			resolved = true
 			return "", errors.New("resolve must not run under socket activation")
 		},
-		func(string) (net.Listener, error) { return nil, errors.New("listen must not run under socket activation") },
+		func(string) (net.Listener, error) {
+			return nil, errors.New("listen must not run under socket activation")
+		},
 	)
 	if err != nil {
 		t.Fatal(err)
