@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"strconv"
@@ -41,17 +42,11 @@ func run(args []string) error {
 		return err
 	}
 	warnMissingAllowedUID(allowedUID)
-	socketPath, err := helper.ServerSocketPath(allowedUID)
-	if err != nil {
-		return fmt.Errorf("resolve helper socket path: %w", err)
-	}
-	listener, activated, err := systemd.InheritedListener(socketPath)
-	if err != nil {
-		return err
-	}
-	if !activated {
-		listener, err = helper.Listen(socketPath)
-	}
+	listener, socketPath, activated, err := openHelperListener(
+		systemd.InheritedListener,
+		func() (string, error) { return helper.ServerSocketPath(allowedUID) },
+		helper.Listen,
+	)
 	if err != nil {
 		return err
 	}
@@ -84,6 +79,38 @@ func run(args []string) error {
 		serveErr := <-serveErrors
 		return errors.Join(shutdownErr, serveErr)
 	}
+}
+
+// activatedListenerName labels the inherited descriptor. Under socket
+// activation the descriptor is the address, so no path is resolved: the
+// packaged unit runs as an unprivileged user whose runtime directory does not
+// hold the socket the unit listens on, and resolving it there fails.
+const activatedListenerName = "tbx-helper.sock"
+
+// openHelperListener prefers a systemd-activated descriptor and only resolves
+// and binds a socket path when there is none. The returned path is empty when
+// activated: nothing on the activated path owns the socket file.
+func openHelperListener(
+	inherited func(string) (net.Listener, bool, error),
+	resolve func() (string, error),
+	listen func(string) (net.Listener, error),
+) (net.Listener, string, bool, error) {
+	listener, activated, err := inherited(activatedListenerName)
+	if err != nil {
+		return nil, "", false, err
+	}
+	if activated {
+		return listener, "", true, nil
+	}
+	socketPath, err := resolve()
+	if err != nil {
+		return nil, "", false, fmt.Errorf("resolve helper socket path: %w", err)
+	}
+	listener, err = listen(socketPath)
+	if err != nil {
+		return nil, "", false, err
+	}
+	return listener, socketPath, false, nil
 }
 
 func serverAllowedUID(resolved *uint32, explicit, activated bool) *uint32 {
