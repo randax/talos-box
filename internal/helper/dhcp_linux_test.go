@@ -44,7 +44,7 @@ func testDHCPManagerOnSubnet(t *testing.T, subnetIndex int, ifindexes map[string
 	listeners := make([]*fakeDHCPListener, 0, 2)
 	manager := &linuxDHCPManager{
 		servers: make(map[int]dhcpEntry),
-		load:    func() ([]cluster.Cluster, error) { return []cluster.Cluster{item}, nil },
+		load:    func() []cluster.Cluster { return []cluster.Cluster{item} },
 		listen: func(int, server4.Handler) (dhcpListener, error) {
 			listener := newFakeDHCPListener()
 			listeners = append(listeners, listener)
@@ -200,5 +200,26 @@ func TestReleasedSubnetRebindsOnTheNextConverge(t *testing.T) {
 	}
 	if entry := manager.servers[0]; entry.ifindex != 22 {
 		t.Fatalf("entry ifindex after rebind = %d, want 22", entry.ifindex)
+	}
+}
+
+func TestConvergeServesSyncedAndAttachedSubnets(t *testing.T) {
+	manager, listeners := testDHCPManagerOnSubnet(t, 0, map[string]int{
+		bridgeNameForSubnet(0): 11,
+		bridgeNameForSubnet(3): 12,
+	})
+	manager.extra = func() []int { return []int{3} }
+
+	if err := manager.Converge(); err != nil {
+		t.Fatal(err)
+	}
+	if len(*listeners) != 2 {
+		t.Fatalf("listeners = %d, want 2", len(*listeners))
+	}
+	if _, served := manager.servers[0]; !served {
+		t.Fatal("synced subnet 0 has no DHCP listener")
+	}
+	if _, served := manager.servers[3]; !served {
+		t.Fatal("attached subnet 3 has no DHCP listener")
 	}
 }

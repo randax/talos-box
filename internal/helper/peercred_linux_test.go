@@ -52,7 +52,7 @@ func TestLinuxUnauthorizedPeerReceivesServerError(t *testing.T) {
 		t.Skip("root is always authorized")
 	}
 	allowedUID := uid + 1
-	server := NewServer(&allowedUID)
+	server := NewServer(nil, &allowedUID)
 	left, right := unixSocketpair(t)
 	defer func() { _ = right.Close() }()
 

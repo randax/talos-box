@@ -39,22 +39,27 @@ type syncedState struct {
 	Clusters []SyncedCluster `json:"clusters"`
 }
 
-// helperState is the helper's copy of the reservations tbxd owns. A state with
+// State is the helper's copy of the reservations tbxd owns. A state with
 // no directory keeps them in memory only, which loses host networking across a
 // helper restart but never fails an otherwise working helper.
-type helperState struct {
+type State struct {
 	mu       sync.RWMutex
 	clusters []cluster.Cluster
 	path     string
 }
 
-func newHelperState(dir string) *helperState {
-	state := &helperState{}
+// NewState creates the helper's reservation state. An empty dir keeps the
+// reservations in memory only.
+func NewState(dir string) *State {
+	state := &State{}
 	if dir != "" {
 		state.path = filepath.Join(dir, reservationsFileName)
 	}
 	return state
 }
+
+// StateDir picks the reservation directory from the process environment.
+func StateDir() string { return helperStateDir(os.Getenv) }
 
 // helperStateDir picks the directory the reservations live in: the systemd
 // StateDirectory when the unit provides one, an explicit override otherwise,
@@ -70,7 +75,7 @@ func helperStateDir(getenv func(string) string) string {
 
 // Load reads the persisted reservations. A missing file is an empty set: a
 // helper that has never been synced still serves.
-func (s *helperState) Load() error {
+func (s *State) Load() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.path == "" {
@@ -99,7 +104,7 @@ func (s *helperState) Load() error {
 // Replace validates and adopts a pushed reservation set, persisting it when the
 // helper has a state directory. A rejected set leaves the previous one in place
 // on disk and in memory.
-func (s *helperState) Replace(in []SyncedCluster) error {
+func (s *State) Replace(in []SyncedCluster) error {
 	clusters, err := syncedClusters(in)
 	if err != nil {
 		return err
@@ -113,7 +118,7 @@ func (s *helperState) Replace(in []SyncedCluster) error {
 	return nil
 }
 
-func (s *helperState) persist(in []SyncedCluster) error {
+func (s *State) persist(in []SyncedCluster) error {
 	if s.path == "" {
 		return nil
 	}
@@ -154,7 +159,7 @@ func writeAndClose(file *os.File, raw []byte) error {
 }
 
 // Clusters returns the synced reservations.
-func (s *helperState) Clusters() []cluster.Cluster {
+func (s *State) Clusters() []cluster.Cluster {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return slices.Clone(s.clusters)
@@ -162,7 +167,7 @@ func (s *helperState) Clusters() []cluster.Cluster {
 
 // SubnetIndexes returns the subnets the synced clusters occupy, sorted and
 // deduplicated.
-func (s *helperState) SubnetIndexes() []int {
+func (s *State) SubnetIndexes() []int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	indexes := make([]int, 0, len(s.clusters))

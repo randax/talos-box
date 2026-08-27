@@ -35,7 +35,7 @@ func TestBGPRejectsInvalidArguments(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			reply := NewServer(nil).dispatch(Request{Op: test.op, Args: json.RawMessage(test.args)})
+			reply := NewServer(nil, nil).dispatch(Request{Op: test.op, Args: json.RawMessage(test.args)})
 			if reply.response.OK || !strings.Contains(reply.response.Error, test.wantErr) {
 				t.Fatalf("dispatch(%s) response = %+v, want error containing %q", test.op, reply.response, test.wantErr)
 			}
@@ -44,7 +44,7 @@ func TestBGPRejectsInvalidArguments(t *testing.T) {
 }
 
 func TestBGPStatusReportsObservedSpeakerOwnership(t *testing.T) {
-	server := NewServer(nil)
+	server := NewServer(nil, nil)
 	announced := []bgp.Route{
 		{Prefix: "172.30.7.200/32", Nexthop: "172.30.7.2"},
 		{Prefix: "172.30.7.201/32", Nexthop: "172.30.7.3"},
@@ -104,7 +104,7 @@ type reportingSpeaker struct {
 func (s *reportingSpeaker) Routes() []bgp.Route { return s.routes }
 
 func TestShutdownStopsEveryBGPSpeaker(t *testing.T) {
-	server := NewServer(nil)
+	server := NewServer(nil, nil)
 	first, second := &shutdownSpeaker{}, &shutdownSpeaker{}
 	server.speakers = map[string]bgpSpeaker{"first": first, "second": second}
 	if err := server.Shutdown(); err != nil {
@@ -175,5 +175,45 @@ func TestIsAuthorizedUID(t *testing.T) {
 				t.Fatalf("isAuthorizedUID(%d) = %t, want %t", test.uid, got, test.want)
 			}
 		})
+	}
+}
+
+type recordingDHCPManager struct {
+	converged [][]int
+	released  []int
+	subnets   func() []int
+}
+
+func (m *recordingDHCPManager) Converge() error {
+	m.converged = append(m.converged, m.subnets())
+	return nil
+}
+
+func (m *recordingDHCPManager) Release(subnetIndex int) error {
+	m.released = append(m.released, subnetIndex)
+	return nil
+}
+
+func (m *recordingDHCPManager) Close() error { return nil }
+
+func TestAttachConvergesDHCPForASubnetTheSyncedStateDoesNotCover(t *testing.T) {
+	server := NewServer(nil, nil)
+	manager := &recordingDHCPManager{subnets: server.attachedSubnetIndexes}
+	server.dhcp = manager
+
+	originalStart := startInterface
+	startInterface = func([]int, int, string, string) (*platformAttachment, error) {
+		return testPlatformAttachment(41, func(int) error { return nil }), nil
+	}
+	t.Cleanup(func() { startInterface = originalStart })
+
+	if _, _, _, err := server.attach(json.RawMessage(`{"cluster":"demo","subnetIndex":5,"node":"cp-1"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if len(manager.converged) != 1 {
+		t.Fatalf("DHCP converges = %d, want 1", len(manager.converged))
+	}
+	if got := manager.converged[0]; len(got) != 1 || got[0] != 5 {
+		t.Fatalf("converged subnets = %v, want [5]", got)
 	}
 }

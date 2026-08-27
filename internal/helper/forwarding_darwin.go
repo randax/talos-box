@@ -16,7 +16,7 @@ func enableForwarding() error {
 	return nil
 }
 
-func convergeNetworking() error { return nil }
+func convergeNetworking([]int) error { return nil }
 
 // TeardownSubnet has nothing to remove on macOS: vmnet owns the shared bridge
 // and reclaims it when the last interface on it goes away, so a destroyed

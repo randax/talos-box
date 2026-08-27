@@ -94,7 +94,7 @@ func TestLinuxSocketOverrideIsSharedByClientAndServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := NewServer(&allowedUID)
+	server := NewServer(nil, &allowedUID)
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()
 	t.Cleanup(func() {

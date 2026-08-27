@@ -27,11 +27,7 @@ var (
 
 // StartInterface converges the cluster's host networking and returns a tap
 // descriptor for QEMU. The helper retains its copy until Detach.
-func StartInterface(subnetIndex int, clusterName, node string) (*platformAttachment, error) {
-	configured, err := configuredLinuxSubnetIndexes()
-	if err != nil {
-		return nil, err
-	}
+func StartInterface(configured []int, subnetIndex int, clusterName, node string) (*platformAttachment, error) {
 	file, err := startLinuxAttachment(linuxNetwork, linuxNFT, configured, subnetIndex, clusterName, node)
 	if err != nil {
 		return nil, err
@@ -50,12 +46,8 @@ func TeardownSubnet(subnetIndex int) (bool, error) {
 	return teardownLinuxBridge(linuxNetwork, subnetIndex)
 }
 
-func convergeNetworking() error {
-	configured, err := configuredLinuxSubnetIndexes()
-	if err != nil {
-		return err
-	}
-	return convergeLinuxManagedState(linuxNetwork, linuxNFT, configured)
+func convergeNetworking(subnets []int) error {
+	return convergeLinuxManagedState(linuxNetwork, linuxNFT, subnets)
 }
 
 func enableForwarding() error {
@@ -63,18 +55,6 @@ func enableForwarding() error {
 }
 
 type realLinuxNetworkOps struct{}
-
-func configuredLinuxSubnetIndexes() ([]int, error) {
-	clusters, err := cluster.List()
-	if err != nil {
-		return nil, fmt.Errorf("load configured cluster networking: %w", err)
-	}
-	indexes := make([]int, 0, len(clusters))
-	for _, item := range clusters {
-		indexes = append(indexes, item.SubnetIndex)
-	}
-	return normalizeLinuxSubnetIndexes(indexes), nil
-}
 
 func (realLinuxNetworkOps) ListLinks() ([]linuxLinkState, error) {
 	links, err := netlink.LinkList()

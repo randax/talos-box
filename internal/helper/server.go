@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -47,6 +48,7 @@ type Server struct {
 	pendingStops map[int]*platformAttachment
 	speakers     map[string]bgpSpeaker
 	dhcp         dhcpManager
+	state        *State
 	allowedUID   *uint32
 	allowAnyUID  bool
 
@@ -57,13 +59,18 @@ type Server struct {
 	connectionWG sync.WaitGroup
 }
 
-// NewServer creates an empty helper server.
-func NewServer(allowedUID *uint32, allowAnyUID ...bool) *Server {
+// NewServer creates an empty helper server over the reservation state tbxd
+// pushes. A nil state serves an empty, memory-only set.
+func NewServer(state *State, allowedUID *uint32, allowAnyUID ...bool) *Server {
+	if state == nil {
+		state = NewState("")
+	}
 	server := &Server{
 		attachments:  make(map[attachmentKey]*platformAttachment),
 		pendingStops: make(map[int]*platformAttachment),
-		dhcp:         newPlatformDHCPManager(),
+		state:        state,
 	}
+	server.dhcp = newPlatformDHCPManager(state.Clusters, server.attachedSubnetIndexes)
 	if allowedUID != nil {
 		uid := *allowedUID
 		server.allowedUID = &uid
@@ -271,6 +278,28 @@ func (s *Server) serveConnection(connection *net.UnixConn) {
 	}
 }
 
+// attachedSubnetIndexes reports the subnets live attachments occupy. DHCP must
+// serve them even when the synced state does not name them yet — a node cannot
+// boot on a subnet with no listener. The caller holds opMu; this must not take
+// it again.
+// desiredSubnetIndexes is every subnet the helper must keep host networking
+// for: the synced reservations plus the live attachments. The caller holds
+// opMu.
+func (s *Server) desiredSubnetIndexes() []int {
+	indexes := append(s.state.SubnetIndexes(), s.attachedSubnetIndexes()...)
+	slices.Sort(indexes)
+	return slices.Compact(indexes)
+}
+
+func (s *Server) attachedSubnetIndexes() []int {
+	indexes := make([]int, 0, len(s.attachments))
+	for _, attachment := range s.attachments {
+		indexes = append(indexes, attachment.subnetIndex)
+	}
+	slices.Sort(indexes)
+	return slices.Compact(indexes)
+}
+
 func isAuthorizedUID(uid uint32, allowedUID *uint32, allowAnyUID bool) bool {
 	return uid == 0 || allowedUID != nil && uid == *allowedUID || allowAnyUID && allowedUID == nil
 }
@@ -300,7 +329,7 @@ func sendResponse(connection *net.UnixConn, response Response, fd int) error {
 
 func (s *Server) dispatch(request Request) serverReply {
 	if request.Op == "dns.listen" {
-		return dnsListenerReply(request.Args)
+		return s.dnsListenerReply(request.Args)
 	}
 	data, fd, cleanup, err := s.handle(request)
 	if err != nil {
@@ -406,14 +435,16 @@ func (s *Server) attach(raw json.RawMessage) (any, int, func(), error) {
 	if _, exists := s.attachments[key]; exists {
 		return nil, -1, nil, fmt.Errorf("network interface for %s/%s is already attached", args.Cluster, args.Node)
 	}
-	attachment, err := startInterface(*args.SubnetIndex, args.Cluster, args.Node)
+	attachment, err := startInterface(s.desiredSubnetIndexes(), *args.SubnetIndex, args.Cluster, args.Node)
 	if err != nil {
 		return nil, -1, nil, err
 	}
+	attachment.subnetIndex = *args.SubnetIndex
+	s.attachments[key] = attachment
 	if err := s.dhcp.Converge(); err != nil {
+		delete(s.attachments, key)
 		return nil, -1, nil, errors.Join(err, attachment.close())
 	}
-	s.attachments[key] = attachment
 	cleanup := func() {
 		if current, ok := s.attachments[key]; ok && current == attachment {
 			err := attachment.close()

@@ -8,7 +8,7 @@ import (
 )
 
 func TestDetachKeepsAttachmentOnStopFailure(t *testing.T) {
-	server := NewServer(nil)
+	server := NewServer(nil, nil)
 	key := attachmentKey{cluster: "demo", node: "cp-1"}
 	server.attachments[key] = testPlatformAttachment(42, func(fd int) error {
 		if fd != 42 {
@@ -27,12 +27,12 @@ func TestDetachKeepsAttachmentOnStopFailure(t *testing.T) {
 }
 
 func TestAttachCleanupDropsAttachmentOnRetainedStopFailure(t *testing.T) {
-	server := NewServer(nil)
+	server := NewServer(nil, nil)
 	startCalls := 0
 	stopCalls := make(map[int]int)
 
 	originalStart := startInterface
-	startInterface = func(subnet int, _, _ string) (*platformAttachment, error) {
+	startInterface = func(_ []int, subnet int, _, _ string) (*platformAttachment, error) {
 		if subnet != 7 {
 			t.Fatalf("startInterface subnet = %d, want 7", subnet)
 		}
@@ -95,13 +95,13 @@ func TestAttachCleanupDropsAttachmentOnRetainedStopFailure(t *testing.T) {
 }
 
 func TestAttachRollsBackInterfaceWhenDHCPConvergenceFails(t *testing.T) {
-	server := NewServer(nil)
+	server := NewServer(nil, nil)
 	convergeErr := errors.New("DHCP unavailable")
 	server.dhcp = &testDHCPManager{convergeErr: convergeErr}
 	stopCalls := 0
 
 	originalStart := startInterface
-	startInterface = func(int, string, string) (*platformAttachment, error) {
+	startInterface = func([]int, int, string, string) (*platformAttachment, error) {
 		return testPlatformAttachment(77, func(int) error {
 			stopCalls++
 			return nil
@@ -122,7 +122,7 @@ func TestAttachRollsBackInterfaceWhenDHCPConvergenceFails(t *testing.T) {
 }
 
 func TestShutdownRetriesRetainedAttachmentStops(t *testing.T) {
-	server := NewServer(nil)
+	server := NewServer(nil, nil)
 	key := attachmentKey{cluster: "demo", node: "cp-1"}
 	stopCalls := 0
 	server.attachments[key] = testPlatformAttachment(42, func(fd int) error {
@@ -148,7 +148,7 @@ func TestShutdownRetriesRetainedAttachmentStops(t *testing.T) {
 }
 
 func TestShutdownClosesDHCPService(t *testing.T) {
-	server := NewServer(nil)
+	server := NewServer(nil, nil)
 	closeErr := errors.New("close DHCP")
 	server.dhcp = &testDHCPManager{closeErr: closeErr}
 
@@ -158,7 +158,7 @@ func TestShutdownClosesDHCPService(t *testing.T) {
 }
 
 func TestShutdownBoundsRetainedStopRetries(t *testing.T) {
-	server := NewServer(nil)
+	server := NewServer(nil, nil)
 	stopCalls := 0
 	stopErr := errors.New("retry later")
 	server.pendingStops[42] = testPlatformAttachment(42, func(fd int) error {
@@ -182,7 +182,7 @@ func TestShutdownBoundsRetainedStopRetries(t *testing.T) {
 }
 
 func TestDetachDropsAttachmentOnTerminalStopFailure(t *testing.T) {
-	server := NewServer(nil)
+	server := NewServer(nil, nil)
 	key := attachmentKey{cluster: "demo", node: "cp-1"}
 	server.attachments[key] = testPlatformAttachment(42, func(fd int) error {
 		if fd != 42 {
@@ -226,7 +226,7 @@ func (m *testDHCPManager) Release(subnetIndex int) error {
 func (m *testDHCPManager) Close() error { return m.closeErr }
 
 func TestTeardownRemovesTheSubnetBridge(t *testing.T) {
-	server := NewServer(nil)
+	server := NewServer(nil, nil)
 	calls := 0
 
 	originalTeardown := teardownSubnet
@@ -258,7 +258,7 @@ func TestTeardownRemovesTheSubnetBridge(t *testing.T) {
 }
 
 func TestTeardownReportsAnAbsentBridgeAsSuccess(t *testing.T) {
-	server := NewServer(nil)
+	server := NewServer(nil, nil)
 
 	originalTeardown := teardownSubnet
 	teardownSubnet = func(int) (bool, error) { return false, nil }
@@ -306,7 +306,7 @@ func TestTeardownReleasesTheSubnetDHCPServerOnlyWhenTheBridgeIsGone(t *testing.T
 			teardownSubnet = test.teardown
 			t.Cleanup(func() { teardownSubnet = originalTeardown })
 
-			server := NewServer(nil)
+			server := NewServer(nil, nil)
 			dhcp := &testDHCPManager{}
 			server.dhcp = dhcp
 
@@ -344,7 +344,7 @@ func TestTeardownRejectsInvalidArguments(t *testing.T) {
 		{name: "subnet above IPv4 octet", args: `{"subnetIndex":256}`, wantErr: "outside 0..255"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			reply := NewServer(nil).dispatch(Request{Op: "net.teardown", Args: json.RawMessage(test.args)})
+			reply := NewServer(nil, nil).dispatch(Request{Op: "net.teardown", Args: json.RawMessage(test.args)})
 			if reply.response.OK || !strings.Contains(reply.response.Error, test.wantErr) {
 				t.Fatalf("net.teardown response = %+v, want error containing %q", reply.response, test.wantErr)
 			}

@@ -35,15 +35,18 @@ type dhcpEntry struct {
 type linuxDHCPManager struct {
 	mu      sync.Mutex
 	servers map[int]dhcpEntry
-	load    func() ([]cluster.Cluster, error)
+	load    func() []cluster.Cluster
+	// extra names subnets that have no synced cluster yet — live attachments.
+	extra   func() []int
 	listen  func(int, server4.Handler) (dhcpListener, error)
 	ifindex func(string) (int, error)
 }
 
-func newPlatformDHCPManager() dhcpManager {
+func newPlatformDHCPManager(load func() []cluster.Cluster, extra func() []int) dhcpManager {
 	return &linuxDHCPManager{
 		servers: make(map[int]dhcpEntry),
-		load:    cluster.List,
+		load:    load,
+		extra:   extra,
 		listen:  listenDHCP,
 		ifindex: bridgeIfindex,
 	}
@@ -53,16 +56,16 @@ func (m *linuxDHCPManager) Converge() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	clusters, err := m.load()
-	if err != nil {
-		return fmt.Errorf("load DHCP reservations: %w", err)
-	}
+	clusters := m.load()
 	if _, err := cluster.NewReservationTable(clusters); err != nil {
 		return fmt.Errorf("validate DHCP reservations: %w", err)
 	}
 	desired := make([]int, 0, len(clusters))
 	for _, item := range clusters {
 		desired = append(desired, item.SubnetIndex)
+	}
+	if m.extra != nil {
+		desired = append(desired, m.extra()...)
 	}
 	desired = normalizeLinuxSubnetIndexes(desired)
 
@@ -167,12 +170,7 @@ func bridgeIfindex(name string) (int, error) {
 
 func (m *linuxDHCPManager) handler(subnetIndex int) server4.Handler {
 	return func(connection net.PacketConn, peer net.Addr, request *dhcpv4.DHCPv4) {
-		clusters, err := m.load()
-		if err != nil {
-			log.Printf("load DHCP reservations for %s: %v", bridgeNameForSubnet(subnetIndex), err)
-			return
-		}
-		reservations, err := cluster.NewReservationTable(clusters)
+		reservations, err := cluster.NewReservationTable(m.load())
 		if err != nil {
 			log.Printf("validate DHCP reservations for %s: %v", bridgeNameForSubnet(subnetIndex), err)
 			return

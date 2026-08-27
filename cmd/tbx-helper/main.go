@@ -53,12 +53,17 @@ func run(args []string) error {
 	if !activated {
 		defer func() { _ = os.Remove(socketPath) }()
 	}
-	if err := helper.ConvergeNetworking(); err != nil {
+	state, err := loadHelperState()
+	if err != nil {
+		_ = listener.Close()
+		return err
+	}
+	if err := helper.ConvergeNetworking(state.SubnetIndexes()); err != nil {
 		_ = listener.Close()
 		return fmt.Errorf("converge helper networking: %w", err)
 	}
 
-	server := helper.NewServer(serverAllowedUID(allowedUID, explicitAllowedUID, activated), activated)
+	server := helper.NewServer(state, serverAllowedUID(allowedUID, explicitAllowedUID, activated), activated)
 	if err := server.ConvergeServices(); err != nil {
 		_ = listener.Close()
 		return fmt.Errorf("converge helper services: %w", err)
@@ -111,6 +116,22 @@ func openHelperListener(
 		return nil, "", false, err
 	}
 	return listener, socketPath, false, nil
+}
+
+// loadHelperState reads the reservations tbxd last pushed, so a restarted
+// helper reconverges host networking without waiting for a daemon. Without a
+// state directory the helper keeps them in memory only: it still serves, but a
+// restart forgets them until tbxd syncs again.
+func loadHelperState() (*helper.State, error) {
+	directory := helper.StateDir()
+	if directory == "" {
+		log.Print("no helper state directory (StateDirectory= or TBX_HELPER_STATE_DIR); reservations are in-memory only")
+	}
+	state := helper.NewState(directory)
+	if err := state.Load(); err != nil {
+		return nil, fmt.Errorf("load helper state: %w", err)
+	}
+	return state, nil
 }
 
 func serverAllowedUID(resolved *uint32, explicit, activated bool) *uint32 {

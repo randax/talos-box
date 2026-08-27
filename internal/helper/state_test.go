@@ -26,7 +26,7 @@ func TestHelperStateRoundTripsThroughDisk(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	state := newHelperState(dir)
+	state := NewState(dir)
 	if err := state.Replace(syncedFixture()); err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +39,7 @@ func TestHelperStateRoundTripsThroughDisk(t *testing.T) {
 		t.Fatalf("reservations.json mode = %o, want 600", mode)
 	}
 
-	reloaded := newHelperState(dir)
+	reloaded := NewState(dir)
 	if err := reloaded.Load(); err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func TestHelperStateRoundTripsThroughDisk(t *testing.T) {
 func TestHelperStateLoadTreatsMissingFileAsEmpty(t *testing.T) {
 	t.Parallel()
 
-	state := newHelperState(t.TempDir())
+	state := NewState(t.TempDir())
 	if err := state.Load(); err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestHelperStateReplaceRejectsInvalidReservations(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	state := newHelperState(dir)
+	state := NewState(dir)
 	if err := state.Replace(syncedFixture()); err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +92,7 @@ func TestHelperStateReplaceRejectsInvalidReservations(t *testing.T) {
 	if got := state.Clusters(); len(got) != 2 || got[0].Name != "alpha" {
 		t.Fatalf("clusters = %#v, want the previous set retained", got)
 	}
-	reloaded := newHelperState(dir)
+	reloaded := NewState(dir)
 	if err := reloaded.Load(); err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +104,7 @@ func TestHelperStateReplaceRejectsInvalidReservations(t *testing.T) {
 func TestHelperStateWithoutDirectoryKeepsStateInMemory(t *testing.T) {
 	t.Parallel()
 
-	state := newHelperState("")
+	state := NewState("")
 	if err := state.Load(); err != nil {
 		t.Fatal(err)
 	}
