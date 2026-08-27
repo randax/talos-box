@@ -61,11 +61,10 @@ type Snapshot struct {
 	Swap           Usage
 	DataVolume     Usage
 	MemoryPressure MemoryPressure
-	// FreeMemoryMiB is host memory available right now. Nothing in Assess reads
-	// it — the steady-state verdict is pressure and swap — but it is the number
-	// the provision-start gate refuses on, so a diagnostic that prints it lets
-	// an operator see a start coming before it is refused (#420, #397). Zero
-	// means it was not measured, and it is reported as such.
+	// FreeMemoryMiB is host memory available right now. Assess weighs it against
+	// the balloon reserve plus the guests about to start, because macOS can keep
+	// old swap allocated after the pressure that filled it has cleared (#483).
+	// Zero means it was not measured, and it is reported as such.
 	FreeMemoryMiB int
 }
 
@@ -165,14 +164,14 @@ func (f Finding) DoctorDetail() string {
 // reports those same findings as FAIL, so the gate and the diagnostic can never
 // disagree about the same reading.
 //
-// Memory pressure is the primary memory signal: macOS keeps swap allocated
-// long after pressure clears, so a high swap-used percentage alone says
-// nothing about current availability. Elevated pressure is therefore reportable
-// on its own, and swap — measured both as a percentage and as absolute free
-// bytes — decides how far it escalates.
-func Assess(snapshot Snapshot) []Finding {
+// Memory pressure is the primary memory signal. Elevated pressure is always
+// reportable, and swap — measured both as a percentage and as absolute free
+// bytes — escalates it only when the host lacks the required free memory.
+// requiredFreeMiB is the balloon reserve plus the memory of guests the caller
+// is about to start; doctor passes the reserve alone.
+func Assess(snapshot Snapshot, requiredFreeMiB int) []Finding {
 	var findings []Finding
-	if finding, ok := memoryFinding(snapshot); ok {
+	if finding, ok := memoryFinding(snapshot, requiredFreeMiB); ok {
 		findings = append(findings, finding)
 	}
 	if percentUsed(snapshot.DataVolume) >= extremeDataVolumeUsedPercent {
@@ -196,20 +195,22 @@ func Assess(snapshot Snapshot) []Finding {
 //   - critical pressure blocks outright;
 //   - warning pressure is always at least advisory — it is the reading that was
 //     live while guest disks were being corrupted (#284) — and blocks once swap
-//     is exhausted by either measure;
+//     is exhausted by either measure unless measured free memory covers the
+//     balloon reserve plus the guests about to start;
 //   - swap at or past extremeSwapUsedPercent keeps its original verdicts: a
-//     block while pressure is elevated or unmeasurable, advisory while pressure
-//     is normal;
+//     block while pressure is elevated or unmeasurable and headroom is absent,
+//     advisory while pressure is normal or measured headroom is sufficient;
 //   - low absolute free swap only escalates alongside a *measured* elevated
 //     pressure AND substantial swap use: macOS grows vm.swapusage on demand,
 //     so a small, mostly-free allocation is the normal reading right when a
 //     host merely begins to swap — that must not block. The ≥75% floor keeps
 //     both QA-observed corruption readings (87–88% used) blocking.
-func memoryFinding(snapshot Snapshot) (Finding, bool) {
+func memoryFinding(snapshot Snapshot, requiredFreeMiB int) (Finding, bool) {
 	swapEnabled := snapshot.Swap.TotalBytes > 0
 	swapExhausted := swapEnabled && percentUsed(snapshot.Swap) >= extremeSwapUsedPercent
 	swapNearlyFull := swapEnabled && snapshot.Swap.AvailableBytes < lowFreeSwapBytes &&
 		percentUsed(snapshot.Swap) >= substantialSwapUsedPercent
+	hasRequiredFreeMemory := snapshot.FreeMemoryMiB > 0 && snapshot.FreeMemoryMiB >= requiredFreeMiB
 
 	var severity Severity
 	switch snapshot.MemoryPressure {
@@ -217,7 +218,7 @@ func memoryFinding(snapshot Snapshot) (Finding, bool) {
 		severity = SeverityBlock
 	case MemoryPressureWarning:
 		severity = SeverityWarn
-		if swapExhausted || swapNearlyFull {
+		if (swapExhausted || swapNearlyFull) && !hasRequiredFreeMemory {
 			severity = SeverityBlock
 		}
 	case MemoryPressureNormal:
@@ -228,18 +229,23 @@ func memoryFinding(snapshot Snapshot) (Finding, bool) {
 		}
 	default:
 		if swapExhausted {
-			severity = SeverityBlock
+			severity = SeverityWarn
+			if !hasRequiredFreeMemory {
+				severity = SeverityBlock
+			}
 		}
 	}
 	if severity == 0 {
 		return Finding{}, false
 	}
-	return Finding{Severity: severity, Detail: memoryDetail(snapshot), Remedy: memoryRemedy}, true
+	headroomDecidesSeverity := (snapshot.MemoryPressure == MemoryPressureWarning && (swapExhausted || swapNearlyFull)) ||
+		(snapshot.MemoryPressure == MemoryPressureUnknown && swapExhausted)
+	return Finding{Severity: severity, Detail: memoryDetail(snapshot, requiredFreeMiB, headroomDecidesSeverity), Remedy: memoryRemedy}, true
 }
 
 // memoryDetail states the condition with every number the gate measured, so an
 // operator can check the same readings by hand.
-func memoryDetail(snapshot Snapshot) string {
+func memoryDetail(snapshot Snapshot, requiredFreeMiB int, includeHeadroom bool) string {
 	pressureClause := "memory pressure could not be measured"
 	if snapshot.MemoryPressure != MemoryPressureUnknown {
 		pressureClause = fmt.Sprintf("memory pressure is %s", snapshot.MemoryPressure)
@@ -252,6 +258,13 @@ func memoryDetail(snapshot Snapshot) string {
 		percentUsed(snapshot.Swap), gib(snapshot.Swap.usedBytes()),
 		gib(snapshot.Swap.TotalBytes), gib(snapshot.Swap.AvailableBytes),
 	)
+	if includeHeadroom {
+		if snapshot.FreeMemoryMiB > 0 {
+			usage += fmt.Sprintf(" with %d MiB free memory against %d MiB required", snapshot.FreeMemoryMiB, requiredFreeMiB)
+		} else {
+			usage += fmt.Sprintf(" with free memory unmeasured against %d MiB required", requiredFreeMiB)
+		}
+	}
 	switch snapshot.MemoryPressure {
 	case MemoryPressureNormal:
 		return usage + " while memory pressure is normal; macOS keeps swap allocated after pressure clears," +

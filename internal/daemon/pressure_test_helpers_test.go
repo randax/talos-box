@@ -17,3 +17,9 @@ func noHostPressure(string) (hostpressure.Snapshot, error) {
 func plentifulHostMemory() (int, error) {
 	return 1 << 20, nil
 }
+
+// scarceHostMemory keeps swap-refusal fixtures on the low-headroom side of
+// #483's rule without consulting the machine running the test.
+func scarceHostMemory() (int, error) {
+	return 1024, nil
+}

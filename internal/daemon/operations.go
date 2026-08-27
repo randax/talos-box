@@ -518,7 +518,11 @@ func (s *Server) createCluster(raw json.RawMessage, progress stageFunc) (Cluster
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return ClusterSummary{}, fmt.Errorf("inspect cluster directory: %w", err)
 	}
-	hostPressureWarnings, err := s.checkHostPressure(dir, args.Force)
+	// Charge the steady-state pressure verdict for the same guests the
+	// provision-start gate is about to admit: stale swap is safe only when free
+	// RAM covers both this allocation and the balloon reserve (#483).
+	addMiB := controlPlanes*roleMemoryMiB(args.ControlPlane, args.Node) + workers*roleMemoryMiB(args.Worker, args.Node)
+	hostPressureWarnings, err := s.checkHostPressure(dir, addMiB, args.Force)
 	if err != nil {
 		return ClusterSummary{}, err
 	}
@@ -528,7 +532,6 @@ func (s *Server) createCluster(raw json.RawMessage, progress stageFunc) (Cluster
 	// One gate, one arithmetic: charge each role what it will actually be
 	// created with, so a create admits exactly the clusters a later
 	// `cluster start` can reassemble (#398).
-	addMiB := controlPlanes*roleMemoryMiB(args.ControlPlane, args.Node) + workers*roleMemoryMiB(args.Worker, args.Node)
 	overcommitWarning, err := s.checkOvercommit(addMiB, args.Force)
 	if err != nil {
 		return ClusterSummary{}, err
@@ -686,7 +689,8 @@ func (s *Server) startCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if err != nil {
 		return ClusterSummary{}, err
 	}
-	hostPressureWarnings, err := s.checkHostPressure(dir, args.Force)
+	bootingMiB := s.stoppedNodeMemoryMiB(item)
+	hostPressureWarnings, err := s.checkHostPressure(dir, bootingMiB, args.Force)
 	if err != nil {
 		return ClusterSummary{}, err
 	}
@@ -696,7 +700,7 @@ func (s *Server) startCluster(raw json.RawMessage) (ClusterSummary, error) {
 	// which start also boots the stopped half of — is gated too, and the
 	// members already running are not counted twice.
 	preBalloonedMiB := 0
-	if bootingMiB := s.stoppedNodeMemoryMiB(item); bootingMiB > 0 {
+	if bootingMiB > 0 {
 		provisionStartWarnings, held, err := s.checkProvisionStart(dir, bootingMiB, args.Force)
 		if err != nil {
 			return ClusterSummary{}, err
@@ -1277,11 +1281,15 @@ func (s *Server) addNodeLocked(raw json.RawMessage, progress stageFunc) (NodeSta
 	if err != nil {
 		return NodeStatus{}, nil, err
 	}
-	hostPressureWarnings, err := s.checkHostPressure(dir, args.Force)
+	running := s.clusterRunning(item.Name)
+	incomingMiB := 0
+	if running {
+		incomingMiB = addMiB
+	}
+	hostPressureWarnings, err := s.checkHostPressure(dir, incomingMiB, args.Force)
 	if err != nil {
 		return NodeStatus{}, nil, err
 	}
-	running := s.clusterRunning(item.Name)
 	preBalloonedMiB := 0
 	if running {
 		// A node added to a running cluster boots immediately, which is the

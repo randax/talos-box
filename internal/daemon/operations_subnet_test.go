@@ -79,7 +79,8 @@ func TestStartClusterRefusesExtremeHostPressure(t *testing.T) {
 		t.Fatal(err)
 	}
 	service := &Server{
-		vms: make(map[string]map[string]hypervisor.Machine),
+		vms:            make(map[string]map[string]hypervisor.Machine),
+		hostFreeMemory: scarceHostMemory,
 		hostPressure: func(string) (hostpressure.Snapshot, error) {
 			return hostpressure.Snapshot{
 				Swap: hostpressure.Usage{TotalBytes: 10 << 30, AvailableBytes: 1 << 30},

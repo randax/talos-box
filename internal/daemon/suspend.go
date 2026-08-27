@@ -99,7 +99,8 @@ func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if err != nil {
 		return ClusterSummary{}, err
 	}
-	pressureWarnings, err := s.checkHostPressure(dir, args.Force)
+	bootingMiB := s.stoppedNodeMemoryMiB(item)
+	pressureWarnings, err := s.checkHostPressure(dir, bootingMiB, args.Force)
 	if err != nil {
 		return ClusterSummary{}, err
 	}
@@ -107,7 +108,7 @@ func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
 	// guests are already resident, which is the concurrent bringup the
 	// projected-start gate exists for (#334).
 	preBalloonedMiB := 0
-	if bootingMiB := s.stoppedNodeMemoryMiB(item); bootingMiB > 0 {
+	if bootingMiB > 0 {
 		provisionStartWarnings, held, err := s.checkProvisionStart(dir, bootingMiB, args.Force)
 		if err != nil {
 			return ClusterSummary{}, err

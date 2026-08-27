@@ -11,7 +11,7 @@ func TestAssessDescribesExtremeHostPressure(t *testing.T) {
 		DataVolume: Usage{TotalBytes: 1_000 << 30, AvailableBytes: 30 << 30},
 	}
 
-	findings := Assess(snapshot)
+	findings := Assess(snapshot, 4096)
 	if len(findings) != 2 {
 		t.Fatalf("Assess() = %v, want swap and data-volume findings", findings)
 	}
@@ -31,6 +31,7 @@ func TestAssessDescribesExtremeHostPressure(t *testing.T) {
 // tbx doctor, so severity is the contract that keeps them in agreement:
 // SeverityBlock is exactly what create refuses on.
 func TestAssessSeverityTracksMemoryPressure(t *testing.T) {
+	const requiredFreeMiB = 4096
 	stickySwap := Usage{TotalBytes: 18 << 30, AvailableBytes: 1 << 30} // 94% used
 
 	tests := []struct {
@@ -49,20 +50,40 @@ func TestAssessSeverityTracksMemoryPressure(t *testing.T) {
 			want:         []string{"swap is 94% used", "memory pressure is normal"},
 		},
 		{
-			name:         "full swap with elevated pressure blocks",
-			snapshot:     Snapshot{Swap: stickySwap, MemoryPressure: MemoryPressureWarning},
-			wantSeverity: SeverityBlock,
-			want:         []string{"swap is 94% used", "memory pressure is warning"},
+			name: "full swap with elevated pressure and enough free memory warns",
+			snapshot: Snapshot{
+				Swap: stickySwap, MemoryPressure: MemoryPressureWarning,
+				FreeMemoryMiB: 12 << 10,
+			},
+			wantSeverity: SeverityWarn,
+			want:         []string{"swap is 94% used", "memory pressure is warning", "12288 MiB free memory", "4096 MiB required"},
 		},
 		{
-			name:         "full swap with unknown pressure keeps the conservative block",
+			name: "full swap with elevated pressure and low free memory blocks",
+			snapshot: Snapshot{
+				Swap: stickySwap, MemoryPressure: MemoryPressureWarning,
+				FreeMemoryMiB: 1 << 10,
+			},
+			wantSeverity: SeverityBlock,
+			want:         []string{"swap is 94% used", "memory pressure is warning", "1024 MiB free memory", "4096 MiB required"},
+		},
+		{
+			name: "full swap with unknown pressure and enough free memory warns",
+			snapshot: Snapshot{
+				Swap: stickySwap, FreeMemoryMiB: 12 << 10,
+			},
+			wantSeverity: SeverityWarn,
+			want:         []string{"swap is 94% used", "memory pressure could not be measured", "12288 MiB free memory", "4096 MiB required"},
+		},
+		{
+			name:         "full swap with unknown pressure and unmeasured free memory blocks",
 			snapshot:     Snapshot{Swap: stickySwap},
 			wantSeverity: SeverityBlock,
 			want:         []string{"swap is 94% used", "memory pressure could not be measured"},
 		},
 		{
-			name:         "critical pressure blocks on its own",
-			snapshot:     Snapshot{MemoryPressure: MemoryPressureCritical},
+			name:         "critical pressure blocks despite abundant free memory",
+			snapshot:     Snapshot{MemoryPressure: MemoryPressureCritical, FreeMemoryMiB: 12 << 10},
 			wantSeverity: SeverityBlock,
 			want:         []string{"memory pressure is critical"},
 		},
@@ -73,7 +94,7 @@ func TestAssessSeverityTracksMemoryPressure(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			findings := Assess(test.snapshot)
+			findings := Assess(test.snapshot, requiredFreeMiB)
 			if len(test.want) == 0 {
 				if len(findings) != 0 {
 					t.Fatalf("Assess() = %v, want none", findings)
@@ -105,11 +126,11 @@ func TestAssessSwapSeverityIsMonotonicWithinAPressureLevel(t *testing.T) {
 		worse := Assess(Snapshot{
 			Swap:           Usage{TotalBytes: 100 << 30, AvailableBytes: 4 << 30}, // 96%
 			MemoryPressure: pressure,
-		})
+		}, 4096)
 		better := Assess(Snapshot{
 			Swap:           Usage{TotalBytes: 100 << 30, AvailableBytes: 9 << 30}, // 91%
 			MemoryPressure: pressure,
-		})
+		}, 4096)
 		if maxSeverity(worse) < maxSeverity(better) {
 			t.Errorf("pressure %v: 96%% swap severity %v is milder than 91%% swap severity %v",
 				pressure, maxSeverity(worse), maxSeverity(better))
@@ -127,7 +148,7 @@ func TestAssessReportsElevatedMemoryPressureBelowTheSwapThreshold(t *testing.T) 
 		MemoryPressure: MemoryPressureWarning,
 	}
 
-	findings := Assess(snapshot)
+	findings := Assess(snapshot, 4096)
 	if len(findings) != 1 {
 		t.Fatalf("Assess() = %v, want a memory-pressure finding", findings)
 	}
@@ -155,8 +176,11 @@ func TestAssessBlocksOnLowFreeSwapWithElevatedPressure(t *testing.T) {
 		{
 			// 88% used — under the 90% swapExhausted rule, so only the
 			// low-free-swap escalation can produce this Block.
-			name:         "low free swap with warning pressure blocks",
-			snapshot:     Snapshot{Swap: Usage{TotalBytes: 12 << 30, AvailableBytes: 12 << 30 * 12 / 100}, MemoryPressure: MemoryPressureWarning},
+			name: "low free swap with warning pressure blocks",
+			snapshot: Snapshot{
+				Swap:           Usage{TotalBytes: 12 << 30, AvailableBytes: 12 << 30 * 12 / 100},
+				MemoryPressure: MemoryPressureWarning, FreeMemoryMiB: 1024,
+			},
 			wantSeverity: SeverityBlock,
 		},
 		{
@@ -180,7 +204,7 @@ func TestAssessBlocksOnLowFreeSwapWithElevatedPressure(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			findings := Assess(test.snapshot)
+			findings := Assess(test.snapshot, 4096)
 			if len(findings) != 1 {
 				t.Fatalf("Assess() = %v, want exactly one memory finding", findings)
 			}
@@ -206,6 +230,7 @@ func TestAssessFlagsTheQAObservedReadings(t *testing.T) {
 			snapshot: Snapshot{
 				Swap:           Usage{TotalBytes: 11 * bytesPerGiB, AvailableBytes: 11 * bytesPerGiB * 13 / 100},
 				MemoryPressure: MemoryPressureWarning,
+				FreeMemoryMiB:  1024,
 			},
 		},
 		{
@@ -215,12 +240,13 @@ func TestAssessFlagsTheQAObservedReadings(t *testing.T) {
 			snapshot: Snapshot{
 				Swap:           Usage{TotalBytes: 10 * bytesPerGiB, AvailableBytes: 10*bytesPerGiB - 8_750*bytesPerGiB/1000},
 				MemoryPressure: MemoryPressureWarning,
+				FreeMemoryMiB:  1024,
 			},
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			findings := Assess(test.snapshot)
+			findings := Assess(test.snapshot, 4096)
 			if len(findings) == 0 {
 				t.Fatal("Assess() = none, want the reading reported rather than a silent PASS")
 			}
@@ -245,7 +271,7 @@ func TestAssessFindingsCarryRunnableRemedies(t *testing.T) {
 	findings := Assess(Snapshot{
 		Swap:       Usage{TotalBytes: 10 << 30, AvailableBytes: 1 << 30},
 		DataVolume: Usage{TotalBytes: 100 << 30, AvailableBytes: 5 << 30},
-	})
+	}, 4096)
 	if len(findings) != 2 {
 		t.Fatalf("Assess() = %v, want swap and data-volume findings", findings)
 	}
@@ -290,7 +316,7 @@ func TestAssessUsesExtremeThresholds(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := len(Assess(test.snapshot)); got != test.want {
+			if got := len(Assess(test.snapshot, 4096)); got != test.want {
 				t.Fatalf("len(Assess()) = %d, want %d", got, test.want)
 			}
 		})

@@ -201,7 +201,7 @@ func (s *Server) checkOvercommit(addMiB int, force bool) (string, error) {
 	return msg + " (forced — ballooning will reclaim under pressure)", nil
 }
 
-func (s *Server) checkHostPressure(path string, force bool) ([]string, error) {
+func (s *Server) checkHostPressure(path string, incomingMiB int, force bool) ([]string, error) {
 	snapshot, err := s.pressureSnapshot(path)
 	if err != nil {
 		// A platform with no host-pressure probe has not failed a measurement,
@@ -214,10 +214,18 @@ func (s *Server) checkHostPressure(path string, force bool) ([]string, error) {
 		}
 		return []string{fmt.Sprintf("host-pressure probe failed: %v; proceeding without host-pressure protection", err)}, nil
 	}
+	measureFree := s.hostFreeMemory
+	if measureFree == nil {
+		measureFree = measureHostFreeMiB
+	}
+	if measured, err := measureFree(); err == nil {
+		snapshot.FreeMemoryMiB = measured
+	}
+	requiredFreeMiB := balloon.DefaultConfig().ReserveMiB + incomingMiB
 	// hostpressure.Assess is the shared classification: tbx doctor reports the
 	// same blocking findings as FAIL, so the gate and the diagnostic agree.
 	// Findings stay one warning each so the CLI renders them one per line.
-	return applyPressureFindings(hostpressure.Assess(snapshot), force)
+	return applyPressureFindings(hostpressure.Assess(snapshot, requiredFreeMiB), force)
 }
 
 // The host readings a Server falls back to when it was built without its own

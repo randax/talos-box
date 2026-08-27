@@ -61,7 +61,7 @@ func (s *Server) startNodeLocked(raw json.RawMessage, progress stageFunc) (NodeR
 	if err != nil {
 		return NodeRunState{}, nil, err
 	}
-	hostPressureWarnings, err := s.checkHostPressure(dir, args.Force)
+	hostPressureWarnings, err := s.checkHostPressure(dir, item.DefaultsFor(node.Role).MemoryMiB, args.Force)
 	if err != nil {
 		return NodeRunState{}, nil, err
 	}

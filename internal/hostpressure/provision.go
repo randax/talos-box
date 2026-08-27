@@ -113,7 +113,8 @@ type ProvisionStartPlan struct {
 //     which is the actionable path #398 asked for. Only a shortfall the running
 //     guests cannot cover blocks.
 //   - Swap: a host already deep into its swap file cannot absorb the
-//     allocation burst of a second bringup. "Deep" is two readings, not one:
+//     allocation burst of a second bringup unless measured free memory already
+//     covers the balloon reserve plus that allocation. "Deep" is two readings:
 //     the file must be at least provisionStartSwapUsedPercent full *and* the
 //     host must either still be off normal memory pressure or be carrying at
 //     least provisionStartSwapUsedBytes of swapped-out pages while its free
@@ -123,8 +124,8 @@ type ProvisionStartPlan struct {
 //     normal pressure says nothing about capacity, at 2 GiB or at 8 (#231,
 //     #284) — but #334's 7.3 GiB of an 8 GiB file said everything even though
 //     the preflight host-pressure read came back PASS, which is why the
-//     absolute rule exists alongside the pressure one. An unmeasurable pressure
-//     reading counts as not-normal, the same way memoryFinding treats it.
+//     absolute rule exists alongside the pressure one. Critical pressure never
+//     disarms; unmeasurable pressure or free memory keeps the conservative rule.
 //
 // Both rules apply only while guests are already running, which is deliberate.
 // A lone cluster on an otherwise idle host is the case the balloon reserve and
@@ -204,6 +205,15 @@ func reclaimShortfallClause(in ProvisionStart) string {
 // enough to be a bringup hazard on its own.
 func swapBlocksProvisionStart(in ProvisionStart) bool {
 	if in.Swap.TotalBytes == 0 || percentUsed(in.Swap) < provisionStartSwapUsedPercent {
+		return false
+	}
+	if in.MemoryPressure == MemoryPressureCritical {
+		return true
+	}
+	// macOS keeps swap allocated after pressure clears. When present free RAM
+	// already covers both the reserve and this bringup, the old swap allocation
+	// is not evidence that the incoming guests have nowhere to go (#483).
+	if in.HostFreeMiB > 0 && in.HostFreeMiB >= in.ReserveMiB+in.NewVMMiB {
 		return false
 	}
 	if in.MemoryPressure != MemoryPressureNormal {
