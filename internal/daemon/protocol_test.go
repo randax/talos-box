@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"net"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestProtocolRoundTrip(t *testing.T) {
@@ -50,6 +52,40 @@ func TestProtocolRoundTrip(t *testing.T) {
 				t.Fatalf("round trip = %#v, want %#v", got, test.value)
 			}
 		})
+	}
+}
+
+func TestNodeStatusServiceFieldsRoundTripJSON(t *testing.T) {
+	t.Parallel()
+	since := time.Date(2026, 8, 28, 9, 38, 0, 0, time.UTC)
+	want := NodeStatus{
+		Name:            "demo-worker-1",
+		Services:        []NodeService{{Name: "kubelet", State: "Preparing", Health: ServiceHealthStarting, Since: &since, Message: "pulling", Restarts: 2}},
+		StalledServices: []StalledService{{Service: "kubelet", State: "Preparing", Since: since}},
+		ServiceProbe:    &ServiceProbe{Status: ServiceProbeSucceeded, Source: "/tmp/talosconfig"},
+	}
+	encoded, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{`"services"`, `"stalledServices"`, `"serviceProbe"`, `"since":"2026-08-28T09:38:00Z"`} {
+		if !strings.Contains(string(encoded), field) {
+			t.Fatalf("node JSON missing %s: %s", field, encoded)
+		}
+	}
+	var got NodeStatus
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("node round trip = %+v, want %+v", got, want)
+	}
+}
+
+func TestProtocolVersionIncludesTalosServiceState(t *testing.T) {
+	t.Parallel()
+	if ProtocolVersion != 16 {
+		t.Fatalf("ProtocolVersion = %d, want 16 for additive service fields", ProtocolVersion)
 	}
 }
 
