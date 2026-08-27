@@ -41,7 +41,7 @@ type hostNetworkingClient interface {
 func configureHostNetworking() {
 	client, err := helper.Connect()
 	if err != nil {
-		log.Printf("network helper unavailable; run sudo tbx system install: %v", err)
+		log.Printf("network helper unavailable; %s: %v", helper.UnavailableAdvice(), err)
 		return
 	}
 	defer func() { _ = client.Close() }()

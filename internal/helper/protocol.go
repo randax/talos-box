@@ -138,3 +138,21 @@ func success(data any) Response {
 func failure(err error) Response {
 	return Response{OK: false, Error: err.Error()}
 }
+
+// UnavailableAdvice is what to tell an operator whose helper cannot be reached
+// at all — a different failure from a stale helper, which protocolMismatch-
+// Advice covers. Every caller shares this so no platform ever reads another
+// platform's remediation: on Linux the helper is a packaged systemd socket
+// unit gated on the `tbx` group, and `tbx system install` (which installs the
+// macOS launchd helper) must never be printed there (#468).
+func UnavailableAdvice() string {
+	return unavailableAdviceForGOOS(runtime.GOOS)
+}
+
+func unavailableAdviceForGOOS(goos string) string {
+	if goos == "linux" {
+		return "enable the helper: `sudo systemctl enable --now tbx-helper.socket` " +
+			"and add your user to the `tbx` group (docs/linux.md)"
+	}
+	return "run `sudo tbx system install`"
+}

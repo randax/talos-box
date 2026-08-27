@@ -883,7 +883,7 @@ func guestAgentSocketPath(item cluster.Cluster, dir string, node cluster.Node) s
 }
 
 func helperInstallError(err error) error {
-	return fmt.Errorf("network helper unavailable; run `sudo tbx system install`: %w", err)
+	return fmt.Errorf("network helper unavailable; %s: %w", helper.UnavailableAdvice(), err)
 }
 
 // requireHelper checks the network helper is reachable; the injected
