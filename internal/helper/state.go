@@ -151,15 +151,32 @@ func (s *State) Replace(owner uint32, in []SyncedCluster) error {
 	return nil
 }
 
+// Partition returns one owner's reservations as last pushed, so a failed
+// convergence can hand them back.
+func (s *State) Partition(owner uint32) []SyncedCluster {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return slices.Clone(s.partitions[owner])
+}
+
 // unionClusters validates every owner's partition alone, then all of them as
 // one reservation table: two users cannot both hand out an IP or a MAC.
 func unionClusters(partitions map[uint32][]SyncedCluster) ([]cluster.Cluster, error) {
 	owners := slices.Sorted(maps.Keys(partitions))
 	var union []cluster.Cluster
+	claimed := make(map[string]uint32)
 	for _, owner := range owners {
 		clusters, err := syncedClusters(partitions[owner])
 		if err != nil {
 			return nil, fmt.Errorf("uid %d: %w", owner, err)
+		}
+		// Attachments, taps and BGP speakers are addressed by cluster name,
+		// so one name cannot stand for two users' clusters at once.
+		for _, item := range clusters {
+			if previous, taken := claimed[item.Name]; taken && previous != owner {
+				return nil, fmt.Errorf("cluster name %q is used by both uid %d and uid %d", item.Name, previous, owner)
+			}
+			claimed[item.Name] = owner
 		}
 		union = append(union, clusters...)
 	}

@@ -225,3 +225,24 @@ func TestHelperStateRejectsACrossOwnerCollision(t *testing.T) {
 		t.Fatalf("clusters after rejected sync = %+v, want alice's alone", got)
 	}
 }
+
+// One name, one owner: attachments and speakers are addressed by cluster
+// name, so a second user cannot sync a cluster under a name the first holds.
+func TestHelperStateRefusesTheSameClusterNameUnderTwoOwners(t *testing.T) {
+	t.Parallel()
+
+	state := NewState("")
+	alice := []SyncedCluster{{Name: "demo", SubnetIndex: 0, Nodes: []SyncedNode{{Name: "demo-cp-1", MAC: "52:54:00:00:00:01", IP: "172.30.0.11"}}}}
+	bob := []SyncedCluster{{Name: "demo", SubnetIndex: 4, Nodes: []SyncedNode{{Name: "demo-cp-1", MAC: "52:54:00:00:04:01", IP: "172.30.4.11"}}}}
+	if err := state.Replace(1000, alice); err != nil {
+		t.Fatal(err)
+	}
+	err := state.Replace(1001, bob)
+	if err == nil || !strings.Contains(err.Error(), `cluster name "demo"`) {
+		t.Fatalf("Replace() error = %v, want the name refused", err)
+	}
+	// The same owner re-pushing the same name is, of course, fine.
+	if err := state.Replace(1000, alice); err != nil {
+		t.Fatal(err)
+	}
+}

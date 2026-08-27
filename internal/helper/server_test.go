@@ -207,7 +207,7 @@ func TestAttachConvergesDHCPForASubnetTheSyncedStateDoesNotCover(t *testing.T) {
 	}
 	t.Cleanup(func() { startInterface = originalStart })
 
-	if _, _, _, err := server.attach(json.RawMessage(`{"cluster":"demo","subnetIndex":5,"node":"cp-1"}`)); err != nil {
+	if _, _, _, err := server.attach(0, json.RawMessage(`{"cluster":"demo","subnetIndex":5,"node":"cp-1"}`)); err != nil {
 		t.Fatal(err)
 	}
 	if len(manager.converged) != 1 {
@@ -298,5 +298,82 @@ func TestSyncFromTwoPeersConvergesOverBothPartitions(t *testing.T) {
 	last := manager.converged[len(manager.converged)-1]
 	if len(last) != 2 || last[0] != 2 || last[1] != 9 {
 		t.Fatalf("DHCP converge after both synced = %v, want [2 9]", last)
+	}
+}
+
+// Two users may each run a cluster called "demo": their attachments are
+// addressed by peer uid, so one cannot block or release the other's.
+func TestAttachmentsFromTwoPeersWithTheSameNamesStayApart(t *testing.T) {
+	server := NewServer(nil, nil)
+	server.dhcp = &recordingDHCPManager{subnets: server.attachedSubnetIndexes}
+	stops := make(map[int]int)
+	next := 50
+	originalStart := startInterface
+	startInterface = func([]int, int, string, string) (*platformAttachment, error) {
+		next++
+		fd := next
+		return testPlatformAttachment(fd, func(int) error { stops[fd]++; return nil }), nil
+	}
+	t.Cleanup(func() { startInterface = originalStart })
+
+	args := json.RawMessage(`{"cluster":"demo","subnetIndex":2,"node":"demo-cp-1"}`)
+	if _, fd, _, err := server.attach(1000, args); err != nil || fd != 51 {
+		t.Fatalf("alice attach = fd %d, %v", fd, err)
+	}
+	if _, fd, _, err := server.attach(1001, args); err != nil || fd != 52 {
+		t.Fatalf("bob attach = fd %d, %v; want an independent attachment", fd, err)
+	}
+	if err := server.detach(1000, json.RawMessage(`{"cluster":"demo","node":"demo-cp-1"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if stops[51] != 1 || stops[52] != 0 {
+		t.Fatalf("stops after alice detached = %v, want only her fd 51 closed", stops)
+	}
+	if _, ok := server.attachments[attachmentKey{owner: 1001, cluster: "demo", node: "demo-cp-1"}]; !ok {
+		t.Fatal("bob's attachment vanished with alice's detach")
+	}
+}
+
+// A push the host cannot converge is rolled back: the owner's previous
+// partition is restored and converged again, so helper and daemon both stand
+// at the last committed set.
+func TestSyncRestoresThePreviousPartitionWhenConvergenceFails(t *testing.T) {
+	state := NewState(t.TempDir())
+	server := NewServer(state, nil)
+	manager := &recordingDHCPManager{subnets: server.desiredSubnetIndexes}
+	server.dhcp = manager
+	failNext := false
+	originalConverge := convergeHostNetworking
+	convergeHostNetworking = func([]int) error {
+		if failNext {
+			failNext = false
+			return errors.New("nft: table busy")
+		}
+		return nil
+	}
+	t.Cleanup(func() { convergeHostNetworking = originalConverge })
+
+	committed := json.RawMessage(`{"clusters":[{"name":"demo","subnetIndex":3,"nodes":[{"name":"demo-cp-1","mac":"52:54:00:00:03:01","ip":"172.30.3.11"}]}]}`)
+	if reply := server.dispatchFrom(1000, Request{Op: "net.sync", Args: committed}); !reply.response.OK {
+		t.Fatalf("committed sync = %+v", reply.response)
+	}
+	proposed := json.RawMessage(`{"clusters":[{"name":"demo","subnetIndex":3,"nodes":[{"name":"demo-cp-1","mac":"52:54:00:00:03:01","ip":"172.30.3.11"},{"name":"demo-worker-1","mac":"52:54:00:00:03:02","ip":"172.30.3.12"}]}]}`)
+	failNext = true
+	reply := server.dispatchFrom(1000, Request{Op: "net.sync", Args: proposed})
+	if reply.response.OK || !strings.Contains(reply.response.Error, "table busy") {
+		t.Fatalf("proposed sync = %+v, want the convergence failure", reply.response)
+	}
+	if got := state.Clusters(); len(got) != 1 || len(got[0].Nodes) != 1 {
+		t.Fatalf("clusters after failed sync = %+v, want the committed single-node set", got)
+	}
+	reloaded := NewState(state.path[:len(state.path)-len("/"+reservationsFileName)])
+	if err := reloaded.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.Clusters(); len(got) != 1 || len(got[0].Nodes) != 1 {
+		t.Fatalf("persisted clusters after failed sync = %+v, want the committed set", got)
+	}
+	if n := len(manager.converged); n != 2 {
+		t.Fatalf("DHCP converges = %d, want 2 (committed sync, then the reconverge after rollback)", n)
 	}
 }

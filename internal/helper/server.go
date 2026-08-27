@@ -32,7 +32,11 @@ var (
 	teardownSubnet         = TeardownSubnet
 )
 
+// attachmentKey names one node's attachment. The owner is the attaching
+// peer's uid: two tbx group members may both run a cluster called "demo",
+// and neither may detach or block the other's.
 type attachmentKey struct {
+	owner   uint32
 	cluster string
 	node    string
 }
@@ -353,9 +357,9 @@ func (s *Server) dispatchFrom(uid uint32, request Request) serverReply {
 func (s *Server) handle(uid uint32, request Request) (any, int, func(), error) {
 	switch request.Op {
 	case "net.attach":
-		return s.attach(request.Args)
+		return s.attach(uid, request.Args)
 	case "net.detach":
-		return nil, -1, nil, s.detach(request.Args)
+		return nil, -1, nil, s.detach(uid, request.Args)
 	case "net.teardown":
 		return s.teardownNetwork(request.Args)
 	case "net.sync":
@@ -440,24 +444,39 @@ func (s *Server) sync(owner uint32, raw json.RawMessage) (any, int, func(), erro
 	if err := decodeArgs(raw, &args); err != nil {
 		return nil, -1, nil, err
 	}
+	previous := s.state.Partition(owner)
 	if err := s.state.Replace(owner, args.Clusters); err != nil {
 		return nil, -1, nil, err
 	}
-	if err := convergeHostNetworking(s.desiredSubnetIndexes()); err != nil {
-		if !isSubnetPreflightError(err) {
-			return nil, -1, nil, fmt.Errorf("converge helper networking: %w", err)
+	if err := s.convergeSynced(); err != nil {
+		// The push is a transaction: tbxd commits its record only once the
+		// helper serves the set, so a set the host could not converge must
+		// not stay behind either. Hand back the owner's previous partition
+		// and converge that; the caller sees the original failure.
+		if restoreErr := s.state.Replace(owner, previous); restoreErr != nil {
+			log.Printf("net.sync: restore uid %d reservations after failed convergence: %v", owner, restoreErr)
+		} else if reconvergeErr := s.convergeSynced(); reconvergeErr != nil {
+			log.Printf("net.sync: reconverge after failed convergence: %v", reconvergeErr)
 		}
-		// A captured subnet is that cluster's problem, reported by its own
-		// attach; the sync must not fail the unrelated cluster that sent it.
-		log.Printf("net.sync: %v", err)
-	}
-	if err := s.dhcp.Converge(); err != nil {
 		return nil, -1, nil, err
 	}
 	return struct{}{}, -1, nil, nil
 }
 
-func (s *Server) attach(raw json.RawMessage) (any, int, func(), error) {
+// convergeSynced brings host networking and DHCP to the synced ∪ attached
+// set. A captured subnet's preflight failure is that cluster's problem,
+// reported by its own attach; it must not fail the sync of another cluster.
+func (s *Server) convergeSynced() error {
+	if err := convergeHostNetworking(s.desiredSubnetIndexes()); err != nil {
+		if !isSubnetPreflightError(err) {
+			return fmt.Errorf("converge helper networking: %w", err)
+		}
+		log.Printf("net.sync: %v", err)
+	}
+	return s.dhcp.Converge()
+}
+
+func (s *Server) attach(owner uint32, raw json.RawMessage) (any, int, func(), error) {
 	var args struct {
 		Cluster     string `json:"cluster"`
 		SubnetIndex *int   `json:"subnetIndex"`
@@ -475,7 +494,7 @@ func (s *Server) attach(raw json.RawMessage) (any, int, func(), error) {
 	if *args.SubnetIndex < 0 || *args.SubnetIndex > 255 {
 		return nil, -1, nil, fmt.Errorf("subnet index %d is outside 0..255", *args.SubnetIndex)
 	}
-	key := attachmentKey{cluster: args.Cluster, node: args.Node}
+	key := attachmentKey{owner: owner, cluster: args.Cluster, node: args.Node}
 	if _, exists := s.attachments[key]; exists {
 		return nil, -1, nil, fmt.Errorf("network interface for %s/%s is already attached", args.Cluster, args.Node)
 	}
@@ -574,7 +593,7 @@ func validateBGPCluster(cluster string) error {
 	return nil
 }
 
-func (s *Server) detach(raw json.RawMessage) error {
+func (s *Server) detach(owner uint32, raw json.RawMessage) error {
 	var args struct {
 		Cluster string `json:"cluster"`
 		Node    string `json:"node"`
@@ -585,7 +604,7 @@ func (s *Server) detach(raw json.RawMessage) error {
 	if args.Cluster == "" || args.Node == "" {
 		return errors.New("cluster and node are required")
 	}
-	key := attachmentKey{cluster: args.Cluster, node: args.Node}
+	key := attachmentKey{owner: owner, cluster: args.Cluster, node: args.Node}
 	attachment, ok := s.attachments[key]
 	if !ok {
 		// Idempotent: the descriptor owner may already have released a

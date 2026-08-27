@@ -9,7 +9,7 @@ import (
 
 func TestDetachKeepsAttachmentOnStopFailure(t *testing.T) {
 	server := NewServer(nil, nil)
-	key := attachmentKey{cluster: "demo", node: "cp-1"}
+	key := attachmentKey{owner: 0, cluster: "demo", node: "cp-1"}
 	server.attachments[key] = testPlatformAttachment(42, func(fd int) error {
 		if fd != 42 {
 			t.Fatalf("stop attachment fd = %d, want 42", fd)
@@ -17,7 +17,7 @@ func TestDetachKeepsAttachmentOnStopFailure(t *testing.T) {
 		return wrapVMNetStopError(errors.New("retry later"), true)
 	})
 
-	err := server.detach(json.RawMessage(`{"cluster":"demo","node":"cp-1"}`))
+	err := server.detach(0, json.RawMessage(`{"cluster":"demo","node":"cp-1"}`))
 	if err == nil {
 		t.Fatal("detach() error = nil, want failure")
 	}
@@ -58,7 +58,7 @@ func TestAttachCleanupDropsAttachmentOnRetainedStopFailure(t *testing.T) {
 		startInterface = originalStart
 	})
 
-	_, fd, cleanup, err := server.attach(json.RawMessage(`{"cluster":"demo","subnetIndex":7,"node":"cp-1"}`))
+	_, fd, cleanup, err := server.attach(0, json.RawMessage(`{"cluster":"demo","subnetIndex":7,"node":"cp-1"}`))
 	if err != nil {
 		t.Fatalf("attach() error = %v", err)
 	}
@@ -67,7 +67,7 @@ func TestAttachCleanupDropsAttachmentOnRetainedStopFailure(t *testing.T) {
 	}
 	cleanup()
 
-	key := attachmentKey{cluster: "demo", node: "cp-1"}
+	key := attachmentKey{owner: 0, cluster: "demo", node: "cp-1"}
 	if _, ok := server.attachments[key]; ok {
 		t.Fatal("attachment mapping retained after failed response cleanup")
 	}
@@ -75,7 +75,7 @@ func TestAttachCleanupDropsAttachmentOnRetainedStopFailure(t *testing.T) {
 		t.Fatal("retained stop was not recorded for shutdown retry")
 	}
 
-	_, retryFD, retryCleanup, err := server.attach(json.RawMessage(`{"cluster":"demo","subnetIndex":7,"node":"cp-1"}`))
+	_, retryFD, retryCleanup, err := server.attach(0, json.RawMessage(`{"cluster":"demo","subnetIndex":7,"node":"cp-1"}`))
 	if err != nil {
 		t.Fatalf("retry attach() error = %v", err)
 	}
@@ -110,7 +110,7 @@ func TestAttachRollsBackInterfaceWhenDHCPConvergenceFails(t *testing.T) {
 	}
 	t.Cleanup(func() { startInterface = originalStart })
 
-	_, _, _, err := server.attach(json.RawMessage(`{"cluster":"demo","subnetIndex":7,"node":"cp-1"}`))
+	_, _, _, err := server.attach(0, json.RawMessage(`{"cluster":"demo","subnetIndex":7,"node":"cp-1"}`))
 	if !errors.Is(err, convergeErr) {
 		t.Fatalf("attach() error = %v, want %v", err, convergeErr)
 	}
@@ -124,7 +124,7 @@ func TestAttachRollsBackInterfaceWhenDHCPConvergenceFails(t *testing.T) {
 
 func TestShutdownRetriesRetainedAttachmentStops(t *testing.T) {
 	server := NewServer(nil, nil)
-	key := attachmentKey{cluster: "demo", node: "cp-1"}
+	key := attachmentKey{owner: 0, cluster: "demo", node: "cp-1"}
 	stopCalls := 0
 	server.attachments[key] = testPlatformAttachment(42, func(fd int) error {
 		if fd != 42 {
@@ -184,7 +184,7 @@ func TestShutdownBoundsRetainedStopRetries(t *testing.T) {
 
 func TestDetachDropsAttachmentOnTerminalStopFailure(t *testing.T) {
 	server := NewServer(nil, nil)
-	key := attachmentKey{cluster: "demo", node: "cp-1"}
+	key := attachmentKey{owner: 0, cluster: "demo", node: "cp-1"}
 	server.attachments[key] = testPlatformAttachment(42, func(fd int) error {
 		if fd != 42 {
 			t.Fatalf("stop attachment fd = %d, want 42", fd)
@@ -192,7 +192,7 @@ func TestDetachDropsAttachmentOnTerminalStopFailure(t *testing.T) {
 		return wrapVMNetStopError(errors.New("released"), false)
 	})
 
-	err := server.detach(json.RawMessage(`{"cluster":"demo","node":"cp-1"}`))
+	err := server.detach(0, json.RawMessage(`{"cluster":"demo","node":"cp-1"}`))
 	if err == nil {
 		t.Fatal("detach() error = nil, want failure")
 	}
