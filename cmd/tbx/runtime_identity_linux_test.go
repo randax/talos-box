@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
@@ -37,8 +38,8 @@ func TestLinuxRuntimeIdentitySkipsSocketActivatedDialsWhenInactive(t *testing.T)
 	identity := collectRuntimeIdentity(context.Background(), runtimeIdentityDeps{
 		executable: func() (string, error) { return "/opt/current/tbx", nil },
 		command: fakeRuntimeIdentityCommandOutput(map[string]fakeRuntimeIdentityCommandResult{
-			"systemctl --user is-active tbxd.service": {output: []byte("inactive\n"), err: errors.New("exit status 3")},
-			"systemctl is-active tbx-helper.service":  {output: []byte("inactive\n"), err: errors.New("exit status 3")},
+			"systemctl --user show -p LoadState,ActiveState tbxd.service": {output: []byte("LoadState=loaded\nActiveState=inactive\n")},
+			"systemctl show -p LoadState,ActiveState tbx-helper.service":  {output: []byte("LoadState=loaded\nActiveState=inactive\n")},
 		}),
 		daemonDial: func(context.Context) (daemon.Info, int, error) {
 			daemonDialed = true
@@ -77,8 +78,8 @@ func TestLinuxRuntimeIdentityDialsOnlyActiveSocketActivatedServices(t *testing.T
 	identity := collectRuntimeIdentity(context.Background(), runtimeIdentityDeps{
 		executable: func() (string, error) { return "/opt/current/tbx", nil },
 		command: fakeRuntimeIdentityCommandOutput(map[string]fakeRuntimeIdentityCommandResult{
-			"systemctl --user is-active tbxd.service": {output: []byte("active\n")},
-			"systemctl is-active tbx-helper.service":  {output: []byte("active\n")},
+			"systemctl --user show -p LoadState,ActiveState tbxd.service": {output: []byte("LoadState=loaded\nActiveState=active\n")},
+			"systemctl show -p LoadState,ActiveState tbx-helper.service":  {output: []byte("LoadState=loaded\nActiveState=active\n")},
 		}),
 		daemonDial: func(context.Context) (daemon.Info, int, error) {
 			daemonDialed = true
@@ -98,5 +99,55 @@ func TestLinuxRuntimeIdentityDialsOnlyActiveSocketActivatedServices(t *testing.T
 	}
 	if !identity.Helper.Available || identity.Helper.Path != "/opt/current/tbx-helper" {
 		t.Fatalf("helper identity = %+v", identity.Helper)
+	}
+}
+
+func TestLinuxRuntimeIdentityDialsWhenUnitsAreNotLoadedAndReportsNotInstalled(t *testing.T) {
+	// `systemctl is-active` would print "inactive" for a unit that does not
+	// exist; `show` reports LoadState=not-found, which must fall through to
+	// the dial so an absent helper is "not installed", never "installed,
+	// inactive".
+	var helperDialed bool
+	deps := runtimeIdentityDeps{
+		executable: func() (string, error) { return "/opt/current/tbx", nil },
+		command: fakeRuntimeIdentityCommandOutput(map[string]fakeRuntimeIdentityCommandResult{
+			"systemctl --user show -p LoadState,ActiveState tbxd.service": {output: []byte("LoadState=not-found\nActiveState=inactive\n")},
+			"systemctl show -p LoadState,ActiveState tbx-helper.service":  {output: []byte("LoadState=not-found\nActiveState=inactive\n")},
+			"systemctl cat tbx-helper.service":                            {err: errors.New("No files found for tbx-helper.service.")},
+		}),
+		daemonDial: func(context.Context) (daemon.Info, int, error) {
+			return daemon.Info{}, 0, os.ErrNotExist
+		},
+		helperDial: func(context.Context) (helper.Info, error) {
+			helperDialed = true
+			return helper.Info{}, os.ErrNotExist
+		},
+	}
+	runtimeIdentityPlatformDeps(&deps)
+	identity := collectRuntimeIdentity(context.Background(), deps)
+	if !helperDialed {
+		t.Fatal("helper was not dialed although no unit is loaded")
+	}
+	var output bytes.Buffer
+	if err := renderRuntimeIdentity(&output, identity); err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); !strings.Contains(got, "helper: not installed") || strings.Contains(got, "installed, inactive") {
+		t.Fatalf("runtime output = %q, want helper reported as not installed", got)
+	}
+}
+
+func TestLinuxSystemdServiceActiveDistrustsUnrecognisedReplies(t *testing.T) {
+	for name, result := range map[string]fakeRuntimeIdentityCommandResult{
+		"command failure": {err: errors.New("Failed to connect to bus")},
+		"garbage":         {output: []byte("something unexpected\n")},
+		"not loaded":      {output: []byte("LoadState=not-found\nActiveState=inactive\n")},
+	} {
+		command := fakeRuntimeIdentityCommandOutput(map[string]fakeRuntimeIdentityCommandResult{
+			"systemctl show -p LoadState,ActiveState tbx-helper.service": result,
+		})
+		if _, known := linuxSystemdServiceActive(command, false, runtimeIdentityHelperServiceUnit); known {
+			t.Fatalf("%s: reply was trusted as an authoritative activity state", name)
+		}
 	}
 }

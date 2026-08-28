@@ -4,8 +4,6 @@ package main
 
 import (
 	"context"
-	"errors"
-	"os/exec"
 	"strings"
 
 	"github.com/randax/talos-box/internal/daemon"
@@ -61,31 +59,42 @@ func linuxActivationSafeHelperProbe(command commandOutput, dial func(context.Con
 	}
 }
 
+// linuxSystemdServiceActive answers whether a socket-activated unit's service
+// is running right now. It uses `systemctl show` rather than `is-active`
+// because the latter prints "inactive" (exit 3) for a unit that does not
+// exist at all, which would render an absent helper as "installed, inactive".
+// known is false when the answer cannot be trusted — no systemd, no such
+// unit, or an unrecognised reply — and the caller then dials: with no unit
+// loaded there is nothing a dial could activate.
 func linuxSystemdServiceActive(command commandOutput, user bool, unit string) (active bool, known bool) {
 	if command == nil {
 		return false, false
 	}
-	args := []string{"is-active", unit}
+	args := []string{"show", "-p", "LoadState,ActiveState", unit}
 	if user {
 		args = append([]string{"--user"}, args...)
 	}
 	output, err := command("systemctl", args...)
-	if err == nil {
-		return strings.TrimSpace(string(output)) == "active", true
-	}
-	if errors.Is(err, exec.ErrNotFound) || looksNonSystemdHost(output, err) {
+	if err != nil {
 		return false, false
 	}
-	return strings.TrimSpace(string(output)) == "active", true
-}
-
-func looksNonSystemdHost(output []byte, err error) bool {
-	text := strings.TrimSpace(string(output))
-	if text == "" && err != nil {
-		text = err.Error()
+	properties := map[string]string{}
+	for _, line := range strings.Split(string(output), "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if ok {
+			properties[key] = value
+		}
 	}
-	return strings.Contains(text, "System has not been booted with systemd") ||
-		strings.Contains(text, "Failed to connect to bus")
+	if properties["LoadState"] != "loaded" {
+		return false, false
+	}
+	switch properties["ActiveState"] {
+	case "active":
+		return true, true
+	case "inactive", "activating", "deactivating", "failed", "reloading":
+		return false, true
+	}
+	return false, false
 }
 
 func linuxHelperConfiguredPath(command commandOutput) configuredComponentPath {
