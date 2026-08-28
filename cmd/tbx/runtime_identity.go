@@ -391,11 +391,17 @@ func sameExecutable(left, right string) bool {
 	return filepath.Clean(left) == filepath.Clean(right)
 }
 
+// runtimeIdentityCommand runs the host commands the identity probes need
+// (systemctl on Linux). It is a variable so the package's TestMain can pin it:
+// a test that talks to a fake daemon socket must not have its dial skipped
+// because the CI runner's systemd has no tbxd unit.
+var runtimeIdentityCommand commandOutput = execCombinedOutput
+
 func defaultRuntimeIdentityDeps() runtimeIdentityDeps {
 	return runtimeIdentityDeps{
 		executable: os.Executable,
 		pathEnv:    os.Getenv("PATH"),
-		command:    execCombinedOutput,
+		command:    runtimeIdentityCommand,
 		readFile:   os.ReadFile,
 		daemonDial: func(ctx context.Context) (daemon.Info, int, error) {
 			if err := ctx.Err(); err != nil {
