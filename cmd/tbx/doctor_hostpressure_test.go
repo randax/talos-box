@@ -37,6 +37,7 @@ func TestRunDoctorHostPressurePassPrintsMeasuredNumbers(t *testing.T) {
 		"2.0 GiB of 8.0 GiB swap in use",
 		"400.0 GiB free on the ~/.talosbox volume",
 		fmt.Sprintf("must leave the %d MiB balloon reserve free, so there is room for %d MiB of new guests right now", reserve, 12243-reserve),
+		fmt.Sprintf("(measured with no guests pending: a start larger than %d MiB of new guests will still be refused)", 12243-reserve),
 	} {
 		if !strings.Contains(output.String(), fragment) {
 			t.Errorf("output missing %q:\n%s", fragment, output.String())
@@ -99,5 +100,73 @@ func TestRunDoctorHostPressurePassSaysTheReserveWasAssumed(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "(daemon unreachable; assuming the default reserve)") {
 		t.Errorf("output missing the assumed-reserve caveat:\n%s", output.String())
+	}
+}
+
+func TestRunDoctorClassifiesHighSwapAgainstMeasuredMemoryHeadroom(t *testing.T) {
+	tests := []struct {
+		name         string
+		pressure     hostpressure.MemoryPressure
+		freeMemory   func() (int, error)
+		wantLevel    string
+		wantExitFail bool
+	}{
+		{
+			name:       "roomy stale swap warns",
+			pressure:   hostpressure.MemoryPressureWarning,
+			freeMemory: func() (int, error) { return 12 << 10, nil },
+			wantLevel:  "WARN",
+		},
+		{
+			name:         "low free memory fails",
+			pressure:     hostpressure.MemoryPressureWarning,
+			freeMemory:   func() (int, error) { return 1 << 10, nil },
+			wantLevel:    "FAIL",
+			wantExitFail: true,
+		},
+		{
+			name:         "unmeasured free memory fails",
+			pressure:     hostpressure.MemoryPressureWarning,
+			freeMemory:   func() (int, error) { return 0, errors.New("vm_stat unavailable") },
+			wantLevel:    "FAIL",
+			wantExitFail: true,
+		},
+		{
+			name:         "critical pressure fails despite abundant free memory",
+			pressure:     hostpressure.MemoryPressureCritical,
+			freeMemory:   func() (int, error) { return 12 << 10, nil },
+			wantLevel:    "FAIL",
+			wantExitFail: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			deps := passingDoctorDependencies()
+			deps.hostPressure = func() (hostpressure.Snapshot, error) {
+				return hostpressure.Snapshot{
+					Swap:           hostpressure.Usage{TotalBytes: 10 << 30, AvailableBytes: 1 << 30},
+					MemoryPressure: test.pressure,
+				}, nil
+			}
+			deps.hostFreeMemory = test.freeMemory
+			deps.balloonReserveMiB = func() (int, error) { return 6144, nil }
+
+			var output strings.Builder
+			err := (cli{out: &output}).runDoctorWithDependencies(nil, deps)
+			if test.wantExitFail != (err != nil) {
+				t.Fatalf("runDoctorWithDependencies() error = %v, want failure = %v", err, test.wantExitFail)
+			}
+			want := test.wantLevel + " host-pressure:"
+			if !strings.Contains(output.String(), want) {
+				t.Fatalf("output missing %q:\n%s", want, output.String())
+			}
+			caveat := "(measured with no guests pending: a start larger than 6144 MiB of new guests will still be refused)"
+			if test.wantLevel == "WARN" && !strings.Contains(output.String(), caveat) {
+				t.Fatalf("output missing %q:\n%s", caveat, output.String())
+			}
+			if test.wantLevel == "FAIL" && strings.Contains(output.String(), caveat) {
+				t.Fatalf("blocking output unexpectedly contains %q:\n%s", caveat, output.String())
+			}
+		})
 	}
 }

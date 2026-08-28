@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/randax/talos-box/internal/daemon"
 )
@@ -126,6 +127,23 @@ func printStatus(output io.Writer, clusters []daemon.ClusterStatus, quiet bool) 
 			}
 			if _, err := fmt.Fprintln(output, line); err != nil {
 				return err
+			}
+		}
+	}
+	// A proven stall is a factual Talos observation, so --quiet keeps it. The
+	// pasteable recovery remains a hint below and is suppressed normally.
+	for _, item := range clusters {
+		for _, node := range item.Nodes {
+			for _, stalled := range node.StalledServices {
+				age := time.Since(stalled.Since)
+				if age < 0 {
+					age = 0
+				}
+				if _, err := fmt.Fprintf(output,
+					"cluster %s: node %s service %s %s for %s\n",
+					item.Name, node.Name, stalled.Service, stalled.State, age.Round(time.Second)); err != nil {
+					return err
+				}
 			}
 		}
 	}

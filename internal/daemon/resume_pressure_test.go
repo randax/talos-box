@@ -83,7 +83,7 @@ func TestResumeGatesOnHostPressureWithNoOtherGuestsResident(t *testing.T) {
 				subnetSources:   emptySubnetSources(),
 				hostPressure:    extremeSwapPressure,
 				hostTotalMemory: plentifulHostMemory,
-				hostFreeMemory:  plentifulHostMemory,
+				hostFreeMemory:  scarceHostMemory,
 			}
 
 			raw, err := json.Marshal(startArgs{Name: "napping", Force: test.force})

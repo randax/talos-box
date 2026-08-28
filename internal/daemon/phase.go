@@ -3,16 +3,19 @@ package daemon
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
+	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/shellquote"
@@ -121,50 +124,146 @@ const kubeletService = "kubelet"
 // serviceProbeTimeout bounds one machine-API service query, dial included.
 const serviceProbeTimeout = 3 * time.Second
 
-// probeNodeService observes one Talos service on a configured node. It is a
+// probeNodeServices observes every Talos service on a configured node. It is a
 // package var because the live implementation dials a node's machine API,
 // which no hermetic test may do; tests replace it wholesale.
-var probeNodeService = probeNodeServiceLive
+var probeNodeServices = probeNodeServicesLive
 
-// probeNodeServiceLive asks a node's machine API about one service, using the
-// cluster's own talosconfig. A cluster tbx never provisioned has no
-// credentials, so there is nothing to ask and nothing to report — the second
-// return says "no reading", never "healthy".
-func probeNodeServiceLive(clusterName, ip, service string) (NodeService, bool) {
+// lookupNodeTalosContext is also injectable because its default-path search
+// reads user state outside the cluster directory. The package TestMain pins it
+// even though the fully stubbed service probe normally prevents reaching it.
+var lookupNodeTalosContext = lookupNodeTalosContextLive
+
+// listNodeServices is the authenticated SDK boundary. Keeping context
+// selection and endpoint selection visible in its arguments lets tests prove
+// the exact context's credentials are paired with the observed lease.
+var listNodeServices = listNodeServicesLive
+
+var errTalosContextMissing = errors.New("talos context missing")
+
+// lookupNodeTalosContextLive selects credentials without ever honoring a
+// talosconfig's current context. A merged config may point current at an
+// unrelated cluster, and talosctl may rename conflicts to <name>-1; neither is
+// authority to inspect this cluster.
+func lookupNodeTalosContextLive(clusterName string) (string, *clientconfig.Context, error) {
 	dir, err := cluster.Dir(clusterName)
 	if err != nil {
-		return NodeService{}, false
+		return "", nil, err
 	}
-	talosconfig := filepath.Join(dir, "talosconfig")
-	if info, err := os.Stat(talosconfig); err != nil || !info.Mode().IsRegular() {
-		return NodeService{}, false
+	local := filepath.Join(dir, "talosconfig")
+	if info, statErr := os.Stat(local); statErr == nil {
+		if !info.Mode().IsRegular() {
+			return "", nil, fmt.Errorf("read cluster talosconfig %s: not a regular file", local)
+		}
+		return contextFromTalosconfig(local, clusterName)
+	} else if !os.IsNotExist(statErr) {
+		return "", nil, fmt.Errorf("inspect cluster talosconfig %s: %w", local, statErr)
+	}
+	paths, err := clientconfig.GetDefaultPaths()
+	if err != nil {
+		return "", nil, fmt.Errorf("find default talosconfig: %w", err)
+	}
+	// A default path that exists but lacks the exact context is an expected
+	// per-candidate outcome, not the end of the search: TALOSCONFIG may name
+	// a file merged for another cluster while ~/.talos/config holds this one.
+	// Unreadable, non-regular, or malformed candidates still fail outright —
+	// a broken file is not permission to fall through to unrelated credentials.
+	var searched []string
+	for _, candidate := range paths {
+		info, statErr := os.Stat(candidate.Path)
+		if os.IsNotExist(statErr) {
+			continue
+		}
+		if statErr != nil {
+			return "", nil, fmt.Errorf("inspect talosconfig %s: %w", candidate.Path, statErr)
+		}
+		if !info.Mode().IsRegular() {
+			return "", nil, fmt.Errorf("read talosconfig %s: not a regular file", candidate.Path)
+		}
+		source, ctx, err := contextFromTalosconfig(candidate.Path, clusterName)
+		if err == nil {
+			return source, ctx, nil
+		}
+		if !errors.Is(err, errTalosContextMissing) {
+			return "", nil, err
+		}
+		searched = append(searched, candidate.Path)
+	}
+	if len(searched) > 0 {
+		return "", nil, fmt.Errorf("%w: exact context %q was not found in %s", errTalosContextMissing, clusterName, strings.Join(searched, ", "))
+	}
+	return "", nil, fmt.Errorf("%w: exact context %q was not found", errTalosContextMissing, clusterName)
+}
+
+func contextFromTalosconfig(path, clusterName string) (string, *clientconfig.Context, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", nil, fmt.Errorf("read talosconfig %s: %w", path, err)
+	}
+	config, err := clientconfig.FromBytes(data)
+	if err != nil {
+		return "", nil, fmt.Errorf("parse talosconfig %s: %w", path, err)
+	}
+	ctx := config.Contexts[clusterName]
+	if ctx == nil {
+		return "", nil, fmt.Errorf("%w: exact context %q was not found in %s", errTalosContextMissing, clusterName, path)
+	}
+	return path, ctx, nil
+}
+
+// probeNodeServicesLive asks the machine API once and classifies the returned
+// list. Missing credentials are distinct from a real authenticated probe that
+// failed, because only the former has an actionable merge instruction.
+func probeNodeServicesLive(clusterName, ip string, now time.Time) ([]NodeService, ServiceProbe) {
+	source, configContext, err := lookupNodeTalosContext(clusterName)
+	if err != nil {
+		status := ServiceProbeFailed
+		if errors.Is(err, errTalosContextMissing) {
+			status = ServiceProbeMissingCredentials
+		}
+		return nil, ServiceProbe{Status: status, Error: err.Error()}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), serviceProbeTimeout)
 	defer cancel()
+	response, err := listNodeServices(ctx, configContext, ip)
+	if err != nil {
+		return nil, ServiceProbe{Status: ServiceProbeFailed, Source: source, Error: err.Error()}
+	}
+	var services []NodeService
+	for _, message := range response.GetMessages() {
+		for _, info := range message.GetServices() {
+			services = append(services, classifyService(info.GetId(), observeServiceAt(info, now)))
+		}
+	}
+	sort.Slice(services, func(i, j int) bool { return services[i].Name < services[j].Name })
+	return services, ServiceProbe{Status: ServiceProbeSucceeded, Source: source}
+}
+
+func listNodeServicesLive(ctx context.Context, configContext *clientconfig.Context, ip string) (*machineapi.ServiceListResponse, error) {
 	// The observed endpoint wins over the talosconfig's generated list for the
 	// same reason the provisioning path prefers it: a node can hold a different
 	// lease than the one its config was written from.
 	connection, err := talosclient.New(ctx,
-		talosclient.WithConfigFromFile(talosconfig),
+		talosclient.WithConfigContext(configContext),
 		talosclient.WithDefaultGRPCDialOptions(),
 		talosclient.WithEndpoints(ip),
 	)
 	if err != nil {
-		return NodeService{}, false
+		return nil, err
 	}
 	defer func() { _ = connection.Close() }()
-	services, err := connection.ServiceInfo(talosclient.WithNode(ctx, ip), service)
-	if err != nil || len(services) == 0 {
-		return NodeService{}, false
+	response, err := connection.ServiceList(talosclient.WithNode(ctx, ip))
+	if err != nil {
+		return nil, err
 	}
-	return classifyService(service, observeService(services[0].Service)), true
+	return response, nil
 }
 
 // observeService reduces the machine API's service report to the facts the
 // classification rules read. A failure event's message is preferred over the
 // health verdict's: a kubelet that cannot exec never gets far enough to
 // publish a health message, and the exec error is the diagnosis.
-func observeService(info *machineapi.ServiceInfo) ServiceObservation {
+func observeServiceAt(info *machineapi.ServiceInfo, now time.Time) ServiceObservation {
 	if info == nil {
 		return ServiceObservation{}
 	}
@@ -176,6 +275,14 @@ func observeService(info *machineapi.ServiceInfo) ServiceObservation {
 	}
 	failureMessage := ""
 	for _, event := range info.GetEvents().GetEvents() {
+		if strings.EqualFold(event.GetState(), info.GetState()) {
+			if timestamp := event.GetTs(); timestamp != nil && timestamp.CheckValid() == nil {
+				value := timestamp.AsTime()
+				if !value.After(now) && (observation.Since == nil || value.After(*observation.Since)) {
+					observation.Since = &value
+				}
+			}
+		}
 		if !strings.EqualFold(event.GetState(), serviceStateFailed) {
 			continue
 		}
@@ -217,6 +324,10 @@ type NodeService struct {
 	// Restarts counts the failure events the node still retains for the
 	// service: a service Talos restarts forever accumulates them.
 	Restarts int `json:"restarts,omitempty"`
+	// Since is the newest retained transition into the current state. Missing
+	// means Talos supplied no trustworthy clock, never that the state began at
+	// probe time.
+	Since *time.Time `json:"since,omitempty"`
 }
 
 // CrashLooping reports a service Talos keeps restarting without it ever
@@ -238,6 +349,7 @@ type ServiceObservation struct {
 	HealthUnknown bool
 	Message       string
 	Failures      int
+	Since         *time.Time
 }
 
 const (
@@ -262,6 +374,7 @@ func classifyService(name string, observation ServiceObservation) NodeService {
 		State:    observation.State,
 		Message:  truncateServiceMessage(strings.TrimSpace(observation.Message)),
 		Restarts: observation.Failures,
+		Since:    observation.Since,
 	}
 	running := strings.EqualFold(observation.State, serviceStateRunning)
 	switch {
@@ -333,6 +446,12 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 	}
 
 	var hints []string
+	if missingTalosCredentials(status) {
+		hints = append(hints, fmt.Sprintf(
+			"Talos service state unavailable: configured nodes answer apid, but no talosconfig context %q was found. Run: talosctl config merge <path-to-talosconfig> and ensure `talosctl config contexts` lists exactly %q.",
+			status.Name, status.Name))
+	}
+	hints = append(hints, serviceStallHints(status, now)...)
 	// Capability gates hold whatever the cluster is doing: the config is
 	// accepted and the extension baked, but this host cannot honour it.
 	for _, capability := range status.Capabilities {
@@ -460,6 +579,33 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 	}
 	if hint := stalledNodesHint(status.Name, stalled, now); hint != "" {
 		hints = append(hints, hint)
+	}
+	return hints
+}
+
+func missingTalosCredentials(status ClusterStatus) bool {
+	for _, node := range status.Nodes {
+		if node.ServiceProbe != nil && node.ServiceProbe.Status == ServiceProbeMissingCredentials {
+			return true
+		}
+	}
+	return false
+}
+
+func serviceStallHints(status ClusterStatus, now time.Time) []string {
+	var hints []string
+	clusterName := shellquote.Quote(status.Name)
+	for _, node := range status.Nodes {
+		nodeName := shellquote.Quote(node.Name)
+		for _, stalled := range node.StalledServices {
+			age := now.Sub(stalled.Since)
+			if age < 0 {
+				continue
+			}
+			hints = append(hints, fmt.Sprintf(
+				"%s: %s has remained %s for %s — image pull may be stalled; inspect with: tbx console %s %s; cold-restart with: tbx node stop %s %s && tbx node start %s %s",
+				node.Name, stalled.Service, stalled.State, formatStallDuration(age), clusterName, nodeName, clusterName, nodeName, clusterName, nodeName))
+		}
 	}
 	return hints
 }

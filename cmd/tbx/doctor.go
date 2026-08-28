@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/randax/talos-box/internal/balloon"
 	"github.com/randax/talos-box/internal/cluster"
@@ -19,6 +20,7 @@ import (
 	"github.com/randax/talos-box/internal/helper"
 	"github.com/randax/talos-box/internal/hostpressure"
 	"github.com/randax/talos-box/internal/hypervisor"
+	"github.com/randax/talos-box/internal/shellquote"
 )
 
 type doctorDependencies struct {
@@ -83,6 +85,7 @@ Checks:
   routes              host routes reach the nodes of running clusters
   inter-cluster       running clusters reach each other's ingress VIPs, from the
                       host and from inside a sibling cluster
+  talos-services      service state reported by configured running nodes
   guest-agent         host support for clusters that baked qemu-guest-agent
   mirror-health       registry-mirror listeners match the running clusters
   mirror-offline      whether the registry mirror is serving from cache only
@@ -213,42 +216,54 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		if err := writeFindings(doctorFinding{level: "SKIP", check: "host-pressure", detail: err.Error()}); err != nil {
 			return err
 		}
-	} else if findings := hostpressure.Assess(snapshot); len(findings) == 0 {
-		// A PASS states the three numbers it was decided on — free memory, swap
-		// in use, free space on the ~/.talosbox volume — plus the headroom the
-		// provision-start gate will measure the next bringup against, so the
-		// verdict can be attested without re-running memory_pressure, sysctl and
-		// df by hand, and so a host cannot read PASS here and still be refused a
-		// second cluster without warning (#420, #397).
+	} else {
+		// Free memory and the daemon's reserve are classification inputs, not
+		// PASS-only decoration: enough present RAM is what distinguishes stale
+		// allocated swap from the active swapping that corrupted guests (#483).
 		snapshot.FreeMemoryMiB = doctorFreeMemoryMiB(deps)
 		reserveMiB, fromDaemon := doctorBalloonReserveMiB(deps)
-		detail := snapshot.Summary(reserveMiB)
-		if !fromDaemon {
-			detail += " (daemon unreachable; assuming the default reserve)"
+		findings := hostpressure.Assess(snapshot, reserveMiB)
+		pendingGuestsClause := ""
+		if snapshot.FreeMemoryMiB > 0 {
+			pendingGuestsClause = fmt.Sprintf(" (measured with no guests pending: a start larger than %d MiB of new guests will still be refused)", snapshot.FreeMemoryMiB-reserveMiB)
 		}
-		if err := writeFindings(doctorFinding{
-			level: "PASS", check: "host-pressure", detail: detail,
-		}); err != nil {
-			return err
-		}
-	} else {
-		// Same classification the daemon's start gate uses: a blocking finding
-		// is what makes cluster create refuse, so it fails here too.
-		for _, finding := range findings {
-			level := "WARN"
-			if finding.Severity == hostpressure.SeverityBlock {
-				level = "FAIL"
+		if len(findings) == 0 {
+			// A PASS states the three numbers it was decided on — free memory,
+			// swap, data-volume space — plus the next bringup's headroom.
+			detail := snapshot.Summary(reserveMiB) + pendingGuestsClause
+			if !fromDaemon {
+				detail += " (daemon unreachable; assuming the default reserve)"
 			}
 			if err := writeFindings(doctorFinding{
-				level: level, check: "host-pressure", detail: finding.DoctorDetail(),
+				level: "PASS", check: "host-pressure", detail: detail,
 			}); err != nil {
 				return err
+			}
+		} else {
+			// Same classification the daemon's start gate uses: a blocking
+			// finding is what makes cluster create refuse, so it fails here too.
+			for _, finding := range findings {
+				level := "WARN"
+				if finding.Severity == hostpressure.SeverityBlock {
+					level = "FAIL"
+				}
+				detail := finding.DoctorDetail()
+				if level == "WARN" {
+					detail += pendingGuestsClause
+				}
+				if err := writeFindings(doctorFinding{
+					level: level, check: "host-pressure", detail: detail,
+				}); err != nil {
+					return err
+				}
 			}
 		}
 	}
 
 	clusters, clusterErr := deps.listClusters()
 	anyRunning := false
+	var statuses []daemon.ClusterStatus
+	var statusErr error
 	if isDaemonUnavailable(clusterErr) {
 		detail := daemonUnavailableDetail(clusterErr)
 		if err := writeFindings(
@@ -299,7 +314,7 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 				return err
 			}
 		} else {
-			statuses, statusErr := deps.getStatus()
+			statuses, statusErr = deps.getStatus()
 			routeFinding := doctorFinding{level: "PASS", check: "routes"}
 			var routeProblems []string
 			if statusErr != nil {
@@ -321,6 +336,9 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 				return err
 			}
 		}
+	}
+	if err := writeFindings(talosServicesFindings(statuses, statusErr, clusterErr, time.Now())...); err != nil {
+		return err
 	}
 
 	if err := writeFindings(guestAgentFinding(deps.listConfig, deps.guestAgentSupport)); err != nil {
@@ -346,6 +364,77 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		return errors.New("one or more doctor checks failed")
 	}
 	return nil
+}
+
+func talosServicesFindings(statuses []daemon.ClusterStatus, statusErr, clusterErr error, now time.Time) []doctorFinding {
+	if clusterErr != nil {
+		detail := fmt.Sprintf("list clusters: %v", clusterErr)
+		if isDaemonUnavailable(clusterErr) {
+			detail = daemonUnavailableDetail(clusterErr)
+		}
+		return []doctorFinding{{level: "SKIP", check: "talos-services", detail: detail}}
+	}
+	if statusErr != nil {
+		return []doctorFinding{{level: "WARN", check: "talos-services", detail: fmt.Sprintf("cluster status unavailable: %v", statusErr)}}
+	}
+	configured := 0
+	var findings []doctorFinding
+	for _, status := range statuses {
+		if !status.Running {
+			continue
+		}
+		for _, node := range status.Nodes {
+			if node.Phase != daemon.PhaseConfigured {
+				continue
+			}
+			configured++
+			clusterName := shellquote.Quote(status.Name)
+			nodeName := shellquote.Quote(node.Name)
+			stalledNames := make(map[string]struct{}, len(node.StalledServices))
+			for _, stalled := range node.StalledServices {
+				stalledNames[stalled.Service] = struct{}{}
+				age := now.Sub(stalled.Since)
+				if age < 0 {
+					age = 0
+				}
+				findings = append(findings, doctorFinding{level: "FAIL", check: "talos-services", detail: fmt.Sprintf(
+					"%s/%s %s %s for %s — image pull may be stalled; inspect with: tbx console %s %s; cold-restart with: tbx node stop %s %s && tbx node start %s %s",
+					status.Name, node.Name, stalled.Service, stalled.State, age.Round(time.Second), clusterName, nodeName, clusterName, nodeName, clusterName, nodeName)})
+			}
+			for _, service := range node.Services {
+				if _, alreadyReported := stalledNames[service.Name]; alreadyReported {
+					continue
+				}
+				if !service.Degraded() {
+					continue
+				}
+				detail := fmt.Sprintf("%s/%s %s %s (%s)", status.Name, node.Name, service.Name, service.State, service.Health)
+				if service.Message != "" {
+					detail += ": " + service.Message
+				}
+				findings = append(findings, doctorFinding{level: "FAIL", check: "talos-services", detail: detail})
+			}
+			switch {
+			case node.ServiceProbe == nil:
+				findings = append(findings, doctorFinding{level: "WARN", check: "talos-services", detail: fmt.Sprintf("%s/%s service probe result unavailable", status.Name, node.Name)})
+			case node.ServiceProbe.Status == daemon.ServiceProbeMissingCredentials:
+				findings = append(findings, doctorFinding{level: "WARN", check: "talos-services", detail: fmt.Sprintf("%s/%s Talos credentials missing: exact context %q was not found; run talosctl config merge <path-to-talosconfig>", status.Name, node.Name, status.Name)})
+			case node.ServiceProbe.Status == daemon.ServiceProbeFailed:
+				detail := node.ServiceProbe.Error
+				if detail == "" {
+					detail = "probe failed"
+				}
+				findings = append(findings, doctorFinding{level: "WARN", check: "talos-services", detail: fmt.Sprintf("%s/%s service probe failed: %s", status.Name, node.Name, detail)})
+			}
+		}
+	}
+	if configured == 0 {
+		return []doctorFinding{{level: "SKIP", check: "talos-services", detail: "no configured running nodes"}}
+	}
+	if len(findings) == 0 {
+		return []doctorFinding{{level: "PASS", check: "talos-services", detail: fmt.Sprintf("%d configured node(s) inspected", configured)}}
+	}
+	return findings
 }
 
 // cacheFindings reports the two stores that share the cache root and used to

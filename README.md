@@ -242,11 +242,19 @@ pod offline. `--deep` still catches what a plain `--check` cannot — a blob tha
 whose bytes no longer match its digest — so `--check --deep` remains the pre-travel gate.
 
 `tbx mirror offline` reports whether the pull-through mirror may reach upstream registries;
-`tbx mirror offline on` serves cached content only (uncached content fails), and `off` restores
-normal pull-through behavior. New machine configs use the catch-all mirror at the cluster
-gateway with `skipFallback: true`, so nodes do not bypass that mirror directly.
+`tbx mirror offline on` serves cached public/upstream content only (uncached content fails), and
+`off` restores normal pull-through behavior. New machine configs use the catch-all mirror at the
+cluster gateway with `skipFallback: true`, so public/upstream pulls cannot bypass it. Syntactic
+loopback registries (`localhost`, loopback IPv4, and loopback IPv6, optionally with a port) are
+the deliberate exception: the mirror redirects the request back to that registry inside the
+node, including while mirror-offline mode is on. Transport follows containerd's localhost
+convention: HTTPS with no port or port 443, HTTP otherwise. A TLS registry on a custom loopback
+port is not supported by this passthrough and needs an explicit `machine.registries.mirrors`
+entry. The redirect changes the host, so credentials rely on containerd re-authorizing the
+redirected request, which its `CheckRedirect` does. Hostnames that only resolve to loopback and
+other private registries remain blocked rather than being redirected.
 
-Offline mode persists across a daemon restart and changes how every pull on the host fails, so
+Offline mode persists across a daemon restart and changes how public/upstream pulls fail, so
 while it is on `tbx status` heads its listing with a banner and `tbx doctor` reports it as a
 `WARN mirror-offline` line. Each miss is also logged as
 `mirror offline miss: <ref> (upstream namespace <host>)` in the daemon log, so an

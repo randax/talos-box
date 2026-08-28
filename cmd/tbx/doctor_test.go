@@ -233,6 +233,7 @@ func TestRunDoctorContinuesAfterFailures(t *testing.T) {
 		"FAIL forwarding: broken",
 		"SKIP system-dns: daemon unavailable: connection refused",
 		"SKIP routes: daemon unavailable: connection refused",
+		"SKIP talos-services: daemon unavailable: connection refused",
 		"PASS egress",
 		"INFO security-inventory: no activated system extensions found",
 	} {
@@ -689,7 +690,7 @@ func TestRunDoctorFailsOnBlockingHostPressure(t *testing.T) {
 		t.Fatal("runDoctorWithDependencies() succeeded despite host pressure that blocks cluster create")
 	}
 	for _, line := range []string{
-		"FAIL host-pressure: host swap is 90% used (9.0 GiB of 10.0 GiB, 1.0 GiB free) and memory pressure could not be measured",
+		"FAIL host-pressure: host swap is 90% used (9.0 GiB of 10.0 GiB, 1.0 GiB free) with free memory unmeasured against 6144 MiB required and memory pressure could not be measured",
 		"FAIL host-pressure: talosbox data volume is 95% used (5.0 GiB free)",
 		"`tbx down`",
 		"`tbx cache prune --all`",
@@ -713,6 +714,7 @@ func TestRunDoctorClusterListOperationErrorFailsChecks(t *testing.T) {
 	for _, line := range []string{
 		"FAIL system-dns: list clusters: decode daemon result",
 		"FAIL routes: list clusters: decode daemon result",
+		"SKIP talos-services: list clusters: decode daemon result",
 	} {
 		if !strings.Contains(output.String(), line) {
 			t.Errorf("output missing %q:\n%s", line, output.String())

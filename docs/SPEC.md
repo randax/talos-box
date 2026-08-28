@@ -252,10 +252,21 @@ physical/VPN interfaces and distinct gateways share the fixed ports without conf
 printed machine configs set Talos `machine.registries.mirrors."*"` to a single endpoint
 `http://172.30.<n>.1:5059` with `skipFallback: true`; legacy fixed listeners on `5055–5058`
 remain only so older clusters keep working until they are recreated. Mirror storage lives in
-the cache and doubles as the offline-venue answer. `tbx mirror offline` reports its current
-mode; `tbx mirror offline on` permits cached responses only and rejects cache misses without
-upstream fallback, while `tbx mirror offline off` restores pull-through behavior. Mirror content
-is shared cache state, not cluster state: it survives cluster destruction and recreation.
+the cache and doubles as the offline-venue answer. The catch-all deliberately redirects only
+syntactic loopback authorities (`localhost`, loopback IPv4, or loopback IPv6, optionally with a
+port) back to the same registry path inside the node, removing containerd's `ns` parameter. This
+lets an in-cluster registry such as `localhost:30500` remain direct without weakening the
+mirror-only rule for public registries. The passthrough infers transport from the port, following
+containerd's localhost convention: HTTPS with no port or port 443, HTTP on every other port. A TLS
+registry on a custom loopback port is therefore unsupported by this redirect and needs an explicit
+`machine.registries.mirrors` entry. Because the redirect changes the host, credentials depend on
+containerd re-authorizing the redirected request; its `CheckRedirect` does so. Hostnames which
+merely resolve to loopback, and all other
+private or non-public authorities, remain blocked by the host mirror. `tbx mirror offline`
+reports its current mode; `tbx mirror offline on` permits cached public/upstream responses only
+and rejects cache misses without upstream fallback, while syntactic loopback registries remain
+direct; `tbx mirror offline off` restores pull-through behavior. Mirror content is shared cache
+state, not cluster state: it survives cluster destruction and recreation.
 
 **Reachability contract**: host ↔ node IPs; host ↔ LB VIPs (L2 or BGP); **cluster ↔ cluster**
 (nodes and VIPs) through the host as inter-subnet router — first-class, per owner decision.

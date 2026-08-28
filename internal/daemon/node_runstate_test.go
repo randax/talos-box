@@ -442,6 +442,7 @@ func TestNodeStartRefusesUnderHostPressureWithoutForce(t *testing.T) {
 	stubNodeMutationReconcile(service)
 	delete(service.vms[item.Name], "demo-worker-1")
 	service.hostPressure = extremeSwapPressure
+	service.hostFreeMemory = scarceHostMemory
 
 	response := dispatchNodeRunState(t, service, "node.start", item.Name, "demo-worker-1")
 
@@ -463,6 +464,7 @@ func TestNodeStartUnderHostPressureWithForceWarns(t *testing.T) {
 	stubNodeMutationReconcile(service)
 	delete(service.vms[item.Name], "demo-worker-1")
 	service.hostPressure = extremeSwapPressure
+	service.hostFreeMemory = scarceHostMemory
 
 	raw, err := json.Marshal(nodeArgs{Cluster: item.Name, Name: "demo-worker-1", Force: true})
 	if err != nil {

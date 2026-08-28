@@ -70,7 +70,11 @@ const (
 // additive cluster.destroy response fields: bridgeRemoved, naming the bridge
 // the destroy took down, and bridgeWarning, carrying why one that should have
 // come down did not (#445).
-const ProtocolVersion = 15
+// Version 16 adds the additive per-node services, stalledServices and
+// serviceProbe fields. Kubelet remains as the protocol-v11 compatibility
+// projection, while newer clients can distinguish an empty list from a probe
+// that lacked credentials or failed (#482).
+const ProtocolVersion = 16
 
 // Request is one newline-delimited daemon request.
 type Request struct {

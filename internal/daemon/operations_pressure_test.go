@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/randax/talos-box/internal/balloon"
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/hostpressure"
 	"github.com/randax/talos-box/internal/hypervisor"
@@ -17,7 +18,7 @@ import (
 
 func TestCreateClusterChecksHostPressureBeforeMutation(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	service := &Server{hostPressure: extremeSwapPressure}
+	service := &Server{hostPressure: extremeSwapPressure, hostFreeMemory: scarceHostMemory}
 	raw, err := json.Marshal(createArgs{Name: "unsafe-create"})
 	if err != nil {
 		t.Fatal(err)
@@ -41,12 +42,46 @@ func TestCheckHostPressureAllowsStickySwapWhileMemoryPressureIsNormal(t *testing
 			MemoryPressure: hostpressure.MemoryPressureNormal,
 		}, nil
 	}}
-	warnings, err := service.checkHostPressure(t.TempDir(), false)
+	warnings, err := service.checkHostPressure(t.TempDir(), 0, false)
 	if err != nil {
 		t.Fatalf("checkHostPressure() = %v, want no refusal for sticky swap with normal pressure", err)
 	}
 	if !strings.Contains(strings.Join(warnings, "\n"), "host swap is 90% used") {
 		t.Fatalf("checkHostPressure() warnings = %q, want an advisory sticky-swap warning", warnings)
+	}
+}
+
+func TestCheckHostPressureWeightsFreeMemoryAgainstReserveAndIncomingGuests(t *testing.T) {
+	const incomingMiB = 6144
+	tests := []struct {
+		name     string
+		freeMiB  int
+		wantFail bool
+	}{
+		{name: "roomy host admits stale swap as a warning", freeMiB: 12 << 10},
+		{name: "low free memory keeps the stale-swap refusal", freeMiB: 1 << 10, wantFail: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service := &Server{
+				hostPressure: func(string) (hostpressure.Snapshot, error) {
+					return hostpressure.Snapshot{
+						Swap:           hostpressure.Usage{TotalBytes: 10 << 30, AvailableBytes: 1 << 30},
+						MemoryPressure: hostpressure.MemoryPressureWarning,
+					}, nil
+				},
+				hostFreeMemory: func() (int, error) { return test.freeMiB, nil },
+			}
+
+			warnings, err := service.checkHostPressure(t.TempDir(), incomingMiB, false)
+			if test.wantFail != (err != nil) {
+				t.Fatalf("checkHostPressure() error = %v, want failure = %v (warnings %q)", err, test.wantFail, warnings)
+			}
+			wantHeadroom := fmt.Sprintf("12288 MiB free memory against %d MiB required", balloon.DefaultConfig().ReserveMiB+incomingMiB)
+			if !test.wantFail && !strings.Contains(strings.Join(warnings, "\n"), wantHeadroom) {
+				t.Fatalf("checkHostPressure() warnings = %q, want measured headroom", warnings)
+			}
+		})
 	}
 }
 
@@ -70,13 +105,17 @@ func TestCheckHostPressureRefusesExactlyTheBlockingAssessFindings(t *testing.T) 
 	}
 	for index, snapshot := range snapshots {
 		blocking := false
-		for _, finding := range hostpressure.Assess(snapshot) {
+		snapshot.FreeMemoryMiB = 1 << 20
+		for _, finding := range hostpressure.Assess(snapshot, balloon.DefaultConfig().ReserveMiB) {
 			if finding.Severity == hostpressure.SeverityBlock {
 				blocking = true
 			}
 		}
-		service := &Server{hostPressure: func(string) (hostpressure.Snapshot, error) { return snapshot, nil }}
-		_, err := service.checkHostPressure(t.TempDir(), false)
+		service := &Server{
+			hostPressure:   func(string) (hostpressure.Snapshot, error) { return snapshot, nil },
+			hostFreeMemory: plentifulHostMemory,
+		}
+		_, err := service.checkHostPressure(t.TempDir(), 0, false)
 		if blocking != (err != nil) {
 			t.Errorf("snapshot %d: checkHostPressure() error = %v, want blocking = %v", index, err, blocking)
 		}
@@ -153,8 +192,9 @@ func TestAddNodeChecksHostPressureBeforeMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	service := &Server{
-		vms:          make(map[string]map[string]hypervisor.Machine),
-		hostPressure: extremeSwapPressure,
+		vms:            make(map[string]map[string]hypervisor.Machine),
+		hostPressure:   extremeSwapPressure,
+		hostFreeMemory: scarceHostMemory,
 	}
 	raw, err := json.Marshal(nodeArgs{Cluster: item.Name, Name: "unsafe-worker", Role: cluster.RoleWorker})
 	if err != nil {
@@ -224,7 +264,7 @@ func TestCheckHostPressureForcedRendersEachBlockingFindingSeparately(t *testing.
 			DataVolume:     hostpressure.Usage{TotalBytes: 100 << 30, AvailableBytes: 1 << 30},
 		}, nil
 	}}
-	warnings, err := service.checkHostPressure(t.TempDir(), true)
+	warnings, err := service.checkHostPressure(t.TempDir(), 0, true)
 	if err != nil {
 		t.Fatalf("checkHostPressure(force) = %v, want forced warnings", err)
 	}
@@ -253,7 +293,7 @@ func TestCheckHostPressureStandsDownSilentlyWhenTheProbeIsUnsupported(t *testing
 	} {
 		t.Run(name, func(t *testing.T) {
 			service := &Server{hostPressure: probe}
-			warnings, err := service.checkHostPressure(t.TempDir(), false)
+			warnings, err := service.checkHostPressure(t.TempDir(), 0, false)
 			if err != nil {
 				t.Fatalf("checkHostPressure() = %v, want no refusal for a missing capability", err)
 			}
@@ -270,7 +310,7 @@ func TestCheckHostPressureStillWarnsOnARealProbeFailure(t *testing.T) {
 	service := &Server{hostPressure: func(string) (hostpressure.Snapshot, error) {
 		return hostpressure.Snapshot{}, errors.New("statfs unavailable")
 	}}
-	warnings, err := service.checkHostPressure(t.TempDir(), false)
+	warnings, err := service.checkHostPressure(t.TempDir(), 0, false)
 	if err != nil {
 		t.Fatalf("checkHostPressure() = %v, want no refusal", err)
 	}

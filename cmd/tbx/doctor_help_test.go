@@ -36,6 +36,7 @@ func TestDoctorHelpDescribesChecksAndExitCodes(t *testing.T) {
 				// every portable check name is listed
 				"helper", "resolver", "DNS", "forwarding", "host-pressure",
 				"system-dns", "routes", "inter-cluster", "guest-agent",
+				"talos-services",
 				"mirror-health", "mirror-offline", "image-cache", "egress",
 				"security-inventory",
 			}
