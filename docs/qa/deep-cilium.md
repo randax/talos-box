@@ -4,7 +4,7 @@
 |---|---|
 | **Tier** | Deep (one feature area exercised against defaults) |
 | **Platform** | macOS + Linux (platform-specific charters marked) |
-| **Estimated duration** | 45–60 min |
+| **Estimated duration** | 75–90 min (includes the 30-minute steady-state blackout baseline) |
 | **Destructive** | Creates and destroys clusters `qa-cil` and `qa-hub`; does not touch other clusters or host config |
 | **Runbook version** | against talos-box main @ the commit recorded in your report |
 
@@ -91,6 +91,37 @@ Expected observations:
 Pass criteria: VIP reachable again within 90 s (macOS) / 15 s (Linux).
 
 On failure: capture timing log and `kubectl -n kube-system get leases`.
+
+#### VIP blackout investigation (#484)
+
+Run a 30-minute steady-state baseline **before** any deliberate Cilium-pod deletion. Keep three
+timestamped streams: a fast probe loop that records HTTP status (including `000`), a watch of the
+L2-announcement lease holder and `renewTime`, and Cilium logs containing leader-election lines.
+For example, run these concurrently and retain their raw output:
+
+```sh
+while true; do code="$(curl -sS -o /dev/null --max-time 1 -w '%{http_code}' http://<subnet>.200/ || true)"; printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${code:-000}"; sleep 0.2; done
+kubectl -n kube-system get leases -w -o yaml
+kubectl -n kube-system logs -l k8s-app=cilium --prefix --timestamps -f
+```
+
+Use `tcpdump` for ARP only when it is available and the extra capture is needed; it is optional.
+Count a blackout only with at least two consecutive failed/`000`/non-200 samples or at least one
+second of failure. Treat a lone sample as curl/host scheduling noise unless ARP and Kubernetes
+evidence agrees.
+
+- **Curated reproduces:** any qualifying blackout while the Service still has `.200`, endpoints
+  remain Ready, and Cilium pods do not restart. talos-box owns the follow-up. Correlate the start
+  within ±5 seconds of lease holder/`renewTime` changes and Cilium leader-election log lines. ARP
+  requests without replies with a stable holder point toward vmnet/L2 delivery; holder churn or
+  stalled renewals point toward Cilium/API rate/lease behavior.
+- **Curated does not reproduce:** zero qualifying blackouts across 30 minutes. Hand back to the
+  workshop and A/B its values, beginning with `bpf.hostLegacyRouting` and
+  `k8sClientRateLimit`; do not alter talos-box defaults.
+
+Only after the baseline, run a deliberate Cilium-pod deletion as a separate follow-up. The
+documented 40–50 second macOS failover must not contaminate the steady-state baseline. This
+procedure classifies ownership and captures correlations; it makes no root-cause claim.
 
 ### C5 — Destroy and cleanup (always run)
 

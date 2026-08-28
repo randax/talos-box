@@ -119,8 +119,12 @@ end-to-end timing and cluster-up gate remains #97. The ISO+install path is dropp
   more lists (use `-` for stdin once); blank lines and `#` comments are ignored. Each entry is a
   fully qualified image reference with a non-`latest` tag or a `sha256`/`sha512` digest; a
   tag-plus-digest entry is the immutable list form. `tbx cache warm --check [--deep] <list>...`
-  verifies that content locally and offline; `--deep` only adds a blob rehash and requires
-  `--check`. Both check modes also verify the implicit bootstrap-required set no list can name
+  verifies tag mapping, selected `linux/<arch>` manifest, config, and all layers locally;
+  `--deep` only adds a blob rehash and requires `--check`. A normal warm resumes incomplete refs
+  without contacting upstream for complete refs; `--refresh` explicitly revalidates only complete
+  unpinned tags, because digest-pinned refs need no freshness resolution. A transient refresh
+  failure is nonfatal when the cached graph is complete. Both check modes also verify the
+  implicit bootstrap-required set no list can name
   (the CRI pod sandbox image), so neither mode reports the cache complete while that image is
   missing; only `--deep` detects a cached blob whose bytes no longer match its digest, so
   `--check --deep` remains the pre-travel gate.
@@ -252,7 +256,12 @@ physical/VPN interfaces and distinct gateways share the fixed ports without conf
 printed machine configs set Talos `machine.registries.mirrors."*"` to a single endpoint
 `http://172.30.<n>.1:5059` with `skipFallback: true`; legacy fixed listeners on `5055–5058`
 remain only so older clusters keep working until they are recreated. Mirror storage lives in
-the cache and doubles as the offline-venue answer. The catch-all deliberately redirects only
+the cache and doubles as the offline-venue answer. A complete cached tag — its mapping, selected
+`linux/<arch>` manifest, config, and every layer — remains available online during transient
+upstream failures; the daemon logs
+`mirror served stale: <host>/<repository>:<tag> (upstream <reason>; cache complete for linux/<arch>)`.
+Anonymous Bearer challenges and `Retry-After` handling are registry-generic. The catch-all
+deliberately redirects only
 syntactic loopback authorities (`localhost`, loopback IPv4, or loopback IPv6, optionally with a
 port) back to the same registry path inside the node, removing containerd's `ns` parameter. This
 lets an in-cluster registry such as `localhost:30500` remain direct without weakening the
@@ -263,10 +272,12 @@ registry on a custom loopback port is therefore unsupported by this redirect and
 containerd re-authorizing the redirected request; its `CheckRedirect` does so. Hostnames which
 merely resolve to loopback, and all other
 private or non-public authorities, remain blocked by the host mirror. `tbx mirror offline`
-reports its current mode; `tbx mirror offline on` permits cached public/upstream responses only
-and rejects cache misses without upstream fallback, while syntactic loopback registries remain
-direct; `tbx mirror offline off` restores pull-through behavior. Mirror content is shared cache
-state, not cluster state: it survives cluster destruction and recreation.
+reports its current mode. Offline stops the mirror from reaching registries and makes its cache
+misses return 404; the node resolver then applies its separate fallback policy. An explicit mirror
+entry with `skipFallback: false` may fall through to upstream, while talos-box's generated `"*"`
+entry uses `skipFallback: true` and therefore remains a hard miss. Syntactic loopback registries
+remain direct; `tbx mirror offline off` restores pull-through behavior. Mirror content is shared
+cache state, not cluster state: it survives cluster destruction and recreation.
 
 **Reachability contract**: host ↔ node IPs; host ↔ LB VIPs (L2 or BGP); **cluster ↔ cluster**
 (nodes and VIPs) through the host as inter-subnet router — first-class, per owner decision.
@@ -369,7 +380,8 @@ tbx bgp enable|disable <cluster> [--quiet]      tbx bgp status <cluster>
 tbx mirror offline [on|off]
 tbx cache pull [-f talosbox.yaml] [--no-images]
                [--talos-version VERSION --schematic ID --extensions LIST]
-tbx cache warm [--check [--deep]] <list-file> [<list-file>...]
+tbx cache warm [--refresh] <list-file> [<list-file>...]
+tbx cache warm --check [--deep] <list-file> [<list-file>...]
 tbx cache list [<image-ref>] [-o json]
 tbx cache prune [--mirror|--all]
 tbx logs [cluster] [--cluster name] [--follow] [--lines n]
@@ -563,7 +575,8 @@ Local-path has no CRD barrier, so apply `storage-namespaces` before `storage-obj
 - **Homebrew** (`brew install randax/tap/talosbox`); binary is Developer-ID signed and
   notarized with the `com.apple.security.virtualization` entitlement — no restricted
   entitlements needed (bridged networking deliberately unused).
-- **`sudo tbx system install`** (one-time) installs `tbx-helper` as a root launchd daemon and
+- **`tbx system install`** (one-time; automatic absolute-path sudo re-exec) installs
+  `tbx-helper` as a root launchd daemon and
   the `/etc/resolver/k8s.test` file; `tbx doctor` verifies helper, resolver, DNS wiring, and
   forwarding (full check table: `docs/macos.md` / `docs/linux.md`). Everything else runs unprivileged. The helper's macOS filesystem writes are
   confined to `/etc/resolver/k8s.test` plus `/etc/resolver/<domain>` for canonical validated

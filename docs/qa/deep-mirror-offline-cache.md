@@ -25,18 +25,33 @@ BLOCKED unless: `tbx version` recorded; `tbx doctor` exits 0 (egress OK); no clu
 **Goal**: `cache warm` accepts pinned refs, rejects unpinned, and reports per-image progress.
 
 Steps:
-1. Write a list file with: one tag-pinned ref (`registry.k8s.io/pause:3.10` — `docker.io/library/pause` does NOT exist on Docker Hub and answers 401 to anonymous pulls, so it is not a valid probe), one tag-pinned ref on Docker Hub itself (`docker.io/library/alpine:3.20`, so the run exercises Hub's anonymous token flow), one digest-pinned ref, one tag+digest ref, a `#` comment, and a blank line. Run `tbx cache warm <file>`.
-2. Run again — record what a re-warm does. It downloads nothing but still re-resolves every tag-pinned ref upstream, so it costs about a full run's wall time; expect the summary to be followed by a `note: re-resolved <n> tag(s) upstream ...` line steering to `--check` for a cheap gate.
-3. Negative: a list containing `docker.io/library/alpine:latest` — expect rejection; a tagless ref — expect rejection; a tag+digest where the digest is wrong — expect a resolution-mismatch error.
-4. `tbx cache warm --check <file>` then `--check --deep <file>`; also `--deep` without `--check` — expect refusal. Both check modes also verify the implicit CRI pod sandbox image (`registry.k8s.io/pause:<v>`) that no warm list names, so the two modes must agree on offline readiness.
+1. Write a list file with known-public, non-`latest` tagged refs from all three required real legs: Docker Hub (`docker.io/library/alpine:3.20`), `public.ecr.aws`, and `ghcr.io`. Also include `registry.k8s.io/pause:3.10`, one digest-pinned ref, one tag+digest ref, a `#` comment, and a blank line. Record the exact ECR and GHCR refs selected, then run `tbx cache warm <file>`. (`docker.io/library/pause` does NOT exist on Docker Hub and is not a valid probe.)
+2. Observe upstream requests with a controlled proxy/access log or packet metadata, without recording credentials. Run the identical command again. Every complete ref must print `already complete`, and the second warm must make **zero upstream calls**.
+3. Run `tbx cache warm --refresh <file>`. It revalidates only complete unpinned tags; digest-pinned refs need no freshness resolution. Record per-registry request counts, especially Docker Hub's, but do not loop, deliberately consume a quota, or claim a registry-specific quota.
+4. Negative: a list containing `docker.io/library/alpine:latest` — expect rejection; a tagless ref — expect rejection; a tag+digest where the digest is wrong — expect a resolution-mismatch error.
+5. `tbx cache warm --check <file>` then `--check --deep <file>`; also `--deep` without `--check` — expect refusal. Both check modes also verify the implicit CRI pod sandbox image (`registry.k8s.io/pause:<v>`) that no warm list names, so the two modes must agree on offline readiness.
 
-Expected observations: per-image progress with continue-through-failures and non-zero exit on any gap; `latest`/tagless rejected by design; mismatch pinned-digest error names the ref; `--check` verifies offline (no upstream dials — verify by watching for network errors with upstream unreachable if feasible, else trust exit + wording); `--deep` requires `--check`.
+Expected observations: all Docker Hub, Public ECR, and GHCR legs succeed and their request behavior is recorded; per-image progress continues through failures and exits non-zero on any gap; `latest`/tagless are rejected; a pinned-digest mismatch names the ref; the default second warm makes zero upstream calls; `--refresh` contacts only the unpinned tag legs; `--check` verifies offline with no upstream dials; `--deep` requires `--check`.
 
 Pass criteria: all accept/reject behaviors as documented.
 
 On failure: capture full command output per case.
 
 **Closed QA task** (no action needed): the [#242](https://github.com/randax/talos-box/issues/242) Docker Hub anonymous-auth fix was confirmed on 2026-08-19 — the `docker.io/library/alpine:3.20` leg warmed cleanly on the first run. Do not re-investigate it. If the Hub leg ever fails again, sanity-check Hub anonymous auth outside tbx first (a plain anonymous token fetch + `HEAD /v2/library/alpine/manifests/3.20`); a failure there is a host/network problem — record the leg as BLOCKED on the host rather than FAIL.
+
+#### Controlled stale-on-429 charter
+
+A real registry quota must not be deliberately exhausted. The hermetic unit test is authoritative:
+
+```sh
+go test ./internal/mirror -run 'TestOnlineCompleteTagHEADServesStaleOnTransientUpstreamStatus|TestOnlineStaleReplayLogsReasonAndReference' -count=1
+```
+
+The controlled upstream returns 429. A complete selected-platform cache must still answer 200,
+and the operator log contract must contain
+`mirror served stale: registry.example/demo:stable`, `upstream status 429`, and
+`cache complete for linux/<arch>`. Record the test result; any incidental real 429 may be
+observed, but never induced.
 
 ### C2 — Gateway-only binds and port layout (depends on a running cluster)
 
@@ -79,18 +94,19 @@ On failure: capture `manifests mirrors` output and `cache list` before/after.
 
 ### C4 — Offline mode semantics (depends on C3)
 
-**Goal**: `mirror offline on` serves cache-only and fails misses hard; mode survives restarts.
+**Goal**: mirror cache-only behavior and node fallback policy remain distinct; mode survives restarts.
 
 Steps:
-1. Warm one specific tag-pinned image (C1's list). `tbx mirror offline on`; `tbx mirror offline` reports `on`.
-2. From the C3 test pod (the [PSA-compliant test pod](deep-storage.md#psa-compliant-test-pod) again), pull the warmed image by tag — succeeds from cache. Pull it by digest — also succeeds (digest/tag parity).
-3. Pull an uncached image — expect a hard failure mentioning offline/not-cached (skipFallback means the node cannot bypass; the pull fails, it does not hang).
-4. Repeat one `localhost:<nodeport>` pull from C3 — it still succeeds because syntactic loopback passthrough performs no public-upstream mirror access.
-5. Restart the daemon itself with `tbx system restart --force` (`--force` is required here: `qa-mir` is running, and a plain restart refuses rather than stop it; on a supervised install — packaged Linux units — restart the tbxd service via the service manager instead). If neither is available, exercise the cluster path: `tbx cluster stop qa-mir && tbx cluster start qa-mir`. Afterwards `tbx mirror offline` still reports `on`.
-6. `tbx system restart --force` stops running clusters and does **not** bring them back (it narrates `stopped clusters: qa-mir`), so start the cluster again before the next step: `tbx cluster start qa-mir`, then wait for the API to answer — allow ~1 min to settle. Skip this step only if step 5 took the `cluster stop`/`start` path, which already leaves the cluster running.
-7. `tbx mirror offline off`; the previously failing public pull now succeeds.
+1. Warm one specific tagged image from C1, then run `tbx cache warm --check <file>`. The check must report it complete for the selected `linux/<arch>` graph, not merely because a root manifest returns 200. Turn on offline mode; `tbx mirror offline` reports `on`.
+2. Against the catch-all endpoint, issue both HEAD and GET for that tag and record 200 plus the same `Docker-Content-Digest`. From the C3 PSA-compliant test pod, perform a fresh actual image pull by tag and then by digest. All four observations — `--check`, offline HEAD, offline GET, and containerd's blob pulls — must agree for the selected platform.
+3. With the generated `"*"` entry (`skipFallback: true`) unchanged, pull an uncached public image. The mirror returns 404 with the offline/not-cached reason and the node must fail quickly rather than bypassing the mirror.
+4. On this disposable cluster, add a more-specific test registry mirror entry pointing at the same catch-all endpoint but setting `skipFallback: false`. Pull a different uncached image from that registry while host connectivity remains online. The mirror still returns its offline 404, but the node resolver may fall through to the real upstream and the pull must succeed. Record the exact machine-config patch and ref so the two policy layers are auditable.
+5. Repeat one `localhost:<nodeport>` pull from C3 — it still succeeds because syntactic loopback passthrough performs no public-upstream mirror access.
+6. Restart the daemon itself with `tbx system restart --force` (`--force` is required here: `qa-mir` is running, and a plain restart refuses rather than stop it; on a supervised install — packaged Linux units — restart the tbxd service via the service manager instead). If neither is available, exercise the cluster path: `tbx cluster stop qa-mir && tbx cluster start qa-mir`. Afterwards `tbx mirror offline` still reports `on`.
+7. `tbx system restart --force` stops running clusters and does **not** bring them back (it narrates `stopped clusters: qa-mir`), so start the cluster again before the next step: `tbx cluster start qa-mir`, then wait for the API to answer — allow ~1 min to settle. Skip this step only if step 6 took the `cluster stop`/`start` path, which already leaves the cluster running.
+8. `tbx mirror offline off`; the previously failing strict-catch-all public pull now succeeds.
 
-Expected observations: cached tag AND digest served offline; public miss = clear hard failure, not a hang; loopback remains direct; mode persists; `off` restores pull-through.
+Expected observations: cache check, tag HEAD/GET, and real selected-platform blob pulls agree; the generated strict catch-all produces a clear 404-backed hard miss; the explicit `skipFallback: false` entry falls through after the same mirror 404; loopback remains direct; mode persists; `off` restores pull-through.
 
 Pass criteria: all behaviors exact.
 

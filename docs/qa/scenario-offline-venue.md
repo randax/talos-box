@@ -27,11 +27,11 @@ BLOCKED unless: doctor clean; no cluster `qa-venue`; you have a way to cut upstr
 Steps:
 1. `tbx cache pull` (default Talos disk image for this host's arch).
 2. Create the provisioned cluster once online to let the mirror warm organically: `tbx cluster create qa-venue --cni cilium --csi longhorn`, wait for the full end state (VIP live, storage ready), exercise a PVC write.
-3. `tbx cache warm --check --deep <list>` if you maintain a pin list for extra workload images you'll use in C3; otherwise record that the mirror was warmed organically.
+3. If you maintain a pin list for extra workload images, run `tbx cache warm <list>` twice: the second default warm must make zero upstream requests for complete refs. Use `tbx cache warm --refresh <list>` only when you explicitly want to revalidate complete unpinned tags, then run `tbx cache warm --check --deep <list>`. Digest-pinned refs need no freshness resolution. Otherwise record that the mirror was warmed organically.
 4. `tbx cache list` — record disk-image and per-upstream mirror totals.
 5. `tbx cluster destroy qa-venue --force` (the venue rehearsal starts from nothing).
 
-Expected observations: cache list shows the Talos image and substantial mirror content across the upstreams the curated path uses.
+Expected observations: cache list shows the Talos image and substantial mirror content across the upstreams the curated path uses. A complete cached tag (mapping, selected `linux/<arch>` manifest, config, and every layer) remains pullable online during a transient upstream failure; when that occurs naturally, `tbx logs` records `mirror served stale: <host>/<repository>:<tag> (upstream <reason>; cache complete for linux/<arch>)`. Do not induce a real 429 or exhaust a registry quota to prove this; the controlled charter in [deep-mirror-offline-cache.md](deep-mirror-offline-cache.md#controlled-stale-on-429-charter) is authoritative.
 
 Pass criteria: cache populated; cluster destroyed clean.
 
@@ -64,10 +64,10 @@ On failure: capture the stalled pod's describe/events, `tbx cache list`, mirror 
 
 ### C4 — Miss behavior stays honest (depends on C3)
 
-**Goal**: an uncached image fails fast and clearly, not with a hang.
+**Goal**: the generated strict node policy turns the mirror's local cache miss into a fast, clear pull failure.
 
 Steps:
-1. Deploy a pod with an image that was never warmed. Base it on the [PSA-compliant test pod](deep-storage.md#psa-compliant-test-pod) (swap in the uncached image) so the apply does not emit a `would violate PodSecurity "restricted:latest"` block — that block is a warning, not a rejection, and is not a finding. Expect a clear pull failure (offline: content not cached) within a bounded time, no infinite hang.
+1. Deploy a pod with an image that was never warmed. Base it on the [PSA-compliant test pod](deep-storage.md#psa-compliant-test-pod) (swap in the uncached image) so the apply does not emit a `would violate PodSecurity "restricted:latest"` block — that block is a warning, not a rejection, and is not a finding. Offline mode stops the mirror from reaching registries and its miss returns 404. talos-box's generated `"*"` entry independently sets `skipFallback: true`, so the node cannot bypass that 404; expect a clear `offline: content not cached` pull failure within a bounded time, with no infinite hang. An explicit mirror entry with `skipFallback: false` could fall through, but the physically disconnected host would still be unable to reach upstream.
 
 Pass criteria: hard, legible failure; cluster otherwise unaffected.
 
