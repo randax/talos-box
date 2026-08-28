@@ -9,7 +9,55 @@ import (
 
 	"github.com/randax/talos-box/internal/hypervisor"
 	"github.com/randax/talos-box/internal/imagecache"
+	"github.com/randax/talos-box/internal/mirror"
 )
+
+func TestCacheWarmForwardsRefreshOptionAndTypedCounts(t *testing.T) {
+	t.Parallel()
+
+	ref := "docker.io/library/nginx:1.27.0"
+	service := &Server{
+		hypervisor: &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
+		warmCacheWithOptions: func(_ context.Context, refs []string, architecture imagecache.Architecture, options mirror.WarmOptions) (mirror.WarmSummary, error) {
+			if len(refs) != 1 || refs[0] != ref {
+				t.Fatalf("refs = %v, want [%q]", refs, ref)
+			}
+			if architecture != imagecache.ArchitectureAMD64 {
+				t.Fatalf("architecture = %q, want %q", architecture, imagecache.ArchitectureAMD64)
+			}
+			if !options.Refresh {
+				t.Fatal("Refresh = false, want true")
+			}
+			return mirror.WarmSummary{
+				Results: []mirror.WarmResult{
+					{Ref: ref, Outcome: mirror.WarmOutcomeFailedMissing, Error: "layer missing"},
+					{Ref: "registry.example/app:v1", Outcome: mirror.WarmOutcomeFailedRevalidate, Error: "upstream 404"},
+				},
+				Failed:           2,
+				FailedMissing:    1,
+				FailedRevalidate: 1,
+			}, nil
+		},
+	}
+
+	value, err := service.handle(Request{
+		Op:   "cache.warm",
+		Args: mustWarmArgs(t, CacheWarmArgs{Refs: []string{ref}, Refresh: true}),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, ok := value.(CacheWarmResult)
+	if !ok {
+		t.Fatalf("result type = %T, want CacheWarmResult", value)
+	}
+	if result.FailedMissing != 1 || result.FailedRevalidate != 1 {
+		t.Fatalf("typed failures = missing %d, revalidate %d; want 1 and 1", result.FailedMissing, result.FailedRevalidate)
+	}
+	if result.Entries[0].Status != CacheWarmStatusFailedMissing || result.Entries[1].Status != CacheWarmStatusFailedRevalidate {
+		t.Fatalf("statuses = %q, %q; want typed failures", result.Entries[0].Status, result.Entries[1].Status)
+	}
+}
 
 func TestCacheWarmRejectsUnpinnedRefsBeforeStartingWarm(t *testing.T) {
 	t.Parallel()

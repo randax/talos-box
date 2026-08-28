@@ -28,11 +28,12 @@ import (
 
 // Server owns all VMs started by one daemon process.
 type Server struct {
-	cache               *imagecache.Cache
-	hypervisor          hypervisor.Hypervisor
-	warmCache           func(context.Context, []string, imagecache.Architecture) (CacheWarmResult, error)
-	checkCache          func(context.Context, []string, imagecache.Architecture, bool) (CacheCheckResult, error)
-	boundMirrorGateways func() []string
+	cache                *imagecache.Cache
+	hypervisor           hypervisor.Hypervisor
+	warmCache            func(context.Context, []string, imagecache.Architecture) (CacheWarmResult, error)
+	warmCacheWithOptions func(context.Context, []string, imagecache.Architecture, mirror.WarmOptions) (mirror.WarmSummary, error)
+	checkCache           func(context.Context, []string, imagecache.Architecture, bool) (CacheCheckResult, error)
+	boundMirrorGateways  func() []string
 
 	// mutationMu guards mutationLocks, whose per-cluster mutexes serialize
 	// every operation that adds or deletes node disks — node.add, node.remove,
@@ -232,33 +233,10 @@ func NewServer(ctx context.Context) (*Server, error) {
 	server.boundMirrorGateways = func() []string {
 		return server.mirrors.BoundGatewayIPs()
 	}
+	server.warmCacheWithOptions = server.mirrors.Warm
 	server.warmCache = func(ctx context.Context, refs []string, architecture imagecache.Architecture) (CacheWarmResult, error) {
-		summary, err := server.mirrors.Warm(ctx, refs, architecture, mirror.WarmOptions{})
-		if err != nil {
-			return CacheWarmResult{}, err
-		}
-		result := CacheWarmResult{
-			Warmed:          summary.Warmed,
-			AlreadyComplete: summary.AlreadyComplete,
-			Failed:          summary.Failed,
-			ReResolvedTags:  summary.ReResolvedTags,
-			Entries:         make([]CacheWarmEntry, 0, len(summary.Results)),
-		}
-		for _, entry := range summary.Results {
-			status := CacheWarmStatusWarmed
-			if entry.Error != "" {
-				status = CacheWarmStatusFailed
-			} else if entry.AlreadyComplete {
-				status = CacheWarmStatusAlreadyComplete
-			}
-			result.Entries = append(result.Entries, CacheWarmEntry{
-				Ref:           entry.Ref,
-				Status:        status,
-				Reason:        entry.Error,
-				ReResolvedTag: entry.ReResolvedTag,
-			})
-		}
-		return result, nil
+		summary, err := server.warmCacheWithOptions(ctx, refs, architecture, mirror.WarmOptions{})
+		return cacheWarmResult(summary), err
 	}
 	server.checkCache = func(ctx context.Context, refs []string, architecture imagecache.Architecture, deep bool) (CacheCheckResult, error) {
 		summary, err := server.mirrors.Check(ctx, refs, architecture, deep)
@@ -284,6 +262,39 @@ func NewServer(ctx context.Context) (*Server, error) {
 		return result, nil
 	}
 	return server, nil
+}
+
+func cacheWarmResult(summary mirror.WarmSummary) CacheWarmResult {
+	result := CacheWarmResult{
+		Warmed:           summary.Warmed,
+		AlreadyComplete:  summary.AlreadyComplete,
+		Failed:           summary.Failed,
+		FailedMissing:    summary.FailedMissing,
+		FailedRevalidate: summary.FailedRevalidate,
+		Entries:          make([]CacheWarmEntry, 0, len(summary.Results)),
+	}
+	for _, entry := range summary.Results {
+		var status CacheWarmStatus
+		switch entry.Outcome {
+		case mirror.WarmOutcomeWarmed:
+			status = CacheWarmStatusWarmed
+		case mirror.WarmOutcomeAlreadyComplete:
+			status = CacheWarmStatusAlreadyComplete
+		case mirror.WarmOutcomeFailedMissing:
+			status = CacheWarmStatusFailedMissing
+		case mirror.WarmOutcomeFailedRevalidate:
+			status = CacheWarmStatusFailedRevalidate
+		default:
+			status = CacheWarmStatusFailed
+		}
+		result.Entries = append(result.Entries, CacheWarmEntry{
+			Ref:            entry.Ref,
+			Status:         status,
+			Reason:         entry.Error,
+			RefreshWarning: entry.RefreshWarning,
+		})
+	}
+	return result
 }
 
 // Listen creates the daemon socket, replacing it only when it is stale.
