@@ -196,11 +196,13 @@ configured bridge or running cluster report `SKIP` before one exists.
 
 | Check | What it proves | Typical remediation |
 |---|---|---|
+| `runtime-compat` | The client, daemon, and helper agree on their versioned protocols. The runtime block above the findings names each executable path, version, protocol, and PID when available | A mismatch is a `FAIL` and makes doctor exit non-zero. Run the exact absolute-path `system restart --force` command printed by doctor, or use the client matching the running components |
+| `installations` | The active daemon is the client's sibling and PATH does not contain multiple distinct `tbx` executables | `WARN` only: choose one installation and remove competing PATH entries |
 | `helper`, `helper-unit`, `helper-access` | The helper socket is enabled, reachable, and accessible to the current `tbx` group member | Enable `tbx-helper.socket`; add the user to `tbx`; then apply the group as `doctor` says: log out and back in, `loginctl terminate-user $USER` under a lingering session, or `wsl --shutdown` under WSL |
 | `helper-capabilities` | The helper has exactly `CAP_NET_ADMIN`, `CAP_NET_BIND_SERVICE`, and `CAP_NET_RAW` | Reinstall the current service unit and restart the helper |
 | `kvm` | `/dev/kvm` exists and is readable+writable | Enable KVM or add the user to the device's group |
 | `qemu` | QEMU meets the 6.2 floor, provides the required machine, and reports suspend availability | Install/upgrade the architecture-specific QEMU package |
-| `forwarding` | IPv4 forwarding is enabled | Repair the host sysctl or restart the helper so desired state is reconverged |
+| `forwarding (host)` | This client read the current host IPv4-forwarding sysctl directly and found it enabled | Repair the host sysctl or restart the helper so desired state is reconverged |
 | `bridge-netfilter` | Docker or another firewall has not combined bridge filtering with a default-DROP `FORWARD` policy. Listing the `FORWARD` chain needs root, and a host without `iptables` cannot be inspected at all, so a run that cannot read the chain is a `WARN`, never a `FAIL` | Apply the targeted rule printed by `doctor`; talosbox never edits foreign firewall tables. On the `WARN`, inspect the chain with `sudo iptables -S FORWARD` (or `sudo nft list chain ip filter FORWARD` where `iptables` is not installed) |
 | `bridge-stp` | Each `br-tbx<n>` bridge has STP disabled | Run the exact `ip link ... stp_state 0` command printed by `doctor` |
 | `rp-filter` | Strict reverse-path filtering will not discard VIP traffic on a multi-homed or VPN host | Set loose mode (`2`) as directed, including per-interface values |
@@ -213,7 +215,7 @@ configured bridge or running cluster report `SKIP` before one exists.
 | `guest-agent` | Clusters that requested the `qemu-guest-agent` extension have a working host channel | `WARN` only: the config stays valid and portable, the extension is simply inert on this host. `SKIP`s when no cluster requests it |
 | `mirror-health` | Pull-through mirror listeners are bound on exactly the running clusters' gateway IPs, and reports the registry-mirror cache totals | Restart the affected cluster (or `tbxd`) so the bind set is reconverged with cluster lifecycle |
 | `image-cache` | Reports the Talos disk-image cache totals, named apart from the registry-mirror cache so offline prep can tell the two stores under `~/.talosbox/cache` apart. Incomplete combinations — prunable leftovers with no usable image — are held out of the total and counted separately, and a cache holding nothing else is a `WARN` | Never `FAIL`s: a failed cache listing is reported once on `mirror-health` and skips this line. On `WARN`, rerun `tbx cache pull` before going offline; use `tbx cache list` for the per-combination breakdown |
-| `mirror-offline` | Whether `tbx mirror offline` is on. The mode persists across a daemon restart and makes every uncached public/upstream pull fail; syntactic loopback registries remain a deliberate direct exception | `WARN` only: run `tbx mirror offline off` to restore upstream pulls; each public/upstream miss is also logged as `mirror offline miss: …` in `tbx logs` |
+| `mirror-offline` | Whether `tbx mirror offline` is on. The mode persists across a daemon restart, prevents the mirror from contacting upstream, and makes its misses return 404; node fallback still depends on `skipFallback`, while syntactic loopback registries remain direct | `WARN` only: run `tbx mirror offline off` to restore mirror pull-through; each public/upstream miss is also logged as `mirror offline miss: …` in `tbx logs` |
 | `egress` | Image Factory access is usable | Follow the specific warning or failure detail. There is no `security-inventory` line here: the system-extension inventory it reports is macOS-only |
 
 `FAIL` makes `tbx doctor` exit non-zero. `WARN` identifies a degraded but usable configuration,
@@ -248,6 +250,12 @@ Cilium L2 announcements are the default ingress-VIP path and work directly on th
 BGP is optional on Linux: use it for routed upstreams, ECMP, or
 `externalTrafficPolicy: Local` when only nodes with local endpoints should advertise. It is not
 required for fast L2 failover on Linux.
+
+While online, a complete cached tag remains pullable during a transient upstream failure; the
+daemon records `mirror served stale: <host>/<repository>:<tag> (upstream <reason>; cache complete
+for linux/<arch>)`. Offline mode stops the mirror from reaching registries and its misses return
+404. Node fallback is a separate policy: an explicit `skipFallback: false` entry may continue to
+upstream, while talos-box's generated `"*"` entry is `skipFallback: true` and remains a hard miss.
 
 `tbx bgp enable|disable <cluster>` flips the announcement mode; it requires `--cni cilium` and
 refuses anything else without touching the speaker. `tbx bgp status <cluster>` reports where the
