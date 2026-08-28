@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"flag"
 	"fmt"
 	"net"
 	"os"
@@ -16,7 +18,39 @@ import (
 	"github.com/randax/talos-box/internal/provision"
 )
 
-func TestRunCacheWarmReadsFilesAndStdinThenPrintsSummary(t *testing.T) {
+func TestRunCacheWarmRejectsRefreshWithCheck(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr, in: bytes.NewBuffer(nil)}
+	err := command.run([]string{"cache", "warm", "--refresh", "--check", "images.txt"})
+	if err == nil || err.Error() != "cache warm --refresh cannot be used with --check" {
+		t.Fatalf("err = %v, want refresh/check usage error", err)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+}
+
+func TestRunCacheWarmHelpExplainsCacheFirstRefreshAndCompleteness(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr, in: bytes.NewBuffer(nil)}
+	err := command.run([]string{"cache", "warm", "--help"})
+	if !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("err = %v, want flag.ErrHelp", err)
+	}
+	for _, want := range []string{
+		"makes no upstream request for complete refs",
+		"--refresh revalidates complete unpinned tags",
+		"digest-pinned refs do not need freshness resolution",
+		"transient refresh failure is nonfatal",
+		"selected linux/<arch> manifest, config, and all layers locally",
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("help = %q, want %q", stderr.String(), want)
+		}
+	}
+}
+
+func TestRunCacheWarmDefaultDoesNotRequestRefresh(t *testing.T) {
 	t.Setenv("HOME", shortTestHome(t))
 	socketPath, err := daemon.SocketPath()
 	if err != nil {
@@ -57,6 +91,9 @@ func TestRunCacheWarmReadsFilesAndStdinThenPrintsSummary(t *testing.T) {
 		if len(args.Refs) != 1 || args.Refs[0] != wantRefs[index] {
 			t.Fatalf("refs = %v, want [%q]", args.Refs, wantRefs[index])
 		}
+		if args.Refresh {
+			t.Fatal("Refresh = true, want false")
+		}
 		result := daemon.CacheWarmResult{Entries: []daemon.CacheWarmEntry{{Ref: wantRefs[index]}}}
 		switch index {
 		case 0, 2:
@@ -88,7 +125,7 @@ func TestRunCacheWarmReadsFilesAndStdinThenPrintsSummary(t *testing.T) {
 		"\u2713 docker.io/library/pause:3.10 warmed\n" +
 		"\u2713 public.ecr.aws/eks-distro/kubernetes/pause:3.10 already complete\n" +
 		"\u2713 ghcr.io/example/app@sha256:1111111111111111111111111111111111111111111111111111111111111111 warmed\n" +
-		"summary: 2 warmed, 1 already complete, 0 failed\n"
+		"summary: 2 warmed, 1 already complete, 0 failed (missing)\n"
 	if got := stdout.String(); got != wantStdout {
 		t.Fatalf("stdout = %q, want %q", got, wantStdout)
 	}
@@ -225,7 +262,7 @@ func TestRunCacheWarmEmitsEachResultAsItCompletes(t *testing.T) {
 			firstOutput:  "\u2713 docker.io/library/pause:3.10 warmed\n",
 			fullOutput: "\u2713 docker.io/library/pause:3.10 warmed\n" +
 				"\u2713 ghcr.io/example/app:v1.0.0 already complete\n" +
-				"summary: 1 warmed, 1 already complete, 0 failed\n",
+				"summary: 1 warmed, 1 already complete, 0 failed (missing)\n",
 		},
 		{
 			// A check also verifies the bootstrap-required set (#404), so the
@@ -426,7 +463,7 @@ func serveDaemonRequests(t *testing.T, listener net.Listener, count int, respond
 	}
 }
 
-func TestRunCacheWarmReturnsErrorWhenAnyRefFails(t *testing.T) {
+func TestRunCacheWarmPrintsMissingAndRevalidateFailuresSeparately(t *testing.T) {
 	t.Setenv("HOME", shortTestHome(t))
 	socketPath, err := daemon.SocketPath()
 	if err != nil {
@@ -456,12 +493,13 @@ func TestRunCacheWarmReturnsErrorWhenAnyRefFails(t *testing.T) {
 		if len(args.Refs) != 1 || args.Refs[0] != refs[index] {
 			t.Fatalf("refs = %v, want [%q]", args.Refs, refs[index])
 		}
-		result := daemon.CacheWarmResult{Entries: []daemon.CacheWarmEntry{{Ref: refs[index], Status: daemon.CacheWarmStatusWarmed}}, Warmed: 1}
+		result := daemon.CacheWarmResult{Failed: 1}
 		if index == 0 {
-			result.Entries[0].Status = daemon.CacheWarmStatusFailed
-			result.Entries[0].Reason = "upstream: timeout"
-			result.Warmed = 0
-			result.Failed = 1
+			result.Entries = []daemon.CacheWarmEntry{{Ref: refs[index], Status: daemon.CacheWarmStatusFailedMissing, Reason: "upstream: timeout"}}
+			result.FailedMissing = 1
+		} else {
+			result.Entries = []daemon.CacheWarmEntry{{Ref: refs[index], Status: daemon.CacheWarmStatusFailedRevalidate, Reason: "upstream 404"}}
+			result.FailedRevalidate = 1
 		}
 		return daemon.Response{OK: true, Data: mustJSON(t, result)}
 	}, done)
@@ -470,13 +508,13 @@ func TestRunCacheWarmReturnsErrorWhenAnyRefFails(t *testing.T) {
 	command := cli{out: &stdout, err: &stderr, in: bytes.NewBuffer(nil)}
 	err = command.run([]string{"cache", "warm", listPath})
 	<-done
-	if err == nil || err.Error() != "cache warm failed for 1 ref(s)" {
-		t.Fatalf("err = %v, want cache warm failed for 1 ref(s)", err)
+	if err == nil || err.Error() != "cache warm failed for 2 ref(s)" {
+		t.Fatalf("err = %v, want cache warm failed for 2 ref(s)", err)
 	}
 	wantStdout := "" +
-		"\u2717 docker.io/library/pause:3.10 upstream: timeout\n" +
-		"\u2713 ghcr.io/example/app:v1.0.0 warmed\n" +
-		"summary: 1 warmed, 0 already complete, 1 failed\n"
+		"\u2717 docker.io/library/pause:3.10 failed (missing): upstream: timeout\n" +
+		"\u2717 ghcr.io/example/app:v1.0.0 failed (revalidate): upstream 404\n" +
+		"summary: 0 warmed, 0 already complete, 1 failed (missing), 1 failed (revalidate)\n"
 	if got := stdout.String(); got != wantStdout {
 		t.Fatalf("stdout = %q, want %q", got, wantStdout)
 	}
@@ -485,10 +523,7 @@ func TestRunCacheWarmReturnsErrorWhenAnyRefFails(t *testing.T) {
 	}
 }
 
-// A re-warm of a fully cached list downloads nothing yet costs a full run's
-// wall time on upstream tag resolution; the summary has to distinguish the two
-// and point at the cheap gate (#405).
-func TestRunCacheWarmNotesReResolvedTagsWhenNothingWasDownloaded(t *testing.T) {
+func TestRunCacheWarmRefreshSetsRefreshAndPrintsUnrevalidatedComplete(t *testing.T) {
 	t.Setenv("HOME", shortTestHome(t))
 	socketPath, err := daemon.SocketPath()
 	if err != nil {
@@ -514,35 +549,39 @@ func TestRunCacheWarmNotesReResolvedTagsWhenNothingWasDownloaded(t *testing.T) {
 		if request.Op != "cache.warm" {
 			t.Fatalf("request op = %q, want cache.warm", request.Op)
 		}
+		var args daemon.CacheWarmArgs
+		if err := json.Unmarshal(request.Args, &args); err != nil {
+			t.Fatal(err)
+		}
+		if !args.Refresh {
+			t.Fatal("Refresh = false, want true")
+		}
 		return daemon.Response{OK: true, Data: mustJSON(t, daemon.CacheWarmResult{
 			Entries: []daemon.CacheWarmEntry{{
-				Ref: ref, Status: daemon.CacheWarmStatusAlreadyComplete, ReResolvedTag: true,
+				Ref: ref, Status: daemon.CacheWarmStatusAlreadyComplete,
+				RefreshWarning: "upstream 429, not revalidated",
 			}},
 			AlreadyComplete: 1,
-			ReResolvedTags:  1,
 		})}
 	}, done)
 
 	var stdout, stderr bytes.Buffer
 	command := cli{out: &stdout, err: &stderr, in: bytes.NewBuffer(nil)}
-	if err := command.run([]string{"cache", "warm", listPath}); err != nil {
+	if err := command.run([]string{"cache", "warm", "--refresh", listPath}); err != nil {
 		t.Fatal(err)
 	}
 	<-done
 
 	wantStdout := "" +
-		"✓ docker.io/library/pause:3.10 already complete\n" +
-		"summary: 0 warmed, 1 already complete, 0 failed\n" +
-		"note: re-resolved 1 tag(s) upstream for freshness; nothing was downloaded. " +
-		"For a cheap offline-readiness gate run `tbx cache warm --check` instead\n"
+		"✓ docker.io/library/pause:3.10 already complete (upstream 429, not revalidated)\n" +
+		"summary: 0 warmed, 1 already complete, 0 failed (missing), 0 failed (revalidate)\n" +
+		"note: 1 complete ref(s) were not revalidated: docker.io/library/pause:3.10\n"
 	if got := stdout.String(); got != wantStdout {
 		t.Fatalf("stdout = %q, want %q", got, wantStdout)
 	}
 }
 
-// A daemon that reports no re-resolution (or an older one that cannot) prints
-// the pre-note summary unchanged.
-func TestRunCacheWarmOmitsTheNoteWithoutReResolvedTags(t *testing.T) {
+func TestRunCacheWarmOmitsTheRevalidateClauseWithoutRefresh(t *testing.T) {
 	t.Setenv("HOME", shortTestHome(t))
 	socketPath, err := daemon.SocketPath()
 	if err != nil {
@@ -578,7 +617,8 @@ func TestRunCacheWarmOmitsTheNoteWithoutReResolvedTags(t *testing.T) {
 	}
 	<-done
 
-	if strings.Contains(stdout.String(), "note:") {
-		t.Fatalf("stdout = %q, want no re-resolution note", stdout.String())
+	want := "✓ " + ref + " warmed\nsummary: 1 warmed, 0 already complete, 0 failed (missing)\n"
+	if got := stdout.String(); got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
 	}
 }

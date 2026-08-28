@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -40,7 +41,7 @@ func TestConnectRejectsProtocolVersionMismatch(t *testing.T) {
 			t.Errorf("handshake op = %q, want %q", request.Op, helperInfoOp)
 			return
 		}
-		if err := sendResponse(connection.(*net.UnixConn), success(Info{ProtocolVersion: protocolVersion + 1}), -1); err != nil {
+		if err := sendResponse(connection.(*net.UnixConn), success(Info{ProtocolVersion: ProtocolVersion + 1}), -1); err != nil {
 			t.Errorf("send response: %v", err)
 		}
 	}()
@@ -53,6 +54,173 @@ func TestConnectRejectsProtocolVersionMismatch(t *testing.T) {
 	}
 	if err == nil || !strings.Contains(err.Error(), hostAdviceCommand()) {
 		t.Fatalf("Connect() error = %v, want reinstall guidance", err)
+	}
+	<-done
+}
+
+func TestProbeReturnsMismatchedHelperIdentity(t *testing.T) {
+	socketPath := shortSocketPath(t, "helper-probe-mismatch")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		connection, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = connection.Close() }()
+
+		var request Request
+		if err := json.NewDecoder(connection).Decode(&request); err != nil {
+			t.Errorf("decode probe request: %v", err)
+			return
+		}
+		if request.Op != helperInfoOp {
+			t.Errorf("probe op = %q, want %q", request.Op, helperInfoOp)
+			return
+		}
+		var args struct {
+			ProtocolVersion int `json:"protocolVersion"`
+		}
+		if err := json.Unmarshal(request.Args, &args); err != nil {
+			t.Errorf("decode probe args: %v", err)
+			return
+		}
+		if args.ProtocolVersion != ProtocolVersion {
+			t.Errorf("probe protocol = %d, want %d", args.ProtocolVersion, ProtocolVersion)
+		}
+		info := Info{
+			ProtocolVersion: ProtocolVersion + 1,
+			Version:         "9.9.9",
+			Executable:      "/opt/other/tbx-helper",
+			PID:             4242,
+		}
+		if err := sendResponse(connection.(*net.UnixConn), success(info), -1); err != nil {
+			t.Errorf("send probe response: %v", err)
+		}
+	}()
+
+	t.Setenv(helperSocketEnv, socketPath)
+	info, err := Probe()
+	if err != nil {
+		t.Fatalf("Probe() = %v", err)
+	}
+	if info.ProtocolVersion != ProtocolVersion+1 || info.Version != "9.9.9" || info.Executable != "/opt/other/tbx-helper" || info.PID != 4242 {
+		t.Fatalf("Probe() = %+v, want mismatched helper identity", info)
+	}
+	<-done
+}
+
+func TestProbeReturnsTypedProtocolMismatchWhenOldHelperRejectsHandshake(t *testing.T) {
+	socketPath := shortSocketPath(t, "helper-probe-rejected-mismatch")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		connection, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = connection.Close() }()
+
+		var request Request
+		if err := json.NewDecoder(connection).Decode(&request); err != nil {
+			t.Errorf("decode probe request: %v", err)
+			return
+		}
+		if request.Op != helperInfoOp {
+			t.Errorf("probe op = %q, want %q", request.Op, helperInfoOp)
+			return
+		}
+		if err := sendResponse(connection.(*net.UnixConn), failure(protocolMismatchError(ProtocolVersion, ProtocolVersion-1)), -1); err != nil {
+			t.Errorf("send mismatch response: %v", err)
+		}
+	}()
+
+	t.Setenv(helperSocketEnv, socketPath)
+	info, err := Probe()
+	if info.ProtocolVersion != 0 || info.Version != "" || info.Executable != "" || info.PID != 0 {
+		t.Fatalf("Probe() info = %+v, want zero identity on rejected handshake", info)
+	}
+	var mismatch *ProtocolMismatchError
+	if !errors.As(err, &mismatch) {
+		t.Fatalf("Probe() error = %v, want typed protocol mismatch", err)
+	}
+	if mismatch.ClientVersion != ProtocolVersion || mismatch.HelperVersion != ProtocolVersion-1 {
+		t.Fatalf("Probe() mismatch = %+v, want client=%d helper=%d", mismatch, ProtocolVersion, ProtocolVersion-1)
+	}
+	if !strings.Contains(err.Error(), hostAdviceCommand()) {
+		t.Fatalf("Probe() error = %q, want reinstall guidance", err.Error())
+	}
+	<-done
+}
+
+func TestConnectStillRejectsMismatchedHelperAfterProbe(t *testing.T) {
+	socketPath := shortSocketPath(t, "helper-probe-then-connect")
+	t.Setenv(helperSocketEnv, socketPath)
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	var connections int
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for connections < 2 {
+			connection, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			connections++
+			var request Request
+			if err := json.NewDecoder(connection).Decode(&request); err != nil {
+				t.Errorf("decode handshake %d: %v", connections, err)
+				_ = connection.Close()
+				return
+			}
+			if request.Op != helperInfoOp {
+				t.Errorf("handshake %d op = %q, want %q", connections, request.Op, helperInfoOp)
+				_ = connection.Close()
+				return
+			}
+			if err := sendResponse(connection.(*net.UnixConn), success(Info{
+				ProtocolVersion: ProtocolVersion + 1,
+				Version:         "9.9.9",
+				Executable:      "/opt/other/tbx-helper",
+				PID:             4242,
+			}), -1); err != nil {
+				t.Errorf("send handshake %d: %v", connections, err)
+			}
+			_ = connection.Close()
+		}
+	}()
+
+	info, err := Probe()
+	if err != nil {
+		t.Fatalf("Probe() = %v", err)
+	}
+	if info.Executable != "/opt/other/tbx-helper" {
+		t.Fatalf("Probe() executable = %q, want /opt/other/tbx-helper", info.Executable)
+	}
+	client, err := Connect()
+	if client != nil {
+		_ = client.Close()
+		t.Fatal("Connect() succeeded after mismatched Probe()")
+	}
+	if err == nil || !strings.Contains(err.Error(), "(client 5, helper 6)") {
+		t.Fatalf("Connect() error = %v, want mismatch naming both protocol versions", err)
 	}
 	<-done
 }
@@ -83,7 +251,7 @@ func TestClientReconnectsAfterHelperRestart(t *testing.T) {
 			_ = unixConnection.Close()
 			return
 		}
-		if err := sendResponse(unixConnection, success(Info{ProtocolVersion: protocolVersion}), -1); err != nil {
+		if err := sendResponse(unixConnection, success(Info{ProtocolVersion: ProtocolVersion}), -1); err != nil {
 			t.Errorf("send first handshake: %v", err)
 			_ = unixConnection.Close()
 			return
@@ -142,7 +310,7 @@ func TestClientReconnectsAfterHelperRestart(t *testing.T) {
 			serveErr(errors.New("unexpected handshake op"))
 			return
 		}
-		if err := sendResponse(connection.(*net.UnixConn), success(Info{ProtocolVersion: protocolVersion}), -1); err != nil {
+		if err := sendResponse(connection.(*net.UnixConn), success(Info{ProtocolVersion: ProtocolVersion}), -1); err != nil {
 			serveErr(err)
 			return
 		}
@@ -197,7 +365,7 @@ func TestClientDoesNotRetryUnsafeOperationAfterHelperRestart(t *testing.T) {
 			retried <- false
 			return
 		}
-		if err := sendResponse(unixConnection, success(Info{ProtocolVersion: protocolVersion}), -1); err != nil {
+		if err := sendResponse(unixConnection, success(Info{ProtocolVersion: ProtocolVersion}), -1); err != nil {
 			_ = unixConnection.Close()
 			retried <- false
 			return
@@ -243,7 +411,7 @@ func TestClientDoesNotRetryUnsafeOperationAfterHelperRestart(t *testing.T) {
 
 func shortSocketPath(t *testing.T, prefix string) string {
 	t.Helper()
-	return fmt.Sprintf("/tmp/%s-%d.sock", prefix, os.Getpid())
+	return filepath.Join(os.TempDir(), fmt.Sprintf("%s-%d.sock", prefix, os.Getpid()))
 }
 
 // A helper built before bgp.status reported routes answers with {active} alone,
@@ -251,8 +419,8 @@ func shortSocketPath(t *testing.T, prefix string) string {
 // announcing. The handshake must refuse it and ask for a reinstall.
 func TestConnectRejectsHelperPredatingBGPRouteReporting(t *testing.T) {
 	const preRouteReportingVersion = 2
-	if protocolVersion <= preRouteReportingVersion {
-		t.Fatalf("protocolVersion = %d, want a version past the bgp.status route contract change", protocolVersion)
+	if ProtocolVersion <= preRouteReportingVersion {
+		t.Fatalf("ProtocolVersion = %d, want a version past the bgp.status route contract change", ProtocolVersion)
 	}
 
 	socketPath := shortSocketPath(t, "helper-stale-bgp")
@@ -319,7 +487,7 @@ func TestSyncSendsEveryClusterReservation(t *testing.T) {
 		if err := decoder.Decode(&handshake); err != nil {
 			return
 		}
-		if err := sendResponse(unixConnection, success(Info{ProtocolVersion: protocolVersion}), -1); err != nil {
+		if err := sendResponse(unixConnection, success(Info{ProtocolVersion: ProtocolVersion}), -1); err != nil {
 			return
 		}
 		var request Request

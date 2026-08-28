@@ -296,8 +296,8 @@ func TestCatchAllMirrorOfflineStillRejectsUncachedPublicPull(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/v2/app/manifests/latest?ns=registry.example", nil)
 	manager.serveCatchAll(recorder, request)
 
-	if recorder.Code != http.StatusServiceUnavailable {
-		t.Fatalf("offline public pull = %d %q, want 503", recorder.Code, recorder.Body.String())
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("offline public pull = %d %q, want 404", recorder.Code, recorder.Body.String())
 	}
 	if !strings.Contains(recorder.Body.String(), "mirror offline: content not cached") {
 		t.Fatalf("offline public pull body = %q, want cache-miss reason", recorder.Body.String())
@@ -935,9 +935,10 @@ func TestManagerOfflineToggleAffectsLegacyAndDynamicMirrors(t *testing.T) {
 	f := newFakeRegistry(t, false)
 	legacyPort := freePort(t)
 	catchAllPort := freePort(t)
+	cacheRoot := t.TempDir()
 
 	m := &Manager{
-		cacheRoot:    t.TempDir(),
+		cacheRoot:    cacheRoot,
 		ports:        []portBinding{{Upstream: "docker.io", Port: legacyPort}},
 		catchAllPort: catchAllPort,
 		resolveUpstreamIPs: func(context.Context, string) ([]net.IP, error) {
@@ -966,6 +967,7 @@ func TestManagerOfflineToggleAffectsLegacyAndDynamicMirrors(t *testing.T) {
 			t.Fatalf("warm path %s = %d %q", path, resp.StatusCode, body)
 		}
 	}
+	cacheTagDigestRoot(t, NewServer("https://registry-1.docker.io", filepath.Join(cacheRoot, "docker.io")), "app", "latest")
 	manifestHits := f.manifestHits.Load()
 
 	m.SetOffline(true)
@@ -1064,7 +1066,8 @@ func TestCatchAllOfflineCachedTagServesAndMissesDoNotResolveOrDial(t *testing.T)
 	defer upstream.Close()
 
 	catchAllPort := freePort(t)
-	m := newManagerWithPorts(t.TempDir(), nil, catchAllPort)
+	cacheRoot := t.TempDir()
+	m := newManagerWithPorts(cacheRoot, nil, catchAllPort)
 	m.baseOverride = upstream.URL
 	m.resolveUpstreamIPs = func(context.Context, string) ([]net.IP, error) {
 		if failResolve.Load() {
@@ -1091,6 +1094,7 @@ func TestCatchAllOfflineCachedTagServesAndMissesDoNotResolveOrDial(t *testing.T)
 	if resp.StatusCode != http.StatusOK || body != manifestBody {
 		t.Fatalf("warm tag = %d %q", resp.StatusCode, body)
 	}
+	cacheTagDigestRoot(t, NewServer("https://registry-1.docker.io", filepath.Join(cacheRoot, "docker.io")), "app", "latest")
 	dialsAfterWarm := dials.Load()
 
 	m.SetOffline(true)
@@ -1206,6 +1210,7 @@ func TestFreshManagerOfflineCachedTagServesAndColdMissDoesNotResolveOrDial(t *te
 	if resp.StatusCode != http.StatusOK || body != manifestBody {
 		t.Fatalf("warm tag = %d %q", resp.StatusCode, body)
 	}
+	cacheTagDigestRoot(t, NewServer("https://registry-1.docker.io", filepath.Join(cacheRoot, "docker.io")), "app", "latest")
 	warm.Close()
 
 	var resolves atomic.Int64
@@ -1232,8 +1237,8 @@ func TestFreshManagerOfflineCachedTagServesAndColdMissDoesNotResolveOrDial(t *te
 		t.Fatalf("offline restarted cached tag = %d %q", resp.StatusCode, body)
 	}
 	resp, body = get(t, fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/missing?ns=docker.io", restarted.catchAllPort))
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("offline restarted miss = %d %q, want 503", resp.StatusCode, body)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("offline restarted miss = %d %q, want 404", resp.StatusCode, body)
 	}
 	if resolves.Load() != 0 || dials.Load() != 0 {
 		t.Fatalf("offline cold paths touched network: resolves=%d dials=%d", resolves.Load(), dials.Load())
@@ -1497,6 +1502,63 @@ func mustURL(t *testing.T, raw string) *url.URL {
 		t.Fatal(err)
 	}
 	return parsed
+}
+
+func TestCatchAllServesStaleTagOnResolutionFailure(t *testing.T) {
+	cacheRoot := t.TempDir()
+	_, manifest, _ := newCompleteStaleFixtureAt(t, filepath.Join(cacheRoot, "registry.example"))
+	manager := newManagerWithPorts(cacheRoot, nil, 0)
+	manager.resolveUpstreamIPs = func(context.Context, string) ([]net.IP, error) {
+		return nil, &net.DNSError{Err: "no such host", Name: "registry.example"}
+	}
+	manager.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	manager.dialContext = func(context.Context, string, string) (net.Conn, error) {
+		t.Fatal("unexpected dial on stale replay")
+		return nil, nil
+	}
+	defer manager.Close()
+
+	logged := captureDaemonLog(t)
+	authority, err := parseUpstreamAuthority("registry.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stale := manager.cacheProbeServer(authority).staleCandidate(httptest.NewRequest(http.MethodGet, "/v2/demo/manifests/stable", nil)); !stale.Complete() {
+		t.Fatalf("stale candidate = %s", stale.Reason())
+	}
+	request := httptest.NewRequest(http.MethodGet, "/v2/demo/manifests/stable?ns=registry.example", nil)
+	recorder := httptest.NewRecorder()
+	manager.serveCatchAll(recorder, request)
+	if recorder.Code != http.StatusOK || recorder.Body.String() != string(manifest) {
+		t.Fatalf("stale catch-all = %d %q, want 200 %q", recorder.Code, recorder.Body.String(), manifest)
+	}
+	if got := recorder.Header().Get(reasonHeader); got != "served-stale" {
+		t.Fatalf("%s = %q, want served-stale", reasonHeader, got)
+	}
+	if line := logged.String(); !strings.Contains(line, "mirror served stale: registry.example/demo:stable") || !strings.Contains(line, "no such host") {
+		t.Fatalf("daemon log = %q, want stale resolution replay", line)
+	}
+}
+
+func TestCatchAllDoesNotServeStaleTagOnPolicyRejection(t *testing.T) {
+	cacheRoot := t.TempDir()
+	_, _, _ = newCompleteStaleFixtureAt(t, filepath.Join(cacheRoot, "registry.example"))
+	manager := newManagerWithPorts(cacheRoot, nil, 0)
+	manager.resolveUpstreamIPs = func(context.Context, string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("127.0.0.1")}, nil
+	}
+	manager.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	defer manager.Close()
+
+	request := httptest.NewRequest(http.MethodGet, "/v2/demo/manifests/stable?ns=registry.example", nil)
+	recorder := httptest.NewRecorder()
+	manager.serveCatchAll(recorder, request)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("policy rejection = %d %q, want 403", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), manifestBody) {
+		t.Fatalf("policy rejection served cached manifest: %q", recorder.Body.String())
+	}
 }
 
 type closableHandler struct {

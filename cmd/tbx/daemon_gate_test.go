@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/randax/talos-box/internal/daemon"
+	"github.com/randax/talos-box/internal/helper"
 )
 
 // fakeDaemon answers daemon.info with a chosen protocol and records every op it
@@ -186,7 +187,7 @@ func unsupervisedDaemon() (supervision, string) { return supervisionNone, "" }
 // what t.TempDir() produces for long test names.
 func tempHome(t *testing.T) string {
 	t.Helper()
-	home, err := os.MkdirTemp("/tmp", "tbx-daemon-")
+	home, err := os.MkdirTemp(os.TempDir(), "tbx-daemon-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -365,8 +366,8 @@ func TestSystemStatusPrintsPIDAndProtocol(t *testing.T) {
 	if !strings.Contains(got, fmt.Sprintf("protocol %d", daemon.ProtocolVersion-1)) {
 		t.Fatalf("stdout = %q, want the daemon protocol", got)
 	}
-	if !strings.Contains(got, fmt.Sprintf("tbx protocol %d", daemon.ProtocolVersion)) {
-		t.Fatalf("stdout = %q, want the CLI protocol", got)
+	if !strings.Contains(got, fmt.Sprintf("daemon protocol %d", daemon.ProtocolVersion)) || !strings.Contains(got, fmt.Sprintf("helper protocol %d", helper.ProtocolVersion)) {
+		t.Fatalf("stdout = %q, want the client compatibility protocols", got)
 	}
 	if !strings.Contains(stderr.String(), "run: tbx system restart") {
 		t.Fatalf("stderr = %q, want a skew warning naming the recovery command", stderr.String())

@@ -14,6 +14,8 @@ import (
 )
 
 const (
+	// ProtocolVersion is the helper wire version understood by this client and
+	// server. Diagnostic identity fields are additive and do not advance it.
 	// Version 2 added dns.syncDomains and the domain argument (with helper-side
 	// validation) on dns.listen/dns.register.
 	//
@@ -35,14 +37,40 @@ const (
 	// DHCP and reconverges no bridges; a version 4 helper would silently leave
 	// every cluster without addresses.
 	//
+	// Version 5 also adds the additive helper.info identity fields Version,
+	// Executable, and PID. They are diagnostic-only: a current client can still
+	// name a mismatched helper without forcing an operational reconnect through
+	// `sudo ... system install` first (#492).
+	//
 	// Bumping this also means bumping the literal in nix/vm-test.nix: the NixOS
 	// smoke test's helper-probe performs this handshake against the packaged
 	// helper, and `nix flake check` fails on a mismatch.
-	protocolVersion = 5
+	ProtocolVersion = 5
 	helperInfoOp    = "helper.info"
 )
 
 var errProtocolMismatch = errors.New("helper protocol mismatch")
+
+// ProtocolMismatchError carries both sides of a helper version-handshake
+// refusal so diagnostics can report a reachable but stale helper (#492).
+type ProtocolMismatchError struct {
+	ClientVersion int
+	HelperVersion int
+	detail        string
+}
+
+func (e *ProtocolMismatchError) Error() string {
+	if e == nil {
+		return errProtocolMismatch.Error()
+	}
+	if e.detail != "" {
+		return e.detail
+	}
+	return fmt.Sprintf("%s (client %d, helper %d): %s",
+		errProtocolMismatch.Error(), e.ClientVersion, e.HelperVersion, protocolMismatchAdvice())
+}
+
+func (e *ProtocolMismatchError) Unwrap() error { return errProtocolMismatch }
 
 // IsProtocolMismatch reports whether err is the version-handshake refusal. It
 // already carries the reinstall advice, so callers must not stack the
@@ -55,7 +83,7 @@ func IsProtocolMismatch(err error) bool { return errors.Is(err, errProtocolMisma
 // advice names the package upgrade and the socket restart instead.
 const linuxHelperReinstallAdvice = "reinstall the helper: upgrade the tbx-helper package " +
 	"(or reinstall the binary and units as in docs/linux.md, \"Build and install the source preview\"), " +
-	"then run `sudo systemctl restart tbx-helper.service`"
+	"then run `sudo systemctl restart tbx-helper.socket`"
 
 // The installed helper binary is pinned at an absolute path by its service
 // definition, so restarting it relaunches the same stale binary; only a
@@ -101,18 +129,18 @@ type Response struct {
 // Info describes the connected helper process.
 type Info struct {
 	ProtocolVersion          int      `json:"protocolVersion"`
+	Version                  string   `json:"version,omitempty"`
+	Executable               string   `json:"executable,omitempty"`
+	PID                      int      `json:"pid,omitempty"`
 	EffectiveCapabilities    uint64   `json:"effectiveCapabilities,omitempty"`
 	EffectiveCapabilityNames []string `json:"effectiveCapabilityNames,omitempty"`
 }
 
 func protocolMismatchError(clientVersion, helperVersion int) error {
-	return fmt.Errorf(
-		"%w (client %d, helper %d): %s",
-		errProtocolMismatch,
-		clientVersion,
-		helperVersion,
-		protocolMismatchAdvice(),
-	)
+	return &ProtocolMismatchError{
+		ClientVersion: clientVersion,
+		HelperVersion: helperVersion,
+	}
 }
 
 func protocolHandshakeFailure(detail string) error {
@@ -127,9 +155,18 @@ func protocolHandshakeFailure(detail string) error {
 	if rest, ok := strings.CutPrefix(detail, errProtocolMismatch.Error()); ok {
 		facts, _, _ := strings.Cut(rest, ":")
 		facts = strings.TrimRight(facts, ";: ")
-		return fmt.Errorf("%w%s: %s", errProtocolMismatch, facts, protocolMismatchAdvice())
+		var clientVersion, helperVersion int
+		if _, err := fmt.Sscanf(facts, " (client %d, helper %d)", &clientVersion, &helperVersion); err == nil {
+			return &ProtocolMismatchError{
+				ClientVersion: clientVersion,
+				HelperVersion: helperVersion,
+				detail: fmt.Sprintf("%s (client %d, helper %d): %s",
+					errProtocolMismatch.Error(), clientVersion, helperVersion, protocolMismatchAdvice()),
+			}
+		}
+		return &ProtocolMismatchError{detail: fmt.Sprintf("%s%s: %s", errProtocolMismatch.Error(), facts, protocolMismatchAdvice())}
 	}
-	return fmt.Errorf("%w: %s; %s", errProtocolMismatch, detail, protocolMismatchAdvice())
+	return &ProtocolMismatchError{detail: fmt.Sprintf("%s: %s; %s", errProtocolMismatch.Error(), detail, protocolMismatchAdvice())}
 }
 
 func success(data any) Response {

@@ -323,7 +323,9 @@ func printWarmedImages(output io.Writer, result *daemon.CacheWarmResult) error {
 		return nil
 	}
 	for _, entry := range result.Entries {
-		if entry.Status != daemon.CacheWarmStatusFailed {
+		if entry.Status != daemon.CacheWarmStatusFailed &&
+			entry.Status != daemon.CacheWarmStatusFailedMissing &&
+			entry.Status != daemon.CacheWarmStatusFailedRevalidate {
 			continue
 		}
 		if _, err := fmt.Fprintf(output, "✗ %s %s\n", entry.Ref, entry.Reason); err != nil {

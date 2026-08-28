@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -40,6 +41,48 @@ func TestBGPRejectsInvalidArguments(t *testing.T) {
 				t.Fatalf("dispatch(%s) response = %+v, want error containing %q", test.op, reply.response, test.wantErr)
 			}
 		})
+	}
+}
+
+func TestHelperInfoReturnsIdentityAcrossProtocolMismatchButOtherOpsRemainGated(t *testing.T) {
+	t.Setenv(helperSocketEnv, shortSocketPath(t, "helper-info-mismatch"))
+
+	reply := NewServer(nil, nil).dispatch(Request{
+		Op:   helperInfoOp,
+		Args: json.RawMessage(`{"protocolVersion":4}`),
+	})
+	if !reply.response.OK {
+		t.Fatalf("helper.info response = %+v, want success", reply.response)
+	}
+	var info Info
+	if err := json.Unmarshal(reply.response.Data, &info); err != nil {
+		t.Fatal(err)
+	}
+	if info.ProtocolVersion != ProtocolVersion {
+		t.Fatalf("helper.info protocol = %d, want %d", info.ProtocolVersion, ProtocolVersion)
+	}
+	if info.Version == "" {
+		t.Fatal("helper.info omitted Version")
+	}
+	if info.Executable == "" {
+		t.Fatal("helper.info omitted Executable")
+	}
+	if !filepath.IsAbs(info.Executable) {
+		t.Fatalf("helper.info executable = %q, want absolute path", info.Executable)
+	}
+	if info.PID != os.Getpid() {
+		t.Fatalf("helper.info pid = %d, want %d", info.PID, os.Getpid())
+	}
+
+	gated := NewServer(nil, nil).dispatch(Request{
+		Op:   "net.attach",
+		Args: json.RawMessage(`{"cluster":"demo","subnetIndex":7,"node":"demo-cp-1"}`),
+	})
+	if gated.response.OK {
+		t.Fatalf("net.attach unexpectedly succeeded: %+v", gated.response)
+	}
+	if !strings.Contains(gated.response.Error, "start vmnet interface") && !strings.Contains(gated.response.Error, "operation not permitted") {
+		t.Fatalf("net.attach error = %q, want normal op handling rather than protocol mismatch gating", gated.response.Error)
 	}
 }
 

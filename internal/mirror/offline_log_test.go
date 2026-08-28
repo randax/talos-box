@@ -5,12 +5,14 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 )
 
-// TestOfflineMissIsLogged pins #403: containerd surfaces only a bare 503 to the
+// TestOfflineMissIsLogged pins #403: containerd surfaces only a bare status to the
 // kubelet event, so without a daemon-log line an offline miss leaves no
 // operator-visible trace anywhere in tbx.
 func TestOfflineMissIsLogged(t *testing.T) {
@@ -49,10 +51,10 @@ func TestOfflineMissIsLogged(t *testing.T) {
 				t.Fatal(err)
 			}
 			_ = resp.Body.Close()
-			if resp.StatusCode != http.StatusServiceUnavailable {
-				t.Fatalf("status = %d, want 503", resp.StatusCode)
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404", resp.StatusCode)
 			}
-			if got := logged.String(); !strings.Contains(got, test.want) {
+			if got := logged.String(); !strings.Contains(got, test.want) || !strings.Contains(got, ": ") {
 				t.Fatalf("daemon log = %q, want substring %q", got, test.want)
 			}
 		})
@@ -75,6 +77,7 @@ func TestOfflineHitIsNotLogged(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("warm status = %d, want 200", resp.StatusCode)
 	}
+	cacheTagDigestRoot(t, server, "app", "latest")
 	server.setOfflineMode(true)
 
 	logged := captureDaemonLog(t)
@@ -139,11 +142,56 @@ func TestOfflineMissLogsRequestedNamespace(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
 	}
-	want := "mirror offline miss: library/nginx:1.27.3 (upstream namespace docker.io)"
+	want := "mirror offline miss: library/nginx:1.27.3 (upstream namespace docker.io): tag mapping /v2/library/nginx/manifests/1.27.3 not cached"
 	if got := logged.String(); !strings.Contains(got, want) {
 		t.Fatalf("daemon log = %q, want substring %q", got, want)
+	}
+}
+
+func TestOfflineMissLogsIncompleteCacheReason(t *testing.T) {
+	server, _, _ := newCompleteStaleFixture(t)
+	if err := os.Remove(server.blobPath("sha256:" + sha256Hex([]byte("layer")))); err != nil {
+		t.Fatal(err)
+	}
+	server.namespace = "registry.example"
+	server.setOfflineMode(true)
+
+	logged := captureDaemonLog(t)
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, httptest.NewRequest(http.MethodHead, "/v2/demo/manifests/stable", nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", recorder.Code)
+	}
+	want := "mirror offline miss: demo:stable (upstream namespace registry.example): 1 of 1 linux/" + runtime.GOARCH + " layers not cached"
+	if got := logged.String(); !strings.Contains(got, want) {
+		t.Fatalf("daemon log = %q, want missing-layer reason", got)
+	}
+}
+
+func TestOnlineStaleReplayLogsReasonAndReference(t *testing.T) {
+	server, _, _ := newCompleteStaleFixture(t)
+	server.namespace = "registry.example"
+	server.client.Transport = roundTripFunc(func(*http.Request) *http.Response {
+		return retryResponse(http.StatusTooManyRequests, "30")
+	})
+	logged := captureDaemonLog(t)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodHead, "/v2/demo/manifests/stable", nil)
+	request.Header.Set("Authorization", "Bearer must-not-leak")
+	server.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	line := logged.String()
+	for _, want := range []string{"mirror served stale: registry.example/demo:stable", "upstream status 429", "cache complete for linux/"} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("daemon log = %q, want substring %q", line, want)
+		}
+	}
+	if strings.Contains(line, "must-not-leak") {
+		t.Fatalf("daemon log leaked auth token: %q", line)
 	}
 }

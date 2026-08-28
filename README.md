@@ -24,17 +24,22 @@ Released binaries come from the Homebrew tap:
 
 ```sh
 brew install randax/tap/tbx
-sudo tbx system install
+tbx system install
 tbx doctor
 ```
 
-After `brew upgrade tbx`, run `sudo tbx system install` again: the launchd helper keeps running the previous binary until it is reinstalled, and `tbx` refuses a helper that speaks an older protocol until then.
+Homebrew and mise/manual installs do not mix; choose one triad (`tbx`, `tbxd`, and
+`tbx-helper`) and keep it together. `tbx system install` automatically re-executes the absolute
+client path through sudo when privilege is needed. After `brew upgrade tbx`, run it again: the
+launchd helper keeps running the previous binary until it is reinstalled, and `tbx` refuses a
+helper that speaks an older protocol until then. For an explicit privileged invocation, use
+`sudo "$(command -v tbx)" system install`, never a PATH-dependent `sudo tbx ...`.
 
 Or build from source:
 
 ```sh
 make build
-sudo bin/tbx system install
+bin/tbx system install
 bin/tbx doctor
 ```
 
@@ -199,7 +204,7 @@ Suspend/resume is capability-gated by the host backend:
   instead of resuming it when a workload cannot tolerate a clock jump (certificate validity
   windows, leases, time-series writers).
 
-On macOS, `sudo tbx system uninstall` removes the helper and resolver integration. On Linux,
+On macOS, `tbx system uninstall` removes the helper and resolver integration. On Linux,
 remove or disable the systemd units installed by the selected installation method.
 
 ### 5. Prepare and inspect the offline cache
@@ -216,6 +221,7 @@ ghcr.io/example/app:v2.4.1@sha256:<64-hex-digest>
 
 ```sh
 tbx cache warm workshop-images.txt more-images.txt # any number of lists; `-` reads stdin once
+tbx cache warm --refresh workshop-images.txt        # revalidate complete, unpinned tags
 tbx cache warm --check workshop-images.txt         # verify locally, without downloading
 tbx cache warm --check --deep workshop-images.txt  # also rehash cached blobs
 tbx cache list                                     # disk images and mirror-cache totals
@@ -232,19 +238,35 @@ digested ref is answered `cached` or `not cached (<reason>)` and exits 0 either 
 unpinnable ref (`:latest`, tagless, no registry host) is rejected with an error and a non-zero
 exit rather than an answer.
 
-Blank lines and lines beginning with `#` are ignored. `--check` verifies the cached manifest
-graph and host-platform image offline; `--deep` is valid only with `--check` and adds only a
-rehash of the cached blobs. Neither runs a live-cluster pull test. Both modes also verify the
+Blank lines and lines beginning with `#` are ignored. By default, warm resumes incomplete refs
+and makes no upstream request for complete refs. `--refresh` revalidates complete unpinned tags;
+digest-pinned refs do not need freshness resolution, and a transient refresh failure is nonfatal
+when the existing cache is complete.
+
+**Complete** means the tag mapping (when the ref uses a tag), root manifest, selected
+`linux/<arch>` manifest, config, and every selected-platform layer are all present locally.
+`--check` verifies exactly that graph offline; `--deep` is valid only with `--check` and adds only
+a rehash of the cached blobs. Missing pieces are structured, for example
+`✗ <ref> index present; linux/<arch> manifest <digest> not cached` or
+`✗ <ref> <n> of <total> linux/<arch> layers not cached: <digest>, ...`; a manifest-only 200 is
+not complete. Neither check runs a live-cluster pull test. Both modes also verify the
 images every node needs before any pod can start but that no list can name — the CRI pod sandbox
 (`registry.k8s.io/pause`) image — so neither mode reports the cache complete while that image is
 missing, and the gap surfaces while it can still be pulled instead of deadlocking every static
 pod offline. `--deep` still catches what a plain `--check` cannot — a blob that is present but
 whose bytes no longer match its digest — so `--check --deep` remains the pre-travel gate.
 
-`tbx mirror offline` reports whether the pull-through mirror may reach upstream registries;
-`tbx mirror offline on` serves cached public/upstream content only (uncached content fails), and
-`off` restores normal pull-through behavior. New machine configs use the catch-all mirror at the
-cluster gateway with `skipFallback: true`, so public/upstream pulls cannot bypass it. Syntactic
+While online, complete cached content remains pullable during transient upstream failures. The
+daemon records that decision as
+`mirror served stale: <host>/<repository>:<tag> (upstream <reason>; cache complete for linux/<arch>)`.
+Anonymous Bearer challenges and `Retry-After` are handled generically; no registry-specific quota
+is promised.
+
+`tbx mirror offline` reports whether the pull-through mirror may reach upstream registries.
+The mirror and the node resolver are two policy layers: offline stops the mirror from reaching
+registries; cache misses return 404. An explicit mirror entry with `skipFallback: false` may fall
+through to upstream. talos-box's generated `"*"` entry uses `skipFallback: true`, so it remains a
+hard miss. `tbx mirror offline off` restores normal pull-through behavior. Syntactic
 loopback registries (`localhost`, loopback IPv4, and loopback IPv6, optionally with a port) are
 the deliberate exception: the mirror redirects the request back to that registry inside the
 node, including while mirror-offline mode is on. Transport follows containerd's localhost
@@ -258,7 +280,7 @@ Offline mode persists across a daemon restart and changes how public/upstream pu
 while it is on `tbx status` heads its listing with a banner and `tbx doctor` reports it as a
 `WARN mirror-offline` line. Each miss is also logged as
 `mirror offline miss: <ref> (upstream namespace <host>)` in the daemon log, so an
-`ImagePullBackOff` whose node event shows only a bare 503 is greppable with `tbx logs`.
+`ImagePullBackOff` is greppable with `tbx logs`.
 
 `tbx cache pull` with no flags reads `talosbox.yaml` the way `tbx up` does: it resolves every
 cluster's Talos version, schematic, and extensions with inheritance applied, performs any

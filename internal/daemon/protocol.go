@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/randax/talos-box/internal/talosversion"
+	"github.com/randax/talos-box/internal/version"
 )
 
 // DefaultTalosVersion and MinTalosVersion mirror the pinned support window;
@@ -74,7 +75,12 @@ const (
 // serviceProbe fields. Kubelet remains as the protocol-v11 compatibility
 // projection, while newer clients can distinguish an empty list from a probe
 // that lacked credentials or failed (#482).
-const ProtocolVersion = 16
+// Version 17 adds the additive daemon.info runtime identity fields Version,
+// Executable, and PID. Package 3 also uses protocol 17 for additive cache
+// warm/check argument and result fields (refresh, refreshWarning, and typed
+// failure counts/statuses), so both changes ship under the same negotiated
+// wire version (#488 #490 #492).
+const ProtocolVersion = 17
 
 // Request is one newline-delimited daemon request.
 type Request struct {
@@ -103,7 +109,10 @@ func (r Response) IsProgress() bool { return r.Stage != "" }
 
 // Info reports daemon wire compatibility details.
 type Info struct {
-	ProtocolVersion int `json:"protocolVersion"`
+	ProtocolVersion int    `json:"protocolVersion"`
+	Version         string `json:"version,omitempty"`
+	Executable      string `json:"executable,omitempty"`
+	PID             int    `json:"pid,omitempty"`
 	// BalloonReserveMiB is the host-memory reserve the daemon's
 	// provision-start gate actually measures against. It is read in the daemon
 	// process, where TBX_BALLOON_RESERVE_MIB takes effect, so a CLI reporting
@@ -167,11 +176,46 @@ func Call(socketPath, op string, args any) (Response, error) {
 }
 
 func success(data any) Response {
+	data = enrichInfo(data)
 	raw, err := json.Marshal(data)
 	if err != nil {
 		return failure(fmt.Errorf("encode response: %w", err))
 	}
 	return Response{OK: true, Data: raw}
+}
+
+func enrichInfo(data any) any {
+	switch info := data.(type) {
+	case Info:
+		return populateInfoIdentity(info)
+	case *Info:
+		if info == nil {
+			return data
+		}
+		enriched := populateInfoIdentity(*info)
+		*info = enriched
+		return info
+	default:
+		return data
+	}
+}
+
+func populateInfoIdentity(info Info) Info {
+	if info.ProtocolVersion == 0 {
+		info.ProtocolVersion = ProtocolVersion
+	}
+	if info.Version == "" {
+		info.Version = version.Version
+	}
+	if info.Executable == "" {
+		if executable, err := os.Executable(); err == nil {
+			info.Executable = executable
+		}
+	}
+	if info.PID == 0 {
+		info.PID = os.Getpid()
+	}
+	return info
 }
 
 func failure(err error) Response {

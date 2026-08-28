@@ -19,7 +19,7 @@ func TestCheckPassesOfflineAfterCompletedWarm(t *testing.T) {
 	fixture := newCheckManifestFixture(t)
 	defer fixture.manager.Close()
 
-	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64)
+	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,8 +37,25 @@ func TestCheckPassesOfflineAfterCompletedWarm(t *testing.T) {
 	}
 }
 
+func TestCheckDoesNotRequireForeignPlatformChildren(t *testing.T) {
+	cacheRoot := t.TempDir()
+	manager := newManagerWithPorts(cacheRoot, nil, 0)
+	fixture := newCompletenessFixtureAt(t, filepath.Join(cacheRoot, "registry.example"))
+	if err := os.Remove(fixture.server.manifestPath(manifestRequestPath("demo", fixture.foreignDigest))); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := manager.Check(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Complete != 1 || summary.Failed != 0 {
+		t.Fatalf("check summary = %+v", summary)
+	}
+}
+
 func TestCheckCachedManifestUsesVerifiedLegacyDigest(t *testing.T) {
-	data := []byte(`{"schemaVersion":2}`)
+	data := []byte(manifestBody)
 	digest := "sha256:" + sha256Hex(data)
 	server := NewServer("https://registry.example", t.TempDir())
 	legacyPath := server.legacyManifestPath("/v2/a/b/manifests/" + digest)
@@ -62,7 +79,7 @@ func TestCheckFailsWhenChildManifestIsMissing(t *testing.T) {
 	fixture := newCheckIndexFixture(t)
 	defer fixture.manager.Close()
 
-	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64)
+	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,6 +100,49 @@ func TestCheckFailsWhenChildManifestIsMissing(t *testing.T) {
 	}
 	if len(checkSummary.Results) != 1 || !strings.Contains(checkSummary.Results[0].Error, fixture.childDigest) {
 		t.Fatalf("check result = %+v, want missing child manifest digest", checkSummary.Results)
+	}
+}
+
+func TestCheckFailsWhenNestedSelectedManifestBlobsAreMissing(t *testing.T) {
+	cacheRoot := t.TempDir()
+	manager := newManagerWithPorts(cacheRoot, nil, 0)
+	defer manager.Close()
+	manager.offline.Store(true)
+	fixture := newNestedCompletenessFixtureAt(t, filepath.Join(cacheRoot, "registry.example"), false)
+
+	summary, err := manager.Check(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Complete != 0 || summary.Failed != 1 {
+		t.Fatalf("check summary = %+v", summary)
+	}
+	if len(summary.Results) != 1 || !strings.Contains(summary.Results[0].Error, fixture.configDigest) {
+		t.Fatalf("check result = %+v, want missing nested config digest", summary.Results)
+	}
+
+	request := httptest.NewRequest(http.MethodHead, "/v2/demo/manifests/stable?ns=registry.example", nil)
+	recorder := httptest.NewRecorder()
+	manager.serveCatchAll(recorder, request)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("offline nested HEAD = %d, want 404", recorder.Code)
+	}
+	if got := recorder.Header().Get(reasonHeader); got != reasonOfflineNotCached {
+		t.Fatalf("%s = %q, want %q", reasonHeader, got, reasonOfflineNotCached)
+	}
+}
+
+func TestCheckPassesWhenNestedSelectedManifestBlobsArePresent(t *testing.T) {
+	cacheRoot := t.TempDir()
+	manager := newManagerWithPorts(cacheRoot, nil, 0)
+	newNestedCompletenessFixtureAt(t, filepath.Join(cacheRoot, "registry.example"), true)
+
+	summary, err := manager.Check(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Complete != 1 || summary.Failed != 0 {
+		t.Fatalf("check summary = %+v", summary)
 	}
 }
 
@@ -135,7 +195,7 @@ func TestCheckFailsWhenHostBlobIsMissing(t *testing.T) {
 	fixture := newCheckManifestFixture(t)
 	defer fixture.manager.Close()
 
-	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64)
+	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +223,7 @@ func TestCheckFailsWhenHostBlobIsSymlinked(t *testing.T) {
 	fixture := newCheckManifestFixture(t)
 	defer fixture.manager.Close()
 
-	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64)
+	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +259,7 @@ func TestCheckDeepCatchesCorruptBlobButPlainCheckDoesNot(t *testing.T) {
 	fixture := newCheckManifestFixture(t)
 	defer fixture.manager.Close()
 
-	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64)
+	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,8 +320,8 @@ func TestCheckRejectsMalformedBlobDigestWithoutPathEscape(t *testing.T) {
 	if summary.Complete != 0 || summary.Failed != 1 {
 		t.Fatalf("check summary = %+v", summary)
 	}
-	if len(summary.Results) != 1 || !strings.Contains(summary.Results[0].Error, "../sentinel") {
-		t.Fatalf("check result = %+v, want malformed digest failure", summary.Results)
+	if len(summary.Results) != 1 || !strings.Contains(summary.Results[0].Error, "invalid manifest: config descriptor has invalid digest: invalid digest reference") {
+		t.Fatalf("check result = %+v, want invalid manifest digest failure", summary.Results)
 	}
 }
 
@@ -290,8 +350,8 @@ func TestCheckRejectsMalformedChildManifestDigest(t *testing.T) {
 	if summary.Complete != 0 || summary.Failed != 1 {
 		t.Fatalf("check summary = %+v", summary)
 	}
-	if len(summary.Results) != 1 || !strings.Contains(summary.Results[0].Error, "../child") {
-		t.Fatalf("check result = %+v, want malformed child digest failure", summary.Results)
+	if len(summary.Results) != 1 || !strings.Contains(summary.Results[0].Error, "invalid manifest: manifest descriptor has invalid digest at manifests[0]: invalid digest reference") {
+		t.Fatalf("check result = %+v, want invalid child manifest digest failure", summary.Results)
 	}
 }
 
@@ -299,7 +359,7 @@ func TestCheckRejectsSymlinkedBlobInPlainMode(t *testing.T) {
 	fixture := newCheckManifestFixture(t)
 	defer fixture.manager.Close()
 
-	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64)
+	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -422,7 +482,7 @@ func TestCheckAllowsEmptyBlobInPlainMode(t *testing.T) {
 	manager.dialContext = egress.dialContext
 	defer manager.Close()
 
-	summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64)
+	summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -444,7 +504,7 @@ func TestCheckUsesNoNetworkWhenCacheIsComplete(t *testing.T) {
 	fixture := newCheckManifestFixture(t)
 	defer fixture.manager.Close()
 
-	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64)
+	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -568,7 +628,11 @@ func TestOpenCheckedRegularFileRejectsPathSwapAfterOpen(t *testing.T) {
 	if renameErr := os.Rename(replacement, path); renameErr != nil {
 		t.Fatal(renameErr)
 	}
-	err = validateOpenedRegularFile(path, info)
+	pathInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = validateOpenedRegularFile(path, pathInfo, info)
 	if err == nil || !strings.Contains(err.Error(), "changed during open") {
 		t.Fatalf("validateOpenedRegularFile() error = %v, want changed-during-open failure", err)
 	}
@@ -578,7 +642,7 @@ func TestCheckRejectsSymlinkedManifestInPlainMode(t *testing.T) {
 	fixture := newCheckManifestFixture(t)
 	defer fixture.manager.Close()
 
-	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64)
+	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

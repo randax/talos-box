@@ -59,6 +59,35 @@ func TestProtocolRoundTrip(t *testing.T) {
 	}
 }
 
+func TestHelperInfoRoundTripJSONIncludesRuntimeIdentity(t *testing.T) {
+	t.Parallel()
+
+	want := Info{
+		ProtocolVersion:          ProtocolVersion,
+		Version:                  "0.1.3",
+		Executable:               "/opt/current/tbx-helper",
+		PID:                      4242,
+		EffectiveCapabilities:    0x3400,
+		EffectiveCapabilityNames: []string{"CAP_NET_ADMIN", "CAP_NET_RAW"},
+	}
+	encoded, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{`"version":"0.1.3"`, `"executable":"/opt/current/tbx-helper"`, `"pid":4242`} {
+		if !strings.Contains(string(encoded), field) {
+			t.Fatalf("helper info JSON missing %s: %s", field, encoded)
+		}
+	}
+	var got Info
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("helper info round trip = %+v, want %+v", got, want)
+	}
+}
+
 func TestSCMRightsResponse(t *testing.T) {
 	t.Parallel()
 
@@ -222,16 +251,16 @@ func TestDetachRequiresNames(t *testing.T) {
 func TestProtocolVersionMatchesTheNixSmokeTest(t *testing.T) {
 	t.Parallel()
 
-	if protocolVersion != 5 {
-		t.Fatalf("protocolVersion = %d, want 5 (net.sync)", protocolVersion)
+	if ProtocolVersion != 5 {
+		t.Fatalf("ProtocolVersion = %d, want 5 (net.sync with additive identity fields)", ProtocolVersion)
 	}
 	raw, err := os.ReadFile(filepath.Join("..", "..", "nix", "vm-test.nix"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		fmt.Sprintf(`"args": {"protocolVersion": %d}`, protocolVersion),
-		fmt.Sprintf(`response["data"]["protocolVersion"] == %d`, protocolVersion),
+		fmt.Sprintf(`"args": {"protocolVersion": %d}`, ProtocolVersion),
+		fmt.Sprintf(`response["data"]["protocolVersion"] == %d`, ProtocolVersion),
 	} {
 		if !strings.Contains(string(raw), want) {
 			t.Fatalf("nix/vm-test.nix does not contain %q", want)

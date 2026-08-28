@@ -24,6 +24,7 @@ import (
 	"github.com/randax/talos-box/internal/helper"
 	"github.com/randax/talos-box/internal/hypervisor"
 	"github.com/randax/talos-box/internal/imagecache"
+	"github.com/randax/talos-box/internal/mirror"
 	"github.com/randax/talos-box/internal/provision"
 	"github.com/randax/talos-box/internal/talosversion"
 )
@@ -111,7 +112,8 @@ type CachePullCombination struct {
 }
 
 type CacheWarmArgs struct {
-	Refs []string `json:"refs"`
+	Refs    []string `json:"refs"`
+	Refresh bool     `json:"refresh,omitempty"`
 }
 
 type CacheCheckArgs struct {
@@ -409,28 +411,31 @@ type CachePullImage struct {
 type CacheWarmStatus string
 
 const (
-	CacheWarmStatusWarmed          CacheWarmStatus = "warmed"
-	CacheWarmStatusAlreadyComplete CacheWarmStatus = "already-complete"
-	CacheWarmStatusFailed          CacheWarmStatus = "failed"
+	CacheWarmStatusWarmed           CacheWarmStatus = "warmed"
+	CacheWarmStatusAlreadyComplete  CacheWarmStatus = "already-complete"
+	CacheWarmStatusFailedMissing    CacheWarmStatus = "failed-missing"
+	CacheWarmStatusFailedRevalidate CacheWarmStatus = "failed-revalidate"
+	// CacheWarmStatusFailed is retained for tolerant rendering of a response
+	// from a legacy daemon. Protocol 17 peers return a typed failure.
+	CacheWarmStatusFailed CacheWarmStatus = "failed"
 )
 
 type CacheWarmEntry struct {
-	Ref    string          `json:"ref"`
-	Status CacheWarmStatus `json:"status"`
-	Reason string          `json:"reason,omitempty"`
-	// ReResolvedTag records that the ref named a tag and the tag was
-	// resolved upstream again, which is where a no-op re-warm spends its
-	// time. An older daemon leaves it unset (#405).
-	ReResolvedTag bool `json:"reResolvedTag,omitempty"`
+	Ref            string          `json:"ref"`
+	Status         CacheWarmStatus `json:"status"`
+	Reason         string          `json:"reason,omitempty"`
+	RefreshWarning string          `json:"refreshWarning,omitempty"`
+	ReResolvedTag  bool            `json:"reResolvedTag,omitempty"`
 }
 
 type CacheWarmResult struct {
-	Entries         []CacheWarmEntry `json:"entries"`
-	Warmed          int              `json:"warmed"`
-	AlreadyComplete int              `json:"alreadyComplete"`
-	Failed          int              `json:"failed"`
-	// ReResolvedTags counts the entries whose tag was re-resolved upstream.
-	ReResolvedTags int `json:"reResolvedTags,omitempty"`
+	Entries          []CacheWarmEntry `json:"entries"`
+	Warmed           int              `json:"warmed"`
+	AlreadyComplete  int              `json:"alreadyComplete"`
+	Failed           int              `json:"failed"`
+	FailedMissing    int              `json:"failedMissing"`
+	FailedRevalidate int              `json:"failedRevalidate"`
+	ReResolvedTags   int              `json:"reResolvedTags,omitempty"`
 }
 
 const cacheWarmTimeout = 2 * time.Hour
@@ -1923,11 +1928,15 @@ func (s *Server) warmMirrorCache(raw json.RawMessage) (CacheWarmResult, error) {
 			return CacheWarmResult{}, err
 		}
 	}
-	if s.warmCache == nil {
+	if s.warmCache == nil && s.warmCacheWithOptions == nil {
 		return CacheWarmResult{}, errors.New("cache warm is not configured")
 	}
 	ctx, cancel := s.lifecycleTimeoutContext(cacheWarmTimeout)
 	defer cancel()
+	if s.warmCacheWithOptions != nil {
+		summary, err := s.warmCacheWithOptions(ctx, args.Refs, s.imageArchitecture(), mirror.WarmOptions{Refresh: args.Refresh})
+		return cacheWarmResult(summary), err
+	}
 	return s.warmCache(ctx, args.Refs, s.imageArchitecture())
 }
 

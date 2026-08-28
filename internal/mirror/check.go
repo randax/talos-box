@@ -35,7 +35,7 @@ func (m *Manager) Check(ctx context.Context, references []string, architecture i
 		if err := ctx.Err(); err != nil {
 			return summary, err
 		}
-		err := m.checkOne(ctx, reference, string(architecture), deep)
+		err := m.checkOne(ctx, reference, architecture, deep)
 		item := CheckResult{Ref: reference}
 		if err != nil {
 			item.Error = err.Error()
@@ -48,7 +48,7 @@ func (m *Manager) Check(ctx context.Context, references []string, architecture i
 	return summary, nil
 }
 
-func (m *Manager) checkOne(ctx context.Context, reference, hostArch string, deep bool) error {
+func (m *Manager) checkOne(ctx context.Context, reference string, architecture imagecache.Architecture, deep bool) error {
 	parsed, err := parseWarmReference(reference)
 	if err != nil {
 		return err
@@ -59,75 +59,17 @@ func (m *Manager) checkOne(ctx context.Context, reference, hostArch string, deep
 	}
 	server := &Server{cacheDir: filepath.Join(m.cacheRoot, authority.cacheKey)}
 
-	listedPath := manifestRequestPath(parsed.repository, parsed.listedRef)
-	body, resolvedDigest, err := checkCachedManifest(ctx, server, listedPath, parsed.pinnedDigest)
-	if err != nil {
-		return err
+	target := CacheTarget{
+		Repository: parsed.repository,
+		Digest:     parsed.pinnedDigest,
+		Platform:   Platform{OS: "linux", Architecture: architecture},
 	}
-
-	seenManifests := map[string]bool{}
-	seenBlobs := map[string]bool{}
-	if resolvedDigest != "" {
-		seenManifests[resolvedDigest] = true
+	if !isDigestReference(parsed.listedRef) {
+		target.Tag = parsed.listedRef
 	}
-	if parsed.listedRef != resolvedDigest {
-		digestPath := manifestRequestPath(parsed.repository, resolvedDigest)
-		if _, _, err := checkCachedManifest(ctx, server, digestPath, resolvedDigest); err != nil {
-			return fmt.Errorf("resolved manifest %s: %w", resolvedDigest, err)
-		}
-	}
-	return checkManifestGraph(ctx, server, parsed.repository, body, hostArch, deep, seenManifests, map[string]bool{}, seenBlobs)
-}
-
-func checkManifestGraph(ctx context.Context, server *Server, repository string, body []byte, hostArch string, deep bool, seenManifests, checkedHostManifests, seenBlobs map[string]bool) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	kind, children, blobs, err := analyzeWarmManifest(body)
-	if err != nil {
-		return err
-	}
-	if kind == "manifest" {
-		for _, blob := range blobs {
-			if seenBlobs[blob] {
-				continue
-			}
-			seenBlobs[blob] = true
-			if err := checkCachedBlob(ctx, server, blob, deep); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-
-	matchedHost := false
-	for _, child := range children {
-		if _, _, err := checkedSupportedDigest(child.digest); err != nil {
-			return fmt.Errorf("child manifest %s invalid: %w", child.digest, err)
-		}
-		hostMatch := child.architecture == hostArch && (child.os == "" || child.os == "linux")
-		if hostMatch {
-			matchedHost = true
-		}
-		childPath := manifestRequestPath(repository, child.digest)
-		var childBody []byte
-		if !seenManifests[child.digest] || (hostMatch && !checkedHostManifests[child.digest]) {
-			var err error
-			childBody, _, err = checkCachedManifest(ctx, server, childPath, child.digest)
-			if err != nil {
-				return fmt.Errorf("child manifest %s: %w", child.digest, err)
-			}
-			seenManifests[child.digest] = true
-		}
-		if hostMatch && !checkedHostManifests[child.digest] {
-			checkedHostManifests[child.digest] = true
-			if err := checkManifestGraph(ctx, server, repository, childBody, hostArch, deep, seenManifests, checkedHostManifests, seenBlobs); err != nil {
-				return err
-			}
-		}
-	}
-	if !matchedHost {
-		return fmt.Errorf("no linux/%s manifest found in index", hostArch)
+	status := server.InspectCached(ctx, target, InspectOptions{Deep: deep})
+	if !status.Complete() {
+		return errors.New(status.Reason())
 	}
 	return nil
 }
@@ -161,28 +103,6 @@ func checkCachedManifest(ctx context.Context, server *Server, requestPath, expec
 		return nil, "", fmt.Errorf("%s invalid: %w", requestPath, err)
 	}
 	return data, resolvedDigest, nil
-}
-
-func checkCachedBlob(ctx context.Context, server *Server, digest string, deep bool) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if _, _, err := checkedSupportedDigest(digest); err != nil {
-		return fmt.Errorf("blob %s invalid: %w", digest, err)
-	}
-	path := server.blobPath(digest)
-	file, _, err := openCheckedRegularFile(path)
-	if err != nil {
-		return fmt.Errorf("blob %s not cached", digest)
-	}
-	defer func() { _ = file.Close() }()
-	if !deep {
-		return nil
-	}
-	if err := verifyBlobFile(file, digest); err != nil {
-		return fmt.Errorf("blob %s corrupted: %w", digest, err)
-	}
-	return nil
 }
 
 func verifyBlobFile(file *os.File, digest string) error {
@@ -285,6 +205,13 @@ func checkedCachedManifestMetadataAtPath(requestPath, path string, data []byte) 
 }
 
 func openCheckedRegularFile(path string) (*os.File, os.FileInfo, error) {
+	pathInfo, err := os.Lstat(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	if pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() {
+		return nil, nil, fmt.Errorf("cached file is not a regular file")
+	}
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, nil, err
@@ -294,7 +221,7 @@ func openCheckedRegularFile(path string) (*os.File, os.FileInfo, error) {
 		_ = file.Close()
 		return nil, nil, err
 	}
-	if err := validateOpenedRegularFile(path, info); err != nil {
+	if err := validateOpenedRegularFile(path, pathInfo, info); err != nil {
 		_ = file.Close()
 		return nil, nil, err
 	}
@@ -312,11 +239,7 @@ func openRegularFileInfo(file *os.File) (os.FileInfo, error) {
 	return info, nil
 }
 
-func validateOpenedRegularFile(path string, info os.FileInfo) error {
-	pathInfo, err := os.Lstat(path)
-	if err != nil {
-		return err
-	}
+func validateOpenedRegularFile(path string, pathInfo, info os.FileInfo) error {
 	if pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() {
 		return fmt.Errorf("cached file is not a regular file")
 	}

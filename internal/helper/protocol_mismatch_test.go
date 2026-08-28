@@ -16,7 +16,7 @@ import (
 // whichever GOOS runs the tests.
 func hostAdviceCommand() string {
 	if runtime.GOOS == "linux" {
-		return "systemctl restart tbx-helper.service"
+		return "systemctl restart tbx-helper.socket"
 	}
 	return "tbx system install"
 }
@@ -128,6 +128,18 @@ func TestProtocolMismatchAdviceQuotesPathsWithSpaces(t *testing.T) {
 	}
 }
 
+func TestProtocolMismatchAdviceUsesCurrentAbsoluteTBXWhenKnown(t *testing.T) {
+	t.Parallel()
+
+	advice := protocolMismatchAdviceFor("/usr/local/Cellar/talos-box/bin/tbxd", nil)
+	if !strings.Contains(advice, "sudo /usr/local/Cellar/talos-box/bin/tbx system install") {
+		t.Fatalf("advice %q missing the current absolute tbx path", advice)
+	}
+	if strings.Contains(advice, "sudo tbx system install") {
+		t.Fatalf("advice %q fell back to PATH lookup", advice)
+	}
+}
+
 // `tbx system install` installs the macOS launchd helper, which docs/linux.md
 // forbids on Linux: a Linux upgrader hitting the protocol bump has to be sent
 // to the package/systemd path instead (#448 follow-up).
@@ -138,7 +150,7 @@ func TestProtocolMismatchAdviceFollowsTheHostInstallMechanism(t *testing.T) {
 	if strings.Contains(linux, "system install") {
 		t.Errorf("Linux advice %q sends the operator to `tbx system install`", linux)
 	}
-	if !strings.Contains(linux, "tbx-helper") || !strings.Contains(linux, "systemctl restart tbx-helper.service") {
+	if !strings.Contains(linux, "tbx-helper") || !strings.Contains(linux, "systemctl restart tbx-helper.socket") {
 		t.Errorf("Linux advice %q missing the package upgrade and socket restart", linux)
 	}
 

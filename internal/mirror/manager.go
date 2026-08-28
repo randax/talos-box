@@ -214,9 +214,14 @@ func (m *Manager) serveCatchAll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, cacheErr.Error(), cacheErr.status)
 		return
 	}
+	cacheProbe := m.cacheProbeServer(authority)
+	stale := cacheProbe.staleCandidate(clone)
 	handler, ok := m.dynamicHandler(authority.cacheKey)
 	if !ok {
 		if err := m.validateResolvedAuthority(r.Context(), authority); err != nil {
+			if stale.Complete() && shouldServeStaleOnValidationError(err) && cacheProbe.serveStaleManifest(w, clone, stale, err.Error()) {
+				return
+			}
 			var validationErr *upstreamValidationError
 			if errors.As(err, &validationErr) {
 				http.Error(w, validationErr.Error(), validationErr.status)
@@ -247,10 +252,8 @@ func (m *Manager) probeCacheOnly(authority upstreamAuthority, w http.ResponseWri
 		return served, err
 	}
 	if server.offlineEnabled() {
-		return false, &cacheReplayError{
-			status: http.StatusServiceUnavailable,
-			err:    fmt.Errorf("mirror offline: content not cached"),
-		}
+		writeOfflineMiss(w, offlineNotCachedMessage)
+		return true, nil
 	}
 	return false, nil
 }
@@ -336,7 +339,7 @@ func redirectLoopbackAuthority(w http.ResponseWriter, r *http.Request, target *u
 func (m *Manager) validateResolvedAuthority(ctx context.Context, authority upstreamAuthority) error {
 	ips, err := m.resolveUpstreamIPs(ctx, authority.canonicalHost)
 	if err != nil {
-		return &upstreamValidationError{status: http.StatusBadGateway, err: fmt.Errorf("resolve ns %q: %w", authority.canonicalAuthority, err)}
+		return &upstreamValidationError{status: http.StatusBadGateway, err: &upstreamResolutionError{err: fmt.Errorf("resolve ns %q: %w", authority.canonicalAuthority, err)}}
 	}
 	hostIPs, err := m.hostOwnedIPs()
 	if err != nil {

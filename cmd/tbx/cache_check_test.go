@@ -408,6 +408,53 @@ func TestRunCacheWarmRejectsDeepWithoutCheck(t *testing.T) {
 	}
 }
 
+func TestRunCacheWarmCheckPrintsStructuredPlatformGap(t *testing.T) {
+	for _, reason := range []string{
+		"index present; linux/arm64 manifest sha256:1111 not cached",
+		"2 of 7 linux/arm64 layers not cached: sha256:2222, sha256:3333",
+	} {
+		t.Run(reason, func(t *testing.T) {
+			t.Setenv("HOME", shortTestHome(t))
+			socketPath, err := daemon.SocketPath()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			listener, err := net.Listen("unix", socketPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = listener.Close() }()
+
+			listPath := filepath.Join(t.TempDir(), "images.txt")
+			ref := provision.KubernetesSandboxImage
+			if err := os.WriteFile(listPath, []byte(ref+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan struct{})
+			go serveDaemonRequests(t, listener, 1, func(_ int, request daemon.Request) daemon.Response {
+				return daemon.Response{OK: true, Data: mustJSON(t, daemon.CacheCheckResult{
+					Entries: []daemon.CacheCheckEntry{{Ref: ref, Status: daemon.CacheCheckStatusFailed, Reason: reason}},
+					Failed:  1,
+				})}
+			}, done)
+
+			var stdout, stderr bytes.Buffer
+			command := cli{out: &stdout, err: &stderr, in: bytes.NewBuffer(nil)}
+			err = command.run([]string{"cache", "warm", "--check", listPath})
+			<-done
+			if err == nil {
+				t.Fatal("cache check succeeded, want structured gap failure")
+			}
+			if got := stdout.String(); !strings.Contains(got, "\u2717 "+ref+" "+reason+"\n") {
+				t.Fatalf("stdout = %q, want preserved reason %q", got, reason)
+			}
+		})
+	}
+}
+
 func TestRunCacheWarmCheckReportsEveryRefBeforeFailing(t *testing.T) {
 	t.Setenv("HOME", shortTestHome(t))
 	socketPath, err := daemon.SocketPath()

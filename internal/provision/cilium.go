@@ -849,8 +849,8 @@ func waitForAPIServer(ctx context.Context, config *rest.Config, interval time.Du
 
 // annotateAPIServerTimeout names the failure a deadline on the very first
 // API-server wait almost always hides when the mirror is offline: the CRI pod
-// sandbox image was never cached, so every static pod loops on a 503 from the
-// mirror and the control plane never comes up at all. The client this code
+// sandbox image was never cached, so every static pod loops on an offline miss
+// from the mirror and the control plane never comes up at all. The client this code
 // holds here talks to kube-apiserver, which by definition is not answering, so
 // no CRI or kubelet state is cheaply readable at this point — this is a
 // pointer at the check that settles it, not a verdict, and it is only added

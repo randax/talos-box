@@ -23,7 +23,7 @@ func TestMirrorOfflineFinding(t *testing.T) {
 			name:      "on warns prominently",
 			offline:   func() (bool, error) { return true, nil },
 			wantLevel: "WARN",
-			wantParts: []string{"mirror offline is on", "tbx mirror offline off"},
+			wantParts: []string{"mirror offline is on", "cache misses return 404", "node fallback depends on skipFallback", "tbx mirror offline off"},
 		},
 		{
 			name:      "off passes",
