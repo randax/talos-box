@@ -218,6 +218,18 @@ func collectRuntimeIdentity(ctx context.Context, deps runtimeIdentityDeps) runti
 				PID:       info.PID,
 				Available: true,
 			}
+			if info.Executable == "" && info.Version == "" {
+				// a wire-compatible helper built before identity reporting
+				// (#492): name it through the configured install path so
+				// the operator can still tell which binary is running
+				identity.Helper.Detail = "predates identity reporting"
+				if deps.helperConfiguredPath != nil {
+					if configured := deps.helperConfiguredPath(); configured.Path != "" {
+						identity.Helper.Path = configured.Path
+						identity.Helper.ConfiguredPathSource = configured.Source
+					}
+				}
+			}
 		} else {
 			var inactive runtimeIdentityInactiveError
 			var mismatch *helper.ProtocolMismatchError

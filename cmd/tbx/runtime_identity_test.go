@@ -364,3 +364,26 @@ func TestRuntimeIdentityNotesOtherPATHInstallWillBecomeIncompatibleForMismatches
 		})
 	}
 }
+
+func TestRuntimeIdentityNamesCompatibleHelperWithoutIdentityThroughConfiguredPath(t *testing.T) {
+	identity := collectRuntimeIdentity(context.Background(), runtimeIdentityDeps{
+		executable: func() (string, error) { return "/opt/current/tbx", nil },
+		helperProbe: func(context.Context) (helper.Info, error) {
+			return helper.Info{ProtocolVersion: helper.ProtocolVersion}, nil
+		},
+		helperConfiguredPath: func() configuredComponentPath {
+			return configuredComponentPath{Path: "/opt/current/tbx-helper", Source: "launchd"}
+		},
+	})
+	var output bytes.Buffer
+	if err := renderRuntimeIdentity(&output, identity); err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf("helper: /opt/current/tbx-helper (configured path from launchd; protocol %d; predates identity reporting)", helper.ProtocolVersion)
+	if got := output.String(); !strings.Contains(got, want) {
+		t.Fatalf("runtime output = %q, want %q", got, want)
+	}
+	if strings.Contains(output.String(), "FAIL runtime-compat") {
+		t.Fatalf("runtime output = %q, a wire-compatible helper must not fail runtime-compat", output.String())
+	}
+}
