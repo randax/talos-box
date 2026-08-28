@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-// TestOfflineMissIsLogged pins #403: containerd surfaces only a bare 503 to the
+// TestOfflineMissIsLogged pins #403: containerd surfaces only a bare status to the
 // kubelet event, so without a daemon-log line an offline miss leaves no
 // operator-visible trace anywhere in tbx.
 func TestOfflineMissIsLogged(t *testing.T) {
@@ -49,8 +49,8 @@ func TestOfflineMissIsLogged(t *testing.T) {
 				t.Fatal(err)
 			}
 			_ = resp.Body.Close()
-			if resp.StatusCode != http.StatusServiceUnavailable {
-				t.Fatalf("status = %d, want 503", resp.StatusCode)
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404", resp.StatusCode)
 			}
 			if got := logged.String(); !strings.Contains(got, test.want) {
 				t.Fatalf("daemon log = %q, want substring %q", got, test.want)
@@ -75,6 +75,7 @@ func TestOfflineHitIsNotLogged(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("warm status = %d, want 200", resp.StatusCode)
 	}
+	cacheTagDigestRoot(t, server, "app", "latest")
 	server.setOfflineMode(true)
 
 	logged := captureDaemonLog(t)
@@ -139,11 +140,36 @@ func TestOfflineMissLogsRequestedNamespace(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
 	}
 	want := "mirror offline miss: library/nginx:1.27.3 (upstream namespace docker.io)"
 	if got := logged.String(); !strings.Contains(got, want) {
 		t.Fatalf("daemon log = %q, want substring %q", got, want)
+	}
+}
+
+func TestOnlineStaleReplayLogsReasonAndReference(t *testing.T) {
+	server, _, _ := newCompleteStaleFixture(t)
+	server.namespace = "registry.example"
+	server.client.Transport = roundTripFunc(func(*http.Request) *http.Response {
+		return retryResponse(http.StatusTooManyRequests, "30")
+	})
+	logged := captureDaemonLog(t)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodHead, "/v2/demo/manifests/stable", nil)
+	request.Header.Set("Authorization", "Bearer must-not-leak")
+	server.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	line := logged.String()
+	for _, want := range []string{"mirror served stale: registry.example/demo:stable", "upstream status 429", "cache complete for linux/"} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("daemon log = %q, want substring %q", line, want)
+		}
+	}
+	if strings.Contains(line, "must-not-leak") {
+		t.Fatalf("daemon log leaked auth token: %q", line)
 	}
 }

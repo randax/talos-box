@@ -9,7 +9,18 @@ import (
 	"github.com/randax/talos-box/internal/daemon"
 )
 
+const mirrorOfflineHelp = `usage: tbx mirror offline [on|off]
+
+Offline stops the mirror from reaching registries; cache misses return 404.
+An explicit mirror entry with skipFallback: false may fall through to upstream.
+talos-box's generated "*" entry uses skipFallback: true, so it remains a hard miss.
+`
+
 func (c cli) runMirror(args []string) error {
+	if len(args) == 2 && args[0] == "offline" && (args[1] == "-h" || args[1] == "--help") {
+		_, err := fmt.Fprint(c.out, mirrorOfflineHelp)
+		return err
+	}
 	// Flags are separated from positionals before any verb judgement, the way
 	// runBGP does it: `tbx mirror --anything` is a flag mistake, and mirror
 	// takes no flags, so it earns the usage line rather than being reported as

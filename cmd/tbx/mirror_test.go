@@ -6,10 +6,33 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/randax/talos-box/internal/daemon"
 )
+
+func TestRunMirrorOfflineHelpExplainsMirrorAndFallbackPolicy(t *testing.T) {
+	for _, flag := range []string{"-h", "--help"} {
+		var stdout, stderr bytes.Buffer
+		command := cli{out: &stdout, err: &stderr}
+		if err := command.run([]string{"mirror", "offline", flag}); err != nil {
+			t.Fatalf("tbx mirror offline %s: %v", flag, err)
+		}
+		for _, want := range []string{
+			"cache misses return 404",
+			"skipFallback: false",
+			`generated "*" entry uses skipFallback: true`,
+		} {
+			if !strings.Contains(stdout.String(), want) {
+				t.Fatalf("help = %q, want substring %q", stdout.String(), want)
+			}
+		}
+		if stderr.Len() != 0 {
+			t.Fatalf("stderr = %q, want empty", stderr.String())
+		}
+	}
+}
 
 func TestRunMirrorOfflineReportsCurrentState(t *testing.T) {
 	t.Setenv("HOME", shortTestHome(t))

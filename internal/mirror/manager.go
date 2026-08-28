@@ -247,10 +247,8 @@ func (m *Manager) probeCacheOnly(authority upstreamAuthority, w http.ResponseWri
 		return served, err
 	}
 	if server.offlineEnabled() {
-		return false, &cacheReplayError{
-			status: http.StatusServiceUnavailable,
-			err:    fmt.Errorf("mirror offline: content not cached"),
-		}
+		writeOfflineMiss(w, offlineNotCachedMessage)
+		return true, nil
 	}
 	return false, nil
 }
