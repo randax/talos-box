@@ -233,7 +233,7 @@ func NewServer(ctx context.Context) (*Server, error) {
 		return server.mirrors.BoundGatewayIPs()
 	}
 	server.warmCache = func(ctx context.Context, refs []string, architecture imagecache.Architecture) (CacheWarmResult, error) {
-		summary, err := server.mirrors.Warm(ctx, refs, architecture)
+		summary, err := server.mirrors.Warm(ctx, refs, architecture, mirror.WarmOptions{})
 		if err != nil {
 			return CacheWarmResult{}, err
 		}

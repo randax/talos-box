@@ -19,7 +19,7 @@ func TestCheckPassesOfflineAfterCompletedWarm(t *testing.T) {
 	fixture := newCheckManifestFixture(t)
 	defer fixture.manager.Close()
 
-	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64)
+	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,6 +34,23 @@ func TestCheckPassesOfflineAfterCompletedWarm(t *testing.T) {
 	}
 	if summaryCheck.Complete != 1 || summaryCheck.Failed != 0 {
 		t.Fatalf("check summary = %+v", summaryCheck)
+	}
+}
+
+func TestCheckDoesNotRequireForeignPlatformChildren(t *testing.T) {
+	cacheRoot := t.TempDir()
+	manager := newManagerWithPorts(cacheRoot, nil, 0)
+	fixture := newCompletenessFixtureAt(t, filepath.Join(cacheRoot, "registry.example"))
+	if err := os.Remove(fixture.server.manifestPath(manifestRequestPath("demo", fixture.foreignDigest))); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := manager.Check(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Complete != 1 || summary.Failed != 0 {
+		t.Fatalf("check summary = %+v", summary)
 	}
 }
 
@@ -62,7 +79,7 @@ func TestCheckFailsWhenChildManifestIsMissing(t *testing.T) {
 	fixture := newCheckIndexFixture(t)
 	defer fixture.manager.Close()
 
-	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64)
+	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +152,7 @@ func TestCheckFailsWhenHostBlobIsMissing(t *testing.T) {
 	fixture := newCheckManifestFixture(t)
 	defer fixture.manager.Close()
 
-	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64)
+	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +180,7 @@ func TestCheckFailsWhenHostBlobIsSymlinked(t *testing.T) {
 	fixture := newCheckManifestFixture(t)
 	defer fixture.manager.Close()
 
-	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64)
+	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +216,7 @@ func TestCheckDeepCatchesCorruptBlobButPlainCheckDoesNot(t *testing.T) {
 	fixture := newCheckManifestFixture(t)
 	defer fixture.manager.Close()
 
-	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64)
+	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -299,7 +316,7 @@ func TestCheckRejectsSymlinkedBlobInPlainMode(t *testing.T) {
 	fixture := newCheckManifestFixture(t)
 	defer fixture.manager.Close()
 
-	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64)
+	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -422,7 +439,7 @@ func TestCheckAllowsEmptyBlobInPlainMode(t *testing.T) {
 	manager.dialContext = egress.dialContext
 	defer manager.Close()
 
-	summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64)
+	summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -444,7 +461,7 @@ func TestCheckUsesNoNetworkWhenCacheIsComplete(t *testing.T) {
 	fixture := newCheckManifestFixture(t)
 	defer fixture.manager.Close()
 
-	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64)
+	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -578,7 +595,7 @@ func TestCheckRejectsSymlinkedManifestInPlainMode(t *testing.T) {
 	fixture := newCheckManifestFixture(t)
 	defer fixture.manager.Close()
 
-	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64)
+	summary, err := fixture.manager.Warm(context.Background(), []string{fixture.ref}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

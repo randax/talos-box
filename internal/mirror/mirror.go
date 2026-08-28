@@ -319,6 +319,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					http.Error(w, mismatch.message(s.imageReference(r.URL.Path), pinSource(r.Context())), http.StatusConflict)
 					return
 				}
+				setReasonHeaders(w, reasonUpstreamManifestInvalid, err.Error())
 				http.Error(w, fmt.Sprintf("upstream manifest: %v", err), http.StatusBadGateway)
 				return
 			}
@@ -1171,8 +1172,9 @@ func decodeJSON(r io.Reader, destination any) error {
 const reasonHeader = "X-Talosbox-Reason"
 
 const (
-	reasonOfflineNotCached      = "offline-not-cached"
-	reasonOfflineCacheCorrupted = "offline-cache-corrupted"
+	reasonOfflineNotCached        = "offline-not-cached"
+	reasonOfflineCacheCorrupted   = "offline-cache-corrupted"
+	reasonUpstreamManifestInvalid = "upstream-manifest-invalid"
 )
 
 const (

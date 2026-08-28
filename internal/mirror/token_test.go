@@ -439,7 +439,7 @@ func TestWarmNegotiatesScopelessChallenge(t *testing.T) {
 	manager.dialContext = egress.dialContext
 	defer manager.Close()
 
-	summary, err := manager.Warm(context.Background(), []string{"registry.example/library/pause:3.10"}, imagecache.ArchitectureAMD64)
+	summary, err := manager.Warm(context.Background(), []string{"registry.example/library/pause:3.10"}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
