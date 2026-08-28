@@ -19,8 +19,9 @@ import (
 // The helper only performs short admin operations, so every interaction is
 // bounded: a stuck helper must not wedge daemon shutdown or cluster ops.
 const (
-	dialTimeout = 5 * time.Second
-	callTimeout = 30 * time.Second
+	dialTimeout  = 5 * time.Second
+	callTimeout  = 30 * time.Second
+	probeTimeout = time.Second
 )
 
 // Client is a serialized connection to tbx-helper.
@@ -37,21 +38,36 @@ func Connect() (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	connection, info, err := dialHelper(socketPath)
+	connection, info, err := dialHelper(socketPath, dialTimeout, callTimeout, true)
 	if err != nil {
 		return nil, err
 	}
 	return &Client{socketPath: socketPath, connection: connection, info: info}, nil
 }
 
-func dialHelper(socketPath string) (*net.UnixConn, Info, error) {
-	dialer := net.Dialer{Timeout: dialTimeout}
+// Probe returns the helper's diagnostic identity without enforcing the protocol
+// match that Connect uses for operational traffic.
+func Probe() (Info, error) {
+	socketPath, err := SocketPath()
+	if err != nil {
+		return Info{}, err
+	}
+	connection, info, err := dialHelper(socketPath, probeTimeout, probeTimeout, false)
+	if err != nil {
+		return Info{}, err
+	}
+	_ = connection.Close()
+	return info, nil
+}
+
+func dialHelper(socketPath string, dialDeadline, handshakeDeadline time.Duration, requireProtocolMatch bool) (*net.UnixConn, Info, error) {
+	dialer := net.Dialer{Timeout: dialDeadline}
 	connection, err := dialer.Dial("unix", socketPath)
 	if err != nil {
 		return nil, Info{}, fmt.Errorf("connect to helper at %s: %w", socketPath, err)
 	}
 	unixConnection := connection.(*net.UnixConn)
-	info, err := handshakeHelper(unixConnection)
+	info, err := handshakeHelper(unixConnection, handshakeDeadline, requireProtocolMatch)
 	if err != nil {
 		_ = unixConnection.Close()
 		return nil, Info{}, err
@@ -316,7 +332,7 @@ func (c *Client) callLocked(op string, args any, wantFD bool) (Response, int, er
 
 func (c *Client) reconnectLocked() error {
 	_ = c.connection.Close()
-	connection, info, err := dialHelper(c.socketPath)
+	connection, info, err := dialHelper(c.socketPath, dialTimeout, callTimeout, true)
 	if err != nil {
 		return fmt.Errorf("reconnect to helper at %s: %w", c.socketPath, err)
 	}
@@ -325,8 +341,8 @@ func (c *Client) reconnectLocked() error {
 	return nil
 }
 
-func handshakeHelper(connection *net.UnixConn) (Info, error) {
-	response, _, err := exchangeRequest(connection, helperInfoOp, map[string]int{"protocolVersion": protocolVersion}, false)
+func handshakeHelper(connection *net.UnixConn, timeout time.Duration, requireProtocolMatch bool) (Info, error) {
+	response, _, err := exchangeRequest(connection, helperInfoOp, map[string]int{"protocolVersion": ProtocolVersion}, false, timeout)
 	if err != nil {
 		return Info{}, err
 	}
@@ -337,14 +353,14 @@ func handshakeHelper(connection *net.UnixConn) (Info, error) {
 	if err := json.Unmarshal(response.Data, &info); err != nil {
 		return Info{}, fmt.Errorf("decode helper info: %w", err)
 	}
-	if info.ProtocolVersion != protocolVersion {
-		return Info{}, protocolMismatchError(protocolVersion, info.ProtocolVersion)
+	if requireProtocolMatch && info.ProtocolVersion != ProtocolVersion {
+		return Info{}, protocolMismatchError(ProtocolVersion, info.ProtocolVersion)
 	}
 	return info, nil
 }
 
-func exchangeRequest(connection *net.UnixConn, op string, args any, wantFD bool) (Response, int, error) {
-	if err := connection.SetDeadline(time.Now().Add(callTimeout)); err != nil {
+func exchangeRequest(connection *net.UnixConn, op string, args any, wantFD bool, timeout time.Duration) (Response, int, error) {
+	if err := connection.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return Response{}, -1, fmt.Errorf("set helper call deadline: %w", err)
 	}
 	defer func() { _ = connection.SetDeadline(time.Time{}) }()

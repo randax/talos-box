@@ -420,9 +420,6 @@ func (s *Server) handle(uid uint32, request Request) (any, int, func(), error) {
 		if err := decodeArgs(request.Args, &args); err != nil {
 			return nil, -1, nil, err
 		}
-		if args.ProtocolVersion != protocolVersion {
-			return nil, -1, nil, protocolMismatchError(args.ProtocolVersion, protocolVersion)
-		}
 		return currentHelperInfo()
 	case "ping":
 		return map[string]bool{"pong": true}, -1, nil, nil

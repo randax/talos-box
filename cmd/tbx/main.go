@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -15,6 +16,7 @@ import (
 	"github.com/randax/talos-box/internal/config"
 	"github.com/randax/talos-box/internal/daemon"
 	"github.com/randax/talos-box/internal/extensions"
+	"github.com/randax/talos-box/internal/helper"
 	"github.com/randax/talos-box/internal/imagecache"
 	"github.com/randax/talos-box/internal/talosversion"
 	"github.com/randax/talos-box/internal/version"
@@ -26,6 +28,10 @@ type cli struct {
 	in  io.Reader
 	// daemon carries the connect-time protocol gate; a nil session skips it
 	daemon *daemonSession
+	// runtimeIdentityDeps is injected only by diagnostics tests; production
+	// commands use bounded, read-only local probes.
+	runtimeIdentityDeps *runtimeIdentityDeps
+	runtimeIdentity     func(context.Context) runtimeIdentity
 }
 
 func main() {
@@ -77,8 +83,11 @@ func (c cli) run(args []string) error {
 	case "doctor":
 		return c.runDoctor(args[1:])
 	case "version", "--version", "-v":
-		_, err := fmt.Fprintf(c.out, "tbx %s (%s/%s, daemon protocol %d)\n", version.Version, runtime.GOOS, runtime.GOARCH, daemon.ProtocolVersion)
-		return err
+		if _, err := fmt.Fprintf(c.out, "tbx %s (%s/%s, daemon protocol %d, helper protocol %d)\n",
+			version.Version, runtime.GOOS, runtime.GOARCH, daemon.ProtocolVersion, helper.ProtocolVersion); err != nil {
+			return err
+		}
+		return renderRuntimeIdentity(c.out, c.collectRuntimeIdentity(context.Background()))
 	case "help", "-h", "--help":
 		c.printHelp(c.out)
 		return nil

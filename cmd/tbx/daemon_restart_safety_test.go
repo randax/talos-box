@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net"
@@ -370,9 +371,41 @@ func TestSystemStatusReportsABusyDaemon(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("tbx system status hung on a busy daemon")
 	}
-	if got := stdout.String(); !strings.Contains(got, "tbxd: busy") ||
+	if got := stdout.String(); !strings.Contains(got, "runtime:") ||
+		!strings.Contains(got, "daemon: busy") ||
 		!strings.Contains(got, "pid") {
-		t.Fatalf("stdout = %q, want a busy report naming the pid", got)
+		t.Fatalf("stdout = %q, want a bounded runtime report naming the busy daemon pid", got)
+	}
+}
+
+func TestSystemStatusUsesRuntimeIdentityBlock(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	command := cli{
+		out: &stdout,
+		err: &stderr,
+		runtimeIdentity: func(context.Context) runtimeIdentity {
+			return runtimeIdentity{
+				Client: componentIdentity{Name: "client", Path: "/opt/current/tbx", Version: "0.1.3", Protocol: daemon.ProtocolVersion, Available: true},
+				Daemon: componentIdentity{Name: "daemon", Path: "/opt/current/tbxd", Version: "0.1.3", Protocol: daemon.ProtocolVersion, PID: 1234, Available: true},
+				Helper: componentIdentity{Name: "helper", Available: false, Detail: "not installed"},
+				Findings: []doctorFinding{
+					{level: "WARN", check: "installations", detail: "daemon executable /opt/current/tbxd does not match this client's sibling /opt/other/tbxd"},
+				},
+			}
+		},
+	}
+
+	if err := command.run([]string{"system", "status"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := stdout.String(); !strings.Contains(got, "runtime:\n") ||
+		!strings.Contains(got, "client: /opt/current/tbx") ||
+		!strings.Contains(got, "daemon: /opt/current/tbxd") ||
+		!strings.Contains(got, "helper: not installed") {
+		t.Fatalf("stdout = %q, want the shared runtime identity block", got)
+	}
+	if got := stderr.String(); !strings.Contains(got, "WARN installations: daemon executable /opt/current/tbxd does not match this client's sibling /opt/other/tbxd") {
+		t.Fatalf("stderr = %q, want runtime findings on stderr", got)
 	}
 }
 

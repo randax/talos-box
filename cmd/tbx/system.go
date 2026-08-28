@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -163,41 +164,33 @@ func refuseSupervisedRestart(force bool) error {
 // daemonStatus reports the running daemon without spawning one, so an operator
 // can see a protocol skew before it bites.
 func (c cli) daemonStatus() error {
-	socketPath, err := daemon.SocketPath()
-	if err != nil {
+	identity := c.collectRuntimeIdentity(context.Background())
+	runtimeBlock := identity
+	runtimeBlock.Findings = nil
+	if err := renderRuntimeIdentity(c.out, runtimeBlock); err != nil {
 		return err
 	}
-	info, pid, err := daemonHandshake(socketPath)
-	if err != nil {
-		var connectionError dialError
-		if errors.As(err, &connectionError) {
-			_, err := fmt.Fprintf(c.out, "tbxd: not running (tbx protocol %d)\n", daemon.ProtocolVersion)
+	compatHint := false
+	for _, finding := range identity.Findings {
+		if finding.check == "runtime-compat" {
+			compatHint = true
+		}
+		if finding.detail == "" {
+			if _, err := fmt.Fprintf(c.err, "%s %s\n", finding.level, finding.check); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, err := fmt.Fprintf(c.err, "%s %s: %s\n", finding.level, finding.check, finding.detail); err != nil {
 			return err
 		}
-		var busy busyDaemonError
-		if errors.As(err, &busy) {
-			// daemon.info waits on the operation lock; a long suspend or
-			// destroy must report as busy rather than hang the diagnostic
-			_, err := fmt.Fprintf(c.out, "tbxd: busy (pid %d; tbx protocol %d)\n", busy.pid, daemon.ProtocolVersion)
+	}
+	if compatHint {
+		if _, err := fmt.Fprintln(c.err, "warning: run: tbx system restart"); err != nil {
 			return err
 		}
-		return err
 	}
-	protocol := strconv.Itoa(info.ProtocolVersion)
-	if info.ProtocolVersion == 0 {
-		// pre-daemon.info builds cannot report a version at all
-		protocol = "unknown"
-	}
-	if _, err := fmt.Fprintf(c.out, "tbxd: running (pid %d, protocol %s; tbx protocol %d)\n",
-		pid, protocol, daemon.ProtocolVersion); err != nil {
-		return err
-	}
-	if info.ProtocolVersion == daemon.ProtocolVersion {
-		return nil
-	}
-	_, err = fmt.Fprintf(c.err, "warning: tbxd protocol %s does not match tbx protocol %d; run: tbx system restart\n",
-		protocol, daemon.ProtocolVersion)
-	return err
+	return nil
 }
 
 func (c cli) installSystem(args []string) error {
