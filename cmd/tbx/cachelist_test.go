@@ -141,6 +141,43 @@ func TestCacheListRefAnswersCachedAndNotCached(t *testing.T) {
 	}
 }
 
+func TestCacheListRefUsesSameStructuredCompletenessReason(t *testing.T) {
+	t.Setenv("HOME", shortTestHome(t))
+	socketPath, err := daemon.SocketPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	ref := "docker.io/library/busybox:1.37"
+	reason := "2 of 7 linux/amd64 layers not cached: sha256:2222, sha256:3333"
+	done := make(chan struct{})
+	go serveDaemonRequests(t, listener, 1, func(_ int, request daemon.Request) daemon.Response {
+		return daemon.Response{OK: true, Data: mustJSON(t, daemon.CacheCheckResult{
+			Entries: []daemon.CacheCheckEntry{{Ref: ref, Status: daemon.CacheCheckStatusFailed, Reason: reason}},
+			Failed:  1,
+		})}
+	}, done)
+
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr, in: bytes.NewBuffer(nil)}
+	if err := command.run([]string{"cache", "list", ref}); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	want := ref + ": not cached (" + reason + ")\n"
+	if got := stdout.String(); got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+}
+
 func TestCacheListRefRejectsAnInvalidReferenceBeforeCallingTheDaemon(t *testing.T) {
 	command := cli{out: &bytes.Buffer{}, err: &bytes.Buffer{}, in: bytes.NewBuffer(nil)}
 	if err := command.runCache([]string{"list", "not a ref"}); err == nil {

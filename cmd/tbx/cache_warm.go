@@ -24,15 +24,29 @@ func (c cli) runCacheWarm(args []string) error {
 	flags.SetOutput(c.err)
 	checkOnly := flags.Bool("check", false, "verify the warmed cache offline instead of downloading")
 	deep := flags.Bool("deep", false, "rehash cached blobs while checking")
+	refresh := flags.Bool("refresh", false, "revalidate complete unpinned tags before warming")
+	flags.Usage = func() {
+		_, _ = fmt.Fprintln(c.err, "Usage: tbx cache warm [--refresh] <list-file> [<list-file>...]")
+		_, _ = fmt.Fprintln(c.err, "       tbx cache warm --check [--deep] <list-file> [<list-file>...]")
+		_, _ = fmt.Fprintln(c.err, "")
+		_, _ = fmt.Fprintln(c.err, "By default, warm resumes incomplete refs and makes no upstream request for complete refs.")
+		_, _ = fmt.Fprintln(c.err, "--refresh revalidates complete unpinned tags; digest-pinned refs do not need freshness resolution.")
+		_, _ = fmt.Fprintln(c.err, "A transient refresh failure is nonfatal when the existing cache is complete.")
+		_, _ = fmt.Fprintln(c.err, "--check verifies tag mapping, selected linux/<arch> manifest, config, and all layers locally.")
+		_, _ = fmt.Fprintln(c.err, "--deep additionally hashes cached blobs.")
+	}
 	positionals, err := parseInterspersed(flags, args)
 	if err != nil {
 		return err
 	}
 	if len(positionals) == 0 {
-		return errors.New("usage: tbx cache warm [--check [--deep]] <list-file> [<list-file>...]")
+		return errors.New("usage: tbx cache warm [--refresh | --check [--deep]] <list-file> [<list-file>...]")
 	}
 	if *deep && !*checkOnly {
 		return errors.New("cache warm --deep requires --check")
+	}
+	if *refresh && *checkOnly {
+		return errors.New("cache warm --refresh cannot be used with --check")
 	}
 	entries, err := parseWarmListEntries(positionals, c.in)
 	if err != nil {
@@ -104,18 +118,16 @@ func (c cli) runCacheWarm(args []string) error {
 		}
 		return nil
 	}
-	var warmed, alreadyComplete, failed, reResolved int
+	var warmed, alreadyComplete, failedMissing, failedRevalidate int
+	var refreshWarnings []string
 	for _, ref := range refs {
 		var result daemon.CacheWarmResult
-		if err := c.call("cache.warm", daemon.CacheWarmArgs{Refs: []string{ref}}, &result); err != nil {
+		if err := c.call("cache.warm", daemon.CacheWarmArgs{Refs: []string{ref}, Refresh: *refresh}, &result); err != nil {
 			return err
 		}
 		entry, err := cacheWarmEntryForRef(ref, result)
 		if err != nil {
 			return err
-		}
-		if entry.ReResolvedTag {
-			reResolved++
 		}
 		switch entry.Status {
 		case daemon.CacheWarmStatusWarmed:
@@ -124,35 +136,49 @@ func (c cli) runCacheWarm(args []string) error {
 			}
 			warmed++
 		case daemon.CacheWarmStatusAlreadyComplete:
-			if _, err := fmt.Fprintf(c.out, "\u2713 %s already complete\n", entry.Ref); err != nil {
+			suffix := ""
+			if entry.RefreshWarning != "" {
+				suffix = " (" + entry.RefreshWarning + ")"
+				refreshWarnings = append(refreshWarnings, entry.Ref)
+			}
+			if _, err := fmt.Fprintf(c.out, "\u2713 %s already complete%s\n", entry.Ref, suffix); err != nil {
 				return err
 			}
 			alreadyComplete++
-		case daemon.CacheWarmStatusFailed:
-			if _, err := fmt.Fprintf(c.out, "\u2717 %s %s\n", entry.Ref, entry.Reason); err != nil {
+		case daemon.CacheWarmStatusFailedRevalidate:
+			if _, err := fmt.Fprintf(c.out, "\u2717 %s failed (revalidate): %s\n", entry.Ref, entry.Reason); err != nil {
 				return err
 			}
-			failed++
+			failedRevalidate++
+		case daemon.CacheWarmStatusFailedMissing:
+			if _, err := fmt.Fprintf(c.out, "\u2717 %s failed (missing): %s\n", entry.Ref, entry.Reason); err != nil {
+				return err
+			}
+			failedMissing++
+		case daemon.CacheWarmStatusFailed:
+			if _, err := fmt.Fprintf(c.out, "\u2717 %s failed (missing): %s\n", entry.Ref, entry.Reason); err != nil {
+				return err
+			}
+			failedMissing++
 		}
 	}
-	if _, err := fmt.Fprintf(c.out, "summary: %d warmed, %d already complete, %d failed\n", warmed, alreadyComplete, failed); err != nil {
+	if _, err := fmt.Fprintf(c.out, "summary: %d warmed, %d already complete, %d failed (missing)", warmed, alreadyComplete, failedMissing); err != nil {
 		return err
 	}
-	// A tag is resolved upstream on every run, so a re-warm of a complete list
-	// costs a full run's wall time while downloading nothing. Saying so keeps
-	// the cost explainable and points at the gate that is actually cheap (#405).
-	if reResolved > 0 {
-		downloads := fmt.Sprintf("%d ref(s) needed downloads", warmed)
-		if warmed == 0 {
-			downloads = "nothing was downloaded"
-		}
-		if _, err := fmt.Fprintf(c.out,
-			"note: re-resolved %d tag(s) upstream for freshness; %s. For a cheap offline-readiness gate run `tbx cache warm --check` instead\n",
-			reResolved, downloads); err != nil {
+	if *refresh || failedRevalidate > 0 {
+		if _, err := fmt.Fprintf(c.out, ", %d failed (revalidate)", failedRevalidate); err != nil {
 			return err
 		}
 	}
-	if failed > 0 {
+	if _, err := fmt.Fprintln(c.out); err != nil {
+		return err
+	}
+	if len(refreshWarnings) > 0 {
+		if _, err := fmt.Fprintf(c.out, "note: %d complete ref(s) were not revalidated: %s\n", len(refreshWarnings), strings.Join(refreshWarnings, ", ")); err != nil {
+			return err
+		}
+	}
+	if failed := failedMissing + failedRevalidate; failed > 0 {
 		return fmt.Errorf("cache warm failed for %d ref(s)", failed)
 	}
 	return nil
@@ -216,8 +242,16 @@ func cacheWarmEntryForRef(ref string, result daemon.CacheWarmResult) (daemon.Cac
 		if result.Warmed != 0 || result.AlreadyComplete != 1 || result.Failed != 0 {
 			return daemon.CacheWarmEntry{}, fmt.Errorf("cache warm returned inconsistent counts for %s", ref)
 		}
+	case daemon.CacheWarmStatusFailedMissing:
+		if result.Warmed != 0 || result.AlreadyComplete != 0 || result.Failed != 1 || result.FailedMissing != 1 || result.FailedRevalidate != 0 {
+			return daemon.CacheWarmEntry{}, fmt.Errorf("cache warm returned inconsistent counts for %s", ref)
+		}
+	case daemon.CacheWarmStatusFailedRevalidate:
+		if result.Warmed != 0 || result.AlreadyComplete != 0 || result.Failed != 1 || result.FailedMissing != 0 || result.FailedRevalidate != 1 {
+			return daemon.CacheWarmEntry{}, fmt.Errorf("cache warm returned inconsistent counts for %s", ref)
+		}
 	case daemon.CacheWarmStatusFailed:
-		if result.Warmed != 0 || result.AlreadyComplete != 0 || result.Failed != 1 {
+		if result.Warmed != 0 || result.AlreadyComplete != 0 || result.Failed != 1 || result.FailedMissing != 0 || result.FailedRevalidate != 0 {
 			return daemon.CacheWarmEntry{}, fmt.Errorf("cache warm returned inconsistent counts for %s", ref)
 		}
 	default:

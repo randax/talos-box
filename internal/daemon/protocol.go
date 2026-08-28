@@ -77,8 +77,9 @@ const (
 // that lacked credentials or failed (#482).
 // Version 17 adds the additive daemon.info runtime identity fields Version,
 // Executable, and PID. Package 3 also uses protocol 17 for additive cache
-// warm/check argument and result fields, so both changes ship under the same
-// negotiated wire version (#492).
+// warm/check argument and result fields (refresh, refreshWarning, and typed
+// failure counts/statuses), so both changes ship under the same negotiated
+// wire version (#488 #490 #492).
 const ProtocolVersion = 17
 
 // Request is one newline-delimited daemon request.
