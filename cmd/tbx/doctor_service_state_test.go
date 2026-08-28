@@ -16,14 +16,17 @@ func TestTalosServicesFindingsCoverPassWarnFailAndSkip(t *testing.T) {
 	missing := daemon.ServiceProbe{Status: daemon.ServiceProbeMissingCredentials}
 	failed := daemon.ServiceProbe{Status: daemon.ServiceProbeFailed, Error: "authentication failed"}
 	tests := []struct {
-		name     string
-		statuses []daemon.ClusterStatus
-		err      error
-		levels   []string
-		contains []string
+		name       string
+		statuses   []daemon.ClusterStatus
+		statusErr  error
+		clusterErr error
+		levels     []string
+		contains   []string
 	}{
 		{name: "skip without configured node", statuses: []daemon.ClusterStatus{{Name: "stopped"}}, levels: []string{"SKIP"}},
-		{name: "warn when status unavailable", err: errors.New("daemon timed out"), levels: []string{"WARN"}, contains: []string{"daemon timed out"}},
+		{name: "skip when daemon is unavailable", clusterErr: dialError{err: errors.New("connection refused")}, levels: []string{"SKIP"}, contains: []string{"daemon unavailable: connection refused"}},
+		{name: "skip when cluster listing fails", clusterErr: errors.New("decode daemon result"), levels: []string{"SKIP"}, contains: []string{"list clusters: decode daemon result"}},
+		{name: "warn when status unavailable", statusErr: errors.New("daemon timed out"), levels: []string{"WARN"}, contains: []string{"daemon timed out"}},
 		{name: "pass after successful inspection", statuses: []daemon.ClusterStatus{{Name: "demo", Running: true, Nodes: []daemon.NodeStatus{{Name: "demo-cp-1", Phase: daemon.PhaseConfigured, ServiceProbe: &succeeded}}}}, levels: []string{"PASS"}},
 		{name: "warn for missing credentials and probe errors", statuses: []daemon.ClusterStatus{{Name: "demo", Running: true, Nodes: []daemon.NodeStatus{
 			{Name: "demo-cp-1", Phase: daemon.PhaseConfigured, ServiceProbe: &missing},
@@ -33,11 +36,12 @@ func TestTalosServicesFindingsCoverPassWarnFailAndSkip(t *testing.T) {
 			{Name: "demo-cp-1", Phase: daemon.PhaseConfigured, ServiceProbe: &succeeded, StalledServices: []daemon.StalledService{{Service: "etcd", State: "Starting", Since: now.Add(-5 * time.Minute)}}},
 			{Name: "demo-worker-1", Phase: daemon.PhaseConfigured, ServiceProbe: &succeeded, Services: []daemon.NodeService{{Name: "kubelet", State: "Failed", Health: daemon.ServiceHealthCrashLooping}}},
 		}}}, levels: []string{"FAIL", "FAIL"}, contains: []string{"demo/demo-cp-1", "etcd Starting", "demo/demo-worker-1", "kubelet Failed"}},
+		{name: "ignore transient failed state", statuses: []daemon.ClusterStatus{{Name: "demo", Running: true, Nodes: []daemon.NodeStatus{{Name: "demo-cp-1", Phase: daemon.PhaseConfigured, ServiceProbe: &succeeded, Services: []daemon.NodeService{{Name: "kubelet", State: "Failed", Health: daemon.ServiceHealthStarting}}}}}}, levels: []string{"PASS"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			findings := talosServicesFindings(tt.statuses, tt.err, now)
+			findings := talosServicesFindings(tt.statuses, tt.statusErr, tt.clusterErr, now)
 			if len(findings) != len(tt.levels) {
 				t.Fatalf("findings = %+v, want levels %v", findings, tt.levels)
 			}

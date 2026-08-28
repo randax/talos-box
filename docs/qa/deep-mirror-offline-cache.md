@@ -60,14 +60,20 @@ On failure: capture the listener table verbatim.
 **Goal**: machine config points public/upstream pulls at the single catch-all with no bypass,
 while syntactic loopback registries deliberately redirect back into the node.
 
+The redirect uses containerd's localhost transport convention: HTTPS with no port or port 443,
+and HTTP on every other port. It cannot pass through a TLS registry on a custom loopback port;
+that registry needs an explicit `machine.registries.mirrors` entry. The redirect also changes the
+host, so credential forwarding depends on containerd re-authorizing the redirected request through
+its `CheckRedirect` hook.
+
 Steps:
 1. `tbx manifests qa-mir mirrors` — expect `"*"` → `http://172.30.<n>.1:5059`, `skipFallback: true`.
 2. From a test pod, pull an image that is NOT cached and NOT on any warm list (while online): confirm it arrives via the mirror (mirror stats change: `tbx cache list` before/after shows the upstream's counters grow). Confirm the image was novel first with `tbx cache list <image-ref>`, which answers `cached` / `not cached` for that one reference — pick a tag-pinned ref for this (not `:latest`, not tagless: `cache list <ref>` applies the same ref validation `cache warm` does and rejects those forms with an error rather than an answer). Base the test pod on the [PSA-compliant test pod](deep-storage.md#psa-compliant-test-pod) (swap in the image under test) so the apply does not emit a `would violate PodSecurity "restricted:latest"` block — that block is a warning, not a rejection, and is not a finding.
-3. Run pinned Talos/containerd pulls from anonymous and authenticated registries exposed at `localhost:<nodeport>`. Both must succeed. Compare `tbx cache list` and `tbx logs` before and after: neither pull may create mirror cache activity or an upstream request. This live check is required because an HTTP unit test proves the `307` response but not containerd's redirect and credential behavior.
+3. Run pinned Talos/containerd pulls from an anonymous HTTP registry and a credentialed HTTP registry exposed at separate `localhost:<nodeport>` authorities. Both must succeed. Compare `tbx cache list` and `tbx logs` before and after: neither pull may create mirror cache activity or an upstream request. Record each authority, whether it was anonymous or credentialed, the pull command and result, and the before/after cache and log outcome. This live acceptance check is required because an HTTP unit test proves the `307` response but not containerd's redirect and credential behavior.
 
-Expected observations: the rendered mirror config matches the live pull behavior; `cache list` per-upstream counters reflect only the public pull; both loopback pulls remain direct.
+Expected observations: the rendered mirror config matches the live pull behavior; `cache list` per-upstream counters reflect only the public pull; the recorded anonymous and credentialed loopback pulls both remain direct.
 
-Pass criteria: public pulls route through the mirror; anonymous and authenticated loopback pulls do not; config matches.
+Pass criteria: public pulls route through the mirror; anonymous and credentialed loopback pulls do not; config matches.
 
 On failure: capture `manifests mirrors` output and `cache list` before/after.
 

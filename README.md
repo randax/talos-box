@@ -247,7 +247,11 @@ whose bytes no longer match its digest — so `--check --deep` remains the pre-t
 cluster gateway with `skipFallback: true`, so public/upstream pulls cannot bypass it. Syntactic
 loopback registries (`localhost`, loopback IPv4, and loopback IPv6, optionally with a port) are
 the deliberate exception: the mirror redirects the request back to that registry inside the
-node, including while mirror-offline mode is on. Hostnames that only resolve to loopback and
+node, including while mirror-offline mode is on. Transport follows containerd's localhost
+convention: HTTPS with no port or port 443, HTTP otherwise. A TLS registry on a custom loopback
+port is not supported by this passthrough and needs an explicit `machine.registries.mirrors`
+entry. The redirect changes the host, so credentials rely on containerd re-authorizing the
+redirected request, which its `CheckRedirect` does. Hostnames that only resolve to loopback and
 other private registries remain blocked rather than being redirected.
 
 Offline mode persists across a daemon restart and changes how public/upstream pulls fail, so

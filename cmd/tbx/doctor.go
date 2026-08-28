@@ -223,10 +223,14 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		snapshot.FreeMemoryMiB = doctorFreeMemoryMiB(deps)
 		reserveMiB, fromDaemon := doctorBalloonReserveMiB(deps)
 		findings := hostpressure.Assess(snapshot, reserveMiB)
+		pendingGuestsClause := ""
+		if snapshot.FreeMemoryMiB > 0 {
+			pendingGuestsClause = fmt.Sprintf(" (measured with no guests pending: a start larger than %d MiB of new guests will still be refused)", snapshot.FreeMemoryMiB-reserveMiB)
+		}
 		if len(findings) == 0 {
 			// A PASS states the three numbers it was decided on — free memory,
 			// swap, data-volume space — plus the next bringup's headroom.
-			detail := snapshot.Summary(reserveMiB)
+			detail := snapshot.Summary(reserveMiB) + pendingGuestsClause
 			if !fromDaemon {
 				detail += " (daemon unreachable; assuming the default reserve)"
 			}
@@ -243,8 +247,12 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 				if finding.Severity == hostpressure.SeverityBlock {
 					level = "FAIL"
 				}
+				detail := finding.DoctorDetail()
+				if level == "WARN" {
+					detail += pendingGuestsClause
+				}
 				if err := writeFindings(doctorFinding{
-					level: level, check: "host-pressure", detail: finding.DoctorDetail(),
+					level: level, check: "host-pressure", detail: detail,
 				}); err != nil {
 					return err
 				}
@@ -329,7 +337,7 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 			}
 		}
 	}
-	if err := writeFindings(talosServicesFindings(statuses, statusErr, time.Now())...); err != nil {
+	if err := writeFindings(talosServicesFindings(statuses, statusErr, clusterErr, time.Now())...); err != nil {
 		return err
 	}
 
@@ -358,7 +366,14 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 	return nil
 }
 
-func talosServicesFindings(statuses []daemon.ClusterStatus, statusErr error, now time.Time) []doctorFinding {
+func talosServicesFindings(statuses []daemon.ClusterStatus, statusErr, clusterErr error, now time.Time) []doctorFinding {
+	if clusterErr != nil {
+		detail := fmt.Sprintf("list clusters: %v", clusterErr)
+		if isDaemonUnavailable(clusterErr) {
+			detail = daemonUnavailableDetail(clusterErr)
+		}
+		return []doctorFinding{{level: "SKIP", check: "talos-services", detail: detail}}
+	}
 	if statusErr != nil {
 		return []doctorFinding{{level: "WARN", check: "talos-services", detail: fmt.Sprintf("cluster status unavailable: %v", statusErr)}}
 	}
@@ -390,7 +405,7 @@ func talosServicesFindings(statuses []daemon.ClusterStatus, statusErr error, now
 				if _, alreadyReported := stalledNames[service.Name]; alreadyReported {
 					continue
 				}
-				if !service.Degraded() && !strings.EqualFold(service.State, "Failed") {
+				if !service.Degraded() {
 					continue
 				}
 				detail := fmt.Sprintf("%s/%s %s %s (%s)", status.Name, node.Name, service.Name, service.State, service.Health)

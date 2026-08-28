@@ -37,6 +37,7 @@ func TestRunDoctorHostPressurePassPrintsMeasuredNumbers(t *testing.T) {
 		"2.0 GiB of 8.0 GiB swap in use",
 		"400.0 GiB free on the ~/.talosbox volume",
 		fmt.Sprintf("must leave the %d MiB balloon reserve free, so there is room for %d MiB of new guests right now", reserve, 12243-reserve),
+		fmt.Sprintf("(measured with no guests pending: a start larger than %d MiB of new guests will still be refused)", 12243-reserve),
 	} {
 		if !strings.Contains(output.String(), fragment) {
 			t.Errorf("output missing %q:\n%s", fragment, output.String())
@@ -158,6 +159,13 @@ func TestRunDoctorClassifiesHighSwapAgainstMeasuredMemoryHeadroom(t *testing.T) 
 			want := test.wantLevel + " host-pressure:"
 			if !strings.Contains(output.String(), want) {
 				t.Fatalf("output missing %q:\n%s", want, output.String())
+			}
+			caveat := "(measured with no guests pending: a start larger than 6144 MiB of new guests will still be refused)"
+			if test.wantLevel == "WARN" && !strings.Contains(output.String(), caveat) {
+				t.Fatalf("output missing %q:\n%s", caveat, output.String())
+			}
+			if test.wantLevel == "FAIL" && strings.Contains(output.String(), caveat) {
+				t.Fatalf("blocking output unexpectedly contains %q:\n%s", caveat, output.String())
 			}
 		})
 	}

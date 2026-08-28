@@ -112,20 +112,15 @@ type ProvisionStartPlan struct {
 //     exactly the shortfall out of the running guests before the new one boots,
 //     which is the actionable path #398 asked for. Only a shortfall the running
 //     guests cannot cover blocks.
-//   - Swap: a host already deep into its swap file cannot absorb the
-//     allocation burst of a second bringup unless measured free memory already
-//     covers the balloon reserve plus that allocation. "Deep" is two readings:
-//     the file must be at least provisionStartSwapUsedPercent full *and* the
-//     host must either still be off normal memory pressure or be carrying at
-//     least provisionStartSwapUsedBytes of swapped-out pages while its free
-//     memory is scarce (provisionStartMemoryIsScarce). macOS grows a swap file
-//     on demand and keeps it allocated long after the pressure that filled it
-//     cleared, so a sticky swapfile on a host with tens of gigabytes free and
-//     normal pressure says nothing about capacity, at 2 GiB or at 8 (#231,
-//     #284) — but #334's 7.3 GiB of an 8 GiB file said everything even though
-//     the preflight host-pressure read came back PASS, which is why the
-//     absolute rule exists alongside the pressure one. Critical pressure never
-//     disarms; unmeasurable pressure or free memory keeps the conservative rule.
+//   - Swap: at normal pressure, Assess always reports swap at least 90% used as
+//     a warning, regardless of free memory. This start gate has a separate 80%
+//     threshold: it blocks when pressure is critical, when pressure is warning
+//     or unknown and free memory does not cover reserve plus incoming guests,
+//     or when normal pressure accompanies at least 4 GiB swapped out and scarce
+//     RAM. Measured free memory covering reserve plus incoming guests disarms
+//     every non-critical case, including unknown pressure. macOS keeps stale
+//     swap allocated, so percentage alone must not block a normal-pressure
+//     start (#231, #284, #334).
 //
 // Both rules apply only while guests are already running, which is deliberate.
 // A lone cluster on an otherwise idle host is the case the balloon reserve and

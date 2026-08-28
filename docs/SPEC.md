@@ -256,7 +256,12 @@ the cache and doubles as the offline-venue answer. The catch-all deliberately re
 syntactic loopback authorities (`localhost`, loopback IPv4, or loopback IPv6, optionally with a
 port) back to the same registry path inside the node, removing containerd's `ns` parameter. This
 lets an in-cluster registry such as `localhost:30500` remain direct without weakening the
-mirror-only rule for public registries. Hostnames which merely resolve to loopback, and all other
+mirror-only rule for public registries. The passthrough infers transport from the port, following
+containerd's localhost convention: HTTPS with no port or port 443, HTTP on every other port. A TLS
+registry on a custom loopback port is therefore unsupported by this redirect and needs an explicit
+`machine.registries.mirrors` entry. Because the redirect changes the host, credentials depend on
+containerd re-authorizing the redirected request; its `CheckRedirect` does so. Hostnames which
+merely resolve to loopback, and all other
 private or non-public authorities, remain blocked by the host mirror. `tbx mirror offline`
 reports its current mode; `tbx mirror offline on` permits cached public/upstream responses only
 and rejects cache misses without upstream fallback, while syntactic loopback registries remain

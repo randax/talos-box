@@ -321,9 +321,9 @@ func redirectLoopbackAuthority(w http.ResponseWriter, r *http.Request, target *u
 		return false
 	}
 
-	// containerd treats localhost registries on explicit non-TLS ports as
-	// plain HTTP. Match that convention so the redirect preserves local
-	// development registries without weakening public-registry fallback.
+	// Transport is inferred from the port, so custom-port TLS needs an explicit
+	// mirror entry. The changed host also relies on containerd's CheckRedirect
+	// to re-authorize credentials on the redirected request.
 	target.Scheme = "https"
 	if authority.port != "" && authority.port != "443" {
 		target.Scheme = "http"

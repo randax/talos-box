@@ -233,6 +233,7 @@ func TestRunDoctorContinuesAfterFailures(t *testing.T) {
 		"FAIL forwarding: broken",
 		"SKIP system-dns: daemon unavailable: connection refused",
 		"SKIP routes: daemon unavailable: connection refused",
+		"SKIP talos-services: daemon unavailable: connection refused",
 		"PASS egress",
 		"INFO security-inventory: no activated system extensions found",
 	} {
@@ -713,6 +714,7 @@ func TestRunDoctorClusterListOperationErrorFailsChecks(t *testing.T) {
 	for _, line := range []string{
 		"FAIL system-dns: list clusters: decode daemon result",
 		"FAIL routes: list clusters: decode daemon result",
+		"SKIP talos-services: list clusters: decode daemon result",
 	} {
 		if !strings.Contains(output.String(), line) {
 			t.Errorf("output missing %q:\n%s", line, output.String())
