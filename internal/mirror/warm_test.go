@@ -1,6 +1,7 @@
 package mirror
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -15,6 +16,214 @@ import (
 
 	"github.com/randax/talos-box/internal/imagecache"
 )
+
+func TestWarmRerunOfCompleteTagUsesNoUpstreamByDefault(t *testing.T) {
+	manager, calls, _, _ := newTransportWarmManager(t)
+
+	ref := "registry.example/demo:stable"
+	first, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64, WarmOptions{})
+	if err != nil || first.Warmed != 1 {
+		t.Fatalf("first warm = %+v, %v", first, err)
+	}
+	before := calls.Load()
+	second, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64, WarmOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.AlreadyComplete != 1 || second.Failed != 0 || second.Results[0].Outcome != WarmOutcomeAlreadyComplete {
+		t.Fatalf("second warm = %+v", second)
+	}
+	if calls.Load() != before {
+		t.Fatalf("upstream calls = %d, want unchanged %d", calls.Load(), before)
+	}
+}
+
+func TestWarmRerunOfCompleteDigestUsesNoUpstream(t *testing.T) {
+	manager, calls, _, manifestDigest := newTransportWarmManager(t)
+
+	if first, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64, WarmOptions{}); err != nil || first.Warmed != 1 {
+		t.Fatalf("first warm = %+v, %v", first, err)
+	}
+	before := calls.Load()
+	ref := "registry.example/demo@" + manifestDigest
+	second, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64, WarmOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.AlreadyComplete != 1 || second.Failed != 0 || second.Results[0].Outcome != WarmOutcomeAlreadyComplete {
+		t.Fatalf("second warm = %+v", second)
+	}
+	if calls.Load() != before {
+		t.Fatalf("upstream calls = %d, want unchanged %d", calls.Load(), before)
+	}
+}
+
+func TestWarmRefreshCompleteUnchangedTagIsAlreadyComplete(t *testing.T) {
+	manager, _, _, _ := newTransportWarmManager(t)
+	ref := "registry.example/demo:stable"
+	if first, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64, WarmOptions{}); err != nil || first.Warmed != 1 {
+		t.Fatalf("first warm = %+v, %v", first, err)
+	}
+	refresh, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64, WarmOptions{Refresh: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refresh.AlreadyComplete != 1 || refresh.Warmed != 0 || !refresh.Results[0].ReResolvedTag {
+		t.Fatalf("refresh = %+v", refresh)
+	}
+}
+
+func newTransportWarmManager(t *testing.T) (*Manager, *atomic.Int64, string, string) {
+	t.Helper()
+	config := []byte("config")
+	layer := []byte("layer")
+	configDigest := "sha256:" + sha256Hex(config)
+	layerDigest := "sha256:" + sha256Hex(layer)
+	manifest := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"%s"},"layers":[{"digest":"%s"}]}`, configDigest, layerDigest)
+	manifestDigest := "sha256:" + sha256Hex([]byte(manifest))
+	calls := &atomic.Int64{}
+	manager := newManagerWithPorts(t.TempDir(), nil, 0)
+	manager.serverFactory = func(_, base, cacheDir string) http.Handler {
+		server := NewServer(base, cacheDir)
+		server.client.Transport = warmRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+			calls.Add(1)
+			response := &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Request: request}
+			switch request.URL.Path {
+			case manifestRequestPath("demo", "stable"), manifestRequestPath("demo", manifestDigest):
+				response.Header.Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+				response.Header.Set("Docker-Content-Digest", manifestDigest)
+				response.Body = io.NopCloser(strings.NewReader(manifest))
+			case "/v2/demo/blobs/" + configDigest:
+				response.Body = io.NopCloser(bytes.NewReader(config))
+			case "/v2/demo/blobs/" + layerDigest:
+				response.Body = io.NopCloser(bytes.NewReader(layer))
+			default:
+				response.StatusCode = http.StatusNotFound
+				response.Status = "404 Not Found"
+				response.Body = io.NopCloser(strings.NewReader("not found"))
+			}
+			return response, nil
+		})
+		return server
+	}
+	t.Cleanup(manager.Close)
+	return manager, calls, manifest, manifestDigest
+}
+
+func TestWarmFetchesOnlySelectedLinuxPlatformChild(t *testing.T) {
+	selectedConfig := "sha256:" + strings.Repeat("a", 64)
+	selectedLayer := "sha256:" + strings.Repeat("b", 64)
+	selectedBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"%s"},"layers":[{"digest":"%s"}]}`, selectedConfig, selectedLayer)
+	selectedDigest := "sha256:" + sha256Hex([]byte(selectedBody))
+	armDigest := "sha256:" + strings.Repeat("c", 64)
+	windowsDigest := "sha256:" + strings.Repeat("d", 64)
+	index := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"digest":"%s","platform":{"os":"linux","architecture":"amd64"}},{"digest":"%s","platform":{"os":"linux","architecture":"arm64"}},{"digest":"%s","platform":{"os":"windows","architecture":"amd64"}}]}`, selectedDigest, armDigest, windowsDigest)
+
+	hits := map[string]int{}
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits[r.URL.Path]++
+		switch r.URL.Path {
+		case manifestRequestPath("demo", selectedDigest):
+			w.Header().Set("Docker-Content-Digest", selectedDigest)
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, selectedBody)
+		case "/v2/demo/blobs/" + selectedConfig, "/v2/demo/blobs/" + selectedLayer:
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	result := WarmResult{}
+	err := warmManifestGraph(context.Background(), handler, NewServer("https://registry.example", t.TempDir()), "demo", []byte(index), "amd64", map[string]bool{}, map[string]bool{}, map[string]bool{}, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hits[manifestRequestPath("demo", selectedDigest)] != 1 || hits[manifestRequestPath("demo", armDigest)] != 0 || hits[manifestRequestPath("demo", windowsDigest)] != 0 {
+		t.Fatalf("manifest hits = %+v", hits)
+	}
+}
+
+func TestWarmRefreshCompleteTagReportsHard404AsRevalidateFailure(t *testing.T) {
+	manager, fixture := newCachedWarmManagerWithStatus(t, http.StatusNotFound)
+	summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64, WarmOptions{Refresh: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.FailedRevalidate != 1 || summary.FailedMissing != 0 || summary.Results[0].Outcome != WarmOutcomeFailedRevalidate {
+		t.Fatalf("summary = %+v", summary)
+	}
+	if status := fixture.server.InspectCached(context.Background(), fixture.target("stable"), InspectOptions{}); !status.Complete() {
+		t.Fatalf("old cache changed: %s", status.Reason())
+	}
+}
+
+func TestWarmMissingTag429IsMissingFailure(t *testing.T) {
+	manager := newManagerWithPorts(t.TempDir(), nil, 0)
+	var calls atomic.Int64
+	manager.serverFactory = warmCountingStatusServerFactory(http.StatusTooManyRequests, &calls)
+	summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64, WarmOptions{Refresh: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.FailedMissing != 1 || summary.FailedRevalidate != 0 || summary.Results[0].Outcome != WarmOutcomeFailedMissing {
+		t.Fatalf("summary = %+v", summary)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("upstream attempts = %d, want 1", calls.Load())
+	}
+}
+
+func TestWarmRefreshCompleteTagTreats429AsAlreadyComplete(t *testing.T) {
+	manager, fixture := newCachedWarmManagerWithStatus(t, http.StatusTooManyRequests)
+	summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64, WarmOptions{Refresh: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.AlreadyComplete != 1 || summary.Failed != 0 || summary.Results[0].RefreshWarning != "upstream 429, not revalidated" {
+		t.Fatalf("summary = %+v", summary)
+	}
+	if status := fixture.server.InspectCached(context.Background(), fixture.target("stable"), InspectOptions{}); !status.Complete() {
+		t.Fatalf("old cache changed: %s", status.Reason())
+	}
+}
+
+func newCachedWarmManagerWithStatus(t *testing.T, status int) (*Manager, completenessFixture) {
+	t.Helper()
+	cacheRoot := t.TempDir()
+	fixture := newCompletenessFixtureAt(t, filepath.Join(cacheRoot, "registry.example"))
+	manager := newManagerWithPorts(cacheRoot, nil, 0)
+	manager.serverFactory = warmStatusServerFactory(status)
+	return manager, fixture
+}
+
+func warmStatusServerFactory(status int) func(string, string, string) http.Handler {
+	return warmCountingStatusServerFactory(status, nil)
+}
+
+func warmCountingStatusServerFactory(status int, calls *atomic.Int64) func(string, string, string) http.Handler {
+	return func(_, base, cacheDir string) http.Handler {
+		server := NewServer(base, cacheDir)
+		server.client.Transport = warmRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+			if calls != nil {
+				calls.Add(1)
+			}
+			return &http.Response{
+				StatusCode: status,
+				Status:     fmt.Sprintf("%d %s", status, http.StatusText(status)),
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(http.StatusText(status))),
+				Request:    request,
+			}, nil
+		})
+		return server
+	}
+}
+
+type warmRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn warmRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
+}
 
 func TestWarmCachesDigestPinnedIndexForOfflineGuestPull(t *testing.T) {
 	amd64Config := []byte(`{"arch":"amd64-config"}`)
@@ -94,7 +303,7 @@ func TestWarmCachesDigestPinnedIndexForOfflineGuestPull(t *testing.T) {
 	manager.dialContext = egress.dialContext
 	defer manager.Close()
 
-	result, err := manager.Warm(context.Background(), []string{"registry.example/demo@" + indexDigest}, imagecache.ArchitectureAMD64)
+	result, err := manager.Warm(context.Background(), []string{"registry.example/demo@" + indexDigest}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,14 +318,21 @@ func TestWarmCachesDigestPinnedIndexForOfflineGuestPull(t *testing.T) {
 	for _, path := range []string{
 		"/v2/demo/manifests/" + indexDigest,
 		"/v2/demo/manifests/" + amd64ManifestDigest,
-		"/v2/demo/manifests/" + arm64ManifestDigest,
-		"/v2/demo/manifests/" + windowsManifestDigest,
 		"/v2/demo/blobs/" + amd64ConfigDigest,
 		"/v2/demo/blobs/" + amd64LayerDigest,
 	} {
 		resp, body := get(t, mirror.URL+path+"?ns=registry.example")
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("%s = %d %q, want 200", path, resp.StatusCode, body)
+		}
+	}
+	for _, path := range []string{
+		"/v2/demo/manifests/" + arm64ManifestDigest,
+		"/v2/demo/manifests/" + windowsManifestDigest,
+	} {
+		resp, body := get(t, mirror.URL+path+"?ns=registry.example")
+		if resp.StatusCode == http.StatusOK {
+			t.Fatalf("%s unexpectedly cached: %q", path, body)
 		}
 	}
 
@@ -126,6 +342,10 @@ func TestWarmCachesDigestPinnedIndexForOfflineGuestPull(t *testing.T) {
 	}
 	if hits.arm64Blob.Load() != 0 {
 		t.Fatalf("arm64 blob hits = %d, want 0", hits.arm64Blob.Load())
+	}
+	if hits.index.Load() != 1 || hits.amd64Manifest.Load() != 1 || hits.amd64Blob.Load() != 2 || hits.arm64Manifest.Load() != 0 || hits.windowsManifest.Load() != 0 {
+		t.Fatalf("upstream hits: index=%d amd64-manifest=%d amd64-blobs=%d arm64-manifest=%d windows-manifest=%d; want 1, 1, 2, 0, 0",
+			hits.index.Load(), hits.amd64Manifest.Load(), hits.amd64Blob.Load(), hits.arm64Manifest.Load(), hits.windowsManifest.Load())
 	}
 }
 
@@ -182,7 +402,7 @@ func TestWarmPopulatesMirrorStatsForCacheList(t *testing.T) {
 	manager.dialContext = egress.dialContext
 	defer manager.Close()
 
-	result, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64)
+	result, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,7 +490,8 @@ func TestWarmUpdatesMirrorStatsPerUpstreamFromZero(t *testing.T) {
 	summary, err := manager.Warm(context.Background(), []string{
 		"registry.one/one@" + digestOne,
 		"registry.two/two@" + digestTwo,
-	}, imagecache.ArchitectureAMD64)
+	}, imagecache.ArchitectureAMD64, WarmOptions{})
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,7 +522,7 @@ func TestWarmUpdatesMirrorStatsPerUpstreamFromZero(t *testing.T) {
 	}
 }
 
-func TestWarmRerunSkipsBlobDownloadsButRefreshesManifestRequests(t *testing.T) {
+func TestWarmRerunOfCompleteDigestKeepsUpstreamCountersUnchanged(t *testing.T) {
 	manifestBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%d},"layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"%s","size":%d}]}`,
 		"sha256:"+sha256Hex([]byte("config")), len("config"), "sha256:"+sha256Hex([]byte("layer")), len("layer"))
 	manifestDigest := "sha256:" + sha256Hex([]byte(manifestBody))
@@ -340,7 +561,7 @@ func TestWarmRerunSkipsBlobDownloadsButRefreshesManifestRequests(t *testing.T) {
 	defer manager.Close()
 
 	ref := "registry.example/demo@" + manifestDigest
-	if _, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64); err != nil {
+	if _, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64, WarmOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	firstManifestHits := manifestHits.Load()
@@ -349,22 +570,22 @@ func TestWarmRerunSkipsBlobDownloadsButRefreshesManifestRequests(t *testing.T) {
 		t.Fatalf("first warm hits = manifests %d blobs %d", firstManifestHits, firstBlobHits)
 	}
 
-	result, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64)
+	result, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.Warmed != 0 || result.AlreadyComplete != 1 || result.Failed != 0 {
 		t.Fatalf("second warm result = %+v", result)
 	}
-	if got := manifestHits.Load(); got <= firstManifestHits {
-		t.Fatalf("manifest hits after rerun = %d, want > %d", got, firstManifestHits)
+	if got := manifestHits.Load(); got != firstManifestHits {
+		t.Fatalf("manifest hits after rerun = %d, want %d", got, firstManifestHits)
 	}
 	if got := blobHits.Load(); got != firstBlobHits {
 		t.Fatalf("blob hits after rerun = %d, want %d", got, firstBlobHits)
 	}
 }
 
-func TestWarmTagAtDigestUsesTagRequestPathAndPinnedDigest(t *testing.T) {
+func TestWarmTagAtDigestUsesDigestPathAndPublishesTagMapping(t *testing.T) {
 	configDigest := "sha256:" + sha256Hex([]byte("config"))
 	manifestBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%d},"layers":[]}`,
 		configDigest, len("config"))
@@ -400,12 +621,21 @@ func TestWarmTagAtDigestUsesTagRequestPathAndPinnedDigest(t *testing.T) {
 	manager.dialContext = egress.dialContext
 	defer manager.Close()
 
-	result, err := manager.Warm(context.Background(), []string{"registry.example/demo/app:v1.0.0@" + manifestDigest}, imagecache.ArchitectureAMD64)
+	result, err := manager.Warm(context.Background(), []string{"registry.example/demo/app:v1.0.0@" + manifestDigest}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Warmed != 1 || tagHits.Load() == 0 || digestHits.Load() == 0 {
+	if result.Warmed != 1 || tagHits.Load() != 0 || digestHits.Load() != 1 {
 		t.Fatalf("warm result = %+v, tag hits = %d, digest hits = %d", result, tagHits.Load(), digestHits.Load())
+	}
+	server := NewServer("https://registry.example", filepath.Join(manager.cacheRoot, "registry.example"))
+	for _, target := range []CacheTarget{
+		{Repository: "demo/app", Digest: manifestDigest, Platform: Platform{OS: "linux", Architecture: imagecache.ArchitectureAMD64}},
+		{Repository: "demo/app", Tag: "v1.0.0", Digest: manifestDigest, Platform: Platform{OS: "linux", Architecture: imagecache.ArchitectureAMD64}},
+	} {
+		if status := server.InspectCached(context.Background(), target, InspectOptions{}); !status.Complete() {
+			t.Fatalf("target %+v incomplete: %s", target, status.Reason())
+		}
 	}
 }
 
@@ -429,9 +659,8 @@ func TestWarmUppercasePinnedDigestCanonicalizesValidationAndDigestRequestPath(t 
 			wantLowerHits: 1,
 		},
 		{
-			name:          "tag-at-digest keeps tag listed ref",
+			name:          "tag-at-digest uses canonical digest path once",
 			ref:           "registry.example/demo/app:v1.0.0@" + uppercaseDigest,
-			wantTagHits:   1,
 			wantLowerHits: 1,
 		},
 	}
@@ -475,7 +704,7 @@ func TestWarmUppercasePinnedDigestCanonicalizesValidationAndDigestRequestPath(t 
 			manager.dialContext = egress.dialContext
 			defer manager.Close()
 
-			result, err := manager.Warm(context.Background(), []string{test.ref}, imagecache.ArchitectureAMD64)
+			result, err := manager.Warm(context.Background(), []string{test.ref}, imagecache.ArchitectureAMD64, WarmOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -607,7 +836,8 @@ func TestWarmTagAndTagAtDigestWithoutDigestHeaderUseValidatedCanonicalDigest(t *
 	summary, err := manager.Warm(context.Background(), []string{
 		"registry.example/demo:stable",
 		"registry.example/demo:v2.0.0@" + pinnedDigest,
-	}, imagecache.ArchitectureAMD64)
+	}, imagecache.ArchitectureAMD64, WarmOptions{})
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -696,7 +926,7 @@ func TestWarmDigestAndTagAtDigestRejectBadDigestHeaders(t *testing.T) {
 	if summary, err := manager.Warm(context.Background(), []string{
 		"registry.example/demo:stable",
 		"registry.example/demo:v2.0.0@" + pinnedDigest,
-	}, imagecache.ArchitectureAMD64); err != nil || summary.Warmed != 2 {
+	}, imagecache.ArchitectureAMD64, WarmOptions{}); err != nil || summary.Warmed != 2 {
 		t.Fatalf("initial warm = %+v, %v", summary, err)
 	}
 
@@ -704,11 +934,12 @@ func TestWarmDigestAndTagAtDigestRejectBadDigestHeaders(t *testing.T) {
 	summary, err := manager.Warm(context.Background(), []string{
 		"registry.example/demo:stable",
 		"registry.example/demo:v2.0.0@" + pinnedDigest,
-	}, imagecache.ArchitectureAMD64)
+	}, imagecache.ArchitectureAMD64, WarmOptions{Refresh: true})
+
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.Failed != 2 {
+	if summary.Failed != 1 || summary.FailedRevalidate != 1 || summary.AlreadyComplete != 1 {
 		t.Fatalf("bad header rerun summary = %+v", summary)
 	}
 
@@ -785,7 +1016,7 @@ func TestWarmSucceedsWhenServerFactoryWrapsMirrorServer(t *testing.T) {
 	}
 	defer manager.Close()
 
-	summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64)
+	summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -836,7 +1067,7 @@ func TestWarmCachesAndServesSHA512BlobOffline(t *testing.T) {
 	manager.dialContext = egress.dialContext
 	defer manager.Close()
 
-	summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64)
+	summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -905,7 +1136,7 @@ func TestWarmRejectsSHA512BlobDigestMismatch(t *testing.T) {
 	manager.dialContext = egress.dialContext
 	defer manager.Close()
 
-	summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64)
+	summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1007,7 +1238,7 @@ func TestWarmCachesAndServesUppercaseManifestDigestsOffline(t *testing.T) {
 			manager.dialContext = egress.dialContext
 			defer manager.Close()
 
-			summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64)
+			summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64, WarmOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1100,7 +1331,7 @@ func TestWarmCachesAndServesUppercaseBlobDigestsOffline(t *testing.T) {
 			manager.dialContext = egress.dialContext
 			defer manager.Close()
 
-			summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64)
+			summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64, WarmOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1223,7 +1454,8 @@ func TestWarmContinuesAfterFailureAndReportsMixedSummary(t *testing.T) {
 	summary, err := manager.Warm(context.Background(), []string{
 		"registry.example/good@" + manifestDigest,
 		"registry.example/missing@sha256:" + strings.Repeat("b", 64),
-	}, imagecache.ArchitectureAMD64)
+	}, imagecache.ArchitectureAMD64, WarmOptions{})
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1286,7 +1518,7 @@ func TestWarmCachesHostBlobsWhenIndexRepeatsChildDigestAcrossPlatforms(t *testin
 	manager.dialContext = egress.dialContext
 	defer manager.Close()
 
-	result, err := manager.Warm(context.Background(), []string{"registry.example/demo@" + indexDigest}, imagecache.ArchitectureAMD64)
+	result, err := manager.Warm(context.Background(), []string{"registry.example/demo@" + indexDigest}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1340,16 +1572,16 @@ func TestWarmFailurePreservesPreviouslyCachedManifest(t *testing.T) {
 	defer manager.Close()
 
 	ref := "registry.example/demo@" + goodDigest
-	if summary, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64); err != nil || summary.Warmed != 1 {
+	if summary, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64, WarmOptions{}); err != nil || summary.Warmed != 1 {
 		t.Fatalf("initial warm = %+v, %v", summary, err)
 	}
 
 	corrupt.Store(true)
-	summary, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64)
+	summary, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.Warmed != 0 || summary.AlreadyComplete != 0 || summary.Failed != 1 {
+	if summary.Warmed != 0 || summary.AlreadyComplete != 1 || summary.Failed != 0 {
 		t.Fatalf("corrupt rerun summary = %+v", summary)
 	}
 
@@ -1401,31 +1633,17 @@ func TestWarmPinnedTagMismatchPreservesPreviouslyCachedTag(t *testing.T) {
 	defer manager.Close()
 
 	ref := "registry.example/demo:stable@" + oldDigest
-	if summary, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64); err != nil || summary.Warmed != 1 {
+	if summary, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64, WarmOptions{}); err != nil || summary.Warmed != 1 {
 		t.Fatalf("initial warm = %+v, %v", summary, err)
 	}
 
 	mismatch.Store(true)
-	summary, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64)
+	summary, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.Failed != 1 {
-		t.Fatalf("mismatch rerun summary = %+v", summary)
-	}
-	// The upstream answered correctly; the list file's pin is stale, so the
-	// reason has to lead with the pin instead of reading as a 502 (#365).
-	reason := summary.Results[0].Error
-	newDigest := "sha256:" + sha256Hex([]byte(newManifest))
-	for _, want := range []string{"pinned digest mismatch", "file pins " + oldDigest, "upstream serves " + newDigest} {
-		if !strings.Contains(reason, want) {
-			t.Fatalf("mismatch reason = %q, want it to carry %q", reason, want)
-		}
-	}
-	for _, unwanted := range []string{"502", "upstream manifest", "returned"} {
-		if strings.Contains(reason, unwanted) {
-			t.Fatalf("mismatch reason = %q, should not read as an upstream failure (%q)", reason, unwanted)
-		}
+	if summary.Failed != 0 || summary.AlreadyComplete != 1 {
+		t.Fatalf("digest-pinned rerun summary = %+v", summary)
 	}
 
 	upstream.Close()
@@ -1482,16 +1700,16 @@ func TestWarmTagRefreshFailurePreservesPreviouslyCachedTag(t *testing.T) {
 	manager.dialContext = egress.dialContext
 	defer manager.Close()
 
-	if summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64); err != nil || summary.Warmed != 1 {
+	if summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64, WarmOptions{}); err != nil || summary.Warmed != 1 {
 		t.Fatalf("initial warm = %+v, %v", summary, err)
 	}
 
 	refreshBroken.Store(true)
-	summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64)
+	summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64, WarmOptions{Refresh: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.Failed != 1 || summary.Warmed != 0 {
+	if summary.Failed != 1 || summary.FailedRevalidate != 1 || summary.Warmed != 0 {
 		t.Fatalf("refresh failure summary = %+v", summary)
 	}
 
@@ -1506,7 +1724,7 @@ func TestWarmTagRefreshFailurePreservesPreviouslyCachedTag(t *testing.T) {
 	}
 }
 
-func TestWarmRefreshNetworkFailureDoesNotFallbackToCachedManifest(t *testing.T) {
+func TestWarmRefreshCompleteTagTreatsTransientFailureAsAlreadyComplete(t *testing.T) {
 	configDigest := "sha256:" + sha256Hex([]byte("config"))
 	manifestBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"%s"},"layers":[]}`, configDigest)
 	manifestDigest := "sha256:" + sha256Hex([]byte(manifestBody))
@@ -1537,16 +1755,16 @@ func TestWarmRefreshNetworkFailureDoesNotFallbackToCachedManifest(t *testing.T) 
 	manager.dialContext = egress.dialContext
 	defer manager.Close()
 
-	if summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64); err != nil || summary.Warmed != 1 {
+	if summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64, WarmOptions{}); err != nil || summary.Warmed != 1 {
 		t.Fatalf("initial warm = %+v, %v", summary, err)
 	}
 
 	upstream.Close()
-	summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64)
+	summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64, WarmOptions{Refresh: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.Failed != 1 || summary.Results[0].Error == "" {
+	if summary.Failed != 0 || summary.AlreadyComplete != 1 || summary.Results[0].RefreshWarning == "" {
 		t.Fatalf("network failure summary = %+v", summary)
 	}
 
@@ -1574,14 +1792,21 @@ func TestDiscardWarmResponseBoundsErrorCapture(t *testing.T) {
 	}
 }
 
-func TestWarmTagReferenceCachesListedTagAndResolvedDigest(t *testing.T) {
+func TestWarmColdTagPublishesTagAndDigestFromOneRootResponse(t *testing.T) {
 	configDigest := "sha256:" + sha256Hex([]byte("config"))
 	manifestBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"%s"},"layers":[]}`, configDigest)
 	manifestDigest := "sha256:" + sha256Hex([]byte(manifestBody))
 
+	var tagHits, digestHits atomic.Int64
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/v2/demo/manifests/stable", "/v2/demo/manifests/" + manifestDigest:
+		case "/v2/demo/manifests/stable":
+			tagHits.Add(1)
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Docker-Content-Digest", manifestDigest)
+			_, _ = fmt.Fprint(w, manifestBody)
+		case "/v2/demo/manifests/" + manifestDigest:
+			digestHits.Add(1)
 			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
 			w.Header().Set("Docker-Content-Digest", manifestDigest)
 			_, _ = fmt.Fprint(w, manifestBody)
@@ -1602,12 +1827,15 @@ func TestWarmTagReferenceCachesListedTagAndResolvedDigest(t *testing.T) {
 	manager.dialContext = egress.dialContext
 	defer manager.Close()
 
-	summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64)
+	summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if summary.Warmed != 1 || summary.AlreadyComplete != 0 || summary.Failed != 0 {
 		t.Fatalf("summary = %+v", summary)
+	}
+	if tagHits.Load() != 1 || digestHits.Load() != 0 {
+		t.Fatalf("root hits: tag=%d digest=%d", tagHits.Load(), digestHits.Load())
 	}
 
 	manager.offline.Store(true)
@@ -1676,7 +1904,8 @@ func TestWarmOneBatchSupportsMultipleRegistriesWithIsolatedOfflineServing(t *tes
 	summary, err := manager.Warm(context.Background(), []string{
 		"registry.one/one@" + digestOne,
 		"registry.two/two@" + digestTwo,
-	}, imagecache.ArchitectureAMD64)
+	}, imagecache.ArchitectureAMD64, WarmOptions{})
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1742,7 +1971,7 @@ func TestWarmOfflineRerunServesCachedDigestManifestAndAgreesWithCheck(t *testing
 	defer manager.Close()
 
 	ref := "registry.example/pause@" + manifestDigest
-	if _, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64); err != nil {
+	if _, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64, WarmOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1757,7 +1986,7 @@ func TestWarmOfflineRerunServesCachedDigestManifestAndAgreesWithCheck(t *testing
 		t.Fatalf("check summary = %+v", check)
 	}
 
-	summary, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64)
+	summary, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1794,14 +2023,14 @@ func TestWarmOfflineRerunServesCachedTagManifest(t *testing.T) {
 	defer manager.Close()
 
 	ref := "registry.example/demo:latest"
-	if _, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64); err != nil {
+	if _, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64, WarmOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
 	upstream.Close()
 	manager.SetOffline(true)
 
-	summary, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64)
+	summary, err := manager.Warm(context.Background(), []string{ref}, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1841,9 +2070,7 @@ func TestOfflineManifestRefreshRequestServesCachedDigestManifest(t *testing.T) {
 	}
 }
 
-// A re-warm of a fully cached tag downloads nothing but still costs a full
-// upstream resolution per tag; the summary has to say so (#405).
-func TestWarmReportsReResolvedTagsSeparatelyFromDownloads(t *testing.T) {
+func TestWarmDefaultRerunDoesNotReResolveTags(t *testing.T) {
 	configDigest := "sha256:" + sha256Hex([]byte("config"))
 	manifestBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"%s"},"layers":[]}`, configDigest)
 	manifestDigest := "sha256:" + sha256Hex([]byte(manifestBody))
@@ -1872,7 +2099,7 @@ func TestWarmReportsReResolvedTagsSeparatelyFromDownloads(t *testing.T) {
 	defer manager.Close()
 
 	refs := []string{"registry.example/demo:stable", "registry.example/demo@" + manifestDigest}
-	first, err := manager.Warm(context.Background(), refs, imagecache.ArchitectureAMD64)
+	first, err := manager.Warm(context.Background(), refs, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1880,15 +2107,15 @@ func TestWarmReportsReResolvedTagsSeparatelyFromDownloads(t *testing.T) {
 		t.Fatalf("first warm ReResolvedTags = %d, want the one tag-pinned ref", first.ReResolvedTags)
 	}
 
-	second, err := manager.Warm(context.Background(), refs, imagecache.ArchitectureAMD64)
+	second, err := manager.Warm(context.Background(), refs, imagecache.ArchitectureAMD64, WarmOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if second.Warmed != 0 || second.AlreadyComplete != 2 {
 		t.Fatalf("re-warm summary = %+v, want everything already complete", second)
 	}
-	if second.ReResolvedTags != 1 {
-		t.Fatalf("re-warm ReResolvedTags = %d, want the tag re-resolved upstream", second.ReResolvedTags)
+	if second.ReResolvedTags != 0 {
+		t.Fatalf("re-warm ReResolvedTags = %d, want no default refresh", second.ReResolvedTags)
 	}
 	for _, result := range second.Results {
 		if strings.Contains(result.Ref, "@") && result.ReResolvedTag {

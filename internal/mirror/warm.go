@@ -8,16 +8,19 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/randax/talos-box/internal/imagecache"
 )
 
 type WarmSummary struct {
-	Results         []WarmResult
-	Warmed          int
-	AlreadyComplete int
-	Failed          int
+	Results          []WarmResult
+	Warmed           int
+	AlreadyComplete  int
+	Failed           int
+	FailedMissing    int
+	FailedRevalidate int
 	// ReResolvedTags counts the tag-pinned refs whose tag was resolved
 	// upstream again. That resolution is what a re-warm of an already
 	// complete list spends its time on, so the summary can explain the
@@ -28,11 +31,24 @@ type WarmSummary struct {
 type WarmResult struct {
 	Ref             string
 	AlreadyComplete bool
+	Outcome         WarmOutcome
+	RefreshWarning  string
 	// ReResolvedTag records that this ref named a tag and the tag was
 	// re-resolved against the upstream registry.
 	ReResolvedTag bool
 	Error         string
 }
+
+type WarmOptions struct{ Refresh bool }
+
+type WarmOutcome string
+
+const (
+	WarmOutcomeWarmed           WarmOutcome = "warmed"
+	WarmOutcomeAlreadyComplete  WarmOutcome = "already-complete"
+	WarmOutcomeFailedMissing    WarmOutcome = "failed-missing"
+	WarmOutcomeFailedRevalidate WarmOutcome = "failed-revalidate"
+)
 
 type warmReference struct {
 	upstream     string
@@ -41,32 +57,43 @@ type warmReference struct {
 	pinnedDigest string
 }
 
-func (m *Manager) Warm(ctx context.Context, references []string, architecture imagecache.Architecture) (WarmSummary, error) {
+func (m *Manager) Warm(ctx context.Context, references []string, architecture imagecache.Architecture, options WarmOptions) (WarmSummary, error) {
 	var summary WarmSummary
 	for _, reference := range references {
-		result, err := m.warmOne(ctx, reference, string(architecture))
+		result, err := m.warmOne(ctx, reference, architecture, options)
 		if err != nil {
-			summary.Results = append(summary.Results, WarmResult{Ref: reference, Error: err.Error()})
+			result.Ref = reference
+			result.Error = err.Error()
+			if result.Outcome == "" {
+				result.Outcome = WarmOutcomeFailedMissing
+			}
+			summary.Results = append(summary.Results, result)
 			summary.Failed++
+			if result.Outcome == WarmOutcomeFailedRevalidate {
+				summary.FailedRevalidate++
+			} else {
+				summary.FailedMissing++
+			}
 			continue
 		}
 		summary.Results = append(summary.Results, result)
 		if result.ReResolvedTag {
 			summary.ReResolvedTags++
 		}
-		if result.AlreadyComplete {
+		switch result.Outcome {
+		case WarmOutcomeAlreadyComplete:
 			summary.AlreadyComplete++
-		} else {
+		default:
 			summary.Warmed++
 		}
 	}
 	return summary, nil
 }
 
-func (m *Manager) warmOne(ctx context.Context, reference, hostArch string) (WarmResult, error) {
+func (m *Manager) warmOne(ctx context.Context, reference string, architecture imagecache.Architecture, options WarmOptions) (WarmResult, error) {
 	parsed, err := parseWarmReference(reference)
 	if err != nil {
-		return WarmResult{}, err
+		return WarmResult{Outcome: WarmOutcomeFailedMissing}, err
 	}
 	if !isDigestReference(parsed.listedRef) {
 		m.warmTagMu.Lock()
@@ -74,81 +101,96 @@ func (m *Manager) warmOne(ctx context.Context, reference, hostArch string) (Warm
 	}
 	authority, err := parseUpstreamAuthority(parsed.upstream)
 	if err != nil {
-		return WarmResult{}, err
+		return WarmResult{Outcome: WarmOutcomeFailedMissing}, err
 	}
+	server := &Server{cacheDir: filepath.Join(m.cacheRoot, authority.cacheKey)}
+	target := CacheTarget{Repository: parsed.repository, Digest: parsed.pinnedDigest, Platform: Platform{OS: "linux", Architecture: architecture}}
+	if !isDigestReference(parsed.listedRef) {
+		target.Tag = parsed.listedRef
+	}
+	before := server.InspectCached(ctx, target, InspectOptions{})
+	refresh := options.Refresh && target.Tag != "" && parsed.pinnedDigest == ""
+	if before.Complete() && !refresh {
+		return WarmResult{Ref: reference, AlreadyComplete: true, Outcome: WarmOutcomeAlreadyComplete}, nil
+	}
+
 	handler := m.handlerForUpstream(authority)
 	m.mu.Lock()
-	server := m.dynamicServers[authority.cacheKey]
+	server = m.dynamicServers[authority.cacheKey]
 	m.mu.Unlock()
 	if server == nil {
-		return WarmResult{}, fmt.Errorf("warm server for %q unavailable", parsed.upstream)
+		return failedWarmResult(before), fmt.Errorf("warm server for %q unavailable", parsed.upstream)
 	}
 
-	result := WarmResult{Ref: reference, AlreadyComplete: true}
+	result := WarmResult{Ref: reference, Outcome: WarmOutcomeWarmed}
 	seenManifests := map[string]bool{}
 	seenBlobs := map[string]bool{}
-	var staged *stagedManifest
-	stageListed := !isDigestReference(parsed.listedRef)
-	if stageListed {
-		staged = &stagedManifest{}
-	}
+	staged := &stagedManifest{}
 
-	validateReference := parsed.listedRef
+	requestReference := parsed.listedRef
+	validateReference := requestReference
 	listedContext := ctx
 	if parsed.pinnedDigest != "" {
+		requestReference = parsed.pinnedDigest
 		validateReference = parsed.pinnedDigest
 		// only the listed ref is pinned by the warm list; everything reached
 		// from it is pinned by its parent manifest
 		listedContext = withFilePin(ctx)
 	}
-	body, digest, cachedBefore, err := warmManifestRequest(listedContext, handler, server, parsed.repository, parsed.listedRef, validateReference, staged)
+	body, digest, _, err := warmManifestRequest(listedContext, handler, server, parsed.repository, requestReference, validateReference, staged)
 	if err != nil {
-		return WarmResult{}, err
+		if before.Complete() && refresh && isTransientWarmError(err) {
+			return WarmResult{Ref: reference, AlreadyComplete: true, Outcome: WarmOutcomeAlreadyComplete, RefreshWarning: refreshWarning(err)}, nil
+		}
+		return failedWarmResult(before), err
 	}
-	if !cachedBefore {
-		result.AlreadyComplete = false
+	if refresh && staged.requestPath == "" {
+		return WarmResult{Ref: reference, AlreadyComplete: true, Outcome: WarmOutcomeAlreadyComplete, RefreshWarning: "upstream unavailable, not revalidated"}, nil
 	}
 	if parsed.pinnedDigest != "" && digest != parsed.pinnedDigest {
-		return WarmResult{}, fmt.Errorf("listed ref %q resolved to %s, want %s", reference, digest, parsed.pinnedDigest)
+		return failedWarmResult(before), fmt.Errorf("listed ref %q resolved to %s, want %s", reference, digest, parsed.pinnedDigest)
 	}
-	if stageListed && staged != nil {
-		staged.metadata.DockerContentDigest = digest
-	}
+	staged.metadata.DockerContentDigest = digest
 	seenManifests[digest] = true
-	if parsed.listedRef != digest {
-		_, _, digestCachedBefore, err := warmManifestRequest(ctx, handler, server, parsed.repository, digest, digest, nil)
-		if err != nil {
-			return WarmResult{}, err
-		}
-		if !digestCachedBefore {
-			result.AlreadyComplete = false
-		}
-	}
 
-	if err := warmManifestGraph(ctx, handler, server, parsed.repository, body, hostArch, seenManifests, map[string]bool{}, seenBlobs, &result); err != nil {
-		return WarmResult{}, err
+	if err := warmManifestGraph(ctx, handler, server, parsed.repository, body, string(architecture), seenManifests, map[string]bool{}, seenBlobs, &result); err != nil {
+		return failedWarmResult(before), err
 	}
-	if stageListed && staged != nil {
-		switch {
-		case staged.requestPath != "" && len(staged.data) > 0:
-			if err := server.storeManifest(staged.requestPath, staged.metadata, staged.data); err != nil {
-				return WarmResult{}, fmt.Errorf("publish listed manifest: %w", err)
-			}
-			// A staged manifest is one the refresh fetched upstream: the tag
-			// was resolved again, whether or not anything was downloaded.
-			result.ReResolvedTag = true
-		case cachedBefore && server.offlineEnabled():
-			// offline replay answered the listed tag from the cache, so the
-			// entry it would republish is already on disk. Online, an empty
-			// stage means the refresh never reached upstream, which stays a
-			// failure so a stale tag is never reported as re-warmed. The
-			// cachedBefore conjunct is defensive: an offline request for an
-			// uncached tag already failed with 503 before reaching here.
-		default:
-			return WarmResult{}, fmt.Errorf("listed ref %q did not produce a staged manifest", reference)
+	if len(body) == 0 {
+		return failedWarmResult(before), fmt.Errorf("listed ref %q produced no manifest", reference)
+	}
+	metadata := staged.metadata
+	metadata.DockerContentDigest = digest
+	if err := server.storeManifest(manifestRequestPath(parsed.repository, digest), metadata, body); err != nil {
+		return failedWarmResult(before), fmt.Errorf("publish digest manifest: %w", err)
+	}
+	digestStatus := server.InspectCached(ctx, CacheTarget{Repository: parsed.repository, Digest: digest, Platform: target.Platform}, InspectOptions{})
+	if !digestStatus.Complete() {
+		return failedWarmResult(before), errors.New(digestStatus.Reason())
+	}
+	if target.Tag != "" {
+		if err := server.storeManifest(manifestRequestPath(parsed.repository, target.Tag), metadata, body); err != nil {
+			return failedWarmResult(before), fmt.Errorf("publish tag manifest: %w", err)
 		}
+		result.ReResolvedTag = true
+	}
+	finalTarget := target
+	finalTarget.Digest = digest
+	if status := server.InspectCached(ctx, finalTarget, InspectOptions{}); !status.Complete() {
+		return failedWarmResult(before), errors.New(status.Reason())
+	}
+	if before.Complete() && before.RootDigest == digest {
+		result.AlreadyComplete = true
+		result.Outcome = WarmOutcomeAlreadyComplete
 	}
 	return result, nil
+}
+
+func failedWarmResult(before CacheStatus) WarmResult {
+	if before.Complete() {
+		return WarmResult{Outcome: WarmOutcomeFailedRevalidate}
+	}
+	return WarmResult{Outcome: WarmOutcomeFailedMissing}
 }
 
 func warmManifestGraph(ctx context.Context, handler http.Handler, server *Server, repository string, body []byte, hostArch string, seenManifests, warmedHostManifests, seenBlobs map[string]bool, result *WarmResult) error {
@@ -176,9 +218,10 @@ func warmManifestGraph(ctx context.Context, handler http.Handler, server *Server
 	matchedHost := false
 	for _, child := range children {
 		hostMatch := child.architecture == hostArch && (child.os == "" || child.os == "linux")
-		if hostMatch {
-			matchedHost = true
+		if !hostMatch {
+			continue
 		}
+		matchedHost = true
 		var (
 			childBody     []byte
 			cachedBefore  bool
@@ -273,16 +316,45 @@ func warmManifestRequest(ctx context.Context, handler http.Handler, server *Serv
 	}, ","))
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusOK {
-		message := strings.TrimSpace(recorder.Body.String())
-		if recorder.Code == http.StatusConflict {
-			// the mirror already named the image and both digests; the request
-			// path and status would only bury that under transport detail
-			return nil, "", cachedBefore, errors.New(message)
-		}
-		return nil, "", cachedBefore, fmt.Errorf("%s returned %d: %s", path, recorder.Code, message)
+	if recorder.Code == http.StatusOK {
+		return recorder.Body.Bytes(), recorder.Header().Get("Docker-Content-Digest"), cachedBefore, nil
 	}
-	return recorder.Body.Bytes(), recorder.Header().Get("Docker-Content-Digest"), cachedBefore, nil
+	message := strings.TrimSpace(recorder.Body.String())
+	if recorder.Code == http.StatusConflict {
+		// the mirror already named the image and both digests; the request
+		// path and status would only bury that under transport detail
+		return nil, "", cachedBefore, errors.New(message)
+	}
+	return nil, "", cachedBefore, &warmRequestError{
+		path:    path,
+		status:  recorder.Code,
+		message: message,
+		reason:  recorder.Header().Get(reasonHeader),
+	}
+}
+
+type warmRequestError struct {
+	path    string
+	status  int
+	message string
+	reason  string
+}
+
+func (e *warmRequestError) Error() string {
+	return fmt.Sprintf("%s returned %d: %s", e.path, e.status, e.message)
+}
+
+func isTransientWarmError(err error) bool {
+	var requestErr *warmRequestError
+	return errors.As(err, &requestErr) && requestErr.reason != reasonUpstreamManifestInvalid && (requestErr.status == http.StatusTooManyRequests || requestErr.status >= 500)
+}
+
+func refreshWarning(err error) string {
+	var requestErr *warmRequestError
+	if errors.As(err, &requestErr) {
+		return fmt.Sprintf("upstream %d, not revalidated", requestErr.status)
+	}
+	return "upstream unavailable, not revalidated"
 }
 
 func warmBlobRequest(ctx context.Context, handler http.Handler, repository, digest string) error {
