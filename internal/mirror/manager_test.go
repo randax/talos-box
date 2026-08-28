@@ -1504,6 +1504,63 @@ func mustURL(t *testing.T, raw string) *url.URL {
 	return parsed
 }
 
+func TestCatchAllServesStaleTagOnResolutionFailure(t *testing.T) {
+	cacheRoot := t.TempDir()
+	_, manifest, _ := newCompleteStaleFixtureAt(t, filepath.Join(cacheRoot, "registry.example"))
+	manager := newManagerWithPorts(cacheRoot, nil, 0)
+	manager.resolveUpstreamIPs = func(context.Context, string) ([]net.IP, error) {
+		return nil, &net.DNSError{Err: "no such host", Name: "registry.example"}
+	}
+	manager.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	manager.dialContext = func(context.Context, string, string) (net.Conn, error) {
+		t.Fatal("unexpected dial on stale replay")
+		return nil, nil
+	}
+	defer manager.Close()
+
+	logged := captureDaemonLog(t)
+	authority, err := parseUpstreamAuthority("registry.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stale := manager.cacheProbeServer(authority).staleCandidate(httptest.NewRequest(http.MethodGet, "/v2/demo/manifests/stable", nil)); !stale.Complete() {
+		t.Fatalf("stale candidate = %s", stale.Reason())
+	}
+	request := httptest.NewRequest(http.MethodGet, "/v2/demo/manifests/stable?ns=registry.example", nil)
+	recorder := httptest.NewRecorder()
+	manager.serveCatchAll(recorder, request)
+	if recorder.Code != http.StatusOK || recorder.Body.String() != string(manifest) {
+		t.Fatalf("stale catch-all = %d %q, want 200 %q", recorder.Code, recorder.Body.String(), manifest)
+	}
+	if got := recorder.Header().Get(reasonHeader); got != "served-stale" {
+		t.Fatalf("%s = %q, want served-stale", reasonHeader, got)
+	}
+	if line := logged.String(); !strings.Contains(line, "mirror served stale: registry.example/demo:stable") || !strings.Contains(line, "no such host") {
+		t.Fatalf("daemon log = %q, want stale resolution replay", line)
+	}
+}
+
+func TestCatchAllDoesNotServeStaleTagOnPolicyRejection(t *testing.T) {
+	cacheRoot := t.TempDir()
+	_, _, _ = newCompleteStaleFixtureAt(t, filepath.Join(cacheRoot, "registry.example"))
+	manager := newManagerWithPorts(cacheRoot, nil, 0)
+	manager.resolveUpstreamIPs = func(context.Context, string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("127.0.0.1")}, nil
+	}
+	manager.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	defer manager.Close()
+
+	request := httptest.NewRequest(http.MethodGet, "/v2/demo/manifests/stable?ns=registry.example", nil)
+	recorder := httptest.NewRecorder()
+	manager.serveCatchAll(recorder, request)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("policy rejection = %d %q, want 403", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), manifestBody) {
+		t.Fatalf("policy rejection served cached manifest: %q", recorder.Body.String())
+	}
+}
+
 type closableHandler struct {
 	closed *atomic.Int64
 }

@@ -71,6 +71,20 @@ func TestInspectCachedReportsAllMissingLayers(t *testing.T) {
 	}
 }
 
+func TestInspectCachedReportsMissingSelectedPlatformWithoutEmptyDigestSlot(t *testing.T) {
+	fixture := newCompletenessFixture(t)
+	target := fixture.target("stable")
+	target.Platform = Platform{OS: "linux", Architecture: imagecache.Architecture("s390x")}
+
+	status := fixture.server.InspectCached(context.Background(), target, InspectOptions{})
+	if status.Complete() {
+		t.Fatal("InspectCached() unexpectedly reported missing platform complete")
+	}
+	if got, want := status.Reason(), "index present; no linux/s390x manifest in index"; got != want {
+		t.Fatalf("Reason() = %q, want %q", got, want)
+	}
+}
+
 func TestInspectCachedRequiresTagAtDigestMappingToPinnedDigest(t *testing.T) {
 	fixture := newCompletenessFixture(t)
 	wrongData := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:` + strings.Repeat("f", 64) + `"},"layers":[]}`)
@@ -129,8 +143,36 @@ func TestInspectCachedRejectsSymlinkAndPathSwap(t *testing.T) {
 	if err := os.Rename(replacement, target); err != nil {
 		t.Fatal(err)
 	}
-	if err := validateOpenedRegularFile(target, info); err == nil || !strings.Contains(err.Error(), "changed during open") {
+	pathInfo, err := os.Lstat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateOpenedRegularFile(target, pathInfo, info); err == nil || !strings.Contains(err.Error(), "changed during open") {
 		t.Fatalf("path swap validation = %v", err)
+	}
+}
+
+func TestInspectCachedWalksNestedSelectedIndexes(t *testing.T) {
+	fixture := newNestedCompletenessFixture(t, false)
+
+	status := fixture.server.InspectCached(context.Background(), fixture.target("stable"), InspectOptions{})
+	if status.Complete() {
+		t.Fatal("InspectCached() = complete, want nested manifest blob gap")
+	}
+	if len(status.Gaps) == 0 || status.Gaps[0].Kind != CacheGapConfig {
+		t.Fatalf("status = %+v, want first gap %q", status, CacheGapConfig)
+	}
+	if got := status.Reason(); !strings.Contains(got, fixture.configDigest) {
+		t.Fatalf("Reason() = %q, want nested config digest %q", got, fixture.configDigest)
+	}
+}
+
+func TestInspectCachedReportsNestedSelectedIndexesCompleteWhenBlobsPresent(t *testing.T) {
+	fixture := newNestedCompletenessFixture(t, true)
+
+	status := fixture.server.InspectCached(context.Background(), fixture.target("stable"), InspectOptions{})
+	if !status.Complete() {
+		t.Fatalf("InspectCached() = %s, want complete", status.Reason())
 	}
 }
 
@@ -171,11 +213,11 @@ func newCompletenessFixtureAt(t *testing.T, cacheDir string) completenessFixture
 	store(platformDigest, "application/vnd.oci.image.manifest.v1+json", platformDigest, platformBody)
 	store(foreignDigest, "application/vnd.oci.image.manifest.v1+json", foreignDigest, foreignBody)
 	writeBlob := func(digest string, data []byte) {
-		p := server.blobPath(digest)
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		path := server.blobPath(digest)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(p, data, 0o644); err != nil {
+		if err := os.WriteFile(path, data, 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -196,4 +238,68 @@ func descriptorJSON(digests []string) string {
 		parts[i] = fmt.Sprintf(`{"digest":"%s"}`, digest)
 	}
 	return strings.Join(parts, ",")
+}
+
+type nestedCompletenessFixture struct {
+	server         *Server
+	rootDigest     string
+	foreignDigest  string
+	configDigest   string
+	layerDigest    string
+	manifestDigest string
+}
+
+func newNestedCompletenessFixture(t *testing.T, includeBlobs bool) nestedCompletenessFixture {
+	return newNestedCompletenessFixtureAt(t, t.TempDir(), includeBlobs)
+}
+
+func newNestedCompletenessFixtureAt(t *testing.T, cacheDir string, includeBlobs bool) nestedCompletenessFixture {
+	t.Helper()
+	server := NewServer("https://registry.example", cacheDir)
+	config := []byte("nested-config")
+	layer := []byte("nested-layer")
+	configDigest := "sha256:" + sha256Hex(config)
+	layerDigest := "sha256:" + sha256Hex(layer)
+	manifestBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"%s"},"layers":[{"digest":"%s"}]}`, configDigest, layerDigest)
+	manifestDigest := "sha256:" + sha256Hex([]byte(manifestBody))
+	nestedBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"digest":"%s","platform":{"os":"linux","architecture":"amd64"}}]}`, manifestDigest)
+	nestedDigest := "sha256:" + sha256Hex([]byte(nestedBody))
+	foreignBody := `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:` + strings.Repeat("e", 64) + `"},"layers":[]}`
+	foreignDigest := "sha256:" + sha256Hex([]byte(foreignBody))
+	rootBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"digest":"%s","platform":{"os":"linux","architecture":"amd64"}},{"digest":"%s","platform":{"os":"linux","architecture":"arm64"}}]}`, nestedDigest, foreignDigest)
+	rootDigest := "sha256:" + sha256Hex([]byte(rootBody))
+	store := func(ref, media, digest, body string) {
+		t.Helper()
+		if err := server.storeManifest(manifestRequestPath("demo", ref), manifestMetadata{ContentType: media, DockerContentDigest: digest}, []byte(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store("stable", "application/vnd.oci.image.index.v1+json", rootDigest, rootBody)
+	store(rootDigest, "application/vnd.oci.image.index.v1+json", rootDigest, rootBody)
+	store(nestedDigest, "application/vnd.oci.image.index.v1+json", nestedDigest, nestedBody)
+	store(manifestDigest, "application/vnd.oci.image.manifest.v1+json", manifestDigest, manifestBody)
+	store(foreignDigest, "application/vnd.oci.image.manifest.v1+json", foreignDigest, foreignBody)
+	if includeBlobs {
+		for digest, data := range map[string][]byte{configDigest: config, layerDigest: layer} {
+			path := server.blobPath(digest)
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	return nestedCompletenessFixture{
+		server:         server,
+		rootDigest:     rootDigest,
+		foreignDigest:  foreignDigest,
+		configDigest:   configDigest,
+		layerDigest:    layerDigest,
+		manifestDigest: manifestDigest,
+	}
+}
+
+func (f nestedCompletenessFixture) target(tag string) CacheTarget {
+	return CacheTarget{Repository: "demo", Tag: tag, Digest: f.rootDigest, Platform: Platform{OS: "linux", Architecture: imagecache.ArchitectureAMD64}}
 }

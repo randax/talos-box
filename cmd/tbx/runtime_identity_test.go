@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/randax/talos-box/internal/daemon"
@@ -25,12 +27,15 @@ func TestRuntimeIdentityPrintsClientDaemonAndHelperTogether(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := fmt.Sprintf("runtime:\n"+
-		"  client: /opt/current/tbx (0.1.3; tbx protocol %d; daemon protocol %d; helper protocol %d)\n"+
+		"  client: /opt/current/tbx (0.1.3; daemon protocol %d; helper protocol %d)\n"+
 		"  daemon: /opt/current/tbxd (0.1.3; protocol %d; pid 1234)\n"+
 		"  helper: /opt/current/tbx-helper (0.1.3; protocol %d; pid 2345)\n",
-		daemon.ProtocolVersion, daemon.ProtocolVersion, helper.ProtocolVersion, daemon.ProtocolVersion, helper.ProtocolVersion)
+		daemon.ProtocolVersion, helper.ProtocolVersion, daemon.ProtocolVersion, helper.ProtocolVersion)
 	if output.String() != want {
 		t.Fatalf("renderRuntimeIdentity() =\n%s\nwant:\n%s", output.String(), want)
+	}
+	if strings.Contains(output.String(), "tbx protocol") {
+		t.Fatalf("renderRuntimeIdentity() kept the duplicated tbx protocol line:\n%s", output.String())
 	}
 }
 
@@ -71,30 +76,61 @@ func TestRuntimeIdentityDeduplicatesSymlinkedPATHEntries(t *testing.T) {
 	}
 }
 
-func TestRuntimeIdentityReportsUnavailableComponentsWithoutStartingThem(t *testing.T) {
-	var daemonProbes, helperProbes int
+func TestRuntimeIdentityReportsUnavailableAndUnreachableHelpers(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "missing socket", err: fmt.Errorf("connect to helper at /tmp/tbx-helper.sock: %w", os.ErrNotExist), want: "helper: not installed"},
+		{name: "connection refused", err: fmt.Errorf("connect to helper at /tmp/tbx-helper.sock: %w", syscall.ECONNREFUSED), want: "helper: not installed"},
+		{name: "other error", err: errors.New("tls alert"), want: "helper: unreachable: tls alert"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			identity := collectRuntimeIdentity(context.Background(), runtimeIdentityDeps{
+				executable: func() (string, error) { return "/opt/current/tbx", nil },
+				helperProbe: func(context.Context) (helper.Info, error) {
+					return helper.Info{}, test.err
+				},
+			})
+			var output bytes.Buffer
+			if err := renderRuntimeIdentity(&output, identity); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(output.String(), test.want) {
+				t.Fatalf("runtime output = %q, want %q", output.String(), test.want)
+			}
+		})
+	}
+}
+
+func TestRuntimeIdentityTreatsRejectedOldHelperAsAvailable(t *testing.T) {
 	identity := collectRuntimeIdentity(context.Background(), runtimeIdentityDeps{
 		executable: func() (string, error) { return "/opt/current/tbx", nil },
-		daemonProbe: func(context.Context) (daemon.Info, int, error) {
-			daemonProbes++
-			return daemon.Info{}, 0, fmt.Errorf("connection refused")
-		},
 		helperProbe: func(context.Context) (helper.Info, error) {
-			helperProbes++
-			return helper.Info{}, fmt.Errorf("no helper socket")
+			return helper.Info{}, &helper.ProtocolMismatchError{ClientVersion: helper.ProtocolVersion, HelperVersion: helper.ProtocolVersion - 1}
 		},
 	})
 	var output bytes.Buffer
 	if err := renderRuntimeIdentity(&output, identity); err != nil {
 		t.Fatal(err)
 	}
-	if daemonProbes != 1 || helperProbes != 1 {
-		t.Fatalf("probe calls = daemon %d helper %d, want one read-only probe each", daemonProbes, helperProbes)
+	if !identity.Helper.Available {
+		t.Fatal("helper mismatch rendered as unavailable")
 	}
-	for _, want := range []string{"daemon: not running", "helper: not installed"} {
-		if !strings.Contains(output.String(), want) {
-			t.Errorf("runtime output missing %q:\n%s", want, output.String())
-		}
+	if got := output.String(); !strings.Contains(got, fmt.Sprintf("helper: unknown path (protocol %d; predates identity reporting)", helper.ProtocolVersion-1)) {
+		t.Fatalf("runtime output = %q, want old-helper identity line", got)
+	}
+	if got := output.String(); !strings.Contains(got, "FAIL runtime-compat:") {
+		t.Fatalf("runtime output = %q, want runtime-compat finding", got)
+	}
+	if got := output.String(); !strings.Contains(got, "system install") || strings.Contains(got, "system restart") {
+		t.Fatalf("runtime output = %q, want helper remediation without daemon restart", got)
+	}
+	if strings.Contains(output.String(), "helper: not installed") {
+		t.Fatalf("runtime output = %q, must not hide a reachable old helper as not installed", output.String())
 	}
 }
 
@@ -125,47 +161,84 @@ func TestRuntimeIdentityWarnsForMultipleDistinctTBXOnPATHFinding(t *testing.T) {
 	}
 }
 
-func TestRuntimeIdentityNamesBothSidesOfOlderDaemonAndHelperMismatch(t *testing.T) {
-	identity := collectRuntimeIdentity(context.Background(), runtimeIdentityDeps{
-		executable: func() (string, error) { return "/opt/current/tbx", nil },
-		daemonProbe: func(context.Context) (daemon.Info, int, error) {
-			return daemon.Info{
-				ProtocolVersion: daemon.ProtocolVersion - 1,
-				Version:         "0.1.2",
-				Executable:      "/opt/old/tbxd",
-				PID:             1111,
-			}, 1111, nil
-		},
-		helperProbe: func(context.Context) (helper.Info, error) {
-			return helper.Info{
-				ProtocolVersion: helper.ProtocolVersion - 1,
-				Version:         "0.1.2",
-				Executable:      "/opt/old/tbx-helper",
-				PID:             2222,
-			}, nil
-		},
-	})
-	var output bytes.Buffer
-	if err := renderRuntimeIdentity(&output, identity); err != nil {
-		t.Fatal(err)
+func TestRuntimeIdentityCompatibilityFindingsArePerComponent(t *testing.T) {
+	identity := runtimeIdentity{
+		Client: componentIdentity{Path: "/opt/current/tbx", Version: "0.1.3", Protocol: daemon.ProtocolVersion, Available: true},
+		Daemon: componentIdentity{Path: "/opt/old/tbxd", Version: "0.1.2", Protocol: daemon.ProtocolVersion - 1, Available: true},
+		Helper: componentIdentity{Path: "/opt/old/tbx-helper", Version: "0.1.2", Protocol: helper.ProtocolVersion - 1, Available: true},
 	}
-	want := "FAIL runtime-compat: client /opt/current/tbx is newer than daemon /opt/old/tbxd (protocol 16 < 17) and helper /opt/old/tbx-helper (protocol 4 < 5); run `/opt/current/tbx system restart --force` or use the matching client\n"
-	if !strings.Contains(output.String(), want) {
-		t.Fatalf("runtime output =\n%s\nwant line:\n%s", output.String(), want)
+	findings := runtimeIdentityFindings(identity)
+	if len(findings) != 3 {
+		t.Fatalf("findings = %+v, want 3", findings)
+	}
+	if findings[1].check != "runtime-compat" || !strings.Contains(findings[1].detail, "daemon /opt/old/tbxd (0.1.2, proto") {
+		t.Fatalf("daemon finding = %+v", findings[1])
+	}
+	if findings[2].check != "runtime-compat" || !strings.Contains(findings[2].detail, "helper /opt/old/tbx-helper (0.1.2, proto") {
+		t.Fatalf("helper finding = %+v", findings[2])
 	}
 }
 
-func TestRuntimeIdentityDoesNotPrescribeHelperReinstallBeforeNamingMultipleInstallConflict(t *testing.T) {
+func TestRuntimeIdentityFormatsDaemonOnlyMismatchBothDirections(t *testing.T) {
+	tests := []struct {
+		name      string
+		protocol  int
+		direction string
+	}{
+		{name: "client newer", protocol: daemon.ProtocolVersion - 1, direction: "newer"},
+		{name: "client older", protocol: daemon.ProtocolVersion + 1, direction: "older"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			identity := runtimeIdentity{
+				Client: componentIdentity{Path: "/opt/current/tbx", Version: "0.1.3", Protocol: daemon.ProtocolVersion, Available: true},
+				Daemon: componentIdentity{Path: "/opt/current/tbxd", Version: "0.1.2", Protocol: test.protocol, Available: true},
+				Helper: componentIdentity{Protocol: helper.ProtocolVersion, Available: true},
+			}
+			findings := runtimeIdentityFindings(identity)
+			if len(findings) != 1 || findings[0].check != "runtime-compat" {
+				t.Fatalf("findings = %+v, want one daemon compatibility failure", findings)
+			}
+			for _, want := range []string{
+				"client /opt/current/tbx (0.1.3, proto",
+				"is " + test.direction + " than daemon /opt/current/tbxd (0.1.2, proto",
+				"`/opt/current/tbx system restart`",
+				"add `--force` only if it refuses because clusters are running",
+			} {
+				if !strings.Contains(findings[0].detail, want) {
+					t.Fatalf("daemon detail = %q, want %q", findings[0].detail, want)
+				}
+			}
+		})
+	}
+}
+
+func TestRuntimeIdentityCompatibilityFindingUsesDaemonPIDWhenPathUnknown(t *testing.T) {
+	identity := runtimeIdentity{
+		Client: componentIdentity{Path: "/opt/current/tbx", Version: "0.1.3", Protocol: daemon.ProtocolVersion, Available: true},
+		Daemon: componentIdentity{PID: 4242, Protocol: daemon.ProtocolVersion - 1, Available: true},
+	}
+	findings := runtimeIdentityFindings(identity)
+	if len(findings) != 1 {
+		t.Fatalf("findings = %+v, want one daemon compatibility finding", findings)
+	}
+	if got := findings[0].detail; !strings.Contains(got, "daemon (pid 4242, protocol") || strings.Contains(got, "daemon unknown") {
+		t.Fatalf("daemon finding = %q, want pid wording without unknown", got)
+	}
+}
+
+func TestRuntimeIdentityNotesOtherPATHInstallWillBecomeIncompatible(t *testing.T) {
 	identity := runtimeIdentity{
 		Client:  componentIdentity{Path: "/opt/current/tbx", Version: "0.1.3", Protocol: daemon.ProtocolVersion, Available: true},
-		Helper:  componentIdentity{Path: "/opt/old/tbx-helper", Version: "0.1.2", Protocol: helper.ProtocolVersion - 1, Available: true},
+		Daemon:  componentIdentity{Path: "/opt/current/tbxd", Version: "0.1.3", Protocol: daemon.ProtocolVersion, Available: true},
+		Helper:  componentIdentity{Path: "/opt/current/tbx-helper", Version: "0.1.3", Protocol: helper.ProtocolVersion, Available: true},
 		PATHTBX: []string{"/opt/current/tbx", "/opt/old/tbx"},
 	}
 	findings := runtimeIdentityFindings(identity)
-	if len(findings) != 2 || findings[0].check != "installations" || findings[1].check != "runtime-compat" {
-		t.Fatalf("findings = %+v, want installation conflict before compatibility failure", findings)
+	if len(findings) != 1 || findings[0].check != "installations" {
+		t.Fatalf("findings = %+v, want one installation warning", findings)
 	}
-	if strings.Contains(findings[0].detail, "system install") || strings.Contains(findings[0].detail, "reinstall the helper") {
-		t.Fatalf("installations detail = %q, want the multi-install conflict named first", findings[0].detail)
+	if !strings.Contains(findings[0].detail, "aligning to this client makes the other installation incompatible") {
+		t.Fatalf("installations detail = %q, want competing-install note", findings[0].detail)
 	}
 }

@@ -64,6 +64,58 @@ func TestSystemStatusUsesTheRuntimeIdentityBlock(t *testing.T) {
 	}
 }
 
+func TestSystemStatusPrintsRestartHintOnlyForDaemonMismatch(t *testing.T) {
+	tests := []struct {
+		name     string
+		identity runtimeIdentity
+		wantHint bool
+	}{
+		{
+			name: "helper only",
+			identity: runtimeIdentity{
+				Client: componentIdentity{Name: "client", Path: "/opt/current/tbx", Version: "0.1.3", Protocol: daemon.ProtocolVersion, Available: true},
+				Daemon: componentIdentity{Name: "daemon", Path: "/opt/current/tbxd", Version: "0.1.3", Protocol: daemon.ProtocolVersion, PID: 1234, Available: true},
+				Helper: componentIdentity{Name: "helper", Path: "/opt/old/tbx-helper", Version: "0.1.2", Protocol: helper.ProtocolVersion - 1, Available: true},
+				Findings: []doctorFinding{
+					{level: "FAIL", check: "runtime-compat", detail: "client /opt/current/tbx (0.1.3, proto 17) is newer than helper /opt/old/tbx-helper (0.1.2, proto 4); run `sudo /opt/current/tbx system install` or use the matching client"},
+				},
+			},
+			wantHint: false,
+		},
+		{
+			name: "daemon only",
+			identity: runtimeIdentity{
+				Client: componentIdentity{Name: "client", Path: "/opt/current/tbx", Version: "0.1.3", Protocol: daemon.ProtocolVersion, Available: true},
+				Daemon: componentIdentity{Name: "daemon", Path: "/opt/old/tbxd", Version: "0.1.2", Protocol: daemon.ProtocolVersion - 1, PID: 1234, Available: true},
+				Helper: componentIdentity{Name: "helper", Path: "/opt/current/tbx-helper", Version: "0.1.3", Protocol: helper.ProtocolVersion, PID: 2345, Available: true},
+				Findings: []doctorFinding{
+					{level: "FAIL", check: "runtime-compat", detail: "client /opt/current/tbx (0.1.3, proto 17) is newer than daemon /opt/old/tbxd (0.1.2, proto 16); run `/opt/current/tbx system restart` (add `--force` only if it refuses because clusters are running) or use the matching client"},
+				},
+			},
+			wantHint: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			command := cli{
+				out:             &stdout,
+				err:             &stderr,
+				runtimeIdentity: func(context.Context) runtimeIdentity { return test.identity },
+			}
+
+			if err := command.run([]string{"system", "status"}); err != nil {
+				t.Fatal(err)
+			}
+			gotHint := strings.Contains(stderr.String(), "warning: run: tbx system restart")
+			if gotHint != test.wantHint {
+				t.Fatalf("stderr = %q, want hint=%v", stderr.String(), test.wantHint)
+			}
+		})
+	}
+}
+
 func (f *fakeDNSUninstaller) UninstallDNS() error {
 	f.calls++
 	return f.uninstal

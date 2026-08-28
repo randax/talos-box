@@ -425,6 +425,7 @@ type CacheWarmEntry struct {
 	Status         CacheWarmStatus `json:"status"`
 	Reason         string          `json:"reason,omitempty"`
 	RefreshWarning string          `json:"refreshWarning,omitempty"`
+	ReResolvedTag  bool            `json:"reResolvedTag,omitempty"`
 }
 
 type CacheWarmResult struct {
@@ -434,6 +435,7 @@ type CacheWarmResult struct {
 	Failed           int              `json:"failed"`
 	FailedMissing    int              `json:"failedMissing"`
 	FailedRevalidate int              `json:"failedRevalidate"`
+	ReResolvedTags   int              `json:"reResolvedTags,omitempty"`
 }
 
 const cacheWarmTimeout = 2 * time.Hour

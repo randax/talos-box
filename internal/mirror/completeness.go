@@ -52,6 +52,8 @@ type CacheStatus struct {
 	layerTotal   int
 }
 
+const maxSelectedIndexDepth = 4
+
 func (s CacheStatus) Complete() bool { return len(s.Gaps) == 0 }
 
 func (s CacheStatus) Reason() string {
@@ -72,6 +74,9 @@ func (s CacheStatus) Reason() string {
 		}
 		return fmt.Sprintf("root manifest %s not cached", gap.Digest)
 	case CacheGapPlatformManifest:
+		if gap.Detail == "no selected platform in index" {
+			return fmt.Sprintf("index present; no %s manifest in index", platform)
+		}
 		if gap.Detail != "" {
 			return fmt.Sprintf("index present; %s manifest %s invalid: %s", platform, gap.Digest, gap.Detail)
 		}
@@ -132,6 +137,10 @@ func (s *Server) InspectCached(ctx context.Context, target CacheTarget, opts Ins
 			status.Gaps = append(status.Gaps, CacheGap{Kind: CacheGapTagMapping, Path: tagPath, Digest: mapped, Detail: detail})
 			return status
 		}
+		if _, err := decodeCachedGraph(data); err != nil {
+			status.Gaps = append(status.Gaps, CacheGap{Kind: CacheGapTagMapping, Path: tagPath, Digest: mapped, Detail: err.Error()})
+			return status
+		}
 		rootDigest = mapped
 	}
 	status.RootDigest = rootDigest
@@ -156,37 +165,15 @@ func (s *Server) InspectCached(ctx context.Context, target CacheTarget, opts Ins
 		status.Gaps = append(status.Gaps, CacheGap{Kind: CacheGapRootManifest, Path: rootPath, Digest: rootDigest, Detail: err.Error()})
 		return status
 	}
-	if len(manifest.Manifests) > 0 || strings.Contains(manifest.MediaType, "index") || strings.Contains(manifest.MediaType, "manifest.list") {
-		selected := ""
-		for _, child := range manifest.Manifests {
-			if child.Platform.Architecture == string(target.Platform.Architecture) && (child.Platform.OS == "" || child.Platform.OS == targetOS(target.Platform)) {
-				selected = child.Digest
-				break
-			}
-		}
-		if selected == "" {
-			status.Gaps = append(status.Gaps, CacheGap{Kind: CacheGapPlatformManifest, Detail: "no selected platform in index"})
-			return status
-		}
-		if _, _, err := checkedSupportedDigest(selected); err != nil {
-			status.Gaps = append(status.Gaps, CacheGap{Kind: CacheGapPlatformManifest, Digest: selected, Detail: err.Error()})
-			return status
-		}
-		childPath := manifestRequestPath(target.Repository, selected)
-		child, _, err := checkedCachedManifest(s, childPath)
+	if selected, ok := selectPlatformDescriptor(descriptorsForGraph(manifest), target.Platform); ok {
+		visited := map[string]struct{}{rootDigest: {}}
+		manifest, err = s.inspectSelectedManifest(ctx, target, manifest, selected, 1, visited, &status)
 		if err != nil {
-			status.Gaps = append(status.Gaps, CacheGap{Kind: CacheGapPlatformManifest, Path: childPath, Digest: selected, Detail: cacheReadDetail(err)})
 			return status
 		}
-		if _, err := verifySupportedDigest(child, selected); err != nil {
-			status.Gaps = append(status.Gaps, CacheGap{Kind: CacheGapPlatformManifest, Path: childPath, Digest: selected, Detail: err.Error()})
-			return status
-		}
-		manifest, err = decodeCachedGraph(child)
-		if err != nil {
-			status.Gaps = append(status.Gaps, CacheGap{Kind: CacheGapPlatformManifest, Path: childPath, Digest: selected, Detail: err.Error()})
-			return status
-		}
+	} else if isManifestIndex(manifest) {
+		status.Gaps = append(status.Gaps, CacheGap{Kind: CacheGapPlatformManifest, Detail: "no selected platform in index"})
+		return status
 	}
 	status.inspectBlobs(ctx, s, manifest, opts)
 	return status
@@ -198,6 +185,87 @@ func targetOS(platform Platform) string {
 	}
 	return platform.OS
 }
+
+type platformDescriptor struct {
+	Digest       string
+	Architecture string
+	OS           string
+}
+
+func descriptorsForGraph(graph cachedGraph) []platformDescriptor {
+	descriptors := make([]platformDescriptor, 0, len(graph.Manifests))
+	for _, child := range graph.Manifests {
+		descriptors = append(descriptors, platformDescriptor{
+			Digest:       child.Digest,
+			Architecture: child.Platform.Architecture,
+			OS:           child.Platform.OS,
+		})
+	}
+	return descriptors
+}
+
+func matchingPlatformDescriptors(descriptors []platformDescriptor, platform Platform) []platformDescriptor {
+	matches := make([]platformDescriptor, 0, len(descriptors))
+	for _, child := range descriptors {
+		if child.Architecture == string(platform.Architecture) && (child.OS == "" || child.OS == targetOS(platform)) {
+			matches = append(matches, child)
+		}
+	}
+	return matches
+}
+
+func selectPlatformDescriptor(descriptors []platformDescriptor, platform Platform) (platformDescriptor, bool) {
+	matches := matchingPlatformDescriptors(descriptors, platform)
+	if len(matches) == 0 {
+		return platformDescriptor{}, false
+	}
+	return matches[0], true
+}
+
+func isManifestIndex(graph cachedGraph) bool {
+	return len(graph.Manifests) > 0 || strings.Contains(graph.MediaType, "index") || strings.Contains(graph.MediaType, "manifest.list")
+}
+
+func (s *Server) inspectSelectedManifest(ctx context.Context, target CacheTarget, graph cachedGraph, selected platformDescriptor, depth int, visited map[string]struct{}, status *CacheStatus) (cachedGraph, error) {
+	if depth > maxSelectedIndexDepth {
+		status.Gaps = append(status.Gaps, CacheGap{Kind: CacheGapPlatformManifest, Digest: selected.Digest, Detail: fmt.Sprintf("selected platform manifest graph exceeds depth %d", maxSelectedIndexDepth)})
+		return cachedGraph{}, errors.New("depth exceeded")
+	}
+	if _, _, err := checkedSupportedDigest(selected.Digest); err != nil {
+		status.Gaps = append(status.Gaps, CacheGap{Kind: CacheGapPlatformManifest, Digest: selected.Digest, Detail: err.Error()})
+		return cachedGraph{}, err
+	}
+	if _, ok := visited[selected.Digest]; ok {
+		status.Gaps = append(status.Gaps, CacheGap{Kind: CacheGapPlatformManifest, Digest: selected.Digest, Detail: "selected platform manifest graph cycles"})
+		return cachedGraph{}, errors.New("cycle")
+	}
+	visited[selected.Digest] = struct{}{}
+	childPath := manifestRequestPath(target.Repository, selected.Digest)
+	child, _, err := checkedCachedManifest(s, childPath)
+	if err != nil {
+		status.Gaps = append(status.Gaps, CacheGap{Kind: CacheGapPlatformManifest, Path: childPath, Digest: selected.Digest, Detail: cacheReadDetail(err)})
+		return cachedGraph{}, err
+	}
+	if _, err := verifySupportedDigest(child, selected.Digest); err != nil {
+		status.Gaps = append(status.Gaps, CacheGap{Kind: CacheGapPlatformManifest, Path: childPath, Digest: selected.Digest, Detail: err.Error()})
+		return cachedGraph{}, err
+	}
+	decoded, err := decodeCachedGraph(child)
+	if err != nil {
+		status.Gaps = append(status.Gaps, CacheGap{Kind: CacheGapPlatformManifest, Path: childPath, Digest: selected.Digest, Detail: err.Error()})
+		return cachedGraph{}, err
+	}
+	if !isManifestIndex(decoded) {
+		return decoded, nil
+	}
+	next, ok := selectPlatformDescriptor(descriptorsForGraph(decoded), target.Platform)
+	if !ok {
+		status.Gaps = append(status.Gaps, CacheGap{Kind: CacheGapPlatformManifest, Detail: "no selected platform in index"})
+		return cachedGraph{}, errors.New("missing selected platform")
+	}
+	return s.inspectSelectedManifest(ctx, target, decoded, next, depth+1, visited, status)
+}
+
 func cacheReadDetail(err error) string {
 	if errors.Is(err, os.ErrNotExist) {
 		return ""

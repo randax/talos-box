@@ -7,7 +7,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/randax/talos-box/internal/daemon"
@@ -57,8 +59,8 @@ func renderRuntimeIdentityBlock(output io.Writer, identity runtimeIdentity) erro
 	if _, err := fmt.Fprintln(output, "runtime:"); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(output, "  client: %s (%s; tbx protocol %d; daemon protocol %d; helper protocol %d)\n",
-		identity.Client.Path, displayVersion(identity.Client.Version), identity.Client.Protocol, identity.Client.Protocol, helper.ProtocolVersion); err != nil {
+	if _, err := fmt.Fprintf(output, "  client: %s (%s; daemon protocol %d; helper protocol %d)\n",
+		identity.Client.Path, displayVersion(identity.Client.Version), identity.Client.Protocol, helper.ProtocolVersion); err != nil {
 		return err
 	}
 	if err := renderComponentIdentity(output, identity.Daemon); err != nil {
@@ -88,15 +90,16 @@ func renderComponentIdentity(output io.Writer, component componentIdentity) erro
 
 	path := component.Path
 	if path == "" {
-		path = "unknown"
+		path = "unknown path"
 	}
 	parts := make([]string, 0, 3)
-	if component.Path == "" || component.Version == "" {
-		parts = append(parts, component.Name+" predates identity reporting")
-	} else {
+	if component.Version != "" {
 		parts = append(parts, component.Version)
 	}
 	parts = append(parts, formatComponentProtocol(component.Protocol))
+	if component.Detail != "" {
+		parts = append(parts, component.Detail)
+	}
 	if component.PID > 0 {
 		parts = append(parts, fmt.Sprintf("pid %d", component.PID))
 	}
@@ -192,10 +195,30 @@ func collectRuntimeIdentity(ctx context.Context, deps runtimeIdentityDeps) runti
 				PID:       info.PID,
 				Available: true,
 			}
+		} else {
+			var mismatch *helper.ProtocolMismatchError
+			switch {
+			case errors.As(err, &mismatch):
+				identity.Helper = componentIdentity{
+					Name:      "helper",
+					Path:      "unknown path",
+					Protocol:  mismatch.HelperVersion,
+					Available: true,
+					Detail:    "predates identity reporting",
+				}
+			case helperProbeUnavailable(err):
+				identity.Helper = componentIdentity{Name: "helper", Detail: "not installed"}
+			default:
+				identity.Helper = componentIdentity{Name: "helper", Detail: "unreachable: " + err.Error()}
+			}
 		}
 	}
 	identity.Findings = runtimeIdentityFindings(identity)
 	return identity
+}
+
+func helperProbeUnavailable(err error) bool {
+	return errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ECONNREFUSED)
 }
 
 func firstPositive(values ...int) int {
@@ -210,10 +233,14 @@ func firstPositive(values ...int) int {
 func runtimeIdentityFindings(identity runtimeIdentity) []doctorFinding {
 	var findings []doctorFinding
 	if len(identity.PATHTBX) > 1 {
+		detail := fmt.Sprintf("multiple tbx executables on PATH: %s; choose one installation", strings.Join(identity.PATHTBX, ", "))
+		if note := multipleInstallCompatibilityNote(identity); note != "" {
+			detail += "; " + note
+		}
 		findings = append(findings, doctorFinding{
 			level:  "WARN",
 			check:  "installations",
-			detail: fmt.Sprintf("multiple tbx executables on PATH: %s; choose one installation", strings.Join(identity.PATHTBX, ", ")),
+			detail: detail,
 		})
 	}
 	if identity.Daemon.Available && identity.Daemon.Path != "" {
@@ -226,35 +253,36 @@ func runtimeIdentityFindings(identity runtimeIdentity) []doctorFinding {
 			})
 		}
 	}
-	if detail := runtimeCompatibilityDetail(identity); detail != "" {
+	findings = append(findings, runtimeCompatibilityFindings(identity)...)
+	return findings
+}
+
+func runtimeCompatibilityFindings(identity runtimeIdentity) []doctorFinding {
+	var findings []doctorFinding
+	if identity.Daemon.Available && identity.Daemon.Protocol != daemon.ProtocolVersion {
 		findings = append(findings, doctorFinding{
 			level:  "FAIL",
 			check:  "runtime-compat",
-			detail: detail,
+			detail: runtimeCompatibilityDetail(identity, "daemon", identity.Daemon, daemon.ProtocolVersion),
+		})
+	}
+	if identity.Helper.Available && identity.Helper.Protocol != helper.ProtocolVersion {
+		findings = append(findings, doctorFinding{
+			level:  "FAIL",
+			check:  "runtime-compat",
+			detail: runtimeCompatibilityDetail(identity, "helper", identity.Helper, helper.ProtocolVersion),
 		})
 	}
 	return findings
 }
 
-func runtimeCompatibilityDetail(identity runtimeIdentity) string {
-	var components []string
-	direction := ""
-	if identity.Daemon.Available && identity.Daemon.Protocol != daemon.ProtocolVersion {
-		components = append(components, formatProtocolSkew("daemon", identity.Daemon.Path, identity.Daemon.Protocol, daemon.ProtocolVersion))
-		direction = protocolDirection(identity.Daemon.Protocol, daemon.ProtocolVersion)
+func multipleInstallCompatibilityNote(identity runtimeIdentity) string {
+	if len(identity.PATHTBX) > 1 &&
+		identity.Daemon.Available && identity.Daemon.Protocol == daemon.ProtocolVersion &&
+		identity.Helper.Available && identity.Helper.Protocol == helper.ProtocolVersion {
+		return "aligning to this client makes the other installation incompatible"
 	}
-	if identity.Helper.Available && identity.Helper.Protocol != helper.ProtocolVersion {
-		components = append(components, formatProtocolSkew("helper", identity.Helper.Path, identity.Helper.Protocol, helper.ProtocolVersion))
-		if direction == "" {
-			direction = protocolDirection(identity.Helper.Protocol, helper.ProtocolVersion)
-		}
-	}
-	if len(components) == 0 {
-		return ""
-	}
-	command := shellquote.Quote(identity.Client.Path) + " system restart --force"
-	return fmt.Sprintf("client %s is %s than %s; run `%s` or use the matching client",
-		identity.Client.Path, direction, joinWithAnd(components), command)
+	return ""
 }
 
 func protocolDirection(found, current int) string {
@@ -264,25 +292,41 @@ func protocolDirection(found, current int) string {
 	return "older"
 }
 
-func formatProtocolSkew(name, path string, found, current int) string {
-	if path == "" {
-		path = "unknown"
+func runtimeCompatibilityDetail(identity runtimeIdentity, name string, component componentIdentity, currentProtocol int) string {
+	detail := fmt.Sprintf("%s is %s than %s; run `%s`",
+		clientCompatibilityIdentity(identity.Client),
+		protocolDirection(component.Protocol, currentProtocol),
+		componentCompatibilityIdentity(name, component),
+		compatibilityRemediation(name, identity.Client.Path),
+	)
+	if name == "daemon" {
+		detail += " (add `--force` only if it refuses because clusters are running)"
 	}
-	return fmt.Sprintf("%s %s (protocol %d %s %d)", name, path, found, compareSymbol(found, current), current)
+	return detail + " or use the matching client"
 }
 
-func compareSymbol(found, current int) string {
-	if found < current {
-		return "<"
-	}
-	return ">"
+func clientCompatibilityIdentity(component componentIdentity) string {
+	return fmt.Sprintf("client %s (%s, proto %d)", component.Path, displayVersion(component.Version), component.Protocol)
 }
 
-func joinWithAnd(items []string) string {
-	if len(items) == 1 {
-		return items[0]
+func componentCompatibilityIdentity(name string, component componentIdentity) string {
+	if component.Path == "" {
+		if component.PID > 0 {
+			return fmt.Sprintf("%s (pid %d, protocol %d)", name, component.PID, component.Protocol)
+		}
+		return fmt.Sprintf("%s (protocol %d)", name, component.Protocol)
 	}
-	return strings.Join(items[:len(items)-1], ", ") + " and " + items[len(items)-1]
+	return fmt.Sprintf("%s %s (%s, proto %d)", name, component.Path, displayVersion(component.Version), component.Protocol)
+}
+
+func compatibilityRemediation(name, clientPath string) string {
+	if name == "daemon" {
+		return shellquote.Quote(clientPath) + " system restart"
+	}
+	if runtime.GOOS == "linux" {
+		return "reinstall the tbx-helper package and restart tbx-helper.socket"
+	}
+	return "sudo " + shellquote.Quote(clientPath) + " system install"
 }
 
 func sameExecutable(left, right string) bool {

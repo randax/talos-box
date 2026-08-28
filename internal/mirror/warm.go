@@ -215,49 +215,36 @@ func warmManifestGraph(ctx context.Context, handler http.Handler, server *Server
 		return nil
 	}
 
-	matchedHost := false
-	for _, child := range children {
-		hostMatch := child.architecture == hostArch && (child.os == "" || child.os == "linux")
-		if !hostMatch {
-			continue
-		}
-		matchedHost = true
-		var (
-			childBody     []byte
-			cachedBefore  bool
-			needChildBody = !seenManifests[child.digest] || (hostMatch && !warmedHostManifests[child.digest])
-		)
-		if needChildBody {
-			var err error
-			childBody, _, cachedBefore, err = warmManifestRequest(ctx, handler, server, repository, child.digest, child.digest, nil)
-			if err != nil {
-				return err
-			}
-			seenManifests[child.digest] = true
-		}
-		if needChildBody && !cachedBefore {
-			result.AlreadyComplete = false
-		}
-		if hostMatch && !warmedHostManifests[child.digest] {
-			warmedHostManifests[child.digest] = true
-			if err := warmManifestGraph(ctx, handler, server, repository, childBody, hostArch, seenManifests, warmedHostManifests, seenBlobs, result); err != nil {
-				return err
-			}
-		}
-	}
-	if !matchedHost {
+	selectedChild, ok := selectPlatformDescriptor(children, Platform{OS: "linux", Architecture: imagecache.Architecture(hostArch)})
+	if !ok {
 		return fmt.Errorf("no linux/%s manifest found in index", hostArch)
+	}
+	var (
+		childBody     []byte
+		cachedBefore  bool
+		needChildBody = !seenManifests[selectedChild.Digest] || !warmedHostManifests[selectedChild.Digest]
+	)
+	if needChildBody {
+		var err error
+		childBody, _, cachedBefore, err = warmManifestRequest(ctx, handler, server, repository, selectedChild.Digest, selectedChild.Digest, nil)
+		if err != nil {
+			return err
+		}
+		seenManifests[selectedChild.Digest] = true
+	}
+	if needChildBody && !cachedBefore {
+		result.AlreadyComplete = false
+	}
+	if !warmedHostManifests[selectedChild.Digest] {
+		warmedHostManifests[selectedChild.Digest] = true
+		if err := warmManifestGraph(ctx, handler, server, repository, childBody, hostArch, seenManifests, warmedHostManifests, seenBlobs, result); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-type warmChildManifest struct {
-	digest       string
-	architecture string
-	os           string
-}
-
-func analyzeWarmManifest(body []byte) (string, []warmChildManifest, []string, error) {
+func analyzeWarmManifest(body []byte) (string, []platformDescriptor, []string, error) {
 	var manifest struct {
 		MediaType string `json:"mediaType"`
 		Manifests []struct {
@@ -278,12 +265,12 @@ func analyzeWarmManifest(body []byte) (string, []warmChildManifest, []string, er
 		return "", nil, nil, fmt.Errorf("decode manifest graph: %w", err)
 	}
 	if len(manifest.Manifests) > 0 || strings.Contains(manifest.MediaType, "index") || strings.Contains(manifest.MediaType, "manifest.list") {
-		children := make([]warmChildManifest, 0, len(manifest.Manifests))
+		children := make([]platformDescriptor, 0, len(manifest.Manifests))
 		for _, child := range manifest.Manifests {
-			children = append(children, warmChildManifest{
-				digest:       child.Digest,
-				architecture: child.Platform.Architecture,
-				os:           child.Platform.OS,
+			children = append(children, platformDescriptor{
+				Digest:       child.Digest,
+				Architecture: child.Platform.Architecture,
+				OS:           child.Platform.OS,
 			})
 		}
 		return "index", children, nil, nil
