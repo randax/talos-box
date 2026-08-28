@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/randax/talos-box/internal/imagecache"
 )
@@ -168,8 +169,8 @@ func TestWarmMissingTag429IsMissingFailure(t *testing.T) {
 	if summary.FailedMissing != 1 || summary.FailedRevalidate != 0 || summary.Results[0].Outcome != WarmOutcomeFailedMissing {
 		t.Fatalf("summary = %+v", summary)
 	}
-	if calls.Load() != 1 {
-		t.Fatalf("upstream attempts = %d, want 1", calls.Load())
+	if calls.Load() != 3 {
+		t.Fatalf("upstream attempts = %d, want 3", calls.Load())
 	}
 }
 
@@ -203,6 +204,7 @@ func warmStatusServerFactory(status int) func(string, string, string) http.Handl
 func warmCountingStatusServerFactory(status int, calls *atomic.Int64) func(string, string, string) http.Handler {
 	return func(_, base, cacheDir string) http.Handler {
 		server := NewServer(base, cacheDir)
+		server.retrySleep = func(context.Context, time.Duration) error { return nil }
 		server.client.Transport = warmRoundTripFunc(func(request *http.Request) (*http.Response, error) {
 			if calls != nil {
 				calls.Add(1)

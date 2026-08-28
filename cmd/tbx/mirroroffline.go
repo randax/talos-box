@@ -11,7 +11,7 @@ import (
 // The mode silently changes public/upstream pull failures and survives a
 // daemon restart, so an operator staring at ImagePullBackOff must be able to
 // see it without remembering to ask `tbx mirror offline` (#403, #481).
-const mirrorOfflineNotice = "mirror offline is on: public/upstream pulls are served from cache only and an uncached image fails; syntactic loopback registries remain direct; run `tbx mirror offline off` to restore upstream pulls"
+const mirrorOfflineNotice = "mirror offline is on: public/upstream pulls are served from cache only and cache misses return 404; node fallback depends on skipFallback (talos-box's generated catch-all is strict); syntactic loopback registries remain direct; run `tbx mirror offline off` to restore upstream pulls"
 
 // mirrorOfflineEnabled asks the daemon whether offline mode is on.
 func (c cli) mirrorOfflineEnabled() (bool, error) {

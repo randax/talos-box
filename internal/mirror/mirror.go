@@ -22,10 +22,13 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/randax/talos-box/internal/imagecache"
 )
 
 // Server mirrors one upstream registry, caching immutable blobs on disk.
@@ -36,7 +39,8 @@ type Server struct {
 	client           *http.Client
 	offline          *atomic.Bool
 	validateUpstream func(context.Context) error
-	now              func() time.Time // tests only: control token expiry
+	now              func() time.Time                           // tests only: control token expiry
+	retrySleep       func(context.Context, time.Duration) error // tests only: avoid real retry delays
 
 	mu     sync.Mutex
 	tokens map[string]token // key: pull scope of the request
@@ -253,7 +257,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.offlineEnabled() {
-		http.Error(w, offlineNotCachedMessage, http.StatusServiceUnavailable)
+		writeOfflineMiss(w, offlineNotCachedMessage)
 		return
 	}
 	if s.validateUpstream != nil {
@@ -274,12 +278,20 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.offlineEnabled() {
-		http.Error(w, offlineNotCachedMessage, http.StatusServiceUnavailable)
+		writeOfflineMiss(w, offlineNotCachedMessage)
 		return
 	}
 
-	resp, err := s.fetch(r)
+	stale := s.staleCandidate(r)
+	policy := s.fillRequestPolicy()
+	if stale.Complete() {
+		policy = immediateRequestPolicy()
+	}
+	resp, err := s.fetch(r, policy)
 	if err != nil {
+		if stale.Complete() && s.serveStaleManifest(w, r, stale, err.Error()) {
+			return
+		}
 		if served, cacheErr := s.serveManifestCacheOnFetchFailure(w, r); served {
 			return
 		} else if cacheErr != nil {
@@ -290,6 +302,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if stale.Complete() && isTransientUpstreamStatus(resp.StatusCode) {
+		closeRetryResponse(resp)
+		if s.serveStaleManifest(w, r, stale, fmt.Sprintf("status %d", resp.StatusCode)) {
+			return
+		}
+	}
 
 	if r.Method == http.MethodGet && resp.StatusCode == http.StatusOK {
 		switch {
@@ -347,15 +365,49 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
+func (s *Server) staleCandidate(r *http.Request) CacheStatus {
+	if s.offlineEnabled() || shouldRefreshManifest(r.Context()) {
+		return CacheStatus{Gaps: []CacheGap{{Detail: "not a live online request"}}}
+	}
+	return s.cachedTagStatus(r)
+}
+
+func (s *Server) cachedTagStatus(r *http.Request) CacheStatus {
+	match := manifestPathRe.FindStringSubmatch(r.URL.Path)
+	if match == nil || isDigestReference(match[2]) {
+		return CacheStatus{Gaps: []CacheGap{{Detail: "not a mutable tag request"}}}
+	}
+	return s.InspectCached(r.Context(), CacheTarget{
+		Repository: match[1],
+		Tag:        match[2],
+		Platform:   Platform{OS: "linux", Architecture: imagecache.Architecture(runtime.GOARCH)},
+	}, InspectOptions{})
+}
+
+func isTransientUpstreamStatus(status int) bool {
+	return status == http.StatusTooManyRequests || status >= http.StatusInternalServerError && status <= 599
+}
+
+func (s *Server) serveStaleManifest(w http.ResponseWriter, r *http.Request, status CacheStatus, upstream string) bool {
+	data, path, err := s.cachedManifest(r.URL.Path)
+	if err != nil || !bytes.Equal(data, status.ManifestData) {
+		return false
+	}
+	metadata := s.cachedManifestMetadataAtPath(r.URL.Path, path, data)
+	log.Printf("mirror served stale: %s/%s (upstream %s; cache complete for %s)",
+		s.upstreamNamespace(), offlineMissReference(r.URL.Path), upstream, platformName(status.Target.Platform))
+	return serveManifestBytes(w, r, status.ManifestData, metadata)
+}
+
 // serveCacheIfAvailable replays cached content, stamping an unserved offline
-// request with the reason it will 503 with. Every offline miss ends in a 503 —
-// here, or in the Manager's cache-only probe — so stamping on the way out
+// request with the reason for its fallback-friendly 404. Every offline miss
+// ends here or in the Manager's cache-only probe, so stamping on the way out
 // covers both without either writer knowing about the other (#363).
 func (s *Server) serveCacheIfAvailable(w http.ResponseWriter, r *http.Request, digest string, isManifest bool) (bool, *cacheReplayError) {
 	served, err := s.replayCache(w, r, digest, isManifest)
 	if !served && err == nil && s.offlineEnabled() {
 		setReasonHeaders(w, reasonOfflineNotCached, offlineNotCachedMessage)
-		// containerd only surfaces the bare 503 to the kubelet event, so
+		// containerd only surfaces the bare status to the kubelet event, so
 		// without this line an offline miss left no trace anywhere in tbx and
 		// the operator saw an unexplained ImagePullBackOff (#403).
 		log.Printf("mirror offline miss: %s (upstream namespace %s)",
@@ -396,7 +448,7 @@ func (s *Server) replayCache(w http.ResponseWriter, r *http.Request, digest stri
 	if isManifest {
 		// A refresh request deliberately bypasses the cache to re-resolve the
 		// reference upstream — but offline there is no upstream to re-resolve
-		// against, so bypassing would 503 on content the cache holds and the
+		// against, so bypassing would report a miss on content the cache holds and the
 		// checker calls complete.
 		if shouldRefreshManifest(r.Context()) && !s.offlineEnabled() {
 			return false, nil
@@ -405,7 +457,7 @@ func (s *Server) replayCache(w http.ResponseWriter, r *http.Request, digest stri
 		if isDigestReference(reference) {
 			return s.serveCachedDigestManifest(w, r, reference)
 		}
-		if s.offlineEnabled() && s.serveCachedManifest(w, r) {
+		if s.offlineEnabled() && s.cachedTagStatus(r).Complete() && s.serveCachedManifest(w, r) {
 			return true, nil
 		}
 	}
@@ -419,9 +471,6 @@ func (s *Server) serveManifestCacheOnFetchFailure(w http.ResponseWriter, r *http
 	reference := manifestReference(r.URL.Path)
 	if isDigestReference(reference) {
 		return s.serveCachedDigestManifest(w, r, reference)
-	}
-	if s.serveCachedManifest(w, r) {
-		return true, nil
 	}
 	return false, nil
 }
@@ -466,63 +515,17 @@ func applyManifestMetadataHeaders(w http.ResponseWriter, metadata manifestMetada
 	}
 }
 
-// fetch performs the upstream request, negotiating an anonymous bearer token
-// on a 401 challenge and following redirects (the http.Client default).
-func (s *Server) fetch(r *http.Request) (*http.Response, error) {
-	url := s.base + r.URL.RequestURI()
-	request, err := http.NewRequestWithContext(r.Context(), r.Method, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	for _, header := range []string{"Accept", "Range"} {
-		if v := r.Header.Get(header); v != "" {
-			request.Header.Set(header, v)
-		}
-	}
-	scope := scopeOf(r.URL.Path)
-	if bearer := s.cachedToken(scope); bearer != "" {
-		request.Header.Set("Authorization", "Bearer "+bearer)
-	}
-	resp, err := s.client.Do(request)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != http.StatusUnauthorized {
-		return resp, nil
-	}
-	challenge, ok := bearerChallengeFrom(resp.Header.Values("WWW-Authenticate"))
-	if !ok {
-		// no token challenge to answer: the upstream's own response is the
-		// most faithful thing to hand back
-		return resp, nil
-	}
-	_ = resp.Body.Close()
-	// a cached token that just drew a 401 is stale even if it has not expired
-	s.forgetToken(scope)
-	bearer, err := s.negotiateToken(r.Context(), challenge, scope)
-	if err != nil {
-		return nil, err
-	}
-	retry := request.Clone(request.Context())
-	retry.Header.Set("Authorization", "Bearer "+bearer)
-	return s.client.Do(retry)
-}
-
 func (s *Server) serveCachedBlob(w http.ResponseWriter, r *http.Request, digest string) bool {
 	canonical, ok := canonicalSupportedDigest(digest)
 	if ok {
 		digest = canonical
 	}
 	path := s.blobPath(digest)
-	file, err := os.Open(path)
+	file, info, err := openCheckedRegularFile(path)
 	if err != nil {
 		return false
 	}
 	defer func() { _ = file.Close() }()
-	info, err := file.Stat()
-	if err != nil {
-		return false
-	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", info.Size()))
 	w.Header().Set("Docker-Content-Digest", digest)
@@ -933,229 +936,6 @@ func (s *Server) blobPath(digest string) string {
 	return filepath.Join(s.cacheDir, "blobs", strings.ReplaceAll(digest, ":", "-"))
 }
 
-var challengeRe = regexp.MustCompile(`([A-Za-z0-9_-]+)="([^"]*)"`)
-
-// bearerChallenge is a parsed RFC 6750 style WWW-Authenticate challenge as
-// registries issue it: a token realm plus the service and scope to ask for.
-type bearerChallenge struct {
-	realm   string
-	service string
-	scope   string
-}
-
-// bearerChallengeFrom returns the first Bearer challenge among the response's
-// WWW-Authenticate values, so an upstream that leads with another scheme —
-// on a separate header line or ahead of Bearer inside one value — is still
-// answered.
-func bearerChallengeFrom(headers []string) (bearerChallenge, bool) {
-	for _, header := range headers {
-		for _, single := range splitChallenges(header) {
-			if challenge, ok := parseBearerChallenge(single); ok {
-				return challenge, true
-			}
-		}
-	}
-	return bearerChallenge{}, false
-}
-
-// splitChallenges splits one WWW-Authenticate value into its individual
-// challenges (RFC 7235 allows several per value, comma-separated). A segment
-// opening with a scheme token starts a new challenge; a key=value segment
-// belongs to the current one. Commas inside quoted strings do not split.
-func splitChallenges(header string) []string {
-	var segments []string
-	depth := false // inside a quoted string
-	start := 0
-	for i := 0; i < len(header); i++ {
-		switch header[i] {
-		case '"':
-			depth = !depth
-		case '\\':
-			if depth {
-				i++
-			}
-		case ',':
-			if !depth {
-				segments = append(segments, header[start:i])
-				start = i + 1
-			}
-		}
-	}
-	segments = append(segments, header[start:])
-
-	var challenges []string
-	current := ""
-	for _, segment := range segments {
-		segment = strings.TrimSpace(segment)
-		if segment == "" {
-			continue
-		}
-		// A parameter is "key=..."; anything else (a bare token, or
-		// "Scheme param=...") opens a new challenge.
-		head, _, _ := strings.Cut(segment, "=")
-		if current != "" && !strings.ContainsAny(strings.TrimSpace(head), " \t") && strings.Contains(segment, "=") {
-			current += ", " + segment
-			continue
-		}
-		if current != "" {
-			challenges = append(challenges, current)
-		}
-		current = segment
-	}
-	if current != "" {
-		challenges = append(challenges, current)
-	}
-	return challenges
-}
-
-// parseBearerChallenge reports whether the single challenge carries the
-// Bearer scheme and, if so, its parameters. Nothing here is
-// registry-specific: every value comes from the challenge itself.
-func parseBearerChallenge(header string) (bearerChallenge, bool) {
-	scheme, rest, ok := strings.Cut(strings.TrimSpace(header), " ")
-	if !ok || !strings.EqualFold(scheme, "Bearer") {
-		return bearerChallenge{}, false
-	}
-	params := map[string]string{}
-	for _, match := range challengeRe.FindAllStringSubmatch(rest, -1) {
-		params[strings.ToLower(match[1])] = match[2]
-	}
-	return bearerChallenge{
-		realm:   params["realm"],
-		service: params["service"],
-		scope:   params["scope"],
-	}, true
-}
-
-// defaultTokenLifetime applies when a token endpoint omits expires_in; a 401
-// on a stale token re-negotiates anyway, so a short default is safe.
-const defaultTokenLifetime = 60 * time.Second
-
-// negotiateToken exchanges an anonymous token at the challenge's realm and
-// caches it under requestScope. Docker Hub answers manifest requests with a
-// challenge that carries no scope, so the scope derived from the request path
-// is the fallback — without it the token comes back with no repository access
-// and the retry 401s again.
-func (s *Server) negotiateToken(ctx context.Context, challenge bearerChallenge, requestScope string) (string, error) {
-	if challenge.realm == "" {
-		return "", fmt.Errorf("auth challenge without realm")
-	}
-	scope := challenge.scope
-	if scope == "" {
-		scope = requestScope
-	}
-	realm, err := url.Parse(challenge.realm)
-	if err != nil {
-		return "", fmt.Errorf("auth challenge realm %q: %w", challenge.realm, err)
-	}
-	query := realm.Query()
-	if challenge.service != "" {
-		query.Set("service", challenge.service)
-	}
-	if scope != "" {
-		query.Set("scope", scope)
-	}
-	realm.RawQuery = query.Encode()
-
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, realm.String(), nil)
-	if err != nil {
-		return "", err
-	}
-	resp, err := s.client.Do(request)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("token endpoint %s returned %d", realm.Redacted(), resp.StatusCode)
-	}
-	var payload struct {
-		Token       string `json:"token"`
-		AccessToken string `json:"access_token"`
-		ExpiresIn   int    `json:"expires_in"`
-	}
-	if err := decodeJSON(resp.Body, &payload); err != nil {
-		return "", fmt.Errorf("token response: %w", err)
-	}
-	bearer := payload.Token
-	if bearer == "" {
-		bearer = payload.AccessToken
-	}
-	if bearer == "" {
-		return "", fmt.Errorf("token endpoint returned no token")
-	}
-
-	// Cache under the request-derived scope only: it is the key fetch looks
-	// up, so any other key would be written and never read. A request whose
-	// path yields no scope negotiates per request instead.
-	if requestScope != "" {
-		s.mu.Lock()
-		if s.tokens == nil {
-			s.tokens = make(map[string]token)
-		}
-		now := s.currentTime()
-		// The daemon is long-lived and scopes are guest-controlled; sweep
-		// expired entries here so the map is bounded by live tokens.
-		for key, entry := range s.tokens {
-			if !now.Before(entry.expires) {
-				delete(s.tokens, key)
-			}
-		}
-		s.tokens[requestScope] = token{value: bearer, expires: now.Add(tokenLifetime(payload.ExpiresIn))}
-		s.mu.Unlock()
-	}
-	return bearer, nil
-}
-
-// tokenLifetime honors the endpoint's expires_in, minus a small skew so a
-// token is never presented in its final moments.
-func tokenLifetime(expiresIn int) time.Duration {
-	lifetime := defaultTokenLifetime
-	if expiresIn > 0 {
-		lifetime = time.Duration(expiresIn) * time.Second
-	}
-	skew := lifetime / 10
-	if skew > 30*time.Second {
-		skew = 30 * time.Second
-	}
-	return lifetime - skew
-}
-
-func (s *Server) currentTime() time.Time {
-	if s.now != nil {
-		return s.now()
-	}
-	return time.Now()
-}
-
-func (s *Server) cachedToken(scope string) string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	entry, ok := s.tokens[scope]
-	if !ok || !s.currentTime().Before(entry.expires) {
-		return ""
-	}
-	return entry.value
-}
-
-func (s *Server) forgetToken(scope string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.tokens, scope)
-}
-
-// scopeOf derives the pull scope a request needs, matching the "scope" a
-// registry's token challenge would carry for that repository.
-func scopeOf(requestPath string) string {
-	if m := manifestPathRe.FindStringSubmatch(requestPath); m != nil {
-		return "repository:" + m[1] + ":pull"
-	}
-	if m := regexp.MustCompile(`^/v2/(.+)/blobs/`).FindStringSubmatch(requestPath); m != nil {
-		return "repository:" + m[1] + ":pull"
-	}
-	return ""
-}
-
 func decodeJSON(r io.Reader, destination any) error {
 	data, err := io.ReadAll(io.LimitReader(r, 1<<20))
 	if err != nil {
@@ -1166,7 +946,7 @@ func decodeJSON(r io.Reader, destination any) error {
 
 // Reason headers ride along with the error surfaces a client may never see a
 // body for: containerd probes with HEAD first, and a HEAD response carries no
-// body, so a bare 503 reads as a broken mirror. Headers survive HEAD, so the
+// body, so a bare status reads as a broken mirror. Headers survive HEAD, so the
 // honest reason travels there — X-Talosbox-Reason for machines, Warning for
 // the surfaces (containerd, kubectl) that already render it (#363).
 const reasonHeader = "X-Talosbox-Reason"
@@ -1178,9 +958,15 @@ const (
 )
 
 const (
+	offlineMissStatus            = http.StatusNotFound
 	offlineNotCachedMessage      = "mirror offline: content not cached"
 	offlineCacheCorruptedMessage = "mirror offline: cached digest corrupted"
 )
+
+func writeOfflineMiss(w http.ResponseWriter, detail string) {
+	setReasonHeaders(w, reasonOfflineNotCached, offlineNotCachedMessage)
+	http.Error(w, detail, offlineMissStatus)
+}
 
 // setReasonHeaders stamps the reason on a response whose body may be dropped.
 // The Warning value follows RFC 7234's "199 <agent> <quoted-text>" shape.

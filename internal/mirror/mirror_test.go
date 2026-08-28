@@ -6,6 +6,7 @@ import (
 	"crypto/sha512"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -14,10 +15,13 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/randax/talos-box/internal/imagecache"
 )
 
 const blobDigest = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
@@ -120,6 +124,23 @@ func get(t *testing.T, url string) (*http.Response, string) {
 		t.Fatal(err)
 	}
 	return resp, string(body)
+}
+
+func cacheTagDigestRoot(t *testing.T, server *Server, repository, tag string) {
+	t.Helper()
+	tagPath := manifestRequestPath(repository, tag)
+	data, path, err := server.cachedManifest(tagPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := server.cachedManifestMetadataAtPath(tagPath, path, data)
+	digest, err := verifySupportedDigest(data, metadata.DockerContentDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.storeManifest(manifestRequestPath(repository, digest), metadata, data); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestPullThroughManifestAndBlob(t *testing.T) {
@@ -592,15 +613,17 @@ func TestBlobIntegrityBeforeServing(t *testing.T) {
 func TestManifestIntegrityBeforeCachingOrServing(t *testing.T) {
 	validBody := []byte(manifestBody)
 	validDigest := "sha256:" + sha256Hex(validBody)
+	graphBody, graphDigest, graphBlobs := singlePlatformGraphFixture()
 	tests := []struct {
-		name         string
-		requestRef   string
-		contentType  string
-		digestHeader string
-		body         string
-		wantStatus   int
-		wantError    string
-		wantCached   bool
+		name          string
+		requestRef    string
+		contentType   string
+		digestHeader  string
+		body          string
+		wantStatus    int
+		wantError     string
+		wantCached    bool
+		completeGraph bool
 	}{
 		{
 			name:        "HTML block page",
@@ -664,13 +687,14 @@ func TestManifestIntegrityBeforeCachingOrServing(t *testing.T) {
 			wantError:    "does not match requested digest",
 		},
 		{
-			name:         "valid manifest",
-			requestRef:   "latest",
-			contentType:  "application/vnd.oci.image.manifest.v1+json",
-			digestHeader: validDigest,
-			body:         manifestBody,
-			wantStatus:   http.StatusOK,
-			wantCached:   true,
+			name:          "valid manifest",
+			requestRef:    "latest",
+			contentType:   "application/vnd.oci.image.manifest.v1+json",
+			digestHeader:  graphDigest,
+			body:          graphBody,
+			wantStatus:    http.StatusOK,
+			wantCached:    true,
+			completeGraph: true,
 		},
 		{
 			name:         "valid manifest requested by digest",
@@ -686,6 +710,11 @@ func TestManifestIntegrityBeforeCachingOrServing(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if data, ok := graphBlobs[r.URL.Path]; ok {
+					w.Header().Set("Content-Type", "application/octet-stream")
+					_, _ = w.Write(data)
+					return
+				}
 				w.Header().Set("Content-Type", test.contentType)
 				if test.digestHeader != "" {
 					w.Header().Set("Docker-Content-Digest", test.digestHeader)
@@ -709,8 +738,25 @@ func TestManifestIntegrityBeforeCachingOrServing(t *testing.T) {
 			if test.wantError == "looks like a web-filter/proxy block page" && !strings.Contains(body, upstream.URL) {
 				t.Errorf("block-page error %q does not name upstream URL %q", body, upstream.URL)
 			}
-			if test.wantCached && body != manifestBody {
+			if test.wantCached && body != test.body {
 				t.Errorf("body = %q, want valid manifest", body)
+			}
+
+			if test.completeGraph {
+				resp, digestBody := get(t, mirror.URL+"/v2/app/manifests/"+graphDigest)
+				if resp.StatusCode != http.StatusOK || digestBody != graphBody {
+					t.Fatalf("warm digest manifest = %d %q", resp.StatusCode, digestBody)
+				}
+				for blobPath, want := range graphBlobs {
+					resp, blobBody := get(t, mirror.URL+blobPath)
+					if resp.StatusCode != http.StatusOK || blobBody != string(want) {
+						t.Fatalf("warm %s = %d %q", blobPath, resp.StatusCode, blobBody)
+					}
+				}
+				status := server.InspectCached(context.Background(), CacheTarget{Repository: "app", Tag: "latest", Platform: Platform{OS: "linux", Architecture: imagecache.Architecture(runtime.GOARCH)}}, InspectOptions{})
+				if !status.Complete() {
+					t.Fatalf("single-platform graph is incomplete: %s", status.Reason())
+				}
 			}
 
 			_, err := os.Stat(server.manifestPath(path))
@@ -721,7 +767,7 @@ func TestManifestIntegrityBeforeCachingOrServing(t *testing.T) {
 			upstream.Close()
 			resp, cachedBody := get(t, mirror.URL+path)
 			if test.wantCached {
-				if resp.StatusCode != http.StatusOK || cachedBody != manifestBody {
+				if resp.StatusCode != http.StatusOK || cachedBody != test.body {
 					t.Errorf("cached response = %d %q", resp.StatusCode, cachedBody)
 				}
 			} else if resp.StatusCode == http.StatusOK {
@@ -849,7 +895,7 @@ func TestLegacyManifestMigrationDoesNotTrustTagsAndVerifiesDigests(t *testing.T)
 			requestPath: "/v2/a_b/manifests/latest",
 			legacyPath:  "/v2/a/b/manifests/latest",
 			body:        `{"schemaVersion":2,"repository":"a/b"}`,
-			wantStatus:  http.StatusServiceUnavailable,
+			wantStatus:  http.StatusNotFound,
 		},
 		{
 			name:        "verified digest replays",
@@ -901,7 +947,7 @@ func TestDistinctRepositoryManifestTagsDoNotCrossServeWhenUnavailable(t *testing
 			unavailable: func(server *Server, _ *httptest.Server) {
 				server.setOfflineMode(true)
 			},
-			wantStatus: http.StatusServiceUnavailable,
+			wantStatus: http.StatusNotFound,
 		},
 		{
 			name: "upstream failure",
@@ -945,19 +991,36 @@ func TestDistinctRepositoryManifestTagsDoNotCrossServeWhenUnavailable(t *testing
 }
 
 func TestManifestOfflineFallback(t *testing.T) {
-	f := newFakeRegistry(t, false)
+	manifest, digest, blobs := singlePlatformGraphFixture()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if data, ok := blobs[r.URL.Path]; ok {
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = w.Write(data)
+			return
+		}
+		if r.URL.Path != "/v2/app/manifests/latest" && r.URL.Path != "/v2/app/manifests/"+digest {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		w.Header().Set("Docker-Content-Digest", digest)
+		_, _ = fmt.Fprint(w, manifest)
+	}))
 	dir := t.TempDir()
-	ts := httptest.NewServer(newLoopbackMirrorServer(t, f.registry.URL, dir))
+	server := newLoopbackMirrorServer(t, upstream.URL, dir)
+	ts := httptest.NewServer(server)
 	defer ts.Close()
 
-	_, body := get(t, ts.URL+"/v2/app/manifests/latest")
-	if !strings.Contains(body, "schemaVersion") {
-		t.Fatalf("online manifest = %q", body)
+	for _, path := range append([]string{"/v2/app/manifests/latest", "/v2/app/manifests/" + digest}, mapKeys(blobs)...) {
+		resp, body := get(t, ts.URL+path)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("warm %s = %d %q", path, resp.StatusCode, body)
+		}
 	}
-	f.registry.Close() // the venue wifi dies
+	upstream.Close() // the venue wifi dies
 
 	resp, body := get(t, ts.URL+"/v2/app/manifests/latest")
-	if resp.StatusCode != http.StatusOK || !strings.Contains(body, "schemaVersion") {
+	if resp.StatusCode != http.StatusOK || body != manifest {
 		t.Fatalf("offline manifest fallback = %d %q", resp.StatusCode, body)
 	}
 	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "manifest") {
@@ -1092,6 +1155,7 @@ func TestOfflineModeServesCachedTagsAndFailsMissesWithoutUpstream(t *testing.T) 
 		t.Fatalf("warm cached tag = %d %q", resp.StatusCode, body)
 	}
 	hitsAfterWarm := upstreamHits.Load()
+	cacheTagDigestRoot(t, server, "app", "latest")
 
 	server.setOfflineMode(true)
 
@@ -1105,8 +1169,8 @@ func TestOfflineModeServesCachedTagsAndFailsMissesWithoutUpstream(t *testing.T) 
 	}
 
 	resp, body = get(t, mirror.URL+"/v2/app/manifests/missing")
-	if resp.StatusCode == http.StatusOK {
-		t.Fatalf("offline uncached tag unexpectedly succeeded: %q", body)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("offline uncached tag = %d %q, want 404", resp.StatusCode, body)
 	}
 	if upstreamHits.Load() != hitsAfterWarm {
 		t.Fatalf("offline uncached tag hit upstream: %d -> %d", hitsAfterWarm, upstreamHits.Load())
@@ -1139,6 +1203,7 @@ func TestOfflineModePreventsAllUncachedUpstreamWork(t *testing.T) {
 
 	// Warm one cached manifest and one cached blob before going offline.
 	_, _ = get(t, mirror.URL+"/v2/app/manifests/latest")
+	cacheTagDigestRoot(t, server, "app", "latest")
 	cachedBlobDigest := "sha256:" + sha256Hex([]byte("blob-bytes"))
 	_, _ = get(t, mirror.URL+"/v2/app/blobs/"+cachedBlobDigest)
 	hitsAfterWarm := upstreamHits.Load()
@@ -1160,8 +1225,8 @@ func TestOfflineModePreventsAllUncachedUpstreamWork(t *testing.T) {
 		mirror.URL + "/v2/app/other",
 	} {
 		resp, _ := get(t, path)
-		if resp.StatusCode == http.StatusOK {
-			t.Fatalf("offline miss %s unexpectedly succeeded", path)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("offline miss %s = %d, want 404", path, resp.StatusCode)
 		}
 	}
 	if upstreamHits.Load() != hitsAfterWarm {
@@ -1233,6 +1298,7 @@ func TestCachedManifestResponsesIncludeProtocolHeaders(t *testing.T) {
 	// Warm cached digest and tag entries, then force the tag path to serve from cache.
 	_, _ = get(t, mirror.URL+"/v2/app/manifests/"+validDigest)
 	_, _ = get(t, mirror.URL+"/v2/app/manifests/latest")
+	cacheTagDigestRoot(t, server, "app", "latest")
 	server.setOfflineMode(true)
 
 	for _, test := range []struct {
@@ -1342,6 +1408,7 @@ func TestCachedManifestMetadataFallbackRevalidatesCurrentBytes(t *testing.T) {
 	// Warm sha512 digest and tag entries.
 	_, _ = get(t, mirror.URL+"/v2/app/manifests/"+sha512Digest)
 	_, _ = get(t, mirror.URL+"/v2/app/manifests/latest")
+	cacheTagDigestRoot(t, server, "app", "latest")
 	server.setOfflineMode(true)
 
 	sha512Path := "/v2/app/manifests/" + sha512Digest
@@ -1752,7 +1819,7 @@ func portOfHostPort(hostPort string) string {
 // A HEAD probe (containerd tries HEAD first) drops the body, so the offline
 // miss must carry its reason in headers or the node event is indistinguishable
 // from a broken mirror (#363).
-func TestOfflineMissCarriesReasonHeaders(t *testing.T) {
+func TestOfflineMissReturnsFallbackFriendly404WithReasonHeaders(t *testing.T) {
 	f := newFakeRegistry(t, false)
 	dir := t.TempDir()
 	server := newLoopbackMirrorServer(t, f.registry.URL, dir)
@@ -1768,6 +1835,7 @@ func TestOfflineMissCarriesReasonHeaders(t *testing.T) {
 		{name: "manifest tag head", method: http.MethodHead, path: "/v2/app/manifests/latest"},
 		{name: "manifest tag get", method: http.MethodGet, path: "/v2/app/manifests/latest"},
 		{name: "manifest digest head", method: http.MethodHead, path: "/v2/app/manifests/" + blobDigest},
+		{name: "manifest digest get", method: http.MethodGet, path: "/v2/app/manifests/" + blobDigest},
 		{name: "blob head", method: http.MethodHead, path: "/v2/app/blobs/" + blobDigest},
 		{name: "blob get", method: http.MethodGet, path: "/v2/app/blobs/" + blobDigest},
 	} {
@@ -1781,8 +1849,8 @@ func TestOfflineMissCarriesReasonHeaders(t *testing.T) {
 				t.Fatal(err)
 			}
 			_ = resp.Body.Close()
-			if resp.StatusCode != http.StatusServiceUnavailable {
-				t.Fatalf("status = %d, want 503", resp.StatusCode)
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404", resp.StatusCode)
 			}
 			if got := resp.Header.Get(reasonHeader); got != reasonOfflineNotCached {
 				t.Fatalf("%s = %q, want %q", reasonHeader, got, reasonOfflineNotCached)
@@ -1792,6 +1860,215 @@ func TestOfflineMissCarriesReasonHeaders(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestOffline404AllowsResolverFallback(t *testing.T) {
+	mirror := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeOfflineMiss(w, offlineNotCachedMessage)
+	})
+	var fallbackHits atomic.Int64
+	fallback := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fallbackHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, manifestBody)
+	})
+
+	request := httptest.NewRequest(http.MethodGet, "/v2/app/manifests/latest", nil)
+	first := httptest.NewRecorder()
+	mirror.ServeHTTP(first, request)
+	if first.Code != http.StatusNotFound || first.Header().Get(reasonHeader) != reasonOfflineNotCached {
+		t.Fatalf("mirror response = %d, reason %q; want 404, %q", first.Code, first.Header().Get(reasonHeader), reasonOfflineNotCached)
+	}
+	second := httptest.NewRecorder()
+	if first.Code == http.StatusNotFound {
+		fallback.ServeHTTP(second, request)
+	}
+	if second.Code != http.StatusOK || second.Body.String() != manifestBody || fallbackHits.Load() != 1 {
+		t.Fatalf("fallback response = %d %q after %d hits, want 200 manifest after 1", second.Code, second.Body.String(), fallbackHits.Load())
+	}
+}
+
+func TestOnlineCompleteTagHEADServesStaleOnTransientUpstreamStatus(t *testing.T) {
+	for _, upstreamStatus := range []int{429, 500, 502, 503, 504} {
+		t.Run(http.StatusText(upstreamStatus), func(t *testing.T) {
+			server, manifest, digest := newCompleteStaleFixture(t)
+			before, err := os.Stat(server.manifestPath(manifestRequestPath("demo", "stable")))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var upstreamHits atomic.Int64
+			server.client.Transport = roundTripFunc(func(*http.Request) *http.Response {
+				upstreamHits.Add(1)
+				return retryResponse(upstreamStatus, "3600")
+			})
+			request := httptest.NewRequest(http.MethodHead, "/v2/demo/manifests/stable", nil)
+			recorder := httptest.NewRecorder()
+			server.ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusOK || recorder.Body.Len() != 0 {
+				t.Fatalf("stale HEAD = %d %q, want 200 empty", recorder.Code, recorder.Body.String())
+			}
+			if got := recorder.Header().Get("Docker-Content-Digest"); got != digest {
+				t.Fatalf("digest = %q, want %q", got, digest)
+			}
+			if got := recorder.Header().Get("Content-Length"); got != fmt.Sprint(len(manifest)) {
+				t.Fatalf("content length = %q, want %d", got, len(manifest))
+			}
+			after, err := os.Stat(server.manifestPath(manifestRequestPath("demo", "stable")))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if upstreamHits.Load() != 1 || !after.ModTime().Equal(before.ModTime()) || after.Size() != before.Size() {
+				t.Fatalf("stale HEAD used %d upstream requests or mutated cache (%v -> %v)", upstreamHits.Load(), before.ModTime(), after.ModTime())
+			}
+		})
+	}
+}
+
+func TestOnlineCompleteTagGETServesStaleOnTransportFailure(t *testing.T) {
+	server, manifest, _ := newCompleteStaleFixture(t)
+	server.namespace = "registry.example"
+	server.client.Transport = roundTripErrorFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("upstream closed")
+	})
+	logged := captureDaemonLog(t)
+	request := httptest.NewRequest(http.MethodGet, "/v2/demo/manifests/stable", nil)
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || recorder.Body.String() != string(manifest) {
+		t.Fatalf("stale GET = %d %q, want 200 %q", recorder.Code, recorder.Body.String(), manifest)
+	}
+	if line := logged.String(); !strings.Contains(line, "mirror served stale: registry.example/demo:stable") || !strings.Contains(line, "upstream closed") {
+		t.Fatalf("daemon log = %q, want transport-failure stale replay", line)
+	}
+}
+
+func TestOnlineCompleteTagServesStaleOnDNSAndTimeoutFailure(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "dns", err: &net.DNSError{Err: "no such host", Name: "registry.example"}},
+		{name: "timeout", err: context.DeadlineExceeded},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server, manifest, _ := newCompleteStaleFixture(t)
+			server.client.Transport = roundTripErrorFunc(func(*http.Request) (*http.Response, error) {
+				return nil, test.err
+			})
+			start := time.Now()
+			request := httptest.NewRequest(http.MethodGet, "/v2/demo/manifests/stable", nil)
+			recorder := httptest.NewRecorder()
+			server.ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusOK || recorder.Body.String() != string(manifest) {
+				t.Fatalf("stale GET = %d %q, want cached 200", recorder.Code, recorder.Body.String())
+			}
+			if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+				t.Fatalf("stale fallback took %s, want no retry wait", elapsed)
+			}
+		})
+	}
+}
+
+func TestOnlinePartialTagDoesNotServeStaleOn429(t *testing.T) {
+	server, _, _ := newCompleteStaleFixture(t)
+	missingDigest := "sha256:" + sha256Hex([]byte("layer"))
+	missing := server.blobPath(missingDigest)
+	if err := os.Remove(missing); err != nil {
+		t.Fatal(err)
+	}
+	var upstreamHits atomic.Int64
+	server.retrySleep = func(context.Context, time.Duration) error { return nil }
+	server.client.Transport = roundTripFunc(func(*http.Request) *http.Response {
+		upstreamHits.Add(1)
+		return retryResponse(http.StatusTooManyRequests, "0")
+	})
+	request := httptest.NewRequest(http.MethodGet, "/v2/demo/manifests/stable", nil)
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("partial cache response = %d, want 429", recorder.Code)
+	}
+	if upstreamHits.Load() != 3 {
+		t.Fatalf("partial cache upstream attempts = %d, want 3", upstreamHits.Load())
+	}
+	status := server.InspectCached(context.Background(), CacheTarget{Repository: "demo", Tag: "stable", Platform: Platform{OS: "linux", Architecture: imagecache.Architecture(runtime.GOARCH)}}, InspectOptions{})
+	if status.Complete() || !strings.Contains(status.Reason(), missingDigest) {
+		t.Fatalf("partial status = %q, want missing layer digest", status.Reason())
+	}
+
+	server.setOfflineMode(true)
+	offline := httptest.NewRecorder()
+	server.ServeHTTP(offline, httptest.NewRequest(http.MethodGet, "/v2/demo/manifests/stable", nil))
+	if offline.Code != http.StatusNotFound {
+		t.Fatalf("offline partial cache response = %d %q, want 404", offline.Code, offline.Body.String())
+	}
+}
+
+func singlePlatformGraphFixture() (string, string, map[string][]byte) {
+	config := []byte("config")
+	layer := []byte("layer")
+	configDigest := "sha256:" + sha256Hex(config)
+	layerDigest := "sha256:" + sha256Hex(layer)
+	manifest := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"%s"},"layers":[{"digest":"%s"}]}`, configDigest, layerDigest)
+	digest := "sha256:" + sha256Hex([]byte(manifest))
+	return manifest, digest, map[string][]byte{
+		"/v2/app/blobs/" + configDigest: config,
+		"/v2/app/blobs/" + layerDigest:  layer,
+	}
+}
+
+func mapKeys(values map[string][]byte) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+func TestOnlineCompleteTagDoesNotMaskHard404(t *testing.T) {
+	server, _, _ := newCompleteStaleFixture(t)
+	server.client.Transport = roundTripFunc(func(*http.Request) *http.Response {
+		return retryResponse(http.StatusNotFound, "")
+	})
+	request := httptest.NewRequest(http.MethodGet, "/v2/demo/manifests/stable", nil)
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("hard miss response = %d, want 404", recorder.Code)
+	}
+}
+
+type roundTripErrorFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripErrorFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+func newCompleteStaleFixture(t *testing.T) (*Server, []byte, string) {
+	t.Helper()
+	server := NewServer("https://registry.example", t.TempDir())
+	config := []byte("config")
+	layer := []byte("layer")
+	configDigest := "sha256:" + sha256Hex(config)
+	layerDigest := "sha256:" + sha256Hex(layer)
+	manifest := []byte(fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"%s"},"layers":[{"digest":"%s"}]}`, configDigest, layerDigest))
+	digest := "sha256:" + sha256Hex(manifest)
+	metadata := manifestMetadata{ContentType: "application/vnd.oci.image.manifest.v1+json", ContentLength: int64(len(manifest)), DockerContentDigest: digest}
+	for _, reference := range []string{"stable", digest} {
+		if err := server.storeManifest(manifestRequestPath("demo", reference), metadata, manifest); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for digest, data := range map[string][]byte{configDigest: config, layerDigest: layer} {
+		path := server.blobPath(digest)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return server, manifest, digest
 }
 
 func TestOfflineCorruptedCachedDigestCarriesReasonHeaders(t *testing.T) {
@@ -1832,7 +2109,7 @@ func TestOfflineCorruptedCachedDigestCarriesReasonHeaders(t *testing.T) {
 }
 
 // The Manager answers an offline miss from its own cache-only probe, before
-// the Server's handler runs, so the reason has to reach that 503 too (#363).
+// the Server's handler runs, so the reason has to reach that 404 too (#363).
 func TestManagerOfflineMissCarriesReasonHeaders(t *testing.T) {
 	manager := newManagerWithPorts(t.TempDir(), nil, freePort(t))
 	manager.offline.Store(true)
@@ -1849,8 +2126,8 @@ func TestManagerOfflineMissCarriesReasonHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
 	}
 	if got := resp.Header.Get(reasonHeader); got != reasonOfflineNotCached {
 		t.Fatalf("%s = %q, want %q", reasonHeader, got, reasonOfflineNotCached)
