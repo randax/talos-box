@@ -311,6 +311,32 @@ func TestLookupNodeTalosContextUsesTheDefaultUserConfig(t *testing.T) {
 	}
 }
 
+func TestLookupNodeTalosContextKeepsSearchingPastAFileWithoutTheContext(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("TALOS_HOME", "")
+	first := filepath.Join(home, "first-talosconfig")
+	t.Setenv("TALOSCONFIG", first)
+	// The first default path is a valid talosconfig that simply lacks the
+	// cluster's context; the exact context lives in the next candidate.
+	writeTalosContextFile(t, first, "other", map[string]string{"other": "first-ca"})
+	second := filepath.Join(home, ".talos", "config")
+	writeTalosContextFile(t, second, "other", map[string]string{"demo": "second-ca", "other": "other-ca"})
+
+	source, ctx, err := lookupNodeTalosContextLive("demo")
+	if err != nil || source != second || ctx.CA != "second-ca" {
+		t.Fatalf("lookup past a context-less file = source %q context %+v error %v, want %s", source, ctx, err, second)
+	}
+
+	// A malformed candidate is still an error, not a file to skip past.
+	if err := os.WriteFile(first, []byte("context: [broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := lookupNodeTalosContextLive("demo"); err == nil || errors.Is(err, errTalosContextMissing) {
+		t.Fatalf("lookup with a malformed first candidate = %v, want a parse error", err)
+	}
+}
+
 func TestProbeNodeServicesUsesExactContextCredentialsAtTheObservedIP(t *testing.T) {
 	now := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
 	exact := &clientconfig.Context{Endpoints: []string{"192.0.2.99"}, CA: "exact-ca", Crt: "exact-crt", Key: "exact-key"}

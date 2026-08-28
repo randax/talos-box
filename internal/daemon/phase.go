@@ -163,6 +163,12 @@ func lookupNodeTalosContextLive(clusterName string) (string, *clientconfig.Conte
 	if err != nil {
 		return "", nil, fmt.Errorf("find default talosconfig: %w", err)
 	}
+	// A default path that exists but lacks the exact context is an expected
+	// per-candidate outcome, not the end of the search: TALOSCONFIG may name
+	// a file merged for another cluster while ~/.talos/config holds this one.
+	// Unreadable, non-regular, or malformed candidates still fail outright —
+	// a broken file is not permission to fall through to unrelated credentials.
+	var searched []string
 	for _, candidate := range paths {
 		info, statErr := os.Stat(candidate.Path)
 		if os.IsNotExist(statErr) {
@@ -174,7 +180,17 @@ func lookupNodeTalosContextLive(clusterName string) (string, *clientconfig.Conte
 		if !info.Mode().IsRegular() {
 			return "", nil, fmt.Errorf("read talosconfig %s: not a regular file", candidate.Path)
 		}
-		return contextFromTalosconfig(candidate.Path, clusterName)
+		source, ctx, err := contextFromTalosconfig(candidate.Path, clusterName)
+		if err == nil {
+			return source, ctx, nil
+		}
+		if !errors.Is(err, errTalosContextMissing) {
+			return "", nil, err
+		}
+		searched = append(searched, candidate.Path)
+	}
+	if len(searched) > 0 {
+		return "", nil, fmt.Errorf("%w: exact context %q was not found in %s", errTalosContextMissing, clusterName, strings.Join(searched, ", "))
 	}
 	return "", nil, fmt.Errorf("%w: exact context %q was not found", errTalosContextMissing, clusterName)
 }
