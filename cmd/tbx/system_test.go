@@ -2,12 +2,15 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/randax/talos-box/internal/daemon"
+	"github.com/randax/talos-box/internal/helper"
 	"github.com/randax/talos-box/internal/resolverset"
 )
 
@@ -17,6 +20,48 @@ type fakeDNSUninstaller struct {
 	calls    int
 	closed   bool
 	uninstal error
+}
+
+func TestSystemStatusUsesTheRuntimeIdentityBlock(t *testing.T) {
+	runtimeDeps := runtimeIdentityDeps{
+		executable: func() (string, error) { return "/opt/current/tbx", nil },
+		daemonProbe: func(context.Context) (daemon.Info, int, error) {
+			return daemon.Info{
+				ProtocolVersion: daemon.ProtocolVersion,
+				Version:         "0.1.3",
+				Executable:      "/opt/current/tbxd",
+				PID:             1234,
+			}, 1234, nil
+		},
+		helperProbe: func(context.Context) (helper.Info, error) {
+			return helper.Info{
+				ProtocolVersion: helper.ProtocolVersion,
+				Version:         "0.1.3",
+				Executable:      "/opt/current/tbx-helper",
+				PID:             2345,
+			}, nil
+		},
+	}
+
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr, runtimeIdentityDeps: &runtimeDeps}
+	if err := command.run([]string{"system", "status"}); err != nil {
+		t.Fatal(err)
+	}
+	text := stdout.String()
+	for _, want := range []string{
+		"runtime:\n",
+		"client: /opt/current/tbx",
+		"daemon: /opt/current/tbxd (0.1.3; protocol 17; pid 1234)",
+		"helper: /opt/current/tbx-helper (0.1.3; protocol 5; pid 2345)",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("system status output missing %q:\n%s", want, text)
+		}
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
 }
 
 func (f *fakeDNSUninstaller) UninstallDNS() error {

@@ -26,6 +26,8 @@ func TestDoctorHelpDescribesChecksAndExitCodes(t *testing.T) {
 			want := []string{
 				"usage: tbx doctor",
 				"exits non-zero",
+				"runtime identity",
+				"current host sysctl, read directly by this client",
 				// the output shape a script parses: doctor prints one line per
 				// finding, and host-pressure and security-inventory each report
 				// several in a single run
@@ -34,11 +36,11 @@ func TestDoctorHelpDescribesChecksAndExitCodes(t *testing.T) {
 				"WARN",
 				"INFO",
 				// every portable check name is listed
-				"helper", "resolver", "DNS", "forwarding", "host-pressure",
+				"helper", "resolver", "DNS", "forwarding (host)", "host-pressure",
 				"system-dns", "routes", "inter-cluster", "guest-agent",
 				"talos-services",
 				"mirror-health", "mirror-offline", "image-cache", "egress",
-				"security-inventory",
+				"security-inventory", "runtime-compat", "installations",
 			}
 			for _, substring := range want {
 				if !strings.Contains(help, substring) {
@@ -82,6 +84,9 @@ func TestDoctorHelpNamesEveryCheckDoctorReports(t *testing.T) {
 	help := doctorHelp()
 	seen := 0
 	for _, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
+		if strings.HasPrefix(line, "runtime:") || strings.HasPrefix(line, "  ") {
+			continue
+		}
 		fields := strings.Fields(line)
 		if len(fields) < 2 {
 			continue

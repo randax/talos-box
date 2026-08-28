@@ -14,6 +14,8 @@ import (
 )
 
 const (
+	// ProtocolVersion is the helper wire version understood by this client and
+	// server. Diagnostic identity fields are additive and do not advance it.
 	// Version 2 added dns.syncDomains and the domain argument (with helper-side
 	// validation) on dns.listen/dns.register.
 	//
@@ -35,10 +37,15 @@ const (
 	// DHCP and reconverges no bridges; a version 4 helper would silently leave
 	// every cluster without addresses.
 	//
+	// Version 5 also adds the additive helper.info identity fields Version,
+	// Executable, and PID. They are diagnostic-only: a current client can still
+	// name a mismatched helper without forcing an operational reconnect through
+	// `sudo ... system install` first (#492).
+	//
 	// Bumping this also means bumping the literal in nix/vm-test.nix: the NixOS
 	// smoke test's helper-probe performs this handshake against the packaged
 	// helper, and `nix flake check` fails on a mismatch.
-	protocolVersion = 5
+	ProtocolVersion = 5
 	helperInfoOp    = "helper.info"
 )
 
@@ -101,6 +108,9 @@ type Response struct {
 // Info describes the connected helper process.
 type Info struct {
 	ProtocolVersion          int      `json:"protocolVersion"`
+	Version                  string   `json:"version,omitempty"`
+	Executable               string   `json:"executable,omitempty"`
+	PID                      int      `json:"pid,omitempty"`
 	EffectiveCapabilities    uint64   `json:"effectiveCapabilities,omitempty"`
 	EffectiveCapabilityNames []string `json:"effectiveCapabilityNames,omitempty"`
 }

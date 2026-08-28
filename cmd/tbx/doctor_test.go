@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/randax/talos-box/internal/daemon"
+	"github.com/randax/talos-box/internal/helper"
 	"github.com/randax/talos-box/internal/hostpressure"
 )
 
@@ -230,7 +231,7 @@ func TestRunDoctorContinuesAfterFailures(t *testing.T) {
 		"FAIL helper: broken",
 		"FAIL resolver: broken",
 		"FAIL DNS: broken",
-		"FAIL forwarding: broken",
+		"FAIL forwarding (host): broken",
 		"SKIP system-dns: daemon unavailable: connection refused",
 		"SKIP routes: daemon unavailable: connection refused",
 		"SKIP talos-services: daemon unavailable: connection refused",
@@ -318,6 +319,61 @@ func TestRunDoctorNoClustersSkipsAndEgressWarnIsNonFatal(t *testing.T) {
 		if !strings.Contains(output.String(), line) {
 			t.Errorf("output missing %q:\n%s", line, output.String())
 		}
+	}
+}
+
+func TestDoctorPrintsRuntimeIdentityBeforeFindingsAndCountsCompatibilityFailure(t *testing.T) {
+	deps := passingDoctorDependencies()
+	deps.runtimeIdentity = func(context.Context) runtimeIdentity {
+		return runtimeIdentity{
+			Client: componentIdentity{Name: "client", Path: "/opt/current/tbx", Version: "0.1.3", Protocol: daemon.ProtocolVersion, Available: true},
+			Daemon: componentIdentity{Name: "daemon", Path: "/opt/old/tbxd", Version: "0.1.2", Protocol: daemon.ProtocolVersion - 1, PID: 1234, Available: true},
+			Helper: componentIdentity{Name: "helper", Path: "/opt/current/tbx-helper", Version: "0.1.3", Protocol: helper.ProtocolVersion, PID: 2345, Available: true},
+			Findings: []doctorFinding{
+				{level: "FAIL", check: "runtime-compat", detail: "daemon /opt/old/tbxd (protocol 16) is older than client /opt/current/tbx (daemon protocol 17); align them to this client with `/opt/current/tbx system restart --force`, or use the matching client"},
+			},
+		}
+	}
+	var output strings.Builder
+	err := (cli{out: &output}).runDoctorWithDependencies(nil, deps)
+	if err == nil {
+		t.Fatal("runDoctorWithDependencies() succeeded despite runtime compatibility failure")
+	}
+	text := output.String()
+	runtimeIndex := strings.Index(text, "runtime:\n")
+	compatIndex := strings.Index(text, "FAIL runtime-compat:")
+	helperIndex := strings.Index(text, "PASS helper")
+	if runtimeIndex != 0 || compatIndex < runtimeIndex || helperIndex < compatIndex {
+		t.Fatalf("doctor output order = %q", text)
+	}
+}
+
+func TestDoctorForwardingFindingIsExplicitHostViewAndUsesNoDaemonCall(t *testing.T) {
+	var calls []string
+	deps := passingDoctorDependencies()
+	deps.runtimeIdentity = func(context.Context) runtimeIdentity {
+		return runtimeIdentity{
+			Client: componentIdentity{Name: "client", Path: "/opt/current/tbx", Version: "0.1.3", Protocol: daemon.ProtocolVersion, Available: true},
+		}
+	}
+	deps.checkForwarding = func() error {
+		calls = append(calls, "forwarding")
+		return errors.New(`net.inet.ip.forwarding is "0", want 1`)
+	}
+	deps.listClusters = func() ([]daemon.ClusterSummary, error) {
+		calls = append(calls, "cluster.list")
+		return nil, nil
+	}
+	var output strings.Builder
+	err := (cli{out: &output}).runDoctorWithDependencies(nil, deps)
+	if err == nil {
+		t.Fatal("runDoctorWithDependencies() succeeded despite forwarding failure")
+	}
+	if len(calls) < 2 || calls[0] != "forwarding" || calls[1] != "cluster.list" {
+		t.Fatalf("calls = %v, want forwarding before daemon-backed checks", calls)
+	}
+	if !strings.Contains(output.String(), `FAIL forwarding (host): net.inet.ip.forwarding is "0", want 1`) {
+		t.Fatalf("doctor output = %q", output.String())
 	}
 }
 

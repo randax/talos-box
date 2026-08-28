@@ -7,6 +7,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/randax/talos-box/internal/version"
 )
 
 const requiredLinuxCapabilityMask uint64 = 1<<10 | 1<<12 | 1<<13
@@ -19,10 +21,21 @@ func currentHelperInfo() (Info, int, func(), error) {
 		return Info{}, -1, nil, fmt.Errorf("read helper capabilities: %w", err)
 	}
 	return Info{
-		ProtocolVersion:          protocolVersion,
+		ProtocolVersion:          ProtocolVersion,
+		Version:                  version.Version,
+		Executable:               helperExecutable(),
+		PID:                      os.Getpid(),
 		EffectiveCapabilities:    capabilities,
 		EffectiveCapabilityNames: capabilityNames(capabilities),
 	}, -1, nil, nil
+}
+
+func helperExecutable() string {
+	executable, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return executable
 }
 
 func currentEffectiveCapabilities() (uint64, error) {

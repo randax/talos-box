@@ -21,9 +21,11 @@ import (
 	"github.com/randax/talos-box/internal/hostpressure"
 	"github.com/randax/talos-box/internal/hypervisor"
 	"github.com/randax/talos-box/internal/shellquote"
+	"github.com/randax/talos-box/internal/version"
 )
 
 type doctorDependencies struct {
+	runtimeIdentity func(context.Context) runtimeIdentity
 	checkHelper     func() error
 	checkResolver   func() error
 	checkDirectDNS  func() error
@@ -72,13 +74,16 @@ clusters that already exist are wired up. Every check is read-only: doctor
 reports, it never repairs. One line per finding, each PASS, WARN, FAIL, INFO, or
 SKIP (the probe did not apply here). Most checks report a single line, but a
 check may report several: host-pressure reports one per condition that fired,
-security-inventory one per activated system extension.
+security-inventory one per activated system extension. The runtime identity
+block names the client, daemon, and helper before those findings.
 
 Checks:
+  runtime-compat       client, daemon, and helper version/protocol agreement
+  installations       distinct tbx executables found on PATH (WARN only)
   helper              privileged helper is installed and answers
   resolver            per-domain resolver wiring for the cluster domains
   DNS                 cluster names resolve against the daemon's DNS directly
-  forwarding          host IP forwarding for cluster traffic
+  forwarding (host)   current host sysctl, read directly by this client
   host-pressure       host memory and disk headroom (the same gate that blocks
                       cluster create)
   system-dns          the system resolver returns each cluster's domain
@@ -159,19 +164,29 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		return errors.New("usage: tbx doctor")
 	}
 
+	identity := runtimeIdentity{
+		Client: componentIdentity{Name: "client", Path: "unknown", Version: version.Version, Protocol: daemon.ProtocolVersion, Available: true},
+		Daemon: componentIdentity{Name: "daemon", Detail: "not running"},
+		Helper: componentIdentity{Name: "helper", Detail: "not installed"},
+	}
+	if deps.runtimeIdentity != nil {
+		identity = deps.runtimeIdentity(context.Background())
+	}
+	if err := renderRuntimeIdentity(c.out, identity); err != nil {
+		return err
+	}
 	failed := false
+	for _, finding := range identity.Findings {
+		if finding.level == "FAIL" {
+			failed = true
+		}
+	}
 	writeFindings := func(findings ...doctorFinding) error {
 		for _, finding := range findings {
 			if finding.level == "FAIL" {
 				failed = true
 			}
-			if finding.detail == "" {
-				if _, err := fmt.Fprintf(c.out, "%s %s\n", finding.level, finding.check); err != nil {
-					return err
-				}
-				continue
-			}
-			if _, err := fmt.Fprintf(c.out, "%s %s: %s\n", finding.level, finding.check, finding.detail); err != nil {
+			if err := writeRuntimeIdentityFinding(c.out, finding); err != nil {
 				return err
 			}
 		}
@@ -185,7 +200,7 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		{name: "helper", run: deps.checkHelper},
 		{name: "resolver", run: deps.checkResolver},
 		{name: "DNS", run: deps.checkDirectDNS},
-		{name: "forwarding", run: deps.checkForwarding},
+		{name: "forwarding (host)", run: deps.checkForwarding},
 	} {
 		finding := doctorFinding{level: "PASS", check: check.name}
 		if err := check.run(); err != nil {
@@ -614,6 +629,7 @@ func isDaemonUnavailable(err error) bool {
 func (c cli) doctorDependencies() doctorDependencies {
 	command := execCombinedOutput
 	deps := doctorDependencies{
+		runtimeIdentity:   c.collectRuntimeIdentity,
 		checkHelper:       checkHelper,
 		checkResolver:     checkResolver,
 		checkDirectDNS:    checkPlatformDirectDNS,

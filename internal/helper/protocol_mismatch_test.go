@@ -128,6 +128,18 @@ func TestProtocolMismatchAdviceQuotesPathsWithSpaces(t *testing.T) {
 	}
 }
 
+func TestProtocolMismatchAdviceUsesCurrentAbsoluteTBXWhenKnown(t *testing.T) {
+	t.Parallel()
+
+	advice := protocolMismatchAdviceFor("/usr/local/Cellar/talos-box/bin/tbxd", nil)
+	if !strings.Contains(advice, "sudo /usr/local/Cellar/talos-box/bin/tbx system install") {
+		t.Fatalf("advice %q missing the current absolute tbx path", advice)
+	}
+	if strings.Contains(advice, "sudo tbx system install") {
+		t.Fatalf("advice %q fell back to PATH lookup", advice)
+	}
+}
+
 // `tbx system install` installs the macOS launchd helper, which docs/linux.md
 // forbids on Linux: a Linux upgrader hitting the protocol bump has to be sent
 // to the package/systemd path instead (#448 follow-up).
