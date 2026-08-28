@@ -752,6 +752,9 @@ func validateManifest(resp *http.Response, requestedReference, pathReference str
 	if !json.Valid(data) {
 		return nil, manifestMetadata{}, fmt.Errorf("manifest response from %s is not valid JSON", manifestURL)
 	}
+	if err := validateManifestBytes(data); err != nil {
+		return nil, manifestMetadata{}, err
+	}
 
 	persistedDigest := ""
 	if headerDigest := strings.TrimSpace(resp.Header.Get("Docker-Content-Digest")); headerDigest != "" {
@@ -893,6 +896,10 @@ func (s *Server) cachedManifestMetadataAtPath(requestPath, path string, data []b
 			_, digestErr := verifySupportedDigest(data, stored.DockerContentDigest)
 			if digestErr == nil && stored.ContentType != "" {
 				metadata.ContentType = stored.ContentType
+			} else if digestErr != nil {
+				if legacyContentType := s.cachedLegacyManifestContentTypeAtPath(path); legacyContentType != "" {
+					metadata.ContentType = legacyContentType
+				}
 			}
 			metadata.DockerContentDigest = cachedManifestDigest(data, manifestReference(requestPath), stored.DockerContentDigest)
 		}

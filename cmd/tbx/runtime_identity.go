@@ -19,13 +19,14 @@ import (
 )
 
 type componentIdentity struct {
-	Name      string
-	Path      string
-	Version   string
-	Protocol  int
-	PID       int
-	Available bool
-	Detail    string
+	Name                 string
+	Path                 string
+	Version              string
+	Protocol             int
+	PID                  int
+	Available            bool
+	Detail               string
+	ConfiguredPathSource string
 }
 
 type runtimeIdentity struct {
@@ -35,13 +36,27 @@ type runtimeIdentity struct {
 }
 
 type runtimeIdentityDeps struct {
-	executable  func() (string, error)
-	pathEnv     string
-	daemonProbe func(context.Context) (daemon.Info, int, error)
-	helperProbe func(context.Context) (helper.Info, error)
+	executable           func() (string, error)
+	pathEnv              string
+	command              commandOutput
+	readFile             func(string) ([]byte, error)
+	daemonDial           func(context.Context) (daemon.Info, int, error)
+	helperDial           func(context.Context) (helper.Info, error)
+	daemonProbe          func(context.Context) (daemon.Info, int, error)
+	helperProbe          func(context.Context) (helper.Info, error)
+	helperConfiguredPath func() configuredComponentPath
 }
 
 const runtimeProbeTimeout = 750 * time.Millisecond
+
+type configuredComponentPath struct {
+	Path   string
+	Source string
+}
+
+type runtimeIdentityInactiveError struct{ detail string }
+
+func (e runtimeIdentityInactiveError) Error() string { return e.detail }
 
 func renderRuntimeIdentity(output io.Writer, identity runtimeIdentity) error {
 	if err := renderRuntimeIdentityBlock(output, identity); err != nil {
@@ -92,7 +107,10 @@ func renderComponentIdentity(output io.Writer, component componentIdentity) erro
 	if path == "" {
 		path = "unknown path"
 	}
-	parts := make([]string, 0, 3)
+	parts := make([]string, 0, 4)
+	if component.ConfiguredPathSource != "" {
+		parts = append(parts, "configured path from "+component.ConfiguredPathSource)
+	}
 	if component.Version != "" {
 		parts = append(parts, component.Version)
 	}
@@ -151,6 +169,7 @@ func executablesOnPATH(name, pathEnv string) []string {
 }
 
 func collectRuntimeIdentity(ctx context.Context, deps runtimeIdentityDeps) runtimeIdentity {
+	runtimeIdentityPlatformDeps(&deps)
 	identity := runtimeIdentity{
 		Client: componentIdentity{Name: "client", Path: "unknown", Version: version.Version, Protocol: daemon.ProtocolVersion, Available: true},
 		Daemon: componentIdentity{Name: "daemon", Detail: "not running"},
@@ -176,8 +195,12 @@ func collectRuntimeIdentity(ctx context.Context, deps runtimeIdentityDeps) runti
 				Available: true,
 			}
 		} else {
+			var inactive runtimeIdentityInactiveError
 			var busy busyDaemonError
-			if errors.As(err, &busy) {
+			switch {
+			case errors.As(err, &inactive):
+				identity.Daemon.Detail = inactive.detail
+			case errors.As(err, &busy):
 				identity.Daemon.Detail = fmt.Sprintf("busy (pid %d; tbx protocol %d)", busy.pid, daemon.ProtocolVersion)
 			}
 		}
@@ -196,15 +219,27 @@ func collectRuntimeIdentity(ctx context.Context, deps runtimeIdentityDeps) runti
 				Available: true,
 			}
 		} else {
+			var inactive runtimeIdentityInactiveError
 			var mismatch *helper.ProtocolMismatchError
 			switch {
+			case errors.As(err, &inactive):
+				identity.Helper = componentIdentity{Name: "helper", Detail: inactive.detail}
 			case errors.As(err, &mismatch):
+				path := "unknown path"
+				source := ""
+				if deps.helperConfiguredPath != nil {
+					if configured := deps.helperConfiguredPath(); configured.Path != "" {
+						path = configured.Path
+						source = configured.Source
+					}
+				}
 				identity.Helper = componentIdentity{
-					Name:      "helper",
-					Path:      "unknown path",
-					Protocol:  mismatch.HelperVersion,
-					Available: true,
-					Detail:    "predates identity reporting",
+					Name:                 "helper",
+					Path:                 path,
+					Protocol:             mismatch.HelperVersion,
+					Available:            true,
+					Detail:               "predates identity reporting",
+					ConfiguredPathSource: source,
 				}
 			case helperProbeUnavailable(err):
 				identity.Helper = componentIdentity{Name: "helper", Detail: "not installed"}
@@ -234,8 +269,9 @@ func runtimeIdentityFindings(identity runtimeIdentity) []doctorFinding {
 	var findings []doctorFinding
 	if len(identity.PATHTBX) > 1 {
 		detail := fmt.Sprintf("multiple tbx executables on PATH: %s; choose one installation", strings.Join(identity.PATHTBX, ", "))
-		if note := multipleInstallCompatibilityNote(identity); note != "" {
-			detail += "; " + note
+		if identity.Daemon.Available && identity.Daemon.Protocol == daemon.ProtocolVersion &&
+			identity.Helper.Available && identity.Helper.Protocol == helper.ProtocolVersion {
+			detail += "; aligning to this client makes the other installation incompatible"
 		}
 		findings = append(findings, doctorFinding{
 			level:  "WARN",
@@ -276,13 +312,12 @@ func runtimeCompatibilityFindings(identity runtimeIdentity) []doctorFinding {
 	return findings
 }
 
-func multipleInstallCompatibilityNote(identity runtimeIdentity) string {
-	if len(identity.PATHTBX) > 1 &&
-		identity.Daemon.Available && identity.Daemon.Protocol == daemon.ProtocolVersion &&
-		identity.Helper.Available && identity.Helper.Protocol == helper.ProtocolVersion {
-		return "aligning to this client makes the other installation incompatible"
+func multipleInstallCompatibilityNote(identity runtimeIdentity, component string) string {
+	otherInstallations := otherPATHInstallations(identity)
+	if len(otherInstallations) == 0 {
+		return ""
 	}
-	return ""
+	return fmt.Sprintf("aligning the %s to this client makes the other installation(s) incompatible: %s", component, strings.Join(otherInstallations, ", "))
 }
 
 func protocolDirection(found, current int) string {
@@ -293,12 +328,15 @@ func protocolDirection(found, current int) string {
 }
 
 func runtimeCompatibilityDetail(identity runtimeIdentity, name string, component componentIdentity, currentProtocol int) string {
-	detail := fmt.Sprintf("%s is %s than %s; run `%s`",
+	detail := fmt.Sprintf("%s is %s than %s",
 		clientCompatibilityIdentity(identity.Client),
 		protocolDirection(component.Protocol, currentProtocol),
 		componentCompatibilityIdentity(name, component),
-		compatibilityRemediation(name, identity.Client.Path),
 	)
+	if note := multipleInstallCompatibilityNote(identity, name); note != "" {
+		detail += "; " + note
+	}
+	detail += "; run `" + compatibilityRemediation(name, identity.Client.Path) + "`"
 	if name == "daemon" {
 		detail += " (add `--force` only if it refuses because clusters are running)"
 	}
@@ -315,6 +353,9 @@ func componentCompatibilityIdentity(name string, component componentIdentity) st
 			return fmt.Sprintf("%s (pid %d, protocol %d)", name, component.PID, component.Protocol)
 		}
 		return fmt.Sprintf("%s (protocol %d)", name, component.Protocol)
+	}
+	if component.Version == "" {
+		return fmt.Sprintf("%s %s (proto %d)", name, component.Path, component.Protocol)
 	}
 	return fmt.Sprintf("%s %s (%s, proto %d)", name, component.Path, displayVersion(component.Version), component.Protocol)
 }
@@ -342,7 +383,9 @@ func defaultRuntimeIdentityDeps() runtimeIdentityDeps {
 	return runtimeIdentityDeps{
 		executable: os.Executable,
 		pathEnv:    os.Getenv("PATH"),
-		daemonProbe: func(ctx context.Context) (daemon.Info, int, error) {
+		command:    execCombinedOutput,
+		readFile:   os.ReadFile,
+		daemonDial: func(ctx context.Context) (daemon.Info, int, error) {
 			if err := ctx.Err(); err != nil {
 				return daemon.Info{}, 0, err
 			}
@@ -352,7 +395,7 @@ func defaultRuntimeIdentityDeps() runtimeIdentityDeps {
 			}
 			return daemonHandshakeWithin(socketPath, runtimeProbeTimeout)
 		},
-		helperProbe: func(ctx context.Context) (helper.Info, error) {
+		helperDial: func(ctx context.Context) (helper.Info, error) {
 			if err := ctx.Err(); err != nil {
 				return helper.Info{}, err
 			}
@@ -372,4 +415,18 @@ func (c cli) collectRuntimeIdentity(ctx context.Context) runtimeIdentity {
 	probeCtx, cancel := context.WithTimeout(ctx, 2*runtimeProbeTimeout)
 	defer cancel()
 	return collectRuntimeIdentity(probeCtx, deps)
+}
+
+func otherPATHInstallations(identity runtimeIdentity) []string {
+	if len(identity.PATHTBX) <= 1 {
+		return nil
+	}
+	others := make([]string, 0, len(identity.PATHTBX)-1)
+	for _, path := range identity.PATHTBX {
+		if identity.Client.Path != "" && sameExecutable(path, identity.Client.Path) {
+			continue
+		}
+		others = append(others, path)
+	}
+	return others
 }

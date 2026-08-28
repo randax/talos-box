@@ -2,7 +2,6 @@ package mirror
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -274,28 +273,15 @@ func cacheReadDetail(err error) string {
 }
 
 type cachedGraph struct {
-	MediaType string `json:"mediaType"`
-	Manifests []struct {
-		Digest   string `json:"digest"`
-		Platform struct {
-			Architecture string `json:"architecture"`
-			OS           string `json:"os"`
-		} `json:"platform"`
-	} `json:"manifests"`
-	Config struct {
-		Digest string `json:"digest"`
-	} `json:"config"`
-	Layers []struct {
-		Digest string `json:"digest"`
-	} `json:"layers"`
+	SchemaVersion int                       `json:"schemaVersion"`
+	MediaType     string                    `json:"mediaType"`
+	Manifests     []manifestIndexDescriptor `json:"manifests"`
+	Config        manifestDescriptor        `json:"config"`
+	Layers        []manifestDescriptor      `json:"layers"`
 }
 
 func decodeCachedGraph(data []byte) (cachedGraph, error) {
-	var graph cachedGraph
-	if err := json.Unmarshal(data, &graph); err != nil {
-		return graph, fmt.Errorf("decode manifest graph: %w", err)
-	}
-	return graph, nil
+	return decodeManifestGraph(data)
 }
 
 func (status *CacheStatus) inspectBlobs(ctx context.Context, server *Server, graph cachedGraph, opts InspectOptions) {

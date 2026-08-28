@@ -26,7 +26,7 @@ import (
 )
 
 const blobDigest = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
-const manifestBody = `{"schemaVersion":2}`
+const manifestBody = `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"layers":[]}`
 
 // fakeRegistry stands in for an upstream: manifest at /v2/app/manifests/latest,
 // blob behind a 302 to a "CDN", optional bearer-token gate.
@@ -142,6 +142,30 @@ func cacheTagDigestRoot(t *testing.T, server *Server, repository, tag string) {
 	if err := server.storeManifest(manifestRequestPath(repository, digest), metadata, data); err != nil {
 		t.Fatal(err)
 	}
+	graph, err := decodeCachedGraph(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, blob := range append([]string{graph.Config.Digest}, layerDigestsForGraph(graph)...) {
+		if blob == "" {
+			continue
+		}
+		blobPath := server.blobPath(blob)
+		if err := os.MkdirAll(filepath.Dir(blobPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(blobPath, []byte("cached"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func layerDigestsForGraph(graph cachedGraph) []string {
+	digests := make([]string, 0, len(graph.Layers))
+	for _, layer := range graph.Layers {
+		digests = append(digests, layer.Digest)
+	}
+	return digests
 }
 
 func TestPullThroughManifestAndBlob(t *testing.T) {
@@ -884,6 +908,7 @@ func TestManifestPathUsesVersionedKeyForTagsAndUnsupportedDigestLikeRefs(t *test
 }
 
 func TestLegacyManifestMigrationDoesNotTrustTagsAndVerifiesDigests(t *testing.T) {
+	validDigest := "sha256:" + sha256Hex([]byte(manifestBody))
 	for _, test := range []struct {
 		name        string
 		requestPath string
@@ -900,16 +925,16 @@ func TestLegacyManifestMigrationDoesNotTrustTagsAndVerifiesDigests(t *testing.T)
 		},
 		{
 			name:        "verified digest replays",
-			requestPath: "/v2/a_b/manifests/sha256:bafebd36189ad3688b7b3915ea55d461e0bfcfbdde11e54b0a123999fb6be50f",
-			legacyPath:  "/v2/a/b/manifests/sha256:bafebd36189ad3688b7b3915ea55d461e0bfcfbdde11e54b0a123999fb6be50f",
-			body:        `{"schemaVersion":2}`,
+			requestPath: "/v2/a_b/manifests/" + validDigest,
+			legacyPath:  "/v2/a/b/manifests/" + validDigest,
+			body:        manifestBody,
 			wantStatus:  http.StatusOK,
 		},
 		{
 			name:        "mismatched digest is rejected",
-			requestPath: "/v2/a_b/manifests/sha256:bafebd36189ad3688b7b3915ea55d461e0bfcfbdde11e54b0a123999fb6be50f",
-			legacyPath:  "/v2/a/b/manifests/sha256:bafebd36189ad3688b7b3915ea55d461e0bfcfbdde11e54b0a123999fb6be50f",
-			body:        `{"schemaVersion":2,"not":"the requested digest"}`,
+			requestPath: "/v2/a_b/manifests/" + validDigest,
+			legacyPath:  "/v2/a/b/manifests/" + validDigest,
+			body:        `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"layers":[]}`,
 			wantStatus:  http.StatusServiceUnavailable,
 		},
 	} {
@@ -959,7 +984,7 @@ func TestDistinctRepositoryManifestTagsDoNotCrossServeWhenUnavailable(t *testing
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			const cachedBody = `{"schemaVersion":2,"repository":"a/b"}`
+			const cachedBody = `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},"layers":[]}`
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path != "/v2/a/b/manifests/latest" {
 					http.NotFound(w, r)
@@ -1511,7 +1536,7 @@ func TestCachedManifestMetadataFallbackRevalidatesCurrentBytes(t *testing.T) {
 func TestCachedManifestMetadataIgnoresStaleContentType(t *testing.T) {
 	server := newLoopbackMirrorServer(t, "http://127.0.0.1", t.TempDir())
 	requestPath := "/v2/app/manifests/latest"
-	data := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json"}`)
+	data := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`)
 
 	if err := os.MkdirAll(filepath.Dir(server.manifestMetadataPath(requestPath)), 0o755); err != nil {
 		t.Fatal(err)
@@ -1541,7 +1566,7 @@ func TestCachedManifestMetadataIgnoresStaleContentType(t *testing.T) {
 func TestCachedManifestMetadataUsesLegacySidecarWhenMetaDigestIsStale(t *testing.T) {
 	server := newLoopbackMirrorServer(t, "http://127.0.0.1", t.TempDir())
 	requestPath := "/v2/app/manifests/latest"
-	data := []byte(manifestBody)
+	data := []byte(`{"schemaVersion":2,"config":{"digest":"` + blobDigest + `"},"layers":[]}`)
 
 	if err := os.MkdirAll(filepath.Dir(server.manifestMetadataPath(requestPath)), 0o755); err != nil {
 		t.Fatal(err)

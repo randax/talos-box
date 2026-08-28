@@ -55,7 +55,7 @@ func TestCheckDoesNotRequireForeignPlatformChildren(t *testing.T) {
 }
 
 func TestCheckCachedManifestUsesVerifiedLegacyDigest(t *testing.T) {
-	data := []byte(`{"schemaVersion":2}`)
+	data := []byte(manifestBody)
 	digest := "sha256:" + sha256Hex(data)
 	server := NewServer("https://registry.example", t.TempDir())
 	legacyPath := server.legacyManifestPath("/v2/a/b/manifests/" + digest)
@@ -320,8 +320,8 @@ func TestCheckRejectsMalformedBlobDigestWithoutPathEscape(t *testing.T) {
 	if summary.Complete != 0 || summary.Failed != 1 {
 		t.Fatalf("check summary = %+v", summary)
 	}
-	if len(summary.Results) != 1 || !strings.Contains(summary.Results[0].Error, "../sentinel") {
-		t.Fatalf("check result = %+v, want malformed digest failure", summary.Results)
+	if len(summary.Results) != 1 || !strings.Contains(summary.Results[0].Error, "invalid manifest: config descriptor has invalid digest: invalid digest reference") {
+		t.Fatalf("check result = %+v, want invalid manifest digest failure", summary.Results)
 	}
 }
 
@@ -350,8 +350,8 @@ func TestCheckRejectsMalformedChildManifestDigest(t *testing.T) {
 	if summary.Complete != 0 || summary.Failed != 1 {
 		t.Fatalf("check summary = %+v", summary)
 	}
-	if len(summary.Results) != 1 || !strings.Contains(summary.Results[0].Error, "../child") {
-		t.Fatalf("check result = %+v, want malformed child digest failure", summary.Results)
+	if len(summary.Results) != 1 || !strings.Contains(summary.Results[0].Error, "invalid manifest: manifest descriptor has invalid digest at manifests[0]: invalid digest reference") {
+		t.Fatalf("check result = %+v, want invalid child manifest digest failure", summary.Results)
 	}
 }
 
