@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1862,32 +1863,6 @@ func TestOfflineMissReturnsFallbackFriendly404WithReasonHeaders(t *testing.T) {
 	}
 }
 
-func TestOffline404AllowsResolverFallback(t *testing.T) {
-	mirror := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		writeOfflineMiss(w, offlineNotCachedMessage)
-	})
-	var fallbackHits atomic.Int64
-	fallback := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		fallbackHits.Add(1)
-		w.WriteHeader(http.StatusOK)
-		_, _ = fmt.Fprint(w, manifestBody)
-	})
-
-	request := httptest.NewRequest(http.MethodGet, "/v2/app/manifests/latest", nil)
-	first := httptest.NewRecorder()
-	mirror.ServeHTTP(first, request)
-	if first.Code != http.StatusNotFound || first.Header().Get(reasonHeader) != reasonOfflineNotCached {
-		t.Fatalf("mirror response = %d, reason %q; want 404, %q", first.Code, first.Header().Get(reasonHeader), reasonOfflineNotCached)
-	}
-	second := httptest.NewRecorder()
-	if first.Code == http.StatusNotFound {
-		fallback.ServeHTTP(second, request)
-	}
-	if second.Code != http.StatusOK || second.Body.String() != manifestBody || fallbackHits.Load() != 1 {
-		t.Fatalf("fallback response = %d %q after %d hits, want 200 manifest after 1", second.Code, second.Body.String(), fallbackHits.Load())
-	}
-}
-
 func TestOnlineCompleteTagHEADServesStaleOnTransientUpstreamStatus(t *testing.T) {
 	for _, upstreamStatus := range []int{429, 500, 502, 503, 504} {
 		t.Run(http.StatusText(upstreamStatus), func(t *testing.T) {
@@ -1913,6 +1888,12 @@ func TestOnlineCompleteTagHEADServesStaleOnTransientUpstreamStatus(t *testing.T)
 			if got := recorder.Header().Get("Content-Length"); got != fmt.Sprint(len(manifest)) {
 				t.Fatalf("content length = %q, want %d", got, len(manifest))
 			}
+			if got := recorder.Header().Get(reasonHeader); got != "served-stale" {
+				t.Fatalf("%s = %q, want %q", reasonHeader, got, "served-stale")
+			}
+			if got := recorder.Header().Get("Warning"); !strings.Contains(got, "served stale") {
+				t.Fatalf("Warning = %q, want stale reason", got)
+			}
 			after, err := os.Stat(server.manifestPath(manifestRequestPath("demo", "stable")))
 			if err != nil {
 				t.Fatal(err)
@@ -1921,6 +1902,28 @@ func TestOnlineCompleteTagHEADServesStaleOnTransientUpstreamStatus(t *testing.T)
 				t.Fatalf("stale HEAD used %d upstream requests or mutated cache (%v -> %v)", upstreamHits.Load(), before.ModTime(), after.ModTime())
 			}
 		})
+	}
+}
+
+func TestTransientUpstreamStatusReturnsExplicit502WhenStaleReplayFails(t *testing.T) {
+	server, _, _ := newCompleteStaleFixture(t)
+	path := server.manifestPath(manifestRequestPath("demo", "stable"))
+	server.client.Transport = roundTripFunc(func(*http.Request) *http.Response {
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		return retryResponse(http.StatusBadGateway, "0")
+	})
+
+	request := httptest.NewRequest(http.MethodHead, "/v2/demo/manifests/stable", nil)
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", recorder.Code)
+	}
+	if got, want := recorder.Body.String(), "upstream status 502 and stale cache unavailable\n"; got != want {
+		t.Fatalf("body = %q, want %q", got, want)
 	}
 }
 
@@ -1936,6 +1939,12 @@ func TestOnlineCompleteTagGETServesStaleOnTransportFailure(t *testing.T) {
 	server.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK || recorder.Body.String() != string(manifest) {
 		t.Fatalf("stale GET = %d %q, want 200 %q", recorder.Code, recorder.Body.String(), manifest)
+	}
+	if got := recorder.Header().Get(reasonHeader); got != "served-stale" {
+		t.Fatalf("%s = %q, want %q", reasonHeader, got, "served-stale")
+	}
+	if got := recorder.Header().Get("Warning"); !strings.Contains(got, "served stale") {
+		t.Fatalf("Warning = %q, want stale reason", got)
 	}
 	if line := logged.String(); !strings.Contains(line, "mirror served stale: registry.example/demo:stable") || !strings.Contains(line, "upstream closed") {
 		t.Fatalf("daemon log = %q, want transport-failure stale replay", line)
@@ -2004,6 +2013,135 @@ func TestOnlinePartialTagDoesNotServeStaleOn429(t *testing.T) {
 	}
 }
 
+func TestOfflineNestedSelectedIndexTagHeadReturns404WhenSelectedManifestBlobsAreMissing(t *testing.T) {
+	fixture := newNestedCompletenessFixtureAt(t, t.TempDir(), false)
+	fixture.server.setOfflineMode(true)
+
+	request := httptest.NewRequest(http.MethodHead, "/v2/demo/manifests/stable", nil)
+	recorder := httptest.NewRecorder()
+	fixture.server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("offline HEAD = %d %q, want 404", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Header().Get(reasonHeader); got != reasonOfflineNotCached {
+		t.Fatalf("%s = %q, want %q", reasonHeader, got, reasonOfflineNotCached)
+	}
+}
+
+func TestOfflineCorruptedTagManifestReturns503(t *testing.T) {
+	server, _, _ := newCompleteStaleFixture(t)
+	if err := os.WriteFile(server.manifestPath(manifestRequestPath("demo", "stable")), []byte(`{"schemaVersion":2`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	server.setOfflineMode(true)
+
+	request := httptest.NewRequest(http.MethodHead, "/v2/demo/manifests/stable", nil)
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", recorder.Code)
+	}
+	if got := recorder.Header().Get(reasonHeader); got != reasonOfflineCacheCorrupted {
+		t.Fatalf("%s = %q, want %q", reasonHeader, got, reasonOfflineCacheCorrupted)
+	}
+}
+
+func TestOfflineMissingLayerReturns404(t *testing.T) {
+	server, _, _ := newCompleteStaleFixture(t)
+	missingDigest := "sha256:" + sha256Hex([]byte("layer"))
+	if err := os.Remove(server.blobPath(missingDigest)); err != nil {
+		t.Fatal(err)
+	}
+	server.setOfflineMode(true)
+	logged := captureDaemonLog(t)
+
+	request := httptest.NewRequest(http.MethodHead, "/v2/demo/manifests/stable", nil)
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", recorder.Code)
+	}
+	if got := recorder.Header().Get(reasonHeader); got != reasonOfflineNotCached {
+		t.Fatalf("%s = %q, want %q", reasonHeader, got, reasonOfflineNotCached)
+	}
+	if line := logged.String(); !strings.Contains(line, missingDigest) {
+		t.Fatalf("daemon log = %q, want missing layer reason", line)
+	}
+}
+
+func TestOfflineServingRejectsUnsafeTagManifestFiles(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(t *testing.T, server *Server, requestPath string)
+	}{
+		{
+			name: "symlinked tag entry",
+			mutate: func(t *testing.T, server *Server, requestPath string) {
+				target := filepath.Join(t.TempDir(), "manifest.json")
+				if err := os.WriteFile(target, []byte(manifestBody), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				path := server.manifestPath(requestPath)
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, path); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "fifo tag entry",
+			mutate: func(t *testing.T, server *Server, requestPath string) {
+				path := server.manifestPath(requestPath)
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if err := syscall.Mkfifo(path, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				holder, err := os.OpenFile(path, os.O_RDWR, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = holder.Close() })
+			},
+		},
+		{
+			name: "oversized tag entry",
+			mutate: func(t *testing.T, server *Server, requestPath string) {
+				path := server.manifestPath(requestPath)
+				if err := os.WriteFile(path, []byte(`{"schemaVersion":2,"padding":"`+strings.Repeat("x", maxManifestBytes)+`"}`), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server, _, _ := newCompleteStaleFixture(t)
+			requestPath := manifestRequestPath("demo", "stable")
+			test.mutate(t, server, requestPath)
+			server.setOfflineMode(true)
+
+			request := httptest.NewRequest(http.MethodHead, "/v2/demo/manifests/stable", nil)
+			recorder := httptest.NewRecorder()
+			server.ServeHTTP(recorder, request)
+
+			if recorder.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want 503", recorder.Code)
+			}
+			if got := recorder.Header().Get(reasonHeader); got != reasonOfflineCacheCorrupted {
+				t.Fatalf("%s = %q, want %q", reasonHeader, got, reasonOfflineCacheCorrupted)
+			}
+		})
+	}
+}
+
 func singlePlatformGraphFixture() (string, string, map[string][]byte) {
 	config := []byte("config")
 	layer := []byte("layer")
@@ -2046,7 +2184,12 @@ func (f roundTripErrorFunc) RoundTrip(request *http.Request) (*http.Response, er
 
 func newCompleteStaleFixture(t *testing.T) (*Server, []byte, string) {
 	t.Helper()
-	server := NewServer("https://registry.example", t.TempDir())
+	return newCompleteStaleFixtureAt(t, t.TempDir())
+}
+
+func newCompleteStaleFixtureAt(t *testing.T, cacheDir string) (*Server, []byte, string) {
+	t.Helper()
+	server := NewServer("https://registry.example", cacheDir)
 	config := []byte("config")
 	layer := []byte("layer")
 	configDigest := "sha256:" + sha256Hex(config)

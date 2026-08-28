@@ -51,6 +51,27 @@ const (
 
 var errProtocolMismatch = errors.New("helper protocol mismatch")
 
+// ProtocolMismatchError carries both sides of a helper version-handshake
+// refusal so diagnostics can report a reachable but stale helper (#492).
+type ProtocolMismatchError struct {
+	ClientVersion int
+	HelperVersion int
+	detail        string
+}
+
+func (e *ProtocolMismatchError) Error() string {
+	if e == nil {
+		return errProtocolMismatch.Error()
+	}
+	if e.detail != "" {
+		return e.detail
+	}
+	return fmt.Sprintf("%s (client %d, helper %d): %s",
+		errProtocolMismatch.Error(), e.ClientVersion, e.HelperVersion, protocolMismatchAdvice())
+}
+
+func (e *ProtocolMismatchError) Unwrap() error { return errProtocolMismatch }
+
 // IsProtocolMismatch reports whether err is the version-handshake refusal. It
 // already carries the reinstall advice, so callers must not stack the
 // "helper unavailable" remediation in front of it.
@@ -62,7 +83,7 @@ func IsProtocolMismatch(err error) bool { return errors.Is(err, errProtocolMisma
 // advice names the package upgrade and the socket restart instead.
 const linuxHelperReinstallAdvice = "reinstall the helper: upgrade the tbx-helper package " +
 	"(or reinstall the binary and units as in docs/linux.md, \"Build and install the source preview\"), " +
-	"then run `sudo systemctl restart tbx-helper.service`"
+	"then run `sudo systemctl restart tbx-helper.socket`"
 
 // The installed helper binary is pinned at an absolute path by its service
 // definition, so restarting it relaunches the same stale binary; only a
@@ -116,13 +137,10 @@ type Info struct {
 }
 
 func protocolMismatchError(clientVersion, helperVersion int) error {
-	return fmt.Errorf(
-		"%w (client %d, helper %d): %s",
-		errProtocolMismatch,
-		clientVersion,
-		helperVersion,
-		protocolMismatchAdvice(),
-	)
+	return &ProtocolMismatchError{
+		ClientVersion: clientVersion,
+		HelperVersion: helperVersion,
+	}
 }
 
 func protocolHandshakeFailure(detail string) error {
@@ -137,9 +155,18 @@ func protocolHandshakeFailure(detail string) error {
 	if rest, ok := strings.CutPrefix(detail, errProtocolMismatch.Error()); ok {
 		facts, _, _ := strings.Cut(rest, ":")
 		facts = strings.TrimRight(facts, ";: ")
-		return fmt.Errorf("%w%s: %s", errProtocolMismatch, facts, protocolMismatchAdvice())
+		var clientVersion, helperVersion int
+		if _, err := fmt.Sscanf(facts, " (client %d, helper %d)", &clientVersion, &helperVersion); err == nil {
+			return &ProtocolMismatchError{
+				ClientVersion: clientVersion,
+				HelperVersion: helperVersion,
+				detail: fmt.Sprintf("%s (client %d, helper %d): %s",
+					errProtocolMismatch.Error(), clientVersion, helperVersion, protocolMismatchAdvice()),
+			}
+		}
+		return &ProtocolMismatchError{detail: fmt.Sprintf("%s%s: %s", errProtocolMismatch.Error(), facts, protocolMismatchAdvice())}
 	}
-	return fmt.Errorf("%w: %s; %s", errProtocolMismatch, detail, protocolMismatchAdvice())
+	return &ProtocolMismatchError{detail: fmt.Sprintf("%s: %s; %s", errProtocolMismatch.Error(), detail, protocolMismatchAdvice())}
 }
 
 func success(data any) Response {

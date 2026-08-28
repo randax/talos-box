@@ -5,6 +5,8 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -52,7 +54,7 @@ func TestOfflineMissIsLogged(t *testing.T) {
 			if resp.StatusCode != http.StatusNotFound {
 				t.Fatalf("status = %d, want 404", resp.StatusCode)
 			}
-			if got := logged.String(); !strings.Contains(got, test.want) {
+			if got := logged.String(); !strings.Contains(got, test.want) || !strings.Contains(got, ": ") {
 				t.Fatalf("daemon log = %q, want substring %q", got, test.want)
 			}
 		})
@@ -143,9 +145,29 @@ func TestOfflineMissLogsRequestedNamespace(t *testing.T) {
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", resp.StatusCode)
 	}
-	want := "mirror offline miss: library/nginx:1.27.3 (upstream namespace docker.io)"
+	want := "mirror offline miss: library/nginx:1.27.3 (upstream namespace docker.io): tag mapping /v2/library/nginx/manifests/1.27.3 not cached"
 	if got := logged.String(); !strings.Contains(got, want) {
 		t.Fatalf("daemon log = %q, want substring %q", got, want)
+	}
+}
+
+func TestOfflineMissLogsIncompleteCacheReason(t *testing.T) {
+	server, _, _ := newCompleteStaleFixture(t)
+	if err := os.Remove(server.blobPath("sha256:" + sha256Hex([]byte("layer")))); err != nil {
+		t.Fatal(err)
+	}
+	server.namespace = "registry.example"
+	server.setOfflineMode(true)
+
+	logged := captureDaemonLog(t)
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, httptest.NewRequest(http.MethodHead, "/v2/demo/manifests/stable", nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", recorder.Code)
+	}
+	want := "mirror offline miss: demo:stable (upstream namespace registry.example): 1 of 1 linux/" + runtime.GOARCH + " layers not cached"
+	if got := logged.String(); !strings.Contains(got, want) {
+		t.Fatalf("daemon log = %q, want missing-layer reason", got)
 	}
 }
 

@@ -103,6 +103,49 @@ func TestCheckFailsWhenChildManifestIsMissing(t *testing.T) {
 	}
 }
 
+func TestCheckFailsWhenNestedSelectedManifestBlobsAreMissing(t *testing.T) {
+	cacheRoot := t.TempDir()
+	manager := newManagerWithPorts(cacheRoot, nil, 0)
+	defer manager.Close()
+	manager.offline.Store(true)
+	fixture := newNestedCompletenessFixtureAt(t, filepath.Join(cacheRoot, "registry.example"), false)
+
+	summary, err := manager.Check(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Complete != 0 || summary.Failed != 1 {
+		t.Fatalf("check summary = %+v", summary)
+	}
+	if len(summary.Results) != 1 || !strings.Contains(summary.Results[0].Error, fixture.configDigest) {
+		t.Fatalf("check result = %+v, want missing nested config digest", summary.Results)
+	}
+
+	request := httptest.NewRequest(http.MethodHead, "/v2/demo/manifests/stable?ns=registry.example", nil)
+	recorder := httptest.NewRecorder()
+	manager.serveCatchAll(recorder, request)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("offline nested HEAD = %d, want 404", recorder.Code)
+	}
+	if got := recorder.Header().Get(reasonHeader); got != reasonOfflineNotCached {
+		t.Fatalf("%s = %q, want %q", reasonHeader, got, reasonOfflineNotCached)
+	}
+}
+
+func TestCheckPassesWhenNestedSelectedManifestBlobsArePresent(t *testing.T) {
+	cacheRoot := t.TempDir()
+	manager := newManagerWithPorts(cacheRoot, nil, 0)
+	newNestedCompletenessFixtureAt(t, filepath.Join(cacheRoot, "registry.example"), true)
+
+	summary, err := manager.Check(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Complete != 1 || summary.Failed != 0 {
+		t.Fatalf("check summary = %+v", summary)
+	}
+}
+
 func TestCheckVerifiesHostBlobsWhenIndexRepeatsChildDigestAcrossPlatforms(t *testing.T) {
 	cacheRoot := t.TempDir()
 	mirrorRoot := filepath.Join(cacheRoot, "mirror")
@@ -585,7 +628,11 @@ func TestOpenCheckedRegularFileRejectsPathSwapAfterOpen(t *testing.T) {
 	if renameErr := os.Rename(replacement, path); renameErr != nil {
 		t.Fatal(renameErr)
 	}
-	err = validateOpenedRegularFile(path, info)
+	pathInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = validateOpenedRegularFile(path, pathInfo, info)
 	if err == nil || !strings.Contains(err.Error(), "changed during open") {
 		t.Fatalf("validateOpenedRegularFile() error = %v, want changed-during-open failure", err)
 	}

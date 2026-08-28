@@ -30,12 +30,13 @@ func TestCacheWarmForwardsRefreshOptionAndTypedCounts(t *testing.T) {
 			}
 			return mirror.WarmSummary{
 				Results: []mirror.WarmResult{
-					{Ref: ref, Outcome: mirror.WarmOutcomeFailedMissing, Error: "layer missing"},
+					{Ref: ref, Outcome: mirror.WarmOutcomeFailedMissing, Error: "layer missing", ReResolvedTag: true},
 					{Ref: "registry.example/app:v1", Outcome: mirror.WarmOutcomeFailedRevalidate, Error: "upstream 404"},
 				},
 				Failed:           2,
 				FailedMissing:    1,
 				FailedRevalidate: 1,
+				ReResolvedTags:   1,
 			}, nil
 		},
 	}
@@ -54,8 +55,39 @@ func TestCacheWarmForwardsRefreshOptionAndTypedCounts(t *testing.T) {
 	if result.FailedMissing != 1 || result.FailedRevalidate != 1 {
 		t.Fatalf("typed failures = missing %d, revalidate %d; want 1 and 1", result.FailedMissing, result.FailedRevalidate)
 	}
+	if result.ReResolvedTags != 1 || !result.Entries[0].ReResolvedTag {
+		t.Fatalf("re-resolved fields = %+v, want summary=1 and first entry=true", result)
+	}
 	if result.Entries[0].Status != CacheWarmStatusFailedMissing || result.Entries[1].Status != CacheWarmStatusFailedRevalidate {
 		t.Fatalf("statuses = %q, %q; want typed failures", result.Entries[0].Status, result.Entries[1].Status)
+	}
+}
+
+func TestCacheWarmResultJSONKeepsOldAndNewFields(t *testing.T) {
+	t.Parallel()
+
+	encoded, err := json.Marshal(CacheWarmResult{
+		Entries: []CacheWarmEntry{{
+			Ref:            "registry.example/demo:stable",
+			Status:         CacheWarmStatusAlreadyComplete,
+			Reason:         "complete",
+			RefreshWarning: "upstream unavailable, not revalidated",
+			ReResolvedTag:  true,
+		}},
+		Warmed:           0,
+		AlreadyComplete:  1,
+		Failed:           0,
+		FailedMissing:    0,
+		FailedRevalidate: 0,
+		ReResolvedTags:   1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"reResolvedTag":true`, `"reResolvedTags":1`, `"failedMissing":0`, `"failedRevalidate":0`} {
+		if !strings.Contains(string(encoded), want) {
+			t.Fatalf("CacheWarmResult JSON = %s, want %s", encoded, want)
+		}
 	}
 }
 

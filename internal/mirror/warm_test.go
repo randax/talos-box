@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -2123,5 +2124,134 @@ func TestWarmDefaultRerunDoesNotReResolveTags(t *testing.T) {
 		if strings.Contains(result.Ref, "@") && result.ReResolvedTag {
 			t.Fatalf("digest-pinned ref reported as re-resolved: %+v", result)
 		}
+	}
+}
+
+func TestWarmCheckAndOfflineTagReplayAgreeOnNestedSelectedManifestCompleteness(t *testing.T) {
+	const ref = "registry.example/demo:stable"
+
+	hostArch := imagecache.Architecture(runtime.GOARCH)
+	nested := newNestedWarmGraphFixture(hostArch)
+	cacheRoot := t.TempDir()
+	manager := newManagerWithPorts(cacheRoot, nil, 0)
+	manager.serverFactory = func(_ string, base, cacheDir string) http.Handler {
+		server := NewServer(base, cacheDir)
+		server.client.Transport = warmRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+			response := &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     make(http.Header),
+				Request:    request,
+			}
+			switch request.URL.Path {
+			case "/v2/demo/manifests/stable", "/v2/demo/manifests/" + nested.rootDigest:
+				response.Header.Set("Content-Type", "application/vnd.oci.image.index.v1+json")
+				response.Header.Set("Docker-Content-Digest", nested.rootDigest)
+				response.Body = io.NopCloser(strings.NewReader(nested.rootBody))
+			case "/v2/demo/manifests/" + nested.indexDigest:
+				response.Header.Set("Content-Type", "application/vnd.oci.image.index.v1+json")
+				response.Header.Set("Docker-Content-Digest", nested.indexDigest)
+				response.Body = io.NopCloser(strings.NewReader(nested.indexBody))
+			case "/v2/demo/manifests/" + nested.manifestDigest:
+				response.Header.Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+				response.Header.Set("Docker-Content-Digest", nested.manifestDigest)
+				response.Body = io.NopCloser(strings.NewReader(nested.manifestBody))
+			case "/v2/demo/blobs/" + nested.configDigest:
+				response.Body = io.NopCloser(strings.NewReader("nested-config"))
+			case "/v2/demo/blobs/" + nested.layerDigest:
+				response.Body = io.NopCloser(strings.NewReader("nested-layer"))
+			default:
+				response.StatusCode = http.StatusNotFound
+				response.Status = "404 Not Found"
+				response.Body = io.NopCloser(strings.NewReader("not found"))
+			}
+			return response, nil
+		})
+		return server
+	}
+	defer manager.Close()
+
+	summary, err := manager.Warm(context.Background(), []string{ref}, hostArch, WarmOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Warmed != 1 || summary.Failed != 0 {
+		t.Fatalf("warm summary = %+v", summary)
+	}
+
+	check, err := manager.Check(context.Background(), []string{ref}, hostArch, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if check.Complete != 1 || check.Failed != 0 {
+		t.Fatalf("check summary = %+v", check)
+	}
+
+	manager.SetOffline(true)
+	request := httptest.NewRequest(http.MethodHead, "/v2/demo/manifests/stable?ns=registry.example", nil)
+	recorder := httptest.NewRecorder()
+	manager.serveCatchAll(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("offline nested HEAD = %d, want 200", recorder.Code)
+	}
+
+	cache := NewServer("https://registry.example", filepath.Join(cacheRoot, "registry.example"))
+	if err := os.Remove(cache.blobPath(nested.layerDigest)); err != nil {
+		t.Fatal(err)
+	}
+
+	check, err = manager.Check(context.Background(), []string{ref}, hostArch, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if check.Complete != 0 || check.Failed != 1 {
+		t.Fatalf("missing-blob check summary = %+v", check)
+	}
+	if got := check.Results[0].Error; !strings.Contains(got, nested.layerDigest) {
+		t.Fatalf("missing-blob check error = %q, want %q", got, nested.layerDigest)
+	}
+
+	request = httptest.NewRequest(http.MethodHead, "/v2/demo/manifests/stable?ns=registry.example", nil)
+	recorder = httptest.NewRecorder()
+	manager.serveCatchAll(recorder, request)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("offline nested HEAD after blob removal = %d, want 404", recorder.Code)
+	}
+}
+
+type nestedWarmGraphFixture struct {
+	rootBody       string
+	rootDigest     string
+	indexBody      string
+	indexDigest    string
+	manifestBody   string
+	manifestDigest string
+	configDigest   string
+	layerDigest    string
+}
+
+func newNestedWarmGraphFixture(targetArch imagecache.Architecture) nestedWarmGraphFixture {
+	configDigest := "sha256:" + sha256Hex([]byte("nested-config"))
+	layerDigest := "sha256:" + sha256Hex([]byte("nested-layer"))
+	manifestBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"%s"},"layers":[{"digest":"%s"}]}`, configDigest, layerDigest)
+	manifestDigest := "sha256:" + sha256Hex([]byte(manifestBody))
+	foreignArch := "arm64"
+	if string(targetArch) == foreignArch {
+		foreignArch = "amd64"
+	}
+	foreignDigest := "sha256:" + strings.Repeat("f", 64)
+	indexBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"digest":"%s","platform":{"os":"linux","architecture":"%s"}},{"digest":"%s","platform":{"os":"linux","architecture":"%s"}}]}`, manifestDigest, targetArch, foreignDigest, foreignArch)
+	indexDigest := "sha256:" + sha256Hex([]byte(indexBody))
+	rootBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"digest":"%s","platform":{"os":"linux","architecture":"%s"}}]}`, indexDigest, targetArch)
+	rootDigest := "sha256:" + sha256Hex([]byte(rootBody))
+	return nestedWarmGraphFixture{
+		rootBody:       rootBody,
+		rootDigest:     rootDigest,
+		indexBody:      indexBody,
+		indexDigest:    indexDigest,
+		manifestBody:   manifestBody,
+		manifestDigest: manifestDigest,
+		configDigest:   configDigest,
+		layerDigest:    layerDigest,
 	}
 }

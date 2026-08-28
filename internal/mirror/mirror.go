@@ -260,8 +260,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeOfflineMiss(w, offlineNotCachedMessage)
 		return
 	}
+	stale := s.staleCandidate(r)
 	if s.validateUpstream != nil {
 		if err := s.validateUpstream(r.Context()); err != nil {
+			if stale.Complete() && shouldServeStaleOnValidationError(err) && s.serveStaleManifest(w, r, stale, err.Error()) {
+				return
+			}
 			var validationErr *upstreamValidationError
 			if errors.As(err, &validationErr) {
 				http.Error(w, validationErr.Error(), validationErr.status)
@@ -281,8 +285,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeOfflineMiss(w, offlineNotCachedMessage)
 		return
 	}
-
-	stale := s.staleCandidate(r)
 	policy := s.fillRequestPolicy()
 	if stale.Complete() {
 		policy = immediateRequestPolicy()
@@ -307,6 +309,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if s.serveStaleManifest(w, r, stale, fmt.Sprintf("status %d", resp.StatusCode)) {
 			return
 		}
+		http.Error(w, fmt.Sprintf("upstream status %d and stale cache unavailable", resp.StatusCode), http.StatusBadGateway)
+		return
 	}
 
 	if r.Method == http.MethodGet && resp.StatusCode == http.StatusOK {
@@ -394,6 +398,7 @@ func (s *Server) serveStaleManifest(w http.ResponseWriter, r *http.Request, stat
 		return false
 	}
 	metadata := s.cachedManifestMetadataAtPath(r.URL.Path, path, data)
+	setReasonHeaders(w, reasonServedStale, staleManifestMessage)
 	log.Printf("mirror served stale: %s/%s (upstream %s; cache complete for %s)",
 		s.upstreamNamespace(), offlineMissReference(r.URL.Path), upstream, platformName(status.Target.Platform))
 	return serveManifestBytes(w, r, status.ManifestData, metadata)
@@ -405,13 +410,29 @@ func (s *Server) serveStaleManifest(w http.ResponseWriter, r *http.Request, stat
 // covers both without either writer knowing about the other (#363).
 func (s *Server) serveCacheIfAvailable(w http.ResponseWriter, r *http.Request, digest string, isManifest bool) (bool, *cacheReplayError) {
 	served, err := s.replayCache(w, r, digest, isManifest)
-	if !served && err == nil && s.offlineEnabled() {
-		setReasonHeaders(w, reasonOfflineNotCached, offlineNotCachedMessage)
+	if !served && s.offlineEnabled() {
+		logReason := offlineNotCachedMessage
+		if isManifest && !isDigestReference(manifestReference(r.URL.Path)) {
+			status := s.cachedTagStatus(r)
+			logReason = status.Reason()
+			if err == nil && cacheStatusCorrupted(status) {
+				setReasonHeaders(w, reasonOfflineCacheCorrupted, offlineCacheCorruptedMessage)
+				err = &cacheReplayError{
+					status: http.StatusServiceUnavailable,
+					err:    errors.New(offlineCacheCorruptedMessage),
+				}
+			}
+		} else if err != nil {
+			logReason = err.Error()
+		}
+		if err == nil {
+			setReasonHeaders(w, reasonOfflineNotCached, offlineNotCachedMessage)
+		}
 		// containerd only surfaces the bare status to the kubelet event, so
 		// without this line an offline miss left no trace anywhere in tbx and
 		// the operator saw an unexplained ImagePullBackOff (#403).
-		log.Printf("mirror offline miss: %s (upstream namespace %s)",
-			offlineMissReference(r.URL.Path), s.upstreamNamespace())
+		log.Printf("mirror offline miss: %s (upstream namespace %s): %s",
+			offlineMissReference(r.URL.Path), s.upstreamNamespace(), logReason)
 	}
 	return served, err
 }
@@ -853,26 +874,7 @@ func (s *Server) cachedManifestBytes(requestPath string) ([]byte, error) {
 var errCachedManifestDigestMismatch = errors.New("cached manifest does not match requested digest")
 
 func (s *Server) cachedManifest(requestPath string) ([]byte, string, error) {
-	path := s.manifestPath(requestPath)
-	data, err := os.ReadFile(path)
-	if err == nil || !errors.Is(err, os.ErrNotExist) {
-		return data, path, err
-	}
-
-	legacyPath, ok := s.legacyManifestFallbackPath(requestPath)
-	if !ok {
-		return nil, path, err
-	}
-	data, err = os.ReadFile(legacyPath)
-	if err != nil {
-		return nil, legacyPath, err
-	}
-	if reference := manifestReference(requestPath); isDigestReference(reference) {
-		if _, err := verifySupportedDigest(data, reference); err != nil {
-			return nil, legacyPath, fmt.Errorf("%w: %v", errCachedManifestDigestMismatch, err)
-		}
-	}
-	return data, legacyPath, nil
+	return checkedCachedManifest(s, requestPath)
 }
 
 func (s *Server) cachedManifestMetadata(requestPath string, data []byte) manifestMetadata {
@@ -954,6 +956,7 @@ const reasonHeader = "X-Talosbox-Reason"
 const (
 	reasonOfflineNotCached        = "offline-not-cached"
 	reasonOfflineCacheCorrupted   = "offline-cache-corrupted"
+	reasonServedStale             = "served-stale"
 	reasonUpstreamManifestInvalid = "upstream-manifest-invalid"
 )
 
@@ -961,6 +964,7 @@ const (
 	offlineMissStatus            = http.StatusNotFound
 	offlineNotCachedMessage      = "mirror offline: content not cached"
 	offlineCacheCorruptedMessage = "mirror offline: cached digest corrupted"
+	staleManifestMessage         = "mirror served stale"
 )
 
 func writeOfflineMiss(w http.ResponseWriter, detail string) {
@@ -973,6 +977,25 @@ func writeOfflineMiss(w http.ResponseWriter, detail string) {
 func setReasonHeaders(w http.ResponseWriter, reason, text string) {
 	w.Header().Set(reasonHeader, reason)
 	w.Header().Set("Warning", fmt.Sprintf("199 talos-box %q", text))
+}
+
+func shouldServeStaleOnValidationError(err error) bool {
+	var resolutionErr *upstreamResolutionError
+	return errors.As(err, &resolutionErr)
+}
+
+func cacheStatusCorrupted(status CacheStatus) bool {
+	for _, gap := range status.Gaps {
+		switch gap.Kind {
+		case CacheGapCorrupt:
+			return true
+		case CacheGapTagMapping, CacheGapRootManifest, CacheGapPlatformManifest:
+			if gap.Detail != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // pinnedDigestMismatchError reports a manifest the upstream served correctly
@@ -1022,6 +1045,11 @@ type upstreamValidationError struct {
 
 func (e *upstreamValidationError) Error() string { return e.err.Error() }
 func (e *upstreamValidationError) Unwrap() error { return e.err }
+
+type upstreamResolutionError struct{ err error }
+
+func (e *upstreamResolutionError) Error() string { return e.err.Error() }
+func (e *upstreamResolutionError) Unwrap() error { return e.err }
 
 type cacheReplayError struct {
 	status int

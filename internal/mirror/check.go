@@ -205,6 +205,13 @@ func checkedCachedManifestMetadataAtPath(requestPath, path string, data []byte) 
 }
 
 func openCheckedRegularFile(path string) (*os.File, os.FileInfo, error) {
+	pathInfo, err := os.Lstat(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	if pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() {
+		return nil, nil, fmt.Errorf("cached file is not a regular file")
+	}
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, nil, err
@@ -214,7 +221,7 @@ func openCheckedRegularFile(path string) (*os.File, os.FileInfo, error) {
 		_ = file.Close()
 		return nil, nil, err
 	}
-	if err := validateOpenedRegularFile(path, info); err != nil {
+	if err := validateOpenedRegularFile(path, pathInfo, info); err != nil {
 		_ = file.Close()
 		return nil, nil, err
 	}
@@ -232,11 +239,7 @@ func openRegularFileInfo(file *os.File) (os.FileInfo, error) {
 	return info, nil
 }
 
-func validateOpenedRegularFile(path string, info os.FileInfo) error {
-	pathInfo, err := os.Lstat(path)
-	if err != nil {
-		return err
-	}
+func validateOpenedRegularFile(path string, pathInfo, info os.FileInfo) error {
 	if pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() {
 		return fmt.Errorf("cached file is not a regular file")
 	}

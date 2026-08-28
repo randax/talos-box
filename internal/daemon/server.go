@@ -271,6 +271,7 @@ func cacheWarmResult(summary mirror.WarmSummary) CacheWarmResult {
 		Failed:           summary.Failed,
 		FailedMissing:    summary.FailedMissing,
 		FailedRevalidate: summary.FailedRevalidate,
+		ReResolvedTags:   summary.ReResolvedTags,
 		Entries:          make([]CacheWarmEntry, 0, len(summary.Results)),
 	}
 	for _, entry := range summary.Results {
@@ -292,6 +293,7 @@ func cacheWarmResult(summary mirror.WarmSummary) CacheWarmResult {
 			Status:         status,
 			Reason:         entry.Error,
 			RefreshWarning: entry.RefreshWarning,
+			ReResolvedTag:  entry.ReResolvedTag,
 		})
 	}
 	return result

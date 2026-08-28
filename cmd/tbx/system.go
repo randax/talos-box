@@ -172,7 +172,7 @@ func (c cli) daemonStatus() error {
 	}
 	compatHint := false
 	for _, finding := range identity.Findings {
-		if finding.check == "runtime-compat" {
+		if finding.check == "runtime-compat" && identity.Daemon.Available && identity.Daemon.Protocol != daemon.ProtocolVersion {
 			compatHint = true
 		}
 		if finding.detail == "" {
