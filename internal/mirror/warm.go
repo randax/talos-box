@@ -2,7 +2,6 @@ package mirror
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -245,26 +244,11 @@ func warmManifestGraph(ctx context.Context, handler http.Handler, server *Server
 }
 
 func analyzeWarmManifest(body []byte) (string, []platformDescriptor, []string, error) {
-	var manifest struct {
-		MediaType string `json:"mediaType"`
-		Manifests []struct {
-			Digest   string `json:"digest"`
-			Platform struct {
-				Architecture string `json:"architecture"`
-				OS           string `json:"os"`
-			} `json:"platform"`
-		} `json:"manifests"`
-		Config struct {
-			Digest string `json:"digest"`
-		} `json:"config"`
-		Layers []struct {
-			Digest string `json:"digest"`
-		} `json:"layers"`
+	manifest, err := decodeManifestGraph(body)
+	if err != nil {
+		return "", nil, nil, err
 	}
-	if err := json.Unmarshal(body, &manifest); err != nil {
-		return "", nil, nil, fmt.Errorf("decode manifest graph: %w", err)
-	}
-	if len(manifest.Manifests) > 0 || strings.Contains(manifest.MediaType, "index") || strings.Contains(manifest.MediaType, "manifest.list") {
+	if isManifestIndex(manifest) {
 		children := make([]platformDescriptor, 0, len(manifest.Manifests))
 		for _, child := range manifest.Manifests {
 			children = append(children, platformDescriptor{
@@ -277,9 +261,7 @@ func analyzeWarmManifest(body []byte) (string, []platformDescriptor, []string, e
 	}
 
 	var blobs []string
-	if manifest.Config.Digest != "" {
-		blobs = append(blobs, manifest.Config.Digest)
-	}
+	blobs = append(blobs, manifest.Config.Digest)
 	for _, layer := range manifest.Layers {
 		blobs = append(blobs, layer.Digest)
 	}

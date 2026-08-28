@@ -176,6 +176,72 @@ func TestInspectCachedReportsNestedSelectedIndexesCompleteWhenBlobsPresent(t *te
 	}
 }
 
+func TestInspectCachedReportsStructurallyInvalidRootManifest(t *testing.T) {
+	server := NewServer("https://registry.example", t.TempDir())
+	body := []byte(`{"schemaVersion":2}`)
+	digest := "sha256:" + sha256Hex(body)
+	storeManifestFixture(t, server, digest, digest, string(body))
+
+	status := server.InspectCached(context.Background(), CacheTarget{
+		Repository: "demo",
+		Digest:     digest,
+		Platform:   Platform{OS: "linux", Architecture: imagecache.ArchitectureAMD64},
+	}, InspectOptions{})
+	if status.Complete() || len(status.Gaps) != 1 {
+		t.Fatalf("InspectCached() = %+v, want one invalid root-manifest gap", status)
+	}
+	gap := status.Gaps[0]
+	if gap.Kind != CacheGapRootManifest || !strings.Contains(gap.Detail, "invalid manifest: missing config descriptor") {
+		t.Fatalf("gap = %+v, want invalid root-manifest detail", gap)
+	}
+}
+
+func TestInspectCachedReportsNestedIndexSelfLoopAsPlatformManifestGap(t *testing.T) {
+	server := NewServer("https://registry.example", t.TempDir())
+	status := &CacheStatus{Target: CacheTarget{Platform: Platform{OS: "linux", Architecture: imagecache.ArchitectureAMD64}}}
+	selected := platformDescriptor{Digest: "sha256:" + strings.Repeat("1", 64), OS: "linux", Architecture: "amd64"}
+
+	_, err := server.inspectSelectedManifest(context.Background(), status.Target, cachedGraph{}, selected, 1, map[string]struct{}{selected.Digest: {}}, status)
+	if err == nil || len(status.Gaps) == 0 || status.Gaps[0].Kind != CacheGapPlatformManifest {
+		t.Fatalf("status = %+v err=%v, want platform-manifest cycle gap", status, err)
+	}
+	if got := status.Gaps[0].Detail; !strings.Contains(got, "cycles") {
+		t.Fatalf("detail = %q, want cycle detail", got)
+	}
+}
+
+func TestInspectCachedReportsNestedIndexRootLoopAsPlatformManifestGap(t *testing.T) {
+	server := NewServer("https://registry.example", t.TempDir())
+	status := &CacheStatus{Target: CacheTarget{Repository: "demo", Platform: Platform{OS: "linux", Architecture: imagecache.ArchitectureAMD64}}}
+	rootDigest := "sha256:" + strings.Repeat("2", 64)
+	childBody := `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"digest":"` + rootDigest + `","platform":{"os":"linux","architecture":"amd64"}}]}`
+	childDigest := "sha256:" + sha256Hex([]byte(childBody))
+	storeManifestFixture(t, server, childDigest, childDigest, childBody)
+	selected := platformDescriptor{Digest: childDigest, OS: "linux", Architecture: "amd64"}
+
+	_, err := server.inspectSelectedManifest(context.Background(), status.Target, cachedGraph{}, selected, 1, map[string]struct{}{rootDigest: {}}, status)
+	if err == nil || len(status.Gaps) == 0 || status.Gaps[0].Kind != CacheGapPlatformManifest {
+		t.Fatalf("status = %+v err=%v, want platform-manifest cycle gap", status, err)
+	}
+	if got := status.Gaps[0].Detail; !strings.Contains(got, "cycles") {
+		t.Fatalf("detail = %q, want cycle detail", got)
+	}
+}
+
+func TestInspectCachedReportsNestedIndexDepthOverflowAsPlatformManifestGap(t *testing.T) {
+	server := NewServer("https://registry.example", t.TempDir())
+	status := &CacheStatus{Target: CacheTarget{Platform: Platform{OS: "linux", Architecture: imagecache.ArchitectureAMD64}}}
+	selected := platformDescriptor{Digest: "sha256:" + strings.Repeat("3", 64), OS: "linux", Architecture: "amd64"}
+
+	_, err := server.inspectSelectedManifest(context.Background(), status.Target, cachedGraph{}, selected, maxSelectedIndexDepth+1, map[string]struct{}{}, status)
+	if err == nil || len(status.Gaps) == 0 || status.Gaps[0].Kind != CacheGapPlatformManifest {
+		t.Fatalf("status = %+v err=%v, want platform-manifest depth gap", status, err)
+	}
+	if got := status.Gaps[0].Detail; !strings.Contains(got, "exceeds depth") {
+		t.Fatalf("detail = %q, want depth detail", got)
+	}
+}
+
 type completenessFixture struct {
 	server                                                  *Server
 	rootDigest, platformDigest, foreignDigest, configDigest string
@@ -302,4 +368,11 @@ func newNestedCompletenessFixtureAt(t *testing.T, cacheDir string, includeBlobs 
 
 func (f nestedCompletenessFixture) target(tag string) CacheTarget {
 	return CacheTarget{Repository: "demo", Tag: tag, Digest: f.rootDigest, Platform: Platform{OS: "linux", Architecture: imagecache.ArchitectureAMD64}}
+}
+
+func storeManifestFixture(t *testing.T, server *Server, ref, digest, body string) {
+	t.Helper()
+	if err := server.storeManifest(manifestRequestPath("demo", ref), manifestMetadata{ContentType: "application/vnd.oci.image.index.v1+json", DockerContentDigest: digest}, []byte(body)); err != nil {
+		t.Fatal(err)
+	}
 }

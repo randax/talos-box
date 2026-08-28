@@ -189,6 +189,59 @@ func TestWarmRefreshCompleteTagTreats429AsAlreadyComplete(t *testing.T) {
 	}
 }
 
+func TestWarmRejectsStructurallyInvalidManifestAndLeavesOfflineHeadUncached(t *testing.T) {
+	cacheRoot := t.TempDir()
+	manager := newManagerWithPorts(cacheRoot, nil, 0)
+	manager.serverFactory = func(_, base, cacheDir string) http.Handler {
+		server := NewServer(base, cacheDir)
+		server.client.Transport = warmRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+			response := &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"schemaVersion":2}`)),
+				Request:    request,
+			}
+			response.Header.Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			response.Header.Set("Docker-Content-Digest", "sha256:"+sha256Hex([]byte(`{"schemaVersion":2}`)))
+			return response, nil
+		})
+		return server
+	}
+	t.Cleanup(manager.Close)
+
+	summary, err := manager.Warm(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64, WarmOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.FailedMissing != 1 || summary.Failed != 1 || summary.Results[0].Outcome != WarmOutcomeFailedMissing {
+		t.Fatalf("summary = %+v", summary)
+	}
+	if got := summary.Results[0].Error; !strings.Contains(got, "upstream manifest: invalid manifest: missing config descriptor") {
+		t.Fatalf("warm error = %q", got)
+	}
+
+	check, err := manager.Check(context.Background(), []string{"registry.example/demo:stable"}, imagecache.ArchitectureAMD64, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if check.Failed != 1 || check.Complete != 0 {
+		t.Fatalf("check = %+v", check)
+	}
+	if got := check.Results[0].Error; !strings.Contains(got, "tag mapping /v2/demo/manifests/stable not cached") {
+		t.Fatalf("check error = %q", got)
+	}
+
+	server := NewServer("https://registry.example", filepath.Join(cacheRoot, "registry.example"))
+	server.setOfflineMode(true)
+	request := httptest.NewRequest(http.MethodHead, "/v2/demo/manifests/stable", nil)
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, request)
+	if recorder.Code == http.StatusOK {
+		t.Fatalf("offline HEAD = %d, want non-200", recorder.Code)
+	}
+}
+
 func newCachedWarmManagerWithStatus(t *testing.T, status int) (*Manager, completenessFixture) {
 	t.Helper()
 	cacheRoot := t.TempDir()
@@ -432,13 +485,13 @@ func TestWarmPopulatesMirrorStatsForCacheList(t *testing.T) {
 }
 
 func TestWarmUpdatesMirrorStatsPerUpstreamFromZero(t *testing.T) {
-	manifestOne := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%d}}`,
+	manifestOne := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%d},"layers":[]}`,
 		"sha256:"+sha256Hex([]byte("config-one")), len("config-one"))
 	digestOne := "sha256:" + sha256Hex([]byte(manifestOne))
 	configOne := "config-one"
 	configOneDigest := "sha256:" + sha256Hex([]byte(configOne))
 
-	manifestTwo := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%d}}`,
+	manifestTwo := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%d},"layers":[]}`,
 		"sha256:"+sha256Hex([]byte("config-two")), len("config-two"))
 	digestTwo := "sha256:" + sha256Hex([]byte(manifestTwo))
 	configTwo := "config-two"
