@@ -18,8 +18,9 @@ type HostInterface struct {
 
 // HostRoute describes the route selected for one candidate guest address.
 type HostRoute struct {
-	Interface string
-	Network   *net.IPNet
+	Interface       string
+	Network         *net.IPNet
+	LooksLikeTunnel bool
 }
 
 // LinuxBridgeName and LinuxBridgeAlias are the netlink identity of a bridge
@@ -222,7 +223,7 @@ func inspectSubnet(
 		return subnetInspection{}, fmt.Errorf("inspect route to %s: invalid IPv4 route mask", destination)
 	}
 	if ones == 0 {
-		if strings.HasPrefix(route.Interface, "utun") {
+		if route.LooksLikeTunnel {
 			return subnetInspection{warning: subnetRouteWarning(index, route.Interface)}, nil
 		}
 		return subnetInspection{}, nil
