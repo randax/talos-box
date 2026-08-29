@@ -42,7 +42,7 @@ func (m balloonMachine) SetMemoryTargetMiB(targetMiB int) error {
 		// not a guest that gave memory back: the driver is not loaded yet, so
 		// the target goes unrecorded and the node still counts as reclaimable.
 		if m.tolerateDeviceNotActive && errors.Is(err, hypervisor.ErrDeviceNotActive) {
-			return nil
+			return fmt.Errorf("%w: %v", balloon.ErrTargetPending, err)
 		}
 		return err
 	}
@@ -52,19 +52,11 @@ func (m balloonMachine) SetMemoryTargetMiB(targetMiB int) error {
 	return nil
 }
 
-// balloonCurrent is the optional current-target readback a Balloonable may
-// carry. The balloon package's interface is deliberately configured-size only —
-// its reconcile is anchored there — so the pre-balloon asks for the reading it
-// needs without forcing every implementation to have one.
-type balloonCurrent interface {
-	CurrentTargetMiB() int
-}
-
 // currentTargetMiB is how much memory a running guest holds right now as far as
 // this daemon knows: the last target it applied, or the configured size for a
 // guest nothing has ballooned.
 func currentTargetMiB(vm balloon.Balloonable) int {
-	if current, ok := vm.(balloonCurrent); ok {
+	if current, ok := vm.(balloon.CurrentTargeter); ok {
 		if target := current.CurrentTargetMiB(); target > 0 {
 			return target
 		}
@@ -314,12 +306,18 @@ func (s *Server) checkProvisionStart(path string, addMiB int, force bool) ([]str
 	if err != nil {
 		// Memory nothing gave back is not headroom. The gate admitted this
 		// start only because the reclaim was going to happen, so a reclaim that
-		// did not happen puts it back where an unaided host would be.
+		// did not happen (or only partly happened) puts it back where an
+		// unaided host would be. What the other guests did give back is still
+		// held on the forced path, so the manager does not hand it straight
+		// back while the new guest boots.
 		detail := fmt.Sprintf("pre-ballooning %d MiB out of the %d MiB of guests already running failed: %v", plan.ReclaimMiB, runningMiB, err)
 		if !force {
 			return nil, 0, fmt.Errorf("%s; %s (use --force to override)", detail, hostpressure.MemoryRemedy)
 		}
-		return append(warnings, detail+" (forced)"), 0, nil
+		if heldMiB > 0 {
+			s.holdBalloonReclaim(heldMiB)
+		}
+		return append(warnings, detail+" (forced)"), heldMiB, nil
 	}
 	s.holdBalloonReclaim(heldMiB)
 	return append(warnings, fmt.Sprintf(
@@ -441,9 +439,19 @@ func (r balloonReclaim) apply(deficitMiB int) (int, error) {
 	// the granularity of any of these readings.
 	targets := balloon.PlanTargets(nodes, deficitMiB+len(nodes), r.floorMiB)
 	heldMiB := 0
+	pendingMiB := 0
+	var pending []string
 	for _, name := range names {
 		if err := r.vms[name].SetMemoryTargetMiB(targets[name]); err != nil {
-			return 0, fmt.Errorf("balloon %s down to %d MiB: %w", name, targets[name], err)
+			if !errors.Is(err, balloon.ErrTargetPending) {
+				return heldMiB, fmt.Errorf("balloon %s down to %d MiB: %w", name, targets[name], err)
+			}
+			// A guest whose balloon driver is not up yet accepted nothing: its
+			// share of the reclaim has not happened, so it is neither headroom
+			// the gate can admit a start on nor memory the hold should keep out.
+			pending = append(pending, name)
+			pendingMiB += currentTargetMiB(r.vms[name]) - targets[name]
+			continue
 		}
 		// The hold is measured from the CONFIGURED size, not from the deficit
 		// this call asked for: the balloon manager's reconcile anchors on
@@ -453,6 +461,9 @@ func (r balloonReclaim) apply(deficitMiB int) (int, error) {
 		if out := r.vms[name].ConfiguredMiB() - targets[name]; out > 0 {
 			heldMiB += out
 		}
+	}
+	if len(pending) > 0 {
+		return heldMiB, fmt.Errorf("%w on %s: %d MiB of the reclaim could not be taken yet", balloon.ErrTargetPending, strings.Join(pending, ", "), pendingMiB)
 	}
 	return heldMiB, nil
 }

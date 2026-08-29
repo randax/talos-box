@@ -151,6 +151,7 @@ getent group kvm >/dev/null && sudo usermod -aG kvm "$USER"
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now tbx-helper.socket
+loginctl enable-linger "$USER"
 systemctl --user daemon-reload
 systemctl --user enable --now tbxd.socket
 ```
@@ -163,6 +164,19 @@ tbx doctor
 
 A socket-activated `tbxd` writes its narration to `~/.talosbox/tbxd.log` — the file `tbx logs`
 reads — as well as to the journal, so both `tbx logs` and `journalctl --user -u tbxd` work.
+The packaged `tbxd.socket` unit is the preferred daemon-start path.
+
+If the socket unit is not installed or enabled, `tbx` still starts its sibling `tbxd` on
+demand. On a systemd host this fallback always uses a transient `systemd-run --user` service
+in `app.slice`, never a process left in the terminal's session scope. If user lingering cannot
+be confirmed, `tbx` warns that guests will stop at logout and points to both
+`loginctl enable-linger` and the packaged socket unit, but it still starts the transient
+service. On a host without systemd, the fallback keeps using the detached `setsid` process used
+by earlier releases.
+
+Under WSL2, enable systemd before installing the units and enable lingering as shown above.
+Lingering keeps the daemon and its guests alive when the last terminal closes; `wsl --shutdown`,
+a WSL restart, and a Windows reboot remain host shutdowns and stop the guests.
 
 Do not use `tbx system install` on Linux. That command currently installs the macOS launchd
 helper; Linux installation is owned by packages and systemd units.
@@ -256,6 +270,24 @@ daemon records `mirror served stale: <host>/<repository>:<tag> (upstream <reason
 for linux/<arch>)`. Offline mode stops the mirror from reaching registries and its misses return
 404. Node fallback is a separate policy: an explicit `skipFallback: false` entry may continue to
 upstream, while talos-box's generated `"*"` entry is `skipFallback: true` and remains a hard miss.
+
+### Host access to warmed registry images
+
+Host OCI tools cannot supply containerd's `?ns=` query. Put the upstream authority immediately
+after the catch-all address instead. For example, after warming
+`public.ecr.aws/docker/library/golang:1.25-alpine`, replace `<gateway>` with the cluster gateway:
+
+```sh
+crane manifest --insecure \
+  <gateway>:5059/public.ecr.aws/docker/library/golang:1.25-alpine
+
+curl -I \
+  http://<gateway>:5059/v2/public.ecr.aws/docker/library/golang/manifests/1.25-alpine
+```
+
+The path form and containerd's query form share the same cache. Both commands therefore continue
+to work for a complete warmed image after `tbx mirror offline on`; an uncached path returns the
+same offline 404 as the query form.
 
 `tbx bgp enable|disable <cluster>` flips the announcement mode; it requires `--cni cilium` and
 refuses anything else without touching the speaker. `tbx bgp status <cluster>` reports where the

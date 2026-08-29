@@ -82,6 +82,25 @@ func TestRunDoctorHostPressurePassUsesDaemonReportedReserve(t *testing.T) {
 	}
 }
 
+func TestRunDoctorHostPressureBelowBalloonReserveReportsNoCapacity(t *testing.T) {
+	deps := passingDoctorDependencies()
+	deps.hostFreeMemory = func() (int, error) { return 6056, nil }
+	deps.balloonReserveMiB = func() (int, error) { return 6144, nil }
+
+	var output strings.Builder
+	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
+		t.Fatalf("runDoctorWithDependencies() = %v for a healthy host below the reserve", err)
+	}
+
+	want := "the host is already 88 MiB below the balloon reserve; any new guest start will be refused until memory frees"
+	if !strings.Contains(output.String(), want) {
+		t.Errorf("output missing %q:\n%s", want, output.String())
+	}
+	if strings.Contains(output.String(), "larger than -88 MiB") {
+		t.Errorf("output reports negative guest capacity:\n%s", output.String())
+	}
+}
+
 // With no daemon to ask, the CLI's own default is a guess about the gate, and
 // the line says so rather than presenting it as the gate's number.
 func TestRunDoctorHostPressurePassSaysTheReserveWasAssumed(t *testing.T) {
@@ -168,5 +187,24 @@ func TestRunDoctorClassifiesHighSwapAgainstMeasuredMemoryHeadroom(t *testing.T) 
 				t.Fatalf("blocking output unexpectedly contains %q:\n%s", caveat, output.String())
 			}
 		})
+	}
+}
+
+func TestRunDoctorWarnsAtEightyPercentSwapUnderNormalPressure(t *testing.T) {
+	deps := passingDoctorDependencies()
+	deps.hostPressure = func() (hostpressure.Snapshot, error) {
+		return hostpressure.Snapshot{
+			Swap:           hostpressure.Usage{TotalBytes: 3 << 30, AvailableBytes: 3 << 30 * 13 / 100},
+			MemoryPressure: hostpressure.MemoryPressureNormal,
+		}, nil
+	}
+	deps.hostFreeMemory = func() (int, error) { return 16 << 10, nil }
+
+	var output strings.Builder
+	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
+		t.Fatalf("runDoctorWithDependencies() = %v, warning must not fail doctor", err)
+	}
+	if !strings.Contains(output.String(), "WARN host-pressure: host swap is 87% used") {
+		t.Fatalf("output missing steady swap warning:\n%s", output.String())
 	}
 }

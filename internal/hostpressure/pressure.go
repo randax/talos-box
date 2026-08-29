@@ -9,6 +9,7 @@ import (
 
 const (
 	extremeSwapUsedPercent       = 90
+	steadySwapUsedPercent        = 80
 	extremeDataVolumeUsedPercent = 95
 	bytesPerGiB                  = 1 << 30
 	// lowFreeSwapBytes is the absolute headroom below which swap counts as
@@ -65,7 +66,9 @@ type Snapshot struct {
 	// the balloon reserve plus the guests about to start, because macOS can keep
 	// old swap allocated after the pressure that filled it has cleared (#483).
 	// Zero means it was not measured, and it is reported as such.
-	FreeMemoryMiB int
+	FreeMemoryMiB  int
+	TotalMemoryMiB int
+	CompressorMiB  int
 }
 
 // Summary renders the numbers behind a host-pressure verdict — free memory,
@@ -79,10 +82,15 @@ func (s Snapshot) Summary(reserveMiB int) string {
 	if s.FreeMemoryMiB > 0 {
 		parts[0] = fmt.Sprintf("%d MiB free memory", s.FreeMemoryMiB)
 	}
+	if s.TotalMemoryMiB > 0 {
+		parts = append(parts, fmt.Sprintf("%d MiB in compressor of %d MiB physical memory", s.CompressorMiB, s.TotalMemoryMiB))
+	} else if s.CompressorMiB > 0 {
+		parts = append(parts, fmt.Sprintf("%d MiB in compressor", s.CompressorMiB))
+	}
 	if s.Swap.TotalBytes == 0 {
 		parts = append(parts, "swap disabled or unmeasurable")
 	} else {
-		parts = append(parts, fmt.Sprintf("%.1f GiB of %.1f GiB swap in use", gib(s.Swap.usedBytes()), gib(s.Swap.TotalBytes)))
+		parts = append(parts, fmt.Sprintf("%.1f GiB of %.1f GiB swap in use (%d%%)", gib(s.Swap.UsedBytes()), gib(s.Swap.TotalBytes), s.Swap.PercentUsed()))
 	}
 	if s.DataVolume.TotalBytes == 0 {
 		parts = append(parts, "~/.talosbox volume unmeasurable")
@@ -102,15 +110,21 @@ func (s Snapshot) headroomClause(reserveMiB int) string {
 		return "starting guests beside running ones must leave the " +
 			fmt.Sprintf("%d MiB", reserveMiB) + " balloon reserve free, which needs a free-memory reading this host did not give"
 	}
-	roomMiB := s.FreeMemoryMiB - reserveMiB
-	if roomMiB < 0 {
-		roomMiB = 0
-	}
+	roomMiB := GuestHeadroomMiB(s.FreeMemoryMiB, reserveMiB)
 	return fmt.Sprintf(
 		"starting guests beside running ones must leave the %d MiB balloon reserve free, so there is room for %d MiB of new guests right now,"+
 			" plus whatever the balloon controller can take back from the guests already running",
 		reserveMiB, roomMiB,
 	)
+}
+
+// GuestHeadroomMiB is the memory a new guest may claim while preserving
+// the balloon reserve. It never reports negative capacity.
+func GuestHeadroomMiB(freeMiB, reserveMiB int) int {
+	if roomMiB := freeMiB - reserveMiB; roomMiB > 0 {
+		return roomMiB
+	}
+	return 0
 }
 
 // Severity ranks a finding for the two consumers of Assess.
@@ -222,7 +236,7 @@ func memoryFinding(snapshot Snapshot, requiredFreeMiB int) (Finding, bool) {
 			severity = SeverityBlock
 		}
 	case MemoryPressureNormal:
-		if swapExhausted {
+		if _, ok := SteadySwapFinding(snapshot); ok {
 			// sticky swap with memory to spare is not a fault, but it is one
 			// pressure tick away from one, so it stays reportable
 			severity = SeverityWarn
@@ -233,6 +247,8 @@ func memoryFinding(snapshot Snapshot, requiredFreeMiB int) (Finding, bool) {
 			if !hasRequiredFreeMemory {
 				severity = SeverityBlock
 			}
+		} else if _, ok := SteadySwapFinding(snapshot); ok {
+			severity = SeverityWarn
 		}
 	}
 	if severity == 0 {
@@ -241,6 +257,20 @@ func memoryFinding(snapshot Snapshot, requiredFreeMiB int) (Finding, bool) {
 	headroomDecidesSeverity := (snapshot.MemoryPressure == MemoryPressureWarning && (swapExhausted || swapNearlyFull)) ||
 		(snapshot.MemoryPressure == MemoryPressureUnknown && swapExhausted)
 	return Finding{Severity: severity, Detail: memoryDetail(snapshot, requiredFreeMiB, headroomDecidesSeverity), Remedy: memoryRemedy}, true
+}
+
+// SteadySwapFinding returns the table/doctor advisory threshold independently
+// of kernel pressure. Assess folds it into its one combined memory finding.
+func SteadySwapFinding(snapshot Snapshot) (Finding, bool) {
+	if snapshot.Swap.PercentUsed() < steadySwapUsedPercent {
+		return Finding{}, false
+	}
+	return Finding{
+		Severity: SeverityWarn,
+		Detail: fmt.Sprintf("host swap is %d%% used (%.1f GiB of %.1f GiB, %.1f GiB free)",
+			snapshot.Swap.PercentUsed(), gib(snapshot.Swap.UsedBytes()), gib(snapshot.Swap.TotalBytes), gib(snapshot.Swap.AvailableBytes)),
+		Remedy: memoryRemedy,
+	}, true
 }
 
 // memoryDetail states the condition with every number the gate measured, so an
@@ -258,6 +288,11 @@ func memoryDetail(snapshot Snapshot, requiredFreeMiB int, includeHeadroom bool) 
 		percentUsed(snapshot.Swap), gib(snapshot.Swap.usedBytes()),
 		gib(snapshot.Swap.TotalBytes), gib(snapshot.Swap.AvailableBytes),
 	)
+	if snapshot.TotalMemoryMiB > 0 {
+		usage += fmt.Sprintf(" with %d MiB in compressor of %d MiB physical memory", snapshot.CompressorMiB, snapshot.TotalMemoryMiB)
+	} else if snapshot.CompressorMiB > 0 {
+		usage += fmt.Sprintf(" with %d MiB in compressor", snapshot.CompressorMiB)
+	}
 	if includeHeadroom {
 		if snapshot.FreeMemoryMiB > 0 {
 			usage += fmt.Sprintf(" with %d MiB free memory against %d MiB required", snapshot.FreeMemoryMiB, requiredFreeMiB)
@@ -276,12 +311,16 @@ func memoryDetail(snapshot Snapshot, requiredFreeMiB int, includeHeadroom bool) 
 	}
 }
 
-func (u Usage) usedBytes() uint64 {
+func (u Usage) UsedBytes() uint64 {
 	if u.AvailableBytes >= u.TotalBytes {
 		return 0
 	}
 	return u.TotalBytes - u.AvailableBytes
 }
+
+func (u Usage) usedBytes() uint64 { return u.UsedBytes() }
+
+func (u Usage) PercentUsed() int { return percentUsed(u) }
 
 func percentUsed(usage Usage) int {
 	if usage.TotalBytes == 0 {

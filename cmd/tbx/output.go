@@ -134,6 +134,13 @@ func printStatus(output io.Writer, clusters []daemon.ClusterStatus, quiet bool) 
 	// pasteable recovery remains a hint below and is suppressed normally.
 	for _, item := range clusters {
 		for _, node := range item.Nodes {
+			if node.RebootedAt != nil {
+				if _, err := fmt.Fprintf(output,
+					"cluster %s: node %s rebooted at %s; Talos boot identity changed while the VM process stayed running\n",
+					item.Name, node.Name, node.RebootedAt.UTC().Format(time.RFC3339)); err != nil {
+					return err
+				}
+			}
 			for _, stalled := range node.StalledServices {
 				age := time.Since(stalled.Since)
 				if age < 0 {

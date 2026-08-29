@@ -31,6 +31,7 @@ func (s *Server) recordVMStart(clusterName, nodeName string) {
 	// new start time, not from whatever the previous incarnation observed.
 	s.reachability.forget(nodeKey(clusterName, nodeName))
 	s.stalls.forget(nodeKey(clusterName, nodeName))
+	s.reboots.forget(nodeKey(clusterName, nodeName))
 }
 
 // nodeKey is the cluster-scoped identity the daemon-side node trackers share.
@@ -47,6 +48,7 @@ func (s *Server) forgetNode(clusterName, nodeName string) {
 	}
 	s.reachability.forget(nodeKey(clusterName, nodeName))
 	s.stalls.forget(nodeKey(clusterName, nodeName))
+	s.reboots.forget(nodeKey(clusterName, nodeName))
 }
 
 // forgetCluster drops the observations of every node in a cluster.
@@ -56,6 +58,7 @@ func (s *Server) forgetCluster(clusterName string) {
 	prefix := clusterName + "/"
 	s.reachability.forgetPrefix(prefix)
 	s.stalls.forgetPrefix(prefix)
+	s.reboots.forgetPrefix(prefix)
 }
 
 // forgetAllNodeTracking clears the trackers wholesale — Shutdown closes every
@@ -65,6 +68,7 @@ func (s *Server) forgetAllNodeTracking() {
 	s.reachability.forgetAll()
 	s.stalls.forgetAll()
 	s.readiness.forgetAll()
+	s.reboots.forgetAll()
 }
 
 // nodeReachability is what the daemon has observed about one node since its VM

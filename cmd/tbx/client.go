@@ -525,6 +525,7 @@ func onDiskVMEstimate() int {
 var (
 	terminateDaemonProcess  = func(pid int) error { return syscall.Kill(pid, syscall.SIGTERM) }
 	spawnDaemonProcess      = startDaemon
+	launchDaemon            = launchDaemonLive
 	supervisedDaemon        = supervisedDaemonUnit
 	daemonProcessAlive      = processAlive
 	daemonLockFree          = socketLockFree
@@ -1001,6 +1002,7 @@ func daemonSpawnFailure(dialErr error, logPath string, logOffset int64) error {
 	}
 	message := fmt.Sprintf("tbxd was started but did not serve its socket within %s (%v); see %s",
 		daemonWaitTimeout, dialErr, logPath)
+	message += daemonSpawnFailureHint()
 	if quoted != "" {
 		message = fmt.Sprintf("%s (last log line: %s)", message, quoted)
 	}
@@ -1068,15 +1070,8 @@ func startDaemon() (int64, error) {
 		return 0, fmt.Errorf("inspect daemon log: %w", err)
 	}
 
-	command := exec.Command(daemonPath)
-	command.Stdout = logFile
-	command.Stderr = logFile
-	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := command.Start(); err != nil {
-		return 0, fmt.Errorf("start %s: %w", daemonPath, err)
-	}
-	if err := command.Process.Release(); err != nil {
-		return 0, fmt.Errorf("detach tbxd: %w", err)
+	if err := launchDaemon(daemonPath, logFile); err != nil {
+		return 0, err
 	}
 	return logInfo.Size(), nil
 }

@@ -1,9 +1,57 @@
 package hostpressure
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
+
+func TestSteadySwapFindingThresholds(t *testing.T) {
+	for _, percent := range []int{79, 80, 87, 89, 90} {
+		t.Run(fmt.Sprintf("%d_percent", percent), func(t *testing.T) {
+			total := uint64(100 << 30)
+			snapshot := Snapshot{Swap: Usage{TotalBytes: total, AvailableBytes: total * uint64(100-percent) / 100}, MemoryPressure: MemoryPressureNormal}
+			finding, ok := SteadySwapFinding(snapshot)
+			if percent < 80 {
+				if ok {
+					t.Fatalf("SteadySwapFinding(%d%%) = %v, want none", percent, finding)
+				}
+				return
+			}
+			if !ok || finding.Severity != SeverityWarn {
+				t.Fatalf("SteadySwapFinding(%d%%) = %v, %v; want warning", percent, finding, ok)
+			}
+			if !strings.Contains(finding.Detail, fmt.Sprintf("%d%%", percent)) {
+				t.Fatalf("detail %q missing percentage", finding.Detail)
+			}
+		})
+	}
+}
+
+func TestAssessCombinesSteadySwapWithMemoryPressure(t *testing.T) {
+	snapshot := Snapshot{
+		Swap:           Usage{TotalBytes: 3 << 30, AvailableBytes: 3 << 30 * 13 / 100},
+		MemoryPressure: MemoryPressureWarning,
+		FreeMemoryMiB:  1024,
+	}
+	findings := Assess(snapshot, 6144)
+	if len(findings) != 1 {
+		t.Fatalf("Assess() = %v, want one combined memory finding", findings)
+	}
+	if findings[0].Severity != SeverityBlock {
+		t.Fatalf("severity = %v, want block under warning pressure and low free swap", findings[0].Severity)
+	}
+}
+
+func TestUsageExportsStableArithmetic(t *testing.T) {
+	usage := Usage{TotalBytes: 10 << 30, AvailableBytes: 13 << 29}
+	if usage.UsedBytes() != usage.TotalBytes-usage.AvailableBytes {
+		t.Fatalf("UsedBytes() = %d", usage.UsedBytes())
+	}
+	if usage.PercentUsed() != 35 {
+		t.Fatalf("PercentUsed() = %d, want 35", usage.PercentUsed())
+	}
+}
 
 func TestAssessDescribesExtremeHostPressure(t *testing.T) {
 	snapshot := Snapshot{
@@ -308,8 +356,8 @@ func TestAssessUsesExtremeThresholds(t *testing.T) {
 		snapshot Snapshot
 		want     int
 	}{
-		{name: "swap below threshold", snapshot: Snapshot{Swap: Usage{TotalBytes: 100, AvailableBytes: 11}}},
-		{name: "swap at threshold", snapshot: Snapshot{Swap: Usage{TotalBytes: 100, AvailableBytes: 10}}, want: 1},
+		{name: "swap below advisory threshold", snapshot: Snapshot{Swap: Usage{TotalBytes: 100, AvailableBytes: 21}}},
+		{name: "swap at advisory threshold", snapshot: Snapshot{Swap: Usage{TotalBytes: 100, AvailableBytes: 20}}, want: 1},
 		{name: "data volume below threshold", snapshot: Snapshot{DataVolume: Usage{TotalBytes: 100, AvailableBytes: 6}}},
 		{name: "data volume at threshold", snapshot: Snapshot{DataVolume: Usage{TotalBytes: 100, AvailableBytes: 5}}, want: 1},
 		{name: "swap disabled", snapshot: Snapshot{Swap: Usage{}}, want: 0},

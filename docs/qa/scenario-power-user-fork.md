@@ -44,11 +44,16 @@ On failure: capture the hint text and probe output.
 Steps:
 1. Generate config with talosctl (`talosctl gen config qa-fork https://<cp-ip>:6443`), patch in the mirror registry config printed by `tbx manifests qa-fork mirrors` (hand-apply the equivalent) and the storage machine patch from `tbx manifests qa-fork storage-machine` (save to file, then take the unconfigured-node branch the printed header names: `talosctl gen config qa-fork https://<cp-ip>:6443 --config-patch @storage-machine.yaml`, since maintenance-mode nodes have no machine config for `talosctl patch mc` to patch; record which route the printed docs led you to).
    Hand-generated configs leave `machine.network.hostname` unset, so Talos assigns random `talos-*` hostnames. Those are the names `kubectl get nodes` reports, and they will not match the `qa-fork-*` names in `tbx status` — expected Talos behavior, not a tbx bug. Leave the mismatch in place: on Talos 1.13, adding `machine.network.hostname` to a config produced by `talosctl gen config` makes **every** `apply-config` fail with `InvalidArgument … static hostname is already set in v1alpha1 config`, because the generated bundle already carries a separate `kind: HostnameConfig` (`auto: stable`) document. If you do want the two views to line up, you must remove or replace that `HostnameConfig` document in the same bundle before setting `machine.network.hostname` — record which route you took.
-2. `talosctl apply-config` to all three nodes; bootstrap the control plane; fetch kubeconfig.
-3. `tbx status qa-fork` — nodes now `configured` (tbx observes, doesn't own).
-4. Install any CNI by hand (e.g. flannel manifest) so nodes go Ready. A CNI is a `hostNetwork`/privileged workload and cannot be made `restricted`-compliant, so expect the `would violate PodSecurity "restricted:latest"` warning block on apply — a warning, not a rejection, and not a finding.
+2. `talosctl apply-config` to all three nodes, but do not bootstrap the control plane yet.
+3. `tbx status qa-fork` — all nodes are `configured`, no node reports a healthy kubelet, and the conditional `talosctl bootstrap` hint is present.
+4. Bootstrap the control plane, fetch kubeconfig, and wait until `tbx status qa-fork` reports at least one healthy kubelet.
+5. `tbx status qa-fork` — the `talosctl bootstrap` hint is absent; the read-only Talos dashboard hint and other status facts remain.
+6. `tbx status qa-fork --quiet` — no hints are printed.
+7. `tbx status qa-fork -o json` — the `hints` array does not contain `talosctl bootstrap`.
+8. Run `tbx status <managed-cilium-or-flannel-cluster>` for an existing managed cluster and confirm its provisioning/Ready wording is unchanged.
+9. Install any CNI by hand (e.g. flannel manifest) so nodes go Ready. A CNI is a `hostNetwork`/privileged workload and cannot be made `restricted`-compliant, so expect the `would violate PodSecurity "restricted:latest"` warning block on apply — a warning, not a rejection, and not a finding.
 
-Expected observations: substrate never fights the manual flow; status phase tracking flips to `configured` purely from observation; mirror config from the printed stream works for the hand-built cluster (pulls go through the gateway mirror).
+Expected observations: substrate never fights the manual flow; status phase tracking flips to `configured` purely from observation; the conditional bootstrap hint is present before bootstrap and disappears as soon as any kubelet is healthy; dashboard and other status facts remain; quiet output has no hints; JSON has no stale bootstrap hint; managed provisioning/Ready wording is unchanged; mirror config from the printed stream works for the hand-built cluster (pulls go through the gateway mirror).
 
 Note on hand-verifying the mirror: the catch-all mirror listens on the cluster gateway at port **5059** (never 5000 — macOS AirPlay Receiver answers there), and it follows containerd's convention of requiring a `?ns=<upstream registry>` query parameter to know which upstream the repository belongs to. Send that parameter and the index Accept headers, or the registry will not serve an OCI-index manifest:
 

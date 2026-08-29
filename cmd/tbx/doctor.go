@@ -235,12 +235,18 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		// Free memory and the daemon's reserve are classification inputs, not
 		// PASS-only decoration: enough present RAM is what distinguishes stale
 		// allocated swap from the active swapping that corrupted guests (#483).
-		snapshot.FreeMemoryMiB = doctorFreeMemoryMiB(deps)
+		if snapshot.FreeMemoryMiB <= 0 {
+			snapshot.FreeMemoryMiB = doctorFreeMemoryMiB(deps)
+		}
 		reserveMiB, fromDaemon := doctorBalloonReserveMiB(deps)
 		findings := hostpressure.Assess(snapshot, reserveMiB)
 		pendingGuestsClause := ""
 		if snapshot.FreeMemoryMiB > 0 {
-			pendingGuestsClause = fmt.Sprintf(" (measured with no guests pending: a start larger than %d MiB of new guests will still be refused)", snapshot.FreeMemoryMiB-reserveMiB)
+			if snapshot.FreeMemoryMiB < reserveMiB {
+				pendingGuestsClause = fmt.Sprintf(" (measured with no guests pending: the host is already %d MiB below the balloon reserve; any new guest start will be refused until memory frees)", reserveMiB-snapshot.FreeMemoryMiB)
+			} else {
+				pendingGuestsClause = fmt.Sprintf(" (measured with no guests pending: a start larger than %d MiB of new guests will still be refused)", hostpressure.GuestHeadroomMiB(snapshot.FreeMemoryMiB, reserveMiB))
+			}
 		}
 		if len(findings) == 0 {
 			// A PASS states the three numbers it was decided on — free memory,
@@ -399,10 +405,15 @@ func talosServicesFindings(statuses []daemon.ClusterStatus, statusErr, clusterEr
 			continue
 		}
 		for _, node := range status.Nodes {
-			if node.Phase != daemon.PhaseConfigured {
+			if !node.Phase.Configured() {
 				continue
 			}
 			configured++
+			if node.RebootedAt != nil {
+				findings = append(findings, doctorFinding{level: "WARN", check: "talos-services", detail: fmt.Sprintf(
+					"%s/%s rebooted at %s; Talos boot identity changed while the VM process stayed running; inspect recovery with: tbx console %s %s",
+					status.Name, node.Name, node.RebootedAt.UTC().Format(time.RFC3339), shellquote.Quote(status.Name), shellquote.Quote(node.Name))})
+			}
 			clusterName := shellquote.Quote(status.Name)
 			nodeName := shellquote.Quote(node.Name)
 			stalledNames := make(map[string]struct{}, len(node.StalledServices))

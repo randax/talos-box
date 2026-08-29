@@ -209,6 +209,9 @@ type NodeStatus struct {
 	// (#288). Nil means it has not answered since its VM launched, so StartedAt
 	// is the only honest clock — and nil for a node that is answering now.
 	UnreachableSince *time.Time `json:"unreachableSince,omitempty"`
+	// RebootedAt is when this daemon observed Talos boot_time change while the
+	// VM process stayed running. The status notice is transient for 15 minutes.
+	RebootedAt *time.Time `json:"rebootedAt,omitempty"`
 }
 
 type ServiceProbeStatus string
@@ -1591,10 +1594,55 @@ func (s *Server) refreshNodeStatuses(statuses []ClusterStatus) {
 			refreshed.UnreachableSince = s.reachability.observe(nodeKey(statuses[i].Name, node.Name), refreshed.Phase, now)
 			statuses[i].Nodes[j] = refreshed
 		}
-		refreshNodeServices(&statuses[i], now)
+	}
+	s.refreshNodeDetails(statuses, now)
+	for i := range statuses {
 		statuses[i].Hints = hintsAt(statuses[i], now)
 	}
 	s.logNodeStalls(statuses, now)
+}
+
+func (s *Server) refreshNodeDetails(statuses []ClusterStatus, now time.Time) {
+	var wait sync.WaitGroup
+	for i := range statuses {
+		status := &statuses[i]
+		for j := range status.Nodes {
+			node := &status.Nodes[j]
+			if !node.Phase.Configured() || node.IP == "" {
+				continue
+			}
+			wait.Add(1)
+			go func(clusterName string, running bool, node *NodeStatus) {
+				defer wait.Done()
+
+				bootProbe := s.reboots.beginObserve(nodeKey(clusterName, node.Name))
+				type bootResult struct {
+					bootTime uint64
+					err      error
+				}
+				bootDone := make(chan bootResult, 1)
+				go func() {
+					bootTime, err := probeNodeBootTime(clusterName, node.IP)
+					bootDone <- bootResult{bootTime: bootTime, err: err}
+				}()
+
+				var (
+					services []NodeService
+					probe    ServiceProbe
+				)
+				if running {
+					services, probe = probeNodeServices(clusterName, node.IP, now)
+				}
+
+				result := <-bootDone
+				s.applyNodeReboot(clusterName, node, bootProbe, result.bootTime, result.err, now)
+				if running {
+					applyNodeServices(node, services, probe, now)
+				}
+			}(status.Name, status.Running, node)
+		}
+	}
+	wait.Wait()
 }
 
 // refreshNodeServices asks each configured node's machine API about its
@@ -1610,30 +1658,54 @@ func refreshNodeServices(status *ClusterStatus, now time.Time) {
 	var wait sync.WaitGroup
 	for i := range status.Nodes {
 		node := &status.Nodes[i]
-		if node.Phase != PhaseConfigured || node.IP == "" {
+		if !node.Phase.Configured() || node.IP == "" {
 			continue
 		}
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
 			services, probe := probeNodeServices(status.Name, node.IP, now)
-			node.ServiceProbe = &probe
-			sort.Slice(services, func(i, j int) bool { return services[i].Name < services[j].Name })
-			node.Services = services
-			for i := range node.Services {
-				if node.StartedAt != nil && node.Services[i].Since != nil && node.Services[i].Since.Before(*node.StartedAt) {
-					started := *node.StartedAt
-					node.Services[i].Since = &started
-				}
-				if node.Services[i].Name == kubeletService {
-					service := node.Services[i]
-					node.Kubelet = &service
-				}
-			}
-			node.StalledServices = stalledServices(node.Services, node.StartedAt, now)
+			applyNodeServices(node, services, probe, now)
 		}()
 	}
 	wait.Wait()
+}
+
+func (s *Server) applyNodeReboot(clusterName string, node *NodeStatus, probe rebootProbe, bootTime uint64, err error, now time.Time) {
+	key := nodeKey(clusterName, node.Name)
+	node.RebootedAt = nil
+	if node.Phase == PhaseRebooted {
+		node.Phase = PhaseConfigured
+	}
+	if err == nil && bootTime != 0 {
+		observation, previous, changed, applied := s.reboots.completeObserve(probe, bootTime, now)
+		if applied && changed {
+			log.Printf("status %s: node %s rebooted without a host VM restart (Talos boot_time changed %d -> %d); observed at %s",
+				clusterName, node.Name, previous, observation.BootTime, observation.RebootedAt.UTC().Format(time.RFC3339))
+		}
+	}
+	if active, ok := s.reboots.current(key, now); ok {
+		rebootedAt := active.RebootedAt
+		node.RebootedAt = &rebootedAt
+		node.Phase = PhaseRebooted
+	}
+}
+
+func applyNodeServices(node *NodeStatus, services []NodeService, probe ServiceProbe, now time.Time) {
+	node.ServiceProbe = &probe
+	sort.Slice(services, func(i, j int) bool { return services[i].Name < services[j].Name })
+	node.Services = services
+	for i := range node.Services {
+		if node.StartedAt != nil && node.Services[i].Since != nil && node.Services[i].Since.Before(*node.StartedAt) {
+			started := *node.StartedAt
+			node.Services[i].Since = &started
+		}
+		if node.Services[i].Name == kubeletService {
+			service := node.Services[i]
+			node.Kubelet = &service
+		}
+	}
+	node.StalledServices = stalledServices(node.Services, node.StartedAt, now)
 }
 
 const serviceStallThreshold = 3 * time.Minute

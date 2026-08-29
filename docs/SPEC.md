@@ -256,7 +256,14 @@ physical/VPN interfaces and distinct gateways share the fixed ports without conf
 printed machine configs set Talos `machine.registries.mirrors."*"` to a single endpoint
 `http://172.30.<n>.1:5059` with `skipFallback: true`; legacy fixed listeners on `5055–5058`
 remain only so older clusters keep working until they are recreated. Mirror storage lives in
-the cache and doubles as the offline-venue answer. A complete cached tag — its mapping, selected
+the cache and doubles as the offline-venue answer. Containerd selects a catch-all upstream with
+the standard `?ns=<upstream-authority>` query. Host OCI clients which cannot add that query use
+`/v2/<upstream-authority>/<repository>/...` on port 5059 instead; the mirror strips exactly the
+authority segment and applies the same canonicalization, cache namespace, offline policy, dynamic
+handler limit, and public-address checks as the query form. A nonempty `ns` query wins when both
+forms appear, while `/v2/` remains the namespace-free registry ping. Without `?ns=`, a first
+repository path segment containing `.` or `:` is interpreted as the upstream host, so repositories
+whose first segment looks like a host must use the `?ns=` form. A complete cached tag — its mapping, selected
 `linux/<arch>` manifest, config, and every layer — remains available online during transient
 upstream failures; the daemon logs
 `mirror served stale: <host>/<repository>:<tag> (upstream <reason>; cache complete for linux/<arch>)`.
@@ -307,12 +314,18 @@ config` already emits a `kind: HostnameConfig` (`auto: stable`) document, so add
 already set in v1alpha1 config`; lining the two views up requires removing or replacing that
 generated document in the same bundle.
 `tbx status` reports each node's observed phase — `stopped`, `suspended`, `unreachable`,
-`maintenance`, `configured` — derived from a credential-free TLS probe of apid: **both** apid modes serve TLS
+`maintenance`, `configured`, or transiently `rebooted` — derived from a credential-free TLS probe of apid: **both** apid modes serve TLS
 (empirical correction, #31 — the earlier "insecure = maintenance" model was wrong);
 maintenance mode presents the well-known `maintenance-service.talos.dev` certificate, a
 configured node presents its cluster-CA identity and demands a client certificate. `suspended`
 is not a probe verdict — no VM is running to probe — but a stopped node holding its own saved
 memory, and it still counts as "not running" for every rule keyed on stopped (#415).
+For configured running nodes, the daemon also samples authenticated Talos `SystemStat.boot_time`
+on every status refresh: the watcher's 30-second cadence and every `tbx status` request. A changed
+nonzero value without a host VM restart is logged once
+and shown as `rebooted` for 15 minutes; deliberate VM starts clear the baseline. The baseline is
+in-memory, so a daemon restart cannot classify a guest reboot that occurred before the first new
+sample, and missing exact-context Talos credentials leave reboot classification unavailable.
 
 ## 7. Snapshots and reset
 
@@ -344,7 +357,13 @@ deleted disks' volume data was unverified.
   not default.
 - **Active memory ballooning** (owner decision): on macOS, `tbxd` monitors host memory pressure and
   inflates virtio balloons proportionally across running configured nodes when host free memory
-  drops below the reserve, never below a **1 GiB per-node floor**, deflating on release.
+  drops at least **256 MiB** below the reserve, never below a **1 GiB per-node floor**, and applies
+  successful aggregate retargets at most once per minute. Swap at least 80% used, compressor
+  occupancy at least 20% of RAM (4 GiB when total RAM is unavailable), or warning/critical kernel
+  pressure latches a release veto: those signals never manufacture reclaim, but prevent a real
+  reclaim from flapping back out until swap is below 70%, compressor occupancy is below 15%
+  (3 GiB fallback), and kernel pressure has cleared. Admission pre-balloon holds bypass both the
+  deadband and rate limit.
   Verified: Talos arm64 kernel has `CONFIG_VIRTIO_BALLOON=m` — printed config snippets MUST
   include `machine.kernel.modules: [{name: virtio_balloon}]`; maintenance-mode nodes are exempt
   from balloon management. The QEMU backend supports balloon target/readback and tolerates an
@@ -485,7 +504,8 @@ create` line, for imperatively created ones; a cluster created before the origin
 keeps the `tbx up` wording, because tbx cannot prove no file backs it and advising a destroy on
 a guess is the worse error; substrate-only clusters retain manual guidance).
 Hints **never execute anything**. `--quiet` suppresses hints and narration but keeps facts
-(schematic/extensions lines) and liveness (the deadline preamble, held back for a 5s
+(schematic/extensions lines, reboot observations, and the table-only host swap advisory when at
+least one returned cluster is running) and liveness (the deadline preamble, held back for a 5s
 grace so the usual no-op — which answers immediately — announces nothing, and worded
 conditionally (`checking demo; if provisioning is needed it may take up to 14m`) until the
 daemon narrates a stage, after which it states the window outright, plus a periodic
@@ -617,7 +637,8 @@ Implementation must close these before v1 ships:
   for fast failover there). Linux shared-bridge mode does not have this gate.
   Residual: repeated-GARP bursts untested.
 - ~~G3 — balloon policy tuning~~ **CLOSED** (#38): defaults are **6 GiB host reserve, 1 GiB
-  per-node floor, 5s poll** (`TBX_BALLOON_RESERVE_MIB` overrides the reserve). Verified live:
+  per-node floor, 5s poll, 256 MiB deadband, and 60s minimum successful-retarget interval**
+  (`TBX_BALLOON_RESERVE_MIB` overrides the reserve). Verified live:
   under a synthetic deficit a configured node's balloon inflated, dropping guest free memory
   from ~2.45 GiB to ~0.6 GiB (≈ the deficit), and deflated back on release. Maintenance-mode
   nodes are apid-probed out and exempt; the overcommit guard warns on create/start/node-add

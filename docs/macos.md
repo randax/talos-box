@@ -86,11 +86,11 @@ in this order:
 | `DNS` | The resolver embedded in `tbxd` answers on `127.0.0.1:5399` | Run any `tbx` command to start the on-demand daemon; the check `SKIP`s instead of failing when only the daemon is down |
 | `forwarding (host)` | This client read `net.inet.ip.forwarding` as `1` directly from the host, so host-to-guest and inter-cluster traffic is routed | Restart the helper so it reconverges the sysctl |
 | `port-179` | No foreign process holds every address on the BGP port, ahead of the per-cluster gateway bind the host speaker needs. The inventory comes from `netstat`, because an unprivileged `lsof -iTCP:179` cannot see a root-owned socket on macOS. `SKIP`s until a cluster exists | `WARN` only: quote the listener the check prints, identify its owner with `sudo lsof -nP -iTCP:179 -sTCP:LISTEN`, and stop it — a listener bound to a cluster gateway is talosbox's own speaker and is never reported |
-| `host-pressure` | Host memory pressure, swap use, and free space on the volume holding `~/.talosbox` are outside the range that resets guests and corrupts Talos `EPHEMERAL` data | Critical pressure blocks. Warning pressure warns, escalating to a block when swap is exhausted and measured free RAM does not cover the reserve plus incoming guests. With normal pressure, swap at least 90% used is always a `WARN`, regardless of free RAM; with unknown pressure, that swap state blocks only when measured free RAM does not cover the reserve plus incoming guests. The line prints the measured numbers and the same runnable remediation as the start gate. Doctor measures with no incoming guests, so its PASS/WARN detail states the largest pending allocation that can change the start verdict. The start gate applies only while guests are running and credits reclaimable balloon memory before refusing |
+| `host-pressure` | Host memory pressure, compressor occupancy, swap use, and free space on the volume holding `~/.talosbox` are outside the range that resets guests and corrupts Talos `EPHEMERAL` data | Swap at least 80% used is always a `WARN`, including a small 3 GiB swap file. Critical pressure blocks. Warning pressure warns, escalating to a block when swap is exhausted and measured free RAM does not cover the reserve plus incoming guests; the existing 90%, low-free-swap, and storage rules can still escalate independently. The line prints free/total memory, compressor, swap percentage, and the same runnable remediation as the start gate. Doctor measures with no incoming guests, so its PASS/WARN detail states the largest pending allocation that can change the start verdict. The start gate applies only while guests are running and credits reclaimable balloon memory before refusing |
 | `system-dns` | macOS itself resolves `<node>.<domain>` to the cluster's addresses through the scoped resolver files, and each custom-domain cluster's `/etc/resolver/<domain>` file is present and talosbox-managed | Remove the unmanaged or non-regular resolver file `doctor` names — talosbox never touches those; otherwise suspect a DNS filtering agent or browser/system DoH bypassing the scoped resolver |
 | `routes` | Host routes to each running cluster's gateway and live nodes exit via a `bridge`/`vmnet` interface or `lo0`, not a tunnel | Disconnect or split-exclude the VPN/ZTNA client that captured `172.30.0.0/16`, then restart the cluster |
 | `inter-cluster` | With more than one cluster running, every cluster's ingress VIP answers from the host **and** from each sibling cluster — the sibling leg is dialled by the `lb-probe` behind each VIP, so it travels the same pod-to-sibling-VIP path a workload would. `SKIP`s with the reason when fewer than two running clusters report a live VIP | `FAIL` names the dead direction (`qa-edge → qa-core VIP 172.30.0.200`). Check the announcement mode of the *target* cluster (`tbx bgp status <cluster>`) and the host route to its VIP; `routes` and `forwarding` can both pass while this path is dead |
-| `talos-services` | Talos services on configured running nodes are not stalled in `Preparing`/`Starting` for more than three minutes, crashlooping, or unhealthy | `PASS` reports the number of configured nodes inspected. Missing credentials or a failed probe is a `WARN`; for missing credentials, run `talosctl config merge <path-to-talosconfig>`. A stalled, crashlooping, or unhealthy service is a `FAIL`. `SKIP` means there are no configured running nodes or cluster state is unavailable |
+| `talos-services` | Talos services on configured running nodes are not stalled in `Preparing`/`Starting` for more than three minutes, crashlooping, unhealthy, or recovering from an unexpected guest reboot | `PASS` reports the number of configured nodes inspected. A `rebootedAt` observation is a `WARN` and names `tbx console`; it does not make doctor exit nonzero by itself. Missing credentials or a failed probe is also a `WARN`; for missing credentials, run `talosctl config merge <path-to-talosconfig>`. A stalled, crashlooping, or unhealthy service is a `FAIL`. `SKIP` means there are no configured running nodes or cluster state is unavailable. Reboot baselines are process-local, so restarting `tbxd` loses history before its first new sample |
 | `guest-agent` | Clusters that requested the `qemu-guest-agent` extension have a working host channel | `WARN` only: the config stays valid and portable, the extension is simply inert on this host. `SKIP`s when no cluster requests it |
 | `mirror-health` | Pull-through mirror listeners are bound on exactly the running clusters' gateway IPs, and reports the registry-mirror cache totals | Restart the affected cluster (or `tbxd`) so the bind set is reconverged with cluster lifecycle |
 | `image-cache` | Reports the Talos disk-image cache totals, named apart from the registry-mirror cache so offline prep can tell the two stores under `~/.talosbox/cache` apart. Incomplete combinations — prunable leftovers with no usable image — are held out of the total and counted separately, and a cache holding nothing else is a `WARN` | Never `FAIL`s: a failed cache listing is reported once on `mirror-health` and skips this line. On `WARN`, rerun `tbx cache pull` before going offline; use `tbx cache list` for the per-combination breakdown |
@@ -157,6 +157,24 @@ daemon records `mirror served stale: <host>/<repository>:<tag> (upstream <reason
 for linux/<arch>)`. Offline mode stops the mirror from reaching registries and its misses return
 404. Node fallback is a separate policy: an explicit `skipFallback: false` entry may continue to
 upstream, while talos-box's generated `"*"` entry is `skipFallback: true` and remains a hard miss.
+
+### Host access to warmed registry images
+
+Host OCI tools cannot supply containerd's `?ns=` query. Put the upstream authority immediately
+after the catch-all address instead. For example, after warming
+`public.ecr.aws/docker/library/golang:1.25-alpine`, replace `<gateway>` with the cluster gateway:
+
+```sh
+crane manifest --insecure \
+  <gateway>:5059/public.ecr.aws/docker/library/golang:1.25-alpine
+
+curl -I \
+  http://<gateway>:5059/v2/public.ecr.aws/docker/library/golang/manifests/1.25-alpine
+```
+
+The path form and containerd's query form share the same cache. Both commands therefore continue
+to work for a complete warmed image after `tbx mirror offline on`; an uncached path returns the
+same offline 404 as the query form.
 
 After `tbx doctor` passes, continue with the common
 [Cilium ingress walkthrough](walkthrough-cilium-ingress.md).

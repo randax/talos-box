@@ -1,12 +1,16 @@
 package balloon
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/randax/talos-box/internal/hostmem"
 )
 
 // recordingVM captures SetMemoryTargetMiB calls.
@@ -14,15 +18,482 @@ type recordingVM struct {
 	configured int
 	target     int
 	err        error
+	calls      int
 }
 
 func (r *recordingVM) ConfiguredMiB() int { return r.configured }
 func (r *recordingVM) SetMemoryTargetMiB(m int) error {
+	r.calls++
 	if r.err != nil {
 		return r.err
 	}
 	r.target = m
 	return nil
+}
+
+type currentTargetRecordingVM struct {
+	recordingVM
+	currentTarget int
+}
+
+func (r *currentTargetRecordingVM) CurrentTargetMiB() int { return r.currentTarget }
+func (r *currentTargetRecordingVM) SetMemoryTargetMiB(targetMiB int) error {
+	if err := r.recordingVM.SetMemoryTargetMiB(targetMiB); err != nil {
+		return err
+	}
+	r.currentTarget = targetMiB
+	return nil
+}
+
+func memorySample(availableMiB int) hostmem.Snapshot {
+	return hostmem.Snapshot{TotalMiB: 32768, AvailableMiB: availableMiB, Pressure: hostmem.PressureNormal}
+}
+
+func TestManagerIgnoresDeficitsBelowDeadband(t *testing.T) {
+	for _, deficit := range []int{0, 2, 88, 255} {
+		t.Run(fmt.Sprintf("%dMiB", deficit), func(t *testing.T) {
+			m := NewManager(nil)
+			v := &recordingVM{configured: 4096, target: 4096}
+			vms := map[string]Balloonable{"a": v}
+			start := time.Unix(1000, 0)
+			m.ReconcileSnapshot(vms, memorySample(6144-deficit), 6144, 1024, 0, start)
+			if v.calls != 1 || v.target != 4096 {
+				t.Fatalf("first tick with deficit %d applied %d target(s), target=%d; want one configured target", deficit, v.calls, v.target)
+			}
+			m.ReconcileSnapshot(vms, memorySample(6144-deficit), 6144, 1024, 0, start.Add(5*time.Second))
+			if v.calls != 1 || v.target != 4096 {
+				t.Fatalf("second tick with deficit %d applied %d target(s), target=%d; want no second apply", deficit, v.calls, v.target)
+			}
+		})
+	}
+}
+
+func TestManagerRestoresExternallyInflatedNodeAfterHoldRelease(t *testing.T) {
+	m := NewManager(nil)
+	v := &recordingVM{configured: 4096, target: 3072}
+
+	m.ReconcileSnapshot(map[string]Balloonable{"a": v}, memorySample(8192), 6144, 1024, 0, time.Unix(1000, 0))
+
+	if v.calls != 1 || v.target != 4096 {
+		t.Fatalf("calls=%d target=%d, want one apply restoring the configured 4096 MiB target", v.calls, v.target)
+	}
+}
+
+func TestManagerRestoresKnownNodeMovedOutsideManager(t *testing.T) {
+	logs := &recordingLog{}
+	m := NewManager(logs.Printf)
+	v := &currentTargetRecordingVM{
+		recordingVM:   recordingVM{configured: 4096, target: 4096},
+		currentTarget: 4096,
+	}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 0, start)
+	v.currentTarget = 2048
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 0, start.Add(5*time.Second))
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 0, start.Add(10*time.Second))
+
+	if v.calls != 2 || v.target != 4096 || v.currentTarget != 4096 {
+		t.Fatalf("calls=%d target=%d current=%d, want one correction restoring 4096 MiB and subsequent silence", v.calls, v.target, v.currentTarget)
+	}
+	lines := logs.snapshot()
+	if got := lines[len(lines)-1]; got != "balloon a: target=4096MiB (restoring externally moved target 2048)" {
+		t.Fatalf("correction log = %q, want distinct external-move restoration telemetry", got)
+	}
+}
+
+func TestManagerRateLimitsPendingTargetUntilDeviceActivates(t *testing.T) {
+	logs := &recordingLog{}
+	m := NewManager(logs.Printf)
+	v := &currentTargetRecordingVM{
+		recordingVM:   recordingVM{configured: 4096, target: 4096, err: ErrTargetPending},
+		currentTarget: 4096,
+	}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 0, start)
+	if v.calls != 1 {
+		t.Fatalf("first tick calls=%d, want one target attempt", v.calls)
+	}
+	if got := m.lastRetarget["a"]; !got.Equal(start) {
+		t.Fatalf("lastRetarget=%v, want %v after pending target", got, start)
+	}
+	if !m.retryPending["a"] {
+		t.Fatal("retryPending=false, want pending target retained for retry")
+	}
+	if lines := logs.snapshot(); len(lines) != 1 || !strings.Contains(lines[0], ErrTargetPending.Error()) {
+		t.Fatalf("pending lines=%v, want exactly one pending line", lines)
+	}
+
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 0, start.Add(5*time.Second))
+	if v.calls != 1 {
+		t.Fatalf("inside rate window calls=%d, want no retry", v.calls)
+	}
+	if lines := logs.snapshot(); len(lines) != 1 {
+		t.Fatalf("inside rate window lines=%v, want pending streak logged once", lines)
+	}
+
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 0, start.Add(time.Minute))
+	if v.calls != 2 {
+		t.Fatalf("at rate window calls=%d, want one retry", v.calls)
+	}
+	if lines := logs.snapshot(); len(lines) != 1 {
+		t.Fatalf("retry lines=%v, want pending streak logged once", lines)
+	}
+
+	v.err = nil
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 0, start.Add(2*time.Minute))
+	if v.calls != 3 || v.target != 4096 || m.last["a"] != 4096 {
+		t.Fatalf("recovery calls=%d target=%d last=%d, want successful 4096 target recorded", v.calls, v.target, m.last["a"])
+	}
+	if m.pendingLogged["a"] {
+		t.Fatal("pending log streak was not cleared after successful apply")
+	}
+	for _, line := range logs.snapshot() {
+		if strings.Contains(line, "restoring externally moved target") {
+			t.Fatalf("pending recovery emitted misleading external-move line: %q", line)
+		}
+	}
+}
+
+func TestManagerRestoresKnownNodeToLiveHoldTarget(t *testing.T) {
+	m := NewManager(nil)
+	v := &currentTargetRecordingVM{
+		recordingVM:   recordingVM{configured: 4096, target: 4096},
+		currentTarget: 4096,
+	}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 0, start)
+	v.currentTarget = 3072
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 1024, start.Add(5*time.Second))
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 1024, start.Add(10*time.Second))
+
+	if v.calls != 2 || v.target != 3072 || v.currentTarget != 3072 {
+		t.Fatalf("calls=%d target=%d current=%d, want one correction applying the live hold-derived 3072 MiB target", v.calls, v.target, v.currentTarget)
+	}
+}
+
+func TestManagerActsAtDeadbandBoundary(t *testing.T) {
+	m := NewManager(nil)
+	v := &recordingVM{configured: 4096, target: 4096}
+	m.ReconcileSnapshot(map[string]Balloonable{"a": v}, memorySample(6144-256), 6144, 1024, 0, time.Unix(1000, 0))
+	if v.calls != 1 || v.target != 4096-256 {
+		t.Fatalf("calls=%d target=%d, want one target at 3840", v.calls, v.target)
+	}
+}
+
+func TestManagerRetargetsAtMostOncePerMinute(t *testing.T) {
+	m := NewManager(nil)
+	v := &recordingVM{configured: 4096, target: 4096}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+	m.ReconcileSnapshot(vms, memorySample(6144-256), 6144, 1024, 0, start)
+	m.ReconcileSnapshot(vms, memorySample(6144-512), 6144, 1024, 0, start.Add(time.Minute-time.Nanosecond))
+	if v.calls != 1 || v.target != 3840 {
+		t.Fatalf("before minute calls=%d target=%d", v.calls, v.target)
+	}
+	m.ReconcileSnapshot(vms, memorySample(6144-512), 6144, 1024, 0, start.Add(time.Minute))
+	if v.calls != 2 || v.target != 3584 {
+		t.Fatalf("at minute calls=%d target=%d", v.calls, v.target)
+	}
+}
+
+func TestManagerHighSwapHoldsExistingReclaim(t *testing.T) {
+	m := NewManager(nil)
+	v := &recordingVM{configured: 4096, target: 4096}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+	m.ReconcileSnapshot(vms, memorySample(6144-512), 6144, 1024, 0, start)
+	high := memorySample(8192)
+	high.SwapTotalBytes, high.SwapAvailableBytes = 3<<30, 512<<20
+	m.ReconcileSnapshot(vms, high, 6144, 1024, 0, start.Add(time.Minute))
+	if v.calls != 1 || v.target != 3584 {
+		t.Fatalf("high swap released reclaim: calls=%d target=%d", v.calls, v.target)
+	}
+}
+
+func TestManagerCompressorPressureHoldsExistingReclaim(t *testing.T) {
+	m := NewManager(nil)
+	v := &recordingVM{configured: 4096, target: 4096}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+	m.ReconcileSnapshot(vms, memorySample(6144-512), 6144, 1024, 0, start)
+	high := memorySample(8192)
+	high.CompressorMiB = 7000
+	m.ReconcileSnapshot(vms, high, 6144, 1024, 0, start.Add(time.Minute))
+	if v.calls != 1 || v.target != 3584 {
+		t.Fatalf("compressor pressure released reclaim: calls=%d target=%d", v.calls, v.target)
+	}
+}
+
+func TestManagerPressureLatchUsesLowWaterMarks(t *testing.T) {
+	m := NewManager(nil)
+	v := &recordingVM{configured: 4096, target: 4096}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+	high := memorySample(6144 - 512)
+	high.SwapTotalBytes, high.SwapAvailableBytes = 10<<30, 2<<30
+	m.ReconcileSnapshot(vms, high, 6144, 1024, 0, start)
+	between := memorySample(8192)
+	between.SwapTotalBytes, between.SwapAvailableBytes = 10<<30, 3<<30
+	m.ReconcileSnapshot(vms, between, 6144, 1024, 0, start.Add(time.Minute))
+	if v.calls != 1 {
+		t.Fatalf("70%% swap cleared latch: calls=%d", v.calls)
+	}
+	low := memorySample(8192)
+	low.SwapTotalBytes, low.SwapAvailableBytes = 10<<30, 4<<30
+	m.ReconcileSnapshot(vms, low, 6144, 1024, 0, start.Add(2*time.Minute))
+	if v.calls != 2 || v.target != 4096 {
+		t.Fatalf("low water did not release: calls=%d target=%d", v.calls, v.target)
+	}
+}
+
+func TestManagerPressureSignalDoesNotCreateReclaimByItself(t *testing.T) {
+	m := NewManager(nil)
+	v := &recordingVM{configured: 4096, target: 4096}
+	high := memorySample(8192)
+	high.Pressure = hostmem.PressureCritical
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+	m.ReconcileSnapshot(vms, high, 6144, 1024, 0, start)
+	m.ReconcileSnapshot(vms, high, 6144, 1024, 0, start.Add(time.Minute))
+	if v.calls != 1 || v.target != 4096 {
+		t.Fatalf("pressure alone reclaimed memory: calls=%d target=%d", v.calls, v.target)
+	}
+}
+
+func TestManagerPreBalloonHoldBypassesDeadbandAndRateLimit(t *testing.T) {
+	m := NewManager(nil)
+	v := &recordingVM{configured: 4096, target: 4096}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 1, start)
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 2, start.Add(time.Second))
+	if v.calls != 2 || v.target != 4094 {
+		t.Fatalf("hold calls=%d target=%d, want immediate 4094", v.calls, v.target)
+	}
+}
+
+func TestManagerHoldDoesNotBypassNaturalDeficitDeadband(t *testing.T) {
+	m := NewManager(nil)
+	v := &recordingVM{configured: 4096, target: 4096}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+
+	for i, deficit := range []int{88, 2, 15} {
+		m.ReconcileSnapshot(vms, memorySample(6144-deficit), 6144, 1024, 1, start.Add(time.Duration(i)*time.Second))
+	}
+
+	if v.calls != 1 || v.target != 4095 {
+		t.Fatalf("calls=%d target=%d, want only the 1 MiB hold applied", v.calls, v.target)
+	}
+}
+
+func TestManagerReleasesHoldAfterItClearsDespiteSmallDeficitDelta(t *testing.T) {
+	m := NewManager(nil)
+	v := &recordingVM{configured: 4096, target: 4096}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 1, start)
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 0, start.Add(2*time.Minute))
+
+	if v.calls != 2 || v.target != 4096 {
+		t.Fatalf("calls=%d target=%d, want the hold reclaimed and then released", v.calls, v.target)
+	}
+}
+
+func TestManagerSkipsSmallDeficitWobblesAroundLastAppliedDeficit(t *testing.T) {
+	m := NewManager(nil)
+	v := &recordingVM{configured: 4096, target: 4096}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+
+	m.ReconcileSnapshot(vms, memorySample(6144-1024), 6144, 1024, 0, start)
+	m.ReconcileSnapshot(vms, memorySample(6144-1050), 6144, 1024, 0, start.Add(time.Minute))
+	m.ReconcileSnapshot(vms, memorySample(6144-950), 6144, 1024, 0, start.Add(2*time.Minute))
+
+	if v.calls != 1 || v.target != 3072 {
+		t.Fatalf("calls=%d target=%d, want the original 1024 MiB reclaim held", v.calls, v.target)
+	}
+
+	m.ReconcileSnapshot(vms, memorySample(6144-1300), 6144, 1024, 0, start.Add(3*time.Minute))
+	if v.calls != 2 || v.target != 2796 {
+		t.Fatalf("calls=%d target=%d, want a larger wobble to retarget", v.calls, v.target)
+	}
+}
+
+func TestManagerPressureLatchClampsReleaseUntilClear(t *testing.T) {
+	m := NewManager(nil)
+	v := &recordingVM{configured: 4096, target: 4096}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+
+	m.ReconcileSnapshot(vms, memorySample(6144-1024), 6144, 1024, 0, start)
+	latched := memorySample(6144 - 300)
+	latched.SwapTotalBytes, latched.SwapAvailableBytes = 10<<30, 1<<30
+	m.ReconcileSnapshot(vms, latched, 6144, 1024, 0, start.Add(time.Minute))
+	if v.calls != 1 || v.target != 3072 {
+		t.Fatalf("latched calls=%d target=%d, want no release while pressure is latched", v.calls, v.target)
+	}
+
+	cleared := memorySample(6144 - 300)
+	cleared.SwapTotalBytes, cleared.SwapAvailableBytes = 10<<30, 4<<30
+	m.ReconcileSnapshot(vms, cleared, 6144, 1024, 0, start.Add(2*time.Minute))
+	if v.calls != 2 || v.target != 3796 {
+		t.Fatalf("cleared calls=%d target=%d, want release to the 300 MiB deficit target", v.calls, v.target)
+	}
+}
+
+func TestManagerPressureLatchClampsPlanToAbandonedPreBalloonTarget(t *testing.T) {
+	m := NewManager(nil)
+	v := &currentTargetRecordingVM{
+		recordingVM:   recordingVM{configured: 4096, target: 4096},
+		currentTarget: 4096,
+	}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 0, start)
+	v.currentTarget = 3072
+	latched := memorySample(6144 - 596)
+	latched.Pressure = hostmem.PressureCritical
+	m.ReconcileSnapshot(vms, latched, 6144, 1024, 0, start.Add(time.Minute))
+
+	if v.target != 3072 || v.currentTarget != 3072 {
+		t.Fatalf("latched target=%d current=%d, want abandoned pre-balloon target 3072 held instead of plan 3500", v.target, v.currentTarget)
+	}
+}
+
+func TestManagerWithoutPressureLatchRestoresAbandonedPreBalloonTargetToPlan(t *testing.T) {
+	m := NewManager(nil)
+	v := &currentTargetRecordingVM{
+		recordingVM:   recordingVM{configured: 4096, target: 4096},
+		currentTarget: 4096,
+	}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 0, start)
+	v.currentTarget = 3072
+	m.ReconcileSnapshot(vms, memorySample(6144-596), 6144, 1024, 0, start.Add(time.Minute))
+
+	if v.target != 3500 || v.currentTarget != 3500 {
+		t.Fatalf("clear target=%d current=%d, want planned target 3500 restored", v.target, v.currentTarget)
+	}
+}
+
+func TestManagerPartialSuccessRateLimitsOnlySuccessfulNode(t *testing.T) {
+	m := NewManager(nil)
+	success := &recordingVM{configured: 4096, target: 4096}
+	retry := &recordingVM{configured: 4096, target: 4096, err: errors.New("apply failed")}
+	vms := map[string]Balloonable{"a": success, "b": retry}
+	start := time.Unix(1000, 0)
+
+	m.ReconcileSnapshot(vms, memorySample(6144-256), 6144, 1024, 0, start)
+	retry.err = nil
+	m.ReconcileSnapshot(vms, memorySample(6144-256), 6144, 1024, 0, start.Add(5*time.Second))
+
+	if success.calls != 1 || success.target != 3968 {
+		t.Fatalf("successful node calls=%d target=%d, want its first target held inside the rate window", success.calls, success.target)
+	}
+	if retry.calls != 2 || retry.target != 3968 {
+		t.Fatalf("retry node calls=%d target=%d, want retry at the existing target", retry.calls, retry.target)
+	}
+}
+
+func TestManagerPartialSuccessRetriesFailedNodeAtNewDeficitWithoutRetargetingSuccessfulPeer(t *testing.T) {
+	m := NewManager(nil)
+	success := &recordingVM{configured: 4096, target: 4096}
+	retry := &recordingVM{configured: 4096, target: 4096, err: errors.New("apply failed")}
+	vms := map[string]Balloonable{"a": success, "b": retry}
+	start := time.Unix(1000, 0)
+
+	m.ReconcileSnapshot(vms, memorySample(6144-256), 6144, 1024, 0, start)
+	retry.err = nil
+	m.ReconcileSnapshot(vms, memorySample(6144-512), 6144, 1024, 0, start.Add(5*time.Second))
+
+	if success.calls != 1 || success.target != 3968 {
+		t.Fatalf("successful node calls=%d target=%d, want its first target held inside the rate window", success.calls, success.target)
+	}
+	if retry.calls != 2 || retry.target != 3840 {
+		t.Fatalf("retry node calls=%d target=%d, want retry at the newer target", retry.calls, retry.target)
+	}
+
+	m.ReconcileSnapshot(vms, memorySample(6144-512), 6144, 1024, 0, start.Add(time.Minute))
+	if success.calls != 2 || success.target != 3840 {
+		t.Fatalf("successful node after rate window calls=%d target=%d, want deferred newer target", success.calls, success.target)
+	}
+	if retry.calls != 2 || retry.target != 3840 {
+		t.Fatalf("retried node after peer window calls=%d target=%d, want no duplicate retarget", retry.calls, retry.target)
+	}
+}
+
+func TestManagerRetriesKnownNodeAfterPartialFailure(t *testing.T) {
+	m := NewManager(nil)
+	success := &recordingVM{configured: 4096, target: 4096}
+	retry := &recordingVM{configured: 4096, target: 4096}
+	vms := map[string]Balloonable{"a": success, "b": retry}
+	start := time.Unix(1000, 0)
+
+	m.ReconcileSnapshot(vms, memorySample(6144-256), 6144, 1024, 0, start)
+	retry.err = errors.New("apply failed")
+	m.ReconcileSnapshot(vms, memorySample(6144-512), 6144, 1024, 0, start.Add(time.Minute))
+	retry.err = nil
+	m.ReconcileSnapshot(vms, memorySample(6144-512), 6144, 1024, 0, start.Add(time.Minute+5*time.Second))
+
+	if success.calls != 2 || success.target != 3840 {
+		t.Fatalf("successful node calls=%d target=%d, want its newer target held inside the rate window", success.calls, success.target)
+	}
+	if retry.calls != 3 || retry.target != 3840 {
+		t.Fatalf("retry node calls=%d target=%d, want known node retried at the unchanged target", retry.calls, retry.target)
+	}
+}
+
+func TestManagerFailedTargetDoesNotConsumeRateWindow(t *testing.T) {
+	m := NewManager(nil)
+	v := &recordingVM{configured: 4096, target: 4096, err: errors.New("apply failed")}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+	m.ReconcileSnapshot(vms, memorySample(6144-512), 6144, 1024, 0, start)
+	v.err = nil
+	m.ReconcileSnapshot(vms, memorySample(6144-512), 6144, 1024, 0, start.Add(time.Second))
+	if v.calls != 2 || v.target != 3584 {
+		t.Fatalf("recovery calls=%d target=%d", v.calls, v.target)
+	}
+}
+
+func TestManagerIncidentSampleDoesNotFlapTargets(t *testing.T) {
+	m := NewManager(nil)
+	v := &recordingVM{configured: 4096, target: 4096}
+	vms := map[string]Balloonable{"cluster/cp-1": v}
+	start := time.Unix(1000, 0)
+	for i, available := range []int{6056, 6142, 6129, 6167} {
+		sample := memorySample(available)
+		sample.CompressorMiB = 8419
+		sample.SwapTotalBytes, sample.SwapAvailableBytes = 3<<30, 410<<20
+		m.ReconcileSnapshot(vms, sample, 6144, 1024, 0, start.Add(time.Duration(i)*31*time.Second))
+	}
+	if v.calls != 1 || v.target != 4096 {
+		t.Fatalf("incident samples flapped target: calls=%d target=%d", v.calls, v.target)
+	}
+}
+
+func TestRunUsesSnapshotProbe(t *testing.T) {
+	rec := &recordingLog{}
+	stop := make(chan struct{})
+	close(stop)
+	RunWithLogger(Config{
+		ReserveMiB: 6144, FloorMiB: 1024, PollInterval: time.Hour,
+		HostMemory: func(context.Context) (hostmem.Snapshot, error) { return memorySample(8192), nil },
+	}, func() map[string]Balloonable { return nil }, stop, rec.Printf)
+	if got := rec.snapshot(); len(got) != 1 || !strings.Contains(got[0], "balloon: manager started") {
+		t.Fatalf("startup lines = %v", got)
+	}
 }
 
 // recordingLog collects the manager's telemetry lines.
@@ -187,7 +658,7 @@ func TestHoldKeepsThePreBalloonedTargetsInPlace(t *testing.T) {
 		"c": &recordingVM{configured: configured, target: configured - reclaim/3},
 	}
 
-	Reconcile(vms, holdAdjustedFreeMiB(freeBefore+reclaim, reserve, reclaim), reserve, floor)
+	NewManager(nil).ReconcileSnapshot(vms, memorySample(freeBefore+reclaim), reserve, floor, reclaim, time.Unix(1000, 0))
 
 	held := 0
 	for name, v := range vms {
@@ -204,18 +675,6 @@ func TestHoldKeepsThePreBalloonedTargetsInPlace(t *testing.T) {
 	// reconcile may land up to one MiB per node short of the reclaim.
 	if held < reclaim-len(vms) {
 		t.Fatalf("reconcile held %d MiB out of the guests, want the %d MiB pre-balloon less the per-node rounding", held, reclaim)
-	}
-}
-
-// The hold is a floor on the deficit, never a ceiling: a host under real
-// pressure still reclaims what the pressure calls for.
-func TestHoldNeverRaisesTheHostFreeReading(t *testing.T) {
-	const reserve = 6144
-	if got := holdAdjustedFreeMiB(4096, reserve, 512); got != 4096 {
-		t.Errorf("holdAdjustedFreeMiB(4096, %d, 512) = %d, want the measured reading under real pressure", reserve, got)
-	}
-	if got := holdAdjustedFreeMiB(8192, reserve, 0); got != 8192 {
-		t.Errorf("holdAdjustedFreeMiB(8192, %d, 0) = %d, want the reading untouched with nothing held", reserve, got)
 	}
 }
 
@@ -308,5 +767,51 @@ func TestRunKeepsPollingAfterARealProbeFailure(t *testing.T) {
 	}
 	if !strings.Contains(got[1], "balloon: read host memory") {
 		t.Errorf("second line = %q, want the read failure reported", got[1])
+	}
+}
+
+// A hold taken from mixed results — one guest shrank, its sibling's balloon
+// device was not up — is the successful guest's reduction only. The manager
+// must not replan that hold over both guests and hand part of it back to the
+// one that gave it, while the pending guest contributes nothing.
+func TestManagerPlansHoldAroundPendingDevice(t *testing.T) {
+	logs := &recordingLog{}
+	m := NewManager(logs.Printf)
+	applied := &currentTargetRecordingVM{
+		recordingVM:   recordingVM{configured: 4096, target: 3583},
+		currentTarget: 3583, // the provision gate already took 513 MiB
+	}
+	pending := &currentTargetRecordingVM{
+		recordingVM:   recordingVM{configured: 4096, target: 4096, err: ErrTargetPending},
+		currentTarget: 4096,
+	}
+	vms := map[string]Balloonable{"a": applied, "b": pending}
+	start := time.Unix(1000, 0)
+	const hold = 513
+
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, hold, start)
+	if applied.target != 3583 {
+		t.Fatalf("applied guest target=%d after first tick, want 3583 (no release on the pending guest's behalf)", applied.target)
+	}
+	if !m.devicePending["b"] || pending.calls != 1 {
+		t.Fatalf("pending guest devicePending=%t calls=%d, want planned around after one attempt", m.devicePending["b"], pending.calls)
+	}
+
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, hold, start.Add(5*time.Second))
+	if applied.target != 3583 || pending.calls != 1 {
+		t.Fatalf("inside window target=%d pendingCalls=%d, want steady", applied.target, pending.calls)
+	}
+
+	// The device comes up: the probe succeeds and the hold is re-shared.
+	pending.err = nil
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, hold, start.Add(time.Minute))
+	if m.devicePending["b"] {
+		t.Fatal("devicePending still set after the device answered")
+	}
+	if applied.target != 3840 || pending.target != 3840 {
+		t.Fatalf("after activation targets a=%d b=%d, want the 513 MiB hold shared as 3840/3840", applied.target, pending.target)
+	}
+	if !slices.ContainsFunc(logs.snapshot(), func(l string) bool { return strings.Contains(l, "device active") }) {
+		t.Fatalf("logs=%v, want the device activation attested", logs.snapshot())
 	}
 }

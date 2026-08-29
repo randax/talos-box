@@ -2,11 +2,50 @@ package main
 
 import (
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestStartDaemonPreservesPreLaunchLogOffsetThroughPlatformLauncher(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	logPath := filepath.Join(home, ".talosbox", "tbxd.log")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	previous := "stale failure from the previous daemon\n"
+	if err := os.WriteFile(logPath, []byte(previous), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	originalLaunchDaemon := launchDaemon
+	launchDaemon = func(_ string, logFile *os.File) error {
+		_, err := io.WriteString(logFile, "failure from this daemon\n")
+
+		return err
+	}
+	t.Cleanup(func() { launchDaemon = originalLaunchDaemon })
+
+	logOffset, err := startDaemon()
+	if err != nil {
+		t.Fatalf("startDaemon() error = %v", err)
+	}
+	if want := int64(len(previous)); logOffset != want {
+		t.Fatalf("startDaemon() log offset = %d, want %d", logOffset, want)
+	}
+
+	reported := daemonSpawnFailure(errors.New("connection refused"), logPath, logOffset).Error()
+	if strings.Contains(reported, "stale failure") {
+		t.Fatalf("daemonSpawnFailure() = %q, quotes a line from before launch", reported)
+	}
+	if !strings.Contains(reported, "failure from this daemon") {
+		t.Fatalf("daemonSpawnFailure() = %q, missing post-launch log line", reported)
+	}
+}
 
 func TestDaemonSpawnFailureTailsLog(t *testing.T) {
 	t.Parallel()
