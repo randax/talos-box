@@ -77,6 +77,7 @@ func newUpstreamClient(transport http.RoundTripper) *http.Client {
 	if transport == nil {
 		base := http.DefaultTransport.(*http.Transport).Clone()
 		base.ResponseHeaderTimeout = upstreamStallTimeout
+		base.MaxIdleConnsPerHost = MaxWarmJobs
 		transport = base
 	}
 	return &http.Client{Transport: transport}
@@ -124,14 +125,16 @@ func newSafeTransport(egress egressDependencies) *http.Transport {
 			Proxy:                 nil,
 			ForceAttemptHTTP2:     true,
 			MaxIdleConns:          100,
-			MaxIdleConnsPerHost:   MaxWarmJobs, // a warm keeps this many fetches on one host
 			IdleConnTimeout:       90 * time.Second,
-			ResponseHeaderTimeout: upstreamStallTimeout,
 			TLSHandshakeTimeout:   10 * time.Second,
 			ExpectContinueTimeout: 1 * time.Second,
 		}
 	}
 	transport.Proxy = nil
+	// both branches: a warm keeps this many fetches on one host, and an
+	// upstream that never answers must not hold a slot forever (#506)
+	transport.MaxIdleConnsPerHost = MaxWarmJobs
+	transport.ResponseHeaderTimeout = upstreamStallTimeout
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 		return dialValidatedIP(ctx, network, address, egress)
 	}

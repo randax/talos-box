@@ -362,3 +362,25 @@ func TestWarmPoolAcquireHonoursCancellation(t *testing.T) {
 		t.Fatalf("slots leaked: shared=%d request=%d", len(pool.shared), len(pool.request))
 	}
 }
+
+func TestUpstreamTransportsBoundHeaderWaitAndKeepWarmWidthIdle(t *testing.T) {
+	for name, transport := range map[string]*http.Transport{
+		"safe":    newSafeTransport(defaultEgressDependencies()),
+		"default": newUpstreamClient(nil).Transport.(*http.Transport),
+	} {
+		if transport.ResponseHeaderTimeout != upstreamStallTimeout {
+			t.Errorf("%s ResponseHeaderTimeout = %s, want %s", name, transport.ResponseHeaderTimeout, upstreamStallTimeout)
+		}
+		if transport.MaxIdleConnsPerHost != MaxWarmJobs {
+			t.Errorf("%s MaxIdleConnsPerHost = %d, want %d", name, transport.MaxIdleConnsPerHost, MaxWarmJobs)
+		}
+	}
+	for name, client := range map[string]*http.Client{
+		"safe":    newUpstreamClient(newSafeTransport(defaultEgressDependencies())),
+		"default": newUpstreamClient(nil),
+	} {
+		if client.Timeout != 0 {
+			t.Errorf("%s client Timeout = %s, want none: the bound is silence, not duration", name, client.Timeout)
+		}
+	}
+}
