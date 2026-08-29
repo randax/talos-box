@@ -50,6 +50,7 @@ func (s *Server) suspendCluster(raw json.RawMessage) (ClusterSummary, error) {
 		retain, err := prepareSavedMachine(machine, savePath)
 		if err == nil {
 			recordSaveStateOwner(savePath)
+			recordSaveStateBalloon(savePath, s.balloonDisabled)
 		}
 		if err != nil {
 			errs = append(errs, fmt.Errorf("suspend %s: %w", name, err))
@@ -147,28 +148,41 @@ func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
 	warnings, restored, err := resumeNodeBatch(item.Nodes, func(node cluster.Node) (resumedNode, error) {
 		savePath := saveStatePath(dir, node.Name)
 		_, saveErr := os.Stat(savePath)
+		// A save carries the device set it was taken with: restoring memory
+		// that has (or lacks) a balloon device into a guest built the other
+		// way is not a resume, so the node cold-boots instead. The save is
+		// left in place for the batch to consume on commit, so a rollback
+		// still keeps every save it started with (#513).
+		balloonMismatch := saveErr == nil && savedWithoutBalloon(savePath) != s.balloonDisabled
 		var fallbackErr error
 		delete(nodes, node.Name)
-		machine, err := s.launchMachine(item, node, &hypervisor.Restore{
+		restore := &hypervisor.Restore{
 			Path: savePath,
 			Fallback: func(err error) {
 				fallbackErr = err
 			},
-		})
+		}
+		if balloonMismatch {
+			restore = nil
+		}
+		machine, err := s.launchMachine(item, node, restore)
 		if err != nil {
 			return resumedNode{}, fmt.Errorf("resume %s: %w", node.Name, err)
 		}
 		nodes[node.Name] = machine
 		attempted = append(attempted, node.Name)
 		var nodeWarning string
-		if fallbackErr != nil {
+		if balloonMismatch {
+			nodeWarning = balloonMismatchWarning(node.Name, s.balloonDisabled)
+			log.Printf("resume %s/%s: %s", item.Name, node.Name, nodeWarning)
+		} else if fallbackErr != nil {
 			nodeWarning = coldBootWarning(node.Name, saveErr != nil, fallbackErr)
 			// Cluster-scoped subject: `tbx logs <cluster>` filters on the
 			// cluster name, so a bare node name would hide the very line
 			// the cold-boot warning sends the operator to read (#411).
 			log.Printf("resume %s/%s: %v", item.Name, node.Name, fallbackErr)
 		}
-		return resumedNode{savePath: savePath, warning: nodeWarning, restored: fallbackErr == nil}, nil
+		return resumedNode{savePath: savePath, warning: nodeWarning, restored: fallbackErr == nil && !balloonMismatch}, nil
 	}, func() error {
 		return s.closeNodes(item.Name, nodes, attempted)
 	})
@@ -420,7 +434,36 @@ func removeSaveStateFiles(paths []string) {
 	for _, path := range paths {
 		_ = os.Remove(path)
 		_ = os.Remove(saveStateOwnerPath(path))
+		_ = os.Remove(saveStateBalloonPath(path))
 	}
+}
+
+// saveStateBalloonPath marks a save taken from a guest that had no balloon
+// device (TBX_DISABLE_BALLOON, #513). Absent means the guest had one.
+func saveStateBalloonPath(savePath string) string { return savePath + ".noballoon" }
+
+func recordSaveStateBalloon(savePath string, disabled bool) {
+	marker := saveStateBalloonPath(savePath)
+	if !disabled {
+		_ = os.Remove(marker)
+		return
+	}
+	if err := os.WriteFile(marker, nil, 0o600); err != nil {
+		log.Printf("record saved state balloon marker %s: %v", marker, err)
+	}
+}
+
+func savedWithoutBalloon(savePath string) bool {
+	_, err := os.Stat(saveStateBalloonPath(savePath))
+	return err == nil
+}
+
+func balloonMismatchWarning(nodeName string, disabledNow bool) string {
+	saved, now := "with", "without"
+	if !disabledNow {
+		saved, now = "without", "with"
+	}
+	return fmt.Sprintf("node %s cold-booted: its saved memory was taken %s a balloon device but the daemon now launches guests %s one (TBX_DISABLE_BALLOON changed); the save was discarded", nodeName, saved, now)
 }
 
 // prepareSavedMachine leaves a successfully-saved VM stopped but otherwise
@@ -453,6 +496,9 @@ func saveStatePath(dir, node string) string {
 // on disk is already lost, and only the recorded owner can tell status that
 // (#413).
 const saveStateOwnerSuffix = saveStateSuffix + ".owner"
+
+// saveStateBalloonSuffix is the removeNodeFiles spelling of saveStateBalloonPath.
+const saveStateBalloonSuffix = saveStateSuffix + ".noballoon"
 
 func saveStateOwnerPath(savePath string) string { return savePath + ".owner" }
 
@@ -550,6 +596,7 @@ func discardSavedState(dir, nodeName string) (bool, string) {
 		return false, undiscardedSaveStateWarning(nodeName, err)
 	}
 	_ = os.Remove(saveStateOwnerPath(path))
+	_ = os.Remove(saveStateBalloonPath(path))
 	log.Printf("discarded saved state %s: cold boot", path)
 	return true, ""
 }
@@ -579,6 +626,7 @@ func discardClusterSavedStates(dir string) (bool, []string) {
 			continue
 		}
 		_ = os.Remove(saveStateOwnerPath(path))
+		_ = os.Remove(saveStateBalloonPath(path))
 		log.Printf("discarded saved state %s: disks were replaced", path)
 		discarded = true
 	}
