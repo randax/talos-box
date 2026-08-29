@@ -121,6 +121,12 @@ talos_config="$workdir/talos"
 cluster_config="$workdir/talosbox.yaml"
 kubeconfig="$workdir/kubeconfig"
 
+# The doctor exit-status assertion (#502) runs against the live cluster later,
+# but it is compiled here, before HOME moves to the scratch directory and takes
+# Go's module and build caches with it.
+doctor_e2e_test="$workdir/tbx-doctor-e2e.test"
+go test -C "$root" -tags=e2e -c -o "$doctor_e2e_test" ./cmd/tbx
+
 mkdir -p "$home" "$tools" "$talos_config"
 export HOME="$home"
 export PATH="$tools:$PATH"
@@ -292,8 +298,8 @@ retry "node registration" 120 5 all_nodes_registered
 kubectl --kubeconfig "$kubeconfig" wait --for=condition=Ready node --all --timeout=10m
 ready_nodes=$(kubectl --kubeconfig "$kubeconfig" get nodes --no-headers | awk '$2 == "Ready" { count++ } END { print count + 0 }')
 [[ "$ready_nodes" -eq 3 ]]
-TBX_E2E_CLUSTER=e2e go test -C "$root" -tags=e2e ./cmd/tbx \
-  -run '^TestLinuxDoctorExitCodeWithRunningClusterRoutes$' -count=1
+TBX_E2E_CLUSTER=e2e "$doctor_e2e_test" -test.v \
+  -test.run '^TestLinuxDoctorExitCodeWithRunningClusterRoutes$'
 printf 'verified 1 control plane + 2 workers through substrate-only path to Ready nodes\n'
 
 kc() {
