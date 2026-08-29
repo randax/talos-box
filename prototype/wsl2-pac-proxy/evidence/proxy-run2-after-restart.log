@@ -1,0 +1,15 @@
+07:30:43 PROTOTYPE proxy listening on 127.0.0.1:5390
+07:30:43   PAC url  http://127.0.0.1:5390/tbx.pac
+07:30:43   resolver 172.30.0.1:53   suffix .k8s.test
+07:30:46 CONNECT  wslproto-cp-1.wslproto.k8s.test:6443          tunnel -> 172.30.0.2
+07:30:46 CONNECT  wslproto-cp-1.wslproto.k8s.test:6443          tunnel -> 172.30.0.2
+07:30:46 CONNECT  wslproto-cp-1.wslproto.k8s.test:6443          tunnel -> 172.30.0.2
+07:30:46 CONNECT  wslproto-cp-1.wslproto.k8s.test:6443          tunnel -> 172.30.0.2
+07:30:46 CONNECT  wslproto-cp-1.wslproto.k8s.test:6443          tunnel -> 172.30.0.2
+07:30:46 CONNECT  wslproto-cp-1.wslproto.k8s.test:6443          tunnel -> 172.30.0.2
+07:30:48 CONNECT  wslproto-cp-1.wslproto.k8s.test:6443          tunnel -> 172.30.0.2
+07:30:48 CONNECT  wslproto-cp-1.wslproto.k8s.test:6443          tunnel -> 172.30.0.2
+07:30:48 CONNECT  wslproto-cp-1.wslproto.k8s.test:6443          tunnel -> 172.30.0.2
+07:30:48 CONNECT  wslproto-cp-1.wslproto.k8s.test:6443          tunnel -> 172.30.0.2
+07:30:48 CONNECT  wslproto-cp-1.wslproto.k8s.test:6443          tunnel -> 172.30.0.2
+07:30:48 CONNECT  wslproto-cp-1.wslproto.k8s.test:6443          tunnel -> 172.30.0.2

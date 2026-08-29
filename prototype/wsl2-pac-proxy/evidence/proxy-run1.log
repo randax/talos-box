@@ -1,0 +1,24 @@
+07:27:08 PROTOTYPE proxy listening on 127.0.0.1:5390
+07:27:08   PAC url  http://127.0.0.1:5390/tbx.pac
+07:27:08   resolver 172.30.0.1:53   suffix .k8s.test
+07:27:29 PAC      127.0.0.1:43918                               served proxy.pac
+07:27:30 CONNECT  wslproto-cp-1.wslproto.k8s.test:6443          tunnel -> 172.30.0.2
+07:27:30 CONNECT  wslproto-cp-1.wslproto.k8s.test:6443          tunnel -> 172.30.0.2
+07:27:33 HTTPFAIL myapp.wslproto.k8s.test                       172.30.0.200:80 -> dial tcp 172.30.0.200:80: connect: no route to host
+07:27:33 CONNECT  172.30.0.2:6443                               tunnel -> 172.30.0.2
+07:27:33 CONNECT  172.30.0.2:6443                               tunnel -> 172.30.0.2
+07:27:33 REFUSE   www.microsoft.com                             not a cluster name or address
+07:28:05 REFUSE   via                                           not a cluster name or address
+07:28:05 CONNECT  wslproto-cp-1.wslproto.k8s.test:6443          tunnel -> 172.30.0.2
+07:28:05 CONNECT  wslproto-cp-1.wslproto.k8s.test:6443          tunnel -> 172.30.0.2
+07:28:05 CONNECT  172.30.0.2:6443                               tunnel -> 172.30.0.2
+07:28:05 REFUSE   www.microsoft.com                             not a cluster name or address
+07:28:33 PAC      127.0.0.1:49432                               served proxy.pac
+07:28:33 PAC      127.0.0.1:49436                               served proxy.pac
+07:28:33 PAC      127.0.0.1:49438                               served proxy.pac
+07:28:33 PAC      127.0.0.1:49446                               served proxy.pac
+07:28:57 PAC      127.0.0.1:50724                               served proxy.pac
+07:28:59 HTTPFAIL myapp.wslproto.k8s.test                       172.30.0.200:80 -> dial tcp 172.30.0.200:80: connect: no route to host
+07:29:01 CONNECT  wslproto-cp-1.wslproto.k8s.test:6443          tunnel -> 172.30.0.2
+07:29:01 CONNECT  wslproto-cp-1.wslproto.k8s.test:6443          tunnel -> 172.30.0.2
+07:29:02 HTTPFAIL myapp.wslproto.k8s.test                       172.30.0.200:80 -> dial tcp 172.30.0.200:80: connect: no route to host
