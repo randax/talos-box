@@ -39,11 +39,28 @@ func TestManagerIgnoresDeficitsBelowDeadband(t *testing.T) {
 		t.Run(fmt.Sprintf("%dMiB", deficit), func(t *testing.T) {
 			m := NewManager(nil)
 			v := &recordingVM{configured: 4096, target: 4096}
-			m.ReconcileSnapshot(map[string]Balloonable{"a": v}, memorySample(6144-deficit), 6144, 1024, 0, time.Unix(1000, 0))
-			if v.calls != 0 || v.target != 4096 {
-				t.Fatalf("deficit %d applied %d target(s), target=%d", deficit, v.calls, v.target)
+			vms := map[string]Balloonable{"a": v}
+			start := time.Unix(1000, 0)
+			m.ReconcileSnapshot(vms, memorySample(6144-deficit), 6144, 1024, 0, start)
+			if v.calls != 1 || v.target != 4096 {
+				t.Fatalf("first tick with deficit %d applied %d target(s), target=%d; want one configured target", deficit, v.calls, v.target)
+			}
+			m.ReconcileSnapshot(vms, memorySample(6144-deficit), 6144, 1024, 0, start.Add(5*time.Second))
+			if v.calls != 1 || v.target != 4096 {
+				t.Fatalf("second tick with deficit %d applied %d target(s), target=%d; want no second apply", deficit, v.calls, v.target)
 			}
 		})
+	}
+}
+
+func TestManagerRestoresExternallyInflatedNodeAfterHoldRelease(t *testing.T) {
+	m := NewManager(nil)
+	v := &recordingVM{configured: 4096, target: 3072}
+
+	m.ReconcileSnapshot(map[string]Balloonable{"a": v}, memorySample(8192), 6144, 1024, 0, time.Unix(1000, 0))
+
+	if v.calls != 1 || v.target != 4096 {
+		t.Fatalf("calls=%d target=%d, want one apply restoring the configured 4096 MiB target", v.calls, v.target)
 	}
 }
 
@@ -127,8 +144,11 @@ func TestManagerPressureSignalDoesNotCreateReclaimByItself(t *testing.T) {
 	v := &recordingVM{configured: 4096, target: 4096}
 	high := memorySample(8192)
 	high.Pressure = hostmem.PressureCritical
-	m.ReconcileSnapshot(map[string]Balloonable{"a": v}, high, 6144, 1024, 0, time.Unix(1000, 0))
-	if v.calls != 0 || v.target != 4096 {
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+	m.ReconcileSnapshot(vms, high, 6144, 1024, 0, start)
+	m.ReconcileSnapshot(vms, high, 6144, 1024, 0, start.Add(time.Minute))
+	if v.calls != 1 || v.target != 4096 {
 		t.Fatalf("pressure alone reclaimed memory: calls=%d target=%d", v.calls, v.target)
 	}
 }
@@ -307,7 +327,7 @@ func TestManagerIncidentSampleDoesNotFlapTargets(t *testing.T) {
 		sample.SwapTotalBytes, sample.SwapAvailableBytes = 3<<30, 410<<20
 		m.ReconcileSnapshot(vms, sample, 6144, 1024, 0, start.Add(time.Duration(i)*31*time.Second))
 	}
-	if v.calls != 0 || v.target != 4096 {
+	if v.calls != 1 || v.target != 4096 {
 		t.Fatalf("incident samples flapped target: calls=%d target=%d", v.calls, v.target)
 	}
 }
@@ -487,7 +507,7 @@ func TestHoldKeepsThePreBalloonedTargetsInPlace(t *testing.T) {
 		"c": &recordingVM{configured: configured, target: configured - reclaim/3},
 	}
 
-	Reconcile(vms, holdAdjustedFreeMiB(freeBefore+reclaim, reserve, reclaim), reserve, floor)
+	NewManager(nil).ReconcileSnapshot(vms, memorySample(freeBefore+reclaim), reserve, floor, reclaim, time.Unix(1000, 0))
 
 	held := 0
 	for name, v := range vms {
@@ -504,18 +524,6 @@ func TestHoldKeepsThePreBalloonedTargetsInPlace(t *testing.T) {
 	// reconcile may land up to one MiB per node short of the reclaim.
 	if held < reclaim-len(vms) {
 		t.Fatalf("reconcile held %d MiB out of the guests, want the %d MiB pre-balloon less the per-node rounding", held, reclaim)
-	}
-}
-
-// The hold is a floor on the deficit, never a ceiling: a host under real
-// pressure still reclaims what the pressure calls for.
-func TestHoldNeverRaisesTheHostFreeReading(t *testing.T) {
-	const reserve = 6144
-	if got := holdAdjustedFreeMiB(4096, reserve, 512); got != 4096 {
-		t.Errorf("holdAdjustedFreeMiB(4096, %d, 512) = %d, want the measured reading under real pressure", reserve, got)
-	}
-	if got := holdAdjustedFreeMiB(8192, reserve, 0); got != 8192 {
-		t.Errorf("holdAdjustedFreeMiB(8192, %d, 0) = %d, want the reading untouched with nothing held", reserve, got)
 	}
 }
 

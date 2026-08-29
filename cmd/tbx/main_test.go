@@ -9,12 +9,11 @@ import (
 	"github.com/randax/talos-box/internal/hostpressure"
 )
 
-// TestMain pins the runtime-identity command seam so no test depends on the
-// host's systemd state: on a Linux runner `systemctl show tbxd.service` would
-// otherwise decide whether a fake daemon socket is dialed at all. Tests that
-// care about the systemd answer inject their own command (see
-// runtime_identity_linux_test.go).
+// TestMain pins the runtime-identity and daemon-launch seams so no test depends
+// on the host's systemd state. Tests that care about a systemd answer override
+// the relevant seam locally and restore it with cleanup.
 func TestMain(m *testing.M) {
+	pinPlatformLaunchSeams()
 	statusMemorySnapshot = func() (hostpressure.Snapshot, error) {
 		return hostpressure.Snapshot{TotalMemoryMiB: 32768, FreeMemoryMiB: 16384, MemoryPressure: hostpressure.MemoryPressureNormal}, nil
 	}

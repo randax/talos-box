@@ -1645,34 +1645,6 @@ func (s *Server) refreshNodeDetails(statuses []ClusterStatus, now time.Time) {
 	wait.Wait()
 }
 
-// refreshNodeReboots probes configured running nodes concurrently. The
-// tracker serializes baselines so overlapping status requests cannot duplicate
-// a reboot event or log line.
-func (s *Server) refreshNodeReboots(statuses []ClusterStatus, now time.Time) {
-	var wait sync.WaitGroup
-	for i := range statuses {
-		status := &statuses[i]
-		for j := range status.Nodes {
-			node := &status.Nodes[j]
-			if !node.Phase.Configured() || node.IP == "" {
-				continue
-			}
-			node.RebootedAt = nil
-			if node.Phase == PhaseRebooted {
-				node.Phase = PhaseConfigured
-			}
-			wait.Add(1)
-			go func(clusterName string, node *NodeStatus) {
-				defer wait.Done()
-				probe := s.reboots.beginObserve(nodeKey(clusterName, node.Name))
-				bootTime, err := probeNodeBootTime(clusterName, node.IP)
-				s.applyNodeReboot(clusterName, node, probe, bootTime, err, now)
-			}(status.Name, node)
-		}
-	}
-	wait.Wait()
-}
-
 // refreshNodeServices asks each configured node's machine API about its
 // kubelet, so a node that answers apid while its kubelet cannot exec stops
 // reading as a healthy `configured` node (#357). Only a running cluster's

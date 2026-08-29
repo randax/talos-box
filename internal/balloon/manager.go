@@ -83,10 +83,6 @@ func (m *Manager) ReconcileSnapshot(vms map[string]Balloonable, sample hostmem.S
 		deficit = holdMiB
 	}
 	holdSetsDeficit := holdMiB > 0 && holdMiB >= naturalDeficit
-	if !holdSetsDeficit && deficit == 0 && m.pressureLatched {
-		m.dropDeparted(vms)
-		return
-	}
 
 	nodes := make([]Node, 0, len(vms))
 	for name, vm := range vms {
@@ -104,7 +100,7 @@ func (m *Manager) ReconcileSnapshot(vms map[string]Balloonable, sample hostmem.S
 	hasUnappliedTarget := false
 	for name, target := range targets {
 		previous, known := m.last[name]
-		if (!known && target != vms[name].ConfiguredMiB()) || (known && previous != target) {
+		if !known || previous != target {
 			changed = true
 			if !known || m.retryPending[name] {
 				hasUnappliedTarget = true
@@ -131,7 +127,7 @@ func (m *Manager) ReconcileSnapshot(vms map[string]Balloonable, sample hostmem.S
 	for _, name := range names {
 		target := targets[name]
 		previous, known := m.last[name]
-		if (!known && target == vms[name].ConfiguredMiB()) || (known && previous == target) {
+		if known && previous == target {
 			continue
 		}
 		if !holdSetsDeficit {
@@ -369,23 +365,4 @@ func RunWithLogger(cfg Config, vms func() map[string]Balloonable, stop <-chan st
 			m.ReconcileSnapshot(vms(), sample, cfg.ReserveMiB, cfg.FloorMiB, 0, now())
 		}
 	}
-}
-
-// holdAdjustedFreeMiB is the host-free reading Reconcile must act on while a
-// pre-balloon is held: low enough that the reconcile's deficit
-// (reserve - free) is at least holdMiB, so the held reclaim stays out of the
-// guests until the hold expires. Debiting the hold from free instead cannot do
-// that: the reclaim is already in the measured reading, so free - hold is
-// algebraically the pre-reclaim reading, which on a host that was above the
-// reserve to begin with yields a deficit of zero and deflates every guest back
-// to configured while the admitted guest is still booting. Real pressure below
-// the cap still wins — the reading is only capped, never raised.
-func holdAdjustedFreeMiB(freeMiB, reserveMiB, holdMiB int) int {
-	if holdMiB <= 0 {
-		return freeMiB
-	}
-	if capped := reserveMiB - holdMiB; freeMiB > capped {
-		return capped
-	}
-	return freeMiB
 }

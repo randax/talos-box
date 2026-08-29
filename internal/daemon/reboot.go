@@ -41,16 +41,6 @@ type rebootLog struct {
 	nodes map[string]rebootState
 }
 
-func (l *rebootLog) observe(key string, bootTime uint64, now time.Time) (rebootObservation, bool) {
-	observation, _, changed := l.observeTransition(key, bootTime, now)
-	return observation, changed
-}
-
-func (l *rebootLog) observeTransition(key string, bootTime uint64, now time.Time) (rebootObservation, uint64, bool) {
-	observation, previous, changed, _ := l.completeObserve(l.beginObserve(key), bootTime, now)
-	return observation, previous, changed
-}
-
 func (l *rebootLog) beginObserve(key string) rebootProbe {
 	l.mu.Lock()
 	defer l.mu.Unlock()

@@ -242,7 +242,11 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		findings := hostpressure.Assess(snapshot, reserveMiB)
 		pendingGuestsClause := ""
 		if snapshot.FreeMemoryMiB > 0 {
-			pendingGuestsClause = fmt.Sprintf(" (measured with no guests pending: a start larger than %d MiB of new guests will still be refused)", snapshot.FreeMemoryMiB-reserveMiB)
+			if snapshot.FreeMemoryMiB < reserveMiB {
+				pendingGuestsClause = fmt.Sprintf(" (measured with no guests pending: the host is already %d MiB below the balloon reserve; any new guest start will be refused until memory frees)", reserveMiB-snapshot.FreeMemoryMiB)
+			} else {
+				pendingGuestsClause = fmt.Sprintf(" (measured with no guests pending: a start larger than %d MiB of new guests will still be refused)", hostpressure.GuestHeadroomMiB(snapshot.FreeMemoryMiB, reserveMiB))
+			}
 		}
 		if len(findings) == 0 {
 			// A PASS states the three numbers it was decided on — free memory,

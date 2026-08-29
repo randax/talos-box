@@ -9,19 +9,6 @@ import (
 	"github.com/randax/talos-box/internal/hostmem"
 )
 
-func TestMemoryPressureFromHostmem(t *testing.T) {
-	for value, want := range map[hostmem.Pressure]MemoryPressure{
-		hostmem.PressureNormal:   MemoryPressureNormal,
-		hostmem.PressureWarning:  MemoryPressureWarning,
-		hostmem.PressureCritical: MemoryPressureCritical,
-		hostmem.PressureUnknown:  MemoryPressureUnknown,
-	} {
-		if got := memoryPressureFromHostmem(value); got != want {
-			t.Errorf("memoryPressureFromHostmem(%v) = %v, want %v", value, got, want)
-		}
-	}
-}
-
 func TestSystemMemorySnapshotUsesSharedSample(t *testing.T) {
 	original := hostmem.SystemSnapshot
 	t.Cleanup(func() { hostmem.SystemSnapshot = original })

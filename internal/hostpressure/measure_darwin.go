@@ -60,19 +60,6 @@ func SystemMemorySnapshotContext(ctx context.Context) (Snapshot, error) {
 	}, nil
 }
 
-func memoryPressureFromHostmem(value hostmem.Pressure) MemoryPressure {
-	switch value {
-	case hostmem.PressureNormal:
-		return MemoryPressureNormal
-	case hostmem.PressureWarning:
-		return MemoryPressureWarning
-	case hostmem.PressureCritical:
-		return MemoryPressureCritical
-	default:
-		return MemoryPressureUnknown
-	}
-}
-
 func measureDataVolume(path string) (Usage, error) {
 	path = filepath.Clean(path)
 	for {

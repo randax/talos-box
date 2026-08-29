@@ -110,15 +110,21 @@ func (s Snapshot) headroomClause(reserveMiB int) string {
 		return "starting guests beside running ones must leave the " +
 			fmt.Sprintf("%d MiB", reserveMiB) + " balloon reserve free, which needs a free-memory reading this host did not give"
 	}
-	roomMiB := s.FreeMemoryMiB - reserveMiB
-	if roomMiB < 0 {
-		roomMiB = 0
-	}
+	roomMiB := GuestHeadroomMiB(s.FreeMemoryMiB, reserveMiB)
 	return fmt.Sprintf(
 		"starting guests beside running ones must leave the %d MiB balloon reserve free, so there is room for %d MiB of new guests right now,"+
 			" plus whatever the balloon controller can take back from the guests already running",
 		reserveMiB, roomMiB,
 	)
+}
+
+// GuestHeadroomMiB is the memory a new guest may claim while preserving
+// the balloon reserve. It never reports negative capacity.
+func GuestHeadroomMiB(freeMiB, reserveMiB int) int {
+	if roomMiB := freeMiB - reserveMiB; roomMiB > 0 {
+		return roomMiB
+	}
+	return 0
 }
 
 // Severity ranks a finding for the two consumers of Assess.
