@@ -105,6 +105,8 @@ func run() (err error) {
 	// Hold the pre-balloon the provision-start gate takes for a booting guest,
 	// so the manager does not hand it straight back (#398).
 	balloonConfig.HoldMiB = server.BalloonHoldMiB
+	// skip ticks while VMs are being torn down (#513)
+	balloonConfig.Paused = server.BalloonPaused
 	go balloon.Run(balloonConfig, server.Balloonables, balloonStop)
 	defer close(balloonStop)
 

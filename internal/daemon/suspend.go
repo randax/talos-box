@@ -42,6 +42,9 @@ func (s *Server) suspendCluster(raw json.RawMessage) (ClusterSummary, error) {
 	}
 	nodes := s.vms[item.Name]
 	var errs []error
+	// active VMs are being paused and stopped: no balloon retarget may land
+	// on one mid-save (#513)
+	defer s.quiesceBalloon()()
 	for name, machine := range nodes {
 		savePath := saveStatePath(dir, name)
 		retain, err := prepareSavedMachine(machine, savePath)

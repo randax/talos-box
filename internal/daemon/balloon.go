@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/randax/talos-box/internal/balloon"
@@ -22,6 +23,11 @@ type balloonMachine struct {
 	// pre-balloon measures what is left rather than assuming the guest is still
 	// at its configured size. Nil on a machine built outside the server.
 	recordTarget func(int)
+	// quiesced reports whether the daemon is tearing VMs down right now; a
+	// snapshot the manager took beforehand must not retarget a guest whose
+	// Stop may already be in flight (#513). Nil on a machine built outside
+	// the server.
+	quiesced func() bool
 }
 
 func (m balloonMachine) ConfiguredMiB() int { return m.configuredMiB }
@@ -36,6 +42,9 @@ func (m balloonMachine) CurrentTargetMiB() int {
 }
 
 func (m balloonMachine) SetMemoryTargetMiB(targetMiB int) error {
+	if m.quiesced != nil && m.quiesced() {
+		return balloon.ErrQuiesced
+	}
 	err := m.machine.SetMemoryTargetMiB(targetMiB)
 	if err != nil {
 		// A tolerated inactive balloon device is not a failure, but it is also
@@ -87,7 +96,34 @@ func (s *Server) Balloonables() map[string]balloon.Balloonable {
 	s.opMu.Lock()
 	candidates := s.balloonCandidatesLocked(balloonReadback)
 	s.opMu.Unlock()
-	return balloonablesFrom(candidates, balloonReadback, s.recordBalloonTarget)
+	return s.balloonablesFrom(candidates, balloonReadback)
+}
+
+// balloonablesFrom is the package-level constructor bound to this server's
+// target ledger and teardown latch.
+func (s *Server) balloonablesFrom(candidates map[string]balloonCandidate, balloonReadback bool) map[string]balloon.Balloonable {
+	return balloonablesFrom(candidates, balloonReadback, s.recordBalloonTarget, s.balloonQuiesced)
+}
+
+// quiesceBalloon takes the teardown latch: while any caller holds it the
+// balloon manager skips its tick (BalloonPaused) and every retarget from an
+// earlier snapshot is refused, so a guest cannot be ballooned while its VM is
+// stopping. The manager's ledger is deliberately left alone — pruning it
+// against a mid-teardown snapshot would drop the pressure-latch clamp for the
+// clusters that stay up. The returned func releases the latch.
+func (s *Server) quiesceBalloon() (release func()) {
+	s.balloonTeardowns.Add(1)
+	var once sync.Once
+	return func() { once.Do(func() { s.balloonTeardowns.Add(-1) }) }
+}
+
+// BalloonPaused is balloonQuiesced for the balloon manager's poll loop.
+func (s *Server) BalloonPaused() bool { return s.balloonQuiesced() }
+
+// balloonQuiesced reports whether ballooning is parked: a teardown is in
+// flight, or the daemon is shutting down (which never releases).
+func (s *Server) balloonQuiesced() bool {
+	return s.balloonShutdown.Load() || s.balloonTeardowns.Load() > 0
 }
 
 // balloonablesLocked is Balloonables for a caller that already holds opMu —
@@ -99,7 +135,7 @@ func (s *Server) Balloonables() map[string]balloon.Balloonable {
 // the probe is bounded by its own dial timeout.
 func (s *Server) balloonablesLocked() map[string]balloon.Balloonable {
 	balloonReadback := s.hypervisor.Capabilities().BalloonReadback.Supported
-	return balloonablesFrom(s.balloonCandidatesLocked(balloonReadback), balloonReadback, s.recordBalloonTarget)
+	return s.balloonablesFrom(s.balloonCandidatesLocked(balloonReadback), balloonReadback)
 }
 
 // balloonCandidatesLocked reads the running, configured nodes out of the VM
@@ -138,7 +174,7 @@ func (s *Server) balloonCandidatesLocked(balloonReadback bool) map[string]balloo
 }
 
 // balloonablesFrom applies the eligibility rule to the captured candidates.
-func balloonablesFrom(candidates map[string]balloonCandidate, balloonReadback bool, record func(string, int)) map[string]balloon.Balloonable {
+func balloonablesFrom(candidates map[string]balloonCandidate, balloonReadback bool, record func(string, int), quiesced func() bool) map[string]balloon.Balloonable {
 	out := map[string]balloon.Balloonable{}
 	for key, e := range candidates {
 		if balloonReadback || (e.ip != "" && ClassifyPhase(true, probeAPID(e.ip)) == PhaseConfigured) {
@@ -147,6 +183,7 @@ func balloonablesFrom(candidates map[string]balloonCandidate, balloonReadback bo
 				configuredMiB:           e.configuredMiB,
 				currentTargetMiB:        e.currentTargetMiB,
 				tolerateDeviceNotActive: e.tolerateDeviceNotActive,
+				quiesced:                quiesced,
 			}
 			if record != nil {
 				machine.recordTarget = func(targetMiB int) { record(key, targetMiB) }
@@ -443,7 +480,9 @@ func (r balloonReclaim) apply(deficitMiB int) (int, error) {
 	var pending []string
 	for _, name := range names {
 		if err := r.vms[name].SetMemoryTargetMiB(targets[name]); err != nil {
-			if !errors.Is(err, balloon.ErrTargetPending) {
+			// a quiesced guest (daemon shutting down) has nothing to give
+			// either; neither is a failure --force could override
+			if !errors.Is(err, balloon.ErrTargetPending) && !errors.Is(err, balloon.ErrQuiesced) {
 				return heldMiB, fmt.Errorf("balloon %s down to %d MiB: %w", name, targets[name], err)
 			}
 			// A guest whose balloon driver is not up yet accepted nothing: its

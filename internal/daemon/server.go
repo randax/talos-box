@@ -67,6 +67,11 @@ type Server struct {
 	stallWatchMu      sync.Mutex
 	stallWatchStop    chan struct{}
 	stallWatchDone    chan struct{}
+	// balloonTeardowns counts VM teardowns in flight and balloonShutdown is
+	// set for good by Shutdown; either parks the balloon manager so no guest
+	// is retargeted while its VM stops (#513).
+	balloonTeardowns atomic.Int32
+	balloonShutdown  atomic.Bool
 
 	provisions           map[string]activeProvision
 	storagePhases        map[string]StoragePhase
@@ -405,6 +410,9 @@ func (s *Server) Shutdown() error {
 		connections = append(connections, connection)
 	}
 	s.listenerMu.Unlock()
+	// park the balloon manager first: a retarget racing a VM stop is the
+	// teardown shape behind the #513 host panics
+	s.balloonShutdown.Store(true)
 	// stop the stall watch before anything is torn down: it takes opMu and
 	// reads the VM map this shutdown is about to empty
 	s.stopStallWatch()
@@ -938,23 +946,55 @@ func decodeArgs(raw json.RawMessage, destination any) error {
 	return nil
 }
 
+// closeVMsSequentially serializes the host-side teardown of VMs. On macOS a
+// fan-out destroys N hypervisor VMs, their vmnet interfaces and balloon
+// devices at once — the shape of the kernel panics in #513 — and the seconds
+// it saves are not worth a host reboot. Guest shutdown (Stop) still runs in
+// parallel: that is the ~20s ACPI wait, which is guest work. The hard stop a
+// Stop falls back to is kernel work again, and the vz backend queues those on
+// its own mutex, so a cluster of wedged guests never fans out either.
+var closeVMsSequentially = runtime.GOOS == "darwin"
+
 func closeVMs(machines []hypervisor.Machine) error {
-	errorsByVM := make(chan error, len(machines))
-	var wait sync.WaitGroup
-	for _, machine := range machines {
-		wait.Add(1)
-		go func() {
-			defer wait.Done()
-			errorsByVM <- closeMachine(machine)
-		}()
-	}
-	wait.Wait()
-	close(errorsByVM)
 	var result error
-	for err := range errorsByVM {
+	for _, err := range closeEach(machines, func(m hypervisor.Machine) hypervisor.Machine { return m }) {
 		result = errors.Join(result, err)
 	}
 	return result
+}
+
+// closeEach stops and closes every item's machine: Stop fans out for all of
+// them, then Close runs one at a time when closeVMsSequentially is set,
+// otherwise concurrently. Results are in input order, each joining the item's
+// stop and close errors like closeMachine.
+func closeEach[T any](items []T, machineOf func(T) hypervisor.Machine) []error {
+	stopErrs := make([]error, len(items))
+	var wait sync.WaitGroup
+	for i, item := range items {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			stopErrs[i] = stopMachine(machineOf(item))
+		}()
+	}
+	wait.Wait()
+
+	results := make([]error, len(items))
+	if closeVMsSequentially {
+		for i, item := range items {
+			results[i] = errors.Join(stopErrs[i], machineOf(item).Close())
+		}
+		return results
+	}
+	for i, item := range items {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			results[i] = errors.Join(stopErrs[i], machineOf(item).Close())
+		}()
+	}
+	wait.Wait()
+	return results
 }
 
 func closeMachine(machine hypervisor.Machine) error {

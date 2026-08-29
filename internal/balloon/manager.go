@@ -27,6 +27,12 @@ const (
 // guest balloon device is not active yet and therefore did not apply it.
 var ErrTargetPending = errors.New("balloon target pending: device not active")
 
+// ErrQuiesced is returned by a Balloonable whose daemon is tearing VMs down
+// right now (#513). The manager treats it as "not this tick": nothing is
+// logged and no ledger entry moves, so the guest's last known target and the
+// pressure-latch clamp survive the teardown window.
+var ErrQuiesced = errors.New("balloon retarget refused: VM teardown in progress")
+
 // Balloonable is the balloon manager's view of a running configured VM.
 type Balloonable interface {
 	ConfiguredMiB() int
@@ -186,6 +192,9 @@ func (m *Manager) applyTarget(vms map[string]Balloonable, name string, target in
 		}
 	}
 	if err := vms[name].SetMemoryTargetMiB(target); err != nil {
+		if errors.Is(err, ErrQuiesced) {
+			return applyOutcomeSkipped
+		}
 		if errors.Is(err, ErrTargetPending) {
 			if !m.pendingLogged[name] {
 				m.log("balloon %s: %v", name, err)
@@ -292,6 +301,9 @@ func (m *Manager) probePendingDevices(vms map[string]Balloonable, now time.Time)
 		}
 		err := vm.SetMemoryTargetMiB(vm.ConfiguredMiB())
 		if err != nil {
+			if errors.Is(err, ErrQuiesced) {
+				continue
+			}
 			if !errors.Is(err, ErrTargetPending) {
 				m.log("balloon %s: %v", name, err)
 			}
@@ -455,7 +467,11 @@ type Config struct {
 	// HostMemory is the shared host-memory probe. HostFreeMiB remains as a
 	// compatibility seam for older callers and tests.
 	HostMemory func(context.Context) (hostmem.Snapshot, error)
-	Now        func() time.Time
+	// Paused reports that the daemon is tearing VMs down: the tick is skipped
+	// outright so the ledger is neither applied nor pruned against a
+	// snapshot taken mid-teardown (#513). Nil means never paused.
+	Paused func() bool
+	Now    func() time.Time
 }
 
 // DefaultConfig is the G3-tuned default: 6 GiB host reserve, 1 GiB per-node
@@ -524,6 +540,9 @@ func RunWithLogger(cfg Config, vms func() map[string]Balloonable, stop <-chan st
 		case <-stop:
 			return
 		case <-ticker.C:
+			if cfg.Paused != nil && cfg.Paused() {
+				continue
+			}
 			sample, err := probe(context.Background())
 			if err != nil {
 				m.log("balloon: read host memory: %v", err)
