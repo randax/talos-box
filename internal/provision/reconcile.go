@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -501,6 +502,10 @@ func generateMachineConfigs(item cluster.Cluster) (generated, error) {
 		if err != nil {
 			return generated{}, fmt.Errorf("patch %s config: %w", role, err)
 		}
+		bytes, err = withReclaimProtection(bytes, item.DefaultsFor(role).MemoryMiB, !item.DisableKubeletMemoryProtection)
+		if err != nil {
+			return generated{}, fmt.Errorf("patch reclaim protection in %s config: %w", role, err)
+		}
 		if extensions.Requested(item.TalosExtensions, extensions.GVisor) {
 			bytes, err = withGVisorUserNamespaces(bytes)
 			if err != nil {
@@ -524,6 +529,87 @@ func generateMachineConfigs(item cluster.Cluster) (generated, error) {
 		return generated{}, fmt.Errorf("generate talosconfig: %w", err)
 	}
 	return generated{talosconfig: talosconfig, configs: configs, paths: paths}, nil
+}
+
+func reclaimMinFreeKiB(memoryMiB int) int {
+	const (
+		floorKiB   = 16 * 1024
+		ceilingKiB = 256 * 1024
+	)
+	if memoryMiB <= floorKiB/32 {
+		return floorKiB
+	}
+	if memoryMiB >= ceilingKiB/32 {
+		return ceilingKiB
+	}
+	return memoryMiB * 32
+}
+
+func mapping(parent map[string]any, key string) (map[string]any, error) {
+	value, found := parent[key]
+	if !found {
+		result := map[string]any{}
+		parent[key] = result
+		return result, nil
+	}
+	result, ok := value.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("%s must be a mapping", key)
+	}
+	return result, nil
+}
+
+func setDefault(values map[string]any, key string, value any) {
+	if _, found := values[key]; !found {
+		values[key] = value
+	}
+}
+
+// kubeletMemoryProtectionMinMiB is the smallest node the kubelet eviction and
+// reservation defaults apply to: 512Mi reserved plus a 300Mi threshold would
+// leave a 1 GiB node with almost nothing schedulable, so smaller nodes keep
+// the reclaim sysctls only.
+const kubeletMemoryProtectionMinMiB = 2048
+
+func withReclaimProtection(config []byte, memoryMiB int, kubeletEnabled bool) ([]byte, error) {
+	var document map[string]any
+	if err := yaml.Unmarshal(config, &document); err != nil {
+		return nil, fmt.Errorf("decode generated machine config: %w", err)
+	}
+	machineSection, err := mapping(document, "machine")
+	if err != nil {
+		return nil, err
+	}
+	sysctls, err := mapping(machineSection, "sysctls")
+	if err != nil {
+		return nil, err
+	}
+	setDefault(sysctls, "vm.min_free_kbytes", strconv.Itoa(reclaimMinFreeKiB(memoryMiB)))
+	setDefault(sysctls, "vm.watermark_scale_factor", "200")
+	setDefault(sysctls, "vm.vfs_cache_pressure", "50")
+
+	if kubeletEnabled && memoryMiB >= kubeletMemoryProtectionMinMiB {
+		kubelet, err := mapping(machineSection, "kubelet")
+		if err != nil {
+			return nil, err
+		}
+		extraConfig, err := mapping(kubelet, "extraConfig")
+		if err != nil {
+			return nil, err
+		}
+		evictionHard, err := mapping(extraConfig, "evictionHard")
+		if err != nil {
+			return nil, err
+		}
+		setDefault(evictionHard, "memory.available", "300Mi")
+		systemReserved, err := mapping(extraConfig, "systemReserved")
+		if err != nil {
+			return nil, err
+		}
+		setDefault(systemReserved, "memory", "512Mi")
+	}
+
+	return yaml.Marshal(document)
 }
 
 // withGVisorUserNamespaces re-opens unprivileged user namespaces on nodes

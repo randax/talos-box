@@ -121,6 +121,12 @@ talos_config="$workdir/talos"
 cluster_config="$workdir/talosbox.yaml"
 kubeconfig="$workdir/kubeconfig"
 
+# The doctor exit-status assertion (#502) runs against the live cluster later,
+# but it is compiled here, before HOME moves to the scratch directory and takes
+# Go's module and build caches with it.
+doctor_e2e_test="$workdir/tbx-doctor-e2e.test"
+go test -C "$root" -tags=e2e -c -o "$doctor_e2e_test" ./cmd/tbx
+
 mkdir -p "$home" "$tools" "$talos_config"
 export HOME="$home"
 export PATH="$tools:$PATH"
@@ -134,10 +140,10 @@ done
 # cluster boots: every version this harness can boot pins its own checksum. The
 # default is the release's tested version; the scheduled floor lane passes the
 # bottom of the supported window instead.
-talos_version=${TBX_E2E_TALOS_VERSION:-v1.13.6}
+talos_version=${TBX_E2E_TALOS_VERSION:-v1.13.9}
 case "$talos_version" in
-  v1.13.6)
-    talosctl_sha256=540c5e7cb0d3fa3a9b2e1c717ced212727b73bcaf0cf9cf9ba2472ec381041d4
+  v1.13.9)
+    talosctl_sha256=7e1d4b7d5846964bdcf63a794e3c8161bb6ef2983d5ace58ea5322f3bf32a27e
     ;;
   v1.12.0)
     talosctl_sha256=11a2745cf92b016b4783acf5eb56bfc394aede61a976dd17b5e8f6d09397e22a
@@ -292,6 +298,8 @@ retry "node registration" 120 5 all_nodes_registered
 kubectl --kubeconfig "$kubeconfig" wait --for=condition=Ready node --all --timeout=10m
 ready_nodes=$(kubectl --kubeconfig "$kubeconfig" get nodes --no-headers | awk '$2 == "Ready" { count++ } END { print count + 0 }')
 [[ "$ready_nodes" -eq 3 ]]
+TBX_E2E_CLUSTER=e2e "$doctor_e2e_test" -test.v \
+  -test.run '^TestLinuxDoctorExitCodeWithRunningClusterRoutes$'
 printf 'verified 1 control plane + 2 workers through substrate-only path to Ready nodes\n'
 
 kc() {

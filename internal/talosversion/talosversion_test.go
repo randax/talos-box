@@ -44,13 +44,13 @@ func TestWarningAboveDefaultOnlyAndNamesBothVersions(t *testing.T) {
 		!strings.Contains(warning, "v1.14.0") || !strings.Contains(warning, Default) {
 		t.Errorf("NewerThanTestedWarning(v1.14.0) = %q, want a warning naming both versions", warning)
 	}
-	if warning := NewerThanTestedWarning("v1.13.7"); warning == "" {
-		t.Error("NewerThanTestedWarning(v1.13.7) = \"\", want a warning for a newer patch")
+	if warning := NewerThanTestedWarning("v1.13.10"); warning == "" {
+		t.Error("NewerThanTestedWarning(v1.13.10) = \"\", want a warning for a newer patch")
 	}
-	if warning := NewerThanTestedWarning("v1.13.7-alpha.1"); warning == "" {
-		t.Error("NewerThanTestedWarning(v1.13.7-alpha.1) = \"\", want a warning for a pre-release above the default")
+	if warning := NewerThanTestedWarning("v1.13.10-alpha.1"); warning == "" {
+		t.Error("NewerThanTestedWarning(v1.13.10-alpha.1) = \"\", want a warning for a pre-release above the default")
 	}
-	for _, version := range []string{Default, Min, "v1.12.5", "v1.13.6-beta.0"} {
+	for _, version := range []string{Default, Min, "v1.12.5", "v1.13.9", "v1.13.9-beta.0"} {
 		if warning := NewerThanTestedWarning(version); warning != "" {
 			t.Errorf("NewerThanTestedWarning(%q) = %q, want silence within [floor, default]", version, warning)
 		}

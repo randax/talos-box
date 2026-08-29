@@ -19,9 +19,15 @@ func TestLowestUsableSubnetIndex(t *testing.T) {
 		wantErr    string
 	}{
 		{
-			name:      "clean host",
-			route:     staticRoute("en0", "0.0.0.0/0"),
+			name:      "ordinary default route is clean",
+			route:     staticRoute("default-link", "0.0.0.0/0"),
 			wantIndex: 0,
+		},
+		{
+			name:      "tunnel default route warns",
+			route:     staticRoute("private-link", "0.0.0.0/0", true),
+			wantIndex: 0,
+			wantWarn:  "private-link",
 		},
 		{
 			name: "foreign interface skips index",
@@ -40,16 +46,16 @@ func TestLowestUsableSubnetIndex(t *testing.T) {
 			wantErr: "all cluster subnets overlap existing host interfaces or routes",
 		},
 		{
-			name:      "broad VPN route warns",
-			route:     staticRoute("utun4", "172.16.0.0/12"),
+			name:      "broad non-default route warns without tunnel signal",
+			route:     staticRoute("broad-link", "172.16.0.0/12"),
 			wantIndex: 0,
-			wantWarn:  "utun4",
+			wantWarn:  "broad-link",
 		},
 		{
-			name:      "full tunnel VPN default route warns",
-			route:     staticRoute("utun8", "0.0.0.0/0"),
+			name:      "broad non-default route warns with tunnel signal",
+			route:     staticRoute("broad-private-link", "172.16.0.0/12", true),
 			wantIndex: 0,
-			wantWarn:  "utun8",
+			wantWarn:  "broad-private-link",
 		},
 		{
 			name:      "no route is clean",
@@ -73,8 +79,13 @@ func TestLowestUsableSubnetIndex(t *testing.T) {
 			wantIndex: 1,
 		},
 		{
-			name:      "specific foreign route skips index",
-			route:     routeByThirdOctet(map[byte]HostRoute{0: routeValue("utun4", "172.30.0.0/24")}),
+			name:      "specific route conflicts without tunnel signal",
+			route:     routeByThirdOctet(map[byte]HostRoute{0: routeValue("specific-link", "172.30.0.0/24")}),
+			wantIndex: 1,
+		},
+		{
+			name:      "specific route conflicts with tunnel signal",
+			route:     routeByThirdOctet(map[byte]HostRoute{0: routeValue("specific-private-link", "172.30.0.0/24", true)}),
 			wantIndex: 1,
 		},
 	}
@@ -376,16 +387,17 @@ func hostAddress(cidr string) net.Addr {
 	return network
 }
 
-func routeValue(name, cidr string) HostRoute {
+func routeValue(name, cidr string, looksLikeTunnel ...bool) HostRoute {
 	_, network, err := net.ParseCIDR(cidr)
 	if err != nil {
 		panic(err)
 	}
-	return HostRoute{Interface: name, Network: network}
+	tunnel := len(looksLikeTunnel) > 0 && looksLikeTunnel[0]
+	return HostRoute{Interface: name, Network: network, LooksLikeTunnel: tunnel}
 }
 
-func staticRoute(name, cidr string) func(net.IP) (HostRoute, error) {
-	value := routeValue(name, cidr)
+func staticRoute(name, cidr string, looksLikeTunnel ...bool) func(net.IP) (HostRoute, error) {
+	value := routeValue(name, cidr, looksLikeTunnel...)
 	return func(net.IP) (HostRoute, error) { return value, nil }
 }
 
@@ -454,4 +466,45 @@ func TestLowestUsableSubnetIndexReusesAFreedIndexOnceItsBridgeIsGone(t *testing.
 	if index != 0 {
 		t.Fatalf("LowestUsableSubnetIndex() after teardown = %d, want 0", index)
 	}
+}
+
+func TestSelectMostSpecificRouteBreaksPrefixTiesByMetricAndKeepsTunnelSignal(t *testing.T) {
+	t.Parallel()
+
+	destination := net.ParseIP("172.30.9.2")
+	all := mustIPNet(t, "0.0.0.0/0")
+	ether := func(metric int) HostRoute { return HostRoute{Interface: "uplink", Network: all, Metric: metric} }
+	tunnel := func(metric int) HostRoute {
+		return HostRoute{Interface: "vpn", Network: all, Metric: metric, LooksLikeTunnel: true}
+	}
+	cases := []struct {
+		name       string
+		routes     []HostRoute
+		wantIface  string
+		wantTunnel bool
+	}{
+		{"lower metric wins over listing order", []HostRoute{ether(100), tunnel(50)}, "vpn", true},
+		{"lower metric wins when listed first", []HostRoute{tunnel(50), ether(100)}, "vpn", true},
+		{"ordinary route with the lower metric hides nothing", []HostRoute{tunnel(100), ether(50)}, "uplink", false},
+		{"full tie keeps the tunnel signal", []HostRoute{ether(0), tunnel(0)}, "uplink", true},
+		{"a longer prefix still beats any metric", []HostRoute{tunnel(0), {Interface: "lan", Network: mustIPNet(t, "172.30.0.0/16"), Metric: 500}}, "lan", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := selectMostSpecificRoute(destination, tc.routes, nil)
+			if got.Interface != tc.wantIface || got.LooksLikeTunnel != tc.wantTunnel {
+				t.Fatalf("selected = %+v, want %s tunnel=%v", got, tc.wantIface, tc.wantTunnel)
+			}
+		})
+	}
+}
+
+func mustIPNet(t *testing.T, cidr string) *net.IPNet {
+	t.Helper()
+	_, network, err := net.ParseCIDR(cidr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return network
 }

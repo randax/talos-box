@@ -34,5 +34,18 @@ func systemRoute(destination net.IP) (HostRoute, error) {
 		}
 		return HostRoute{}, fmt.Errorf("run /sbin/route: %w (%s)", err, strings.TrimSpace(string(output)))
 	}
-	return parseHostRoute(output, destination)
+	return parseDarwinHostRoute(output, destination)
+}
+
+func parseDarwinHostRoute(output []byte, destination net.IP) (HostRoute, error) {
+	route, err := parseHostRoute(output, destination)
+	if err != nil {
+		return HostRoute{}, err
+	}
+	route.LooksLikeTunnel = darwinRouteLooksLikeTunnel(route.Interface)
+	return route, nil
+}
+
+func darwinRouteLooksLikeTunnel(interfaceName string) bool {
+	return strings.HasPrefix(interfaceName, "utun")
 }

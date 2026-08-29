@@ -36,13 +36,17 @@ const (
 	nodeRunStateProtocolVersion             = 8
 	bgpReconcileProtocolVersion             = 10
 	bgpStatusProtocolVersion                = 14
+	kubeletMemoryProtectionProtocolVersion  = 19
 )
 
 func requiresProvisioningIntentHandshake(input cluster.ProvisioningIntentInput) bool {
-	return input.CNI != "" || input.CSI != "" || input.LB != nil || input.BGP != nil || input.Hubble != nil
+	return input.CNI != "" || input.CSI != "" || input.LB != nil || input.BGP != nil || input.Hubble != nil || input.KubeletMemoryProtection != nil
 }
 
 func minimumProvisioningIntentProtocol(input cluster.ProvisioningIntentInput) int {
+	if input.KubeletMemoryProtection != nil {
+		return kubeletMemoryProtectionProtocolVersion
+	}
 	if input.CSI != "" {
 		return csiProvisioningIntentProtocolVersion
 	}
@@ -72,7 +76,11 @@ func (c cli) ensureProvisioningIntentSupport(input cluster.ProvisioningIntentInp
 	if !requiresProvisioningIntentHandshake(input) {
 		return nil
 	}
-	return c.ensureProtocolAtLeast(minimumProvisioningIntentProtocol(input), "--cni/--csi/--hubble/--lb/--bgp")
+	feature := "--cni/--csi/--hubble/--lb/--bgp"
+	if input.KubeletMemoryProtection != nil {
+		feature = "kubeletMemoryProtection"
+	}
+	return c.ensureProtocolAtLeast(minimumProvisioningIntentProtocol(input), feature)
 }
 
 // ensureNodeRemoveSupport refuses to send node.remove to a daemon that would

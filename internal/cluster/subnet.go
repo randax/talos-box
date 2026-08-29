@@ -20,6 +20,10 @@ type HostInterface struct {
 type HostRoute struct {
 	Interface string
 	Network   *net.IPNet
+	// Metric orders routes that share a prefix, lower first, as the kernel
+	// does; platforms that report a single resolved route leave it zero.
+	Metric          int
+	LooksLikeTunnel bool
 }
 
 // LinuxBridgeName and LinuxBridgeAlias are the netlink identity of a bridge
@@ -222,7 +226,7 @@ func inspectSubnet(
 		return subnetInspection{}, fmt.Errorf("inspect route to %s: invalid IPv4 route mask", destination)
 	}
 	if ones == 0 {
-		if strings.HasPrefix(route.Interface, "utun") {
+		if route.LooksLikeTunnel {
 			return subnetInspection{warning: subnetRouteWarning(index, route.Interface)}, nil
 		}
 		return subnetInspection{}, nil
@@ -266,6 +270,11 @@ func networksOverlap(left, right *net.IPNet) bool {
 	return left.Contains(right.IP) || right.Contains(left.IP)
 }
 
+// selectMostSpecificRoute picks the route the kernel would use: the longest
+// prefix, then the lowest metric. Routes tied on both are indistinguishable
+// from here, so the tunnel signal of any of them is kept (#503): hiding a
+// tunnel default route behind an ordinary one listed first would silence the
+// warning the signal exists for.
 func selectMostSpecificRoute(destination net.IP, routes []HostRoute, ignoredInterfaces map[string]bool) HostRoute {
 	selected := HostRoute{}
 	selectedPrefix := -1
@@ -274,11 +283,16 @@ func selectMostSpecificRoute(destination net.IP, routes []HostRoute, ignoredInte
 			continue
 		}
 		prefix, bits := route.Network.Mask.Size()
-		if bits != 32 || prefix < 0 || prefix <= selectedPrefix {
+		if bits != 32 || prefix < 0 || prefix < selectedPrefix {
 			continue
 		}
-		selected = route
-		selectedPrefix = prefix
+		switch {
+		case prefix > selectedPrefix, route.Metric < selected.Metric:
+			selected = route
+			selectedPrefix = prefix
+		case route.Metric == selected.Metric:
+			selected.LooksLikeTunnel = selected.LooksLikeTunnel || route.LooksLikeTunnel
+		}
 	}
 	return selected
 }

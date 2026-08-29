@@ -130,8 +130,8 @@ end-to-end timing and cluster-up gate remains #97. The ISO+install path is dropp
   `--check --deep` remains the pre-travel gate.
   This verifies cache completeness, not a live-cluster pull.
 - Node disks: `~/.talosbox/clusters/<name>/<node>.img`, **20 GB sparse** default.
-- **Talos version matrix**: each tbx release pins one tested default Talos version (initially
-  v1.13.6, the validated one); `talosbox.yaml` may override `talos.version`, `talos.schematic`,
+- **Talos version matrix**: each tbx release pins one tested default Talos version (currently
+  v1.13.9, the validated one); `talosbox.yaml` may override `talos.version`, `talos.schematic`,
   and `talos.extensions` at file level and per cluster, inheriting field-wise (set fields
   override, lists override rather than concatenate, `extensions: []` opts out). Only the
   pinned default is CI-verified on every change; the floor of the supported window is booted by
@@ -430,7 +430,7 @@ Schema (v1):
 ```yaml
 version: 1
 talos:
-  version: v1.13.6        # optional; defaults to the release's pinned version
+  version: v1.13.9        # optional; defaults to the release's pinned version
   schematic: ""           # optional Image Factory schematic id
   extensions: []          # optional curated Talos extensions, bare short names:
                           # gvisor|nfs-utils|qemu-guest-agent
@@ -446,6 +446,7 @@ clusters:
     lb: true               # LoadBalancer support with the curated CNI
     bgp: false
     hubble: false          # Cilium Hubble Relay and UI
+    kubeletMemoryProtection: false # optional curated-provisioning opt-out; default true
     domain: lab.internal   # optional cluster domain; default <name>.k8s.test
     allowUnsafeDomain: false # explicit opt-in for domains that can shadow real DNS
     node:                  # defaults for all nodes
@@ -455,6 +456,21 @@ clusters:
     controlPlane: {}       # optional per-role overrides of `node`
     worker: {}
 ```
+
+**Guest-memory protection semantics.** Curated provisioning adds reclaim-oriented sysctls to
+every generated machine config. It scales `vm.min_free_kbytes` from each role's memory at
+32 KiB per MiB, clamped to 16,384–262,144 KiB, and defaults
+`vm.watermark_scale_factor` to `200` and `vm.vfs_cache_pressure` to `50`. On nodes with at least
+2 GiB it also defaults kubelet's hard `memory.available` eviction threshold to `300Mi` and its
+system memory reservation to `512Mi`; smaller nodes keep the sysctls only, since that
+reservation would leave them almost nothing schedulable. User-supplied values win and unrelated settings are preserved.
+`kubeletMemoryProtection: false` omits only those kubelet eviction and reservation defaults;
+the reclaim sysctls still apply. Unlike `hubble`, the setting is baked into machine config at
+node creation: changing it in `talosbox.yaml` is persisted by `tbx up` and shapes nodes added
+afterwards, but already-configured nodes are not re-patched (use `talosctl patch mc`). Like `hubble`, the field is provisioning-only and is rejected
+without a curated `cni:`. Substrate-only users own their machine config and can apply the same
+policy manually; [Guest memory and reclaim](guest-memory.md) documents the patch, trade-offs,
+and the bring-your-own-schematic balloon opt-out.
 
 **Curated CSI semantics.** `csi:` is a flat scalar and rejects any value without a curated
 `cni:` before anything mutates. Longhorn (pinned v1-series) is the multinode engine; local-path

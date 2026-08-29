@@ -47,6 +47,53 @@ func TestStrongestProvisioningIntentRequiresCSIProtocolRegardlessOfOrder(t *test
 	}
 }
 
+func TestStrongestProvisioningIntentRequiresKubeletMemoryProtectionProtocol(t *testing.T) {
+	cfg := config.Config{Clusters: []config.ClusterSpec{
+		{ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, CSI: cluster.CSILonghorn, LB: true}},
+		{ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, LB: true, DisableKubeletMemoryProtection: true}},
+	}}
+	input, ok := strongestProvisioningIntent(cfg)
+	if !ok {
+		t.Fatal("strongestProvisioningIntent() found no provisioning intent")
+	}
+	if input.KubeletMemoryProtection == nil || *input.KubeletMemoryProtection {
+		t.Fatalf("strongest provisioning input = %+v, want memory-protection opt-out", input)
+	}
+	if got := minimumProvisioningIntentProtocol(input); got != kubeletMemoryProtectionProtocolVersion {
+		t.Fatalf("mixed config minimum protocol = %d, want %d", got, kubeletMemoryProtectionProtocolVersion)
+	}
+}
+
+func TestKubeletMemoryProtectionDefaultKeepsLegacyProvisioningProtocol(t *testing.T) {
+	input := (cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true}).Input()
+	if input.KubeletMemoryProtection != nil {
+		t.Fatalf("default provisioning input = %+v, want no new wire field", input)
+	}
+	if got := minimumProvisioningIntentProtocol(input); got != legacyProvisioningIntentProtocolVersion {
+		t.Fatalf("default provisioning minimum protocol = %d, want legacy protocol %d", got, legacyProvisioningIntentProtocolVersion)
+	}
+}
+
+func TestUpRequiresKubeletMemoryProtectionProtocol(t *testing.T) {
+	home, requests := startUpTestDaemon(t,
+		daemon.Response{OK: true, Data: json.RawMessage(`{"protocolVersion":18}`)},
+	)
+	path := filepath.Join(home, "talosbox.yaml")
+	contents := "version: 1\nclusters:\n  - name: demo\n    cni: cilium\n    kubeletMemoryProtection: false\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	err := (cli{out: &stdout, err: &stderr}).runUp([]string{"-f", path})
+	if err == nil || !strings.Contains(err.Error(), "tbxd protocol 18 is too old") || !strings.Contains(err.Error(), "kubeletMemoryProtection") {
+		t.Fatalf("runUp() error = %v, want protocol-18 kubeletMemoryProtection refusal", err)
+	}
+	if request := <-requests; request.Op != "daemon.info" {
+		t.Fatalf("operation = %q, want daemon.info before any mutation", request.Op)
+	}
+}
+
 func TestRunUpSendsCSIIntentAfterProtocolHandshake(t *testing.T) {
 	home, requests := startUpTestDaemon(t,
 		daemon.Response{OK: true, Data: json.RawMessage(fmt.Sprintf(`{"protocolVersion":%d}`, daemon.ProtocolVersion))},
