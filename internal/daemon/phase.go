@@ -423,6 +423,15 @@ func formatBootWindow(window time.Duration) string {
 // stuck, and the operator needs evidence instead of reassurance (#288).
 const nodeStallThreshold = 3 * nodeBootWindow
 
+func anyHealthyKubelet(nodes []NodeStatus) bool {
+	for _, node := range nodes {
+		if node.Kubelet != nil && node.Kubelet.Health == ServiceHealthHealthy {
+			return true
+		}
+	}
+	return false
+}
+
 // Hints returns copy-pasteable next steps for a cluster, keyed on its nodes'
 // phases. Hints describe; they never execute (SPEC §10).
 func Hints(status ClusterStatus) []string {
@@ -550,7 +559,7 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 			// Bootstrapping by hand belongs to the substrate-only path and to a
 			// cluster nobody is driving; while tbx is provisioning, the hint
 			// above owns the bootstrap and this one would race it (#366).
-			if !provisioning {
+			if !provisioning && !anyHealthyKubelet(status.Nodes) {
 				hints = append(hints,
 					fmt.Sprintf("all nodes configured. If etcd is not yet bootstrapped: talosctl bootstrap --talosconfig ./talosconfig --nodes %[1]s --endpoints %[1]s, then talosctl kubeconfig . --talosconfig ./talosconfig --nodes %[1]s --endpoints %[1]s", cp.IP),
 				)
