@@ -101,10 +101,10 @@ The source preview requires Go 1.26. Install the repository's current toolchain 
 official Go archive when the distribution package is older:
 
 ```sh
-GO_VERSION=1.26.5
+GO_VERSION=1.26.6
 case "$(uname -m)" in
-  x86_64) GO_ARCH=amd64; GO_SHA256=5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053 ;;
-  aarch64|arm64) GO_ARCH=arm64; GO_SHA256=fe4789e92b1f33358680864bbe8704289e7bb5fc207d80623c308935bd696d49 ;;
+  x86_64) GO_ARCH=amd64; GO_SHA256=708effb774be8237570d0add163225abbdfaf4fca28b2611df167beba4feef89 ;;
+  aarch64|arm64) GO_ARCH=arm64; GO_SHA256=d0507e9e9d7fe012aae570108cbd76c15de879e17130ab8cb90d4d7445cb1f2e ;;
   *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
 esac
 GO_ARCHIVE="go${GO_VERSION}.linux-${GO_ARCH}.tar.gz"
@@ -114,7 +114,7 @@ sudo rm -rf /usr/local/go
 sudo tar -C /usr/local -xzf "$GO_ARCHIVE"
 rm "$GO_ARCHIVE"
 export PATH="/usr/local/go/bin:$PATH"
-go version  # go1.26.5
+go version  # go1.26.6
 ```
 
 Add `export PATH="/usr/local/go/bin:$PATH"` to the shell profile before continuing.

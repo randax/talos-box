@@ -78,6 +78,7 @@ func selectLinuxSystemRoute(
 		observed = append(observed, HostRoute{
 			Interface:       interfaceName,
 			Network:         network,
+			Metric:          route.Priority,
 			LooksLikeTunnel: looksLikeTunnel,
 		})
 	}

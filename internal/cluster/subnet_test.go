@@ -467,3 +467,44 @@ func TestLowestUsableSubnetIndexReusesAFreedIndexOnceItsBridgeIsGone(t *testing.
 		t.Fatalf("LowestUsableSubnetIndex() after teardown = %d, want 0", index)
 	}
 }
+
+func TestSelectMostSpecificRouteBreaksPrefixTiesByMetricAndKeepsTunnelSignal(t *testing.T) {
+	t.Parallel()
+
+	destination := net.ParseIP("172.30.9.2")
+	all := mustIPNet(t, "0.0.0.0/0")
+	ether := func(metric int) HostRoute { return HostRoute{Interface: "uplink", Network: all, Metric: metric} }
+	tunnel := func(metric int) HostRoute {
+		return HostRoute{Interface: "vpn", Network: all, Metric: metric, LooksLikeTunnel: true}
+	}
+	cases := []struct {
+		name       string
+		routes     []HostRoute
+		wantIface  string
+		wantTunnel bool
+	}{
+		{"lower metric wins over listing order", []HostRoute{ether(100), tunnel(50)}, "vpn", true},
+		{"lower metric wins when listed first", []HostRoute{tunnel(50), ether(100)}, "vpn", true},
+		{"ordinary route with the lower metric hides nothing", []HostRoute{tunnel(100), ether(50)}, "uplink", false},
+		{"full tie keeps the tunnel signal", []HostRoute{ether(0), tunnel(0)}, "uplink", true},
+		{"a longer prefix still beats any metric", []HostRoute{tunnel(0), {Interface: "lan", Network: mustIPNet(t, "172.30.0.0/16"), Metric: 500}}, "lan", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := selectMostSpecificRoute(destination, tc.routes, nil)
+			if got.Interface != tc.wantIface || got.LooksLikeTunnel != tc.wantTunnel {
+				t.Fatalf("selected = %+v, want %s tunnel=%v", got, tc.wantIface, tc.wantTunnel)
+			}
+		})
+	}
+}
+
+func mustIPNet(t *testing.T, cidr string) *net.IPNet {
+	t.Helper()
+	_, network, err := net.ParseCIDR(cidr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return network
+}
