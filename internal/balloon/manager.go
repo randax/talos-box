@@ -23,6 +23,10 @@ const (
 	pressureClearCompressorMiB = 3 * 1024
 )
 
+// ErrTargetPending means the hypervisor accepted the request path, but the
+// guest balloon device is not active yet and therefore did not apply it.
+var ErrTargetPending = errors.New("balloon target pending: device not active")
+
 // Balloonable is the balloon manager's view of a running configured VM.
 type Balloonable interface {
 	ConfiguredMiB() int
@@ -50,6 +54,7 @@ type Manager struct {
 	lastAppliedHold     bool
 	lastRetarget        map[string]time.Time
 	retryPending        map[string]bool
+	pendingLogged       map[string]bool
 	pressureLatched     bool
 	deadbandMiB         int
 	minRetargetInterval time.Duration
@@ -66,6 +71,7 @@ func NewManager(logger Logger) *Manager {
 		last:                map[string]int{},
 		lastRetarget:        map[string]time.Time{},
 		retryPending:        map[string]bool{},
+		pendingLogged:       map[string]bool{},
 		deadbandMiB:         defaultDeadbandMiB,
 		minRetargetInterval: defaultMinRetargetInterval,
 	}
@@ -96,8 +102,16 @@ func (m *Manager) ReconcileSnapshot(vms map[string]Balloonable, sample hostmem.S
 	targets := PlanTargets(nodes, deficit, floorMiB)
 	if m.pressureLatched {
 		for name, target := range targets {
-			if previous, ok := m.last[name]; ok && target > previous {
-				targets[name] = previous
+			if previous, ok := m.last[name]; ok {
+				ceiling := previous
+				if current, ok := vms[name].(CurrentTargeter); ok {
+					if currentTarget := current.CurrentTargetMiB(); currentTarget > 0 && currentTarget < ceiling {
+						ceiling = currentTarget
+					}
+				}
+				if target > ceiling {
+					targets[name] = ceiling
+				}
 			}
 		}
 	}
@@ -142,13 +156,22 @@ func (m *Manager) ReconcileSnapshot(vms map[string]Balloonable, sample hostmem.S
 		if known && previous == target {
 			continue
 		}
-		if !holdSetsDeficit && !externallyMoved {
+		if !holdSetsDeficit && (!externallyMoved || m.retryPending[name]) {
 			if last, ok := m.lastRetarget[name]; ok && now.Sub(last) < m.minRetargetInterval {
 				m.retryPending[name] = true
 				continue
 			}
 		}
 		if err := vms[name].SetMemoryTargetMiB(target); err != nil {
+			if errors.Is(err, ErrTargetPending) {
+				if !m.pendingLogged[name] {
+					m.log("balloon %s: %v", name, err)
+					m.pendingLogged[name] = true
+				}
+				m.retryPending[name] = true
+				m.lastRetarget[name] = now
+				continue
+			}
 			m.log("balloon %s: %v", name, err)
 			m.retryPending[name] = true
 			continue
@@ -156,6 +179,7 @@ func (m *Manager) ReconcileSnapshot(vms map[string]Balloonable, sample hostmem.S
 		m.last[name] = target
 		m.lastRetarget[name] = now
 		delete(m.retryPending, name)
+		delete(m.pendingLogged, name)
 		anySucceeded = true
 		if externallyMoved {
 			m.log("balloon %s: target=%dMiB (restoring externally moved target %d)", name, target, externalTarget)
@@ -225,6 +249,11 @@ func (m *Manager) dropDeparted(vms map[string]Balloonable) {
 	for name := range m.retryPending {
 		if _, ok := vms[name]; !ok {
 			delete(m.retryPending, name)
+		}
+	}
+	for name := range m.pendingLogged {
+		if _, ok := vms[name]; !ok {
+			delete(m.pendingLogged, name)
 		}
 	}
 	if len(m.last) == 0 {

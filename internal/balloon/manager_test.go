@@ -102,6 +102,61 @@ func TestManagerRestoresKnownNodeMovedOutsideManager(t *testing.T) {
 	}
 }
 
+func TestManagerRateLimitsPendingTargetUntilDeviceActivates(t *testing.T) {
+	logs := &recordingLog{}
+	m := NewManager(logs.Printf)
+	v := &currentTargetRecordingVM{
+		recordingVM:   recordingVM{configured: 4096, target: 4096, err: ErrTargetPending},
+		currentTarget: 4096,
+	}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 0, start)
+	if v.calls != 1 {
+		t.Fatalf("first tick calls=%d, want one target attempt", v.calls)
+	}
+	if got := m.lastRetarget["a"]; !got.Equal(start) {
+		t.Fatalf("lastRetarget=%v, want %v after pending target", got, start)
+	}
+	if !m.retryPending["a"] {
+		t.Fatal("retryPending=false, want pending target retained for retry")
+	}
+	if lines := logs.snapshot(); len(lines) != 1 || !strings.Contains(lines[0], ErrTargetPending.Error()) {
+		t.Fatalf("pending lines=%v, want exactly one pending line", lines)
+	}
+
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 0, start.Add(5*time.Second))
+	if v.calls != 1 {
+		t.Fatalf("inside rate window calls=%d, want no retry", v.calls)
+	}
+	if lines := logs.snapshot(); len(lines) != 1 {
+		t.Fatalf("inside rate window lines=%v, want pending streak logged once", lines)
+	}
+
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 0, start.Add(time.Minute))
+	if v.calls != 2 {
+		t.Fatalf("at rate window calls=%d, want one retry", v.calls)
+	}
+	if lines := logs.snapshot(); len(lines) != 1 {
+		t.Fatalf("retry lines=%v, want pending streak logged once", lines)
+	}
+
+	v.err = nil
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 0, start.Add(2*time.Minute))
+	if v.calls != 3 || v.target != 4096 || m.last["a"] != 4096 {
+		t.Fatalf("recovery calls=%d target=%d last=%d, want successful 4096 target recorded", v.calls, v.target, m.last["a"])
+	}
+	if m.pendingLogged["a"] {
+		t.Fatal("pending log streak was not cleared after successful apply")
+	}
+	for _, line := range logs.snapshot() {
+		if strings.Contains(line, "restoring externally moved target") {
+			t.Fatalf("pending recovery emitted misleading external-move line: %q", line)
+		}
+	}
+}
+
 func TestManagerRestoresKnownNodeToLiveHoldTarget(t *testing.T) {
 	m := NewManager(nil)
 	v := &currentTargetRecordingVM{
@@ -290,6 +345,44 @@ func TestManagerPressureLatchClampsReleaseUntilClear(t *testing.T) {
 	m.ReconcileSnapshot(vms, cleared, 6144, 1024, 0, start.Add(2*time.Minute))
 	if v.calls != 2 || v.target != 3796 {
 		t.Fatalf("cleared calls=%d target=%d, want release to the 300 MiB deficit target", v.calls, v.target)
+	}
+}
+
+func TestManagerPressureLatchClampsPlanToAbandonedPreBalloonTarget(t *testing.T) {
+	m := NewManager(nil)
+	v := &currentTargetRecordingVM{
+		recordingVM:   recordingVM{configured: 4096, target: 4096},
+		currentTarget: 4096,
+	}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 0, start)
+	v.currentTarget = 3072
+	latched := memorySample(6144 - 596)
+	latched.Pressure = hostmem.PressureCritical
+	m.ReconcileSnapshot(vms, latched, 6144, 1024, 0, start.Add(time.Minute))
+
+	if v.target != 3072 || v.currentTarget != 3072 {
+		t.Fatalf("latched target=%d current=%d, want abandoned pre-balloon target 3072 held instead of plan 3500", v.target, v.currentTarget)
+	}
+}
+
+func TestManagerWithoutPressureLatchRestoresAbandonedPreBalloonTargetToPlan(t *testing.T) {
+	m := NewManager(nil)
+	v := &currentTargetRecordingVM{
+		recordingVM:   recordingVM{configured: 4096, target: 4096},
+		currentTarget: 4096,
+	}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 0, start)
+	v.currentTarget = 3072
+	m.ReconcileSnapshot(vms, memorySample(6144-596), 6144, 1024, 0, start.Add(time.Minute))
+
+	if v.target != 3500 || v.currentTarget != 3500 {
+		t.Fatalf("clear target=%d current=%d, want planned target 3500 restored", v.target, v.currentTarget)
 	}
 }
 

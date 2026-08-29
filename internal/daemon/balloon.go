@@ -42,7 +42,7 @@ func (m balloonMachine) SetMemoryTargetMiB(targetMiB int) error {
 		// not a guest that gave memory back: the driver is not loaded yet, so
 		// the target goes unrecorded and the node still counts as reclaimable.
 		if m.tolerateDeviceNotActive && errors.Is(err, hypervisor.ErrDeviceNotActive) {
-			return nil
+			return fmt.Errorf("%w: %v", balloon.ErrTargetPending, err)
 		}
 		return err
 	}
@@ -434,7 +434,7 @@ func (r balloonReclaim) apply(deficitMiB int) (int, error) {
 	targets := balloon.PlanTargets(nodes, deficitMiB+len(nodes), r.floorMiB)
 	heldMiB := 0
 	for _, name := range names {
-		if err := r.vms[name].SetMemoryTargetMiB(targets[name]); err != nil {
+		if err := r.vms[name].SetMemoryTargetMiB(targets[name]); err != nil && !errors.Is(err, balloon.ErrTargetPending) {
 			return 0, fmt.Errorf("balloon %s down to %d MiB: %w", name, targets[name], err)
 		}
 		// The hold is measured from the CONFIGURED size, not from the deficit

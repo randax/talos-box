@@ -47,8 +47,8 @@ func TestBalloonablesBypassAPIDProbeWhenBackendReportsBalloonReadback(t *testing
 	if len(vms) != 1 {
 		t.Fatalf("Balloonables() count = %d, want 1 running node without apid gating", len(vms))
 	}
-	if err := vms[item.Name+"/"+item.Nodes[0].Name].SetMemoryTargetMiB(1024); err != nil {
-		t.Fatalf("SetMemoryTargetMiB() = %v, want ErrDeviceNotActive tolerated on QEMU path", err)
+	if err := vms[item.Name+"/"+item.Nodes[0].Name].SetMemoryTargetMiB(1024); !errors.Is(err, balloon.ErrTargetPending) {
+		t.Fatalf("SetMemoryTargetMiB() = %v, want ErrTargetPending on QEMU path", err)
 	}
 }
 
@@ -82,18 +82,43 @@ func TestBalloonablesKeepAPIDGateWithoutBalloonReadback(t *testing.T) {
 
 func TestBalloonMachineOnlyToleratesInactiveDeviceOnCapabilityDrivenPath(t *testing.T) {
 	errDeviceInactive := hypervisor.ErrDeviceNotActive
-
-	if err := (balloonMachine{
-		machine:                 &fakeMachine{setMemoryErr: errDeviceInactive},
-		tolerateDeviceNotActive: true,
-	}).SetMemoryTargetMiB(1024); err != nil {
-		t.Fatalf("SetMemoryTargetMiB() = %v, want nil when inactive devices are tolerated", err)
-	}
+	recorded := 0
 
 	err := (balloonMachine{
+		machine:                 &fakeMachine{setMemoryErr: errDeviceInactive},
+		tolerateDeviceNotActive: true,
+		recordTarget:            func(int) { recorded++ },
+	}).SetMemoryTargetMiB(1024)
+	if !errors.Is(err, balloon.ErrTargetPending) {
+		t.Fatalf("SetMemoryTargetMiB() = %v, want ErrTargetPending when inactive devices are tolerated", err)
+	}
+	if recorded != 0 {
+		t.Fatalf("recordTarget calls=%d, want none for a target the guest did not accept", recorded)
+	}
+
+	err = (balloonMachine{
 		machine: &fakeMachine{setMemoryErr: errDeviceInactive},
 	}).SetMemoryTargetMiB(1024)
 	if !errors.Is(err, errDeviceInactive) {
 		t.Fatalf("SetMemoryTargetMiB() = %v, want ErrDeviceNotActive when capability path is not enabled", err)
+	}
+}
+
+func TestBalloonReclaimTreatsPendingTargetAsSuccess(t *testing.T) {
+	vm := balloonMachine{
+		machine:                 &fakeMachine{setMemoryErr: hypervisor.ErrDeviceNotActive},
+		configuredMiB:           4096,
+		tolerateDeviceNotActive: true,
+	}
+
+	held, err := (balloonReclaim{
+		vms:      map[string]balloon.Balloonable{"a": vm},
+		floorMiB: 1024,
+	}).apply(512)
+	if err != nil {
+		t.Fatalf("apply() = %v, want pending inactive device tolerated", err)
+	}
+	if held <= 0 {
+		t.Fatalf("apply() held=%d, want planned reclaim preserved", held)
 	}
 }
