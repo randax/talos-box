@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -766,5 +767,51 @@ func TestRunKeepsPollingAfterARealProbeFailure(t *testing.T) {
 	}
 	if !strings.Contains(got[1], "balloon: read host memory") {
 		t.Errorf("second line = %q, want the read failure reported", got[1])
+	}
+}
+
+// A hold taken from mixed results — one guest shrank, its sibling's balloon
+// device was not up — is the successful guest's reduction only. The manager
+// must not replan that hold over both guests and hand part of it back to the
+// one that gave it, while the pending guest contributes nothing.
+func TestManagerPlansHoldAroundPendingDevice(t *testing.T) {
+	logs := &recordingLog{}
+	m := NewManager(logs.Printf)
+	applied := &currentTargetRecordingVM{
+		recordingVM:   recordingVM{configured: 4096, target: 3583},
+		currentTarget: 3583, // the provision gate already took 513 MiB
+	}
+	pending := &currentTargetRecordingVM{
+		recordingVM:   recordingVM{configured: 4096, target: 4096, err: ErrTargetPending},
+		currentTarget: 4096,
+	}
+	vms := map[string]Balloonable{"a": applied, "b": pending}
+	start := time.Unix(1000, 0)
+	const hold = 513
+
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, hold, start)
+	if applied.target != 3583 {
+		t.Fatalf("applied guest target=%d after first tick, want 3583 (no release on the pending guest's behalf)", applied.target)
+	}
+	if !m.devicePending["b"] || pending.calls != 1 {
+		t.Fatalf("pending guest devicePending=%t calls=%d, want planned around after one attempt", m.devicePending["b"], pending.calls)
+	}
+
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, hold, start.Add(5*time.Second))
+	if applied.target != 3583 || pending.calls != 1 {
+		t.Fatalf("inside window target=%d pendingCalls=%d, want steady", applied.target, pending.calls)
+	}
+
+	// The device comes up: the probe succeeds and the hold is re-shared.
+	pending.err = nil
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, hold, start.Add(time.Minute))
+	if m.devicePending["b"] {
+		t.Fatal("devicePending still set after the device answered")
+	}
+	if applied.target != 3840 || pending.target != 3840 {
+		t.Fatalf("after activation targets a=%d b=%d, want the 513 MiB hold shared as 3840/3840", applied.target, pending.target)
+	}
+	if !slices.ContainsFunc(logs.snapshot(), func(l string) bool { return strings.Contains(l, "device active") }) {
+		t.Fatalf("logs=%v, want the device activation attested", logs.snapshot())
 	}
 }

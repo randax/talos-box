@@ -55,6 +55,7 @@ type Manager struct {
 	lastRetarget        map[string]time.Time
 	retryPending        map[string]bool
 	pendingLogged       map[string]bool
+	devicePending       map[string]bool
 	pressureLatched     bool
 	deadbandMiB         int
 	minRetargetInterval time.Duration
@@ -72,6 +73,7 @@ func NewManager(logger Logger) *Manager {
 		lastRetarget:        map[string]time.Time{},
 		retryPending:        map[string]bool{},
 		pendingLogged:       map[string]bool{},
+		devicePending:       map[string]bool{},
 		deadbandMiB:         defaultDeadbandMiB,
 		minRetargetInterval: defaultMinRetargetInterval,
 	}
@@ -80,6 +82,13 @@ func NewManager(logger Logger) *Manager {
 // ReconcileSnapshot applies the steady-state policy to one shared memory
 // sample. Pressure signals veto release of existing reclaim; they never create
 // reclaim without a real available-memory deficit.
+//
+// A guest whose balloon device is not active yet cannot give memory back, so
+// it is planned around: the deficit is shared out over the guests that can,
+// and the pending guest is only probed on the retry window until its device
+// comes up. Reductions are applied before releases so a pending device is
+// discovered before any other guest is handed memory on its behalf; when one
+// is discovered mid-tick the plan is redone without it.
 func (m *Manager) ReconcileSnapshot(vms map[string]Balloonable, sample hostmem.Snapshot, reserveMiB, floorMiB, holdMiB int, now time.Time) {
 	m.updatePressureLatch(sample)
 	naturalDeficit := reserveMiB - sample.AvailableMiB
@@ -95,8 +104,124 @@ func (m *Manager) ReconcileSnapshot(vms map[string]Balloonable, sample hostmem.S
 	}
 	holdSetsDeficit := holdMiB > 0 && holdMiB >= naturalDeficit
 
+	m.probePendingDevices(vms, now)
+
+	appliedThisTick := map[string]int{}
+	anySucceeded := false
+	for round := 0; round <= len(vms); round++ {
+		targets := m.planActive(vms, deficit, floorMiB)
+		changed, hasUnappliedTarget := m.classify(vms, targets)
+		if !changed {
+			break
+		}
+		if round == 0 && !holdSetsDeficit && !m.lastAppliedHold && m.lastAppliedKnown && absInt(deficit-m.lastAppliedDeficit) < m.deadbandMiB && !hasUnappliedTarget {
+			break
+		}
+		names := make([]string, 0, len(targets))
+		for name := range targets {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		newlyPending := false
+		for _, reductions := range []bool{true, false} {
+			for _, name := range names {
+				target := targets[name]
+				if (target < m.currentMiB(vms[name], name)) != reductions {
+					continue
+				}
+				if prior, ok := appliedThisTick[name]; ok && target >= prior {
+					// Already moved this tick; a replan never hands back
+					// what this tick just took.
+					continue
+				}
+				outcome := m.applyTarget(vms, name, target, holdSetsDeficit, sample, reserveMiB, deficit, now)
+				switch outcome {
+				case applyOutcomeApplied:
+					appliedThisTick[name] = target
+					anySucceeded = true
+				case applyOutcomePending:
+					newlyPending = true
+				}
+			}
+			if newlyPending {
+				break
+			}
+		}
+		if !newlyPending {
+			break
+		}
+	}
+	if anySucceeded {
+		m.lastAppliedDeficit = deficit
+		m.lastAppliedKnown = true
+		m.lastAppliedHold = holdSetsDeficit
+	}
+	m.dropDeparted(vms)
+}
+
+type applyOutcome int
+
+const (
+	applyOutcomeSkipped applyOutcome = iota
+	applyOutcomeApplied
+	applyOutcomePending
+	applyOutcomeFailed
+)
+
+// applyTarget is one node's share of a tick: the change-driven skip, the
+// per-node retry window, and the telemetry for whatever the guest answered.
+func (m *Manager) applyTarget(vms map[string]Balloonable, name string, target int, holdSetsDeficit bool, sample hostmem.Snapshot, reserveMiB, deficit int, now time.Time) applyOutcome {
+	previous, known := m.last[name]
+	externalTarget, externallyMoved := externallyMovedTarget(vms[name], previous, known)
+	if externallyMoved {
+		known = false
+	}
+	if known && previous == target {
+		return applyOutcomeSkipped
+	}
+	if !holdSetsDeficit && (!externallyMoved || m.retryPending[name]) {
+		if last, ok := m.lastRetarget[name]; ok && now.Sub(last) < m.minRetargetInterval {
+			m.retryPending[name] = true
+			return applyOutcomeSkipped
+		}
+	}
+	if err := vms[name].SetMemoryTargetMiB(target); err != nil {
+		if errors.Is(err, ErrTargetPending) {
+			if !m.pendingLogged[name] {
+				m.log("balloon %s: %v", name, err)
+				m.pendingLogged[name] = true
+			}
+			m.devicePending[name] = true
+			m.retryPending[name] = true
+			m.lastRetarget[name] = now
+			return applyOutcomePending
+		}
+		m.log("balloon %s: %v", name, err)
+		m.retryPending[name] = true
+		return applyOutcomeFailed
+	}
+	m.last[name] = target
+	m.lastRetarget[name] = now
+	delete(m.retryPending, name)
+	delete(m.pendingLogged, name)
+	if externallyMoved {
+		m.log("balloon %s: target=%dMiB (restoring externally moved target %d)", name, target, externalTarget)
+		return applyOutcomeApplied
+	}
+	m.log("balloon %s: target=%dMiB (configured=%d hostFree=%d reserve=%d deficit=%d compressor=%dMiB swapUsed=%d%% pressureLatched=%t)",
+		name, target, vms[name].ConfiguredMiB(), sample.AvailableMiB, reserveMiB, deficit,
+		sample.CompressorMiB, snapshotSwapPercent(sample), m.pressureLatched)
+	return applyOutcomeApplied
+}
+
+// planActive shares deficit over the guests whose balloon device answers,
+// clamped under a pressure latch so no guest is handed memory back.
+func (m *Manager) planActive(vms map[string]Balloonable, deficit, floorMiB int) map[string]int {
 	nodes := make([]Node, 0, len(vms))
 	for name, vm := range vms {
+		if m.devicePending[name] {
+			continue
+		}
 		nodes = append(nodes, Node{Name: name, ConfiguredMiB: vm.ConfiguredMiB()})
 	}
 	targets := PlanTargets(nodes, deficit, floorMiB)
@@ -115,8 +240,12 @@ func (m *Manager) ReconcileSnapshot(vms map[string]Balloonable, sample hostmem.S
 			}
 		}
 	}
-	changed := false
-	hasUnappliedTarget := false
+	return targets
+}
+
+// classify reports whether any planned target differs from the manager's
+// record, and whether one of those is a node with no applied target yet.
+func (m *Manager) classify(vms map[string]Balloonable, targets map[string]int) (changed, hasUnappliedTarget bool) {
 	for name, target := range targets {
 		previous, known := m.last[name]
 		if _, moved := externallyMovedTarget(vms[name], previous, known); moved {
@@ -131,70 +260,50 @@ func (m *Manager) ReconcileSnapshot(vms map[string]Balloonable, sample hostmem.S
 			delete(m.retryPending, name)
 		}
 	}
-	if !changed {
-		m.dropDeparted(vms)
-		return
-	}
-	if !holdSetsDeficit && !m.lastAppliedHold && m.lastAppliedKnown && absInt(deficit-m.lastAppliedDeficit) < m.deadbandMiB && !hasUnappliedTarget {
-		m.dropDeparted(vms)
-		return
-	}
+	return changed, hasUnappliedTarget
+}
 
-	names := make([]string, 0, len(vms))
-	for name := range vms {
-		names = append(names, name)
+// currentMiB is what the guest holds as far as the manager can tell: its
+// reported current target, else the manager's record, else its configured size.
+func (m *Manager) currentMiB(vm Balloonable, name string) int {
+	if current, ok := vm.(CurrentTargeter); ok {
+		if target := current.CurrentTargetMiB(); target > 0 {
+			return target
+		}
 	}
-	sort.Strings(names)
-	anySucceeded := false
-	for _, name := range names {
-		target := targets[name]
-		previous, known := m.last[name]
-		externalTarget, externallyMoved := externallyMovedTarget(vms[name], previous, known)
-		if externallyMoved {
-			known = false
-		}
-		if known && previous == target {
+	if previous, ok := m.last[name]; ok {
+		return previous
+	}
+	return vm.ConfiguredMiB()
+}
+
+// probePendingDevices asks each guest with an inactive balloon device for its
+// configured size once per retry window — a no-op for the guest, which never
+// inflated, that tells the manager when the device has come up. A guest whose
+// device answers rejoins the plan on this tick.
+func (m *Manager) probePendingDevices(vms map[string]Balloonable, now time.Time) {
+	for name := range m.devicePending {
+		vm, ok := vms[name]
+		if !ok {
 			continue
 		}
-		if !holdSetsDeficit && (!externallyMoved || m.retryPending[name]) {
-			if last, ok := m.lastRetarget[name]; ok && now.Sub(last) < m.minRetargetInterval {
-				m.retryPending[name] = true
-				continue
-			}
-		}
-		if err := vms[name].SetMemoryTargetMiB(target); err != nil {
-			if errors.Is(err, ErrTargetPending) {
-				if !m.pendingLogged[name] {
-					m.log("balloon %s: %v", name, err)
-					m.pendingLogged[name] = true
-				}
-				m.retryPending[name] = true
-				m.lastRetarget[name] = now
-				continue
-			}
-			m.log("balloon %s: %v", name, err)
-			m.retryPending[name] = true
+		if last, ok := m.lastRetarget[name]; ok && now.Sub(last) < m.minRetargetInterval {
 			continue
 		}
-		m.last[name] = target
-		m.lastRetarget[name] = now
+		err := vm.SetMemoryTargetMiB(vm.ConfiguredMiB())
+		if err != nil {
+			if !errors.Is(err, ErrTargetPending) {
+				m.log("balloon %s: %v", name, err)
+			}
+			m.lastRetarget[name] = now
+			continue
+		}
+		delete(m.devicePending, name)
 		delete(m.retryPending, name)
 		delete(m.pendingLogged, name)
-		anySucceeded = true
-		if externallyMoved {
-			m.log("balloon %s: target=%dMiB (restoring externally moved target %d)", name, target, externalTarget)
-			continue
-		}
-		m.log("balloon %s: target=%dMiB (configured=%d hostFree=%d reserve=%d deficit=%d compressor=%dMiB swapUsed=%d%% pressureLatched=%t)",
-			name, target, vms[name].ConfiguredMiB(), sample.AvailableMiB, reserveMiB, deficit,
-			sample.CompressorMiB, snapshotSwapPercent(sample), m.pressureLatched)
+		m.last[name] = vm.ConfiguredMiB()
+		m.log("balloon %s: device active; target=%dMiB", name, vm.ConfiguredMiB())
 	}
-	if anySucceeded {
-		m.lastAppliedDeficit = deficit
-		m.lastAppliedKnown = true
-		m.lastAppliedHold = holdSetsDeficit
-	}
-	m.dropDeparted(vms)
 }
 
 func externallyMovedTarget(vm Balloonable, previous int, known bool) (int, bool) {
@@ -254,6 +363,11 @@ func (m *Manager) dropDeparted(vms map[string]Balloonable) {
 	for name := range m.pendingLogged {
 		if _, ok := vms[name]; !ok {
 			delete(m.pendingLogged, name)
+		}
+	}
+	for name := range m.devicePending {
+		if _, ok := vms[name]; !ok {
+			delete(m.devicePending, name)
 		}
 	}
 	if len(m.last) == 0 {
