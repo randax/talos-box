@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/randax/talos-box/internal/balloon"
@@ -104,21 +105,48 @@ func TestBalloonMachineOnlyToleratesInactiveDeviceOnCapabilityDrivenPath(t *test
 	}
 }
 
-func TestBalloonReclaimTreatsPendingTargetAsSuccess(t *testing.T) {
-	vm := balloonMachine{
+func TestBalloonReclaimDoesNotCreditAPendingTarget(t *testing.T) {
+	pending := balloonMachine{
 		machine:                 &fakeMachine{setMemoryErr: hypervisor.ErrDeviceNotActive},
 		configuredMiB:           4096,
 		tolerateDeviceNotActive: true,
 	}
 
 	held, err := (balloonReclaim{
-		vms:      map[string]balloon.Balloonable{"a": vm},
+		vms:      map[string]balloon.Balloonable{"a": pending},
 		floorMiB: 1024,
 	}).apply(512)
-	if err != nil {
-		t.Fatalf("apply() = %v, want pending inactive device tolerated", err)
+	if !errors.Is(err, balloon.ErrTargetPending) {
+		t.Fatalf("apply() = %v, want ErrTargetPending: an inactive device released nothing", err)
 	}
-	if held <= 0 {
-		t.Fatalf("apply() held=%d, want planned reclaim preserved", held)
+	if held != 0 {
+		t.Fatalf("apply() held=%d, want 0 for a reclaim that has not happened", held)
+	}
+}
+
+func TestBalloonReclaimHoldsOnlyWhatActiveGuestsGaveBack(t *testing.T) {
+	pending := balloonMachine{
+		machine:                 &fakeMachine{setMemoryErr: hypervisor.ErrDeviceNotActive},
+		configuredMiB:           4096,
+		tolerateDeviceNotActive: true,
+	}
+	active := &fakeMachine{active: true}
+	healthy := balloonMachine{machine: active, configuredMiB: 4096}
+
+	held, err := (balloonReclaim{
+		vms:      map[string]balloon.Balloonable{"a": pending, "b": healthy},
+		floorMiB: 1024,
+	}).apply(1024)
+	if !errors.Is(err, balloon.ErrTargetPending) {
+		t.Fatalf("apply() = %v, want ErrTargetPending naming the pending guest", err)
+	}
+	if !strings.Contains(err.Error(), "a") {
+		t.Fatalf("apply() = %v, want the pending guest named", err)
+	}
+	// The healthy guest was asked for its share (half of 1024 + 1 MiB
+	// residual) and only that share is held.
+	want := 4096 - active.memoryTargets[len(active.memoryTargets)-1]
+	if held != want || want <= 0 {
+		t.Fatalf("apply() held=%d, want %d (the healthy guest's reduction only)", held, want)
 	}
 }
