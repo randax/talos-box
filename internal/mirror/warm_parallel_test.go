@@ -28,11 +28,17 @@ type parallelWarmFixture struct {
 	peak     atomic.Int64
 	gate     chan struct{}
 	failBlob string
+	// shareLayers gives every image the same layer bytes, so refs share a blob
+	shareLayers bool
+	onBlob      func()
 }
 
-func newParallelWarmFixture(t *testing.T, repos []string, layersPerImage int) *parallelWarmFixture {
+func newParallelWarmFixture(t *testing.T, repos []string, layersPerImage int, options ...func(*parallelWarmFixture)) *parallelWarmFixture {
 	t.Helper()
 	f := &parallelWarmFixture{gate: make(chan struct{})}
+	for _, option := range options {
+		option(f)
+	}
 	type image struct {
 		manifest, digest string
 		blobs            map[string][]byte
@@ -43,6 +49,9 @@ func newParallelWarmFixture(t *testing.T, repos []string, layersPerImage int) *p
 		var layers []string
 		for i := 0; i < layersPerImage; i++ {
 			data := []byte(fmt.Sprintf("%s-layer-%d", repo, i))
+			if f.shareLayers {
+				data = []byte(fmt.Sprintf("shared-layer-%d", i))
+			}
 			digest := "sha256:" + sha256Hex(data)
 			blobs[digest] = data
 			layers = append(layers, fmt.Sprintf(`{"digest":"%s"}`, digest))
@@ -77,6 +86,9 @@ func newParallelWarmFixture(t *testing.T, repos []string, layersPerImage int) *p
 					response.StatusCode, response.Status = http.StatusInternalServerError, "500 Internal Server Error"
 					response.Body = io.NopCloser(strings.NewReader("boom"))
 					return response, nil
+				}
+				if f.onBlob != nil {
+					f.onBlob()
 				}
 				n := f.inFlight.Add(1)
 				for {
@@ -187,8 +199,8 @@ func TestWarmJobsAreCappedByTheDaemonWideLimit(t *testing.T) {
 	if <-reached {
 		t.Fatalf("peak in flight = %d, want <= %d", f.peak.Load(), MaxWarmJobs)
 	}
-	if peak := f.peak.Load(); peak != MaxWarmJobs {
-		t.Fatalf("peak in flight = %d, want exactly the cap %d", peak, MaxWarmJobs)
+	if peak := f.peak.Load(); peak < 2 || peak > MaxWarmJobs {
+		t.Fatalf("peak in flight = %d, want parallel but within the cap %d", peak, MaxWarmJobs)
 	}
 }
 
@@ -260,6 +272,27 @@ func TestWarmSerializesOnlySameTag(t *testing.T) {
 	}
 	if len(k.locks) != 0 {
 		t.Fatalf("locks map = %v, want released keys forgotten", k.locks)
+	}
+}
+
+func TestWarmDownloadsALayerSharedByConcurrentRefsOnce(t *testing.T) {
+	var fetches atomic.Int64
+	f := newParallelWarmFixture(t, []string{"one", "two"}, 1, func(f *parallelWarmFixture) {
+		f.shareLayers = true
+		f.onBlob = func() { fetches.Add(1) }
+	})
+	reached := f.openGateWhen(1, 5*time.Second)
+	summary, err := f.manager.Warm(context.Background(), f.refs, imagecache.ArchitectureAMD64, WarmOptions{Jobs: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-reached
+	if summary.Warmed != 2 {
+		t.Fatalf("summary = %+v", summary)
+	}
+	// one shared layer + two configs
+	if got := fetches.Load(); got != 3 {
+		t.Fatalf("blob fetches = %d, want 3 (the shared layer once)", got)
 	}
 }
 

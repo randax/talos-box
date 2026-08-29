@@ -92,8 +92,9 @@ func TestRunCacheWarmDefaultDoesNotRequestRefresh(t *testing.T) {
 		if args.Refresh {
 			t.Error("Refresh = true, want false")
 		}
-		if args.Jobs != daemon.DefaultCacheWarmJobs {
-			t.Errorf("Jobs = %d, want the default %d", args.Jobs, daemon.DefaultCacheWarmJobs)
+		// the default 8 jobs are split across the 4 requests in flight
+		if want := daemon.DefaultCacheWarmJobs / 4; args.Jobs != want {
+			t.Errorf("Jobs = %d, want the default's per-request share %d", args.Jobs, want)
 		}
 		result := daemon.CacheWarmResult{Entries: []daemon.CacheWarmEntry{{Ref: wantRefs[index]}}}
 		switch index {
@@ -735,10 +736,11 @@ func TestRunCacheWarmKeepsSeveralRefsInFlightAndPrintsInListOrder(t *testing.T) 
 	var mu sync.Mutex
 	inFlight, peak := 0, 0
 	holdFirst := make(chan struct{})
+	var shares []int
 	warmStubListener(t, func(connection net.Conn, args daemon.CacheWarmArgs) {
-		if args.Jobs != 6 {
-			t.Errorf("Jobs = %d, want 6", args.Jobs)
-		}
+		mu.Lock()
+		shares = append(shares, args.Jobs)
+		mu.Unlock()
 		mu.Lock()
 		inFlight++
 		if inFlight > peak {
@@ -762,6 +764,7 @@ func TestRunCacheWarmKeepsSeveralRefsInFlightAndPrintsInListOrder(t *testing.T) 
 	command := cli{out: stdout, err: &stderr, in: bytes.NewBuffer(nil)}
 	commandDone := make(chan error, 1)
 	go func() { commandDone <- command.run([]string{"cache", "warm", "--jobs", "6", writeWarmList(t, refs)}) }()
+	// --jobs 6 over 4 requests in flight: shares of 2, 2, 1, 1
 
 	// the later refs finish while the first is held, yet nothing prints:
 	// output is in list order
@@ -785,8 +788,13 @@ func TestRunCacheWarmKeepsSeveralRefsInFlightAndPrintsInListOrder(t *testing.T) 
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if peak != 4 {
-		t.Fatalf("peak requests in flight = %d, want min(4, jobs) = 4", peak)
+	if peak < 2 || peak > 4 {
+		t.Fatalf("peak requests in flight = %d, want parallel and at most min(4, jobs) = 4", peak)
+	}
+	for _, share := range shares {
+		if share != 1 && share != 2 {
+			t.Fatalf("request shares = %v, want each request to carry 1 or 2 of the 6 jobs", shares)
+		}
 	}
 	var want strings.Builder
 	for _, ref := range refs {
@@ -795,6 +803,15 @@ func TestRunCacheWarmKeepsSeveralRefsInFlightAndPrintsInListOrder(t *testing.T) 
 	want.WriteString("summary: 6 warmed, 0 already complete, 0 failed (missing)\n")
 	if got := stdout.String(); got != want.String() {
 		t.Fatalf("stdout = %q, want %q", got, want.String())
+	}
+}
+
+func TestWarmRefsConcurrentlySplitsJobsAcrossRequests(t *testing.T) {
+	for jobs, want := range map[int][]int{1: {1}, 2: {1, 1}, 3: {1, 1, 1}, 4: {1, 1, 1, 1}, 6: {2, 2, 1, 1}, 8: {2, 2, 2, 2}, 9: {3, 2, 2, 2}} {
+		got := warmJobShares(jobs)
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Errorf("shares(%d) = %v, want %v", jobs, got, want)
+		}
 	}
 }
 

@@ -2164,7 +2164,7 @@ func TestWarmDefaultRerunDoesNotReResolveTags(t *testing.T) {
 		t.Fatal(err)
 	}
 	if first.ReResolvedTags != 1 {
-		t.Fatalf("first warm ReResolvedTags = %d, want the one tag-pinned ref", first.ReResolvedTags)
+		t.Fatalf("first warm ReResolvedTags = %d, want the one tag-pinned ref; results %+v", first.ReResolvedTags, first.Results)
 	}
 
 	second, err := manager.Warm(context.Background(), refs, imagecache.ArchitectureAMD64, WarmOptions{})

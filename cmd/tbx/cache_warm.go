@@ -186,6 +186,21 @@ func (c cli) runCacheWarm(args []string) error {
 	return nil
 }
 
+// warmJobShares splits jobs across at most four in-flight requests so the
+// shares sum to jobs: 8 -> [2 2 2 2], 6 -> [2 2 1 1], 1 -> [1].
+func warmJobShares(jobs int) []int {
+	const maxRequestsInFlight = 4
+	requests := min(maxRequestsInFlight, jobs)
+	shares := make([]int, requests)
+	for i := range shares {
+		shares[i] = jobs / requests
+		if i < jobs%requests {
+			shares[i]++
+		}
+	}
+	return shares
+}
+
 type warmOutcome struct {
 	entry daemon.CacheWarmEntry
 	err   error
@@ -195,23 +210,30 @@ type warmOutcome struct {
 // each, as before) so the daemon's blob pool sees more than one ref at a
 // time, and hands the outcomes back in list order: each returned func blocks
 // until its ref is done, so the caller still prints ✓/✗ lines progressively.
-// The first error stops further requests from starting. --jobs 1 keeps one
-// request in flight, which is exactly the serial behaviour it replaces (#506).
+// The in-flight requests split `jobs` between them — each slot carries its
+// share, and the shares sum to jobs — so the run keeps exactly --jobs blob
+// downloads in flight however many requests that takes. The first error stops
+// further requests from starting. --jobs 1 keeps one request in flight, which
+// is exactly the serial behaviour it replaces (#506).
 func (c cli) warmRefsConcurrently(refs []string, refresh bool, jobs int) []func() (daemon.CacheWarmEntry, error) {
-	const maxRequestsInFlight = 4
 	outcomes := make([]chan warmOutcome, len(refs))
 	for i := range outcomes {
 		outcomes[i] = make(chan warmOutcome, 1)
 	}
-	slots := make(chan struct{}, min(maxRequestsInFlight, jobs))
+	shares := warmJobShares(jobs)
+	slots := make(chan int, len(shares))
+	for _, share := range shares {
+		slots <- share
+	}
 	stop := make(chan struct{})
 	var stopOnce sync.Once
 	go func() {
 		for i, ref := range refs {
+			var share int
 			select {
 			case <-stop:
 				return
-			case slots <- struct{}{}:
+			case share = <-slots:
 			}
 			select {
 			case <-stop:
@@ -220,9 +242,9 @@ func (c cli) warmRefsConcurrently(refs []string, refresh bool, jobs int) []func(
 			default:
 			}
 			go func() {
-				defer func() { <-slots }()
+				defer func() { slots <- share }()
 				var result daemon.CacheWarmResult
-				err := c.call("cache.warm", daemon.CacheWarmArgs{Refs: []string{ref}, Refresh: refresh, Jobs: jobs}, &result)
+				err := c.call("cache.warm", daemon.CacheWarmArgs{Refs: []string{ref}, Refresh: refresh, Jobs: share}, &result)
 				var entry daemon.CacheWarmEntry
 				if err == nil {
 					entry, err = cacheWarmEntryForRef(ref, result)

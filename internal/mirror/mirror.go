@@ -104,7 +104,7 @@ func newSafeTransport(egress egressDependencies) *http.Transport {
 			Proxy:                 nil,
 			ForceAttemptHTTP2:     true,
 			MaxIdleConns:          100,
-			MaxIdleConnsPerHost:   http.DefaultMaxIdleConnsPerHost,
+			MaxIdleConnsPerHost:   MaxWarmJobs, // a warm keeps this many fetches on one host
 			IdleConnTimeout:       90 * time.Second,
 			TLSHandshakeTimeout:   10 * time.Second,
 			ExpectContinueTimeout: 1 * time.Second,

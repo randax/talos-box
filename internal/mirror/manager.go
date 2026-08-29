@@ -56,6 +56,8 @@ type Manager struct {
 	dynamicClosers    map[string]func()
 	dynamicCap        int
 	warmTagLocks      keyedMutex
+	warmBlobLocks     keyedMutex
+	warmPublishLocks  keyedMutex
 	warmSlotsOnce     sync.Once
 	warmSlots         chan struct{}
 }

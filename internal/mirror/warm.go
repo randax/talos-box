@@ -188,6 +188,10 @@ func (m *Manager) warmOne(ctx context.Context, reference string, architecture im
 	}
 	metadata := staged.metadata
 	metadata.DockerContentDigest = digest
+	// a tag ref and a digest ref of the same image warm side by side and
+	// both publish this manifest: the inspect below must not read one while
+	// the other swaps the identical file in (#506)
+	defer m.warmPublishLocks.lock(server.cacheDir + " " + digest)()
 	if err := server.storeManifest(manifestRequestPath(parsed.repository, digest), metadata, body); err != nil {
 		return failedWarmResult(before), fmt.Errorf("publish digest manifest: %w", err)
 	}
@@ -243,6 +247,12 @@ func warmManifestGraph(ctx context.Context, handler http.Handler, server *Server
 					return err
 				}
 				defer release()
+				// refs warming side by side often share a base layer; one
+				// downloads it and the others find it cached
+				defer pool.inflight.lock(server.cacheDir + " " + blob)()
+				if blobCached(server, blob) {
+					return nil
+				}
 				return warmBlobRequest(ctx, handler, repository, blob)
 			})
 		}

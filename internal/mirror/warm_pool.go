@@ -20,8 +20,9 @@ const (
 // download, so `jobs` is exactly the request's in-flight count when it runs
 // alone and the shared cap is what it degrades to when it does not.
 type warmPool struct {
-	request chan struct{}
-	shared  chan struct{}
+	request  chan struct{}
+	shared   chan struct{}
+	inflight *keyedMutex
 }
 
 func (m *Manager) newWarmPool(jobs int) *warmPool {
@@ -32,7 +33,7 @@ func (m *Manager) newWarmPool(jobs int) *warmPool {
 		jobs = MaxWarmJobs
 	}
 	m.warmSlotsOnce.Do(func() { m.warmSlots = make(chan struct{}, MaxWarmJobs) })
-	return &warmPool{request: make(chan struct{}, jobs), shared: m.warmSlots}
+	return &warmPool{request: make(chan struct{}, jobs), shared: m.warmSlots, inflight: &m.warmBlobLocks}
 }
 
 func (p *warmPool) jobs() int { return cap(p.request) }
