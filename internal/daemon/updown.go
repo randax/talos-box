@@ -495,7 +495,8 @@ func reconcileProvisioningIntentWithVolumes(item cluster.Cluster, spec config.Cl
 		}
 		next.CSI = desired.CSI
 	}
-	// Hubble is the one symmetric optional desired set. CNI and LB rules above
+	next.DisableKubeletMemoryProtection = desired.DisableKubeletMemoryProtection
+	// Optional provisioning settings remain symmetric. CNI and LB rules above
 	// have already fixed the cluster's irreversible substrate contract.
 	if current.CNI == cluster.CNICilium {
 		next.BGP = desired.BGP

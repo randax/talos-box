@@ -282,7 +282,12 @@ func validateBGPIntent(item cluster.Cluster) error {
 		return fmt.Errorf("cluster %q cannot enable BGP: bgp requires cni: cilium", item.Name)
 	}
 	enabled := true
-	if _, err := cluster.ParseProvisioningIntent(string(item.CNI), string(item.CSI), &item.LB, &enabled, &item.Hubble); err != nil {
+	var kubeletMemoryProtection *bool
+	if item.DisableKubeletMemoryProtection {
+		disabled := false
+		kubeletMemoryProtection = &disabled
+	}
+	if _, err := cluster.ParseProvisioningIntent(string(item.CNI), string(item.CSI), &item.LB, &enabled, &item.Hubble, kubeletMemoryProtection); err != nil {
 		return fmt.Errorf("cluster %q cannot enable BGP: %w", item.Name, err)
 	}
 	return nil

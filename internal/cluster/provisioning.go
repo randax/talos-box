@@ -24,27 +24,29 @@ const (
 // It deliberately contains no progress markers: reconciliation derives those
 // from the cluster itself.
 type ProvisioningIntent struct {
-	CNI    CNI  `json:"cni,omitempty"`
-	CSI    CSI  `json:"csi,omitempty"`
-	LB     bool `json:"lb,omitempty"`
-	BGP    bool `json:"bgp,omitempty"`
-	Hubble bool `json:"hubble,omitempty"`
+	CNI                            CNI  `json:"cni,omitempty"`
+	CSI                            CSI  `json:"csi,omitempty"`
+	LB                             bool `json:"lb,omitempty"`
+	BGP                            bool `json:"bgp,omitempty"`
+	Hubble                         bool `json:"hubble,omitempty"`
+	DisableKubeletMemoryProtection bool `json:"disableKubeletMemoryProtection,omitempty"`
 }
 
 // ProvisioningIntentInput is the wire representation of the provisioning
 // knobs. Pointers distinguish omitted values from explicit false values so
 // validation can reject any knob supplied without cni.
 type ProvisioningIntentInput struct {
-	CNI    string `json:"cni,omitempty" yaml:"cni"`
-	CSI    string `json:"csi,omitempty" yaml:"csi"`
-	LB     *bool  `json:"lb,omitempty" yaml:"lb"`
-	BGP    *bool  `json:"bgp,omitempty" yaml:"bgp"`
-	Hubble *bool  `json:"hubble,omitempty" yaml:"hubble"`
+	CNI                     string `json:"cni,omitempty" yaml:"cni"`
+	CSI                     string `json:"csi,omitempty" yaml:"csi"`
+	LB                      *bool  `json:"lb,omitempty" yaml:"lb"`
+	BGP                     *bool  `json:"bgp,omitempty" yaml:"bgp"`
+	Hubble                  *bool  `json:"hubble,omitempty" yaml:"hubble"`
+	KubeletMemoryProtection *bool  `json:"kubeletMemoryProtection,omitempty" yaml:"kubeletMemoryProtection"`
 }
 
 // Intent returns the defaulted, validated durable intent.
 func (input ProvisioningIntentInput) Intent() (ProvisioningIntent, error) {
-	return ParseProvisioningIntent(input.CNI, input.CSI, input.LB, input.BGP, input.Hubble)
+	return ParseProvisioningIntent(input.CNI, input.CSI, input.LB, input.BGP, input.Hubble, input.KubeletMemoryProtection)
 }
 
 // Input returns the protocol form of a validated intent. Substrate-only
@@ -53,16 +55,20 @@ func (intent ProvisioningIntent) Input() ProvisioningIntentInput {
 	if intent.CNI == "" {
 		return ProvisioningIntentInput{}
 	}
-	return ProvisioningIntentInput{
+	input := ProvisioningIntentInput{
 		CNI: string(intent.CNI), CSI: string(intent.CSI), LB: boolPointer(intent.LB),
 		BGP: boolPointer(intent.BGP), Hubble: boolPointer(intent.Hubble),
 	}
+	if intent.DisableKubeletMemoryProtection {
+		input.KubeletMemoryProtection = boolPointer(false)
+	}
+	return input
 }
 
 // ParseProvisioningIntent validates the user-facing CNI knobs and applies
 // their defaults. Pointer values preserve whether a knob was supplied, which
 // lets callers reject even an explicit false value without cni.
-func ParseProvisioningIntent(cni, csi string, lb, bgp, hubble *bool) (ProvisioningIntent, error) {
+func ParseProvisioningIntent(cni, csi string, lb, bgp, hubble, kubeletMemoryProtection *bool) (ProvisioningIntent, error) {
 	if cni == "" {
 		switch {
 		case csi != "":
@@ -73,6 +79,8 @@ func ParseProvisioningIntent(cni, csi string, lb, bgp, hubble *bool) (Provisioni
 			return ProvisioningIntent{}, fmt.Errorf("bgp requires cni: cilium and lb: true")
 		case hubble != nil:
 			return ProvisioningIntent{}, fmt.Errorf("hubble requires cni: cilium")
+		case kubeletMemoryProtection != nil:
+			return ProvisioningIntent{}, fmt.Errorf("kubeletMemoryProtection requires cni: cilium or flannel")
 		default:
 			return ProvisioningIntent{}, nil
 		}
@@ -97,6 +105,9 @@ func ParseProvisioningIntent(cni, csi string, lb, bgp, hubble *bool) (Provisioni
 	}
 	if hubble != nil {
 		intent.Hubble = *hubble
+	}
+	if kubeletMemoryProtection != nil {
+		intent.DisableKubeletMemoryProtection = !*kubeletMemoryProtection
 	}
 	if intent.BGP && !intent.LB {
 		return ProvisioningIntent{}, fmt.Errorf("bgp requires lb: true")

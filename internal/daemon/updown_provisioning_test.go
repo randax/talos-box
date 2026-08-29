@@ -33,10 +33,30 @@ func TestCreateFromSpecWithoutCNIUsesLegacyProvisioningFields(t *testing.T) {
 	if err := json.Unmarshal(encoded, &fields); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"cni", "csi", "lb", "bgp", "hubble"} {
+	for _, key := range []string{"cni", "csi", "lb", "bgp", "hubble", "kubeletMemoryProtection"} {
 		if _, found := fields[key]; found {
 			t.Fatalf("createFromSpec legacy input unexpectedly includes %q: %s", key, encoded)
 		}
+	}
+}
+
+func TestCreateArgsFromSpecCarriesKubeletMemoryProtectionOptOut(t *testing.T) {
+	spec := config.ClusterSpec{
+		Name: "demo",
+		ProvisioningIntent: cluster.ProvisioningIntent{
+			CNI: cluster.CNICilium, LB: true, DisableKubeletMemoryProtection: true,
+		},
+	}
+	encoded, err := json.Marshal(createArgsFromSpec(spec, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var input cluster.ProvisioningIntentInput
+	if err := json.Unmarshal(encoded, &input); err != nil {
+		t.Fatal(err)
+	}
+	if input.KubeletMemoryProtection == nil || *input.KubeletMemoryProtection {
+		t.Fatalf("create args = %s, want kubeletMemoryProtection false", encoded)
 	}
 }
 
@@ -117,6 +137,13 @@ func TestReconcileProvisioningIntentMutationRules(t *testing.T) {
 			current:     cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true, Hubble: true},
 			desired:     cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true},
 			want:        cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true},
+			wantChanged: true,
+		},
+		{
+			name:        "kubelet memory protection opt-out remains symmetric",
+			current:     cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, LB: true},
+			desired:     cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, LB: true, DisableKubeletMemoryProtection: true},
+			want:        cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, LB: true, DisableKubeletMemoryProtection: true},
 			wantChanged: true,
 		},
 		{

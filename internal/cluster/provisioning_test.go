@@ -9,14 +9,15 @@ func boolPtr(value bool) *bool { return &value }
 
 func TestParseProvisioningIntent(t *testing.T) {
 	tests := []struct {
-		name    string
-		cni     string
-		csi     string
-		lb      *bool
-		bgp     *bool
-		hubble  *bool
-		want    ProvisioningIntent
-		wantErr []string
+		name                    string
+		cni                     string
+		csi                     string
+		lb                      *bool
+		bgp                     *bool
+		hubble                  *bool
+		kubeletMemoryProtection *bool
+		want                    ProvisioningIntent
+		wantErr                 []string
 	}{
 		{
 			name: "cilium defaults load balancer on",
@@ -84,6 +85,11 @@ func TestParseProvisioningIntent(t *testing.T) {
 			wantErr: []string{"hubble requires cni"},
 		},
 		{
+			name:                    "kubelet memory protection without cni",
+			kubeletMemoryProtection: boolPtr(false),
+			wantErr:                 []string{"kubeletMemoryProtection requires cni"},
+		},
+		{
 			name:    "bgp requires load balancer",
 			cni:     "cilium",
 			lb:      boolPtr(false),
@@ -106,7 +112,7 @@ func TestParseProvisioningIntent(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := ParseProvisioningIntent(tt.cni, tt.csi, tt.lb, tt.bgp, tt.hubble)
+			got, err := ParseProvisioningIntent(tt.cni, tt.csi, tt.lb, tt.bgp, tt.hubble, tt.kubeletMemoryProtection)
 			if len(tt.wantErr) > 0 {
 				if err == nil {
 					t.Fatalf("ParseProvisioningIntent() error = nil, want containing %q", tt.wantErr)
@@ -125,5 +131,32 @@ func TestParseProvisioningIntent(t *testing.T) {
 				t.Fatalf("ParseProvisioningIntent() = %+v, want %+v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestParseProvisioningIntentDefaultsKubeletMemoryProtectionOn(t *testing.T) {
+	intent, err := (ProvisioningIntentInput{CNI: string(CNICilium)}).Intent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if intent.DisableKubeletMemoryProtection {
+		t.Fatalf("default provisioning intent = %+v, want kubelet memory protection enabled", intent)
+	}
+}
+
+func TestParseProvisioningIntentAllowsKubeletMemoryProtectionOptOut(t *testing.T) {
+	intent, err := (ProvisioningIntentInput{
+		CNI:                     string(CNICilium),
+		KubeletMemoryProtection: boolPtr(false),
+	}).Intent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !intent.DisableKubeletMemoryProtection {
+		t.Fatalf("opt-out provisioning intent = %+v, want kubelet memory protection disabled", intent)
+	}
+	input := intent.Input()
+	if input.KubeletMemoryProtection == nil || *input.KubeletMemoryProtection {
+		t.Fatalf("durable opt-out input = %+v, want explicit kubeletMemoryProtection false", input)
 	}
 }

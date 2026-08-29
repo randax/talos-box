@@ -150,6 +150,7 @@ func TestParseRejectsInvalidProvisioningIntent(t *testing.T) {
 		{"lb without cni", "lb: false", "lb requires cni"},
 		{"bgp without cni", "bgp: false", "bgp requires cni"},
 		{"hubble without cni", "hubble: false", "hubble requires cni"},
+		{"kubelet memory protection without cni", "kubeletMemoryProtection: false", "kubeletMemoryProtection requires cni"},
 		{"bgp without load balancer", "cni: cilium\n    lb: false\n    bgp: true", "bgp requires lb: true"},
 		{"flannel bgp", "cni: flannel\n    bgp: true", "bgp requires cni: cilium"},
 		{"flannel hubble", "cni: flannel\n    hubble: true", "hubble requires cni: cilium"},
@@ -330,6 +331,38 @@ func TestMarshalProvisioningIntentRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(back.Clusters[0], spec) {
 		t.Fatalf("round trip = %+v, want %+v", back.Clusters[0], spec)
+	}
+}
+
+func TestKubeletMemoryProtectionOptOutMarshalRoundTrip(t *testing.T) {
+	cfg, err := Parse([]byte(`version: 1
+clusters:
+  - name: protected
+    cni: cilium
+  - name: opted-out
+    cni: flannel
+    kubeletMemoryProtection: false
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Clusters[0].DisableKubeletMemoryProtection {
+		t.Fatalf("default cluster intent = %+v, want protection enabled", cfg.Clusters[0].ProvisioningIntent)
+	}
+	if !cfg.Clusters[1].DisableKubeletMemoryProtection {
+		t.Fatalf("opted-out cluster intent = %+v, want protection disabled", cfg.Clusters[1].ProvisioningIntent)
+	}
+
+	encoded := Marshal(cfg)
+	if strings.Count(encoded, "kubeletMemoryProtection: false") != 1 {
+		t.Fatalf("marshaled config must contain exactly the explicit opt-out:\n%s", encoded)
+	}
+	back, err := Parse([]byte(encoded))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(back, cfg) {
+		t.Fatalf("round trip = %+v, want %+v", back, cfg)
 	}
 }
 

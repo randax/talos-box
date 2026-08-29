@@ -34,6 +34,9 @@ func Marshal(cfg Config) string {
 			if c.Hubble {
 				b.WriteString("    hubble: true\n")
 			}
+			if c.DisableKubeletMemoryProtection {
+				b.WriteString("    kubeletMemoryProtection: false\n")
+			}
 		}
 		if c.Domain != "" {
 			fmt.Fprintf(&b, "    domain: %s\n", c.Domain)
