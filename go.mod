@@ -1,6 +1,6 @@
 module github.com/randax/talos-box
 
-go 1.26.5
+go 1.26.6
 
 require (
 	github.com/Code-Hex/vz/v3 v3.7.1
@@ -8,7 +8,7 @@ require (
 	github.com/google/nftables v0.3.0
 	github.com/insomniacslk/dhcp v0.0.0-20260728151720-c308df0fdcef
 	github.com/osrg/gobgp/v3 v3.37.0
-	github.com/siderolabs/talos/pkg/machinery v1.13.6
+	github.com/siderolabs/talos/pkg/machinery v1.13.9
 	github.com/vishvananda/netlink v1.3.0
 	go.yaml.in/yaml/v4 v4.0.0-rc.4
 	golang.org/x/sys v0.47.0
