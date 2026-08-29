@@ -198,27 +198,27 @@ func (m *Manager) serveCatchAll(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	authority, err := parseUpstreamAuthority(strings.TrimSpace(r.URL.Query().Get("ns")))
+	route, err := routeCatchAllRequest(r.URL)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	clone := r.Clone(r.Context())
-	clone.URL = cloneURLWithoutQueryValue(r.URL, "ns")
-	if redirectLoopbackAuthority(w, r, clone.URL, authority) {
+	clone.URL = route.Target
+	if redirectLoopbackAuthority(w, r, clone.URL, route.Authority) {
 		return
 	}
-	if served, cacheErr := m.probeCacheOnly(authority, w, clone); served {
+	if served, cacheErr := m.probeCacheOnly(route.Authority, w, clone); served {
 		return
 	} else if cacheErr != nil {
 		http.Error(w, cacheErr.Error(), cacheErr.status)
 		return
 	}
-	cacheProbe := m.cacheProbeServer(authority)
+	cacheProbe := m.cacheProbeServer(route.Authority)
 	stale := cacheProbe.staleCandidate(clone)
-	handler, ok := m.dynamicHandler(authority.cacheKey)
+	handler, ok := m.dynamicHandler(route.Authority.cacheKey)
 	if !ok {
-		if err := m.validateResolvedAuthority(r.Context(), authority); err != nil {
+		if err := m.validateResolvedAuthority(r.Context(), route.Authority); err != nil {
 			if stale.Complete() && shouldServeStaleOnValidationError(err) && cacheProbe.serveStaleManifest(w, clone, stale, err.Error()) {
 				return
 			}
@@ -230,9 +230,89 @@ func (m *Manager) serveCatchAll(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
-		handler = m.handlerForUpstream(authority)
+		handler = m.handlerForUpstream(route.Authority)
 	}
 	handler.ServeHTTP(w, clone)
+}
+
+type catchAllRoute struct {
+	Authority upstreamAuthority
+	Target    *url.URL
+}
+
+func routeCatchAllRequest(raw *url.URL) (catchAllRoute, error) {
+	if namespace := strings.TrimSpace(raw.Query().Get("ns")); namespace != "" {
+		authority, err := parseUpstreamAuthority(namespace)
+		if err != nil {
+			return catchAllRoute{}, err
+		}
+		return catchAllRoute{
+			Authority: authority,
+			Target:    cloneURLWithoutQueryValue(raw, "ns"),
+		}, nil
+	}
+
+	authorityValue, target, ok, err := pathPrefixedAuthority(raw)
+	if err != nil {
+		return catchAllRoute{}, err
+	}
+	if !ok {
+		return catchAllRoute{}, fmt.Errorf("missing ns query parameter")
+	}
+	authority, err := parseUpstreamAuthority(authorityValue)
+	if err != nil {
+		return catchAllRoute{}, err
+	}
+	return catchAllRoute{Authority: authority, Target: target}, nil
+}
+
+func pathPrefixedAuthority(raw *url.URL) (authority string, target *url.URL, ok bool, err error) {
+	escapedPath := raw.EscapedPath()
+	const prefix = "/v2/"
+	if !strings.HasPrefix(escapedPath, prefix) {
+		return "", nil, false, nil
+	}
+	remainder := strings.TrimPrefix(escapedPath, prefix)
+	separator := strings.IndexByte(remainder, '/')
+	if separator < 0 {
+		return "", nil, false, nil
+	}
+	escapedAuthority := remainder[:separator]
+	if escapedAuthority == "" {
+		return "", nil, false, nil
+	}
+	authority, err = url.PathUnescape(escapedAuthority)
+	if err != nil {
+		return "", nil, false, fmt.Errorf("malformed path-prefixed authority: %w", err)
+	}
+	if strings.Contains(authority, "/") {
+		return "", nil, false, fmt.Errorf("malformed path-prefixed authority %q", authority)
+	}
+	if !looksLikeUpstreamAuthority(authority) {
+		return "", nil, false, nil
+	}
+
+	repositoryPath := remainder[separator+1:]
+	if repositoryPath == "" || strings.HasPrefix(repositoryPath, "/") {
+		return "", nil, false, fmt.Errorf("path-prefixed authority requires a repository operation")
+	}
+	if strings.Contains(strings.ToLower(repositoryPath), "%2f") {
+		return "", nil, false, fmt.Errorf("encoded slash in repository path is not allowed")
+	}
+	targetPath := prefix + repositoryPath
+	decodedTargetPath, err := url.PathUnescape(targetPath)
+	if err != nil {
+		return "", nil, false, fmt.Errorf("malformed catch-all path: %w", err)
+	}
+	targetValue := *raw
+	target = &targetValue
+	target.Path = decodedTargetPath
+	target.RawPath = targetPath
+	return authority, target, true, nil
+}
+
+func looksLikeUpstreamAuthority(segment string) bool {
+	return strings.ContainsAny(segment, ".:")
 }
 
 func (m *Manager) probeCacheOnly(authority upstreamAuthority, w http.ResponseWriter, r *http.Request) (bool, *cacheReplayError) {

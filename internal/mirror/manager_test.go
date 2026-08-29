@@ -3,6 +3,7 @@ package mirror
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -170,6 +171,118 @@ func TestCatchAllMirrorRoutesByNamespaceCachesUnderUpstreamAndMapsDockerIO(t *te
 	}
 }
 
+func TestCatchAllPathPrefixRoutesToSameUpstreamAndCacheAsNamespace(t *testing.T) {
+	digest := "sha256:" + sha256Hex([]byte(manifestBody))
+	cacheRoot := t.TempDir()
+	m := newManagerWithPorts(cacheRoot, nil, 0)
+	m.resolveUpstreamIPs = func(context.Context, string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("203.0.113.10")}, nil
+	}
+	m.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	m.serverFactory = func(_ string, base, cacheDir string) http.Handler {
+		server := NewServer(base, cacheDir)
+		server.client.Transport = roundTripFunc(func(r *http.Request) *http.Response {
+			if r.URL.Path != "/v2/docker/library/golang/manifests/latest" {
+				return &http.Response{StatusCode: http.StatusNotFound, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("not found"))}
+			}
+			header := make(http.Header)
+			header.Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			header.Set("Docker-Content-Digest", digest)
+			return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(manifestBody))}
+		})
+		return server
+	}
+	defer m.Close()
+
+	queryRecorder := httptest.NewRecorder()
+	m.serveCatchAll(queryRecorder, httptest.NewRequest(http.MethodGet, "/v2/docker/library/golang/manifests/latest?ns=PUBLIC.ECR.AWS.", nil))
+	if queryRecorder.Code != http.StatusOK || queryRecorder.Body.String() != manifestBody {
+		t.Fatalf("namespace form = %d %q", queryRecorder.Code, queryRecorder.Body.String())
+	}
+
+	pathRecorder := httptest.NewRecorder()
+	m.serveCatchAll(pathRecorder, httptest.NewRequest(http.MethodHead, "/v2/public.ecr.aws/docker/library/golang/manifests/latest", nil))
+	if pathRecorder.Code != http.StatusOK {
+		t.Fatalf("path HEAD = %d, want 200", pathRecorder.Code)
+	}
+	if got := pathRecorder.Header().Get("Docker-Content-Digest"); got != digest {
+		t.Fatalf("path HEAD Docker-Content-Digest = %q, want %q", got, digest)
+	}
+	if got := len(m.dynamic); got != 1 {
+		t.Fatalf("dynamic handlers = %d, want one shared handler", got)
+	}
+	entries, err := os.ReadDir(cacheRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "public.ecr.aws" {
+		t.Fatalf("cache roots = %v, want only public.ecr.aws", entries)
+	}
+}
+
+func TestCatchAllPathPrefixMapsDockerIOToRegistryOne(t *testing.T) {
+	m := newManagerWithPorts(t.TempDir(), nil, 0)
+	m.resolveUpstreamIPs = func(context.Context, string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("203.0.113.10")}, nil
+	}
+	m.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	var gotAuthority, gotBase, gotCacheDir string
+	m.serverFactory = func(authority, base, cacheDir string) http.Handler {
+		gotAuthority, gotBase, gotCacheDir = authority, base, cacheDir
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	}
+	defer m.Close()
+
+	recorder := httptest.NewRecorder()
+	m.serveCatchAll(recorder, httptest.NewRequest(http.MethodGet, "/v2/docker.io/library/busybox/manifests/latest", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("path-prefixed docker.io = %d %q", recorder.Code, recorder.Body.String())
+	}
+	if gotAuthority != "docker.io" || gotBase != "https://registry-1.docker.io" || filepath.Base(gotCacheDir) != "docker.io" {
+		t.Fatalf("factory arguments = (%q, %q, %q), want docker.io canonical mapping", gotAuthority, gotBase, gotCacheDir)
+	}
+}
+
+func TestCatchAllPathPrefixPreservesRepositoryPath(t *testing.T) {
+	m := newManagerWithPorts(t.TempDir(), nil, 0)
+	m.resolveUpstreamIPs = func(context.Context, string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("203.0.113.10")}, nil
+	}
+	m.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	var gotPath, gotQuery string
+	m.serverFactory = func(string, string, string) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotPath, gotQuery = r.URL.EscapedPath(), r.URL.RawQuery
+			w.WriteHeader(http.StatusOK)
+		})
+	}
+	defer m.Close()
+
+	recorder := httptest.NewRecorder()
+	m.serveCatchAll(recorder, httptest.NewRequest(http.MethodGet, "/v2/xpkg.crossplane.io/crossplane/provider-aws/manifests/v1.0.0?variant=debug", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("path-prefixed request = %d %q", recorder.Code, recorder.Body.String())
+	}
+	if gotPath != "/v2/crossplane/provider-aws/manifests/v1.0.0" || gotQuery != "variant=debug" {
+		t.Fatalf("forwarded target = %q?%s", gotPath, gotQuery)
+	}
+}
+
+func TestCatchAllPathPrefixRejectsEncodedRepositorySlash(t *testing.T) {
+	m := newManagerWithPorts(t.TempDir(), nil, 0)
+	m.resolveUpstreamIPs = func(context.Context, string) ([]net.IP, error) {
+		t.Fatal("encoded repository slash reached authority resolution")
+		return nil, nil
+	}
+	defer m.Close()
+
+	recorder := httptest.NewRecorder()
+	m.serveCatchAll(recorder, httptest.NewRequest(http.MethodGet, "/v2/public.ecr.aws/team%2Fapp/manifests/latest", nil))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("encoded repository slash = %d %q, want 400", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestCatchAllMirrorRefusesNonPublicNamespaces(t *testing.T) {
 	var dials atomic.Int64
 
@@ -204,6 +317,82 @@ func TestCatchAllMirrorRefusesNonPublicNamespaces(t *testing.T) {
 
 	if dials.Load() != 0 {
 		t.Fatalf("blocked namespaces dialed upstream %d times, want 0", dials.Load())
+	}
+}
+
+func TestCatchAllPathPrefixRefusesNonPublicAuthorities(t *testing.T) {
+	var dials atomic.Int64
+	m := newManagerWithPorts(t.TempDir(), nil, 0)
+	m.resolveUpstreamIPs = func(_ context.Context, host string) ([]net.IP, error) {
+		switch host {
+		case "loopback.registry.example":
+			return []net.IP{net.ParseIP("127.0.0.1")}, nil
+		case "10.0.0.7", "100.64.0.7", "169.254.1.7":
+			return []net.IP{net.ParseIP(host)}, nil
+		default:
+			return nil, fmt.Errorf("unexpected host %q", host)
+		}
+	}
+	m.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
+	m.dialContext = func(context.Context, string, string) (net.Conn, error) {
+		dials.Add(1)
+		return nil, fmt.Errorf("unexpected dial")
+	}
+	defer m.Close()
+
+	for _, authority := range []string{"loopback.registry.example", "10.0.0.7", "100.64.0.7", "169.254.1.7"} {
+		t.Run(authority, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, "/v2/"+authority+"/app/manifests/latest", nil)
+			m.serveCatchAll(recorder, request)
+			if recorder.Code != http.StatusForbidden {
+				t.Fatalf("status for authority %s = %d, want 403", authority, recorder.Code)
+			}
+		})
+	}
+	if dials.Load() != 0 {
+		t.Fatalf("blocked path authorities dialed upstream %d times, want 0", dials.Load())
+	}
+}
+
+func TestCatchAllPathPrefixLoopbackRedirectMatchesNamespaceForm(t *testing.T) {
+	m := newManagerWithPorts(t.TempDir(), nil, 0)
+	defer m.Close()
+
+	locations := make([]string, 0, 2)
+	for _, requestURL := range []string{
+		"/v2/app/manifests/latest?variant=debug&ns=localhost%3A30500",
+		"/v2/localhost:30500/app/manifests/latest?variant=debug",
+	} {
+		recorder := httptest.NewRecorder()
+		m.serveCatchAll(recorder, httptest.NewRequest(http.MethodGet, requestURL, nil))
+		if recorder.Code != http.StatusTemporaryRedirect {
+			t.Fatalf("GET %s = %d %q, want 307", requestURL, recorder.Code, recorder.Body.String())
+		}
+		locations = append(locations, recorder.Header().Get("Location"))
+	}
+	if locations[0] != locations[1] {
+		t.Fatalf("redirect locations differ: namespace=%q path=%q", locations[0], locations[1])
+	}
+}
+
+func TestCatchAllPathPrefixOfflineMissDoesNotCreateDynamicHandler(t *testing.T) {
+	var handlers atomic.Int64
+	m := newManagerWithPorts(t.TempDir(), nil, 0)
+	m.SetOffline(true)
+	m.serverFactory = func(string, string, string) http.Handler {
+		handlers.Add(1)
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	}
+	defer m.Close()
+
+	recorder := httptest.NewRecorder()
+	m.serveCatchAll(recorder, httptest.NewRequest(http.MethodGet, "/v2/public.ecr.aws/app/manifests/missing", nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("offline path miss = %d %q, want 404", recorder.Code, recorder.Body.String())
+	}
+	if handlers.Load() != 0 || len(m.dynamic) != 0 {
+		t.Fatalf("offline path miss allocated handlers: factory=%d dynamic=%d", handlers.Load(), len(m.dynamic))
 	}
 }
 
@@ -753,12 +942,11 @@ func TestCatchAllMirrorRejectsNonGlobalAuthorities(t *testing.T) {
 	}
 }
 
-func TestCatchAllMirrorBoundsDynamicHandlersAndClosesEvictedEntries(t *testing.T) {
-	catchAllPort := freePort(t)
+func TestCatchAllPathPrefixUsesTheSameLRUCap(t *testing.T) {
 	var created atomic.Int64
 	var closed atomic.Int64
 
-	m := newManagerWithPorts(t.TempDir(), nil, catchAllPort)
+	m := newManagerWithPorts(t.TempDir(), nil, 0)
 	m.dynamicCap = 4
 	m.resolveUpstreamIPs = func(context.Context, string) ([]net.IP, error) {
 		return []net.IP{net.ParseIP("203.0.113.10")}, nil
@@ -770,16 +958,13 @@ func TestCatchAllMirrorBoundsDynamicHandlersAndClosesEvictedEntries(t *testing.T
 	}
 	defer m.Close()
 
-	if err := m.Bind("127.0.0.1"); err != nil {
-		t.Fatal(err)
-	}
-
 	totalAuthorities := int(m.dynamicCap) + 3
 	for i := 0; i < totalAuthorities; i++ {
-		ns := fmt.Sprintf("registry-%d.example", i)
-		resp, body := get(t, fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/latest?ns=%s", catchAllPort, url.QueryEscape(ns)))
-		if resp.StatusCode != http.StatusOK || body != manifestBody {
-			t.Fatalf("ns=%s -> %d %q", ns, resp.StatusCode, body)
+		authority := fmt.Sprintf("registry-%d.example", i)
+		recorder := httptest.NewRecorder()
+		m.serveCatchAll(recorder, httptest.NewRequest(http.MethodGet, "/v2/"+authority+"/app/manifests/latest", nil))
+		if recorder.Code != http.StatusOK || recorder.Body.String() != manifestBody {
+			t.Fatalf("authority=%s -> %d %q", authority, recorder.Code, recorder.Body.String())
 		}
 	}
 
@@ -996,127 +1181,120 @@ func TestManagerOfflineToggleAffectsLegacyAndDynamicMirrors(t *testing.T) {
 	}
 }
 
-func TestCatchAllCachedDigestServesWhenResolverFailsWithoutDial(t *testing.T) {
+func TestCatchAllPathPrefixCachedDigestSurvivesResolverFailure(t *testing.T) {
 	validDigest := "sha256:" + sha256Hex([]byte(manifestBody))
 	var failResolve atomic.Bool
-	var dials atomic.Int64
-	var failDial atomic.Bool
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
-		w.Header().Set("Docker-Content-Digest", validDigest)
-		_, _ = fmt.Fprint(w, manifestBody)
-	}))
-	defer upstream.Close()
-
-	catchAllPort := freePort(t)
-	m := newManagerWithPorts(t.TempDir(), nil, catchAllPort)
-	m.baseOverride = upstream.URL
+	var resolves atomic.Int64
+	var upstreamRequests atomic.Int64
+	m := newManagerWithPorts(t.TempDir(), nil, 0)
 	m.resolveUpstreamIPs = func(context.Context, string) ([]net.IP, error) {
+		resolves.Add(1)
 		if failResolve.Load() {
 			return nil, fmt.Errorf("resolver unavailable")
 		}
 		return []net.IP{net.ParseIP("203.0.113.10")}, nil
 	}
 	m.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
-	m.dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-		dials.Add(1)
-		if failDial.Load() {
-			return nil, fmt.Errorf("unexpected dial")
-		}
-		return (&net.Dialer{}).DialContext(ctx, network, hostPortOfURL(t, upstream.URL))
+	m.serverFactory = func(_ string, base, cacheDir string) http.Handler {
+		server := NewServer(base, cacheDir)
+		server.client.Transport = roundTripFunc(func(*http.Request) *http.Response {
+			upstreamRequests.Add(1)
+			header := make(http.Header)
+			header.Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			header.Set("Docker-Content-Digest", validDigest)
+			return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(manifestBody))}
+		})
+		return server
 	}
 	defer m.Close()
 
-	if err := m.Bind("127.0.0.1"); err != nil {
-		t.Fatal(err)
+	path := "/v2/docker.io/app/manifests/" + url.PathEscape(validDigest)
+	warm := httptest.NewRecorder()
+	m.serveCatchAll(warm, httptest.NewRequest(http.MethodGet, path, nil))
+	if warm.Code != http.StatusOK || warm.Body.String() != manifestBody {
+		t.Fatalf("warm digest = %d %q", warm.Code, warm.Body.String())
 	}
-
-	path := fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/%s?ns=docker.io", catchAllPort, url.QueryEscape(validDigest))
-	resp, body := get(t, path)
-	if resp.StatusCode != http.StatusOK || body != manifestBody {
-		t.Fatalf("warm digest = %d %q", resp.StatusCode, body)
-	}
-	dialsAfterWarm := dials.Load()
+	requestsAfterWarm := upstreamRequests.Load()
+	resolvesAfterWarm := resolves.Load()
 	failResolve.Store(true)
-	failDial.Store(true)
 
-	resp, body = get(t, path)
-	if resp.StatusCode != http.StatusOK || body != manifestBody {
-		t.Fatalf("cached digest = %d %q", resp.StatusCode, body)
+	cached := httptest.NewRecorder()
+	m.serveCatchAll(cached, httptest.NewRequest(http.MethodGet, path, nil))
+	if cached.Code != http.StatusOK || cached.Body.String() != manifestBody {
+		t.Fatalf("cached digest = %d %q", cached.Code, cached.Body.String())
 	}
-	if dials.Load() != dialsAfterWarm {
-		t.Fatalf("cached digest dialed upstream again: %d -> %d", dialsAfterWarm, dials.Load())
+	if upstreamRequests.Load() != requestsAfterWarm {
+		t.Fatalf("cached digest contacted upstream again: %d -> %d", requestsAfterWarm, upstreamRequests.Load())
+	}
+	if resolves.Load() != resolvesAfterWarm {
+		t.Fatalf("cached digest resolved upstream again: %d -> %d", resolvesAfterWarm, resolves.Load())
 	}
 }
 
-func TestCatchAllOfflineCachedTagServesAndMissesDoNotResolveOrDial(t *testing.T) {
+func TestCatchAllPathPrefixOfflineCachedTagServesWithoutResolveOrDial(t *testing.T) {
 	var failResolve atomic.Bool
-	var dials atomic.Int64
-	var failDial atomic.Bool
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/v2/app/manifests/latest":
-			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
-			w.Header().Set("Docker-Content-Digest", "sha256:"+sha256Hex([]byte(manifestBody)))
-			_, _ = fmt.Fprint(w, manifestBody)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer upstream.Close()
-
-	catchAllPort := freePort(t)
+	var resolves atomic.Int64
+	var upstreamRequests atomic.Int64
 	cacheRoot := t.TempDir()
-	m := newManagerWithPorts(cacheRoot, nil, catchAllPort)
-	m.baseOverride = upstream.URL
+	m := newManagerWithPorts(cacheRoot, nil, 0)
 	m.resolveUpstreamIPs = func(context.Context, string) ([]net.IP, error) {
+		resolves.Add(1)
 		if failResolve.Load() {
 			return nil, fmt.Errorf("resolver unavailable")
 		}
 		return []net.IP{net.ParseIP("203.0.113.10")}, nil
 	}
 	m.hostOwnedIPs = func() ([]net.IP, error) { return nil, nil }
-	m.dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-		dials.Add(1)
-		if failDial.Load() {
-			return nil, fmt.Errorf("unexpected dial")
-		}
-		return (&net.Dialer{}).DialContext(ctx, network, hostPortOfURL(t, upstream.URL))
+	m.serverFactory = func(_ string, base, cacheDir string) http.Handler {
+		server := NewServer(base, cacheDir)
+		server.client.Transport = roundTripFunc(func(r *http.Request) *http.Response {
+			upstreamRequests.Add(1)
+			header := make(http.Header)
+			if r.URL.Path != "/v2/app/manifests/latest" {
+				return &http.Response{StatusCode: http.StatusNotFound, Header: header, Body: io.NopCloser(strings.NewReader("not found"))}
+			}
+			header.Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			header.Set("Docker-Content-Digest", "sha256:"+sha256Hex([]byte(manifestBody)))
+			return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(manifestBody))}
+		})
+		return server
 	}
 	defer m.Close()
 
-	if err := m.Bind("127.0.0.1"); err != nil {
-		t.Fatal(err)
-	}
-
-	cachedTag := fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/latest?ns=docker.io", catchAllPort)
-	resp, body := get(t, cachedTag)
-	if resp.StatusCode != http.StatusOK || body != manifestBody {
-		t.Fatalf("warm tag = %d %q", resp.StatusCode, body)
+	cachedTag := "/v2/docker.io/app/manifests/latest"
+	warm := httptest.NewRecorder()
+	m.serveCatchAll(warm, httptest.NewRequest(http.MethodGet, cachedTag, nil))
+	if warm.Code != http.StatusOK || warm.Body.String() != manifestBody {
+		t.Fatalf("warm tag = %d %q", warm.Code, warm.Body.String())
 	}
 	cacheTagDigestRoot(t, NewServer("https://registry-1.docker.io", filepath.Join(cacheRoot, "docker.io")), "app", "latest")
-	dialsAfterWarm := dials.Load()
+	requestsAfterWarm := upstreamRequests.Load()
+	resolvesAfterWarm := resolves.Load()
 
 	m.SetOffline(true)
 	failResolve.Store(true)
-	failDial.Store(true)
 
-	resp, body = get(t, cachedTag)
-	if resp.StatusCode != http.StatusOK || body != manifestBody {
-		t.Fatalf("offline cached tag = %d %q", resp.StatusCode, body)
+	cached := httptest.NewRecorder()
+	m.serveCatchAll(cached, httptest.NewRequest(http.MethodGet, cachedTag, nil))
+	if cached.Code != http.StatusOK || cached.Body.String() != manifestBody {
+		t.Fatalf("offline cached tag = %d %q", cached.Code, cached.Body.String())
 	}
 	for _, path := range []string{
-		fmt.Sprintf("http://127.0.0.1:%d/v2/app/blobs/sha256:%s?ns=docker.io", catchAllPort, strings.Repeat("1", 64)),
-		fmt.Sprintf("http://127.0.0.1:%d/v2/app/manifests/missing?ns=docker.io", catchAllPort),
-		fmt.Sprintf("http://127.0.0.1:%d/v2/app/other?ns=docker.io", catchAllPort),
+		"/v2/docker.io/app/blobs/sha256:" + strings.Repeat("1", 64),
+		"/v2/docker.io/app/manifests/missing",
+		"/v2/docker.io/app/other",
 	} {
-		resp, _ := get(t, path)
-		if resp.StatusCode == http.StatusOK {
+		recorder := httptest.NewRecorder()
+		m.serveCatchAll(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		if recorder.Code == http.StatusOK {
 			t.Fatalf("offline miss %s unexpectedly succeeded", path)
 		}
 	}
-	if dials.Load() != dialsAfterWarm {
-		t.Fatalf("offline paths dialed upstream: %d -> %d", dialsAfterWarm, dials.Load())
+	if upstreamRequests.Load() != requestsAfterWarm {
+		t.Fatalf("offline paths contacted upstream: %d -> %d", requestsAfterWarm, upstreamRequests.Load())
+	}
+	if resolves.Load() != resolvesAfterWarm {
+		t.Fatalf("offline paths resolved upstream: %d -> %d", resolvesAfterWarm, resolves.Load())
 	}
 }
 
