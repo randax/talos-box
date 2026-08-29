@@ -155,6 +155,26 @@ func TestRenderInspectionSubstrateSectionsNeedNoCuratedCNI(t *testing.T) {
 	}
 }
 
+func TestSubstrateMachineRenderDoesNotApplyProvisioningReclaimDefaults(t *testing.T) {
+	machine, err := RenderInspection(cluster.Cluster{Name: "demo", SubnetIndex: 7}, "machine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, absent := range []string{
+		"vm.min_free_kbytes", "vm.watermark_scale_factor", "vm.vfs_cache_pressure",
+		"evictionHard", "memory.available", "systemReserved",
+	} {
+		if strings.Contains(machine, absent) {
+			t.Fatalf("substrate-only machine render unexpectedly contains %q:\n%s", absent, machine)
+		}
+	}
+	for _, retained := range []string{"machine:", "virtio_balloon", "RegistryMirrorConfig"} {
+		if !strings.Contains(machine, retained) {
+			t.Fatalf("substrate-only machine render lost %q:\n%s", retained, machine)
+		}
+	}
+}
+
 // TestRenderInspectionMachineSectionCarriesBalloonModule pins SPEC §8: the
 // printed config snippets MUST include the virtio_balloon kernel module. The
 // `balloon` section is deprecated and redirects here, so the `machine` section

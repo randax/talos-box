@@ -83,7 +83,9 @@ const (
 // Version 18 adds the additive per-node rebootedAt field and rebooted phase.
 // Shared pressure sampling and table-only status advisories do not change any
 // request shape.
-const ProtocolVersion = 18
+// Version 19 honors the kubeletMemoryProtection provisioning opt-out. Older
+// daemons would silently ignore the new request field and apply protection.
+const ProtocolVersion = 19
 
 // Request is one newline-delimited daemon request.
 type Request struct {

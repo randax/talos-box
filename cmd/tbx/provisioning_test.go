@@ -391,7 +391,7 @@ func TestCreateClusterWithoutCNIUsesLegacyProtocolAndOutput(t *testing.T) {
 	if err := json.Unmarshal(request.Args, &args); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"cni", "csi", "lb", "bgp", "hubble"} {
+	for _, key := range []string{"cni", "csi", "lb", "bgp", "hubble", "kubeletMemoryProtection"} {
 		if _, found := args[key]; found {
 			t.Fatalf("legacy create request unexpectedly includes %q: %s", key, request.Args)
 		}

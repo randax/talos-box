@@ -107,10 +107,10 @@ func TestNodeStatusRebootFieldsRoundTripJSON(t *testing.T) {
 	}
 }
 
-func TestProtocolVersionIncludesTalosServiceState(t *testing.T) {
+func TestProtocolVersionIncludesKubeletMemoryProtection(t *testing.T) {
 	t.Parallel()
-	if ProtocolVersion != 18 {
-		t.Fatalf("ProtocolVersion = %d, want 18 for reboot observability", ProtocolVersion)
+	if ProtocolVersion != 19 {
+		t.Fatalf("ProtocolVersion = %d, want 19 for kubelet memory protection", ProtocolVersion)
 	}
 }
 
