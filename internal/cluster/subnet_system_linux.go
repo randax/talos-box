@@ -52,6 +52,7 @@ func selectLinuxSystemRoute(
 	ignored := make(map[string]bool)
 	for _, route := range routes {
 		interfaceName := "netlink-route"
+		looksLikeTunnel := false
 		if route.LinkIndex != 0 {
 			link, err := linkByIndex(route.LinkIndex)
 			if err != nil {
@@ -62,6 +63,7 @@ func selectLinuxSystemRoute(
 				return HostRoute{}, fmt.Errorf("resolve route interface %d: %w", route.LinkIndex, err)
 			}
 			interfaceName = link.Attrs().Name
+			looksLikeTunnel = linuxLinkLooksLikeTunnel(link)
 			if ip := destination.To4(); ip != nil {
 				index := int(ip[2])
 				if interfaceName == LinuxBridgeName(index) && link.Attrs().Alias == LinuxBridgeAlias(index) {
@@ -73,11 +75,29 @@ func selectLinuxSystemRoute(
 		if network == nil {
 			network = &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)}
 		}
-		observed = append(observed, HostRoute{Interface: interfaceName, Network: network})
+		observed = append(observed, HostRoute{
+			Interface:       interfaceName,
+			Network:         network,
+			LooksLikeTunnel: looksLikeTunnel,
+		})
 	}
 	selected := selectMostSpecificRoute(destination, observed, ignored)
 	if selected.Interface == "" && selected.Network == nil {
 		return HostRoute{}, nil
 	}
 	return selected, nil
+}
+
+func linuxLinkLooksLikeTunnel(link netlink.Link) bool {
+	switch link.Type() {
+	case "tuntap", "wireguard", "ppp", "ipip", "ip6tnl", "gre", "ip6gre", "gretap", "ip6gretap", "sit", "vti", "vti6", "xfrm":
+		return true
+	}
+
+	switch link.Attrs().EncapType {
+	case "ppp", "ipip", "tunnel6", "gre", "sit":
+		return true
+	default:
+		return false
+	}
 }

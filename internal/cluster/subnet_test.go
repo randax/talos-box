@@ -19,9 +19,15 @@ func TestLowestUsableSubnetIndex(t *testing.T) {
 		wantErr    string
 	}{
 		{
-			name:      "clean host",
-			route:     staticRoute("en0", "0.0.0.0/0"),
+			name:      "ordinary default route is clean",
+			route:     staticRoute("default-link", "0.0.0.0/0"),
 			wantIndex: 0,
+		},
+		{
+			name:      "tunnel default route warns",
+			route:     staticRoute("private-link", "0.0.0.0/0", true),
+			wantIndex: 0,
+			wantWarn:  "private-link",
 		},
 		{
 			name: "foreign interface skips index",
@@ -40,16 +46,16 @@ func TestLowestUsableSubnetIndex(t *testing.T) {
 			wantErr: "all cluster subnets overlap existing host interfaces or routes",
 		},
 		{
-			name:      "broad VPN route warns",
-			route:     staticRoute("utun4", "172.16.0.0/12"),
+			name:      "broad non-default route warns without tunnel signal",
+			route:     staticRoute("broad-link", "172.16.0.0/12"),
 			wantIndex: 0,
-			wantWarn:  "utun4",
+			wantWarn:  "broad-link",
 		},
 		{
-			name:      "full tunnel VPN default route warns",
-			route:     staticRoute("utun8", "0.0.0.0/0"),
+			name:      "broad non-default route warns with tunnel signal",
+			route:     staticRoute("broad-private-link", "172.16.0.0/12", true),
 			wantIndex: 0,
-			wantWarn:  "utun8",
+			wantWarn:  "broad-private-link",
 		},
 		{
 			name:      "no route is clean",
@@ -73,8 +79,13 @@ func TestLowestUsableSubnetIndex(t *testing.T) {
 			wantIndex: 1,
 		},
 		{
-			name:      "specific foreign route skips index",
-			route:     routeByThirdOctet(map[byte]HostRoute{0: routeValue("utun4", "172.30.0.0/24")}),
+			name:      "specific route conflicts without tunnel signal",
+			route:     routeByThirdOctet(map[byte]HostRoute{0: routeValue("specific-link", "172.30.0.0/24")}),
+			wantIndex: 1,
+		},
+		{
+			name:      "specific route conflicts with tunnel signal",
+			route:     routeByThirdOctet(map[byte]HostRoute{0: routeValue("specific-private-link", "172.30.0.0/24", true)}),
 			wantIndex: 1,
 		},
 	}
@@ -376,16 +387,17 @@ func hostAddress(cidr string) net.Addr {
 	return network
 }
 
-func routeValue(name, cidr string) HostRoute {
+func routeValue(name, cidr string, looksLikeTunnel ...bool) HostRoute {
 	_, network, err := net.ParseCIDR(cidr)
 	if err != nil {
 		panic(err)
 	}
-	return HostRoute{Interface: name, Network: network}
+	tunnel := len(looksLikeTunnel) > 0 && looksLikeTunnel[0]
+	return HostRoute{Interface: name, Network: network, LooksLikeTunnel: tunnel}
 }
 
-func staticRoute(name, cidr string) func(net.IP) (HostRoute, error) {
-	value := routeValue(name, cidr)
+func staticRoute(name, cidr string, looksLikeTunnel ...bool) func(net.IP) (HostRoute, error) {
+	value := routeValue(name, cidr, looksLikeTunnel...)
 	return func(net.IP) (HostRoute, error) { return value, nil }
 }
 
