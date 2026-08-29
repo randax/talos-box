@@ -30,7 +30,7 @@ type parallelWarmFixture struct {
 	failBlob string
 	// shareLayers gives every image the same layer bytes, so refs share a blob
 	shareLayers bool
-	onBlob      func()
+	onBlob      func(digest string)
 }
 
 func newParallelWarmFixture(t *testing.T, repos []string, layersPerImage int, options ...func(*parallelWarmFixture)) *parallelWarmFixture {
@@ -88,7 +88,7 @@ func newParallelWarmFixture(t *testing.T, repos []string, layersPerImage int, op
 					return response, nil
 				}
 				if f.onBlob != nil {
-					f.onBlob()
+					f.onBlob(parts[2])
 				}
 				n := f.inFlight.Add(1)
 				for {
@@ -204,38 +204,75 @@ func TestWarmJobsAreCappedByTheDaemonWideLimit(t *testing.T) {
 	}
 }
 
-func TestWarmFirstBlobErrorCancelsSiblingsAndOtherRefsContinue(t *testing.T) {
-	f := newParallelWarmFixture(t, []string{"bad", "good"}, 3)
-	f.failBlob = f.blobs[0]
-	// never open the gate: the bad ref's healthy siblings only finish if the
-	// failure cancels them; the good ref's blobs are released once bad is done
-	summaryDone := make(chan WarmSummary, 1)
-	go func() {
-		summary, err := f.manager.Warm(context.Background(), f.refs, imagecache.ArchitectureAMD64, WarmOptions{Jobs: 8})
-		if err != nil {
-			t.Error(err)
+func TestWarmFirstBlobErrorStopsStartingSiblingsAndOtherRefsContinue(t *testing.T) {
+	var mu sync.Mutex
+	fetched := map[string]int{}
+	f := newParallelWarmFixture(t, []string{"bad", "good"}, 3, func(f *parallelWarmFixture) {
+		f.onBlob = func(digest string) {
+			mu.Lock()
+			fetched[digest]++
+			mu.Unlock()
 		}
-		summaryDone <- summary
-	}()
-	// wait until only the good ref's 4 blobs remain in flight, then release
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) && f.inFlight.Load() != 4 {
-		time.Sleep(time.Millisecond)
+	})
+	f.failBlob = f.blobs[0] // bad's first layer; its config is requested before it
+	<-f.openGateWhen(0, 0)  // nothing waits: each blob is served as soon as it is asked for
+	summary, err := f.manager.Warm(context.Background(), f.refs, imagecache.ArchitectureAMD64, WarmOptions{Jobs: 1})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := f.inFlight.Load(); got != 4 {
-		t.Fatalf("in flight = %d after the bad ref failed, want the good ref's 4", got)
-	}
-	close(f.gate)
-	summary := <-summaryDone
 	if summary.Failed != 1 || summary.Warmed != 1 {
 		t.Fatalf("summary = %+v", summary)
 	}
 	bad := summary.Results[0]
 	if bad.Outcome != WarmOutcomeFailedMissing || !strings.Contains(bad.Error, "500") || strings.Contains(bad.Error, "context canceled") {
-		t.Fatalf("bad result = %+v, want the 500 and not the cancellation fallout", bad)
+		t.Fatalf("bad result = %+v, want the 500 and not the stop's fallout", bad)
 	}
 	if summary.Results[1].Outcome != WarmOutcomeWarmed {
 		t.Fatalf("good result = %+v", summary.Results[1])
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	// with one download at a time the failure lands before bad's other two
+	// layers start, and they must then not start at all
+	for _, layer := range f.blobs[1:3] {
+		if fetched[layer] != 0 {
+			t.Fatalf("bad's layer %s was fetched after a sibling failed", layer)
+		}
+	}
+	for _, layer := range f.blobs[3:6] {
+		if fetched[layer] != 1 {
+			t.Fatalf("good's layer %s fetched %d times, want 1", layer, fetched[layer])
+		}
+	}
+}
+
+func TestWarmFirstBlobErrorLetsInFlightSiblingsFinish(t *testing.T) {
+	f := newParallelWarmFixture(t, []string{"bad"}, 3)
+	// blobs start in manifest order (config, then layers), so with the last
+	// layer failing the config and two healthy layers are already in flight,
+	// blocked on the gate, when the failure lands. Release them then.
+	f.failBlob = f.blobs[2]
+	reached := f.openGateWhen(3, 5*time.Second)
+	summary, err := f.manager.Warm(context.Background(), f.refs, imagecache.ArchitectureAMD64, WarmOptions{Jobs: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !<-reached {
+		t.Fatalf("healthy siblings never ran alongside the failing layer; peak = %d", f.peak.Load())
+	}
+	if summary.Failed != 1 {
+		t.Fatalf("summary = %+v", summary)
+	}
+	f.manager.mu.Lock()
+	server := f.manager.dynamicServers["registry.example"]
+	f.manager.mu.Unlock()
+	if server == nil {
+		t.Fatal("no dynamic server for registry.example")
+	}
+	for _, layer := range f.blobs[0:2] {
+		if !blobCached(server, layer) {
+			t.Fatalf("in-flight layer %s was discarded after the sibling failed; it must stay for the rerun", layer)
+		}
 	}
 }
 
@@ -279,7 +316,7 @@ func TestWarmDownloadsALayerSharedByConcurrentRefsOnce(t *testing.T) {
 	var fetches atomic.Int64
 	f := newParallelWarmFixture(t, []string{"one", "two"}, 1, func(f *parallelWarmFixture) {
 		f.shareLayers = true
-		f.onBlob = func() { fetches.Add(1) }
+		f.onBlob = func(string) { fetches.Add(1) }
 	})
 	reached := f.openGateWhen(1, 5*time.Second)
 	summary, err := f.manager.Warm(context.Background(), f.refs, imagecache.ArchitectureAMD64, WarmOptions{Jobs: 8})

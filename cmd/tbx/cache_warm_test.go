@@ -9,7 +9,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -44,6 +43,7 @@ func TestRunCacheWarmHelpExplainsCacheFirstRefreshAndCompleteness(t *testing.T) 
 		"digest-pinned refs do not need freshness resolution",
 		"transient refresh failure is nonfatal",
 		"selected linux/<arch> manifest, config, and all layers locally",
+		"--jobs N keeps N blob downloads in flight",
 	} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Fatalf("help = %q, want %q", stderr.String(), want)
@@ -81,34 +81,34 @@ func TestRunCacheWarmDefaultDoesNotRequestRefresh(t *testing.T) {
 		"ghcr.io/example/app@sha256:1111111111111111111111111111111111111111111111111111111111111111",
 	}
 	done := make(chan struct{})
-	go serveWarmRequests(t, listener, wantRefs, func(index int, request daemon.Request) daemon.Response {
+	go serveDaemonRequests(t, listener, 1, func(_ int, request daemon.Request) daemon.Response {
 		if request.Op != "cache.warm" {
-			t.Fatalf("request op = %q, want cache.warm", request.Op)
+			t.Errorf("request op = %q, want cache.warm", request.Op)
+		}
+		if !request.Progress {
+			t.Error("Progress = false, want narration requested")
 		}
 		var args daemon.CacheWarmArgs
 		if err := json.Unmarshal(request.Args, &args); err != nil {
-			t.Fatal(err)
+			t.Error(err)
+		}
+		if fmt.Sprint(args.Refs) != fmt.Sprint(wantRefs) {
+			t.Errorf("refs = %v, want the whole list %v in one request", args.Refs, wantRefs)
 		}
 		if args.Refresh {
 			t.Error("Refresh = true, want false")
 		}
-		// the default 8 jobs are split across the 4 requests in flight
-		if want := daemon.DefaultCacheWarmJobs / 4; args.Jobs != want {
-			t.Errorf("Jobs = %d, want the default's per-request share %d", args.Jobs, want)
-		}
-		result := daemon.CacheWarmResult{Entries: []daemon.CacheWarmEntry{{Ref: wantRefs[index]}}}
-		switch index {
-		case 0, 2:
-			result.Entries[0].Status = daemon.CacheWarmStatusWarmed
-			result.Warmed = 1
-		case 1:
-			result.Entries[0].Status = daemon.CacheWarmStatusAlreadyComplete
-			result.AlreadyComplete = 1
+		if args.Jobs != daemon.DefaultCacheWarmJobs {
+			t.Errorf("Jobs = %d, want the default %d", args.Jobs, daemon.DefaultCacheWarmJobs)
 		}
 		return daemon.Response{OK: true, Data: mustJSON(t, daemon.CacheWarmResult{
-			Entries:         result.Entries,
-			Warmed:          result.Warmed,
-			AlreadyComplete: result.AlreadyComplete,
+			Entries: []daemon.CacheWarmEntry{
+				{Ref: wantRefs[0], Status: daemon.CacheWarmStatusWarmed},
+				{Ref: wantRefs[1], Status: daemon.CacheWarmStatusAlreadyComplete},
+				{Ref: wantRefs[2], Status: daemon.CacheWarmStatusWarmed},
+			},
+			Warmed:          2,
+			AlreadyComplete: 1,
 		})}
 	}, done)
 
@@ -256,17 +256,6 @@ func TestRunCacheWarmEmitsEachResultAsItCompletes(t *testing.T) {
 		fullOutput   string
 	}{
 		{
-			name:         "warm",
-			op:           "cache.warm",
-			refs:         []string{"docker.io/library/pause:3.10", "ghcr.io/example/app:v1.0.0"},
-			firstResult:  daemon.CacheWarmResult{Entries: []daemon.CacheWarmEntry{{Ref: "docker.io/library/pause:3.10", Status: daemon.CacheWarmStatusWarmed}}, Warmed: 1},
-			secondResult: daemon.CacheWarmResult{Entries: []daemon.CacheWarmEntry{{Ref: "ghcr.io/example/app:v1.0.0", Status: daemon.CacheWarmStatusAlreadyComplete}}, AlreadyComplete: 1},
-			firstOutput:  "\u2713 docker.io/library/pause:3.10 warmed\n",
-			fullOutput: "\u2713 docker.io/library/pause:3.10 warmed\n" +
-				"\u2713 ghcr.io/example/app:v1.0.0 already complete\n" +
-				"summary: 1 warmed, 1 already complete, 0 failed (missing)\n",
-		},
-		{
 			// A check also verifies the bootstrap-required set (#404), so the
 			// list already names it here to keep the request count at two.
 			name:         "check",
@@ -370,10 +359,6 @@ func TestRunCacheWarmEmitsEachResultAsItCompletes(t *testing.T) {
 			args := []string{"cache", "warm"}
 			if test.checkOnly {
 				args = append(args, "--check")
-			} else {
-				// the stub answers by arrival order; --jobs 1 keeps one
-				// request in flight so arrival order is list order
-				args = append(args, "--jobs", "1")
 			}
 			args = append(args, listPath)
 			commandDone := make(chan error, 1)
@@ -427,30 +412,6 @@ func (b *signalBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.value.String()
-}
-
-// serveWarmRequests is serveDaemonRequests for `cache.warm`, whose requests
-// arrive a few at a time in no fixed order since #506: the index handed to
-// respond is the ref's position in `refs`, not the arrival order.
-func serveWarmRequests(t *testing.T, listener net.Listener, refs []string, respond func(int, daemon.Request) daemon.Response, done chan<- struct{}) {
-	t.Helper()
-	serveDaemonRequests(t, listener, len(refs), func(_ int, request daemon.Request) daemon.Response {
-		var args daemon.CacheWarmArgs
-		if err := json.Unmarshal(request.Args, &args); err != nil {
-			t.Error(err)
-			return daemon.Response{Error: err.Error()}
-		}
-		if len(args.Refs) != 1 {
-			t.Errorf("refs = %v, want exactly one", args.Refs)
-			return daemon.Response{Error: "want one ref"}
-		}
-		index := slices.Index(refs, args.Refs[0])
-		if index < 0 {
-			t.Errorf("unexpected ref %q", args.Refs[0])
-			return daemon.Response{Error: "unexpected ref"}
-		}
-		return respond(index, request)
-	}, done)
 }
 
 func serveDaemonRequests(t *testing.T, listener net.Listener, count int, respond func(int, daemon.Request) daemon.Response, done chan<- struct{}) {
@@ -515,23 +476,23 @@ func TestRunCacheWarmPrintsMissingAndRevalidateFailuresSeparately(t *testing.T) 
 	}
 
 	done := make(chan struct{})
-	go serveWarmRequests(t, listener, refs, func(index int, request daemon.Request) daemon.Response {
+	go serveDaemonRequests(t, listener, 1, func(_ int, request daemon.Request) daemon.Response {
 		var args daemon.CacheWarmArgs
 		if err := json.Unmarshal(request.Args, &args); err != nil {
-			t.Fatal(err)
+			t.Error(err)
 		}
-		if len(args.Refs) != 1 || args.Refs[0] != refs[index] {
-			t.Fatalf("refs = %v, want [%q]", args.Refs, refs[index])
+		if fmt.Sprint(args.Refs) != fmt.Sprint(refs) {
+			t.Errorf("refs = %v, want %v", args.Refs, refs)
 		}
-		result := daemon.CacheWarmResult{Failed: 1}
-		if index == 0 {
-			result.Entries = []daemon.CacheWarmEntry{{Ref: refs[index], Status: daemon.CacheWarmStatusFailedMissing, Reason: "upstream: timeout"}}
-			result.FailedMissing = 1
-		} else {
-			result.Entries = []daemon.CacheWarmEntry{{Ref: refs[index], Status: daemon.CacheWarmStatusFailedRevalidate, Reason: "upstream 404"}}
-			result.FailedRevalidate = 1
-		}
-		return daemon.Response{OK: true, Data: mustJSON(t, result)}
+		return daemon.Response{OK: true, Data: mustJSON(t, daemon.CacheWarmResult{
+			Entries: []daemon.CacheWarmEntry{
+				{Ref: refs[0], Status: daemon.CacheWarmStatusFailedMissing, Reason: "upstream: timeout"},
+				{Ref: refs[1], Status: daemon.CacheWarmStatusFailedRevalidate, Reason: "upstream 404"},
+			},
+			Failed:           2,
+			FailedMissing:    1,
+			FailedRevalidate: 1,
+		})}
 	}, done)
 
 	var stdout, stderr bytes.Buffer
@@ -653,18 +614,27 @@ func TestRunCacheWarmOmitsTheRevalidateClauseWithoutRefresh(t *testing.T) {
 	}
 }
 
-func TestRunCacheWarmRejectsJobsBelowOne(t *testing.T) {
+func TestRunCacheWarmRejectsJobsOutsideItsRange(t *testing.T) {
+	for _, jobs := range []string{"0", "-3", fmt.Sprint(daemon.MaxCacheWarmJobs + 1)} {
+		var stdout, stderr bytes.Buffer
+		command := cli{out: &stdout, err: &stderr, in: bytes.NewBuffer(nil)}
+		err := command.run([]string{"cache", "warm", "--jobs", jobs, "images.txt"})
+		if err == nil || !strings.HasPrefix(err.Error(), "cache warm --jobs must be between 1 and 16") {
+			t.Fatalf("--jobs %s: err = %v, want range error", jobs, err)
+		}
+	}
 	var stdout, stderr bytes.Buffer
 	command := cli{out: &stdout, err: &stderr, in: bytes.NewBuffer(nil)}
-	err := command.run([]string{"cache", "warm", "--jobs", "0", "images.txt"})
-	if err == nil || err.Error() != "cache warm --jobs must be at least 1, got 0" {
-		t.Fatalf("err = %v, want --jobs usage error", err)
+	err := command.run([]string{"cache", "warm", "--check", "--jobs", "4", "images.txt"})
+	if err == nil || err.Error() != "cache warm --jobs cannot be used with --check" {
+		t.Fatalf("err = %v, want jobs/check usage error", err)
 	}
 }
 
-// warmStubListener serves the protocol handshake and then hands every
-// cache.warm connection to serve, concurrently, until the listener closes.
-func warmStubListener(t *testing.T, serve func(net.Conn, daemon.CacheWarmArgs)) net.Listener {
+// warmNarrationListener serves the handshake, then one cache.warm request:
+// it narrates the given entries as stages, waiting on each release channel
+// before the next, and answers with the final result.
+func warmNarrationListener(t *testing.T, narrate []daemon.CacheWarmEntry, release []<-chan struct{}, final daemon.CacheWarmResult, gotArgs chan<- daemon.CacheWarmArgs) net.Listener {
 	t.Helper()
 	t.Setenv("HOME", shortTestHome(t))
 	socketPath, err := daemon.SocketPath()
@@ -685,199 +655,130 @@ func warmStubListener(t *testing.T, serve func(net.Conn, daemon.CacheWarmArgs)) 
 			if err != nil {
 				return
 			}
-			go func() {
-				defer func() { _ = connection.Close() }()
-				var request daemon.Request
-				if err := json.NewDecoder(connection).Decode(&request); err != nil {
-					return
+			var request daemon.Request
+			if err := json.NewDecoder(connection).Decode(&request); err != nil {
+				_ = connection.Close()
+				return
+			}
+			encoder := json.NewEncoder(connection)
+			if request.Op == "daemon.info" {
+				_ = encoder.Encode(daemon.Response{OK: true, Data: mustJSON(t, daemon.Info{ProtocolVersion: daemon.ProtocolVersion})})
+				_ = connection.Close()
+				continue
+			}
+			var args daemon.CacheWarmArgs
+			if err := json.Unmarshal(request.Args, &args); err != nil || request.Op != "cache.warm" {
+				t.Errorf("request = %+v (%v), want cache.warm", request, err)
+			}
+			gotArgs <- args
+			for i, entry := range narrate {
+				if i < len(release) && release[i] != nil {
+					<-release[i]
 				}
-				if request.Op == "daemon.info" {
-					_ = json.NewEncoder(connection).Encode(daemon.Response{OK: true, Data: mustJSON(t, daemon.Info{ProtocolVersion: daemon.ProtocolVersion})})
-					return
-				}
-				var args daemon.CacheWarmArgs
-				if err := json.Unmarshal(request.Args, &args); err != nil || request.Op != "cache.warm" || len(args.Refs) != 1 {
-					t.Errorf("request = %+v (%v), want one-ref cache.warm", request, err)
-					return
-				}
-				serve(connection, args)
-			}()
+				_ = encoder.Encode(daemon.Response{Stage: daemon.CacheWarmEntryStagePrefix + string(mustJSON(t, entry))})
+			}
+			_ = encoder.Encode(daemon.Response{OK: true, Data: mustJSON(t, final)})
+			_ = connection.Close()
 		}
 	}()
 	return listener
 }
 
-func warmedResponse(t *testing.T, ref string) daemon.Response {
-	t.Helper()
-	return daemon.Response{OK: true, Data: mustJSON(t, daemon.CacheWarmResult{
-		Entries: []daemon.CacheWarmEntry{{Ref: ref, Status: daemon.CacheWarmStatusWarmed}},
-		Warmed:  1,
-	})}
-}
+func TestRunCacheWarmPrintsNarratedEntriesAsTheyArrive(t *testing.T) {
+	refs := []string{"registry.example/one:v1", "registry.example/two:v1", "registry.example/three:v1"}
+	entries := []daemon.CacheWarmEntry{
+		{Ref: refs[0], Status: daemon.CacheWarmStatusWarmed},
+		{Ref: refs[1], Status: daemon.CacheWarmStatusAlreadyComplete},
+		{Ref: refs[2], Status: daemon.CacheWarmStatusFailedMissing, Reason: "upstream: timeout"},
+	}
+	final := daemon.CacheWarmResult{Entries: entries, Warmed: 1, AlreadyComplete: 1, Failed: 1, FailedMissing: 1}
+	releaseSecond := make(chan struct{})
+	releaseThird := make(chan struct{})
+	gotArgs := make(chan daemon.CacheWarmArgs, 1)
+	warmNarrationListener(t, entries, []<-chan struct{}{nil, releaseSecond, releaseThird}, final, gotArgs)
 
-func writeWarmList(t *testing.T, refs []string) string {
-	t.Helper()
 	listPath := filepath.Join(t.TempDir(), "images.txt")
 	if err := os.WriteFile(listPath, []byte(strings.Join(refs, "\n")+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return listPath
-}
-
-func TestRunCacheWarmKeepsSeveralRefsInFlightAndPrintsInListOrder(t *testing.T) {
-	refs := []string{
-		"registry.example/one:v1",
-		"registry.example/two:v1",
-		"registry.example/three:v1",
-		"registry.example/four:v1",
-		"registry.example/five:v1",
-		"registry.example/six:v1",
-	}
-	var mu sync.Mutex
-	inFlight, peak := 0, 0
-	holdFirst := make(chan struct{})
-	var shares []int
-	warmStubListener(t, func(connection net.Conn, args daemon.CacheWarmArgs) {
-		mu.Lock()
-		shares = append(shares, args.Jobs)
-		mu.Unlock()
-		mu.Lock()
-		inFlight++
-		if inFlight > peak {
-			peak = inFlight
-		}
-		mu.Unlock()
-		if args.Refs[0] == refs[0] {
-			<-holdFirst
-		} else {
-			// let the others pile up while the first is held
-			time.Sleep(50 * time.Millisecond)
-		}
-		mu.Lock()
-		inFlight--
-		mu.Unlock()
-		_ = json.NewEncoder(connection).Encode(warmedResponse(t, args.Refs[0]))
-	})
-
 	stdout := newSignalBuffer()
 	var stderr bytes.Buffer
 	command := cli{out: stdout, err: &stderr, in: bytes.NewBuffer(nil)}
 	commandDone := make(chan error, 1)
-	go func() { commandDone <- command.run([]string{"cache", "warm", "--jobs", "6", writeWarmList(t, refs)}) }()
-	// --jobs 6 over 4 requests in flight: shares of 2, 2, 1, 1
+	go func() { commandDone <- command.run([]string{"cache", "warm", "--jobs", "3", listPath}) }()
 
-	// the later refs finish while the first is held, yet nothing prints:
-	// output is in list order
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		mu.Lock()
-		p := peak
-		mu.Unlock()
-		if p >= 4 {
-			break
-		}
-		time.Sleep(time.Millisecond)
+	select {
+	case <-stdout.wrote:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first narrated entry was not printed before the second was released")
 	}
-	time.Sleep(100 * time.Millisecond)
-	if got := stdout.String(); got != "" {
-		t.Fatalf("printed %q while the first ref was still in flight", got)
+	if got, want := stdout.String(), "\u2713 "+refs[0]+" warmed\n"; got != want {
+		t.Fatalf("output after first entry = %q, want %q", got, want)
 	}
-	close(holdFirst)
-	if err := <-commandDone; err != nil {
+	close(releaseSecond)
+	close(releaseThird)
+	err := <-commandDone
+	if err == nil || err.Error() != "cache warm failed for 1 ref(s)" {
+		t.Fatalf("err = %v, want one failed ref", err)
+	}
+	want := "\u2713 " + refs[0] + " warmed\n" +
+		"\u2713 " + refs[1] + " already complete\n" +
+		"\u2717 " + refs[2] + " failed (missing): upstream: timeout\n" +
+		"summary: 1 warmed, 1 already complete, 1 failed (missing)\n"
+	if got := stdout.String(); got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	args := <-gotArgs
+	if args.Jobs != 3 || fmt.Sprint(args.Refs) != fmt.Sprint(refs) {
+		t.Fatalf("args = %+v, want jobs 3 and the whole list", args)
+	}
+}
+
+func TestRunCacheWarmPrintsEntriesADaemonDidNotNarrate(t *testing.T) {
+	// an older daemon narrates nothing (or a newer one narrates part of the
+	// list before a stage is lost); the final result covers the rest, once
+	refs := []string{"registry.example/one:v1", "registry.example/two:v1"}
+	entries := []daemon.CacheWarmEntry{
+		{Ref: refs[0], Status: daemon.CacheWarmStatusWarmed},
+		{Ref: refs[1], Status: daemon.CacheWarmStatusWarmed},
+	}
+	warmNarrationListener(t, entries[:1], nil, daemon.CacheWarmResult{Entries: entries, Warmed: 2}, make(chan daemon.CacheWarmArgs, 1))
+	listPath := filepath.Join(t.TempDir(), "images.txt")
+	if err := os.WriteFile(listPath, []byte(strings.Join(refs, "\n")+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	if peak < 2 || peak > 4 {
-		t.Fatalf("peak requests in flight = %d, want parallel and at most min(4, jobs) = 4", peak)
-	}
-	for _, share := range shares {
-		if share != 1 && share != 2 {
-			t.Fatalf("request shares = %v, want each request to carry 1 or 2 of the 6 jobs", shares)
-		}
-	}
-	var want strings.Builder
-	for _, ref := range refs {
-		want.WriteString("✓ " + ref + " warmed\n")
-	}
-	want.WriteString("summary: 6 warmed, 0 already complete, 0 failed (missing)\n")
-	if got := stdout.String(); got != want.String() {
-		t.Fatalf("stdout = %q, want %q", got, want.String())
-	}
-}
-
-func TestWarmRefsConcurrentlySplitsJobsAcrossRequests(t *testing.T) {
-	for jobs, want := range map[int][]int{1: {1}, 2: {1, 1}, 3: {1, 1, 1}, 4: {1, 1, 1, 1}, 6: {2, 2, 1, 1}, 8: {2, 2, 2, 2}, 9: {3, 2, 2, 2}} {
-		got := warmJobShares(jobs)
-		if fmt.Sprint(got) != fmt.Sprint(want) {
-			t.Errorf("shares(%d) = %v, want %v", jobs, got, want)
-		}
-	}
-}
-
-func TestRunCacheWarmJobsOneKeepsOneRequestInFlight(t *testing.T) {
-	refs := []string{"registry.example/one:v1", "registry.example/two:v1", "registry.example/three:v1"}
-	var mu sync.Mutex
-	inFlight, peak := 0, 0
-	warmStubListener(t, func(connection net.Conn, args daemon.CacheWarmArgs) {
-		if args.Jobs != 1 {
-			t.Errorf("Jobs = %d, want 1", args.Jobs)
-		}
-		mu.Lock()
-		inFlight++
-		if inFlight > peak {
-			peak = inFlight
-		}
-		mu.Unlock()
-		time.Sleep(30 * time.Millisecond)
-		mu.Lock()
-		inFlight--
-		mu.Unlock()
-		_ = json.NewEncoder(connection).Encode(warmedResponse(t, args.Refs[0]))
-	})
 	var stdout, stderr bytes.Buffer
 	command := cli{out: &stdout, err: &stderr, in: bytes.NewBuffer(nil)}
-	if err := command.run([]string{"cache", "warm", "--jobs", "1", writeWarmList(t, refs)}); err != nil {
+	if err := command.run([]string{"cache", "warm", listPath}); err != nil {
 		t.Fatal(err)
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	if peak != 1 {
-		t.Fatalf("peak requests in flight = %d, want 1", peak)
+	want := "\u2713 " + refs[0] + " warmed\n" + "\u2713 " + refs[1] + " warmed\n" + "summary: 2 warmed, 0 already complete, 0 failed (missing)\n"
+	if got := stdout.String(); got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
 	}
 }
 
-func TestRunCacheWarmStopsStartingRequestsAfterAnError(t *testing.T) {
-	refs := make([]string, 12)
-	for i := range refs {
-		refs[i] = fmt.Sprintf("registry.example/img%d:v1", i)
+func TestRunCacheWarmRejectsNarrationOutOfListOrder(t *testing.T) {
+	refs := []string{"registry.example/one:v1", "registry.example/two:v1"}
+	entries := []daemon.CacheWarmEntry{
+		{Ref: refs[1], Status: daemon.CacheWarmStatusWarmed},
+		{Ref: refs[0], Status: daemon.CacheWarmStatusWarmed},
 	}
-	var mu sync.Mutex
-	seen := map[string]bool{}
-	warmStubListener(t, func(connection net.Conn, args daemon.CacheWarmArgs) {
-		mu.Lock()
-		seen[args.Refs[0]] = true
-		mu.Unlock()
-		if args.Refs[0] == refs[0] {
-			_ = json.NewEncoder(connection).Encode(daemon.Response{Error: "daemon exploded"})
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-		_ = json.NewEncoder(connection).Encode(warmedResponse(t, args.Refs[0]))
-	})
+	warmNarrationListener(t, entries, nil, daemon.CacheWarmResult{Entries: entries, Warmed: 2}, make(chan daemon.CacheWarmArgs, 1))
+	listPath := filepath.Join(t.TempDir(), "images.txt")
+	if err := os.WriteFile(listPath, []byte(strings.Join(refs, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	var stdout, stderr bytes.Buffer
 	command := cli{out: &stdout, err: &stderr, in: bytes.NewBuffer(nil)}
-	err := command.run([]string{"cache", "warm", writeWarmList(t, refs)})
-	if err == nil || !strings.Contains(err.Error(), "daemon exploded") {
-		t.Fatalf("err = %v, want the daemon error", err)
-	}
-	time.Sleep(100 * time.Millisecond)
-	mu.Lock()
-	defer mu.Unlock()
-	if len(seen) > 4 {
-		t.Fatalf("%d refs were requested after the first failed, want at most the 4 already in flight", len(seen))
+	err := command.run([]string{"cache", "warm", listPath})
+	if err == nil || !strings.Contains(err.Error(), "narrated "+refs[1]+", want "+refs[0]) {
+		t.Fatalf("err = %v, want out-of-order narration rejected", err)
 	}
 	if stdout.Len() != 0 {
-		t.Fatalf("stdout = %q, want nothing after a failed first ref", stdout.String())
+		t.Fatalf("stdout = %q, want nothing printed for misordered narration", stdout.String())
 	}
 }

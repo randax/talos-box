@@ -66,7 +66,70 @@ func TestCacheWarmForwardsRefreshOptionAndTypedCounts(t *testing.T) {
 	}
 }
 
-func TestCacheWarmRejectsNegativeJobs(t *testing.T) {
+func TestCacheWarmNarratesEachFinishedEntryInOrder(t *testing.T) {
+	t.Parallel()
+	refs := []string{"registry.example/one:v1", "registry.example/two:v1"}
+	service := &Server{
+		hypervisor: &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
+		warmCacheWithOptions: func(_ context.Context, refs []string, _ imagecache.Architecture, options mirror.WarmOptions) (mirror.WarmSummary, error) {
+			if options.OnResult == nil {
+				t.Fatal("OnResult = nil, want narration wired for a narrated request")
+			}
+			var summary mirror.WarmSummary
+			for i, ref := range refs {
+				result := mirror.WarmResult{Ref: ref, Outcome: mirror.WarmOutcomeWarmed}
+				if i == 1 {
+					result = mirror.WarmResult{Ref: ref, Outcome: mirror.WarmOutcomeFailedRevalidate, Error: "upstream 404"}
+				}
+				summary.Results = append(summary.Results, result)
+				options.OnResult(result)
+			}
+			return summary, nil
+		},
+	}
+	var stages []string
+	value, err := service.handle(Request{
+		Op:   "cache.warm",
+		Args: mustWarmArgs(t, CacheWarmArgs{Refs: refs, Jobs: 4}),
+	}, func(stage string) { stages = append(stages, stage) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := value.(CacheWarmResult)
+	if len(stages) != 2 {
+		t.Fatalf("stages = %q, want one per ref", stages)
+	}
+	for i, stage := range stages {
+		entry, ok := ParseCacheWarmEntryStage(stage)
+		if !ok {
+			t.Fatalf("stage %q did not parse as a warm entry", stage)
+		}
+		if entry != result.Entries[i] {
+			t.Fatalf("narrated entry %d = %+v, want the final entry %+v", i, entry, result.Entries[i])
+		}
+	}
+	if _, ok := ParseCacheWarmEntryStage("waiting for the daemon's current operation to finish"); ok {
+		t.Fatal("plain narration parsed as a warm entry")
+	}
+}
+
+func TestCacheWarmSkipsNarrationWithoutAListener(t *testing.T) {
+	t.Parallel()
+	service := &Server{
+		hypervisor: &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
+		warmCacheWithOptions: func(_ context.Context, _ []string, _ imagecache.Architecture, options mirror.WarmOptions) (mirror.WarmSummary, error) {
+			if options.OnResult != nil {
+				t.Fatal("OnResult set for an unnarrated request")
+			}
+			return mirror.WarmSummary{}, nil
+		},
+	}
+	if _, err := service.handle(Request{Op: "cache.warm", Args: mustWarmArgs(t, CacheWarmArgs{Refs: []string{"registry.example/one:v1"}})}, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCacheWarmRejectsJobsOutsideItsRange(t *testing.T) {
 	t.Parallel()
 	service := &Server{
 		hypervisor: &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
@@ -75,12 +138,14 @@ func TestCacheWarmRejectsNegativeJobs(t *testing.T) {
 			return mirror.WarmSummary{}, nil
 		},
 	}
-	_, err := service.handle(Request{
-		Op:   "cache.warm",
-		Args: mustWarmArgs(t, CacheWarmArgs{Refs: []string{"docker.io/library/nginx:1.27.0"}, Jobs: -1}),
-	}, nil)
-	if err == nil || !strings.Contains(err.Error(), "jobs must not be negative") {
-		t.Fatalf("err = %v, want negative jobs rejection", err)
+	for _, jobs := range []int{-1, MaxCacheWarmJobs + 1} {
+		_, err := service.handle(Request{
+			Op:   "cache.warm",
+			Args: mustWarmArgs(t, CacheWarmArgs{Refs: []string{"docker.io/library/nginx:1.27.0"}, Jobs: jobs}),
+		}, nil)
+		if err == nil || !strings.Contains(err.Error(), "jobs must be between 0 and 16") {
+			t.Fatalf("jobs %d: err = %v, want range rejection", jobs, err)
+		}
 	}
 }
 

@@ -246,9 +246,10 @@ exit rather than an answer.
 Blank lines and lines beginning with `#` are ignored. By default, warm resumes incomplete refs
 and makes no upstream request for complete refs. `--refresh` revalidates complete unpinned tags;
 digest-pinned refs do not need freshness resolution, and a transient refresh failure is nonfatal
-when the existing cache is complete. Warm keeps up to `--jobs` blob downloads in flight across the
-whole list (default 8, capped daemon-wide at 16 when runs overlap); `--jobs 1` downloads one blob at
-a time. A failing blob fails only its own ref, and what was already downloaded is kept for the rerun.
+when the existing cache is complete. Warm keeps `--jobs` blob downloads in flight across the whole
+list (default 8, at most 16, which is also the daemon-wide ceiling when runs overlap); `--jobs 1`
+downloads one blob at a time. A failing blob fails only its own ref: its remaining layers are not
+started, downloads already under way finish, and everything fetched is kept for the rerun.
 
 **Complete** means the tag mapping (when the ref uses a tag), root manifest, selected
 `linux/<arch>` manifest, config, and every selected-platform layer are all present locally.

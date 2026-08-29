@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 
 	"github.com/randax/talos-box/internal/imagecache"
 )
@@ -44,6 +43,9 @@ type WarmOptions struct {
 	// Jobs bounds the blob downloads this warm keeps in flight; zero means
 	// DefaultWarmJobs and MaxWarmJobs is the ceiling (#506).
 	Jobs int
+	// OnResult, when set, sees every result as soon as it is final, in list
+	// order, so a caller can report progress while the rest still downloads.
+	OnResult func(WarmResult)
 }
 
 type WarmOutcome string
@@ -64,56 +66,70 @@ type warmReference struct {
 
 func (m *Manager) Warm(ctx context.Context, references []string, architecture imagecache.Architecture, options WarmOptions) (WarmSummary, error) {
 	pool := m.newWarmPool(options.Jobs)
-	results := make([]WarmResult, len(references))
-	errs := make([]error, len(references))
-	refSlots := make(chan struct{}, pool.jobs())
-	var wg sync.WaitGroup
-	for i, reference := range references {
-		select {
-		case refSlots <- struct{}{}:
-		case <-ctx.Done():
-			errs[i] = ctx.Err()
-			continue
-		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer func() { <-refSlots }()
-			results[i], errs[i] = m.warmOne(ctx, reference, architecture, options, pool)
-		}()
+	done := make([]chan WarmResult, len(references))
+	for i := range done {
+		done[i] = make(chan WarmResult, 1)
 	}
-	wg.Wait()
-
+	go func() {
+		// refs are started in list order, at most jobs at a time, so the
+		// in-order consumer below never waits on a ref that has not started
+		refSlots := make(chan struct{}, pool.jobs())
+		for i, reference := range references {
+			select {
+			case refSlots <- struct{}{}:
+			case <-ctx.Done():
+				done[i] <- finishedWarmResult(reference, WarmResult{}, ctx.Err())
+				continue
+			}
+			go func() {
+				defer func() { <-refSlots }()
+				result, err := m.warmOne(ctx, reference, architecture, options, pool)
+				done[i] <- finishedWarmResult(reference, result, err)
+			}()
+		}
+	}()
 	var summary WarmSummary
-	for i, reference := range references {
-		result, err := results[i], errs[i]
-		if err != nil {
-			result.Ref = reference
-			result.Error = err.Error()
-			if result.Outcome == "" {
-				result.Outcome = WarmOutcomeFailedMissing
-			}
-			summary.Results = append(summary.Results, result)
-			summary.Failed++
-			if result.Outcome == WarmOutcomeFailedRevalidate {
-				summary.FailedRevalidate++
-			} else {
-				summary.FailedMissing++
-			}
-			continue
-		}
-		summary.Results = append(summary.Results, result)
-		if result.ReResolvedTag {
-			summary.ReResolvedTags++
-		}
-		switch result.Outcome {
-		case WarmOutcomeAlreadyComplete:
-			summary.AlreadyComplete++
-		default:
-			summary.Warmed++
+	for i := range references {
+		result := <-done[i]
+		summary.add(result)
+		if options.OnResult != nil {
+			options.OnResult(result)
 		}
 	}
 	return summary, nil
+}
+
+func finishedWarmResult(reference string, result WarmResult, err error) WarmResult {
+	if err != nil {
+		result.Ref = reference
+		result.Error = err.Error()
+		if result.Outcome == "" {
+			result.Outcome = WarmOutcomeFailedMissing
+		}
+	}
+	return result
+}
+
+func (s *WarmSummary) add(result WarmResult) {
+	s.Results = append(s.Results, result)
+	if result.Error != "" {
+		s.Failed++
+		if result.Outcome == WarmOutcomeFailedRevalidate {
+			s.FailedRevalidate++
+		} else {
+			s.FailedMissing++
+		}
+		return
+	}
+	if result.ReResolvedTag {
+		s.ReResolvedTags++
+	}
+	switch result.Outcome {
+	case WarmOutcomeAlreadyComplete:
+		s.AlreadyComplete++
+	default:
+		s.Warmed++
+	}
 }
 
 func (m *Manager) warmOne(ctx context.Context, reference string, architecture imagecache.Architecture, options WarmOptions, pool *warmPool) (WarmResult, error) {
@@ -141,10 +157,7 @@ func (m *Manager) warmOne(ctx context.Context, reference string, architecture im
 		return WarmResult{Ref: reference, AlreadyComplete: true, Outcome: WarmOutcomeAlreadyComplete}, nil
 	}
 
-	handler := m.handlerForUpstream(authority)
-	m.mu.Lock()
-	server = m.dynamicServers[authority.cacheKey]
-	m.mu.Unlock()
+	handler, server := m.handlerAndServerForUpstream(authority)
 	if server == nil {
 		return failedWarmResult(before), fmt.Errorf("warm server for %q unavailable", parsed.upstream)
 	}
@@ -241,12 +254,7 @@ func warmManifestGraph(ctx context.Context, handler http.Handler, server *Server
 				continue
 			}
 			downloading = true
-			group.run(func(ctx context.Context) error {
-				release, err := pool.acquire(ctx)
-				if err != nil {
-					return err
-				}
-				defer release()
+			started := group.start(pool, func(ctx context.Context) error {
 				// refs warming side by side often share a base layer; one
 				// downloads it and the others find it cached
 				defer pool.inflight.lock(server.cacheDir + " " + blob)()
@@ -255,6 +263,9 @@ func warmManifestGraph(ctx context.Context, handler http.Handler, server *Server
 				}
 				return warmBlobRequest(ctx, handler, repository, blob)
 			})
+			if !started {
+				break
+			}
 		}
 		if err := group.wait(); err != nil {
 			return err

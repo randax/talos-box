@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"strings"
-	"sync"
 
 	"github.com/randax/talos-box/internal/daemon"
 	"github.com/randax/talos-box/internal/provision"
@@ -26,7 +25,7 @@ func (c cli) runCacheWarm(args []string) error {
 	checkOnly := flags.Bool("check", false, "verify the warmed cache offline instead of downloading")
 	deep := flags.Bool("deep", false, "rehash cached blobs while checking")
 	refresh := flags.Bool("refresh", false, "revalidate complete unpinned tags before warming")
-	jobs := flags.Int("jobs", daemon.DefaultCacheWarmJobs, "blob downloads to keep in flight (1 warms one blob at a time)")
+	jobs := flags.Int("jobs", daemon.DefaultCacheWarmJobs, fmt.Sprintf("blob downloads to keep in flight, 1-%d (1 warms one blob at a time)", daemon.MaxCacheWarmJobs))
 	flags.Usage = func() {
 		_, _ = fmt.Fprintln(c.err, "Usage: tbx cache warm [--refresh] [--jobs N] <list-file> [<list-file>...]")
 		_, _ = fmt.Fprintln(c.err, "       tbx cache warm --check [--deep] <list-file> [<list-file>...]")
@@ -34,7 +33,7 @@ func (c cli) runCacheWarm(args []string) error {
 		_, _ = fmt.Fprintln(c.err, "By default, warm resumes incomplete refs and makes no upstream request for complete refs.")
 		_, _ = fmt.Fprintln(c.err, "--refresh revalidates complete unpinned tags; digest-pinned refs do not need freshness resolution.")
 		_, _ = fmt.Fprintln(c.err, "A transient refresh failure is nonfatal when the existing cache is complete.")
-		_, _ = fmt.Fprintf(c.err, "--jobs N keeps up to N blob downloads in flight across the list (default %d); 1 warms one blob at a time.\n", daemon.DefaultCacheWarmJobs)
+		_, _ = fmt.Fprintf(c.err, "--jobs N keeps N blob downloads in flight across the list (default %d, at most %d); 1 warms one blob at a time.\n", daemon.DefaultCacheWarmJobs, daemon.MaxCacheWarmJobs)
 		_, _ = fmt.Fprintln(c.err, "--check verifies tag mapping, selected linux/<arch> manifest, config, and all layers locally.")
 		_, _ = fmt.Fprintln(c.err, "--deep additionally hashes cached blobs.")
 	}
@@ -51,8 +50,13 @@ func (c cli) runCacheWarm(args []string) error {
 	if *refresh && *checkOnly {
 		return errors.New("cache warm --refresh cannot be used with --check")
 	}
-	if *jobs < 1 {
-		return fmt.Errorf("cache warm --jobs must be at least 1, got %d", *jobs)
+	if *jobs < 1 || *jobs > daemon.MaxCacheWarmJobs {
+		return fmt.Errorf("cache warm --jobs must be between 1 and %d, got %d", daemon.MaxCacheWarmJobs, *jobs)
+	}
+	jobsGiven := false
+	flags.Visit(func(f *flag.Flag) { jobsGiven = jobsGiven || f.Name == "jobs" })
+	if jobsGiven && *checkOnly {
+		return errors.New("cache warm --jobs cannot be used with --check")
 	}
 	entries, err := parseWarmListEntries(positionals, c.in)
 	if err != nil {
@@ -124,148 +128,98 @@ func (c cli) runCacheWarm(args []string) error {
 		}
 		return nil
 	}
-	var warmed, alreadyComplete, failedMissing, failedRevalidate int
-	var refreshWarnings []string
-	for _, next := range c.warmRefsConcurrently(refs, *refresh, *jobs) {
-		entry, err := next()
-		if err != nil {
-			return err
+	// One request carries the whole list: the daemon runs the refs under its
+	// --jobs blob budget and narrates each finished entry in list order, so
+	// the lines below still appear as refs complete. A daemon that does not
+	// narrate entries (or narrates fewer than it answers) is covered by the
+	// final result, printed from where the narration stopped (#506).
+	var tally warmTally
+	var printErr error
+	onStage := func(stage string) {
+		entry, ok := daemon.ParseCacheWarmEntryStage(stage)
+		if !ok {
+			_, _ = fmt.Fprintln(c.err, stage)
+			return
 		}
-		switch entry.Status {
-		case daemon.CacheWarmStatusWarmed:
-			if _, err := fmt.Fprintf(c.out, "\u2713 %s warmed\n", entry.Ref); err != nil {
-				return err
-			}
-			warmed++
-		case daemon.CacheWarmStatusAlreadyComplete:
-			suffix := ""
-			if entry.RefreshWarning != "" {
-				suffix = " (" + entry.RefreshWarning + ")"
-				refreshWarnings = append(refreshWarnings, entry.Ref)
-			}
-			if _, err := fmt.Fprintf(c.out, "\u2713 %s already complete%s\n", entry.Ref, suffix); err != nil {
-				return err
-			}
-			alreadyComplete++
-		case daemon.CacheWarmStatusFailedRevalidate:
-			if _, err := fmt.Fprintf(c.out, "\u2717 %s failed (revalidate): %s\n", entry.Ref, entry.Reason); err != nil {
-				return err
-			}
-			failedRevalidate++
-		case daemon.CacheWarmStatusFailedMissing:
-			if _, err := fmt.Fprintf(c.out, "\u2717 %s failed (missing): %s\n", entry.Ref, entry.Reason); err != nil {
-				return err
-			}
-			failedMissing++
-		case daemon.CacheWarmStatusFailed:
-			if _, err := fmt.Fprintf(c.out, "\u2717 %s failed (missing): %s\n", entry.Ref, entry.Reason); err != nil {
-				return err
-			}
-			failedMissing++
+		if printErr != nil || tally.printed >= len(refs) {
+			return
 		}
+		if entry.Ref != refs[tally.printed] {
+			printErr = fmt.Errorf("cache warm narrated %s, want %s", entry.Ref, refs[tally.printed])
+			return
+		}
+		printErr = tally.print(c.out, entry)
 	}
-	if _, err := fmt.Fprintf(c.out, "summary: %d warmed, %d already complete, %d failed (missing)", warmed, alreadyComplete, failedMissing); err != nil {
+	var result daemon.CacheWarmResult
+	if err := c.callNarrated("cache.warm", daemon.CacheWarmArgs{Refs: refs, Refresh: *refresh, Jobs: *jobs}, &result, onStage); err != nil {
 		return err
 	}
-	if *refresh || failedRevalidate > 0 {
-		if _, err := fmt.Fprintf(c.out, ", %d failed (revalidate)", failedRevalidate); err != nil {
+	if printErr != nil {
+		return printErr
+	}
+	if len(result.Entries) != len(refs) {
+		return fmt.Errorf("cache warm returned %d entries for %d refs", len(result.Entries), len(refs))
+	}
+	for i := tally.printed; i < len(refs); i++ {
+		if result.Entries[i].Ref != refs[i] {
+			return fmt.Errorf("cache warm returned result for %s, want %s", result.Entries[i].Ref, refs[i])
+		}
+		if err := tally.print(c.out, result.Entries[i]); err != nil {
+			return err
+		}
+	}
+	if _, err := fmt.Fprintf(c.out, "summary: %d warmed, %d already complete, %d failed (missing)", tally.warmed, tally.alreadyComplete, tally.failedMissing); err != nil {
+		return err
+	}
+	if *refresh || tally.failedRevalidate > 0 {
+		if _, err := fmt.Fprintf(c.out, ", %d failed (revalidate)", tally.failedRevalidate); err != nil {
 			return err
 		}
 	}
 	if _, err := fmt.Fprintln(c.out); err != nil {
 		return err
 	}
-	if len(refreshWarnings) > 0 {
-		if _, err := fmt.Fprintf(c.out, "note: %d complete ref(s) were not revalidated: %s\n", len(refreshWarnings), strings.Join(refreshWarnings, ", ")); err != nil {
+	if len(tally.refreshWarnings) > 0 {
+		if _, err := fmt.Fprintf(c.out, "note: %d complete ref(s) were not revalidated: %s\n", len(tally.refreshWarnings), strings.Join(tally.refreshWarnings, ", ")); err != nil {
 			return err
 		}
 	}
-	if failed := failedMissing + failedRevalidate; failed > 0 {
+	if failed := tally.failedMissing + tally.failedRevalidate; failed > 0 {
 		return fmt.Errorf("cache warm failed for %d ref(s)", failed)
 	}
 	return nil
 }
 
-// warmJobShares splits jobs across at most four in-flight requests so the
-// shares sum to jobs: 8 -> [2 2 2 2], 6 -> [2 2 1 1], 1 -> [1].
-func warmJobShares(jobs int) []int {
-	const maxRequestsInFlight = 4
-	requests := min(maxRequestsInFlight, jobs)
-	shares := make([]int, requests)
-	for i := range shares {
-		shares[i] = jobs / requests
-		if i < jobs%requests {
-			shares[i]++
-		}
-	}
-	return shares
+// warmTally prints one warm entry per line and keeps the counts the summary
+// line reports.
+type warmTally struct {
+	printed, warmed, alreadyComplete, failedMissing, failedRevalidate int
+	refreshWarnings                                                   []string
 }
 
-type warmOutcome struct {
-	entry daemon.CacheWarmEntry
-	err   error
-}
-
-// warmRefsConcurrently keeps a few `cache.warm` requests in flight (one ref
-// each, as before) so the daemon's blob pool sees more than one ref at a
-// time, and hands the outcomes back in list order: each returned func blocks
-// until its ref is done, so the caller still prints ✓/✗ lines progressively.
-// The in-flight requests split `jobs` between them — each slot carries its
-// share, and the shares sum to jobs — so the run keeps exactly --jobs blob
-// downloads in flight however many requests that takes. The first error stops
-// further requests from starting. --jobs 1 keeps one request in flight, which
-// is exactly the serial behaviour it replaces (#506).
-func (c cli) warmRefsConcurrently(refs []string, refresh bool, jobs int) []func() (daemon.CacheWarmEntry, error) {
-	outcomes := make([]chan warmOutcome, len(refs))
-	for i := range outcomes {
-		outcomes[i] = make(chan warmOutcome, 1)
-	}
-	shares := warmJobShares(jobs)
-	slots := make(chan int, len(shares))
-	for _, share := range shares {
-		slots <- share
-	}
-	stop := make(chan struct{})
-	var stopOnce sync.Once
-	go func() {
-		for i, ref := range refs {
-			var share int
-			select {
-			case <-stop:
-				return
-			case share = <-slots:
-			}
-			select {
-			case <-stop:
-				// a slot freed by the failing ref is not a reason to start
-				return
-			default:
-			}
-			go func() {
-				defer func() { slots <- share }()
-				var result daemon.CacheWarmResult
-				err := c.call("cache.warm", daemon.CacheWarmArgs{Refs: []string{ref}, Refresh: refresh, Jobs: share}, &result)
-				var entry daemon.CacheWarmEntry
-				if err == nil {
-					entry, err = cacheWarmEntryForRef(ref, result)
-				}
-				if err != nil {
-					// closed before this slot is returned, so it cannot be
-					// handed to a ref that will never be printed
-					stopOnce.Do(func() { close(stop) })
-				}
-				outcomes[i] <- warmOutcome{entry: entry, err: err}
-			}()
+func (t *warmTally) print(out io.Writer, entry daemon.CacheWarmEntry) error {
+	t.printed++
+	var err error
+	switch entry.Status {
+	case daemon.CacheWarmStatusWarmed:
+		_, err = fmt.Fprintf(out, "\u2713 %s warmed\n", entry.Ref)
+		t.warmed++
+	case daemon.CacheWarmStatusAlreadyComplete:
+		suffix := ""
+		if entry.RefreshWarning != "" {
+			suffix = " (" + entry.RefreshWarning + ")"
+			t.refreshWarnings = append(t.refreshWarnings, entry.Ref)
 		}
-	}()
-	next := make([]func() (daemon.CacheWarmEntry, error), len(refs))
-	for i := range refs {
-		next[i] = func() (daemon.CacheWarmEntry, error) {
-			outcome := <-outcomes[i]
-			return outcome.entry, outcome.err
-		}
+		_, err = fmt.Fprintf(out, "\u2713 %s already complete%s\n", entry.Ref, suffix)
+		t.alreadyComplete++
+	case daemon.CacheWarmStatusFailedRevalidate:
+		_, err = fmt.Fprintf(out, "\u2717 %s failed (revalidate): %s\n", entry.Ref, entry.Reason)
+		t.failedRevalidate++
+	case daemon.CacheWarmStatusFailedMissing, daemon.CacheWarmStatusFailed:
+		_, err = fmt.Fprintf(out, "\u2717 %s failed (missing): %s\n", entry.Ref, entry.Reason)
+		t.failedMissing++
 	}
-	return next
+	return err
 }
 
 // withBootstrapRequiredRefs appends the bootstrap-required images the list
@@ -305,41 +259,6 @@ func cacheCheckEntryForRef(ref string, result daemon.CacheCheckResult) (daemon.C
 		}
 	default:
 		return daemon.CacheCheckEntry{}, fmt.Errorf("cache check returned unknown status %q for %s", entry.Status, entry.Ref)
-	}
-	return entry, nil
-}
-
-func cacheWarmEntryForRef(ref string, result daemon.CacheWarmResult) (daemon.CacheWarmEntry, error) {
-	if len(result.Entries) != 1 {
-		return daemon.CacheWarmEntry{}, fmt.Errorf("cache warm returned %d entries for %s, want 1", len(result.Entries), ref)
-	}
-	entry := result.Entries[0]
-	if entry.Ref != ref {
-		return daemon.CacheWarmEntry{}, fmt.Errorf("cache warm returned result for %s, want %s", entry.Ref, ref)
-	}
-	switch entry.Status {
-	case daemon.CacheWarmStatusWarmed:
-		if result.Warmed != 1 || result.AlreadyComplete != 0 || result.Failed != 0 {
-			return daemon.CacheWarmEntry{}, fmt.Errorf("cache warm returned inconsistent counts for %s", ref)
-		}
-	case daemon.CacheWarmStatusAlreadyComplete:
-		if result.Warmed != 0 || result.AlreadyComplete != 1 || result.Failed != 0 {
-			return daemon.CacheWarmEntry{}, fmt.Errorf("cache warm returned inconsistent counts for %s", ref)
-		}
-	case daemon.CacheWarmStatusFailedMissing:
-		if result.Warmed != 0 || result.AlreadyComplete != 0 || result.Failed != 1 || result.FailedMissing != 1 || result.FailedRevalidate != 0 {
-			return daemon.CacheWarmEntry{}, fmt.Errorf("cache warm returned inconsistent counts for %s", ref)
-		}
-	case daemon.CacheWarmStatusFailedRevalidate:
-		if result.Warmed != 0 || result.AlreadyComplete != 0 || result.Failed != 1 || result.FailedMissing != 0 || result.FailedRevalidate != 1 {
-			return daemon.CacheWarmEntry{}, fmt.Errorf("cache warm returned inconsistent counts for %s", ref)
-		}
-	case daemon.CacheWarmStatusFailed:
-		if result.Warmed != 0 || result.AlreadyComplete != 0 || result.Failed != 1 || result.FailedMissing != 0 || result.FailedRevalidate != 0 {
-			return daemon.CacheWarmEntry{}, fmt.Errorf("cache warm returned inconsistent counts for %s", ref)
-		}
-	default:
-		return daemon.CacheWarmEntry{}, fmt.Errorf("cache warm returned unknown status %q for %s", entry.Status, entry.Ref)
 	}
 	return entry, nil
 }

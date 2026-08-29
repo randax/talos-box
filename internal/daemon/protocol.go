@@ -85,7 +85,10 @@ const (
 // request shape.
 // Version 19 honors the kubeletMemoryProtection provisioning opt-out. Older
 // daemons would silently ignore the new request field and apply protection.
-const ProtocolVersion = 19
+// Version 20 honors cache.warm's jobs field and narrates each finished ref as
+// a stage. Older daemons would silently warm serially and answer only at the
+// end (#506).
+const ProtocolVersion = 20
 
 // Request is one newline-delimited daemon request.
 type Request struct {

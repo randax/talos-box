@@ -57,16 +57,36 @@ func NewServer(base, cacheDir string) *Server {
 	return &Server{
 		base:     strings.TrimSuffix(base, "/"),
 		cacheDir: cacheDir,
-		client:   &http.Client{Timeout: 5 * time.Minute},
+		client:   newUpstreamClient(nil),
 		tokens:   make(map[string]token),
 	}
+}
+
+// upstreamStallTimeout is how long an upstream may go silent — before its
+// headers, or between two reads of its body — before the request is given up.
+// It replaces a whole-request timeout: with several layers sharing the link at
+// once a large layer legitimately takes many times longer than it did alone,
+// and only a stalled one is a failure (#506).
+const upstreamStallTimeout = 5 * time.Minute
+
+// newUpstreamClient bounds an upstream request by silence, not by total
+// duration: the transport times out the headers and fetch wraps each body so a
+// stall cancels the request. A nil transport takes the default one with the
+// same header bound.
+func newUpstreamClient(transport http.RoundTripper) *http.Client {
+	if transport == nil {
+		base := http.DefaultTransport.(*http.Transport).Clone()
+		base.ResponseHeaderTimeout = upstreamStallTimeout
+		transport = base
+	}
+	return &http.Client{Transport: transport}
 }
 
 func newServerWithEgress(base, cacheDir string, egress egressDependencies) *Server {
 	return &Server{
 		base:     strings.TrimSuffix(base, "/"),
 		cacheDir: cacheDir,
-		client:   &http.Client{Timeout: 5 * time.Minute, Transport: newSafeTransport(egress)},
+		client:   newUpstreamClient(newSafeTransport(egress)),
 		tokens:   make(map[string]token),
 	}
 }
@@ -106,6 +126,7 @@ func newSafeTransport(egress egressDependencies) *http.Transport {
 			MaxIdleConns:          100,
 			MaxIdleConnsPerHost:   MaxWarmJobs, // a warm keeps this many fetches on one host
 			IdleConnTimeout:       90 * time.Second,
+			ResponseHeaderTimeout: upstreamStallTimeout,
 			TLSHandshakeTimeout:   10 * time.Second,
 			ExpectContinueTimeout: 1 * time.Second,
 		}

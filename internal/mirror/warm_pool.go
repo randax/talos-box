@@ -56,39 +56,69 @@ func (p *warmPool) acquire(ctx context.Context) (func(), error) {
 	}, nil
 }
 
-// warmGroup runs a ref's blob downloads and keeps the first error: that error
-// cancels the siblings, whose own cancellation errors are dropped so the ref
-// reports what actually went wrong rather than the fallout.
+// warmGroup runs a ref's blob downloads and keeps the first error. Downloads
+// are started in manifest order, each after its slot is held; the first error
+// stops the next from starting and frees a start still waiting for a slot,
+// while downloads already under way finish, so what a failing ref did fetch
+// stays on disk for the rerun. Errors caused by the stop itself are dropped
+// so the ref reports what actually went wrong rather than the fallout.
 type warmGroup struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
-	once   sync.Once
-	err    error
+	ctx     context.Context
+	stopCtx context.Context
+	stop    context.CancelFunc
+	wg      sync.WaitGroup
+	mu      sync.Mutex
+	err     error
 }
 
 func newWarmGroup(ctx context.Context) *warmGroup {
-	ctx, cancel := context.WithCancel(ctx)
-	return &warmGroup{ctx: ctx, cancel: cancel}
+	stopCtx, stop := context.WithCancel(ctx)
+	return &warmGroup{ctx: ctx, stopCtx: stopCtx, stop: stop}
 }
 
-func (g *warmGroup) run(fn func(context.Context) error) {
+// start holds a pool slot for fn and runs it. It reports false once a sibling
+// has failed — or the caller's context is done — and nothing was started.
+func (g *warmGroup) start(pool *warmPool, fn func(context.Context) error) bool {
+	release, err := pool.acquire(g.stopCtx)
+	if err != nil {
+		return false
+	}
+	if g.failed() {
+		release()
+		return false
+	}
 	g.wg.Add(1)
 	go func() {
 		defer g.wg.Done()
-		if err := fn(g.ctx); err != nil {
-			g.once.Do(func() {
-				g.err = err
-				g.cancel()
-			})
+		err := fn(g.ctx)
+		g.mu.Lock()
+		if err != nil && g.err == nil {
+			g.err = err
+			g.stop()
 		}
+		g.mu.Unlock()
+		// released only after the failure is recorded, so the slot cannot
+		// start a sibling the failure should have stopped
+		release()
 	}()
+	return true
 }
 
+func (g *warmGroup) failed() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.err != nil
+}
+
+// wait joins the downloads and returns the first error, or the caller's
+// context error if that is what stopped the starts.
 func (g *warmGroup) wait() error {
 	g.wg.Wait()
-	g.cancel()
-	return g.err
+	g.stop()
+	if g.err != nil {
+		return g.err
+	}
+	return g.ctx.Err()
 }
 
 // keyedMutex serializes work on one key without touching the others: two
