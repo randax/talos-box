@@ -2,6 +2,8 @@ package mirror
 
 import (
 	"context"
+	"errors"
+	"log"
 	"sync"
 )
 
@@ -92,9 +94,15 @@ func (g *warmGroup) start(pool *warmPool, fn func(context.Context) error) bool {
 		defer g.wg.Done()
 		err := fn(g.ctx)
 		g.mu.Lock()
-		if err != nil && g.err == nil {
+		switch {
+		case err == nil:
+		case g.err == nil:
 			g.err = err
 			g.stop()
+		case !errors.Is(err, context.Canceled):
+			// the ref reports the first failure; a second real one is still
+			// worth a trace for whoever debugs a multi-blob outage
+			log.Printf("mirror warm: a sibling blob also failed: %v", err)
 		}
 		g.mu.Unlock()
 		// released only after the failure is recorded, so the slot cannot
@@ -123,33 +131,33 @@ func (g *warmGroup) wait() error {
 
 // keyedMutex serializes work on one key without touching the others: two
 // warms of the same tag still publish one at a time, unrelated tags no longer
-// queue behind each other (#506).
+// queue behind each other (#506). A wait is cancellable, so a ref stopped by
+// a sibling's failure or by shutdown does not sit behind another ref's
+// download of the same blob.
 type keyedMutex struct {
 	mu    sync.Mutex
 	locks map[string]*keyedLock
 }
 
 type keyedLock struct {
-	sync.Mutex
+	held    chan struct{} // holds one token while unlocked
 	waiters int
 }
 
-func (k *keyedMutex) lock(key string) func() {
+func (k *keyedMutex) lock(ctx context.Context, key string) (func(), error) {
 	k.mu.Lock()
 	if k.locks == nil {
 		k.locks = make(map[string]*keyedLock)
 	}
 	entry := k.locks[key]
 	if entry == nil {
-		entry = &keyedLock{}
+		entry = &keyedLock{held: make(chan struct{}, 1)}
 		k.locks[key] = entry
 	}
 	entry.waiters++
 	k.mu.Unlock()
 
-	entry.Lock()
-	return func() {
-		entry.Unlock()
+	forget := func() {
 		k.mu.Lock()
 		entry.waiters--
 		if entry.waiters == 0 {
@@ -157,4 +165,14 @@ func (k *keyedMutex) lock(key string) func() {
 		}
 		k.mu.Unlock()
 	}
+	select {
+	case entry.held <- struct{}{}:
+	case <-ctx.Done():
+		forget()
+		return nil, ctx.Err()
+	}
+	return func() {
+		<-entry.held
+		forget()
+	}, nil
 }

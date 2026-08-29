@@ -140,7 +140,11 @@ func (m *Manager) warmOne(ctx context.Context, reference string, architecture im
 	if !isDigestReference(parsed.listedRef) {
 		// the same tag resolved and published by two warms at once must not
 		// interleave; other tags are unrelated and run alongside
-		defer m.warmTagLocks.lock(parsed.upstream + "/" + parsed.repository + ":" + parsed.listedRef)()
+		unlock, err := m.warmTagLocks.lock(ctx, parsed.upstream+"/"+parsed.repository+":"+parsed.listedRef)
+		if err != nil {
+			return WarmResult{Outcome: WarmOutcomeFailedMissing}, err
+		}
+		defer unlock()
 	}
 	authority, err := parseUpstreamAuthority(parsed.upstream)
 	if err != nil {
@@ -204,7 +208,11 @@ func (m *Manager) warmOne(ctx context.Context, reference string, architecture im
 	// a tag ref and a digest ref of the same image warm side by side and
 	// both publish this manifest: the inspect below must not read one while
 	// the other swaps the identical file in (#506)
-	defer m.warmPublishLocks.lock(server.cacheDir + " " + digest)()
+	unlockPublish, err := m.warmPublishLocks.lock(ctx, server.cacheDir+" "+digest)
+	if err != nil {
+		return failedWarmResult(before), err
+	}
+	defer unlockPublish()
 	if err := server.storeManifest(manifestRequestPath(parsed.repository, digest), metadata, body); err != nil {
 		return failedWarmResult(before), fmt.Errorf("publish digest manifest: %w", err)
 	}
@@ -256,8 +264,11 @@ func warmManifestGraph(ctx context.Context, handler http.Handler, server *Server
 			downloading = true
 			// refs warming side by side often share a base layer: one
 			// downloads it while the others wait here, holding no slot, and
-			// then find it cached
-			unlock := pool.inflight.lock(server.cacheDir + " " + blob)
+			// then find it cached. A sibling's failure ends the wait.
+			unlock, err := pool.inflight.lock(group.stopCtx, server.cacheDir+" "+blob)
+			if err != nil {
+				break
+			}
 			if blobCached(server, blob) {
 				unlock()
 				continue

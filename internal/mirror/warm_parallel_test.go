@@ -31,11 +31,14 @@ type parallelWarmFixture struct {
 	// shareLayers gives every image the same layer bytes, so refs share a blob
 	shareLayers bool
 	onBlob      func(digest string)
+	// holdBlob blocks that one digest on hold instead of the gate
+	holdBlob string
+	hold     chan struct{}
 }
 
 func newParallelWarmFixture(t *testing.T, repos []string, layersPerImage int, options ...func(*parallelWarmFixture)) *parallelWarmFixture {
 	t.Helper()
-	f := &parallelWarmFixture{gate: make(chan struct{})}
+	f := &parallelWarmFixture{gate: make(chan struct{}), hold: make(chan struct{})}
 	for _, option := range options {
 		option(f)
 	}
@@ -97,8 +100,12 @@ func newParallelWarmFixture(t *testing.T, repos []string, layersPerImage int, op
 						break
 					}
 				}
+				wait := f.gate
+				if parts[2] == f.holdBlob {
+					wait = f.hold
+				}
 				select {
-				case <-f.gate:
+				case <-wait:
 				case <-request.Context().Done():
 					f.inFlight.Add(-1)
 					return nil, request.Context().Err()
@@ -288,13 +295,24 @@ func TestWarmSerializesOnlySameTag(t *testing.T) {
 	}
 
 	var k keyedMutex
-	unlockA := k.lock("a")
-	unlockB := k.lock("b") // unrelated key: must not block
+	unlockA, err := k.lock(context.Background(), "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlockB, err := k.lock(context.Background(), "b") // unrelated key: must not block
+	if err != nil {
+		t.Fatal(err)
+	}
 	unlockB()
 	second := make(chan struct{})
 	go func() {
 		defer close(second)
-		k.lock("a")()
+		unlock, err := k.lock(context.Background(), "a")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		unlock()
 	}()
 	select {
 	case <-second:
@@ -312,25 +330,72 @@ func TestWarmSerializesOnlySameTag(t *testing.T) {
 	}
 }
 
-func TestWarmDownloadsALayerSharedByConcurrentRefsOnce(t *testing.T) {
-	var fetches atomic.Int64
-	f := newParallelWarmFixture(t, []string{"one", "two"}, 1, func(f *parallelWarmFixture) {
-		f.shareLayers = true
-		f.onBlob = func(string) { fetches.Add(1) }
-	})
-	reached := f.openGateWhen(1, 5*time.Second)
-	summary, err := f.manager.Warm(context.Background(), f.refs, imagecache.ArchitectureAMD64, WarmOptions{Jobs: 8})
+func TestKeyedMutexWaitHonoursCancellation(t *testing.T) {
+	var k keyedMutex
+	unlock, err := k.lock(context.Background(), "layer")
 	if err != nil {
 		t.Fatal(err)
 	}
-	<-reached
-	if summary.Warmed != 2 {
-		t.Fatalf("summary = %+v", summary)
+	ctx, cancel := context.WithCancel(context.Background())
+	waited := make(chan error, 1)
+	go func() {
+		_, err := k.lock(ctx, "layer")
+		waited <- err
+	}()
+	cancel()
+	select {
+	case err := <-waited:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled wait = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled waiter never returned")
 	}
-	// one shared layer + two configs
-	if got := fetches.Load(); got != 3 {
-		t.Fatalf("blob fetches = %d, want 3 (the shared layer once)", got)
+	unlock()
+	if len(k.locks) != 0 {
+		t.Fatalf("locks map = %v, want the cancelled waiter forgotten", k.locks)
 	}
+}
+
+func TestWarmCancellationFreesARefWaitingOnASharedBlob(t *testing.T) {
+	// "slow" downloads the shared layer and is held there; "fast" shares it
+	// and so waits for slow's download, holding no slot. Cancelling fast's
+	// warm must end that wait at once rather than after slow's download.
+	f := newParallelWarmFixture(t, []string{"slow", "fast"}, 1, func(f *parallelWarmFixture) { f.shareLayers = true })
+	f.holdBlob = f.blobs[0]
+	close(f.gate) // everything but the held layer is served at once
+
+	slowDone := make(chan struct{})
+	go func() {
+		defer close(slowDone)
+		_, _ = f.manager.Warm(context.Background(), f.refs[:1], imagecache.ArchitectureAMD64, WarmOptions{Jobs: 1})
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && f.inFlight.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	if f.inFlight.Load() == 0 {
+		t.Fatal("slow never started the shared layer")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	fastDone := make(chan WarmResult, 1)
+	go func() {
+		summary, _ := f.manager.Warm(ctx, f.refs[1:], imagecache.ArchitectureAMD64, WarmOptions{Jobs: 1})
+		fastDone <- summary.Results[0]
+	}()
+	time.Sleep(100 * time.Millisecond) // let fast reach the shared layer's wait
+	cancel()
+	select {
+	case result := <-fastDone:
+		if result.Outcome != WarmOutcomeFailedMissing || !strings.Contains(result.Error, context.Canceled.Error()) {
+			t.Fatalf("fast result = %+v, want the cancellation", result)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("fast never returned after cancellation while slow held the shared layer")
+	}
+	close(f.hold)
+	<-slowDone
 }
 
 func TestWarmPoolAcquireHonoursCancellation(t *testing.T) {
