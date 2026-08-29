@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/randax/talos-box/internal/imagecache"
 )
@@ -38,7 +39,12 @@ type WarmResult struct {
 	Error         string
 }
 
-type WarmOptions struct{ Refresh bool }
+type WarmOptions struct {
+	Refresh bool
+	// Jobs bounds the blob downloads this warm keeps in flight; zero means
+	// DefaultWarmJobs and MaxWarmJobs is the ceiling (#506).
+	Jobs int
+}
 
 type WarmOutcome string
 
@@ -57,9 +63,30 @@ type warmReference struct {
 }
 
 func (m *Manager) Warm(ctx context.Context, references []string, architecture imagecache.Architecture, options WarmOptions) (WarmSummary, error) {
+	pool := m.newWarmPool(options.Jobs)
+	results := make([]WarmResult, len(references))
+	errs := make([]error, len(references))
+	refSlots := make(chan struct{}, pool.jobs())
+	var wg sync.WaitGroup
+	for i, reference := range references {
+		select {
+		case refSlots <- struct{}{}:
+		case <-ctx.Done():
+			errs[i] = ctx.Err()
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-refSlots }()
+			results[i], errs[i] = m.warmOne(ctx, reference, architecture, options, pool)
+		}()
+	}
+	wg.Wait()
+
 	var summary WarmSummary
-	for _, reference := range references {
-		result, err := m.warmOne(ctx, reference, architecture, options)
+	for i, reference := range references {
+		result, err := results[i], errs[i]
 		if err != nil {
 			result.Ref = reference
 			result.Error = err.Error()
@@ -89,14 +116,15 @@ func (m *Manager) Warm(ctx context.Context, references []string, architecture im
 	return summary, nil
 }
 
-func (m *Manager) warmOne(ctx context.Context, reference string, architecture imagecache.Architecture, options WarmOptions) (WarmResult, error) {
+func (m *Manager) warmOne(ctx context.Context, reference string, architecture imagecache.Architecture, options WarmOptions, pool *warmPool) (WarmResult, error) {
 	parsed, err := parseWarmReference(reference)
 	if err != nil {
 		return WarmResult{Outcome: WarmOutcomeFailedMissing}, err
 	}
 	if !isDigestReference(parsed.listedRef) {
-		m.warmTagMu.Lock()
-		defer m.warmTagMu.Unlock()
+		// the same tag resolved and published by two warms at once must not
+		// interleave; other tags are unrelated and run alongside
+		defer m.warmTagLocks.lock(parsed.upstream + "/" + parsed.repository + ":" + parsed.listedRef)()
 	}
 	authority, err := parseUpstreamAuthority(parsed.upstream)
 	if err != nil {
@@ -152,7 +180,7 @@ func (m *Manager) warmOne(ctx context.Context, reference string, architecture im
 	staged.metadata.DockerContentDigest = digest
 	seenManifests[digest] = true
 
-	if err := warmManifestGraph(ctx, handler, server, parsed.repository, body, string(architecture), seenManifests, map[string]bool{}, seenBlobs, &result); err != nil {
+	if err := warmManifestGraph(ctx, handler, server, parsed.repository, body, string(architecture), seenManifests, map[string]bool{}, seenBlobs, &result, pool); err != nil {
 		return failedWarmResult(before), err
 	}
 	if len(body) == 0 {
@@ -192,12 +220,14 @@ func failedWarmResult(before CacheStatus) WarmResult {
 	return WarmResult{Outcome: WarmOutcomeFailedMissing}
 }
 
-func warmManifestGraph(ctx context.Context, handler http.Handler, server *Server, repository string, body []byte, hostArch string, seenManifests, warmedHostManifests, seenBlobs map[string]bool, result *WarmResult) error {
+func warmManifestGraph(ctx context.Context, handler http.Handler, server *Server, repository string, body []byte, hostArch string, seenManifests, warmedHostManifests, seenBlobs map[string]bool, result *WarmResult, pool *warmPool) error {
 	kind, children, blobs, err := analyzeWarmManifest(body)
 	if err != nil {
 		return err
 	}
 	if kind == "manifest" {
+		group := newWarmGroup(ctx)
+		downloading := false
 		for _, blob := range blobs {
 			if seenBlobs[blob] {
 				continue
@@ -206,9 +236,20 @@ func warmManifestGraph(ctx context.Context, handler http.Handler, server *Server
 			if blobCached(server, blob) {
 				continue
 			}
-			if err := warmBlobRequest(ctx, handler, repository, blob); err != nil {
-				return err
-			}
+			downloading = true
+			group.run(func(ctx context.Context) error {
+				release, err := pool.acquire(ctx)
+				if err != nil {
+					return err
+				}
+				defer release()
+				return warmBlobRequest(ctx, handler, repository, blob)
+			})
+		}
+		if err := group.wait(); err != nil {
+			return err
+		}
+		if downloading {
 			result.AlreadyComplete = false
 		}
 		return nil
@@ -236,7 +277,7 @@ func warmManifestGraph(ctx context.Context, handler http.Handler, server *Server
 	}
 	if !warmedHostManifests[selectedChild.Digest] {
 		warmedHostManifests[selectedChild.Digest] = true
-		if err := warmManifestGraph(ctx, handler, server, repository, childBody, hostArch, seenManifests, warmedHostManifests, seenBlobs, result); err != nil {
+		if err := warmManifestGraph(ctx, handler, server, repository, childBody, hostArch, seenManifests, warmedHostManifests, seenBlobs, result, pool); err != nil {
 			return err
 		}
 	}

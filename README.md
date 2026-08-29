@@ -226,6 +226,7 @@ ghcr.io/example/app:v2.4.1@sha256:<64-hex-digest>
 ```sh
 tbx cache warm workshop-images.txt more-images.txt # any number of lists; `-` reads stdin once
 tbx cache warm --refresh workshop-images.txt        # revalidate complete, unpinned tags
+tbx cache warm --jobs 4 workshop-images.txt         # fewer parallel blob downloads (default 8; 1 = one at a time)
 tbx cache warm --check workshop-images.txt         # verify locally, without downloading
 tbx cache warm --check --deep workshop-images.txt  # also rehash cached blobs
 tbx cache list                                     # disk images and mirror-cache totals
@@ -245,7 +246,9 @@ exit rather than an answer.
 Blank lines and lines beginning with `#` are ignored. By default, warm resumes incomplete refs
 and makes no upstream request for complete refs. `--refresh` revalidates complete unpinned tags;
 digest-pinned refs do not need freshness resolution, and a transient refresh failure is nonfatal
-when the existing cache is complete.
+when the existing cache is complete. Warm keeps up to `--jobs` blob downloads in flight across the
+whole list (default 8, capped daemon-wide at 16 when runs overlap); `--jobs 1` downloads one blob at
+a time. A failing blob fails only its own ref, and what was already downloaded is kept for the rerun.
 
 **Complete** means the tag mapping (when the ref uses a tag), root manifest, selected
 `linux/<arch>` manifest, config, and every selected-platform layer are all present locally.

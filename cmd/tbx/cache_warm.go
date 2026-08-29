@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/randax/talos-box/internal/daemon"
 	"github.com/randax/talos-box/internal/provision"
@@ -25,13 +26,15 @@ func (c cli) runCacheWarm(args []string) error {
 	checkOnly := flags.Bool("check", false, "verify the warmed cache offline instead of downloading")
 	deep := flags.Bool("deep", false, "rehash cached blobs while checking")
 	refresh := flags.Bool("refresh", false, "revalidate complete unpinned tags before warming")
+	jobs := flags.Int("jobs", daemon.DefaultCacheWarmJobs, "blob downloads to keep in flight (1 warms one blob at a time)")
 	flags.Usage = func() {
-		_, _ = fmt.Fprintln(c.err, "Usage: tbx cache warm [--refresh] <list-file> [<list-file>...]")
+		_, _ = fmt.Fprintln(c.err, "Usage: tbx cache warm [--refresh] [--jobs N] <list-file> [<list-file>...]")
 		_, _ = fmt.Fprintln(c.err, "       tbx cache warm --check [--deep] <list-file> [<list-file>...]")
 		_, _ = fmt.Fprintln(c.err, "")
 		_, _ = fmt.Fprintln(c.err, "By default, warm resumes incomplete refs and makes no upstream request for complete refs.")
 		_, _ = fmt.Fprintln(c.err, "--refresh revalidates complete unpinned tags; digest-pinned refs do not need freshness resolution.")
 		_, _ = fmt.Fprintln(c.err, "A transient refresh failure is nonfatal when the existing cache is complete.")
+		_, _ = fmt.Fprintf(c.err, "--jobs N keeps up to N blob downloads in flight across the list (default %d); 1 warms one blob at a time.\n", daemon.DefaultCacheWarmJobs)
 		_, _ = fmt.Fprintln(c.err, "--check verifies tag mapping, selected linux/<arch> manifest, config, and all layers locally.")
 		_, _ = fmt.Fprintln(c.err, "--deep additionally hashes cached blobs.")
 	}
@@ -47,6 +50,9 @@ func (c cli) runCacheWarm(args []string) error {
 	}
 	if *refresh && *checkOnly {
 		return errors.New("cache warm --refresh cannot be used with --check")
+	}
+	if *jobs < 1 {
+		return fmt.Errorf("cache warm --jobs must be at least 1, got %d", *jobs)
 	}
 	entries, err := parseWarmListEntries(positionals, c.in)
 	if err != nil {
@@ -120,12 +126,8 @@ func (c cli) runCacheWarm(args []string) error {
 	}
 	var warmed, alreadyComplete, failedMissing, failedRevalidate int
 	var refreshWarnings []string
-	for _, ref := range refs {
-		var result daemon.CacheWarmResult
-		if err := c.call("cache.warm", daemon.CacheWarmArgs{Refs: []string{ref}, Refresh: *refresh}, &result); err != nil {
-			return err
-		}
-		entry, err := cacheWarmEntryForRef(ref, result)
+	for _, next := range c.warmRefsConcurrently(refs, *refresh, *jobs) {
+		entry, err := next()
 		if err != nil {
 			return err
 		}
@@ -182,6 +184,66 @@ func (c cli) runCacheWarm(args []string) error {
 		return fmt.Errorf("cache warm failed for %d ref(s)", failed)
 	}
 	return nil
+}
+
+type warmOutcome struct {
+	entry daemon.CacheWarmEntry
+	err   error
+}
+
+// warmRefsConcurrently keeps a few `cache.warm` requests in flight (one ref
+// each, as before) so the daemon's blob pool sees more than one ref at a
+// time, and hands the outcomes back in list order: each returned func blocks
+// until its ref is done, so the caller still prints ✓/✗ lines progressively.
+// The first error stops further requests from starting. --jobs 1 keeps one
+// request in flight, which is exactly the serial behaviour it replaces (#506).
+func (c cli) warmRefsConcurrently(refs []string, refresh bool, jobs int) []func() (daemon.CacheWarmEntry, error) {
+	const maxRequestsInFlight = 4
+	outcomes := make([]chan warmOutcome, len(refs))
+	for i := range outcomes {
+		outcomes[i] = make(chan warmOutcome, 1)
+	}
+	slots := make(chan struct{}, min(maxRequestsInFlight, jobs))
+	stop := make(chan struct{})
+	var stopOnce sync.Once
+	go func() {
+		for i, ref := range refs {
+			select {
+			case <-stop:
+				return
+			case slots <- struct{}{}:
+			}
+			select {
+			case <-stop:
+				// a slot freed by the failing ref is not a reason to start
+				return
+			default:
+			}
+			go func() {
+				defer func() { <-slots }()
+				var result daemon.CacheWarmResult
+				err := c.call("cache.warm", daemon.CacheWarmArgs{Refs: []string{ref}, Refresh: refresh, Jobs: jobs}, &result)
+				var entry daemon.CacheWarmEntry
+				if err == nil {
+					entry, err = cacheWarmEntryForRef(ref, result)
+				}
+				if err != nil {
+					// closed before this slot is returned, so it cannot be
+					// handed to a ref that will never be printed
+					stopOnce.Do(func() { close(stop) })
+				}
+				outcomes[i] <- warmOutcome{entry: entry, err: err}
+			}()
+		}
+	}()
+	next := make([]func() (daemon.CacheWarmEntry, error), len(refs))
+	for i := range refs {
+		next[i] = func() (daemon.CacheWarmEntry, error) {
+			outcome := <-outcomes[i]
+			return outcome.entry, outcome.err
+		}
+	}
+	return next
 }
 
 // withBootstrapRequiredRefs appends the bootstrap-required images the list

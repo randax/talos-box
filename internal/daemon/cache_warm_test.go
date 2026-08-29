@@ -28,6 +28,9 @@ func TestCacheWarmForwardsRefreshOptionAndTypedCounts(t *testing.T) {
 			if !options.Refresh {
 				t.Fatal("Refresh = false, want true")
 			}
+			if options.Jobs != 3 {
+				t.Fatalf("Jobs = %d, want 3", options.Jobs)
+			}
 			return mirror.WarmSummary{
 				Results: []mirror.WarmResult{
 					{Ref: ref, Outcome: mirror.WarmOutcomeFailedMissing, Error: "layer missing", ReResolvedTag: true},
@@ -43,7 +46,7 @@ func TestCacheWarmForwardsRefreshOptionAndTypedCounts(t *testing.T) {
 
 	value, err := service.handle(Request{
 		Op:   "cache.warm",
-		Args: mustWarmArgs(t, CacheWarmArgs{Refs: []string{ref}, Refresh: true}),
+		Args: mustWarmArgs(t, CacheWarmArgs{Refs: []string{ref}, Refresh: true, Jobs: 3}),
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -60,6 +63,24 @@ func TestCacheWarmForwardsRefreshOptionAndTypedCounts(t *testing.T) {
 	}
 	if result.Entries[0].Status != CacheWarmStatusFailedMissing || result.Entries[1].Status != CacheWarmStatusFailedRevalidate {
 		t.Fatalf("statuses = %q, %q; want typed failures", result.Entries[0].Status, result.Entries[1].Status)
+	}
+}
+
+func TestCacheWarmRejectsNegativeJobs(t *testing.T) {
+	t.Parallel()
+	service := &Server{
+		hypervisor: &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
+		warmCacheWithOptions: func(context.Context, []string, imagecache.Architecture, mirror.WarmOptions) (mirror.WarmSummary, error) {
+			t.Fatal("warm must not start with negative jobs")
+			return mirror.WarmSummary{}, nil
+		},
+	}
+	_, err := service.handle(Request{
+		Op:   "cache.warm",
+		Args: mustWarmArgs(t, CacheWarmArgs{Refs: []string{"docker.io/library/nginx:1.27.0"}, Jobs: -1}),
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "jobs must not be negative") {
+		t.Fatalf("err = %v, want negative jobs rejection", err)
 	}
 }
 

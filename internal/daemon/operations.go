@@ -111,9 +111,16 @@ type CachePullCombination struct {
 	Intent     cluster.ProvisioningIntent `json:"intent"`
 }
 
+// DefaultCacheWarmJobs is the blob-download width `tbx cache warm` asks for
+// when --jobs is not given (#506).
+const DefaultCacheWarmJobs = mirror.DefaultWarmJobs
+
 type CacheWarmArgs struct {
 	Refs    []string `json:"refs"`
 	Refresh bool     `json:"refresh,omitempty"`
+	// Jobs bounds the blob downloads kept in flight; zero takes the mirror's
+	// default and the daemon caps it (#506).
+	Jobs int `json:"jobs,omitempty"`
 }
 
 type CacheCheckArgs struct {
@@ -1995,6 +2002,9 @@ func (s *Server) warmMirrorCache(raw json.RawMessage) (CacheWarmResult, error) {
 	if len(args.Refs) == 0 {
 		return CacheWarmResult{}, errors.New("at least one image reference is required")
 	}
+	if args.Jobs < 0 {
+		return CacheWarmResult{}, fmt.Errorf("jobs must not be negative, got %d", args.Jobs)
+	}
 	for _, ref := range args.Refs {
 		if err := ValidateWarmRef(ref); err != nil {
 			return CacheWarmResult{}, err
@@ -2006,7 +2016,7 @@ func (s *Server) warmMirrorCache(raw json.RawMessage) (CacheWarmResult, error) {
 	ctx, cancel := s.lifecycleTimeoutContext(cacheWarmTimeout)
 	defer cancel()
 	if s.warmCacheWithOptions != nil {
-		summary, err := s.warmCacheWithOptions(ctx, args.Refs, s.imageArchitecture(), mirror.WarmOptions{Refresh: args.Refresh})
+		summary, err := s.warmCacheWithOptions(ctx, args.Refs, s.imageArchitecture(), mirror.WarmOptions{Refresh: args.Refresh, Jobs: args.Jobs})
 		return cacheWarmResult(summary), err
 	}
 	return s.warmCache(ctx, args.Refs, s.imageArchitecture())

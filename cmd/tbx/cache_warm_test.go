@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -80,7 +81,7 @@ func TestRunCacheWarmDefaultDoesNotRequestRefresh(t *testing.T) {
 		"ghcr.io/example/app@sha256:1111111111111111111111111111111111111111111111111111111111111111",
 	}
 	done := make(chan struct{})
-	go serveDaemonRequests(t, listener, len(wantRefs), func(index int, request daemon.Request) daemon.Response {
+	go serveWarmRequests(t, listener, wantRefs, func(index int, request daemon.Request) daemon.Response {
 		if request.Op != "cache.warm" {
 			t.Fatalf("request op = %q, want cache.warm", request.Op)
 		}
@@ -88,11 +89,11 @@ func TestRunCacheWarmDefaultDoesNotRequestRefresh(t *testing.T) {
 		if err := json.Unmarshal(request.Args, &args); err != nil {
 			t.Fatal(err)
 		}
-		if len(args.Refs) != 1 || args.Refs[0] != wantRefs[index] {
-			t.Fatalf("refs = %v, want [%q]", args.Refs, wantRefs[index])
-		}
 		if args.Refresh {
-			t.Fatal("Refresh = true, want false")
+			t.Error("Refresh = true, want false")
+		}
+		if args.Jobs != daemon.DefaultCacheWarmJobs {
+			t.Errorf("Jobs = %d, want the default %d", args.Jobs, daemon.DefaultCacheWarmJobs)
 		}
 		result := daemon.CacheWarmResult{Entries: []daemon.CacheWarmEntry{{Ref: wantRefs[index]}}}
 		switch index {
@@ -368,6 +369,10 @@ func TestRunCacheWarmEmitsEachResultAsItCompletes(t *testing.T) {
 			args := []string{"cache", "warm"}
 			if test.checkOnly {
 				args = append(args, "--check")
+			} else {
+				// the stub answers by arrival order; --jobs 1 keeps one
+				// request in flight so arrival order is list order
+				args = append(args, "--jobs", "1")
 			}
 			args = append(args, listPath)
 			commandDone := make(chan error, 1)
@@ -421,6 +426,30 @@ func (b *signalBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.value.String()
+}
+
+// serveWarmRequests is serveDaemonRequests for `cache.warm`, whose requests
+// arrive a few at a time in no fixed order since #506: the index handed to
+// respond is the ref's position in `refs`, not the arrival order.
+func serveWarmRequests(t *testing.T, listener net.Listener, refs []string, respond func(int, daemon.Request) daemon.Response, done chan<- struct{}) {
+	t.Helper()
+	serveDaemonRequests(t, listener, len(refs), func(_ int, request daemon.Request) daemon.Response {
+		var args daemon.CacheWarmArgs
+		if err := json.Unmarshal(request.Args, &args); err != nil {
+			t.Error(err)
+			return daemon.Response{Error: err.Error()}
+		}
+		if len(args.Refs) != 1 {
+			t.Errorf("refs = %v, want exactly one", args.Refs)
+			return daemon.Response{Error: "want one ref"}
+		}
+		index := slices.Index(refs, args.Refs[0])
+		if index < 0 {
+			t.Errorf("unexpected ref %q", args.Refs[0])
+			return daemon.Response{Error: "unexpected ref"}
+		}
+		return respond(index, request)
+	}, done)
 }
 
 func serveDaemonRequests(t *testing.T, listener net.Listener, count int, respond func(int, daemon.Request) daemon.Response, done chan<- struct{}) {
@@ -485,7 +514,7 @@ func TestRunCacheWarmPrintsMissingAndRevalidateFailuresSeparately(t *testing.T) 
 	}
 
 	done := make(chan struct{})
-	go serveDaemonRequests(t, listener, len(refs), func(index int, request daemon.Request) daemon.Response {
+	go serveWarmRequests(t, listener, refs, func(index int, request daemon.Request) daemon.Response {
 		var args daemon.CacheWarmArgs
 		if err := json.Unmarshal(request.Args, &args); err != nil {
 			t.Fatal(err)
@@ -620,5 +649,218 @@ func TestRunCacheWarmOmitsTheRevalidateClauseWithoutRefresh(t *testing.T) {
 	want := "✓ " + ref + " warmed\nsummary: 1 warmed, 0 already complete, 0 failed (missing)\n"
 	if got := stdout.String(); got != want {
 		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+}
+
+func TestRunCacheWarmRejectsJobsBelowOne(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr, in: bytes.NewBuffer(nil)}
+	err := command.run([]string{"cache", "warm", "--jobs", "0", "images.txt"})
+	if err == nil || err.Error() != "cache warm --jobs must be at least 1, got 0" {
+		t.Fatalf("err = %v, want --jobs usage error", err)
+	}
+}
+
+// warmStubListener serves the protocol handshake and then hands every
+// cache.warm connection to serve, concurrently, until the listener closes.
+func warmStubListener(t *testing.T, serve func(net.Conn, daemon.CacheWarmArgs)) net.Listener {
+	t.Helper()
+	t.Setenv("HOME", shortTestHome(t))
+	socketPath, err := daemon.SocketPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			connection, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer func() { _ = connection.Close() }()
+				var request daemon.Request
+				if err := json.NewDecoder(connection).Decode(&request); err != nil {
+					return
+				}
+				if request.Op == "daemon.info" {
+					_ = json.NewEncoder(connection).Encode(daemon.Response{OK: true, Data: mustJSON(t, daemon.Info{ProtocolVersion: daemon.ProtocolVersion})})
+					return
+				}
+				var args daemon.CacheWarmArgs
+				if err := json.Unmarshal(request.Args, &args); err != nil || request.Op != "cache.warm" || len(args.Refs) != 1 {
+					t.Errorf("request = %+v (%v), want one-ref cache.warm", request, err)
+					return
+				}
+				serve(connection, args)
+			}()
+		}
+	}()
+	return listener
+}
+
+func warmedResponse(t *testing.T, ref string) daemon.Response {
+	t.Helper()
+	return daemon.Response{OK: true, Data: mustJSON(t, daemon.CacheWarmResult{
+		Entries: []daemon.CacheWarmEntry{{Ref: ref, Status: daemon.CacheWarmStatusWarmed}},
+		Warmed:  1,
+	})}
+}
+
+func writeWarmList(t *testing.T, refs []string) string {
+	t.Helper()
+	listPath := filepath.Join(t.TempDir(), "images.txt")
+	if err := os.WriteFile(listPath, []byte(strings.Join(refs, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return listPath
+}
+
+func TestRunCacheWarmKeepsSeveralRefsInFlightAndPrintsInListOrder(t *testing.T) {
+	refs := []string{
+		"registry.example/one:v1",
+		"registry.example/two:v1",
+		"registry.example/three:v1",
+		"registry.example/four:v1",
+		"registry.example/five:v1",
+		"registry.example/six:v1",
+	}
+	var mu sync.Mutex
+	inFlight, peak := 0, 0
+	holdFirst := make(chan struct{})
+	warmStubListener(t, func(connection net.Conn, args daemon.CacheWarmArgs) {
+		if args.Jobs != 6 {
+			t.Errorf("Jobs = %d, want 6", args.Jobs)
+		}
+		mu.Lock()
+		inFlight++
+		if inFlight > peak {
+			peak = inFlight
+		}
+		mu.Unlock()
+		if args.Refs[0] == refs[0] {
+			<-holdFirst
+		} else {
+			// let the others pile up while the first is held
+			time.Sleep(50 * time.Millisecond)
+		}
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
+		_ = json.NewEncoder(connection).Encode(warmedResponse(t, args.Refs[0]))
+	})
+
+	stdout := newSignalBuffer()
+	var stderr bytes.Buffer
+	command := cli{out: stdout, err: &stderr, in: bytes.NewBuffer(nil)}
+	commandDone := make(chan error, 1)
+	go func() { commandDone <- command.run([]string{"cache", "warm", "--jobs", "6", writeWarmList(t, refs)}) }()
+
+	// the later refs finish while the first is held, yet nothing prints:
+	// output is in list order
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		p := peak
+		mu.Unlock()
+		if p >= 4 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := stdout.String(); got != "" {
+		t.Fatalf("printed %q while the first ref was still in flight", got)
+	}
+	close(holdFirst)
+	if err := <-commandDone; err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if peak != 4 {
+		t.Fatalf("peak requests in flight = %d, want min(4, jobs) = 4", peak)
+	}
+	var want strings.Builder
+	for _, ref := range refs {
+		want.WriteString("✓ " + ref + " warmed\n")
+	}
+	want.WriteString("summary: 6 warmed, 0 already complete, 0 failed (missing)\n")
+	if got := stdout.String(); got != want.String() {
+		t.Fatalf("stdout = %q, want %q", got, want.String())
+	}
+}
+
+func TestRunCacheWarmJobsOneKeepsOneRequestInFlight(t *testing.T) {
+	refs := []string{"registry.example/one:v1", "registry.example/two:v1", "registry.example/three:v1"}
+	var mu sync.Mutex
+	inFlight, peak := 0, 0
+	warmStubListener(t, func(connection net.Conn, args daemon.CacheWarmArgs) {
+		if args.Jobs != 1 {
+			t.Errorf("Jobs = %d, want 1", args.Jobs)
+		}
+		mu.Lock()
+		inFlight++
+		if inFlight > peak {
+			peak = inFlight
+		}
+		mu.Unlock()
+		time.Sleep(30 * time.Millisecond)
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
+		_ = json.NewEncoder(connection).Encode(warmedResponse(t, args.Refs[0]))
+	})
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr, in: bytes.NewBuffer(nil)}
+	if err := command.run([]string{"cache", "warm", "--jobs", "1", writeWarmList(t, refs)}); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if peak != 1 {
+		t.Fatalf("peak requests in flight = %d, want 1", peak)
+	}
+}
+
+func TestRunCacheWarmStopsStartingRequestsAfterAnError(t *testing.T) {
+	refs := make([]string, 12)
+	for i := range refs {
+		refs[i] = fmt.Sprintf("registry.example/img%d:v1", i)
+	}
+	var mu sync.Mutex
+	seen := map[string]bool{}
+	warmStubListener(t, func(connection net.Conn, args daemon.CacheWarmArgs) {
+		mu.Lock()
+		seen[args.Refs[0]] = true
+		mu.Unlock()
+		if args.Refs[0] == refs[0] {
+			_ = json.NewEncoder(connection).Encode(daemon.Response{Error: "daemon exploded"})
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+		_ = json.NewEncoder(connection).Encode(warmedResponse(t, args.Refs[0]))
+	})
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr, in: bytes.NewBuffer(nil)}
+	err := command.run([]string{"cache", "warm", writeWarmList(t, refs)})
+	if err == nil || !strings.Contains(err.Error(), "daemon exploded") {
+		t.Fatalf("err = %v, want the daemon error", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) > 4 {
+		t.Fatalf("%d refs were requested after the first failed, want at most the 4 already in flight", len(seen))
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want nothing after a failed first ref", stdout.String())
 	}
 }
