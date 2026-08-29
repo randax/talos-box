@@ -292,6 +292,8 @@ retry "node registration" 120 5 all_nodes_registered
 kubectl --kubeconfig "$kubeconfig" wait --for=condition=Ready node --all --timeout=10m
 ready_nodes=$(kubectl --kubeconfig "$kubeconfig" get nodes --no-headers | awk '$2 == "Ready" { count++ } END { print count + 0 }')
 [[ "$ready_nodes" -eq 3 ]]
+TBX_E2E_CLUSTER=e2e go test -tags=e2e ./cmd/tbx \
+  -run '^TestLinuxDoctorExitCodeWithRunningClusterRoutes$' -count=1
 printf 'verified 1 control plane + 2 workers through substrate-only path to Ready nodes\n'
 
 kc() {
