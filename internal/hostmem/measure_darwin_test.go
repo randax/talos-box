@@ -4,9 +4,7 @@ package hostmem
 
 import (
 	"context"
-	"os/exec"
 	"testing"
-	"time"
 )
 
 func TestSnapshotFromDarwinOutputs(t *testing.T) {
@@ -89,17 +87,132 @@ func TestSnapshotFromDarwinOutputsRejectsMalformedInput(t *testing.T) {
 	}
 }
 
-func TestLiveSystemSnapshot(t *testing.T) {
-	if _, err := exec.LookPath("vm_stat"); err != nil {
-		t.Skip("vm_stat is unavailable")
+func TestTotalMiBContextReadsOnlyHwMemsize(t *testing.T) {
+	original := darwinCommandOutput
+	t.Cleanup(func() { darwinCommandOutput = original })
+	calls := 0
+	darwinCommandOutput = func(context.Context, string, ...string) ([]byte, error) {
+		calls++
+		if calls != 1 {
+			t.Fatalf("unexpected extra host probe call %d", calls)
+		}
+		return []byte("34359738368\n"), nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	snapshot, err := systemSnapshot(ctx)
+
+	total, err := TotalMiBContext(context.Background())
 	if err != nil {
-		t.Skipf("live host-memory probe unavailable: %v", err)
+		t.Fatalf("TotalMiBContext() error = %v", err)
 	}
-	if snapshot.TotalMiB <= 0 || snapshot.AvailableMiB < 0 {
-		t.Fatalf("implausible live snapshot: %+v", snapshot)
+	if total != 32768 {
+		t.Fatalf("TotalMiBContext() = %d, want 32768", total)
+	}
+}
+
+func TestAvailableSnapshotContextToleratesSwapAndPressureFailures(t *testing.T) {
+	original := darwinCommandOutput
+	t.Cleanup(func() { darwinCommandOutput = original })
+	vmstat := `Mach Virtual Memory Statistics: (page size of 4096 bytes)
+Pages free:                               1000.
+Pages inactive:                           500.
+Pages speculative:                        100.
+Pages occupied by compressor:             250.
+`
+	calls := []string{}
+	darwinCommandOutput = func(_ context.Context, name string, args ...string) ([]byte, error) {
+		call := name
+		for _, arg := range args {
+			call += " " + arg
+		}
+		calls = append(calls, call)
+		switch {
+		case name == "vm_stat":
+			return []byte(vmstat), nil
+		case len(args) >= 2 && args[1] == "vm.swapusage":
+			return nil, context.DeadlineExceeded
+		case len(args) >= 2 && args[1] == "kern.memorystatus_vm_pressure_level":
+			return nil, context.DeadlineExceeded
+		default:
+			t.Fatalf("unexpected probe %q", call)
+			return nil, nil
+		}
+	}
+
+	snapshot, err := AvailableSnapshotContext(context.Background())
+	if err != nil {
+		t.Fatalf("AvailableSnapshotContext() error = %v", err)
+	}
+	if snapshot.AvailableMiB != 6 || snapshot.CompressorMiB != 0 {
+		t.Fatalf("AvailableSnapshotContext() = %+v", snapshot)
+	}
+	if snapshot.SwapTotalBytes != 0 || snapshot.SwapAvailableBytes != 0 || snapshot.Pressure != PressureUnknown {
+		t.Fatalf("AvailableSnapshotContext() did not degrade missing fields: %+v", snapshot)
+	}
+	if len(calls) != 3 {
+		t.Fatalf("probe calls = %v, want vm_stat plus optional swap/pressure sysctls", calls)
+	}
+}
+
+func TestAvailableSnapshotContextDegradesMalformedOptionalSwapOutput(t *testing.T) {
+	original := darwinCommandOutput
+	t.Cleanup(func() { darwinCommandOutput = original })
+	vmstat := `Mach Virtual Memory Statistics: (page size of 4096 bytes)
+Pages free:                               1000.
+Pages inactive:                           500.
+Pages speculative:                        100.
+Pages occupied by compressor:             250.
+`
+	darwinCommandOutput = func(_ context.Context, name string, args ...string) ([]byte, error) {
+		switch {
+		case name == "vm_stat":
+			return []byte(vmstat), nil
+		case len(args) >= 2 && args[1] == "vm.swapusage":
+			return []byte("garbled"), nil
+		case len(args) >= 2 && args[1] == "kern.memorystatus_vm_pressure_level":
+			return []byte("2\n"), nil
+		default:
+			t.Fatalf("unexpected probe %q %q", name, args)
+			return nil, nil
+		}
+	}
+
+	snapshot, err := AvailableSnapshotContext(context.Background())
+	if err != nil {
+		t.Fatalf("AvailableSnapshotContext() error = %v", err)
+	}
+	if snapshot.AvailableMiB != 6 || snapshot.CompressorMiB != 0 {
+		t.Fatalf("AvailableSnapshotContext() = %+v", snapshot)
+	}
+	if snapshot.SwapTotalBytes != 0 || snapshot.SwapAvailableBytes != 0 {
+		t.Fatalf("AvailableSnapshotContext() kept malformed swap data: %+v", snapshot)
+	}
+	if snapshot.Pressure != PressureWarning {
+		t.Fatalf("AvailableSnapshotContext() pressure = %v, want warning", snapshot.Pressure)
+	}
+}
+
+func TestSystemSnapshotStillRequiresSwapAndPressureReads(t *testing.T) {
+	original := darwinCommandOutput
+	t.Cleanup(func() { darwinCommandOutput = original })
+	vmstat := `Mach Virtual Memory Statistics: (page size of 4096 bytes)
+Pages free:                               1000.
+Pages inactive:                           500.
+Pages speculative:                        100.
+Pages occupied by compressor:             250.
+`
+	darwinCommandOutput = func(_ context.Context, name string, args ...string) ([]byte, error) {
+		switch {
+		case name == "vm_stat":
+			return []byte(vmstat), nil
+		case len(args) >= 2 && args[1] == "vm.swapusage":
+			return nil, context.DeadlineExceeded
+		case len(args) >= 2 && args[1] == "hw.memsize":
+			return []byte("34359738368\n"), nil
+		default:
+			return []byte("1\n"), nil
+		}
+	}
+
+	if _, err := systemSnapshot(context.Background()); err == nil {
+		t.Fatal("systemSnapshot() error = nil, want strict swap/pressure read failure")
 	}
 }

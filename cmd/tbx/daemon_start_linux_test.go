@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -137,7 +138,11 @@ func TestLinuxDaemonLaunchReportsSystemdRunFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("launchDaemonLive() error = nil, want systemd-run failure")
 	}
-	for _, want := range []string{"user bus unavailable", "systemctl --user enable --now tbxd.socket"} {
+	for _, want := range []string{
+		"user bus unavailable",
+		"systemctl --user enable --now tbxd.socket",
+		"journalctl --user -u talos-box-tbxd-fallback-" + strconv.Itoa(os.Getpid()) + ".service",
+	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("launchDaemonLive() error = %q, missing %q", err, want)
 		}
@@ -198,6 +203,69 @@ func TestLinuxDaemonLaunchFallsBackToForkWithoutSystemd(t *testing.T) {
 	}
 	if state.systemdRuns != 0 {
 		t.Fatalf("systemd launcher calls = %d, want 0", state.systemdRuns)
+	}
+}
+
+func TestLinuxDaemonLaunchDefersLingerWarningUntilSuccessfulLaunch(t *testing.T) {
+	state := pinLinuxDaemonLaunchTest(t)
+	hasSystemd = func() bool { return true }
+	queryUserLinger = func(int) (bool, error) { return false, nil }
+	runSystemdDaemon = func([]string) error { return errors.New("user bus unavailable") }
+
+	err := launchDaemonLive("/opt/talos-box/bin/tbxd", nil)
+	if err == nil {
+		t.Fatal("launchDaemonLive() error = nil, want systemd-run failure")
+	}
+	if state.stderr.Len() != 0 {
+		t.Fatalf("launchDaemonLive() stderr = %q, want no linger warning on a failed launch", state.stderr.String())
+	}
+}
+
+func TestRunSystemdDaemonLiveIncludesTrimmedStderr(t *testing.T) {
+	original := systemdRunCombinedOutput
+	t.Cleanup(func() { systemdRunCombinedOutput = original })
+	systemdRunCombinedOutput = func(name string, args ...string) ([]byte, error) {
+		if name != "systemd-run" {
+			t.Fatalf("command = %q, want systemd-run", name)
+		}
+		if !slices.Equal(args, []string{"--user"}) {
+			t.Fatalf("args = %q", args)
+		}
+		var exitErr *exec.ExitError
+		if err := exitStatusError(t, 1); !errors.As(err, &exitErr) {
+			t.Fatalf("exitStatusError() = %T, want *exec.ExitError", err)
+		}
+		exitErr.Stderr = []byte(" permission denied \n")
+		return exitErr.Stderr, exitErr
+	}
+
+	err := runSystemdDaemonLive([]string{"--user"})
+	if err == nil {
+		t.Fatal("runSystemdDaemonLive() error = nil, want stderr-wrapped exit error")
+	}
+	for _, want := range []string{"exit status 1", "permission denied"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("runSystemdDaemonLive() error = %q, missing %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), " permission denied \n") {
+		t.Fatalf("runSystemdDaemonLive() error = %q, want trimmed stderr", err)
+	}
+}
+
+func TestDaemonSpawnFailureMentionsFallbackJournalOnSystemdHosts(t *testing.T) {
+	state := pinLinuxDaemonLaunchTest(t)
+	hasSystemd = func() bool { return true }
+	err := daemonSpawnFailure(errors.New("connection refused"), filepath.Join(t.TempDir(), "tbxd.log"), 0)
+	if err == nil {
+		t.Fatal("daemonSpawnFailure() error = nil")
+	}
+	want := "journalctl --user -u talos-box-tbxd-fallback-" + strconv.Itoa(os.Getpid()) + ".service"
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("daemonSpawnFailure() = %q, missing %q", err, want)
+	}
+	if state.stderr.Len() != 0 {
+		t.Fatalf("daemonSpawnFailure() wrote to stderr: %q", state.stderr.String())
 	}
 }
 

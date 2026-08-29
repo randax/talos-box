@@ -11,3 +11,5 @@ import (
 func launchDaemonLive(string, *os.File) error {
 	return fmt.Errorf("automatic tbxd launch is unsupported on %s", runtime.GOOS)
 }
+
+func daemonSpawnFailureHint() string { return "" }

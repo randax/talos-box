@@ -1002,6 +1002,7 @@ func daemonSpawnFailure(dialErr error, logPath string, logOffset int64) error {
 	}
 	message := fmt.Sprintf("tbxd was started but did not serve its socket within %s (%v); see %s",
 		daemonWaitTimeout, dialErr, logPath)
+	message += daemonSpawnFailureHint()
 	if quoted != "" {
 		message = fmt.Sprintf("%s (last log line: %s)", message, quoted)
 	}

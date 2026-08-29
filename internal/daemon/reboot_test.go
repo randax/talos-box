@@ -161,6 +161,41 @@ func TestConcurrentRebootObservationEmitsOneChange(t *testing.T) {
 	}
 }
 
+func TestRebootLogDiscardsOutOfOrderProbeCompletions(t *testing.T) {
+	var log rebootLog
+	now := time.Date(2026, 8, 29, 7, 0, 0, 0, time.UTC)
+	log.observe("demo/cp-1", 100, now)
+
+	older := log.beginObserve("demo/cp-1")
+	newer := log.beginObserve("demo/cp-1")
+
+	observation, previous, changed, applied := log.completeObserve(newer, 200, now.Add(2*time.Second))
+	if !applied || !changed || previous != 100 || observation.BootTime != 200 {
+		t.Fatalf("newer completion = (%+v, %d, %v, %v)", observation, previous, changed, applied)
+	}
+	if _, _, changed, applied := log.completeObserve(older, 100, now.Add(time.Second)); applied || changed {
+		t.Fatalf("older completion applied=%v changed=%v, want discard", applied, changed)
+	}
+	if bootTime := rebootBootTime(&log, "demo/cp-1"); bootTime != 200 {
+		t.Fatalf("boot time after stale completion = %d, want 200", bootTime)
+	}
+}
+
+func TestRebootLogDiscardsProbeCompletionAfterRecordVMStart(t *testing.T) {
+	server := &Server{}
+	now := time.Date(2026, 8, 29, 7, 0, 0, 0, time.UTC)
+	token := server.reboots.beginObserve("demo/cp-1")
+
+	server.recordVMStart("demo", "cp-1")
+
+	if _, _, changed, applied := server.reboots.completeObserve(token, 100, now.Add(time.Second)); applied || changed {
+		t.Fatalf("stale completion applied=%v changed=%v, want discard", applied, changed)
+	}
+	if bootTime := rebootBootTime(&server.reboots, "demo/cp-1"); bootTime != 0 {
+		t.Fatalf("recordVMStart race restored boot time %d", bootTime)
+	}
+}
+
 func TestProbeNodeBootTimeUsesTypedSystemStat(t *testing.T) {
 	originalLookup, originalRead := lookupNodeTalosContext, readNodeSystemStat
 	t.Cleanup(func() {
@@ -209,11 +244,66 @@ func TestBackgroundRefreshPathDetectsReboot(t *testing.T) {
 	}
 }
 
+func TestRefreshNodeStatusesRunsBootAndServiceProbesConcurrently(t *testing.T) {
+	originalBoot := probeNodeBootTime
+	t.Cleanup(func() { probeNodeBootTime = originalBoot })
+
+	bootStarted := make(chan struct{})
+	releaseBoot := make(chan struct{})
+	probeNodeBootTime = func(string, string) (uint64, error) {
+		close(bootStarted)
+		<-releaseBoot
+		return 100, nil
+	}
+
+	serviceStarted := make(chan struct{})
+	releaseService := make(chan struct{})
+	stubNodeServices(t, func(_, _ string, _ time.Time) ([]NodeService, ServiceProbe) {
+		close(serviceStarted)
+		<-releaseService
+		return []NodeService{classifyService(kubeletService, ServiceObservation{State: "Running", Healthy: true})}, ServiceProbe{Status: ServiceProbeSucceeded}
+	})
+
+	server := &Server{
+		nodeIPLookup: func(string, int) string { return "172.30.0.2" },
+		nodeProbe:    func(string) ProbeResult { return ProbeResult{Dialed: true, TLS: true} },
+	}
+	statuses := []ClusterStatus{{
+		Name:    "demo",
+		Running: true,
+		Nodes:   []NodeStatus{{Name: "demo-cp-1", Phase: PhaseConfigured}},
+	}}
+
+	done := make(chan struct{})
+	go func() {
+		server.refreshNodeStatuses(statuses)
+		close(done)
+	}()
+
+	<-bootStarted
+	select {
+	case <-serviceStarted:
+	case <-time.After(time.Second):
+		close(releaseBoot)
+		<-done
+		t.Fatal("service probe did not start while boot probe was blocked")
+	}
+
+	close(releaseBoot)
+	close(releaseService)
+	<-done
+}
+
 func rebootKnown(log *rebootLog, key string) bool {
 	log.mu.Lock()
 	defer log.mu.Unlock()
-	_, ok := log.nodes[key]
-	return ok
+	return log.nodes[key].observation.BootTime != 0
+}
+
+func rebootBootTime(log *rebootLog, key string) uint64 {
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	return log.nodes[key].observation.BootTime
 }
 
 func TestPhaseConfiguredIncludesRebooted(t *testing.T) {

@@ -13,30 +13,75 @@ import (
 
 const defaultPageSize = 4096
 
-func systemSnapshot(ctx context.Context) (Snapshot, error) {
-	vmstat, err := commandOutput(ctx, "vm_stat")
+var darwinCommandOutput = commandOutput
+
+func TotalMiBContext(ctx context.Context) (int, error) {
+	totalBytes, err := readTotalBytes(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return int(totalBytes / 1024 / 1024), nil
+}
+
+func AvailableSnapshotContext(ctx context.Context) (Snapshot, error) {
+	vmstat, err := darwinCommandOutput(ctx, "vm_stat")
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("vm_stat: %w", err)
 	}
-	swap, err := commandOutput(ctx, "/usr/sbin/sysctl", "-n", "vm.swapusage")
+	pageSize, pages, err := parseVMStat(string(vmstat))
+	if err != nil {
+		return Snapshot{}, err
+	}
+
+	snapshot := Snapshot{
+		AvailableMiB:  int((pages["Pages free"] + pages["Pages inactive"] + pages["Pages speculative"]) * uint64(pageSize) / 1024 / 1024),
+		CompressorMiB: int(pages["Pages occupied by compressor"] * uint64(pageSize) / 1024 / 1024),
+		Pressure:      PressureUnknown,
+	}
+	if swap, err := darwinCommandOutput(ctx, "/usr/sbin/sysctl", "-n", "vm.swapusage"); err == nil {
+		if swapTotal, swapFree, parseErr := parseSwapUsage(string(swap)); parseErr == nil {
+			snapshot.SwapTotalBytes = swapTotal
+			snapshot.SwapAvailableBytes = swapFree
+		}
+	}
+	if pressure, err := darwinCommandOutput(ctx, "/usr/sbin/sysctl", "-n", "kern.memorystatus_vm_pressure_level"); err == nil {
+		snapshot.Pressure = pressureFromLevel(string(pressure))
+	}
+	return snapshot, nil
+}
+
+func systemSnapshot(ctx context.Context) (Snapshot, error) {
+	vmstat, err := darwinCommandOutput(ctx, "vm_stat")
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("vm_stat: %w", err)
+	}
+	swap, err := darwinCommandOutput(ctx, "/usr/sbin/sysctl", "-n", "vm.swapusage")
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("read vm.swapusage: %w", err)
 	}
-	memsize, err := commandOutput(ctx, "/usr/sbin/sysctl", "-n", "hw.memsize")
+	totalBytes, err := readTotalBytes(ctx)
 	if err != nil {
-		return Snapshot{}, fmt.Errorf("read hw.memsize: %w", err)
-	}
-	totalBytes, err := strconv.ParseUint(strings.TrimSpace(string(memsize)), 10, 64)
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("parse hw.memsize: %w", err)
+		return Snapshot{}, err
 	}
 	pressure := ""
-	if output, pressureErr := commandOutput(ctx, "/usr/sbin/sysctl", "-n", "kern.memorystatus_vm_pressure_level"); pressureErr == nil {
+	if output, pressureErr := darwinCommandOutput(ctx, "/usr/sbin/sysctl", "-n", "kern.memorystatus_vm_pressure_level"); pressureErr == nil {
 		pressure = strings.TrimSpace(string(output))
 	} else if ctx.Err() != nil {
 		return Snapshot{}, fmt.Errorf("read memory pressure: %w", ctx.Err())
 	}
 	return snapshotFromDarwinOutputs(string(vmstat), string(swap), totalBytes, pressure)
+}
+
+func readTotalBytes(ctx context.Context) (uint64, error) {
+	memsize, err := darwinCommandOutput(ctx, "/usr/sbin/sysctl", "-n", "hw.memsize")
+	if err != nil {
+		return 0, fmt.Errorf("read hw.memsize: %w", err)
+	}
+	totalBytes, err := strconv.ParseUint(strings.TrimSpace(string(memsize)), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse hw.memsize: %w", err)
+	}
+	return totalBytes, nil
 }
 
 func commandOutput(ctx context.Context, name string, args ...string) ([]byte, error) {

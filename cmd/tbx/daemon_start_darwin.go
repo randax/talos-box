@@ -23,3 +23,5 @@ func launchDaemonLive(daemonPath string, logFile *os.File) error {
 
 	return nil
 }
+
+func daemonSpawnFailureHint() string { return "" }

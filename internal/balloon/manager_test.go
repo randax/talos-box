@@ -145,6 +145,144 @@ func TestManagerPreBalloonHoldBypassesDeadbandAndRateLimit(t *testing.T) {
 	}
 }
 
+func TestManagerHoldDoesNotBypassNaturalDeficitDeadband(t *testing.T) {
+	m := NewManager(nil)
+	v := &recordingVM{configured: 4096, target: 4096}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+
+	for i, deficit := range []int{88, 2, 15} {
+		m.ReconcileSnapshot(vms, memorySample(6144-deficit), 6144, 1024, 1, start.Add(time.Duration(i)*time.Second))
+	}
+
+	if v.calls != 1 || v.target != 4095 {
+		t.Fatalf("calls=%d target=%d, want only the 1 MiB hold applied", v.calls, v.target)
+	}
+}
+
+func TestManagerReleasesHoldAfterItClearsDespiteSmallDeficitDelta(t *testing.T) {
+	m := NewManager(nil)
+	v := &recordingVM{configured: 4096, target: 4096}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 1, start)
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 0, start.Add(2*time.Minute))
+
+	if v.calls != 2 || v.target != 4096 {
+		t.Fatalf("calls=%d target=%d, want the hold reclaimed and then released", v.calls, v.target)
+	}
+}
+
+func TestManagerSkipsSmallDeficitWobblesAroundLastAppliedDeficit(t *testing.T) {
+	m := NewManager(nil)
+	v := &recordingVM{configured: 4096, target: 4096}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+
+	m.ReconcileSnapshot(vms, memorySample(6144-1024), 6144, 1024, 0, start)
+	m.ReconcileSnapshot(vms, memorySample(6144-1050), 6144, 1024, 0, start.Add(time.Minute))
+	m.ReconcileSnapshot(vms, memorySample(6144-950), 6144, 1024, 0, start.Add(2*time.Minute))
+
+	if v.calls != 1 || v.target != 3072 {
+		t.Fatalf("calls=%d target=%d, want the original 1024 MiB reclaim held", v.calls, v.target)
+	}
+
+	m.ReconcileSnapshot(vms, memorySample(6144-1300), 6144, 1024, 0, start.Add(3*time.Minute))
+	if v.calls != 2 || v.target != 2796 {
+		t.Fatalf("calls=%d target=%d, want a larger wobble to retarget", v.calls, v.target)
+	}
+}
+
+func TestManagerPressureLatchClampsReleaseUntilClear(t *testing.T) {
+	m := NewManager(nil)
+	v := &recordingVM{configured: 4096, target: 4096}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+
+	m.ReconcileSnapshot(vms, memorySample(6144-1024), 6144, 1024, 0, start)
+	latched := memorySample(6144 - 300)
+	latched.SwapTotalBytes, latched.SwapAvailableBytes = 10<<30, 1<<30
+	m.ReconcileSnapshot(vms, latched, 6144, 1024, 0, start.Add(time.Minute))
+	if v.calls != 1 || v.target != 3072 {
+		t.Fatalf("latched calls=%d target=%d, want no release while pressure is latched", v.calls, v.target)
+	}
+
+	cleared := memorySample(6144 - 300)
+	cleared.SwapTotalBytes, cleared.SwapAvailableBytes = 10<<30, 4<<30
+	m.ReconcileSnapshot(vms, cleared, 6144, 1024, 0, start.Add(2*time.Minute))
+	if v.calls != 2 || v.target != 3796 {
+		t.Fatalf("cleared calls=%d target=%d, want release to the 300 MiB deficit target", v.calls, v.target)
+	}
+}
+
+func TestManagerPartialSuccessRateLimitsOnlySuccessfulNode(t *testing.T) {
+	m := NewManager(nil)
+	success := &recordingVM{configured: 4096, target: 4096}
+	retry := &recordingVM{configured: 4096, target: 4096, err: errors.New("apply failed")}
+	vms := map[string]Balloonable{"a": success, "b": retry}
+	start := time.Unix(1000, 0)
+
+	m.ReconcileSnapshot(vms, memorySample(6144-256), 6144, 1024, 0, start)
+	retry.err = nil
+	m.ReconcileSnapshot(vms, memorySample(6144-256), 6144, 1024, 0, start.Add(5*time.Second))
+
+	if success.calls != 1 || success.target != 3968 {
+		t.Fatalf("successful node calls=%d target=%d, want its first target held inside the rate window", success.calls, success.target)
+	}
+	if retry.calls != 2 || retry.target != 3968 {
+		t.Fatalf("retry node calls=%d target=%d, want retry at the existing target", retry.calls, retry.target)
+	}
+}
+
+func TestManagerPartialSuccessRetriesFailedNodeAtNewDeficitWithoutRetargetingSuccessfulPeer(t *testing.T) {
+	m := NewManager(nil)
+	success := &recordingVM{configured: 4096, target: 4096}
+	retry := &recordingVM{configured: 4096, target: 4096, err: errors.New("apply failed")}
+	vms := map[string]Balloonable{"a": success, "b": retry}
+	start := time.Unix(1000, 0)
+
+	m.ReconcileSnapshot(vms, memorySample(6144-256), 6144, 1024, 0, start)
+	retry.err = nil
+	m.ReconcileSnapshot(vms, memorySample(6144-512), 6144, 1024, 0, start.Add(5*time.Second))
+
+	if success.calls != 1 || success.target != 3968 {
+		t.Fatalf("successful node calls=%d target=%d, want its first target held inside the rate window", success.calls, success.target)
+	}
+	if retry.calls != 2 || retry.target != 3840 {
+		t.Fatalf("retry node calls=%d target=%d, want retry at the newer target", retry.calls, retry.target)
+	}
+
+	m.ReconcileSnapshot(vms, memorySample(6144-512), 6144, 1024, 0, start.Add(time.Minute))
+	if success.calls != 2 || success.target != 3840 {
+		t.Fatalf("successful node after rate window calls=%d target=%d, want deferred newer target", success.calls, success.target)
+	}
+	if retry.calls != 2 || retry.target != 3840 {
+		t.Fatalf("retried node after peer window calls=%d target=%d, want no duplicate retarget", retry.calls, retry.target)
+	}
+}
+
+func TestManagerRetriesKnownNodeAfterPartialFailure(t *testing.T) {
+	m := NewManager(nil)
+	success := &recordingVM{configured: 4096, target: 4096}
+	retry := &recordingVM{configured: 4096, target: 4096}
+	vms := map[string]Balloonable{"a": success, "b": retry}
+	start := time.Unix(1000, 0)
+
+	m.ReconcileSnapshot(vms, memorySample(6144-256), 6144, 1024, 0, start)
+	retry.err = errors.New("apply failed")
+	m.ReconcileSnapshot(vms, memorySample(6144-512), 6144, 1024, 0, start.Add(time.Minute))
+	retry.err = nil
+	m.ReconcileSnapshot(vms, memorySample(6144-512), 6144, 1024, 0, start.Add(time.Minute+5*time.Second))
+
+	if success.calls != 2 || success.target != 3840 {
+		t.Fatalf("successful node calls=%d target=%d, want its newer target held inside the rate window", success.calls, success.target)
+	}
+	if retry.calls != 3 || retry.target != 3840 {
+		t.Fatalf("retry node calls=%d target=%d, want known node retried at the unchanged target", retry.calls, retry.target)
+	}
+}
+
 func TestManagerFailedTargetDoesNotConsumeRateWindow(t *testing.T) {
 	m := NewManager(nil)
 	v := &recordingVM{configured: 4096, target: 4096, err: errors.New("apply failed")}

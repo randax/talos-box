@@ -40,7 +40,11 @@ type Logger func(format string, v ...any)
 type Manager struct {
 	log                 Logger
 	last                map[string]int
-	lastRetarget        time.Time
+	lastAppliedDeficit  int
+	lastAppliedKnown    bool
+	lastAppliedHold     bool
+	lastRetarget        map[string]time.Time
+	retryPending        map[string]bool
 	pressureLatched     bool
 	deadbandMiB         int
 	minRetargetInterval time.Duration
@@ -52,7 +56,14 @@ func NewManager(logger Logger) *Manager {
 	if logger == nil {
 		logger = log.Printf
 	}
-	return &Manager{log: logger, last: map[string]int{}, deadbandMiB: defaultDeadbandMiB, minRetargetInterval: defaultMinRetargetInterval}
+	return &Manager{
+		log:                 logger,
+		last:                map[string]int{},
+		lastRetarget:        map[string]time.Time{},
+		retryPending:        map[string]bool{},
+		deadbandMiB:         defaultDeadbandMiB,
+		minRetargetInterval: defaultMinRetargetInterval,
+	}
 }
 
 // ReconcileSnapshot applies the steady-state policy to one shared memory
@@ -60,20 +71,19 @@ func NewManager(logger Logger) *Manager {
 // reclaim without a real available-memory deficit.
 func (m *Manager) ReconcileSnapshot(vms map[string]Balloonable, sample hostmem.Snapshot, reserveMiB, floorMiB, holdMiB int, now time.Time) {
 	m.updatePressureLatch(sample)
-	deficit := reserveMiB - sample.AvailableMiB
-	if deficit < 0 {
-		deficit = 0
+	naturalDeficit := reserveMiB - sample.AvailableMiB
+	if naturalDeficit < 0 {
+		naturalDeficit = 0
 	}
-	bypass := holdMiB > 0
+	if naturalDeficit > 0 && naturalDeficit < m.deadbandMiB {
+		naturalDeficit = 0
+	}
+	deficit := naturalDeficit
 	if holdMiB > deficit {
 		deficit = holdMiB
 	}
-
-	if !bypass && deficit > 0 && deficit < m.deadbandMiB {
-		m.dropDeparted(vms)
-		return
-	}
-	if !bypass && deficit == 0 && m.pressureLatched {
+	holdSetsDeficit := holdMiB > 0 && holdMiB >= naturalDeficit
+	if !holdSetsDeficit && deficit == 0 && m.pressureLatched {
 		m.dropDeparted(vms)
 		return
 	}
@@ -83,19 +93,31 @@ func (m *Manager) ReconcileSnapshot(vms map[string]Balloonable, sample hostmem.S
 		nodes = append(nodes, Node{Name: name, ConfiguredMiB: vm.ConfiguredMiB()})
 	}
 	targets := PlanTargets(nodes, deficit, floorMiB)
+	if m.pressureLatched {
+		for name, target := range targets {
+			if previous, ok := m.last[name]; ok && target > previous {
+				targets[name] = previous
+			}
+		}
+	}
 	changed := false
+	hasUnappliedTarget := false
 	for name, target := range targets {
 		previous, known := m.last[name]
 		if (!known && target != vms[name].ConfiguredMiB()) || (known && previous != target) {
 			changed = true
-			break
+			if !known || m.retryPending[name] {
+				hasUnappliedTarget = true
+			}
+		} else {
+			delete(m.retryPending, name)
 		}
 	}
 	if !changed {
 		m.dropDeparted(vms)
 		return
 	}
-	if !bypass && !m.lastRetarget.IsZero() && now.Sub(m.lastRetarget) < m.minRetargetInterval {
+	if !holdSetsDeficit && !m.lastAppliedHold && m.lastAppliedKnown && absInt(deficit-m.lastAppliedDeficit) < m.deadbandMiB && !hasUnappliedTarget {
 		m.dropDeparted(vms)
 		return
 	}
@@ -105,26 +127,36 @@ func (m *Manager) ReconcileSnapshot(vms map[string]Balloonable, sample hostmem.S
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	allSucceeded := true
+	anySucceeded := false
 	for _, name := range names {
 		target := targets[name]
 		previous, known := m.last[name]
 		if (!known && target == vms[name].ConfiguredMiB()) || (known && previous == target) {
 			continue
 		}
+		if !holdSetsDeficit {
+			if last, ok := m.lastRetarget[name]; ok && now.Sub(last) < m.minRetargetInterval {
+				m.retryPending[name] = true
+				continue
+			}
+		}
 		if err := vms[name].SetMemoryTargetMiB(target); err != nil {
 			m.log("balloon %s: %v", name, err)
-			delete(m.last, name)
-			allSucceeded = false
+			m.retryPending[name] = true
 			continue
 		}
 		m.last[name] = target
+		m.lastRetarget[name] = now
+		delete(m.retryPending, name)
+		anySucceeded = true
 		m.log("balloon %s: target=%dMiB (configured=%d hostFree=%d reserve=%d deficit=%d compressor=%dMiB swapUsed=%d%% pressureLatched=%t)",
 			name, target, vms[name].ConfiguredMiB(), sample.AvailableMiB, reserveMiB, deficit,
 			sample.CompressorMiB, snapshotSwapPercent(sample), m.pressureLatched)
 	}
-	if allSucceeded {
-		m.lastRetarget = now
+	if anySucceeded {
+		m.lastAppliedDeficit = deficit
+		m.lastAppliedKnown = true
+		m.lastAppliedHold = holdSetsDeficit
 	}
 	m.dropDeparted(vms)
 }
@@ -157,8 +189,32 @@ func (m *Manager) dropDeparted(vms map[string]Balloonable) {
 	for name := range m.last {
 		if _, ok := vms[name]; !ok {
 			delete(m.last, name)
+			delete(m.lastRetarget, name)
 		}
 	}
+	for name := range m.lastRetarget {
+		if _, ok := vms[name]; !ok {
+			delete(m.lastRetarget, name)
+			delete(m.retryPending, name)
+		}
+	}
+	for name := range m.retryPending {
+		if _, ok := vms[name]; !ok {
+			delete(m.retryPending, name)
+		}
+	}
+	if len(m.last) == 0 {
+		m.lastAppliedDeficit = 0
+		m.lastAppliedKnown = false
+		m.lastAppliedHold = false
+	}
+}
+
+func absInt(value int) int {
+	if value < 0 {
+		return -value
+	}
+	return value
 }
 
 // Reconcile computes and applies balloon targets for one poll: if host free

@@ -261,7 +261,9 @@ the standard `?ns=<upstream-authority>` query. Host OCI clients which cannot add
 `/v2/<upstream-authority>/<repository>/...` on port 5059 instead; the mirror strips exactly the
 authority segment and applies the same canonicalization, cache namespace, offline policy, dynamic
 handler limit, and public-address checks as the query form. A nonempty `ns` query wins when both
-forms appear, while `/v2/` remains the namespace-free registry ping. A complete cached tag — its mapping, selected
+forms appear, while `/v2/` remains the namespace-free registry ping. Without `?ns=`, a first
+repository path segment containing `.` or `:` is interpreted as the upstream host, so repositories
+whose first segment looks like a host must use the `?ns=` form. A complete cached tag — its mapping, selected
 `linux/<arch>` manifest, config, and every layer — remains available online during transient
 upstream failures; the daemon logs
 `mirror served stale: <host>/<repository>:<tag> (upstream <reason>; cache complete for linux/<arch>)`.
@@ -319,7 +321,8 @@ configured node presents its cluster-CA identity and demands a client certificat
 is not a probe verdict — no VM is running to probe — but a stopped node holding its own saved
 memory, and it still counts as "not running" for every rule keyed on stopped (#415).
 For configured running nodes, the daemon also samples authenticated Talos `SystemStat.boot_time`
-on its 30-second watcher cadence. A changed nonzero value without a host VM restart is logged once
+on every status refresh: the watcher's 30-second cadence and every `tbx status` request. A changed
+nonzero value without a host VM restart is logged once
 and shown as `rebooted` for 15 minutes; deliberate VM starts clear the baseline. The baseline is
 in-memory, so a daemon restart cannot classify a guest reboot that occurred before the first new
 sample, and missing exact-context Talos credentials leave reboot classification unavailable.

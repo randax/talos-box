@@ -10,11 +10,7 @@ import (
 
 // HostTotalMiB returns physical RAM in MiB.
 func HostTotalMiB() (int, error) {
-	snapshot, err := hostmem.SystemSnapshot(context.Background())
-	if err != nil {
-		return 0, err
-	}
-	return snapshot.TotalMiB, nil
+	return hostmem.TotalMiBContext(context.Background())
 }
 
 // HostFreeMiB estimates memory available to the host (free + inactive +
@@ -28,7 +24,7 @@ func HostFreeMiB() (int, error) {
 // path (doctor, cluster create) pass a deadline: vm_stat is a subprocess and a
 // stalled one would otherwise hang the command with no exit code.
 func HostFreeMiBContext(ctx context.Context) (int, error) {
-	snapshot, err := hostmem.SystemSnapshot(ctx)
+	snapshot, err := hostmem.AvailableSnapshotContext(ctx)
 	if err != nil {
 		return 0, err
 	}

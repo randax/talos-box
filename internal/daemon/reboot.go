@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,12 +20,25 @@ type rebootObservation struct {
 	RebootedAt time.Time
 }
 
+type rebootProbe struct {
+	key        string
+	generation uint64
+	seq        uint64
+}
+
+type rebootState struct {
+	observation rebootObservation
+	generation  uint64
+	nextSeq     uint64
+	appliedSeq  uint64
+}
+
 // rebootLog is intentionally process-local. After a daemon restart the first
 // successful sample establishes a new baseline, so a reboot that happened
 // before that sample cannot be classified retroactively.
 type rebootLog struct {
 	mu    sync.Mutex
-	nodes map[string]rebootObservation
+	nodes map[string]rebootState
 }
 
 func (l *rebootLog) observe(key string, bootTime uint64, now time.Time) (rebootObservation, bool) {
@@ -33,32 +47,50 @@ func (l *rebootLog) observe(key string, bootTime uint64, now time.Time) (rebootO
 }
 
 func (l *rebootLog) observeTransition(key string, bootTime uint64, now time.Time) (rebootObservation, uint64, bool) {
+	observation, previous, changed, _ := l.completeObserve(l.beginObserve(key), bootTime, now)
+	return observation, previous, changed
+}
+
+func (l *rebootLog) beginObserve(key string) rebootProbe {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if bootTime == 0 {
-		return rebootObservation{}, 0, false
-	}
 	if l.nodes == nil {
-		l.nodes = make(map[string]rebootObservation)
+		l.nodes = make(map[string]rebootState)
 	}
-	previous, known := l.nodes[key]
-	if !known {
-		observation := rebootObservation{BootTime: bootTime}
-		l.nodes[key] = observation
-		return observation, 0, false
+	state := l.nodes[key]
+	state.nextSeq++
+	l.nodes[key] = state
+	return rebootProbe{key: key, generation: state.generation, seq: state.nextSeq}
+}
+
+func (l *rebootLog) completeObserve(probe rebootProbe, bootTime uint64, now time.Time) (rebootObservation, uint64, bool, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	state, ok := l.nodes[probe.key]
+	if !ok || probe.generation != state.generation || probe.seq < state.appliedSeq || bootTime == 0 {
+		return rebootObservation{}, 0, false, false
+	}
+	previous := state.observation
+	state.appliedSeq = probe.seq
+	if previous.BootTime == 0 {
+		state.observation = rebootObservation{BootTime: bootTime}
+		l.nodes[probe.key] = state
+		return state.observation, 0, false, true
 	}
 	if previous.BootTime == bootTime {
-		return previous, previous.BootTime, false
+		l.nodes[probe.key] = state
+		return previous, previous.BootTime, false, true
 	}
-	observation := rebootObservation{BootTime: bootTime, RebootedAt: now}
-	l.nodes[key] = observation
-	return observation, previous.BootTime, true
+	state.observation = rebootObservation{BootTime: bootTime, RebootedAt: now}
+	l.nodes[probe.key] = state
+	return state.observation, previous.BootTime, true, true
 }
 
 func (l *rebootLog) current(key string, now time.Time) (rebootObservation, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	observation, ok := l.nodes[key]
+	state, ok := l.nodes[key]
+	observation := state.observation
 	if !ok || observation.RebootedAt.IsZero() || now.Sub(observation.RebootedAt) >= rebootNoticeTTL {
 		return rebootObservation{}, false
 	}
@@ -68,19 +100,39 @@ func (l *rebootLog) current(key string, now time.Time) (rebootObservation, bool)
 func (l *rebootLog) forget(key string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	delete(l.nodes, key)
+	if l.nodes == nil {
+		l.nodes = make(map[string]rebootState)
+	}
+	state := l.nodes[key]
+	state.generation++
+	state.observation = rebootObservation{}
+	state.appliedSeq = 0
+	l.nodes[key] = state
 }
 
 func (l *rebootLog) forgetPrefix(prefix string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	forgetPrefix(l.nodes, prefix)
+	for key, state := range l.nodes {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		state.generation++
+		state.observation = rebootObservation{}
+		state.appliedSeq = 0
+		l.nodes[key] = state
+	}
 }
 
 func (l *rebootLog) forgetAll() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.nodes = nil
+	for key, state := range l.nodes {
+		state.generation++
+		state.observation = rebootObservation{}
+		state.appliedSeq = 0
+		l.nodes[key] = state
+	}
 }
 
 var probeNodeBootTime = probeNodeBootTimeLive
