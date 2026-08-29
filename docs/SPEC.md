@@ -256,7 +256,12 @@ physical/VPN interfaces and distinct gateways share the fixed ports without conf
 printed machine configs set Talos `machine.registries.mirrors."*"` to a single endpoint
 `http://172.30.<n>.1:5059` with `skipFallback: true`; legacy fixed listeners on `5055–5058`
 remain only so older clusters keep working until they are recreated. Mirror storage lives in
-the cache and doubles as the offline-venue answer. A complete cached tag — its mapping, selected
+the cache and doubles as the offline-venue answer. Containerd selects a catch-all upstream with
+the standard `?ns=<upstream-authority>` query. Host OCI clients which cannot add that query use
+`/v2/<upstream-authority>/<repository>/...` on port 5059 instead; the mirror strips exactly the
+authority segment and applies the same canonicalization, cache namespace, offline policy, dynamic
+handler limit, and public-address checks as the query form. A nonempty `ns` query wins when both
+forms appear, while `/v2/` remains the namespace-free registry ping. A complete cached tag — its mapping, selected
 `linux/<arch>` manifest, config, and every layer — remains available online during transient
 upstream failures; the daemon logs
 `mirror served stale: <host>/<repository>:<tag> (upstream <reason>; cache complete for linux/<arch>)`.

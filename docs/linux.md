@@ -257,6 +257,24 @@ for linux/<arch>)`. Offline mode stops the mirror from reaching registries and i
 404. Node fallback is a separate policy: an explicit `skipFallback: false` entry may continue to
 upstream, while talos-box's generated `"*"` entry is `skipFallback: true` and remains a hard miss.
 
+### Host access to warmed registry images
+
+Host OCI tools cannot supply containerd's `?ns=` query. Put the upstream authority immediately
+after the catch-all address instead. For example, after warming
+`public.ecr.aws/docker/library/golang:1.25-alpine`, replace `<gateway>` with the cluster gateway:
+
+```sh
+crane manifest --insecure \
+  <gateway>:5059/public.ecr.aws/docker/library/golang:1.25-alpine
+
+curl -I \
+  http://<gateway>:5059/v2/public.ecr.aws/docker/library/golang/manifests/1.25-alpine
+```
+
+The path form and containerd's query form share the same cache. Both commands therefore continue
+to work for a complete warmed image after `tbx mirror offline on`; an uncached path returns the
+same offline 404 as the query form.
+
 `tbx bgp enable|disable <cluster>` flips the announcement mode; it requires `--cni cilium` and
 refuses anything else without touching the speaker. `tbx bgp status <cluster>` reports where the
 mode actually stands: the recorded mode, whether the host speaker is running, the address it
