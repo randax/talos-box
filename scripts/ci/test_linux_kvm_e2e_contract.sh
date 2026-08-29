@@ -118,7 +118,7 @@ require 'retry "NFSv3 locked write"' "$harness"
 require 'ganesha.nfsd -f' "$harness"
 require 'Enable_NLM = true;' "$harness"
 require 'retry "Ganesha NFSv3 registration"' "$harness"
-require 'talos_version=${TBX_E2E_TALOS_VERSION:-v1.13.6}' "$harness"
+require 'talos_version=${TBX_E2E_TALOS_VERSION:-v1.13.9}' "$harness"
 require '  v1.12.0)' "$harness"
 
 # The storage harness exercises the curated provisioning path end to end:

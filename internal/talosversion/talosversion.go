@@ -10,7 +10,7 @@ import (
 )
 
 // Default is the Talos version tbx boots and CI tests by default.
-const Default = "v1.13.6"
+const Default = "v1.13.9"
 
 // Min is the oldest Talos version tbx supports: the default's previous
 // minor. Bumping Default to a new minor drags Min up in the same diff.

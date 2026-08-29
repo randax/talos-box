@@ -134,10 +134,10 @@ done
 # cluster boots: every version this harness can boot pins its own checksum. The
 # default is the release's tested version; the scheduled floor lane passes the
 # bottom of the supported window instead.
-talos_version=${TBX_E2E_TALOS_VERSION:-v1.13.6}
+talos_version=${TBX_E2E_TALOS_VERSION:-v1.13.9}
 case "$talos_version" in
-  v1.13.6)
-    talosctl_sha256=540c5e7cb0d3fa3a9b2e1c717ced212727b73bcaf0cf9cf9ba2472ec381041d4
+  v1.13.9)
+    talosctl_sha256=7e1d4b7d5846964bdcf63a794e3c8161bb6ef2983d5ace58ea5322f3bf32a27e
     ;;
   v1.12.0)
     talosctl_sha256=11a2745cf92b016b4783acf5eb56bfc394aede61a976dd17b5e8f6d09397e22a

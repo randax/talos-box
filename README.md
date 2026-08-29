@@ -87,6 +87,10 @@ names in `tbx status`. Leaving that mismatch alone is the simplest path: on Talo
 already set in v1alpha1 config`. To line the two views up you must remove or replace that generated
 `HostnameConfig` document in the same bundle.
 
+Substrate-only machine configs do not receive talosbox's curated guest-memory defaults. See
+[Guest memory and reclaim](docs/guest-memory.md) for the equivalent manual patch, the kubelet
+trade-off, and the bring-your-own-schematic procedure for disabling virtio ballooning.
+
 Add `--csi longhorn` (multinode, replicated) or `--csi local-path` (lightweight, single-node)
 — or the `csi:` key in `talosbox.yaml` — for persistent storage; it requires a curated CNI.
 The engine's StorageClass becomes the cluster default and Longhorn's replica count derives
