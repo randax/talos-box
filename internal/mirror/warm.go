@@ -254,16 +254,20 @@ func warmManifestGraph(ctx context.Context, handler http.Handler, server *Server
 				continue
 			}
 			downloading = true
+			// refs warming side by side often share a base layer: one
+			// downloads it while the others wait here, holding no slot, and
+			// then find it cached
+			unlock := pool.inflight.lock(server.cacheDir + " " + blob)
+			if blobCached(server, blob) {
+				unlock()
+				continue
+			}
 			started := group.start(pool, func(ctx context.Context) error {
-				// refs warming side by side often share a base layer; one
-				// downloads it and the others find it cached
-				defer pool.inflight.lock(server.cacheDir + " " + blob)()
-				if blobCached(server, blob) {
-					return nil
-				}
+				defer unlock()
 				return warmBlobRequest(ctx, handler, repository, blob)
 			})
 			if !started {
+				unlock()
 				break
 			}
 		}

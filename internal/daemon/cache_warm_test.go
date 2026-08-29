@@ -129,6 +129,28 @@ func TestCacheWarmSkipsNarrationWithoutAListener(t *testing.T) {
 	}
 }
 
+func TestCacheWarmBudgetScalesWithTheList(t *testing.T) {
+	t.Parallel()
+	refs := []string{"registry.example/one:v1", "registry.example/two:v1", "registry.example/three:v1"}
+	service := &Server{
+		hypervisor: &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
+		warmCacheWithOptions: func(ctx context.Context, _ []string, _ imagecache.Architecture, _ mirror.WarmOptions) (mirror.WarmSummary, error) {
+			deadline, ok := ctx.Deadline()
+			if !ok {
+				t.Fatal("warm context has no deadline")
+			}
+			remaining := time.Until(deadline)
+			if remaining <= 2*cacheWarmTimeout || remaining > 3*cacheWarmTimeout {
+				t.Fatalf("deadline in %s, want the per-ref budget times three refs", remaining)
+			}
+			return mirror.WarmSummary{}, nil
+		},
+	}
+	if _, err := service.handle(Request{Op: "cache.warm", Args: mustWarmArgs(t, CacheWarmArgs{Refs: refs})}, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCacheWarmRejectsJobsOutsideItsRange(t *testing.T) {
 	t.Parallel()
 	service := &Server{

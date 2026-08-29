@@ -2036,7 +2036,10 @@ func (s *Server) warmMirrorCache(raw json.RawMessage, progress stageFunc) (Cache
 	if s.warmCache == nil && s.warmCacheWithOptions == nil {
 		return CacheWarmResult{}, errors.New("cache warm is not configured")
 	}
-	ctx, cancel := s.lifecycleTimeoutContext(cacheWarmTimeout)
+	// the budget is per ref: the CLI used to send one request per ref and
+	// now sends the list, and a long list on a slow link must not lose at the
+	// end what each ref alone would have been allowed (#506)
+	ctx, cancel := s.lifecycleTimeoutContext(cacheWarmTimeout * time.Duration(len(args.Refs)))
 	defer cancel()
 	if s.warmCacheWithOptions != nil {
 		options := mirror.WarmOptions{Refresh: args.Refresh, Jobs: args.Jobs}

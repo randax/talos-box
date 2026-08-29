@@ -192,7 +192,7 @@ func TestWarmJobsOneDownloadsSerially(t *testing.T) {
 
 func TestWarmJobsAreCappedByTheDaemonWideLimit(t *testing.T) {
 	f := newParallelWarmFixture(t, []string{"big"}, MaxWarmJobs+8)
-	reached := f.openGateWhen(MaxWarmJobs+1, 300*time.Millisecond)
+	reached := f.openGateWhen(MaxWarmJobs+1, 2*time.Second)
 	if _, err := f.manager.Warm(context.Background(), f.refs, imagecache.ArchitectureAMD64, WarmOptions{Jobs: 1000}); err != nil {
 		t.Fatal(err)
 	}

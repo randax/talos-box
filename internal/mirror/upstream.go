@@ -112,6 +112,10 @@ func (s *Server) negotiateToken(ctx context.Context, challenge bearerChallenge, 
 		query.Set("scope", scope)
 	}
 	realm.RawQuery = query.Encode()
+	// the token body is small, so the same silence bound as a fetch's body
+	// is a generous whole-exchange bound here (#506)
+	ctx, cancel := context.WithTimeout(ctx, upstreamStallTimeout)
+	defer cancel()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, realm.String(), nil)
 	if err != nil {
 		return "", err
