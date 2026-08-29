@@ -100,15 +100,23 @@ func run() (err error) {
 	stopHostNetworkingMaintenance := startHostNetworkingMaintenance()
 	// registry mirrors are bound per cluster gateway by the daemon (see #39).
 
-	balloonStop := make(chan struct{})
-	balloonConfig := balloon.DefaultConfig()
-	// Hold the pre-balloon the provision-start gate takes for a booting guest,
-	// so the manager does not hand it straight back (#398).
-	balloonConfig.HoldMiB = server.BalloonHoldMiB
-	// skip ticks while VMs are being torn down (#513)
-	balloonConfig.Paused = server.BalloonPaused
-	go balloon.Run(balloonConfig, server.Balloonables, balloonStop)
-	defer close(balloonStop)
+	if disabled, raw := balloon.DisableSetting(); disabled {
+		// no device to drive: guests launch without a balloon (#513)
+		log.Printf("balloon: disabled by %s; guests launch without a memory balloon device", balloon.DisableEnv)
+	} else {
+		if raw != "" && !balloon.RecognizedOff(raw) {
+			log.Printf("balloon: %s=%q not understood (use 1, true, or yes); ballooning stays on", balloon.DisableEnv, raw)
+		}
+		balloonStop := make(chan struct{})
+		balloonConfig := balloon.DefaultConfig()
+		// Hold the pre-balloon the provision-start gate takes for a booting guest,
+		// so the manager does not hand it straight back (#398).
+		balloonConfig.HoldMiB = server.BalloonHoldMiB
+		// skip ticks while VMs are being torn down (#513)
+		balloonConfig.Paused = server.BalloonPaused
+		go balloon.Run(balloonConfig, server.Balloonables, balloonStop)
+		defer close(balloonStop)
+	}
 
 	serveErrors := make(chan error, 2)
 	go func() { serveErrors <- server.Serve(listener) }()

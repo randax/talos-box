@@ -49,6 +49,10 @@ type doctorDependencies struct {
 	// daemon is what makes the reported headroom the number that will decide
 	// the next bringup (#397, #420). Nil or an error falls back to the default.
 	balloonReserveMiB func() (int, error)
+	// balloonDisabled reports whether the daemon launches guests without a
+	// balloon device (TBX_DISABLE_BALLOON, #513); only a disabled balloon
+	// prints a line, as INFO, so the operator's own choice never nags.
+	balloonDisabled func() (bool, error)
 	// guestAgentSupport is the host capability, not a running backend's, so the
 	// gate is explained even with the daemon down.
 	guestAgentSupport func() hypervisor.FeatureStatus
@@ -86,6 +90,8 @@ Checks:
   forwarding (host)   current host sysctl, read directly by this client
   host-pressure       host memory and disk headroom (the same gate that blocks
                       cluster create)
+  balloon             INFO only, printed when the daemon runs guests without a
+                      memory balloon device (TBX_DISABLE_BALLOON)
   system-dns          the system resolver returns each cluster's domain
   routes              host routes reach the nodes of running clusters
   inter-cluster       running clusters reach each other's ingress VIPs, from the
@@ -278,6 +284,13 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 					return err
 				}
 			}
+		}
+	}
+
+	// right after host-pressure, where the check list documents it
+	if finding, ok := balloonDisabledFinding(deps.balloonDisabled); ok {
+		if err := writeFindings(finding); err != nil {
+			return err
 		}
 	}
 
@@ -673,6 +686,11 @@ func (c cli) doctorDependencies() doctorDependencies {
 			var result daemon.Info
 			err := c.doctorCall("daemon.info", struct{}{}, &result)
 			return result.BalloonReserveMiB, err
+		},
+		balloonDisabled: func() (bool, error) {
+			var result daemon.Info
+			err := c.doctorCall("daemon.info", struct{}{}, &result)
+			return result.BalloonDisabled, err
 		},
 		mirrorOffline: func() (bool, error) {
 			var result daemon.MirrorOfflineStatus

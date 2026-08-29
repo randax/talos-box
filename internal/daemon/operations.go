@@ -924,10 +924,11 @@ func (s *Server) launchMachine(item cluster.Cluster, node cluster.Node, restore 
 	}
 	sizing := item.DefaultsFor(node.Role)
 	machine, err := s.hypervisor.Launch(context.Background(), hypervisor.Spec{
-		CPUs:      sizing.CPUs,
-		MemoryMiB: sizing.MemoryMiB,
-		DiskPath:  filepath.Join(dir, node.Name+".img"),
-		MAC:       node.MAC,
+		CPUs:           sizing.CPUs,
+		MemoryMiB:      sizing.MemoryMiB,
+		DiskPath:       filepath.Join(dir, node.Name+".img"),
+		MAC:            node.MAC,
+		DisableBalloon: s.balloonDisabled,
 		Network: func() (*helper.Attachment, error) {
 			attachment, err := helper.Attach(item.Name, item.SubnetIndex, node.Name)
 			if errors.Is(err, helper.ErrUnavailable) {

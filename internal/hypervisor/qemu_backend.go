@@ -345,6 +345,7 @@ func (m *qemuMachine) launchConfig(qmpPath, incoming string) qemuLaunchConfig {
 		MAC:            m.spec.MAC,
 		TapFD:          3,
 		ConsoleFD:      4,
+		DisableBalloon: m.spec.DisableBalloon,
 		QMPSocketPath:  qmpPath,
 		Firmware:       qemuFirmware{CodePath: m.owner.firmware.CodePath, VarsPath: m.spec.EFIVarsPath},
 		IncomingPath:   incoming,

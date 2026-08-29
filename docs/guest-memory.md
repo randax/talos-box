@@ -53,8 +53,30 @@ cluster instead; this field requires a curated `cni:`.
 
 ## Disable virtio ballooning
 
-Ballooning lets `tbxd` reclaim unused guest memory when the host is under pressure. If a workload
-must opt out, create a bring-your-own Image Factory schematic whose kernel arguments are exactly
+Ballooning lets `tbxd` reclaim unused guest memory when the host is under pressure.
+
+### Host-wide: remove the balloon device
+
+Set `TBX_DISABLE_BALLOON=1` in the environment `tbxd` starts with and restart the daemon:
+`TBX_DISABLE_BALLOON=1 tbx system restart` on macOS or a Linux host where `tbx` launches the
+daemon itself. A packaged Linux install runs `tbxd` from the socket-activated user unit, which
+does not read your shell: put the variable in a drop-in
+(`systemctl --user edit tbxd` → `[Service]` / `Environment=TBX_DISABLE_BALLOON=1`) and restart
+the unit. The daemon logs `balloon: disabled by TBX_DISABLE_BALLOON` at startup when the
+setting took effect.
+
+Every guest it launches afterwards has no balloon device at all — the balloon manager does not
+run, the provision-start gate credits no reclaimable memory, and `tbx doctor` prints an
+`INFO balloon` line so the setting is visible. Flipping the setting invalidates suspended
+memory: a cluster suspended with the balloon (or without it) cannot be resumed into guests
+built the other way, so `tbx cluster resume` cold-boots those nodes with a warning and discards
+their saves. Resume before changing the setting if the saved memory matters. This is the recommended
+setting on hosts with plenty of RAM, and the first thing to try if the host itself panics
+during cluster teardown (see [macOS notes](macos.md) and #513).
+
+### Per-image: blacklist the guest driver
+
+If a workload must opt out while keeping the host device, create a bring-your-own Image Factory schematic whose kernel arguments are exactly
 ordered with both mandatory console arguments first:
 
 ```yaml
@@ -72,7 +94,8 @@ talos:
   schematic: <schematic-id>
 ```
 
-There is no `talos.disableBalloon` setting. The schematic is the opt-out. Keep any system
+There is no per-cluster `talos.disableBalloon` setting: the schematic is the per-image opt-out,
+`TBX_DISABLE_BALLOON` the host-wide one. Keep any system
 extensions your cluster needs in that schematic or in `talos.extensions`.
 
 With `virtio_balloon` blacklisted, `tbxd` loses its guest-memory reclamation mechanism for those
