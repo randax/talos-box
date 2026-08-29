@@ -49,7 +49,7 @@ func TestHints(t *testing.T) {
 			want: []string{"talosctl version --insecure --nodes 172.30.0.2", "talosctl gen config", "apply-config --insecure"},
 		},
 		{
-			name:  "all configured suggests bootstrap and the dashboard",
+			name:  "all configured with no kubelet observation suggests bootstrap and the dashboard",
 			nodes: []NodeStatus{node("demo-cp-1", PhaseConfigured)},
 			want: []string{
 				"talosctl bootstrap --talosconfig ./talosconfig --nodes 172.30.0.2 --endpoints 172.30.0.2",

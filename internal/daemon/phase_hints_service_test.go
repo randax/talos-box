@@ -94,9 +94,9 @@ func TestHintsIgnoreFreshServiceStartup(t *testing.T) {
 	}
 }
 
-// TestHintsKeepManualBootstrapWithoutAProvisioningIntent keeps the hand-bootstrap
-// path — a substrate-only cluster tbx is not driving — pointed at talosctl.
-func TestHintsKeepManualBootstrapWithoutAProvisioningIntent(t *testing.T) {
+// TestHintsKeepManualBootstrapWithoutAServiceReading keeps the hand-bootstrap
+// path when a substrate-only cluster has no positive kubelet observation.
+func TestHintsKeepManualBootstrapWithoutAServiceReading(t *testing.T) {
 	t.Parallel()
 
 	status := ClusterStatus{
@@ -106,6 +106,121 @@ func TestHintsKeepManualBootstrapWithoutAProvisioningIntent(t *testing.T) {
 	joined := strings.Join(Hints(status), "\n")
 	if !strings.Contains(joined, "talosctl bootstrap") {
 		t.Fatalf("hand-bootstrap path lost its hint:\n%s", joined)
+	}
+}
+
+func TestHintsSuppressManualBootstrapAfterHealthyKubelet(t *testing.T) {
+	t.Parallel()
+
+	status := ClusterStatus{
+		Name: "bare",
+		Nodes: []NodeStatus{{
+			Name: "bare-cp-1", Role: cluster.RoleControlPlane, Phase: PhaseConfigured, IP: "172.30.0.2",
+			Kubelet: &NodeService{Name: kubeletService, Health: ServiceHealthHealthy},
+		}},
+	}
+	joined := strings.Join(Hints(status), "\n")
+	if strings.Contains(joined, "talosctl bootstrap") {
+		t.Fatalf("manual bootstrap hint offered after kubelet became healthy:\n%s", joined)
+	}
+}
+
+func TestHintsSuppressManualBootstrapWhenAnyNodeHasHealthyKubelet(t *testing.T) {
+	t.Parallel()
+
+	status := ClusterStatus{
+		Name: "bare",
+		Nodes: []NodeStatus{
+			{
+				Name: "bare-cp-1", Role: cluster.RoleControlPlane, Phase: PhaseConfigured, IP: "172.30.0.2",
+				Kubelet: &NodeService{Name: kubeletService, Health: ServiceHealthUnknown},
+			},
+			{
+				Name: "bare-worker-1", Role: cluster.RoleWorker, Phase: PhaseConfigured, IP: "172.30.0.3",
+				Kubelet: &NodeService{Name: kubeletService, Health: ServiceHealthHealthy},
+			},
+		},
+	}
+	joined := strings.Join(Hints(status), "\n")
+	if strings.Contains(joined, "talosctl bootstrap") {
+		t.Fatalf("manual bootstrap hint offered when a worker kubelet is healthy:\n%s", joined)
+	}
+}
+
+func TestHintsKeepManualBootstrapWithoutHealthyKubelet(t *testing.T) {
+	t.Parallel()
+
+	missing := ServiceProbe{Status: ServiceProbeMissingCredentials}
+	failed := ServiceProbe{Status: ServiceProbeFailed, Error: "probe failed"}
+	tests := []struct {
+		name    string
+		kubelet *NodeService
+		probe   *ServiceProbe
+	}{
+		{name: "starting", kubelet: &NodeService{Name: kubeletService, Health: ServiceHealthStarting}},
+		{name: "unknown", kubelet: &NodeService{Name: kubeletService, Health: ServiceHealthUnknown}},
+		{name: "unhealthy", kubelet: &NodeService{Name: kubeletService, Health: ServiceHealthUnhealthy}},
+		{name: "crashlooping", kubelet: &NodeService{Name: kubeletService, Health: ServiceHealthCrashLooping}},
+		{name: "probe missing credentials", probe: &missing},
+		{name: "probe failure", probe: &failed},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			status := ClusterStatus{
+				Name: "bare",
+				Nodes: []NodeStatus{{
+					Name: "bare-cp-1", Role: cluster.RoleControlPlane, Phase: PhaseConfigured, IP: "172.30.0.2",
+					Kubelet: tt.kubelet, ServiceProbe: tt.probe,
+				}},
+			}
+			joined := strings.Join(Hints(status), "\n")
+			if !strings.Contains(joined, "talosctl bootstrap") {
+				t.Fatalf("manual bootstrap hint missing without a healthy kubelet:\n%s", joined)
+			}
+		})
+	}
+}
+
+func TestHealthyKubeletSuppressesOnlyBootstrapHint(t *testing.T) {
+	t.Parallel()
+
+	missing := ServiceProbe{Status: ServiceProbeMissingCredentials}
+	status := ClusterStatus{
+		Name: "bare",
+		Nodes: []NodeStatus{
+			{
+				Name: "bare-cp-1", Role: cluster.RoleControlPlane, Phase: PhaseConfigured, IP: "172.30.0.2",
+				ServiceProbe: &missing,
+			},
+			{
+				Name: "bare-worker-1", Role: cluster.RoleWorker, Phase: PhaseConfigured, IP: "172.30.0.3",
+				Kubelet: &NodeService{Name: kubeletService, Health: ServiceHealthHealthy},
+			},
+		},
+	}
+	joined := strings.Join(Hints(status), "\n")
+	if strings.Contains(joined, "talosctl bootstrap") {
+		t.Fatalf("manual bootstrap hint offered after kubelet became healthy:\n%s", joined)
+	}
+	for _, want := range []string{"talosctl dashboard", "Talos service state unavailable", "talosctl config merge"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("healthy kubelet suppression removed independent hint %q:\n%s", want, joined)
+		}
+	}
+}
+
+func TestHintsSuppressManualBootstrapWhenKubernetesIsReady(t *testing.T) {
+	t.Parallel()
+
+	status := ClusterStatus{
+		Name:            "bare",
+		KubernetesReady: true,
+		Nodes:           []NodeStatus{{Name: "bare-cp-1", Role: cluster.RoleControlPlane, Phase: PhaseConfigured, IP: "172.30.0.2"}},
+	}
+	joined := strings.Join(Hints(status), "\n")
+	if strings.Contains(joined, "talosctl bootstrap") {
+		t.Fatalf("manual bootstrap hint offered after Kubernetes became Ready:\n%s", joined)
 	}
 }
 
