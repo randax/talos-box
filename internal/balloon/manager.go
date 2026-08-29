@@ -29,6 +29,11 @@ type Balloonable interface {
 	SetMemoryTargetMiB(int) error
 }
 
+// CurrentTargeter optionally reports the guest's current balloon target.
+type CurrentTargeter interface {
+	CurrentTargetMiB() int
+}
+
 // Logger sinks the manager's telemetry; it has log.Printf's shape so the
 // daemon's default logger (tbxd.log) can be passed straight through.
 type Logger func(format string, v ...any)
@@ -100,6 +105,9 @@ func (m *Manager) ReconcileSnapshot(vms map[string]Balloonable, sample hostmem.S
 	hasUnappliedTarget := false
 	for name, target := range targets {
 		previous, known := m.last[name]
+		if _, moved := externallyMovedTarget(vms[name], previous, known); moved {
+			known = false
+		}
 		if !known || previous != target {
 			changed = true
 			if !known || m.retryPending[name] {
@@ -127,10 +135,14 @@ func (m *Manager) ReconcileSnapshot(vms map[string]Balloonable, sample hostmem.S
 	for _, name := range names {
 		target := targets[name]
 		previous, known := m.last[name]
+		externalTarget, externallyMoved := externallyMovedTarget(vms[name], previous, known)
+		if externallyMoved {
+			known = false
+		}
 		if known && previous == target {
 			continue
 		}
-		if !holdSetsDeficit {
+		if !holdSetsDeficit && !externallyMoved {
 			if last, ok := m.lastRetarget[name]; ok && now.Sub(last) < m.minRetargetInterval {
 				m.retryPending[name] = true
 				continue
@@ -145,6 +157,10 @@ func (m *Manager) ReconcileSnapshot(vms map[string]Balloonable, sample hostmem.S
 		m.lastRetarget[name] = now
 		delete(m.retryPending, name)
 		anySucceeded = true
+		if externallyMoved {
+			m.log("balloon %s: target=%dMiB (restoring externally moved target %d)", name, target, externalTarget)
+			continue
+		}
 		m.log("balloon %s: target=%dMiB (configured=%d hostFree=%d reserve=%d deficit=%d compressor=%dMiB swapUsed=%d%% pressureLatched=%t)",
 			name, target, vms[name].ConfiguredMiB(), sample.AvailableMiB, reserveMiB, deficit,
 			sample.CompressorMiB, snapshotSwapPercent(sample), m.pressureLatched)
@@ -155,6 +171,18 @@ func (m *Manager) ReconcileSnapshot(vms map[string]Balloonable, sample hostmem.S
 		m.lastAppliedHold = holdSetsDeficit
 	}
 	m.dropDeparted(vms)
+}
+
+func externallyMovedTarget(vm Balloonable, previous int, known bool) (int, bool) {
+	if !known {
+		return 0, false
+	}
+	current, ok := vm.(CurrentTargeter)
+	if !ok {
+		return 0, false
+	}
+	target := current.CurrentTargetMiB()
+	return target, target != previous
 }
 
 func (m *Manager) updatePressureLatch(sample hostmem.Snapshot) {

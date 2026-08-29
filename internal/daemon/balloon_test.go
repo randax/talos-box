@@ -4,9 +4,22 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/randax/talos-box/internal/balloon"
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/hypervisor"
 )
+
+func TestBalloonMachineReportsCurrentTarget(t *testing.T) {
+	var targeter balloon.CurrentTargeter = balloonMachine{configuredMiB: 4096}
+	if got := targeter.CurrentTargetMiB(); got != 4096 {
+		t.Fatalf("CurrentTargetMiB() = %d, want configured 4096 before a target is recorded", got)
+	}
+
+	targeter = balloonMachine{configuredMiB: 4096, currentTargetMiB: 3072}
+	if got := targeter.CurrentTargetMiB(); got != 3072 {
+		t.Fatalf("CurrentTargetMiB() = %d, want recorded 3072", got)
+	}
+}
 
 func TestBalloonablesBypassAPIDProbeWhenBackendReportsBalloonReadback(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())

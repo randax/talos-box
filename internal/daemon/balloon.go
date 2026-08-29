@@ -52,19 +52,11 @@ func (m balloonMachine) SetMemoryTargetMiB(targetMiB int) error {
 	return nil
 }
 
-// balloonCurrent is the optional current-target readback a Balloonable may
-// carry. The balloon package's interface is deliberately configured-size only —
-// its reconcile is anchored there — so the pre-balloon asks for the reading it
-// needs without forcing every implementation to have one.
-type balloonCurrent interface {
-	CurrentTargetMiB() int
-}
-
 // currentTargetMiB is how much memory a running guest holds right now as far as
 // this daemon knows: the last target it applied, or the configured size for a
 // guest nothing has ballooned.
 func currentTargetMiB(vm balloon.Balloonable) int {
-	if current, ok := vm.(balloonCurrent); ok {
+	if current, ok := vm.(balloon.CurrentTargeter); ok {
 		if target := current.CurrentTargetMiB(); target > 0 {
 			return target
 		}

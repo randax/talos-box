@@ -30,6 +30,20 @@ func (r *recordingVM) SetMemoryTargetMiB(m int) error {
 	return nil
 }
 
+type currentTargetRecordingVM struct {
+	recordingVM
+	currentTarget int
+}
+
+func (r *currentTargetRecordingVM) CurrentTargetMiB() int { return r.currentTarget }
+func (r *currentTargetRecordingVM) SetMemoryTargetMiB(targetMiB int) error {
+	if err := r.recordingVM.SetMemoryTargetMiB(targetMiB); err != nil {
+		return err
+	}
+	r.currentTarget = targetMiB
+	return nil
+}
+
 func memorySample(availableMiB int) hostmem.Snapshot {
 	return hostmem.Snapshot{TotalMiB: 32768, AvailableMiB: availableMiB, Pressure: hostmem.PressureNormal}
 }
@@ -61,6 +75,49 @@ func TestManagerRestoresExternallyInflatedNodeAfterHoldRelease(t *testing.T) {
 
 	if v.calls != 1 || v.target != 4096 {
 		t.Fatalf("calls=%d target=%d, want one apply restoring the configured 4096 MiB target", v.calls, v.target)
+	}
+}
+
+func TestManagerRestoresKnownNodeMovedOutsideManager(t *testing.T) {
+	logs := &recordingLog{}
+	m := NewManager(logs.Printf)
+	v := &currentTargetRecordingVM{
+		recordingVM:   recordingVM{configured: 4096, target: 4096},
+		currentTarget: 4096,
+	}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 0, start)
+	v.currentTarget = 2048
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 0, start.Add(5*time.Second))
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 0, start.Add(10*time.Second))
+
+	if v.calls != 2 || v.target != 4096 || v.currentTarget != 4096 {
+		t.Fatalf("calls=%d target=%d current=%d, want one correction restoring 4096 MiB and subsequent silence", v.calls, v.target, v.currentTarget)
+	}
+	lines := logs.snapshot()
+	if got := lines[len(lines)-1]; got != "balloon a: target=4096MiB (restoring externally moved target 2048)" {
+		t.Fatalf("correction log = %q, want distinct external-move restoration telemetry", got)
+	}
+}
+
+func TestManagerRestoresKnownNodeToLiveHoldTarget(t *testing.T) {
+	m := NewManager(nil)
+	v := &currentTargetRecordingVM{
+		recordingVM:   recordingVM{configured: 4096, target: 4096},
+		currentTarget: 4096,
+	}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 0, start)
+	v.currentTarget = 3072
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 1024, start.Add(5*time.Second))
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 1024, start.Add(10*time.Second))
+
+	if v.calls != 2 || v.target != 3072 || v.currentTarget != 3072 {
+		t.Fatalf("calls=%d target=%d current=%d, want one correction applying the live hold-derived 3072 MiB target", v.calls, v.target, v.currentTarget)
 	}
 }
 
