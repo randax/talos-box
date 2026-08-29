@@ -149,7 +149,7 @@ func (c cli) runConsole(args []string) error {
 	}
 
 	_, _ = fmt.Fprintf(c.err, "attached to %s/%s console (kernel + machined logs; recent output replays) — detach with Ctrl-]\n", clusterName, nodeName)
-	if target.Phase == daemon.PhaseConfigured {
+	if target.Phase.Configured() {
 		_, _ = fmt.Fprintln(c.err, configuredConsoleTip(target.IP, filepath.Join(dir, "talosconfig")))
 	}
 
