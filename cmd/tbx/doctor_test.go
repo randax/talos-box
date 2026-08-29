@@ -330,7 +330,7 @@ func TestDoctorPrintsRuntimeIdentityBeforeFindingsAndCountsCompatibilityFailure(
 			Daemon: componentIdentity{Name: "daemon", Path: "/opt/old/tbxd", Version: "0.1.2", Protocol: daemon.ProtocolVersion - 1, PID: 1234, Available: true},
 			Helper: componentIdentity{Name: "helper", Path: "/opt/current/tbx-helper", Version: "0.1.3", Protocol: helper.ProtocolVersion, PID: 2345, Available: true},
 			Findings: []doctorFinding{
-				{level: "FAIL", check: "runtime-compat", detail: "daemon /opt/old/tbxd (protocol 16) is older than client /opt/current/tbx (daemon protocol 17); align them to this client with `/opt/current/tbx system restart --force`, or use the matching client"},
+				{level: "FAIL", check: "runtime-compat", detail: fmt.Sprintf("daemon /opt/old/tbxd (protocol %d) is older than client /opt/current/tbx (daemon protocol %d); align them to this client with `/opt/current/tbx system restart --force`, or use the matching client", daemon.ProtocolVersion-1, daemon.ProtocolVersion)},
 			},
 		}
 	}

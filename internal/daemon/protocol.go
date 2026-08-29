@@ -80,7 +80,10 @@ const (
 // warm/check argument and result fields (refresh, refreshWarning, and typed
 // failure counts/statuses), so both changes ship under the same negotiated
 // wire version (#488 #490 #492).
-const ProtocolVersion = 17
+// Version 18 adds the additive per-node rebootedAt field and rebooted phase.
+// Shared pressure sampling and table-only status advisories do not change any
+// request shape.
+const ProtocolVersion = 18
 
 // Request is one newline-delimited daemon request.
 type Request struct {

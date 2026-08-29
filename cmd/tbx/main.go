@@ -685,6 +685,12 @@ func (c cli) runStatus(args []string) error {
 	if err := printMirrorOfflineNotice(c.out, offline, offlineErr); err != nil {
 		return err
 	}
+	if runningStatusExists(result) {
+		snapshot, probeErr := statusMemorySnapshot()
+		if err := printStatusPressureNotice(c.out, snapshot, probeErr); err != nil {
+			return err
+		}
+	}
 	return printStatus(c.out, result, *quiet)
 }
 

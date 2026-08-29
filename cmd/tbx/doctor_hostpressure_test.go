@@ -170,3 +170,22 @@ func TestRunDoctorClassifiesHighSwapAgainstMeasuredMemoryHeadroom(t *testing.T) 
 		})
 	}
 }
+
+func TestRunDoctorWarnsAtEightyPercentSwapUnderNormalPressure(t *testing.T) {
+	deps := passingDoctorDependencies()
+	deps.hostPressure = func() (hostpressure.Snapshot, error) {
+		return hostpressure.Snapshot{
+			Swap:           hostpressure.Usage{TotalBytes: 3 << 30, AvailableBytes: 3 << 30 * 13 / 100},
+			MemoryPressure: hostpressure.MemoryPressureNormal,
+		}, nil
+	}
+	deps.hostFreeMemory = func() (int, error) { return 16 << 10, nil }
+
+	var output strings.Builder
+	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
+		t.Fatalf("runDoctorWithDependencies() = %v, warning must not fail doctor", err)
+	}
+	if !strings.Contains(output.String(), "WARN host-pressure: host swap is 87% used") {
+		t.Fatalf("output missing steady swap warning:\n%s", output.String())
+	}
+}

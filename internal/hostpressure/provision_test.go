@@ -276,9 +276,8 @@ func TestAssessProvisionStart(t *testing.T) {
 	}
 }
 
-// TestAssessProvisionStartSwapCeilingIsNotSteadyState guards the #231 boundary:
-// the lower swap ceiling belongs to bringup only, so a steady-state host at the
-// same reading must stay a PASS for Assess.
+// The bringup rule remains independently blocking, while steady state now
+// reports the same 80% reading as an advisory (#498).
 func TestAssessProvisionStartSwapCeilingIsNotSteadyState(t *testing.T) {
 	// A 2 GiB dynamic swapfile 80% used: past the bringup percentage ceiling,
 	// but only 1.6 GiB actually swapped out, which is the sticky-file reading
@@ -287,7 +286,11 @@ func TestAssessProvisionStartSwapCeilingIsNotSteadyState(t *testing.T) {
 		Swap:           Usage{TotalBytes: 2 << 30, AvailableBytes: 2 << 30 * 20 / 100},
 		MemoryPressure: MemoryPressureNormal,
 	}
-	for _, finding := range Assess(snapshot, 4096) {
+	steady := Assess(snapshot, 4096)
+	if len(steady) != 1 || steady[0].Severity != SeverityWarn {
+		t.Fatalf("Assess() = %v, want one warning at 80%% swap use with normal pressure", steady)
+	}
+	for _, finding := range steady {
 		if finding.Severity == SeverityBlock {
 			t.Fatalf("Assess() blocked at 80%% swap use with normal pressure: %s", finding)
 		}

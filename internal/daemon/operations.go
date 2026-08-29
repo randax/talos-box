@@ -209,6 +209,9 @@ type NodeStatus struct {
 	// (#288). Nil means it has not answered since its VM launched, so StartedAt
 	// is the only honest clock — and nil for a node that is answering now.
 	UnreachableSince *time.Time `json:"unreachableSince,omitempty"`
+	// RebootedAt is when this daemon observed Talos boot_time change while the
+	// VM process stayed running. The status notice is transient for 15 minutes.
+	RebootedAt *time.Time `json:"rebootedAt,omitempty"`
 }
 
 type ServiceProbeStatus string
@@ -1591,10 +1594,57 @@ func (s *Server) refreshNodeStatuses(statuses []ClusterStatus) {
 			refreshed.UnreachableSince = s.reachability.observe(nodeKey(statuses[i].Name, node.Name), refreshed.Phase, now)
 			statuses[i].Nodes[j] = refreshed
 		}
+	}
+	s.refreshNodeReboots(statuses, now)
+	for i := range statuses {
 		refreshNodeServices(&statuses[i], now)
 		statuses[i].Hints = hintsAt(statuses[i], now)
 	}
 	s.logNodeStalls(statuses, now)
+}
+
+// refreshNodeReboots probes configured running nodes concurrently. The
+// tracker serializes baselines so overlapping status requests cannot duplicate
+// a reboot event or log line.
+func (s *Server) refreshNodeReboots(statuses []ClusterStatus, now time.Time) {
+	var wait sync.WaitGroup
+	for i := range statuses {
+		status := &statuses[i]
+		for j := range status.Nodes {
+			node := &status.Nodes[j]
+			if !node.Phase.Configured() || node.IP == "" {
+				continue
+			}
+			node.RebootedAt = nil
+			if node.Phase == PhaseRebooted {
+				node.Phase = PhaseConfigured
+			}
+			wait.Add(1)
+			go func(clusterName string, node *NodeStatus) {
+				defer wait.Done()
+				key := nodeKey(clusterName, node.Name)
+				applyCurrent := func() {
+					if active, ok := s.reboots.current(key, now); ok {
+						rebootedAt := active.RebootedAt
+						node.RebootedAt = &rebootedAt
+						node.Phase = PhaseRebooted
+					}
+				}
+				bootTime, err := probeNodeBootTime(clusterName, node.IP)
+				if err != nil || bootTime == 0 {
+					applyCurrent()
+					return
+				}
+				observation, previous, changed := s.reboots.observeTransition(key, bootTime, now)
+				if changed {
+					log.Printf("status %s: node %s rebooted without a host VM restart (Talos boot_time changed %d -> %d); observed at %s",
+						clusterName, node.Name, previous, observation.BootTime, observation.RebootedAt.UTC().Format(time.RFC3339))
+				}
+				applyCurrent()
+			}(status.Name, node)
+		}
+	}
+	wait.Wait()
 }
 
 // refreshNodeServices asks each configured node's machine API about its
@@ -1610,7 +1660,7 @@ func refreshNodeServices(status *ClusterStatus, now time.Time) {
 	var wait sync.WaitGroup
 	for i := range status.Nodes {
 		node := &status.Nodes[i]
-		if node.Phase != PhaseConfigured || node.IP == "" {
+		if !node.Phase.Configured() || node.IP == "" {
 			continue
 		}
 		wait.Add(1)
