@@ -3,6 +3,7 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
 	"os"
 	"strings"
@@ -74,6 +75,15 @@ func TestLinuxDoctorExitCodeWithRunningClusterRoutes(t *testing.T) {
 		t.Fatalf("cluster %q has no live node IP: %+v", clusterName, statuses[0].Nodes)
 	}
 	pass := func() error { return nil }
+	// Only the route lookup runs for real: the system-DNS check shares the
+	// command seam, and this test asserts doctor's exit status for #502 alone,
+	// not that the runner's resolver answers cluster names.
+	routeOnly := func(name string, args ...string) ([]byte, error) {
+		if name != "ip" {
+			return nil, fmt.Errorf("%s is not exercised by this test", name)
+		}
+		return execCombinedOutput(name, args...)
+	}
 	deps := doctorDependencies{
 		checkHelper:     pass,
 		checkResolver:   pass,
@@ -81,7 +91,7 @@ func TestLinuxDoctorExitCodeWithRunningClusterRoutes(t *testing.T) {
 		checkForwarding: pass,
 		listClusters:    listClusters,
 		getStatus:       getStatus,
-		command:         execCombinedOutput,
+		command:         routeOnly,
 		doHTTP: func(*http.Request) (*http.Response, error) {
 			return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
 		},

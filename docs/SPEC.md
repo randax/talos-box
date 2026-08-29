@@ -464,7 +464,9 @@ every generated machine config. It scales `vm.min_free_kbytes` from each role's 
 kubelet's hard `memory.available` eviction threshold to `300Mi` and its system memory
 reservation to `512Mi`. User-supplied values win and unrelated settings are preserved.
 `kubeletMemoryProtection: false` omits only those kubelet eviction and reservation defaults;
-the reclaim sysctls still apply. Like `hubble`, the field is provisioning-only and is rejected
+the reclaim sysctls still apply. Unlike `hubble`, the setting is baked into machine config at
+node creation: changing it in `talosbox.yaml` is persisted by `tbx up` and shapes nodes added
+afterwards, but already-configured nodes are not re-patched (use `talosctl patch mc`). Like `hubble`, the field is provisioning-only and is rejected
 without a curated `cni:`. Substrate-only users own their machine config and can apply the same
 policy manually; [Guest memory and reclaim](guest-memory.md) documents the patch, trade-offs,
 and the bring-your-own-schematic balloon opt-out.
