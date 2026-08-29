@@ -2,29 +2,39 @@
 
 package hostpressure
 
-import "testing"
+import (
+	"context"
+	"testing"
 
-func TestMemoryPressureFromLevelMapsSysctlValues(t *testing.T) {
-	for value, want := range map[string]MemoryPressure{
-		"1":       MemoryPressureNormal,
-		"2":       MemoryPressureWarning,
-		"4":       MemoryPressureCritical,
-		"0":       MemoryPressureUnknown,
-		"":        MemoryPressureUnknown,
-		"garbage": MemoryPressureUnknown,
+	"github.com/randax/talos-box/internal/hostmem"
+)
+
+func TestMemoryPressureFromHostmem(t *testing.T) {
+	for value, want := range map[hostmem.Pressure]MemoryPressure{
+		hostmem.PressureNormal:   MemoryPressureNormal,
+		hostmem.PressureWarning:  MemoryPressureWarning,
+		hostmem.PressureCritical: MemoryPressureCritical,
+		hostmem.PressureUnknown:  MemoryPressureUnknown,
 	} {
-		if got := memoryPressureFromLevel(value); got != want {
-			t.Errorf("memoryPressureFromLevel(%q) = %v, want %v", value, got, want)
+		if got := memoryPressureFromHostmem(value); got != want {
+			t.Errorf("memoryPressureFromHostmem(%v) = %v, want %v", value, got, want)
 		}
 	}
 }
 
-func TestParseSwapUsageReadsMacOSSysctlOutput(t *testing.T) {
-	usage, err := parseSwapUsage("total = 22500.00M  used = 21000.00M  free = 1500.00M  (encrypted)\n")
+func TestSystemMemorySnapshotUsesSharedSample(t *testing.T) {
+	original := hostmem.SystemSnapshot
+	t.Cleanup(func() { hostmem.SystemSnapshot = original })
+	hostmem.SystemSnapshot = func(context.Context) (hostmem.Snapshot, error) {
+		return hostmem.Snapshot{TotalMiB: 32768, AvailableMiB: 6131, CompressorMiB: 8419,
+			SwapTotalBytes: 3 << 30, SwapAvailableBytes: 410 << 20, Pressure: hostmem.PressureWarning}, nil
+	}
+	snapshot, err := SystemMemorySnapshotContext(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if usage.TotalBytes != 22_500<<20 || usage.AvailableBytes != 1_500<<20 {
-		t.Fatalf("parseSwapUsage() = %+v, want 22500 MiB total and 1500 MiB available", usage)
+	if snapshot.TotalMemoryMiB != 32768 || snapshot.FreeMemoryMiB != 6131 || snapshot.CompressorMiB != 8419 ||
+		snapshot.Swap.TotalBytes != 3<<30 || snapshot.MemoryPressure != MemoryPressureWarning {
+		t.Fatalf("snapshot = %+v", snapshot)
 	}
 }

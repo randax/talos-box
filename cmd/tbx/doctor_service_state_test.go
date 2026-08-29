@@ -15,6 +15,7 @@ func TestTalosServicesFindingsCoverPassWarnFailAndSkip(t *testing.T) {
 	succeeded := daemon.ServiceProbe{Status: daemon.ServiceProbeSucceeded}
 	missing := daemon.ServiceProbe{Status: daemon.ServiceProbeMissingCredentials}
 	failed := daemon.ServiceProbe{Status: daemon.ServiceProbeFailed, Error: "authentication failed"}
+	rebootedAt := now.Add(-time.Minute)
 	tests := []struct {
 		name       string
 		statuses   []daemon.ClusterStatus
@@ -28,6 +29,7 @@ func TestTalosServicesFindingsCoverPassWarnFailAndSkip(t *testing.T) {
 		{name: "skip when cluster listing fails", clusterErr: errors.New("decode daemon result"), levels: []string{"SKIP"}, contains: []string{"list clusters: decode daemon result"}},
 		{name: "warn when status unavailable", statusErr: errors.New("daemon timed out"), levels: []string{"WARN"}, contains: []string{"daemon timed out"}},
 		{name: "pass after successful inspection", statuses: []daemon.ClusterStatus{{Name: "demo", Running: true, Nodes: []daemon.NodeStatus{{Name: "demo-cp-1", Phase: daemon.PhaseConfigured, ServiceProbe: &succeeded}}}}, levels: []string{"PASS"}},
+		{name: "rebooted node remains inspectable and warns", statuses: []daemon.ClusterStatus{{Name: "demo", Running: true, Nodes: []daemon.NodeStatus{{Name: "demo-cp-1", Phase: daemon.PhaseRebooted, RebootedAt: &rebootedAt, ServiceProbe: &succeeded}}}}, levels: []string{"WARN"}, contains: []string{"demo/demo-cp-1 rebooted at", "VM process stayed running"}},
 		{name: "warn for missing credentials and probe errors", statuses: []daemon.ClusterStatus{{Name: "demo", Running: true, Nodes: []daemon.NodeStatus{
 			{Name: "demo-cp-1", Phase: daemon.PhaseConfigured, ServiceProbe: &missing},
 			{Name: "demo-worker-1", Phase: daemon.PhaseConfigured, ServiceProbe: &failed},

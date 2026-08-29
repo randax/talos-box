@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -52,7 +53,7 @@ func TestSystemStatusUsesTheRuntimeIdentityBlock(t *testing.T) {
 	for _, want := range []string{
 		"runtime:\n",
 		"client: /opt/current/tbx",
-		"daemon: /opt/current/tbxd (0.1.3; protocol 17; pid 1234)",
+		fmt.Sprintf("daemon: /opt/current/tbxd (0.1.3; protocol %d; pid 1234)", daemon.ProtocolVersion),
 		"helper: /opt/current/tbx-helper (0.1.3; protocol 5; pid 2345)",
 	} {
 		if !strings.Contains(text, want) {
@@ -77,7 +78,7 @@ func TestSystemStatusPrintsRestartHintOnlyForDaemonMismatch(t *testing.T) {
 				Daemon: componentIdentity{Name: "daemon", Path: "/opt/current/tbxd", Version: "0.1.3", Protocol: daemon.ProtocolVersion, PID: 1234, Available: true},
 				Helper: componentIdentity{Name: "helper", Path: "/opt/old/tbx-helper", Version: "0.1.2", Protocol: helper.ProtocolVersion - 1, Available: true},
 				Findings: []doctorFinding{
-					{level: "FAIL", check: "runtime-compat", detail: "client /opt/current/tbx (0.1.3, proto 17) is newer than helper /opt/old/tbx-helper (0.1.2, proto 4); run `sudo /opt/current/tbx system install` or use the matching client"},
+					{level: "FAIL", check: "runtime-compat", detail: fmt.Sprintf("client /opt/current/tbx (0.1.3, proto %d) is newer than helper /opt/old/tbx-helper (0.1.2, proto 4); run `sudo /opt/current/tbx system install` or use the matching client", daemon.ProtocolVersion)},
 				},
 			},
 			wantHint: false,
@@ -89,7 +90,7 @@ func TestSystemStatusPrintsRestartHintOnlyForDaemonMismatch(t *testing.T) {
 				Daemon: componentIdentity{Name: "daemon", Path: "/opt/old/tbxd", Version: "0.1.2", Protocol: daemon.ProtocolVersion - 1, PID: 1234, Available: true},
 				Helper: componentIdentity{Name: "helper", Path: "/opt/current/tbx-helper", Version: "0.1.3", Protocol: helper.ProtocolVersion, PID: 2345, Available: true},
 				Findings: []doctorFinding{
-					{level: "FAIL", check: "runtime-compat", detail: "client /opt/current/tbx (0.1.3, proto 17) is newer than daemon /opt/old/tbxd (0.1.2, proto 16); run `/opt/current/tbx system restart` (add `--force` only if it refuses because clusters are running) or use the matching client"},
+					{level: "FAIL", check: "runtime-compat", detail: fmt.Sprintf("client /opt/current/tbx (0.1.3, proto %d) is newer than daemon /opt/old/tbxd (0.1.2, proto %d); run `/opt/current/tbx system restart` (add `--force` only if it refuses because clusters are running) or use the matching client", daemon.ProtocolVersion, daemon.ProtocolVersion-1)},
 				},
 			},
 			wantHint: true,

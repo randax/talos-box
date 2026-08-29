@@ -56,6 +56,7 @@ type Server struct {
 	// a stall is aged from that transition rather than from VM uptime (#288).
 	reachability reachabilityLog
 	stalls       stallLog
+	reboots      rebootLog
 	// readiness records when a cluster's Kubernetes readiness probe started
 	// failing, so a momentary blip is not escalated into destroy-and-recreate
 	// advice (#418).

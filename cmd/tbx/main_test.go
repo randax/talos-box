@@ -5,6 +5,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/randax/talos-box/internal/hostpressure"
 )
 
 // TestMain pins the runtime-identity command seam so no test depends on the
@@ -13,6 +15,9 @@ import (
 // care about the systemd answer inject their own command (see
 // runtime_identity_linux_test.go).
 func TestMain(m *testing.M) {
+	statusMemorySnapshot = func() (hostpressure.Snapshot, error) {
+		return hostpressure.Snapshot{TotalMemoryMiB: 32768, FreeMemoryMiB: 16384, MemoryPressure: hostpressure.MemoryPressureNormal}, nil
+	}
 	runtimeIdentityCommand = func(name string, args ...string) ([]byte, error) {
 		if name == "systemctl" && len(args) > 0 && (args[0] == "show" || (args[0] == "--user" && len(args) > 1 && args[1] == "show")) {
 			return []byte("LoadState=not-found\nActiveState=inactive\n"), nil

@@ -85,10 +85,32 @@ func TestNodeStatusServiceFieldsRoundTripJSON(t *testing.T) {
 	}
 }
 
+func TestNodeStatusRebootFieldsRoundTripJSON(t *testing.T) {
+	t.Parallel()
+	rebootedAt := time.Date(2026, 8, 29, 6, 49, 28, 0, time.UTC)
+	want := NodeStatus{Name: "demo-cp-1", Phase: PhaseRebooted, RebootedAt: &rebootedAt}
+	encoded, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{`"phase":"rebooted"`, `"rebootedAt":"2026-08-29T06:49:28Z"`} {
+		if !strings.Contains(string(encoded), field) {
+			t.Fatalf("node JSON missing %s: %s", field, encoded)
+		}
+	}
+	var got NodeStatus
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("round trip = %+v, want %+v", got, want)
+	}
+}
+
 func TestProtocolVersionIncludesTalosServiceState(t *testing.T) {
 	t.Parallel()
-	if ProtocolVersion != 17 {
-		t.Fatalf("ProtocolVersion = %d, want 17 for runtime identity, additive service fields, and cache-warm fields", ProtocolVersion)
+	if ProtocolVersion != 18 {
+		t.Fatalf("ProtocolVersion = %d, want 18 for reboot observability", ProtocolVersion)
 	}
 }
 

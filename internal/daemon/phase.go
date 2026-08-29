@@ -33,6 +33,7 @@ const (
 	PhaseUnreachable Phase = "unreachable"
 	PhaseMaintenance Phase = "maintenance"
 	PhaseConfigured  Phase = "configured"
+	PhaseRebooted    Phase = "rebooted"
 	// PhaseSuspended is a stopped node whose own memory is saved on disk. It
 	// is not a probe verdict — no VM is running to probe — but a promotion of
 	// PhaseStopped applied where suspension is known, so the JSON surface
@@ -45,6 +46,10 @@ const (
 // stopped with saved memory. Every rule that keyed on PhaseStopped means this,
 // because the suspended promotion changed the spelling and not the fact.
 func (p Phase) Stopped() bool { return p == PhaseStopped || p == PhaseSuspended }
+
+// Configured reports phases backed by an authenticated configured Talos node.
+// Rebooted is a transient observation layered on that same apid phase.
+func (p Phase) Configured() bool { return p == PhaseConfigured || p == PhaseRebooted }
 
 // ProbeResult is what one apid probe observed.
 type ProbeResult struct {
@@ -440,7 +445,7 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 			unreachable = append(unreachable, node)
 		case PhaseMaintenance:
 			maintenance = append(maintenance, node)
-		case PhaseConfigured:
+		case PhaseConfigured, PhaseRebooted:
 			configured = append(configured, node)
 		}
 	}
@@ -452,6 +457,12 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 			status.Name, status.Name))
 	}
 	hints = append(hints, serviceStallHints(status, now)...)
+	for _, node := range status.Nodes {
+		if node.Phase == PhaseRebooted && node.RebootedAt != nil {
+			hints = append(hints, fmt.Sprintf("node %s rebooted without a host VM restart at %s; inspect the recovery with: tbx console %s %s",
+				node.Name, node.RebootedAt.UTC().Format(time.RFC3339), shellquote.Quote(status.Name), shellquote.Quote(node.Name)))
+		}
+	}
 	// Capability gates hold whatever the cluster is doing: the config is
 	// accepted and the extension baked, but this host cannot honour it.
 	for _, capability := range status.Capabilities {

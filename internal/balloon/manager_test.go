@@ -1,12 +1,15 @@
 package balloon
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/randax/talos-box/internal/hostmem"
 )
 
 // recordingVM captures SetMemoryTargetMiB calls.
@@ -14,15 +17,174 @@ type recordingVM struct {
 	configured int
 	target     int
 	err        error
+	calls      int
 }
 
 func (r *recordingVM) ConfiguredMiB() int { return r.configured }
 func (r *recordingVM) SetMemoryTargetMiB(m int) error {
+	r.calls++
 	if r.err != nil {
 		return r.err
 	}
 	r.target = m
 	return nil
+}
+
+func memorySample(availableMiB int) hostmem.Snapshot {
+	return hostmem.Snapshot{TotalMiB: 32768, AvailableMiB: availableMiB, Pressure: hostmem.PressureNormal}
+}
+
+func TestManagerIgnoresDeficitsBelowDeadband(t *testing.T) {
+	for _, deficit := range []int{0, 2, 88, 255} {
+		t.Run(fmt.Sprintf("%dMiB", deficit), func(t *testing.T) {
+			m := NewManager(nil)
+			v := &recordingVM{configured: 4096, target: 4096}
+			m.ReconcileSnapshot(map[string]Balloonable{"a": v}, memorySample(6144-deficit), 6144, 1024, 0, time.Unix(1000, 0))
+			if v.calls != 0 || v.target != 4096 {
+				t.Fatalf("deficit %d applied %d target(s), target=%d", deficit, v.calls, v.target)
+			}
+		})
+	}
+}
+
+func TestManagerActsAtDeadbandBoundary(t *testing.T) {
+	m := NewManager(nil)
+	v := &recordingVM{configured: 4096, target: 4096}
+	m.ReconcileSnapshot(map[string]Balloonable{"a": v}, memorySample(6144-256), 6144, 1024, 0, time.Unix(1000, 0))
+	if v.calls != 1 || v.target != 4096-256 {
+		t.Fatalf("calls=%d target=%d, want one target at 3840", v.calls, v.target)
+	}
+}
+
+func TestManagerRetargetsAtMostOncePerMinute(t *testing.T) {
+	m := NewManager(nil)
+	v := &recordingVM{configured: 4096, target: 4096}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+	m.ReconcileSnapshot(vms, memorySample(6144-256), 6144, 1024, 0, start)
+	m.ReconcileSnapshot(vms, memorySample(6144-512), 6144, 1024, 0, start.Add(time.Minute-time.Nanosecond))
+	if v.calls != 1 || v.target != 3840 {
+		t.Fatalf("before minute calls=%d target=%d", v.calls, v.target)
+	}
+	m.ReconcileSnapshot(vms, memorySample(6144-512), 6144, 1024, 0, start.Add(time.Minute))
+	if v.calls != 2 || v.target != 3584 {
+		t.Fatalf("at minute calls=%d target=%d", v.calls, v.target)
+	}
+}
+
+func TestManagerHighSwapHoldsExistingReclaim(t *testing.T) {
+	m := NewManager(nil)
+	v := &recordingVM{configured: 4096, target: 4096}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+	m.ReconcileSnapshot(vms, memorySample(6144-512), 6144, 1024, 0, start)
+	high := memorySample(8192)
+	high.SwapTotalBytes, high.SwapAvailableBytes = 3<<30, 512<<20
+	m.ReconcileSnapshot(vms, high, 6144, 1024, 0, start.Add(time.Minute))
+	if v.calls != 1 || v.target != 3584 {
+		t.Fatalf("high swap released reclaim: calls=%d target=%d", v.calls, v.target)
+	}
+}
+
+func TestManagerCompressorPressureHoldsExistingReclaim(t *testing.T) {
+	m := NewManager(nil)
+	v := &recordingVM{configured: 4096, target: 4096}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+	m.ReconcileSnapshot(vms, memorySample(6144-512), 6144, 1024, 0, start)
+	high := memorySample(8192)
+	high.CompressorMiB = 7000
+	m.ReconcileSnapshot(vms, high, 6144, 1024, 0, start.Add(time.Minute))
+	if v.calls != 1 || v.target != 3584 {
+		t.Fatalf("compressor pressure released reclaim: calls=%d target=%d", v.calls, v.target)
+	}
+}
+
+func TestManagerPressureLatchUsesLowWaterMarks(t *testing.T) {
+	m := NewManager(nil)
+	v := &recordingVM{configured: 4096, target: 4096}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+	high := memorySample(6144 - 512)
+	high.SwapTotalBytes, high.SwapAvailableBytes = 10<<30, 2<<30
+	m.ReconcileSnapshot(vms, high, 6144, 1024, 0, start)
+	between := memorySample(8192)
+	between.SwapTotalBytes, between.SwapAvailableBytes = 10<<30, 3<<30
+	m.ReconcileSnapshot(vms, between, 6144, 1024, 0, start.Add(time.Minute))
+	if v.calls != 1 {
+		t.Fatalf("70%% swap cleared latch: calls=%d", v.calls)
+	}
+	low := memorySample(8192)
+	low.SwapTotalBytes, low.SwapAvailableBytes = 10<<30, 4<<30
+	m.ReconcileSnapshot(vms, low, 6144, 1024, 0, start.Add(2*time.Minute))
+	if v.calls != 2 || v.target != 4096 {
+		t.Fatalf("low water did not release: calls=%d target=%d", v.calls, v.target)
+	}
+}
+
+func TestManagerPressureSignalDoesNotCreateReclaimByItself(t *testing.T) {
+	m := NewManager(nil)
+	v := &recordingVM{configured: 4096, target: 4096}
+	high := memorySample(8192)
+	high.Pressure = hostmem.PressureCritical
+	m.ReconcileSnapshot(map[string]Balloonable{"a": v}, high, 6144, 1024, 0, time.Unix(1000, 0))
+	if v.calls != 0 || v.target != 4096 {
+		t.Fatalf("pressure alone reclaimed memory: calls=%d target=%d", v.calls, v.target)
+	}
+}
+
+func TestManagerPreBalloonHoldBypassesDeadbandAndRateLimit(t *testing.T) {
+	m := NewManager(nil)
+	v := &recordingVM{configured: 4096, target: 4096}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 1, start)
+	m.ReconcileSnapshot(vms, memorySample(8192), 6144, 1024, 2, start.Add(time.Second))
+	if v.calls != 2 || v.target != 4094 {
+		t.Fatalf("hold calls=%d target=%d, want immediate 4094", v.calls, v.target)
+	}
+}
+
+func TestManagerFailedTargetDoesNotConsumeRateWindow(t *testing.T) {
+	m := NewManager(nil)
+	v := &recordingVM{configured: 4096, target: 4096, err: errors.New("apply failed")}
+	vms := map[string]Balloonable{"a": v}
+	start := time.Unix(1000, 0)
+	m.ReconcileSnapshot(vms, memorySample(6144-512), 6144, 1024, 0, start)
+	v.err = nil
+	m.ReconcileSnapshot(vms, memorySample(6144-512), 6144, 1024, 0, start.Add(time.Second))
+	if v.calls != 2 || v.target != 3584 {
+		t.Fatalf("recovery calls=%d target=%d", v.calls, v.target)
+	}
+}
+
+func TestManagerIncidentSampleDoesNotFlapTargets(t *testing.T) {
+	m := NewManager(nil)
+	v := &recordingVM{configured: 4096, target: 4096}
+	vms := map[string]Balloonable{"cluster/cp-1": v}
+	start := time.Unix(1000, 0)
+	for i, available := range []int{6056, 6142, 6129, 6167} {
+		sample := memorySample(available)
+		sample.CompressorMiB = 8419
+		sample.SwapTotalBytes, sample.SwapAvailableBytes = 3<<30, 410<<20
+		m.ReconcileSnapshot(vms, sample, 6144, 1024, 0, start.Add(time.Duration(i)*31*time.Second))
+	}
+	if v.calls != 0 || v.target != 4096 {
+		t.Fatalf("incident samples flapped target: calls=%d target=%d", v.calls, v.target)
+	}
+}
+
+func TestRunUsesSnapshotProbe(t *testing.T) {
+	rec := &recordingLog{}
+	stop := make(chan struct{})
+	close(stop)
+	RunWithLogger(Config{
+		ReserveMiB: 6144, FloorMiB: 1024, PollInterval: time.Hour,
+		HostMemory: func(context.Context) (hostmem.Snapshot, error) { return memorySample(8192), nil },
+	}, func() map[string]Balloonable { return nil }, stop, rec.Printf)
+	if got := rec.snapshot(); len(got) != 1 || !strings.Contains(got[0], "balloon: manager started") {
+		t.Fatalf("startup lines = %v", got)
+	}
 }
 
 // recordingLog collects the manager's telemetry lines.

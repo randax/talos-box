@@ -14,6 +14,7 @@ import (
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/helper"
+	"github.com/randax/talos-box/internal/hostmem"
 )
 
 // TestMain pins the host readings for the whole package. Any test that reaches
@@ -28,6 +29,9 @@ func TestMain(m *testing.M) {
 	measureHostFreeMiB = plentifulHostMemory
 	measureHostTotalMiB = plentifulHostMemory
 	measureHostPressure = noHostPressure
+	hostmem.SystemSnapshot = func(context.Context) (hostmem.Snapshot, error) {
+		return hostmem.Snapshot{TotalMiB: 32768, AvailableMiB: 16384, Pressure: hostmem.PressureNormal}, nil
+	}
 	// The BGP port inventory shells out to the host's netstat, whose listeners
 	// are the runner's business and not any test's: an unrelated process on
 	// port 179 must not add an advisory to a `bgp enable` a test is asserting
@@ -44,6 +48,12 @@ func TestMain(m *testing.M) {
 	}
 	probeNodeServices = func(string, string, time.Time) ([]NodeService, ServiceProbe) {
 		return nil, ServiceProbe{Status: ServiceProbeMissingCredentials}
+	}
+	probeNodeBootTime = func(string, string) (uint64, error) {
+		return 0, errors.New("live Talos system stat disabled in package tests")
+	}
+	readNodeSystemStat = func(context.Context, *clientconfig.Context, string) (*machineapi.SystemStatResponse, error) {
+		return nil, errors.New("live Talos system stat disabled in package tests")
 	}
 	socketDir, err := containHostHelper()
 	if err != nil {
