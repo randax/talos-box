@@ -111,9 +111,39 @@ type CachePullCombination struct {
 	Intent     cluster.ProvisioningIntent `json:"intent"`
 }
 
+// DefaultCacheWarmJobs is the blob-download width `tbx cache warm` asks for
+// when --jobs is not given, and MaxCacheWarmJobs the most it may ask for: the
+// daemon-wide ceiling shared by every warm in flight (#506).
+const (
+	DefaultCacheWarmJobs = mirror.DefaultWarmJobs
+	MaxCacheWarmJobs     = mirror.MaxWarmJobs
+)
+
+// CacheWarmEntryStagePrefix marks a cache.warm stage that carries one finished
+// entry as JSON, narrated in list order as the warm progresses, so the client
+// can report each ref while the rest still downloads (#506).
+const CacheWarmEntryStagePrefix = "cache.warm entry "
+
+// ParseCacheWarmEntryStage decodes a stage produced for a finished warm entry.
+// Any other narration reports false.
+func ParseCacheWarmEntryStage(stage string) (CacheWarmEntry, bool) {
+	raw, ok := strings.CutPrefix(stage, CacheWarmEntryStagePrefix)
+	if !ok {
+		return CacheWarmEntry{}, false
+	}
+	var entry CacheWarmEntry
+	if err := json.Unmarshal([]byte(raw), &entry); err != nil {
+		return CacheWarmEntry{}, false
+	}
+	return entry, true
+}
+
 type CacheWarmArgs struct {
 	Refs    []string `json:"refs"`
 	Refresh bool     `json:"refresh,omitempty"`
+	// Jobs bounds the blob downloads kept in flight; zero takes the mirror's
+	// default and the daemon caps it (#506).
+	Jobs int `json:"jobs,omitempty"`
 }
 
 type CacheCheckArgs struct {
@@ -1987,13 +2017,16 @@ func (s *Server) strayPinnedImages(pulled []CachePullImage) ([]CacheImageEntry, 
 	return strays, nil
 }
 
-func (s *Server) warmMirrorCache(raw json.RawMessage) (CacheWarmResult, error) {
+func (s *Server) warmMirrorCache(raw json.RawMessage, progress stageFunc) (CacheWarmResult, error) {
 	var args CacheWarmArgs
 	if err := decodeArgs(raw, &args); err != nil {
 		return CacheWarmResult{}, err
 	}
 	if len(args.Refs) == 0 {
 		return CacheWarmResult{}, errors.New("at least one image reference is required")
+	}
+	if args.Jobs < 0 || args.Jobs > MaxCacheWarmJobs {
+		return CacheWarmResult{}, fmt.Errorf("jobs must be between 0 and %d, got %d", MaxCacheWarmJobs, args.Jobs)
 	}
 	for _, ref := range args.Refs {
 		if err := ValidateWarmRef(ref); err != nil {
@@ -2003,10 +2036,23 @@ func (s *Server) warmMirrorCache(raw json.RawMessage) (CacheWarmResult, error) {
 	if s.warmCache == nil && s.warmCacheWithOptions == nil {
 		return CacheWarmResult{}, errors.New("cache warm is not configured")
 	}
-	ctx, cancel := s.lifecycleTimeoutContext(cacheWarmTimeout)
+	// the budget is per ref: the CLI used to send one request per ref and
+	// now sends the list, and a long list on a slow link must not lose at the
+	// end what each ref alone would have been allowed (#506)
+	ctx, cancel := s.lifecycleTimeoutContext(cacheWarmTimeout * time.Duration(len(args.Refs)))
 	defer cancel()
 	if s.warmCacheWithOptions != nil {
-		summary, err := s.warmCacheWithOptions(ctx, args.Refs, s.imageArchitecture(), mirror.WarmOptions{Refresh: args.Refresh})
+		options := mirror.WarmOptions{Refresh: args.Refresh, Jobs: args.Jobs}
+		if progress != nil {
+			options.OnResult = func(result mirror.WarmResult) {
+				encoded, err := json.Marshal(cacheWarmEntry(result))
+				if err != nil {
+					return
+				}
+				progress.stage("%s%s", CacheWarmEntryStagePrefix, encoded)
+			}
+		}
+		summary, err := s.warmCacheWithOptions(ctx, args.Refs, s.imageArchitecture(), options)
 		return cacheWarmResult(summary), err
 	}
 	return s.warmCache(ctx, args.Refs, s.imageArchitecture())

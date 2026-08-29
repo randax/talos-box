@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -121,9 +122,12 @@ func TestWarmFetchesOnlySelectedLinuxPlatformChild(t *testing.T) {
 	windowsDigest := "sha256:" + strings.Repeat("d", 64)
 	index := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"digest":"%s","platform":{"os":"linux","architecture":"amd64"}},{"digest":"%s","platform":{"os":"linux","architecture":"arm64"}},{"digest":"%s","platform":{"os":"windows","architecture":"amd64"}}]}`, selectedDigest, armDigest, windowsDigest)
 
+	var hitsMu sync.Mutex
 	hits := map[string]int{}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hitsMu.Lock()
 		hits[r.URL.Path]++
+		hitsMu.Unlock()
 		switch r.URL.Path {
 		case manifestRequestPath("demo", selectedDigest):
 			w.Header().Set("Docker-Content-Digest", selectedDigest)
@@ -136,7 +140,7 @@ func TestWarmFetchesOnlySelectedLinuxPlatformChild(t *testing.T) {
 		}
 	})
 	result := WarmResult{}
-	err := warmManifestGraph(context.Background(), handler, NewServer("https://registry.example", t.TempDir()), "demo", []byte(index), "amd64", map[string]bool{}, map[string]bool{}, map[string]bool{}, &result)
+	err := warmManifestGraph(context.Background(), handler, NewServer("https://registry.example", t.TempDir()), "demo", []byte(index), "amd64", map[string]bool{}, map[string]bool{}, map[string]bool{}, &result, newManagerWithPorts(t.TempDir(), nil, 0).newWarmPool(0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1452,7 +1456,7 @@ func TestWarmManifestGraphSkipsAlreadyCachedBlobs(t *testing.T) {
 	})
 
 	result := &WarmResult{Ref: "registry.example/demo:1.0.0", AlreadyComplete: true}
-	if err := warmManifestGraph(context.Background(), handler, server, "demo", []byte(manifestBody), string(imagecache.ArchitectureAMD64), map[string]bool{}, map[string]bool{}, map[string]bool{}, result); err != nil {
+	if err := warmManifestGraph(context.Background(), handler, server, "demo", []byte(manifestBody), string(imagecache.ArchitectureAMD64), map[string]bool{}, map[string]bool{}, map[string]bool{}, result, newManagerWithPorts(t.TempDir(), nil, 0).newWarmPool(0)); err != nil {
 		t.Fatal(err)
 	}
 	if !result.AlreadyComplete {
@@ -2160,7 +2164,7 @@ func TestWarmDefaultRerunDoesNotReResolveTags(t *testing.T) {
 		t.Fatal(err)
 	}
 	if first.ReResolvedTags != 1 {
-		t.Fatalf("first warm ReResolvedTags = %d, want the one tag-pinned ref", first.ReResolvedTags)
+		t.Fatalf("first warm ReResolvedTags = %d, want the one tag-pinned ref; results %+v", first.ReResolvedTags, first.Results)
 	}
 
 	second, err := manager.Warm(context.Background(), refs, imagecache.ArchitectureAMD64, WarmOptions{})

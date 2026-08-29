@@ -55,7 +55,11 @@ type Manager struct {
 	dynamicLRUEntries map[string]*list.Element
 	dynamicClosers    map[string]func()
 	dynamicCap        int
-	warmTagMu         sync.Mutex
+	warmTagLocks      keyedMutex
+	warmBlobLocks     keyedMutex
+	warmPublishLocks  keyedMutex
+	warmSlotsOnce     sync.Once
+	warmSlots         chan struct{}
 }
 
 const dynamicHandlerCap = 64
@@ -434,6 +438,13 @@ func (m *Manager) validateResolvedAuthority(ctx context.Context, authority upstr
 }
 
 func (m *Manager) handlerForUpstream(authority upstreamAuthority) http.Handler {
+	handler, _ := m.handlerAndServerForUpstream(authority)
+	return handler
+}
+
+// handlerAndServerForUpstream returns the handler and the retained server
+// under one lock, so a concurrent warm's eviction cannot slip between the two.
+func (m *Manager) handlerAndServerForUpstream(authority upstreamAuthority) (http.Handler, *Server) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.ensureDynamicStateLocked()
@@ -441,7 +452,7 @@ func (m *Manager) handlerForUpstream(authority upstreamAuthority) http.Handler {
 		if element := m.dynamicLRUEntries[authority.cacheKey]; element != nil {
 			m.dynamicOrder.MoveToBack(element)
 		}
-		return handler
+		return handler, m.dynamicServers[authority.cacheKey]
 	}
 
 	base := authority.base
@@ -473,7 +484,7 @@ func (m *Manager) handlerForUpstream(authority upstreamAuthority) http.Handler {
 	for _, closer := range m.evictDynamicLocked() {
 		closer()
 	}
-	return handler
+	return handler, retainedServer
 }
 
 func (m *Manager) newDynamicMirrorServer(base, cacheDir string, authority upstreamAuthority) *Server {

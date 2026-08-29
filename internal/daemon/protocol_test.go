@@ -107,10 +107,10 @@ func TestNodeStatusRebootFieldsRoundTripJSON(t *testing.T) {
 	}
 }
 
-func TestProtocolVersionIncludesKubeletMemoryProtection(t *testing.T) {
+func TestProtocolVersionIncludesCacheWarmJobs(t *testing.T) {
 	t.Parallel()
-	if ProtocolVersion != 19 {
-		t.Fatalf("ProtocolVersion = %d, want 19 for kubelet memory protection", ProtocolVersion)
+	if ProtocolVersion != 20 {
+		t.Fatalf("ProtocolVersion = %d, want 20 for cache.warm jobs and entry narration", ProtocolVersion)
 	}
 }
 

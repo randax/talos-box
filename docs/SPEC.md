@@ -399,7 +399,7 @@ tbx bgp enable|disable <cluster> [--quiet]      tbx bgp status <cluster>
 tbx mirror offline [on|off]
 tbx cache pull [-f talosbox.yaml] [--no-images]
                [--talos-version VERSION --schematic ID --extensions LIST]
-tbx cache warm [--refresh] <list-file> [<list-file>...]
+tbx cache warm [--refresh] [--jobs N] <list-file> [<list-file>...]
 tbx cache warm --check [--deep] <list-file> [<list-file>...]
 tbx cache list [<image-ref>] [-o json]
 tbx cache prune [--mirror|--all]

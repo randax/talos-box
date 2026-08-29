@@ -38,7 +38,15 @@ type WarmResult struct {
 	Error         string
 }
 
-type WarmOptions struct{ Refresh bool }
+type WarmOptions struct {
+	Refresh bool
+	// Jobs bounds the blob downloads this warm keeps in flight; zero means
+	// DefaultWarmJobs and MaxWarmJobs is the ceiling (#506).
+	Jobs int
+	// OnResult, when set, sees every result as soon as it is final, in list
+	// order, so a caller can report progress while the rest still downloads.
+	OnResult func(WarmResult)
+}
 
 type WarmOutcome string
 
@@ -57,46 +65,86 @@ type warmReference struct {
 }
 
 func (m *Manager) Warm(ctx context.Context, references []string, architecture imagecache.Architecture, options WarmOptions) (WarmSummary, error) {
+	pool := m.newWarmPool(options.Jobs)
+	done := make([]chan WarmResult, len(references))
+	for i := range done {
+		done[i] = make(chan WarmResult, 1)
+	}
+	go func() {
+		// refs are started in list order, at most jobs at a time, so the
+		// in-order consumer below never waits on a ref that has not started
+		refSlots := make(chan struct{}, pool.jobs())
+		for i, reference := range references {
+			select {
+			case refSlots <- struct{}{}:
+			case <-ctx.Done():
+				done[i] <- finishedWarmResult(reference, WarmResult{}, ctx.Err())
+				continue
+			}
+			go func() {
+				defer func() { <-refSlots }()
+				result, err := m.warmOne(ctx, reference, architecture, options, pool)
+				done[i] <- finishedWarmResult(reference, result, err)
+			}()
+		}
+	}()
 	var summary WarmSummary
-	for _, reference := range references {
-		result, err := m.warmOne(ctx, reference, architecture, options)
-		if err != nil {
-			result.Ref = reference
-			result.Error = err.Error()
-			if result.Outcome == "" {
-				result.Outcome = WarmOutcomeFailedMissing
-			}
-			summary.Results = append(summary.Results, result)
-			summary.Failed++
-			if result.Outcome == WarmOutcomeFailedRevalidate {
-				summary.FailedRevalidate++
-			} else {
-				summary.FailedMissing++
-			}
-			continue
-		}
-		summary.Results = append(summary.Results, result)
-		if result.ReResolvedTag {
-			summary.ReResolvedTags++
-		}
-		switch result.Outcome {
-		case WarmOutcomeAlreadyComplete:
-			summary.AlreadyComplete++
-		default:
-			summary.Warmed++
+	for i := range references {
+		result := <-done[i]
+		summary.add(result)
+		if options.OnResult != nil {
+			options.OnResult(result)
 		}
 	}
 	return summary, nil
 }
 
-func (m *Manager) warmOne(ctx context.Context, reference string, architecture imagecache.Architecture, options WarmOptions) (WarmResult, error) {
+func finishedWarmResult(reference string, result WarmResult, err error) WarmResult {
+	if err != nil {
+		result.Ref = reference
+		result.Error = err.Error()
+		if result.Outcome == "" {
+			result.Outcome = WarmOutcomeFailedMissing
+		}
+	}
+	return result
+}
+
+func (s *WarmSummary) add(result WarmResult) {
+	s.Results = append(s.Results, result)
+	if result.Error != "" {
+		s.Failed++
+		if result.Outcome == WarmOutcomeFailedRevalidate {
+			s.FailedRevalidate++
+		} else {
+			s.FailedMissing++
+		}
+		return
+	}
+	if result.ReResolvedTag {
+		s.ReResolvedTags++
+	}
+	switch result.Outcome {
+	case WarmOutcomeAlreadyComplete:
+		s.AlreadyComplete++
+	default:
+		s.Warmed++
+	}
+}
+
+func (m *Manager) warmOne(ctx context.Context, reference string, architecture imagecache.Architecture, options WarmOptions, pool *warmPool) (WarmResult, error) {
 	parsed, err := parseWarmReference(reference)
 	if err != nil {
 		return WarmResult{Outcome: WarmOutcomeFailedMissing}, err
 	}
 	if !isDigestReference(parsed.listedRef) {
-		m.warmTagMu.Lock()
-		defer m.warmTagMu.Unlock()
+		// the same tag resolved and published by two warms at once must not
+		// interleave; other tags are unrelated and run alongside
+		unlock, err := m.warmTagLocks.lock(ctx, parsed.upstream+"/"+parsed.repository+":"+parsed.listedRef)
+		if err != nil {
+			return WarmResult{Outcome: WarmOutcomeFailedMissing}, err
+		}
+		defer unlock()
 	}
 	authority, err := parseUpstreamAuthority(parsed.upstream)
 	if err != nil {
@@ -113,10 +161,7 @@ func (m *Manager) warmOne(ctx context.Context, reference string, architecture im
 		return WarmResult{Ref: reference, AlreadyComplete: true, Outcome: WarmOutcomeAlreadyComplete}, nil
 	}
 
-	handler := m.handlerForUpstream(authority)
-	m.mu.Lock()
-	server = m.dynamicServers[authority.cacheKey]
-	m.mu.Unlock()
+	handler, server := m.handlerAndServerForUpstream(authority)
 	if server == nil {
 		return failedWarmResult(before), fmt.Errorf("warm server for %q unavailable", parsed.upstream)
 	}
@@ -152,7 +197,7 @@ func (m *Manager) warmOne(ctx context.Context, reference string, architecture im
 	staged.metadata.DockerContentDigest = digest
 	seenManifests[digest] = true
 
-	if err := warmManifestGraph(ctx, handler, server, parsed.repository, body, string(architecture), seenManifests, map[string]bool{}, seenBlobs, &result); err != nil {
+	if err := warmManifestGraph(ctx, handler, server, parsed.repository, body, string(architecture), seenManifests, map[string]bool{}, seenBlobs, &result, pool); err != nil {
 		return failedWarmResult(before), err
 	}
 	if len(body) == 0 {
@@ -160,6 +205,14 @@ func (m *Manager) warmOne(ctx context.Context, reference string, architecture im
 	}
 	metadata := staged.metadata
 	metadata.DockerContentDigest = digest
+	// a tag ref and a digest ref of the same image warm side by side and
+	// both publish this manifest: the inspect below must not read one while
+	// the other swaps the identical file in (#506)
+	unlockPublish, err := m.warmPublishLocks.lock(ctx, server.cacheDir+" "+digest)
+	if err != nil {
+		return failedWarmResult(before), err
+	}
+	defer unlockPublish()
 	if err := server.storeManifest(manifestRequestPath(parsed.repository, digest), metadata, body); err != nil {
 		return failedWarmResult(before), fmt.Errorf("publish digest manifest: %w", err)
 	}
@@ -192,12 +245,14 @@ func failedWarmResult(before CacheStatus) WarmResult {
 	return WarmResult{Outcome: WarmOutcomeFailedMissing}
 }
 
-func warmManifestGraph(ctx context.Context, handler http.Handler, server *Server, repository string, body []byte, hostArch string, seenManifests, warmedHostManifests, seenBlobs map[string]bool, result *WarmResult) error {
+func warmManifestGraph(ctx context.Context, handler http.Handler, server *Server, repository string, body []byte, hostArch string, seenManifests, warmedHostManifests, seenBlobs map[string]bool, result *WarmResult, pool *warmPool) error {
 	kind, children, blobs, err := analyzeWarmManifest(body)
 	if err != nil {
 		return err
 	}
 	if kind == "manifest" {
+		group := newWarmGroup(ctx)
+		downloading := false
 		for _, blob := range blobs {
 			if seenBlobs[blob] {
 				continue
@@ -206,9 +261,31 @@ func warmManifestGraph(ctx context.Context, handler http.Handler, server *Server
 			if blobCached(server, blob) {
 				continue
 			}
-			if err := warmBlobRequest(ctx, handler, repository, blob); err != nil {
-				return err
+			downloading = true
+			// refs warming side by side often share a base layer: one
+			// downloads it while the others wait here, holding no slot, and
+			// then find it cached. A sibling's failure ends the wait.
+			unlock, err := pool.inflight.lock(group.stopCtx, server.cacheDir+" "+blob)
+			if err != nil {
+				break
 			}
+			if blobCached(server, blob) {
+				unlock()
+				continue
+			}
+			started := group.start(pool, func(ctx context.Context) error {
+				defer unlock()
+				return warmBlobRequest(ctx, handler, repository, blob)
+			})
+			if !started {
+				unlock()
+				break
+			}
+		}
+		if err := group.wait(); err != nil {
+			return err
+		}
+		if downloading {
 			result.AlreadyComplete = false
 		}
 		return nil
@@ -236,7 +313,7 @@ func warmManifestGraph(ctx context.Context, handler http.Handler, server *Server
 	}
 	if !warmedHostManifests[selectedChild.Digest] {
 		warmedHostManifests[selectedChild.Digest] = true
-		if err := warmManifestGraph(ctx, handler, server, repository, childBody, hostArch, seenManifests, warmedHostManifests, seenBlobs, result); err != nil {
+		if err := warmManifestGraph(ctx, handler, server, repository, childBody, hostArch, seenManifests, warmedHostManifests, seenBlobs, result, pool); err != nil {
 			return err
 		}
 	}

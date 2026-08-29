@@ -276,28 +276,32 @@ func cacheWarmResult(summary mirror.WarmSummary) CacheWarmResult {
 		Entries:          make([]CacheWarmEntry, 0, len(summary.Results)),
 	}
 	for _, entry := range summary.Results {
-		var status CacheWarmStatus
-		switch entry.Outcome {
-		case mirror.WarmOutcomeWarmed:
-			status = CacheWarmStatusWarmed
-		case mirror.WarmOutcomeAlreadyComplete:
-			status = CacheWarmStatusAlreadyComplete
-		case mirror.WarmOutcomeFailedMissing:
-			status = CacheWarmStatusFailedMissing
-		case mirror.WarmOutcomeFailedRevalidate:
-			status = CacheWarmStatusFailedRevalidate
-		default:
-			status = CacheWarmStatusFailed
-		}
-		result.Entries = append(result.Entries, CacheWarmEntry{
-			Ref:            entry.Ref,
-			Status:         status,
-			Reason:         entry.Error,
-			RefreshWarning: entry.RefreshWarning,
-			ReResolvedTag:  entry.ReResolvedTag,
-		})
+		result.Entries = append(result.Entries, cacheWarmEntry(entry))
 	}
 	return result
+}
+
+func cacheWarmEntry(entry mirror.WarmResult) CacheWarmEntry {
+	var status CacheWarmStatus
+	switch entry.Outcome {
+	case mirror.WarmOutcomeWarmed:
+		status = CacheWarmStatusWarmed
+	case mirror.WarmOutcomeAlreadyComplete:
+		status = CacheWarmStatusAlreadyComplete
+	case mirror.WarmOutcomeFailedMissing:
+		status = CacheWarmStatusFailedMissing
+	case mirror.WarmOutcomeFailedRevalidate:
+		status = CacheWarmStatusFailedRevalidate
+	default:
+		status = CacheWarmStatusFailed
+	}
+	return CacheWarmEntry{
+		Ref:            entry.Ref,
+		Status:         status,
+		Reason:         entry.Error,
+		RefreshWarning: entry.RefreshWarning,
+		ReResolvedTag:  entry.ReResolvedTag,
+	}
 }
 
 // Listen creates the daemon socket, replacing it only when it is stale.
@@ -908,7 +912,7 @@ func (s *Server) handle(request Request, progress stageFunc) (any, error) {
 	case "cache.pull":
 		return s.pullCache(request.Args)
 	case "cache.warm":
-		return s.warmMirrorCache(request.Args)
+		return s.warmMirrorCache(request.Args, progress)
 	case "cache.check":
 		return s.checkMirrorCache(request.Args)
 	case "cache.list":

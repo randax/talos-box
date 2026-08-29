@@ -112,6 +112,10 @@ func (s *Server) negotiateToken(ctx context.Context, challenge bearerChallenge, 
 		query.Set("scope", scope)
 	}
 	realm.RawQuery = query.Encode()
+	// the token body is small, so the same silence bound as a fetch's body
+	// is a generous whole-exchange bound here (#506)
+	ctx, cancel := context.WithTimeout(ctx, upstreamStallTimeout)
+	defer cancel()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, realm.String(), nil)
 	if err != nil {
 		return "", err
@@ -375,8 +379,10 @@ func (s *Server) doPlainRequest(request *http.Request, policy requestPolicy) (*h
 // fetch prepares a guest request for the configured upstream. The caller
 // chooses whether bounded retries are appropriate for this request path.
 func (s *Server) fetch(r *http.Request, policy requestPolicy) (*http.Response, error) {
-	request, err := http.NewRequestWithContext(r.Context(), r.Method, s.base+r.URL.RequestURI(), nil)
+	ctx, cancel := context.WithCancel(r.Context())
+	request, err := http.NewRequestWithContext(ctx, r.Method, s.base+r.URL.RequestURI(), nil)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	for _, header := range []string{"Accept", "Range"} {
@@ -384,5 +390,38 @@ func (s *Server) fetch(r *http.Request, policy requestPolicy) (*http.Response, e
 			request.Header.Set(header, value)
 		}
 	}
-	return s.doRegistryRequest(request, policy)
+	resp, err := s.doRegistryRequest(request, policy)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	resp.Body = newStallBody(resp.Body, cancel, upstreamStallTimeout)
+	return resp, nil
+}
+
+// stallBody cancels its request when no bytes arrive for `timeout`, and on
+// Close, so a body that stops mid-layer fails instead of holding a slot.
+type stallBody struct {
+	io.ReadCloser
+	timer  *time.Timer
+	cancel context.CancelFunc
+}
+
+func newStallBody(body io.ReadCloser, cancel context.CancelFunc, timeout time.Duration) *stallBody {
+	return &stallBody{ReadCloser: body, timer: time.AfterFunc(timeout, cancel), cancel: cancel}
+}
+
+func (b *stallBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if n > 0 {
+		b.timer.Reset(upstreamStallTimeout)
+	}
+	return n, err
+}
+
+func (b *stallBody) Close() error {
+	b.timer.Stop()
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
 }
