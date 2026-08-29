@@ -46,8 +46,8 @@ talosctl patch mc -p @guest-memory.yaml --nodes <node-ip>
 ```
 
 The kubelet reservation and eviction threshold reduce memory visible to workloads, which is
-material on small guests. To keep the reclaim sysctls but leave kubelet schedulable memory
-unchanged, omit the entire `machine.kubelet` block. On the curated path, set
+material on small guests; the curated path applies them only to nodes with at least 2 GiB. To
+keep the reclaim sysctls but leave kubelet schedulable memory unchanged, omit the entire `machine.kubelet` block. On the curated path, set
 `kubeletMemoryProtection: false` on the cluster instead; this field requires a curated `cni:`.
 
 ## Disable virtio ballooning

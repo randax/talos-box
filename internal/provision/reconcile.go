@@ -565,6 +565,12 @@ func setDefault(values map[string]any, key string, value any) {
 	}
 }
 
+// kubeletMemoryProtectionMinMiB is the smallest node the kubelet eviction and
+// reservation defaults apply to: 512Mi reserved plus a 300Mi threshold would
+// leave a 1 GiB node with almost nothing schedulable, so smaller nodes keep
+// the reclaim sysctls only.
+const kubeletMemoryProtectionMinMiB = 2048
+
 func withReclaimProtection(config []byte, memoryMiB int, kubeletEnabled bool) ([]byte, error) {
 	var document map[string]any
 	if err := yaml.Unmarshal(config, &document); err != nil {
@@ -582,7 +588,7 @@ func withReclaimProtection(config []byte, memoryMiB int, kubeletEnabled bool) ([
 	setDefault(sysctls, "vm.watermark_scale_factor", "200")
 	setDefault(sysctls, "vm.vfs_cache_pressure", "50")
 
-	if kubeletEnabled {
+	if kubeletEnabled && memoryMiB >= kubeletMemoryProtectionMinMiB {
 		kubelet, err := mapping(machineSection, "kubelet")
 		if err != nil {
 			return nil, err

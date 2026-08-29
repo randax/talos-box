@@ -460,9 +460,10 @@ clusters:
 **Guest-memory protection semantics.** Curated provisioning adds reclaim-oriented sysctls to
 every generated machine config. It scales `vm.min_free_kbytes` from each role's memory at
 32 KiB per MiB, clamped to 16,384–262,144 KiB, and defaults
-`vm.watermark_scale_factor` to `200` and `vm.vfs_cache_pressure` to `50`. It also defaults
-kubelet's hard `memory.available` eviction threshold to `300Mi` and its system memory
-reservation to `512Mi`. User-supplied values win and unrelated settings are preserved.
+`vm.watermark_scale_factor` to `200` and `vm.vfs_cache_pressure` to `50`. On nodes with at least
+2 GiB it also defaults kubelet's hard `memory.available` eviction threshold to `300Mi` and its
+system memory reservation to `512Mi`; smaller nodes keep the sysctls only, since that
+reservation would leave them almost nothing schedulable. User-supplied values win and unrelated settings are preserved.
 `kubeletMemoryProtection: false` omits only those kubelet eviction and reservation defaults;
 the reclaim sysctls still apply. Unlike `hubble`, the setting is baked into machine config at
 node creation: changing it in `talosbox.yaml` is persisted by `tbx up` and shapes nodes added

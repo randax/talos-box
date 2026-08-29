@@ -105,6 +105,31 @@ func TestGeneratedConfigAllowsKubeletMemoryProtectionOptOut(t *testing.T) {
 	}
 }
 
+func TestGeneratedConfigSkipsKubeletMemoryProtectionOnSmallNodes(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item := cluster.Cluster{
+		Name:               "small-node",
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, LB: true},
+		NodeDefaults:       cluster.NodeDefaults{MemoryMiB: 1024}, Nodes: []cluster.Node{{Name: "cp-1", Role: cluster.RoleControlPlane, IP: "172.30.0.2"}},
+	}
+	result, err := generateMachineConfigs(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	machine := generatedMachineSettings(t, result.configs[cluster.RoleControlPlane])
+	if got := machine["sysctls"].(map[string]any)["vm.min_free_kbytes"]; got != "32768" {
+		t.Fatalf("vm.min_free_kbytes = %v, want 32768 on a 1 GiB node", got)
+	}
+	if extra, ok := machine["kubelet"].(map[string]any)["extraConfig"].(map[string]any); ok {
+		if _, found := extra["evictionHard"]; found {
+			t.Fatalf("1 GiB node received kubelet eviction defaults: %+v", extra)
+		}
+		if _, found := extra["systemReserved"]; found {
+			t.Fatalf("1 GiB node received kubelet reservation defaults: %+v", extra)
+		}
+	}
+}
+
 func TestReclaimDefaultsDoNotClobberExistingMachineSettings(t *testing.T) {
 	input := []byte(`machine:
   sysctls:
