@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -132,12 +133,8 @@ func TestRunDoctorFallsBackWhenDaemonReportsNoHypervisorInventory(t *testing.T) 
 func TestRunDoctorHypervisorInventoryFallsBackWhenDaemonStalls(t *testing.T) {
 	t.Parallel()
 	deps := hypervisorDoctorDependencies()
-	release := make(chan struct{})
-	t.Cleanup(func() { close(release) })
-	deps.daemonInfo = func() (daemon.Info, error) {
-		<-release
-		return daemon.Info{}, nil
-	}
+	// doctorCall's silence bound surfaces a stalled daemon as a timeout error
+	deps.daemonInfo = func() (daemon.Info, error) { return daemon.Info{}, os.ErrDeadlineExceeded }
 	deps.hypervisors = func(context.Context) hypervisor.Registry {
 		return hypervisor.Registry{
 			Backends: map[hypervisor.Name]hypervisor.Backend{
@@ -158,7 +155,7 @@ func TestRunDoctorHypervisorInventoryFallsBackWhenDaemonStalls(t *testing.T) {
 	if elapsed := time.Since(started); elapsed > 2*hypervisorProbeTimeout {
 		t.Fatalf("doctor took %v with a stalled daemon; the timeout must be paid once, not per finding", elapsed)
 	}
-	if !strings.Contains(output.String(), "probed locally; daemon info unavailable: context deadline exceeded") {
+	if !strings.Contains(output.String(), "probed locally; daemon info unavailable: i/o timeout") {
 		t.Fatalf("doctor output missing stalled-daemon wording:\n%s", output.String())
 	}
 }

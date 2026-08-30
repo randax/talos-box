@@ -75,10 +75,13 @@ func stoppedNodeHint(clusterName string) string {
 	return fmt.Sprintf("the cluster reconverges without it; watch it with: tbx status %s", shellquote.Quote(clusterName))
 }
 
-// opWaitNarrationInterval is how often a request queued behind the daemon's
-// operation lock repeats that it is still waiting. It is a var only so tests
-// can shorten it.
-var opWaitNarrationInterval = 30 * time.Second
+// OpWaitNarrationInterval is how often a request queued behind the daemon's
+// operation lock repeats that it is still waiting. Exported so a client's
+// silence bound can be sized to outlast the heartbeat (doctor does).
+const OpWaitNarrationInterval = 30 * time.Second
+
+// opWaitNarrationInterval is the live value; a var only so tests can shorten it.
+var opWaitNarrationInterval = OpWaitNarrationInterval
 
 // clusterStages narrates on behalf of one cluster inside a multi-cluster pass,
 // naming it on every line so an operator watching an `up` can tell whose image

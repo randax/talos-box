@@ -116,3 +116,49 @@ func TestDoctorCallWaitsForNarratedSlowDaemon(t *testing.T) {
 		t.Fatalf("statuses = %+v, want the daemon's answer", statuses)
 	}
 }
+
+// Once one diagnostic has found the daemon silent, the rest must not each
+// wait out the bound again: the report pays for the stall once.
+func TestDoctorCallerFailsFastAfterSilence(t *testing.T) {
+	t.Setenv("HOME", shortTestHome(t))
+	socketPath, err := daemon.SocketPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+	go func() {
+		for {
+			connection, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() { <-t.Context().Done(); _ = connection.Close() }()
+		}
+	}()
+
+	previous := doctorCallTimeout
+	doctorCallTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { doctorCallTimeout = previous })
+
+	call := (cli{}).doctorCaller()
+	var summaries []daemon.ClusterSummary
+	if err := call("cluster.list", struct{}{}, &summaries); !isTimeout(err) {
+		t.Fatalf("first call error = %v, want a timeout", err)
+	}
+	started := time.Now()
+	var statuses []daemon.ClusterStatus
+	err = call("status", map[string]string{"cluster": ""}, &statuses)
+	if !isTimeout(err) {
+		t.Fatalf("second call error = %v, want the remembered timeout", err)
+	}
+	if elapsed := time.Since(started); elapsed > doctorCallTimeout/2 {
+		t.Fatalf("second call waited %v; it should fail fast after the first stall", elapsed)
+	}
+}

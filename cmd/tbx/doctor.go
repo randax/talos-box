@@ -171,10 +171,9 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		return errors.New("usage: tbx doctor")
 	}
 	if deps.daemonInfo != nil {
-		// One bounded daemon.info call feeds the balloon findings and the
-		// hypervisor inventory; a daemon that accepts the socket but never
-		// answers must not hang doctor past hypervisorProbeTimeout.
-		deps.daemonInfo = boundedOnce(deps.daemonInfo, hypervisorProbeTimeout)
+		// One daemon.info call feeds the balloon findings and the hypervisor
+		// inventory; its bound lives in doctorCall like every other diagnostic.
+		deps.daemonInfo = sync.OnceValues(deps.daemonInfo)
 		if deps.balloonReserveMiB == nil {
 			deps.balloonReserveMiB = func() (int, error) {
 				info, err := deps.daemonInfo()
@@ -747,40 +746,6 @@ func hypervisorFindings(inventory doctorHypervisorInventory) []doctorFinding {
 	return findings
 }
 
-// boundedOnce runs call at most once and hands every caller the same result.
-// The first caller waits up to timeout; a timeout is cached too, so a stalled
-// daemon costs doctor one wait, not one per finding.
-func boundedOnce[T any](call func() (T, error), timeout time.Duration) func() (T, error) {
-	type result struct {
-		value T
-		err   error
-	}
-	done := make(chan result, 1)
-	var start sync.Once
-	var mu sync.Mutex
-	var cached *result
-	return func() (T, error) {
-		start.Do(func() {
-			go func() {
-				value, err := call()
-				done <- result{value, err}
-			}()
-		})
-		mu.Lock()
-		defer mu.Unlock()
-		if cached == nil {
-			select {
-			case r := <-done:
-				cached = &r
-			case <-time.After(timeout):
-				var zero T
-				cached = &result{zero, context.DeadlineExceeded}
-			}
-		}
-		return cached.value, cached.err
-	}
-}
-
 func featureGate(status daemon.FeatureStatusInfo) string {
 	if status.Supported {
 		return "supported"
@@ -826,6 +791,7 @@ func isDaemonUnavailable(err error) bool {
 
 func (c cli) doctorDependencies() doctorDependencies {
 	command := execCombinedOutput
+	call := c.doctorCaller()
 	deps := doctorDependencies{
 		runtimeIdentity: c.collectRuntimeIdentity,
 		checkHelper:     checkHelper,
@@ -835,23 +801,23 @@ func (c cli) doctorDependencies() doctorDependencies {
 		listConfig:      cluster.List,
 		daemonInfo: func() (daemon.Info, error) {
 			var result daemon.Info
-			err := c.doctorCall("daemon.info", struct{}{}, &result)
+			err := call("daemon.info", struct{}{}, &result)
 			return result, err
 		},
 		hypervisors: hypervisor.NewAll,
 		listClusters: func() ([]daemon.ClusterSummary, error) {
 			var result []daemon.ClusterSummary
-			err := c.doctorCall("cluster.list", struct{}{}, &result)
+			err := call("cluster.list", struct{}{}, &result)
 			return result, err
 		},
 		getStatus: func() ([]daemon.ClusterStatus, error) {
 			var result []daemon.ClusterStatus
-			err := c.doctorCall("status", map[string]string{"cluster": ""}, &result)
+			err := call("status", map[string]string{"cluster": ""}, &result)
 			return result, err
 		},
 		listCache: func() (daemon.CacheListResult, error) {
 			var result daemon.CacheListResult
-			err := c.doctorCall("cache.list", struct{}{}, &result)
+			err := call("cache.list", struct{}{}, &result)
 			return result, err
 		},
 		// bounded like every other diagnostic subprocess: a stalled vm_stat
@@ -863,7 +829,7 @@ func (c cli) doctorDependencies() doctorDependencies {
 		},
 		mirrorOffline: func() (bool, error) {
 			var result daemon.MirrorOfflineStatus
-			err := c.doctorCall("mirror.offline.get", struct{}{}, &result)
+			err := call("mirror.offline.get", struct{}{}, &result)
 			return result.Enabled, err
 		},
 		hostPressure: func() (hostpressure.Snapshot, error) {
@@ -896,11 +862,35 @@ func (c cli) doctorDependencies() doctorDependencies {
 }
 
 // doctorCallTimeout bounds the daemon's silence on each diagnostic RPC, not
-// the RPC itself: doctor asks for narration, and a status walking many nodes
-// re-arms the deadline on every probe it reports, while a daemon that accepts
-// the socket and then says nothing surfaces as a finding instead of a hang
-// (#392 for the mechanism).
-var doctorCallTimeout = 10 * time.Second
+// the RPC itself: doctor asks for narration, so a status walking many nodes
+// re-arms the deadline on every probe it reports and a request queued behind
+// the operation lock re-arms it on every queue heartbeat — which is why the
+// bound must outlast that heartbeat. Only a daemon that accepts the socket
+// and then says nothing trips it (#392 for the mechanism).
+var doctorCallTimeout = 2 * daemon.OpWaitNarrationInterval
+
+// doctorCaller is doctorCall with memory: once the daemon has gone silent,
+// every later diagnostic fails fast with that error instead of each waiting
+// out doctorCallTimeout, so a stalled daemon costs the report one wait.
+func (c cli) doctorCaller() func(op string, args, destination any) error {
+	var mu sync.Mutex
+	var stalled error
+	return func(op string, args, destination any) error {
+		mu.Lock()
+		err := stalled
+		mu.Unlock()
+		if err != nil {
+			return err
+		}
+		err = c.doctorCall(op, args, destination)
+		if isTimeout(err) {
+			mu.Lock()
+			stalled = err
+			mu.Unlock()
+		}
+		return err
+	}
+}
 
 // doctorCall deliberately uses exchangeWithin directly instead of cli.call:
 // diagnostics must report an absent daemon as SKIP, not start one as a side

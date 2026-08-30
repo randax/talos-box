@@ -871,7 +871,7 @@ func (s *Server) clusterMutationLock(clusterName string) *sync.Mutex {
 // when the client asked for progress, so a client's silence deadline measures
 // a stalled daemon rather than the honest length of a many-node probe.
 func (s *Server) dispatchStatus(request Request, progress stageFunc) Response {
-	s.opMu.Lock()
+	s.lockOperation(progress)
 	data, err := s.handle(request, nil)
 	s.opMu.Unlock()
 	if err != nil {
