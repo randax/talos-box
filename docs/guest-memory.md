@@ -71,8 +71,9 @@ run, the provision-start gate credits no reclaimable memory, and `tbx doctor` pr
 memory: a cluster suspended with the balloon (or without it) cannot be resumed into guests
 built the other way, so `tbx cluster resume` cold-boots those nodes with a warning and discards
 their saves. Resume before changing the setting if the saved memory matters. This is the recommended
-setting on hosts with plenty of RAM, and the first thing to try if the host itself panics
-during cluster teardown (see [macOS notes](macos.md) and #513).
+setting on hosts with plenty of RAM. (It was once suggested for the `Kernel tag check
+fault` host panics of #513; those turned out to be an unrelated macOS content-filter
+bug the flag does not prevent — see [macOS kernel panics](macos-panics.md).)
 
 ### Per-image: blacklist the guest driver
 

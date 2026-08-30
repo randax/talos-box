@@ -1,0 +1,95 @@
+//go:build darwin
+
+package main
+
+import (
+	"errors"
+	"strings"
+	"testing"
+)
+
+// fakeSecurityHost answers the two probes securityInventoryFindings makes:
+// the system-extension listing and the MTE capability sysctl.
+func fakeSecurityHost(t *testing.T, extensionList string, mte string, mteErr error) commandOutput {
+	t.Helper()
+	return func(name string, args ...string) ([]byte, error) {
+		switch {
+		case strings.HasSuffix(name, "systemextensionsctl"):
+			return []byte(extensionList), nil
+		case strings.HasSuffix(name, "sysctl"):
+			if mteErr != nil {
+				return nil, mteErr
+			}
+			return []byte(mte + "\n"), nil
+		default:
+			t.Fatalf("unexpected command %s %v", name, args)
+			return nil, nil
+		}
+	}
+}
+
+const activatedGlobalProtect = "* * PXPZ95SK77 com.paloaltonetworks.GlobalProtect.client.extension (6.2.5/6.2.5) GlobalProtect [activated enabled]\n"
+
+// A content-filter system extension on a host whose silicon enforces memory
+// tagging is the #513 panic shape: closing a filtered TCP socket can take the
+// whole Mac down. Doctor must say so, as a WARN, naming the extension.
+func TestSecurityInventoryWarnsContentFilterOnMTEHost(t *testing.T) {
+	t.Parallel()
+
+	findings := securityInventoryFindings(fakeSecurityHost(t, activatedGlobalProtect, "1", nil))
+	var warn *doctorFinding
+	for i := range findings {
+		if findings[i].level == "WARN" {
+			warn = &findings[i]
+		}
+	}
+	if warn == nil {
+		t.Fatalf("findings = %+v, want a WARN panic-risk finding", findings)
+	}
+	if warn.check != "security-inventory" {
+		t.Fatalf("check = %q, want security-inventory", warn.check)
+	}
+	for _, want := range []string{"com.paloaltonetworks.GlobalProtect.client.extension", "#513", "panic"} {
+		if !strings.Contains(warn.detail, want) {
+			t.Fatalf("detail %q does not mention %q", warn.detail, want)
+		}
+	}
+}
+
+// The same filter on silicon without memory tagging cannot panic the host, so
+// the risk line stays absent and the inventory remains informational.
+func TestSecurityInventoryNoPanicRiskWithoutMTE(t *testing.T) {
+	t.Parallel()
+
+	findings := securityInventoryFindings(fakeSecurityHost(t, activatedGlobalProtect, "0", nil))
+	for _, finding := range findings {
+		if finding.level != "INFO" {
+			t.Fatalf("finding %+v, want INFO only without MTE", finding)
+		}
+	}
+}
+
+// An MTE host with no content-filter-class extension has no #513 exposure.
+func TestSecurityInventoryNoPanicRiskWithoutFilter(t *testing.T) {
+	t.Parallel()
+
+	tailscaleOnly := "* * XYZ1234567 com.tailscale.ipn.macsys.network-extension (1.66/1.66) Tailscale [activated enabled]\n"
+	findings := securityInventoryFindings(fakeSecurityHost(t, tailscaleOnly, "1", nil))
+	for _, finding := range findings {
+		if finding.level != "INFO" {
+			t.Fatalf("finding %+v, want INFO only without a content filter", finding)
+		}
+	}
+}
+
+// A failed capability probe is silence, not a guess: no WARN on unknown MTE.
+func TestSecurityInventoryNoPanicRiskWhenMTEUnknown(t *testing.T) {
+	t.Parallel()
+
+	findings := securityInventoryFindings(fakeSecurityHost(t, activatedGlobalProtect, "", errors.New("sysctl unavailable")))
+	for _, finding := range findings {
+		if finding.level != "INFO" {
+			t.Fatalf("finding %+v, want INFO only when MTE capability is unknown", finding)
+		}
+	}
+}
