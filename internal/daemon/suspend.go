@@ -429,18 +429,39 @@ func resumeNodeBatch[T any](nodes []T, resume func(T) (resumedNode, error), roll
 			warnings = append(warnings, result.warning)
 		}
 	}
-	removeSaveStateFiles(savePaths)
+	warnings = append(warnings, removeSaveStateFiles(savePaths)...)
 	return warnings, restored, nil
 }
 
 // removeSaveStateFiles commits a successful cluster-wide resume. Callers keep
 // the batch intact on rollback so a later resume can retry every saved node.
-func removeSaveStateFiles(paths []string) {
+// It returns one warning per balloon marker that could not be cleared: the
+// resume itself succeeded, but the next suspend of that node will refuse to
+// save over the stale marker until it is removed.
+func removeSaveStateFiles(paths []string) []string {
+	var warnings []string
 	for _, path := range paths {
 		_ = os.Remove(path)
 		_ = os.Remove(saveStateOwnerPath(path))
-		removeSaveStateBalloonMarker(path)
+		if err := removeSaveStateBalloonMarker(path); err != nil {
+			warnings = append(warnings, staleBalloonMarkerWarning(nodeNameOfSave(path), err))
+		}
 	}
+	return warnings
+}
+
+// nodeNameOfSave recovers the node name from a save path.
+func nodeNameOfSave(savePath string) string {
+	return strings.TrimSuffix(filepath.Base(savePath), saveStateSuffix)
+}
+
+// staleBalloonMarkerWarning tells the operator that a marker outlived its
+// save, and what it will block.
+func staleBalloonMarkerWarning(nodeName string, err error) string {
+	return fmt.Sprintf(
+		"could not clear the balloon marker beside %s's discarded suspended memory: %v; the next suspend of that node will fail until %s is removed",
+		nodeName, err, saveStateBalloonSuffix,
+	)
 }
 
 // saveStateBalloonPath marks a save taken from a guest that had no balloon
@@ -466,13 +487,16 @@ func recordSaveStateBalloon(savePath string, disabled bool) error {
 }
 
 // removeSaveStateBalloonMarker drops the marker beside a save that is going
-// away. It cannot be best effort either: a marker that outlives its save would
-// stamp the next save at this path, so a failure is reported loudly.
-func removeSaveStateBalloonMarker(savePath string) {
+// away. It cannot be best effort either: a marker that outlives its save makes
+// the next suspend at this path refuse to save (recordSaveStateBalloon fails
+// to clear it), so the failure goes back to the caller to surface.
+func removeSaveStateBalloonMarker(savePath string) error {
 	marker := saveStateBalloonPath(savePath)
 	if err := os.Remove(marker); err != nil && !errors.Is(err, os.ErrNotExist) {
-		log.Printf("remove saved state balloon marker %s: %v (the next save here settles it again)", marker, err)
+		log.Printf("remove saved state balloon marker %s: %v", marker, err)
+		return err
 	}
+	return nil
 }
 
 func savedWithoutBalloon(savePath string) bool {
@@ -618,8 +642,12 @@ func discardSavedState(dir, nodeName string) (bool, string) {
 		return false, undiscardedSaveStateWarning(nodeName, err)
 	}
 	_ = os.Remove(saveStateOwnerPath(path))
-	removeSaveStateBalloonMarker(path)
 	log.Printf("discarded saved state %s: cold boot", path)
+	if err := removeSaveStateBalloonMarker(path); err != nil {
+		// the save is gone, so the cold boot stands; the marker is what the
+		// operator has to deal with before the next suspend
+		return true, staleBalloonMarkerWarning(nodeName, err)
+	}
 	return true, ""
 }
 
@@ -643,14 +671,15 @@ func discardClusterSavedStates(dir string) (bool, []string) {
 				continue
 			}
 			log.Printf("discard saved state %s: %v", path, err)
-			node := strings.TrimSuffix(filepath.Base(path), saveStateSuffix)
-			failures = append(failures, undiscardedSaveStateWarning(node, err))
+			failures = append(failures, undiscardedSaveStateWarning(nodeNameOfSave(path), err))
 			continue
 		}
 		_ = os.Remove(saveStateOwnerPath(path))
-		removeSaveStateBalloonMarker(path)
 		log.Printf("discarded saved state %s: disks were replaced", path)
 		discarded = true
+		if err := removeSaveStateBalloonMarker(path); err != nil {
+			failures = append(failures, staleBalloonMarkerWarning(nodeNameOfSave(path), err))
+		}
 	}
 	return discarded, failures
 }
