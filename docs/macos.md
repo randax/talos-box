@@ -1,7 +1,8 @@
 # macOS host setup
 
-talosbox runs Talos guests on Apple Silicon through Virtualization.framework. The unprivileged
-`tbxd` daemon owns the VMs, while a root launchd `tbx-helper` daemon owns the small set of host
+talosbox runs Talos guests on Apple Silicon through Virtualization.framework. VZ is the
+zero-install default on Apple Silicon; QEMU/HVF is optional and best-effort. The unprivileged `tbxd`
+daemon owns the VMs, while a root launchd `tbx-helper` daemon owns the small set of host
 operations that require privilege: vmnet attachments, `/etc/resolver` files, IP forwarding, and
 route injection.
 
@@ -22,11 +23,12 @@ build through `make build` rather than a bare `go build`.
 |---|---|---|
 | Apple Silicon (M1 or newer), macOS 14+ | Tier one | The validated development and workshop target |
 | Apple Silicon, macOS 13 | Unsupported | Suspend/resume and the current Virtualization.framework surface need macOS 14 |
-| Intel Macs | Unsupported | talosbox does not emulate; the guest architecture must match the host |
+| Intel Macs | Best effort | Community-verified only; talosbox does not emulate, and the guest architecture must match the host |
 
 macOS requires:
 
-- an Apple Silicon Mac running macOS 14 or newer;
+- an Apple Silicon Mac running macOS 14 or newer for the default VZ path, or macOS 15+ for the
+  optional QEMU/HVF path; Intel Macs use QEMU/HVF and remain community-verified;
 - 16 GB RAM minimum for the default 1-control-plane + 2-worker topology;
 - 25 GB free on the volume holding `~/.talosbox` (node disks are 20 GB sparse);
 - the Xcode command line tools and [Go 1.26](https://go.dev/doc/install) for the source build;
@@ -36,8 +38,33 @@ macOS requires:
   helper call fails with a protocol mismatch naming the `system install` to rerun.
 
 Suspend/resume is capability-gated rather than version-gated here: memory is preserved while
-the same `tbxd` process stays alive, and a resume after a daemon restart warns and safely
-cold-boots because Virtualization.framework device identity cannot be reconstructed.
+the same `tbxd` process stays alive. VZ still warns and safely cold-boots after a daemon
+restart because Virtualization.framework device identity cannot be reconstructed, while QEMU
+retains its saved state across that restart.
+
+## Hypervisor selection
+
+VZ stays the zero-install default on Apple Silicon. `TBX_HYPERVISOR` selects QEMU only when you
+want the optional path; otherwise the compiled default stays in effect. The resolved choice is recorded on the
+cluster, so a cluster created as VZ stays VZ even if the daemon default changes later.
+
+QEMU/HVF is best effort on macOS. Homebrew QEMU needs macOS 15+ to expose HVF; install it with
+`brew install qemu`, or use the QEMU package from nixpkgs. The installed binary must retain the
+`com.apple.security.hypervisor` entitlement. QEMU still runs unprivileged on the helper-owned
+datagram FD that vmnet hands to the VM.
+
+```yaml
+clusters:
+  - name: demo
+    hypervisor: qemu
+```
+
+```sh
+TBX_HYPERVISOR=qemu tbx system restart --force
+```
+
+For a self-supervised launchd job, put `TBX_HYPERVISOR` in the job plist's
+`EnvironmentVariables` dictionary, then kickstart that job with `launchctl kickstart -k <domain>/<label>`.
 
 ## Install host dependencies
 
@@ -102,6 +129,21 @@ in this order:
 `FAIL` makes `tbx doctor` exit non-zero. `WARN` identifies a degraded but usable configuration,
 such as an inert guest-agent channel or filtered Image Factory egress. `INFO` lines
 (`security-inventory`) never affect the exit code.
+
+`tbx doctor` also prints an INFO `Hypervisors` section before the rest of the checks. Each line
+names one hypervisor, its availability, the current default source (`default=yes (source=compiled)`
+or `default=yes (source=TBX_HYPERVISOR)`), and the feature gates used by `tbx status`. The
+macOS QEMU hypervisor currently emits these availability/remediation pairs:
+
+- `qemu-system-<arch> was not found on PATH` -> `install QEMU: brew install qemu, then restart tbxd`
+- `QEMU does not list the hvf accelerator` -> `HVF not built in: Homebrew builds without HVF on macOS 14; upgrade to macOS 15+ and reinstall QEMU`
+- `HVF denied: kern.hv_support is not 1` -> `use a Mac with Hypervisor.framework support enabled`
+- `HVF denied: <binary> lacks com.apple.security.hypervisor` -> `install or reinstall a signed Homebrew/nixpkgs QEMU; do not re-sign it without the hypervisor entitlement`
+- `probe QEMU: <error>` -> `upgrade QEMU to 6.2 or newer: brew upgrade qemu, then restart tbxd`
+- `hypervisor feature unsupported: QEMU >= 6.2 is required (found <version>)` -> `upgrade QEMU to 6.2 or newer: brew upgrade qemu, then restart tbxd`
+- `hypervisor feature unsupported: QEMU <version> does not provide required machine type "<machine>"` -> `upgrade QEMU to 6.2 or newer: brew upgrade qemu, then restart tbxd`
+- `resolve QEMU binary path: <error>` -> `upgrade QEMU to 6.2 or newer: brew upgrade qemu, then restart tbxd`
+- `no matching EFI firmware pair found for <arch>` -> `reinstall QEMU so its edk2 firmware is present`
 
 ## macOS networking and ingress
 

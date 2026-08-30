@@ -1,8 +1,8 @@
 # Linux host setup
 
-talosbox runs Linux guests directly on QEMU/KVM. The unprivileged `tbxd` daemon owns QEMU,
-while a socket-activated `tbx-helper` service owns the small set of host-network operations
-that require capabilities.
+talosbox runs Linux guests directly on QEMU/KVM. QEMU is the only Linux hypervisor and the
+compiled default. The unprivileged `tbxd` daemon owns QEMU, while a socket-activated
+`tbx-helper` service owns the small set of host-network operations that require capabilities.
 
 ## Availability
 
@@ -41,6 +41,15 @@ does not use emulation as a fallback. Linux requires:
 
 Suspend/resume is the sole QEMU-version-gated feature. It requires QEMU 8.2 or newer; all
 other supported operations work on QEMU 6.2–8.1.
+
+## Hypervisor selection
+
+Linux accepts QEMU only. A portable `hypervisor: vz` cluster fails during resolution with
+`hypervisor feature unsupported: hypervisor "vz" is not registered`.
+
+`TBX_HYPERVISOR` reaches the transient daemon `tbx` starts because the client forwards it into
+the `systemd-run --user` service. A packaged or self-managed `tbxd.service` must set the
+variable in the unit environment instead, for example with `Environment=TBX_HYPERVISOR=qemu`.
 
 ## Install host dependencies
 

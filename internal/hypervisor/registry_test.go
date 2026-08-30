@@ -165,6 +165,52 @@ func TestRegistryResolveDefaultRejectsUnavailableDefault(t *testing.T) {
 	}
 }
 
+func TestRegistryResolveIncludesUnavailableReasonAndWrappedError(t *testing.T) {
+	t.Parallel()
+
+	inner := errors.New("exit status 1")
+	registry := Registry{Backends: map[Name]Backend{
+		NameQEMU: {Availability: Availability{
+			Reason: "QEMU does not list the hvf accelerator",
+			Err:    inner,
+		}},
+	}}
+
+	_, err := registry.Resolve(NameQEMU)
+	if !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("Resolve(qemu) error = %v, want ErrUnsupported", err)
+	}
+	if !errors.Is(err, inner) {
+		t.Fatalf("Resolve(qemu) error = %v, want wrapped %v", err, inner)
+	}
+	if !strings.Contains(err.Error(), "QEMU does not list the hvf accelerator") {
+		t.Fatalf("Resolve(qemu) error = %q, want availability reason", err)
+	}
+}
+
+func TestRegistryResolveAvoidsDuplicatingReasonWhenWrappedErrorMatches(t *testing.T) {
+	t.Parallel()
+
+	inner := errors.New("exit status 1")
+	registry := Registry{Backends: map[Name]Backend{
+		NameQEMU: {Availability: Availability{
+			Reason: inner.Error(),
+			Err:    inner,
+		}},
+	}}
+
+	_, err := registry.Resolve(NameQEMU)
+	if !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("Resolve(qemu) error = %v, want ErrUnsupported", err)
+	}
+	if !errors.Is(err, inner) {
+		t.Fatalf("Resolve(qemu) error = %v, want wrapped %v", err, inner)
+	}
+	if strings.Count(err.Error(), inner.Error()) != 1 {
+		t.Fatalf("Resolve(qemu) error = %q, expected inner message once", err)
+	}
+}
+
 func TestRegistryNamesAreSorted(t *testing.T) {
 	t.Parallel()
 

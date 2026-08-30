@@ -55,7 +55,7 @@ type doctorDependencies struct {
 	// prints a line, as INFO, so the operator's own choice never nags.
 	balloonDisabled func() (bool, error)
 	daemonInfo      func() (daemon.Info, error)
-	hypervisors     func(context.Context) hypervisor.Registry
+	hypervisors     func(context.Context) (hypervisor.Registry, error)
 	command         commandOutput
 	readFile        func(string) ([]byte, error)
 	accessRW        func(string) error
@@ -685,7 +685,10 @@ func doctorHypervisors(deps doctorDependencies) doctorHypervisorInventory {
 	}
 	probeCtx, probeCancel := context.WithTimeout(context.Background(), hypervisorProbeTimeout)
 	defer probeCancel()
-	registry := deps.hypervisors(probeCtx)
+	registry, probeErr := deps.hypervisors(probeCtx)
+	if probeErr != nil {
+		return doctorHypervisorInventory{err: probeErr}
+	}
 	items := make([]daemon.HypervisorInfo, 0, len(registry.Backends))
 	for _, name := range registry.Names() {
 		entry := registry.Backends[name]
@@ -812,7 +815,7 @@ func (c cli) doctorDependencies() doctorDependencies {
 			err := call("daemon.info", struct{}{}, &result)
 			return result, err
 		},
-		hypervisors: hypervisor.NewAll,
+		hypervisors: hypervisor.NewAllFromEnvironment,
 		listClusters: func() ([]daemon.ClusterSummary, error) {
 			var result []daemon.ClusterSummary
 			err := call("cluster.list", struct{}{}, &result)

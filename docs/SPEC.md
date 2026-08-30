@@ -438,6 +438,7 @@ clusters:
   - name: demo
     controlPlanes: 1
     workers: 2
+    hypervisor: qemu      # optional per-cluster hypervisor: vz | qemu
     talos: {}              # optional per-cluster override of the file-level talos
                            # block; unset fields inherit, set fields override,
                            # extension lists override (extensions: [] = none)
@@ -471,6 +472,13 @@ afterwards, but already-configured nodes are not re-patched (use `talosctl patch
 without a curated `cni:`. Substrate-only users own their machine config and can apply the same
 policy manually; [Guest memory and reclaim](guest-memory.md) documents the patch, trade-offs,
 and the bring-your-own-schematic balloon opt-out.
+
+**Hypervisor selection.** Cluster `hypervisor` overrides `TBX_HYPERVISOR`, which overrides the
+compiled default. The daemon stores the resolved choice in cluster state when a cluster is
+created; an empty legacy state value means the platform's compiled default, not the current
+environment-selected default. `tbx up` refuses drift with `cluster "<name>": hypervisor is
+immutable (cluster has "<old>", talosbox.yaml wants "<new>"); destroy and recreate the cluster
+to change the hypervisor`. `tbx status` reports the resolved choice in its `HYPERVISOR` column.
 
 **Curated CSI semantics.** `csi:` is a flat scalar and rejects any value without a curated
 `cni:` before anything mutates. Longhorn (pinned v1-series) is the multinode engine; local-path
@@ -510,8 +518,8 @@ too (§7).
 
 ## 10. Guided output
 
-`tbx status` is **state-aware**: alongside nodes/IPs/DNS names/LB pool/BGP state and the
-storage phase (provisioning → live, gated by the write/readback probe, §9) it appends
+`tbx status` is **state-aware**: alongside nodes/IPs/DNS names/hypervisor/LB pool/BGP state and
+the storage phase (provisioning → live, gated by the write/readback probe, §9) it appends
 copy-pasteable next-step hints keyed to observed state (maintenance node → the
 `talosctl --insecure` probe; provisioned clusters report convergence progress and the
 recovery that actually applies — a safe `tbx up` rerun for clusters a `talosbox.yaml` backs,
@@ -532,6 +540,12 @@ distinct from the per-phase budgets the daemon narrates (`CNI budget`, `CNI+stor
 The CLI stops waiting once that bound plus a grace passes **without any sign of life**: a
 narrated call re-arms the wait on every stage the daemon sends, so only a gate that goes silent
 fails the verb instead of hanging it.
+
+`tbx doctor` also prints an INFO `Hypervisors` section before the rest of the checks. Each line
+names one hypervisor, its availability, the current default source (`default=yes (source=compiled)`
+or `default=yes (source=TBX_HYPERVISOR)`), and the feature gates used by `tbx status`. When a
+hypervisor is unavailable, the line carries its exact reason and, if the hypervisor supplied
+one, `remediation: <text>` inside the parentheses.
 
 **State-changing verbs narrate their stages.** `cluster create`, `snapshot create|restore`,
 `node add|remove` and `node start|stop` stream the daemon's stages to stderr as the work

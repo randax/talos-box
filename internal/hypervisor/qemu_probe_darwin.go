@@ -22,6 +22,7 @@ const (
 	qemuDarwinHostRemediation        = "use a Mac with Hypervisor.framework support enabled"
 	qemuDarwinEntitlementRemediation = "install or reinstall a signed Homebrew/nixpkgs QEMU; do not re-sign it without the hypervisor entitlement"
 	qemuDarwinFirmwareRemediation    = "reinstall QEMU so its edk2 firmware is present"
+	qemuDarwinUpgradeRemediation     = "upgrade QEMU to 6.2 or newer: brew upgrade qemu, then restart tbxd"
 )
 
 type qemuDarwinProbeDeps struct {
@@ -32,6 +33,7 @@ type qemuDarwinProbeDeps struct {
 	probe        func(context.Context, string, qemuPeerVerifier) (qemuProbe, error)
 	evalSymlinks func(string) (string, error)
 	homeDir      func() (string, error)
+	user         func() string
 	fs           qemuFS
 }
 
@@ -48,6 +50,7 @@ func defaultQEMUDarwinProbeDeps() qemuDarwinProbeDeps {
 		probe:        probeQEMU,
 		evalSymlinks: filepath.EvalSymlinks,
 		homeDir:      os.UserHomeDir,
+		user:         func() string { return os.Getenv("USER") },
 		fs:           osQEMUFS{},
 	}
 }
@@ -57,12 +60,16 @@ func probeDarwinQEMUAccelerator(ctx context.Context, binary string, command qemu
 	if err != nil {
 		return false, err
 	}
+	return hasDarwinQEMUAccelerator(output, "hvf"), nil
+}
+
+func hasDarwinQEMUAccelerator(output []byte, accelerator string) bool {
 	for _, line := range strings.Split(string(output), "\n") {
-		if strings.TrimSpace(line) == "hvf" {
-			return true, nil
+		if strings.TrimSpace(line) == accelerator {
+			return true
 		}
 	}
-	return false, nil
+	return false
 }
 
 func runQEMUDarwinCommand(ctx context.Context, name string, args ...string) ([]byte, error) {

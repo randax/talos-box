@@ -85,7 +85,7 @@ func TestRunDoctorReportsHypervisorsWithDaemonDown(t *testing.T) {
 	deps.daemonInfo = func() (daemon.Info, error) {
 		return daemon.Info{}, dialError{err: errors.New("connection refused")}
 	}
-	deps.hypervisors = func(context.Context) hypervisor.Registry {
+	deps.hypervisors = func(context.Context) (hypervisor.Registry, error) {
 		return hypervisor.Registry{
 			Backends: map[hypervisor.Name]hypervisor.Backend{
 				"primary": {
@@ -94,7 +94,7 @@ func TestRunDoctorReportsHypervisorsWithDaemonDown(t *testing.T) {
 				},
 			},
 			Default: hypervisor.Default{Name: "primary", Source: hypervisor.DefaultSourceCompiled},
-		}
+		}, nil
 	}
 	deps.listConfig = func() ([]cluster.Cluster, error) {
 		return []cluster.Cluster{{Name: "demo", TalosExtensions: []string{"qemu-guest-agent"}}}, nil
@@ -116,11 +116,57 @@ func TestRunDoctorReportsHypervisorsWithDaemonDown(t *testing.T) {
 	}
 }
 
+func TestRunDoctorLocalFallbackUsesEnvironmentHypervisorDefault(t *testing.T) {
+	t.Parallel()
+	deps := hypervisorDoctorDependencies()
+	deps.daemonInfo = func() (daemon.Info, error) {
+		return daemon.Info{}, dialError{err: errors.New("connection refused")}
+	}
+	deps.hypervisors = func(context.Context) (hypervisor.Registry, error) {
+		return hypervisor.Registry{
+			Backends: map[hypervisor.Name]hypervisor.Backend{
+				hypervisor.NameVZ:   {Hypervisor: doctorTestHypervisor{}, Availability: hypervisor.Availability{Available: true}},
+				hypervisor.NameQEMU: {Hypervisor: doctorTestHypervisor{}, Availability: hypervisor.Availability{Available: true}},
+			},
+			Default:         hypervisor.Default{Name: hypervisor.NameQEMU, Source: hypervisor.DefaultSourceEnvironment},
+			CompiledDefault: hypervisor.NameVZ,
+		}, nil
+	}
+
+	var output strings.Builder
+	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "qemu: availability=available; default=yes (source=TBX_HYPERVISOR)") {
+		t.Fatalf("doctor output missing environment-selected local default:\n%s", output.String())
+	}
+}
+
+func TestRunDoctorLocalFallbackReportsInvalidEnvironment(t *testing.T) {
+	t.Parallel()
+	deps := hypervisorDoctorDependencies()
+	deps.daemonInfo = func() (daemon.Info, error) {
+		return daemon.Info{}, dialError{err: errors.New("connection refused")}
+	}
+	deps.hypervisors = func(context.Context) (hypervisor.Registry, error) {
+		return hypervisor.Registry{}, errors.New(`TBX_HYPERVISOR: hypervisor must be one of vz | qemu (got "xen")`)
+	}
+
+	var output strings.Builder
+	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
+		t.Fatal(err)
+	}
+	want := `INFO Hypervisors: inventory unavailable: TBX_HYPERVISOR: hypervisor must be one of vz | qemu (got "xen")`
+	if !strings.Contains(output.String(), want) {
+		t.Fatalf("doctor output missing invalid environment error:\n%s", output.String())
+	}
+}
+
 func TestRunDoctorFallsBackWhenDaemonReportsNoHypervisorInventory(t *testing.T) {
 	t.Parallel()
 	deps := hypervisorDoctorDependencies()
 	deps.daemonInfo = func() (daemon.Info, error) { return daemon.Info{}, nil }
-	deps.hypervisors = func(context.Context) hypervisor.Registry {
+	deps.hypervisors = func(context.Context) (hypervisor.Registry, error) {
 		return hypervisor.Registry{
 			Backends: map[hypervisor.Name]hypervisor.Backend{
 				"primary": {
@@ -129,7 +175,7 @@ func TestRunDoctorFallsBackWhenDaemonReportsNoHypervisorInventory(t *testing.T) 
 				},
 			},
 			Default: hypervisor.Default{Name: "primary", Source: hypervisor.DefaultSourceCompiled},
-		}
+		}, nil
 	}
 	deps.listConfig = func() ([]cluster.Cluster, error) {
 		return []cluster.Cluster{{Name: "demo", TalosExtensions: []string{"qemu-guest-agent"}}}, nil
@@ -155,13 +201,13 @@ func TestRunDoctorHypervisorInventoryFallsBackWhenDaemonStalls(t *testing.T) {
 	deps := hypervisorDoctorDependencies()
 	// doctorCall's silence bound surfaces a stalled daemon as a timeout error
 	deps.daemonInfo = func() (daemon.Info, error) { return daemon.Info{}, os.ErrDeadlineExceeded }
-	deps.hypervisors = func(context.Context) hypervisor.Registry {
+	deps.hypervisors = func(context.Context) (hypervisor.Registry, error) {
 		return hypervisor.Registry{
 			Backends: map[hypervisor.Name]hypervisor.Backend{
 				"primary": {Hypervisor: doctorTestHypervisor{}, Availability: hypervisor.Availability{Available: true}},
 			},
 			Default: hypervisor.Default{Name: "primary", Source: hypervisor.DefaultSourceCompiled},
-		}
+		}, nil
 	}
 
 	started := time.Now()
@@ -211,13 +257,13 @@ func TestRunDoctorFallsBackOnDaemonInfoError(t *testing.T) {
 	t.Parallel()
 	deps := hypervisorDoctorDependencies()
 	deps.daemonInfo = func() (daemon.Info, error) { return daemon.Info{}, errors.New("protocol decode failed") }
-	deps.hypervisors = func(context.Context) hypervisor.Registry {
+	deps.hypervisors = func(context.Context) (hypervisor.Registry, error) {
 		return hypervisor.Registry{
 			Backends: map[hypervisor.Name]hypervisor.Backend{
 				"primary": {Hypervisor: doctorTestHypervisor{}, Availability: hypervisor.Availability{Available: true}},
 			},
 			Default: hypervisor.Default{Name: "primary", Source: hypervisor.DefaultSourceCompiled},
-		}
+		}, nil
 	}
 
 	var output strings.Builder
@@ -236,7 +282,7 @@ func TestRunDoctorHypervisorProbeIsBounded(t *testing.T) {
 		return daemon.Info{}, dialError{err: errors.New("connection refused")}
 	}
 	observedCancellation := make(chan struct{})
-	deps.hypervisors = func(ctx context.Context) hypervisor.Registry {
+	deps.hypervisors = func(ctx context.Context) (hypervisor.Registry, error) {
 		<-ctx.Done()
 		close(observedCancellation)
 		return hypervisor.Registry{
@@ -244,7 +290,7 @@ func TestRunDoctorHypervisorProbeIsBounded(t *testing.T) {
 				"primary": {Availability: hypervisor.Availability{Reason: ctx.Err().Error()}},
 			},
 			Default: hypervisor.Default{Name: "primary", Source: hypervisor.DefaultSourceCompiled},
-		}
+		}, nil
 	}
 
 	var output strings.Builder

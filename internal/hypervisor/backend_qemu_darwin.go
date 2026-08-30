@@ -5,9 +5,7 @@ package hypervisor
 import (
 	"context"
 	"fmt"
-	"os"
 	"runtime"
-	"strings"
 )
 
 func newQEMU(ctx context.Context) (Hypervisor, error) {
@@ -44,17 +42,17 @@ func newQEMUWith(ctx context.Context, deps qemuDarwinProbeDeps) (Hypervisor, err
 	}
 	probe, err := deps.probe(ctx, binary, verifyQMPPeerDarwin)
 	if err != nil {
-		return nil, fmt.Errorf("probe QEMU: %w", err)
+		return nil, newUnavailableError(fmt.Sprintf("probe QEMU: %v", err), qemuDarwinUpgradeRemediation, err)
 	}
 	if err := validateQEMUProbe(probe, system.Machine); err != nil {
-		return nil, err
+		return nil, newUnavailableError(err.Error(), qemuDarwinUpgradeRemediation, err)
 	}
 	resolvedBinary, err := deps.evalSymlinks(binary)
 	if err != nil {
-		return nil, fmt.Errorf("resolve QEMU binary path: %w", err)
+		return nil, newUnavailableError(fmt.Sprintf("resolve QEMU binary path: %v", err), qemuDarwinUpgradeRemediation, err)
 	}
 	homeDir, _ := deps.homeDir()
-	candidates := darwinQEMUFirmwareCandidates(resolvedBinary, homeDir, os.Getenv("USER"), architecture)
+	candidates := darwinQEMUFirmwareCandidates(resolvedBinary, homeDir, deps.user(), architecture)
 	firmware, err := discoverQEMUFirmware(deps.fs, architecture, candidates)
 	if err != nil {
 		reason := fmt.Sprintf("no matching EFI firmware pair found for %s", architecture)
@@ -76,13 +74,4 @@ func newQEMUWith(ctx context.Context, deps qemuDarwinProbeDeps) (Hypervisor, err
 		verifyPeer:   verifyQMPPeerDarwin,
 		saved:        make(map[string]*qemuMachine),
 	}, nil
-}
-
-func hasDarwinQEMUAccelerator(output []byte, accelerator string) bool {
-	for _, line := range strings.Split(string(output), "\n") {
-		if strings.TrimSpace(line) == accelerator {
-			return true
-		}
-	}
-	return false
 }

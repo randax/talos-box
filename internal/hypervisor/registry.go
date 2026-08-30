@@ -121,6 +121,9 @@ func (r Registry) Resolve(name Name) (Hypervisor, error) {
 			reason = "backend is unavailable"
 		}
 		if backend.Availability.Err != nil {
+			if reason != backend.Availability.Err.Error() {
+				return nil, fmt.Errorf("%w: hypervisor %q: %s: %w", ErrUnsupported, name, reason, backend.Availability.Err)
+			}
 			return nil, fmt.Errorf("%w: hypervisor %q: %w", ErrUnsupported, name, backend.Availability.Err)
 		}
 		return nil, fmt.Errorf("%w: hypervisor %q: %s", ErrUnsupported, name, reason)

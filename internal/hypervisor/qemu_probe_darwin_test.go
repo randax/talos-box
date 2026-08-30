@@ -65,6 +65,37 @@ func TestDarwinQEMUAvailabilityProbe(t *testing.T) {
 			wantRemediation: "install or reinstall a signed Homebrew/nixpkgs QEMU; do not re-sign it without the hypervisor entitlement",
 		},
 		{
+			name: "capability probe failed",
+			change: func(deps *qemuDarwinProbeDeps) {
+				deps.probe = func(context.Context, string, qemuPeerVerifier) (qemuProbe, error) {
+					return qemuProbe{}, probeErr
+				}
+			},
+			wantReason:      "probe QEMU: probe failed",
+			wantRemediation: "upgrade QEMU to 6.2 or newer: brew upgrade qemu, then restart tbxd",
+			wantWrapped:     probeErr,
+		},
+		{
+			name: "QEMU too old",
+			change: func(deps *qemuDarwinProbeDeps) {
+				deps.probe = func(context.Context, string, qemuPeerVerifier) (qemuProbe, error) {
+					return qemuProbe{Version: qemuVersion{Major: 6, Minor: 1}, Machines: []string{system.Machine}}, nil
+				}
+			},
+			wantReason:      "hypervisor feature unsupported: QEMU >= 6.2 is required (found 6.1.0)",
+			wantRemediation: "upgrade QEMU to 6.2 or newer: brew upgrade qemu, then restart tbxd",
+			wantWrapped:     ErrUnsupported,
+		},
+		{
+			name: "binary path resolution failed",
+			change: func(deps *qemuDarwinProbeDeps) {
+				deps.evalSymlinks = func(string) (string, error) { return "", probeErr }
+			},
+			wantReason:      "resolve QEMU binary path: probe failed",
+			wantRemediation: "upgrade QEMU to 6.2 or newer: brew upgrade qemu, then restart tbxd",
+			wantWrapped:     probeErr,
+		},
+		{
 			name: "firmware absent",
 			change: func(deps *qemuDarwinProbeDeps) {
 				deps.fs = missingQEMUFirmwareFS{}
@@ -171,11 +202,9 @@ func TestDarwinQEMUEntitlementParser(t *testing.T) {
 }
 
 func TestDarwinQEMUFirmwareCandidates(t *testing.T) {
-	t.Setenv("USER", "test-user")
-
 	home := filepath.Join(string(filepath.Separator), "Users", "test-user")
 	resolved := filepath.Join(string(filepath.Separator), "nix", "store", "qemu-hash", "bin", "qemu-system-aarch64")
-	candidates := darwinQEMUFirmwareCandidates(resolved, home, os.Getenv("USER"), ArchitectureARM64)
+	candidates := darwinQEMUFirmwareCandidates(resolved, home, "test-user", ArchitectureARM64)
 	wantRoots := []string{
 		filepath.Join(string(filepath.Separator), "nix", "store", "qemu-hash", "share", "qemu"),
 		"/opt/homebrew/opt/qemu/share/qemu",
@@ -207,6 +236,23 @@ func TestDarwinQEMUFirmwareCandidates(t *testing.T) {
 		VarsPath: "/opt/homebrew/opt/qemu/share/qemu/edk2-i386-vars.fd",
 	}) {
 		t.Fatalf("amd64 candidates do not contain the Homebrew firmware pair: %+v", amd64)
+	}
+}
+
+func TestDarwinQEMUUsesInjectedUserForFirmwareCandidates(t *testing.T) {
+	t.Parallel()
+
+	deps := passingDarwinQEMUProbeDeps(t, Architecture(runtime.GOARCH))
+	called := false
+	deps.user = func() string {
+		called = true
+		return "test-user"
+	}
+	if _, err := newQEMUWith(context.Background(), deps); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("newQEMUWith did not use the injected user dependency")
 	}
 }
 
@@ -264,6 +310,7 @@ func passingDarwinQEMUProbeDeps(t *testing.T, architecture Architecture) qemuDar
 		},
 		evalSymlinks: func(string) (string, error) { return resolved, nil },
 		homeDir:      func() (string, error) { return filepath.Join(dir, "home"), nil },
+		user:         func() string { return "test-user" },
 		fs:           osQEMUFS{},
 	}
 }
