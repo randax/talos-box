@@ -2,7 +2,9 @@ package hypervisor
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"sort"
 )
 
@@ -16,11 +18,29 @@ const (
 	NameQEMU Name = "qemu"
 )
 
+// ParseName validates a configured hypervisor name.
+func ParseName(raw string) (Name, error) {
+	name := Name(raw)
+	switch name {
+	case NameVZ, NameQEMU:
+		return name, nil
+	default:
+		return "", fmt.Errorf("hypervisor must be one of vz | qemu (got %q)", raw)
+	}
+}
+
 // DefaultSource identifies how the active default was selected.
 type DefaultSource string
 
-// DefaultSourceCompiled is the platform's built-in selection.
-const DefaultSourceCompiled DefaultSource = "compiled"
+const (
+	// DefaultEnv selects the daemon's default hypervisor.
+	DefaultEnv = "TBX_HYPERVISOR"
+
+	// DefaultSourceCompiled is the platform's built-in selection.
+	DefaultSourceCompiled DefaultSource = "compiled"
+	// DefaultSourceEnvironment records a selection from DefaultEnv.
+	DefaultSourceEnvironment DefaultSource = DefaultEnv
+)
 
 // Default records the selected backend and the source of that selection.
 type Default struct {
@@ -30,9 +50,10 @@ type Default struct {
 
 // Availability records whether a probed backend can be used.
 type Availability struct {
-	Available bool
-	Reason    string
-	Err       error
+	Available   bool
+	Reason      string
+	Remediation string
+	Err         error
 }
 
 // Backend pairs a successful probe with its availability gate.
@@ -43,8 +64,56 @@ type Backend struct {
 
 // Registry contains every known backend and the current default.
 type Registry struct {
-	Backends map[Name]Backend
-	Default  Default
+	Backends        map[Name]Backend
+	Default         Default
+	CompiledDefault Name
+}
+
+type resolutionError struct {
+	name   Name
+	reason string
+	err    error
+}
+
+func (e resolutionError) Error() string {
+	return fmt.Sprintf("%s: hypervisor %q: %s", ErrUnsupported, e.name, e.reason)
+}
+
+func (e resolutionError) Unwrap() []error {
+	if e.err == nil {
+		return []error{ErrUnsupported}
+	}
+	return []error{ErrUnsupported, e.err}
+}
+
+// WithDefault returns a copy with a different effective default.
+func (r Registry) WithDefault(raw string, source DefaultSource) (Registry, error) {
+	name, err := ParseName(raw)
+	if err != nil {
+		return Registry{}, err
+	}
+	if _, ok := r.Backends[name]; !ok {
+		return Registry{}, fmt.Errorf("hypervisor %q is not registered", name)
+	}
+	r.Default = Default{Name: name, Source: source}
+	return r, nil
+}
+
+// NewAllFromEnvironment probes all platform backends and applies DefaultEnv.
+func NewAllFromEnvironment(ctx context.Context) (Registry, error) {
+	return withDefaultFromEnvironment(NewAll(ctx), os.LookupEnv)
+}
+
+func withDefaultFromEnvironment(registry Registry, lookupEnv func(string) (string, bool)) (Registry, error) {
+	raw, ok := lookupEnv(DefaultEnv)
+	if !ok || raw == "" {
+		return registry, nil
+	}
+	configured, err := registry.WithDefault(raw, DefaultSourceEnvironment)
+	if err != nil {
+		return Registry{}, fmt.Errorf("%s: %w", DefaultEnv, err)
+	}
+	return configured, nil
 }
 
 // Names returns registered backend names in lexical order.
@@ -68,10 +137,7 @@ func (r Registry) Resolve(name Name) (Hypervisor, error) {
 		if reason == "" {
 			reason = "backend is unavailable"
 		}
-		if backend.Availability.Err != nil {
-			return nil, fmt.Errorf("%w: hypervisor %q: %w", ErrUnsupported, name, backend.Availability.Err)
-		}
-		return nil, fmt.Errorf("%w: hypervisor %q: %s", ErrUnsupported, name, reason)
+		return nil, resolutionError{name: name, reason: reason, err: backend.Availability.Err}
 	}
 	return backend.Hypervisor, nil
 }
@@ -87,11 +153,35 @@ type backendFactory struct {
 	new  func(context.Context) (Hypervisor, error)
 }
 
+type unavailableError struct {
+	reason      string
+	remediation string
+	err         error
+}
+
+func newUnavailableError(reason, remediation string, err error) error {
+	return unavailableError{reason: reason, remediation: remediation, err: err}
+}
+
+func (e unavailableError) Error() string { return e.reason }
+func (e unavailableError) Unwrap() error { return e.err }
+
 func newRegistry(ctx context.Context, selection Default, factories []backendFactory) Registry {
-	registry := Registry{Backends: make(map[Name]Backend, len(factories)), Default: selection}
+	registry := Registry{
+		Backends:        make(map[Name]Backend, len(factories)),
+		Default:         selection,
+		CompiledDefault: selection.Name,
+	}
 	for _, factory := range factories {
 		backend, err := factory.new(ctx)
 		if err != nil {
+			var unavailable unavailableError
+			if errors.As(err, &unavailable) {
+				registry.Backends[factory.name] = Backend{Availability: Availability{
+					Reason: unavailable.reason, Remediation: unavailable.remediation, Err: unavailable.err,
+				}}
+				continue
+			}
 			registry.Backends[factory.name] = Backend{Availability: Availability{Reason: err.Error(), Err: err}}
 			continue
 		}

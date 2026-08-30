@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/hostpressure"
 	"github.com/randax/talos-box/internal/hypervisor"
 	"github.com/randax/talos-box/internal/imagecache"
 )
@@ -31,8 +33,9 @@ func fakeRegistry(defaultName hypervisor.Name, backends map[hypervisor.Name]hype
 		}
 	}
 	return hypervisor.Registry{
-		Backends: registered,
-		Default:  hypervisor.Default{Name: defaultName, Source: hypervisor.DefaultSourceCompiled},
+		Backends:        registered,
+		Default:         hypervisor.Default{Name: defaultName, Source: hypervisor.DefaultSourceCompiled},
+		CompiledDefault: defaultName,
 	}
 }
 
@@ -69,70 +72,250 @@ func TestNewServerWithRegistryAllowsUnavailableNonDefaultHypervisor(t *testing.T
 	}
 }
 
-func TestNewServerWithRegistryRejectsUnavailableDefaultHypervisor(t *testing.T) {
-	t.Parallel()
+func TestNewServerWithRegistryAllowsUnavailableDefaultHypervisor(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	registry := hypervisor.Registry{
 		Backends: map[hypervisor.Name]hypervisor.Backend{
 			"primary": {Availability: hypervisor.Availability{Reason: "default probe failed"}},
 		},
-		Default: hypervisor.Default{Name: "primary", Source: hypervisor.DefaultSourceCompiled},
+		Default:         hypervisor.Default{Name: "primary", Source: hypervisor.DefaultSourceCompiled},
+		CompiledDefault: "primary",
 	}
 
-	_, err := newServer(context.Background(), registry)
-	if !errors.Is(err, hypervisor.ErrUnsupported) || !strings.Contains(err.Error(), "default probe failed") {
-		t.Fatalf("newServer() error = %v, want ErrUnsupported preserving default probe reason", err)
+	server, err := newServer(context.Background(), registry)
+	if err != nil {
+		t.Fatalf("newServer() = %v, want unavailable default backend to be retained", err)
 	}
+	t.Cleanup(func() { _ = server.Shutdown() })
 }
 
-func TestHypervisorForClusterUsesDefaultSelection(t *testing.T) {
+func TestHypervisorForClusterUsesPersistedSelection(t *testing.T) {
 	t.Parallel()
-	first := &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64}
-	selected := &fakeHypervisor{architecture: hypervisor.ArchitectureARM64}
-	server := &Server{hypervisors: fakeRegistry("selected", map[hypervisor.Name]hypervisor.Hypervisor{
-		"first":    first,
-		"selected": selected,
-	})}
+	persisted := &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64}
+	selectedDefault := &fakeHypervisor{architecture: hypervisor.ArchitectureARM64}
+	registry := fakeRegistry("selected", map[hypervisor.Name]hypervisor.Hypervisor{
+		"persisted": persisted,
+		"selected":  selectedDefault,
+	})
+	server := &Server{hypervisors: registry}
 
-	name, backend, err := server.hypervisorForCluster(cluster.Cluster{Name: "ordinary"})
+	name, backend, err := server.hypervisorForCluster(cluster.Cluster{Name: "ordinary", Hypervisor: "persisted"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if name != "selected" || backend != selected {
-		t.Fatalf("hypervisorForCluster() = (%q, %p), want selected backend %p", name, backend, selected)
+	if name != "persisted" || backend != persisted {
+		t.Fatalf("hypervisorForCluster() = (%q, %p), want persisted backend %p", name, backend, persisted)
+	}
+}
+
+func TestHypervisorForClusterUsesCompiledDefaultForLegacyState(t *testing.T) {
+	t.Parallel()
+	compiled := &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64}
+	effective := &fakeHypervisor{architecture: hypervisor.ArchitectureARM64}
+	registry := fakeRegistry("effective", map[hypervisor.Name]hypervisor.Hypervisor{
+		"compiled":  compiled,
+		"effective": effective,
+	})
+	registry.CompiledDefault = "compiled"
+	server := &Server{hypervisors: registry}
+
+	name, backend, err := server.hypervisorForCluster(cluster.Cluster{Name: "legacy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "compiled" || backend != compiled {
+		t.Fatalf("hypervisorForCluster() = (%q, %p), want compiled backend %p", name, backend, compiled)
+	}
+}
+
+func TestHypervisorForCreateUsesExplicitThenEffectiveDefault(t *testing.T) {
+	t.Parallel()
+	explicit := &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64}
+	effective := &fakeHypervisor{architecture: hypervisor.ArchitectureARM64}
+	registry := fakeRegistry("effective", map[hypervisor.Name]hypervisor.Hypervisor{
+		"explicit":  explicit,
+		"effective": effective,
+	})
+	server := &Server{hypervisors: registry}
+
+	name, backend, err := server.hypervisorForCreate("explicit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "explicit" || backend != explicit {
+		t.Fatalf("hypervisorForCreate(explicit) = (%q, %p), want explicit backend %p", name, backend, explicit)
+	}
+
+	name, backend, err = server.hypervisorForCreate("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "effective" || backend != effective {
+		t.Fatalf("hypervisorForCreate(empty) = (%q, %p), want effective default %p", name, backend, effective)
+	}
+}
+
+func TestCreateAgainstUnavailableHypervisorReturnsGateReasonBeforeHostProbes(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	hostProbed := false
+	service := &Server{
+		hypervisors: hypervisor.Registry{
+			Backends: map[hypervisor.Name]hypervisor.Backend{
+				"primary":  {Hypervisor: &fakeHypervisor{}, Availability: hypervisor.Availability{Available: true}},
+				"optional": {Availability: hypervisor.Availability{Reason: "optional capability is unavailable"}},
+			},
+			Default:         hypervisor.Default{Name: "primary", Source: hypervisor.DefaultSourceCompiled},
+			CompiledDefault: "primary",
+		},
+		hostPressure: func(string) (hostpressure.Snapshot, error) {
+			hostProbed = true
+			return hostpressure.Snapshot{}, nil
+		},
+	}
+	raw, err := json.Marshal(createArgs{Name: "gated", Hypervisor: "optional"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = service.createCluster(raw, nil)
+	if err == nil || !strings.Contains(err.Error(), "optional capability is unavailable") {
+		t.Fatalf("createCluster() error = %v, want hypervisor availability reason", err)
+	}
+	if hostProbed {
+		t.Fatal("createCluster() probed host pressure before rejecting the unavailable hypervisor")
+	}
+	if _, loadErr := cluster.Load("gated"); !errors.Is(loadErr, os.ErrNotExist) {
+		t.Fatalf("cluster.Load(gated) error = %v, want no persisted state", loadErr)
+	}
+}
+
+func TestCreateRecordsResolvedHypervisorAndArchitecture(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	const schematic, version = "selected-schematic", "v1.13.6"
+	disk := filepath.Join(root, schematic, version, string(hypervisor.ArchitectureAMD64), "disk.raw")
+	if err := os.MkdirAll(filepath.Dir(disk), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(disk, []byte("disk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	selected := &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64}
+	service := &Server{
+		cache:         imagecache.New(root),
+		hypervisors:   fakeRegistry("selected", map[hypervisor.Name]hypervisor.Hypervisor{"selected": selected}),
+		vms:           make(map[string]map[string]hypervisor.Machine),
+		helperCheck:   func() error { return nil },
+		hostPressure:  noHostPressure,
+		subnetSources: emptySubnetSources(),
+	}
+	zero := 0
+	raw, err := json.Marshal(createArgs{
+		Name: "recorded", ControlPlanes: &zero, Workers: &zero,
+		Hypervisor: "selected", Schematic: schematic, Version: version,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := service.createCluster(raw, nil); err != nil {
+		t.Fatal(err)
+	}
+	item, err := cluster.Load("recorded")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.Hypervisor != "selected" || item.ImageArchitecture != string(hypervisor.ArchitectureAMD64) {
+		t.Fatalf("stored selection = (%q, %q), want selected hypervisor and architecture", item.Hypervisor, item.ImageArchitecture)
+	}
+}
+
+func TestStatusReportsEffectiveHypervisorForLegacyAndNewState(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	for _, item := range []cluster.Cluster{
+		{Name: "legacy", SubnetIndex: 1},
+		{Name: "persisted", SubnetIndex: 2, Hypervisor: "selected"},
+	} {
+		if err := cluster.Save(item); err != nil {
+			t.Fatal(err)
+		}
+	}
+	registry := fakeRegistry("selected", map[hypervisor.Name]hypervisor.Hypervisor{
+		"compiled": &fakeHypervisor{},
+		"selected": &fakeHypervisor{},
+	})
+	registry.CompiledDefault = "compiled"
+	service := &Server{hypervisors: registry, vms: make(map[string]map[string]hypervisor.Machine)}
+
+	statuses, err := service.status(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make(map[string]hypervisor.Name, len(statuses))
+	for _, status := range statuses {
+		got[status.Name] = status.Hypervisor
+	}
+	if got["legacy"] != "compiled" || got["persisted"] != "selected" {
+		t.Fatalf("status hypervisors = %v, want legacy compiled and persisted selected", got)
+	}
+}
+
+func TestInfoReportsHypervisorAvailabilityRemediation(t *testing.T) {
+	t.Parallel()
+	service := &Server{hypervisors: hypervisor.Registry{
+		Backends: map[hypervisor.Name]hypervisor.Backend{
+			hypervisor.NameQEMU: {Availability: hypervisor.Availability{
+				Reason: "runtime unavailable", Remediation: "install runtime support",
+			}},
+		},
+		Default:         hypervisor.Default{Name: hypervisor.NameQEMU, Source: hypervisor.DefaultSourceEnvironment},
+		CompiledDefault: hypervisor.NameVZ,
+	}}
+
+	info := service.info()
+	if len(info.Hypervisors) != 1 || info.Hypervisors[0].AvailabilityRemediation != "install runtime support" {
+		t.Fatalf("info hypervisors = %+v, want availability remediation", info.Hypervisors)
 	}
 }
 
 func TestBalloonCandidatesUseResolvedHypervisorCapabilities(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	item, err := cluster.New("balloon-candidates", 0, 1, 0, cluster.NodeDefaults{MemoryMiB: 2048})
-	if err != nil {
-		t.Fatal(err)
+	items := make([]cluster.Cluster, 0, 2)
+	for index, selection := range []string{"readback", "conservative"} {
+		item, err := cluster.New(selection, index, 1, 0, cluster.NodeDefaults{MemoryMiB: 2048})
+		if err != nil {
+			t.Fatal(err)
+		}
+		item.Hypervisor = selection
+		if err := cluster.Save(item); err != nil {
+			t.Fatal(err)
+		}
+		items = append(items, item)
 	}
-	if err := cluster.Save(item); err != nil {
-		t.Fatal(err)
-	}
-	key := item.Name + "/" + item.Nodes[0].Name
 	server := &Server{
-		hypervisors: singleFakeRegistry(&fakeHypervisor{capabilities: hypervisor.Capabilities{
-			BalloonReadback: hypervisor.FeatureStatus{Supported: true},
-		}}),
+		hypervisors: fakeRegistry("readback", map[hypervisor.Name]hypervisor.Hypervisor{
+			"readback": &fakeHypervisor{capabilities: hypervisor.Capabilities{
+				BalloonReadback: hypervisor.FeatureStatus{Supported: true},
+			}},
+			"conservative": &fakeHypervisor{},
+		}),
 		vms: map[string]map[string]hypervisor.Machine{
-			item.Name: {item.Nodes[0].Name: &fakeMachine{active: true}},
+			items[0].Name: {items[0].Nodes[0].Name: &fakeMachine{active: true}},
+			items[1].Name: {items[1].Nodes[0].Name: &fakeMachine{active: true}},
 		},
 	}
 	candidates := server.balloonCandidatesLocked()
-	if !candidates[key].balloonReadback {
-		t.Fatalf("candidate %+v does not carry resolved balloon readback", candidates[key])
+	readbackKey := items[0].Name + "/" + items[0].Nodes[0].Name
+	conservativeKey := items[1].Name + "/" + items[1].Nodes[0].Name
+	if !candidates[readbackKey].balloonReadback {
+		t.Fatalf("candidate %+v does not carry resolved balloon readback", candidates[readbackKey])
 	}
-
-	setFakeHypervisor(server, &fakeHypervisor{})
-	candidates = server.balloonCandidatesLocked()
-	if candidates[key].balloonReadback {
-		t.Fatalf("candidate %+v unexpectedly carries balloon readback", candidates[key])
+	if candidates[conservativeKey].balloonReadback {
+		t.Fatalf("candidate %+v unexpectedly carries balloon readback", candidates[conservativeKey])
 	}
-	candidate := candidates[key]
+	candidate := candidates[conservativeKey]
 	candidate.ip = ""
-	if got := balloonablesFrom(map[string]balloonCandidate{key: candidate}, nil, func() bool { return false }); len(got) != 0 {
+	if got := balloonablesFrom(map[string]balloonCandidate{conservativeKey: candidate}, nil, func() bool { return false }); len(got) != 0 {
 		t.Fatalf("balloonablesFrom() = %v, want conservative eligibility without readback", got)
 	}
 }

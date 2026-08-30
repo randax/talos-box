@@ -55,7 +55,7 @@ type doctorDependencies struct {
 	// prints a line, as INFO, so the operator's own choice never nags.
 	balloonDisabled func() (bool, error)
 	daemonInfo      func() (daemon.Info, error)
-	hypervisors     func(context.Context) hypervisor.Registry
+	hypervisors     func(context.Context) (hypervisor.Registry, error)
 	command         commandOutput
 	readFile        func(string) ([]byte, error)
 	accessRW        func(string) error
@@ -399,8 +399,7 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		return err
 	}
 
-	guestAgent, guestAgentKnown := defaultGuestAgentStatus(hypervisorInventory)
-	if err := writeFindings(guestAgentFinding(deps.listConfig, guestAgent, guestAgentKnown)); err != nil {
+	if err := writeFindings(guestAgentFinding(deps.listConfig, deps.getStatus, statuses, statusErr, hypervisorInventory)); err != nil {
 		return err
 	}
 
@@ -619,11 +618,13 @@ func imageCacheFinding(images []daemon.CacheImageEntry) (level, detail string) {
 // and portable, the extension is simply inert on this host.
 func guestAgentFinding(
 	listConfig func() ([]cluster.Cluster, error),
-	support hypervisor.FeatureStatus,
-	supportKnown bool,
+	getStatus func() ([]daemon.ClusterStatus, error),
+	statuses []daemon.ClusterStatus,
+	statusErr error,
+	inventory doctorHypervisorInventory,
 ) doctorFinding {
 	finding := doctorFinding{check: "guest-agent"}
-	if listConfig == nil || !supportKnown {
+	if listConfig == nil {
 		finding.level, finding.detail = "SKIP", "probe unavailable"
 		return finding
 	}
@@ -642,13 +643,60 @@ func guestAgentFinding(
 		finding.level, finding.detail = "SKIP", "no cluster requests "+extensions.GuestAgent
 		return finding
 	}
-	if !support.Supported {
-		finding.level = "WARN"
-		finding.detail = fmt.Sprintf("cluster(s) %s request %s: %s", strings.Join(requesting, ", "), extensions.GuestAgent, support.Reason)
+	if len(statuses) == 0 && statusErr == nil && getStatus != nil {
+		statuses, statusErr = getStatus()
+	}
+
+	statusByName := make(map[string]daemon.ClusterStatus, len(statuses))
+	for _, status := range statuses {
+		statusByName[status.Name] = status
+	}
+	supported := make([]string, 0, len(requesting))
+	unsupported := make(map[string][]string)
+	for _, item := range items {
+		if !extensions.Requested(item.TalosExtensions, extensions.GuestAgent) {
+			continue
+		}
+		support, ok := guestAgentSupportForCluster(item, statusByName[item.Name], inventory)
+		if !ok {
+			reason := "probe unavailable"
+			if statusErr != nil {
+				reason = "cluster status unavailable: " + statusErr.Error()
+			} else if inventory.err != nil {
+				reason = "hypervisor inventory unavailable: " + inventory.err.Error()
+			}
+			unsupported[reason] = append(unsupported[reason], item.Name)
+			continue
+		}
+		if support.Supported {
+			supported = append(supported, item.Name)
+			continue
+		}
+		reason := support.Reason
+		if reason == "" {
+			reason = "backend has no guest-agent channel"
+		}
+		unsupported[reason] = append(unsupported[reason], item.Name)
+	}
+	if len(supported) == 0 && len(unsupported) == 0 {
+		finding.level, finding.detail = "SKIP", "probe unavailable"
 		return finding
 	}
+	details := make([]string, 0, 1+len(unsupported))
+	if len(supported) != 0 {
+		sort.Strings(supported)
+		details = append(details, fmt.Sprintf("channel available for cluster(s) %s", strings.Join(supported, ", ")))
+	}
+	for _, reason := range sortedMapKeys(unsupported) {
+		names := unsupported[reason]
+		sort.Strings(names)
+		details = append(details, fmt.Sprintf("cluster(s) %s request %s: %s", strings.Join(names, ", "), extensions.GuestAgent, reason))
+	}
 	finding.level = "PASS"
-	finding.detail = fmt.Sprintf("channel available for cluster(s) %s", strings.Join(requesting, ", "))
+	if len(unsupported) != 0 {
+		finding.level = "WARN"
+	}
+	finding.detail = strings.Join(details, "; ")
 	return finding
 }
 
@@ -658,6 +706,7 @@ type doctorHypervisorInventory struct {
 	items         []daemon.HypervisorInfo
 	defaultName   hypervisor.Name
 	defaultSource hypervisor.DefaultSource
+	compiledName  hypervisor.Name
 	localProbeTag string
 	err           error
 }
@@ -668,7 +717,16 @@ func doctorHypervisors(deps doctorDependencies) doctorHypervisorInventory {
 	}
 	info, err := deps.daemonInfo()
 	if err == nil && len(info.Hypervisors) > 0 {
-		return doctorHypervisorInventory{items: info.Hypervisors, defaultName: info.DefaultHypervisor, defaultSource: info.DefaultHypervisorSource}
+		inventory := doctorHypervisorInventory{
+			items:         info.Hypervisors,
+			defaultName:   info.DefaultHypervisor,
+			defaultSource: info.DefaultHypervisorSource,
+			compiledName:  info.CompiledDefaultHypervisor,
+		}
+		if inventory.defaultSource == hypervisor.DefaultSourceCompiled {
+			inventory.compiledName = inventory.defaultName
+		}
+		return inventory
 	}
 	if deps.hypervisors == nil {
 		if err == nil {
@@ -685,14 +743,18 @@ func doctorHypervisors(deps doctorDependencies) doctorHypervisorInventory {
 	}
 	probeCtx, probeCancel := context.WithTimeout(context.Background(), hypervisorProbeTimeout)
 	defer probeCancel()
-	registry := deps.hypervisors(probeCtx)
+	registry, probeErr := deps.hypervisors(probeCtx)
+	if probeErr != nil {
+		return doctorHypervisorInventory{err: probeErr}
+	}
 	items := make([]daemon.HypervisorInfo, 0, len(registry.Backends))
 	for _, name := range registry.Names() {
 		entry := registry.Backends[name]
 		item := daemon.HypervisorInfo{
-			Name:               name,
-			Available:          entry.Availability.Available,
-			AvailabilityReason: entry.Availability.Reason,
+			Name:                    name,
+			Available:               entry.Availability.Available,
+			AvailabilityReason:      entry.Availability.Reason,
+			AvailabilityRemediation: entry.Availability.Remediation,
 		}
 		if entry.Availability.Available && entry.Hypervisor != nil {
 			capabilities := entry.Hypervisor.Capabilities()
@@ -703,7 +765,7 @@ func doctorHypervisors(deps doctorDependencies) doctorHypervisorInventory {
 		items = append(items, item)
 	}
 	return doctorHypervisorInventory{
-		items: items, defaultName: registry.Default.Name, defaultSource: registry.Default.Source, localProbeTag: localProbeTag,
+		items: items, defaultName: registry.Default.Name, defaultSource: registry.Default.Source, compiledName: registry.CompiledDefault, localProbeTag: localProbeTag,
 	}
 }
 
@@ -728,8 +790,15 @@ func hypervisorFindings(inventory doctorHypervisorInventory) []doctorFinding {
 		guestAgent := featureGate(item.GuestAgent)
 		if !item.Available {
 			availability = "unavailable"
+			details := make([]string, 0, 2)
 			if item.AvailabilityReason != "" {
-				availability += " (" + item.AvailabilityReason + ")"
+				details = append(details, item.AvailabilityReason)
+			}
+			if item.AvailabilityRemediation != "" {
+				details = append(details, "remediation: "+item.AvailabilityRemediation)
+			}
+			if len(details) != 0 {
+				availability += " (" + strings.Join(details, "; ") + ")"
 			}
 			balloonReadback, suspendRestart, guestAgent = "unavailable", "unavailable", "unavailable"
 		}
@@ -756,13 +825,59 @@ func featureGate(status daemon.FeatureStatusInfo) string {
 	return "unsupported"
 }
 
-func defaultGuestAgentStatus(inventory doctorHypervisorInventory) (hypervisor.FeatureStatus, bool) {
+func guestAgentSupportFromInventory(name hypervisor.Name, inventory doctorHypervisorInventory) (hypervisor.FeatureStatus, bool) {
 	for _, item := range inventory.items {
-		if item.Name == inventory.defaultName && item.Available {
-			return hypervisor.FeatureStatus{Supported: item.GuestAgent.Supported, Reason: item.GuestAgent.Reason}, true
+		if item.Name != name {
+			continue
+		}
+		if !item.Available {
+			reason := item.AvailabilityReason
+			if reason == "" {
+				reason = "backend is unavailable"
+			}
+			return hypervisor.FeatureStatus{Reason: reason}, true
+		}
+		return hypervisor.FeatureStatus{Supported: item.GuestAgent.Supported, Reason: item.GuestAgent.Reason}, true
+	}
+	return hypervisor.FeatureStatus{}, false
+}
+
+func guestAgentSupportFromStatus(status daemon.ClusterStatus) (hypervisor.FeatureStatus, bool) {
+	for _, capability := range status.Capabilities {
+		if capability.Name == extensions.GuestAgent {
+			return hypervisor.FeatureStatus{Supported: capability.Supported, Reason: capability.Reason}, true
 		}
 	}
 	return hypervisor.FeatureStatus{}, false
+}
+
+func guestAgentSupportForCluster(item cluster.Cluster, status daemon.ClusterStatus, inventory doctorHypervisorInventory) (hypervisor.FeatureStatus, bool) {
+	if support, ok := guestAgentSupportFromStatus(status); ok {
+		return support, true
+	}
+	name := status.Hypervisor
+	if name == "" {
+		name = hypervisor.Name(item.Hypervisor)
+	}
+	if name == "" {
+		name = inventory.compiledName
+		if name == "" && inventory.defaultSource == hypervisor.DefaultSourceCompiled {
+			name = inventory.defaultName
+		}
+	}
+	if name == "" {
+		return hypervisor.FeatureStatus{}, false
+	}
+	return guestAgentSupportFromInventory(name, inventory)
+}
+
+func sortedMapKeys(values map[string][]string) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func stringSlicesEqual(left, right []string) bool {
@@ -804,7 +919,7 @@ func (c cli) doctorDependencies() doctorDependencies {
 			err := call("daemon.info", struct{}{}, &result)
 			return result, err
 		},
-		hypervisors: hypervisor.NewAll,
+		hypervisors: hypervisor.NewAllFromEnvironment,
 		listClusters: func() ([]daemon.ClusterSummary, error) {
 			var result []daemon.ClusterSummary
 			err := call("cluster.list", struct{}{}, &result)

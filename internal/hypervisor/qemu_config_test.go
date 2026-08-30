@@ -1,11 +1,15 @@
 package hypervisor
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
+
+	"github.com/randax/talos-box/internal/helper"
 )
 
 func TestQEMUVersionCompareAndString(t *testing.T) {
@@ -106,16 +110,20 @@ func TestEnsureQEMUVarsCopiesOnceWithoutOverwrite(t *testing.T) {
 	}
 }
 
-func TestBuildQEMUArgv(t *testing.T) {
+func TestBuildQEMUArgvLinuxGoldenUnchanged(t *testing.T) {
 	t.Parallel()
 
 	got, err := buildQEMUArgv(qemuLaunchConfig{
 		Architecture:  ArchitectureAMD64,
+		Machine:       "q35",
+		Accelerator:   "kvm",
+		CPU:           "host",
 		CPUs:          4,
 		MemoryMiB:     8192,
 		DiskPath:      "/var/lib/talos/node,disk.img",
 		MAC:           "02:00:00:00:00:01",
-		TapFD:         9,
+		NetworkKind:   helper.AttachmentTapFD,
+		NetworkFD:     9,
 		ConsoleFD:     7,
 		QMPSocketPath: "/run/talos/qmp,node.sock",
 		Firmware: qemuFirmware{
@@ -162,15 +170,96 @@ func TestBuildQEMUArgv(t *testing.T) {
 	}
 }
 
+func TestBuildQEMUArgvMapsNetworkAttachment(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		kind       helper.AttachmentKind
+		wantNetdev string
+	}{
+		{name: "tap", kind: helper.AttachmentTapFD, wantNetdev: "tap,id=net0,fd=9"},
+		{name: "datagram", kind: helper.AttachmentDatagramFD, wantNetdev: "dgram,id=net0,local.type=fd,local.str=9"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := validQEMULaunchConfig()
+			cfg.NetworkKind = test.kind
+			argv, err := buildQEMUArgv(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !containsSequence(argv, []string{"-netdev", test.wantNetdev}) {
+				t.Fatalf("network argv = %#v, want %q", argv, test.wantNetdev)
+			}
+		})
+	}
+}
+
+func TestBuildQEMUArgvDarwinARM64UsesHVFHostCPUAndGICv3(t *testing.T) {
+	t.Parallel()
+
+	cfg := validQEMULaunchConfig()
+	cfg.Architecture = ArchitectureARM64
+	cfg.Machine = "virt,gic-version=3"
+	cfg.Accelerator = "hvf"
+	argv, err := buildQEMUArgv(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsSequence(argv, []string{"-machine", "virt,gic-version=3", "-accel", "hvf", "-cpu", "host"}) {
+		t.Fatalf("platform argv = %#v", argv)
+	}
+	if slices.Contains(argv, "gic-version=host") {
+		t.Fatalf("platform argv contains forbidden machine option: %#v", argv)
+	}
+}
+
+func TestBuildQEMUArgvRejectsUnknownAttachmentKind(t *testing.T) {
+	t.Parallel()
+
+	cfg := validQEMULaunchConfig()
+	cfg.NetworkKind = helper.AttachmentKind("unknown-fd")
+	_, err := buildQEMUArgv(cfg)
+	if !errors.Is(err, ErrUnsupported) || !strings.Contains(err.Error(), `QEMU cannot use network attachment kind "unknown-fd"`) {
+		t.Fatalf("buildQEMUArgv() error = %v", err)
+	}
+}
+
+func validQEMULaunchConfig() qemuLaunchConfig {
+	return qemuLaunchConfig{
+		Architecture:  ArchitectureAMD64,
+		Machine:       "q35",
+		Accelerator:   "kvm",
+		CPU:           "host",
+		CPUs:          2,
+		MemoryMiB:     2048,
+		DiskPath:      "/var/lib/talos/node.img",
+		MAC:           "02:00:00:00:00:01",
+		NetworkKind:   helper.AttachmentTapFD,
+		NetworkFD:     9,
+		ConsoleFD:     7,
+		QMPSocketPath: "/run/talos/node.qmp.sock",
+		Firmware: qemuFirmware{
+			CodePath: "/usr/share/OVMF/OVMF_CODE.fd",
+			VarsPath: "/var/lib/talos/node.VARS.fd",
+		},
+	}
+}
+
 // TBX_DISABLE_BALLOON drops the balloon device and nothing else (#513).
 func TestBuildQEMUArgvOmitsBalloonWhenDisabled(t *testing.T) {
 	cfg := qemuLaunchConfig{
 		Architecture:  ArchitectureAMD64,
+		Machine:       "q35",
+		Accelerator:   "kvm",
+		CPU:           "host",
 		CPUs:          2,
 		MemoryMiB:     2048,
 		DiskPath:      "/var/lib/talos/disk.img",
 		MAC:           "02:00:00:00:00:01",
-		TapFD:         9,
+		NetworkKind:   helper.AttachmentTapFD,
+		NetworkFD:     9,
 		ConsoleFD:     7,
 		QMPSocketPath: "/run/talos/qmp.sock",
 		Firmware:      qemuFirmware{CodePath: "/usr/share/OVMF/OVMF_CODE.fd", VarsPath: "/var/lib/talos/VARS.fd"},
@@ -201,11 +290,15 @@ func TestBuildQEMUArgvAddsGuestAgentPort(t *testing.T) {
 
 	got, err := buildQEMUArgv(qemuLaunchConfig{
 		Architecture:  ArchitectureAMD64,
+		Machine:       "q35",
+		Accelerator:   "kvm",
+		CPU:           "host",
 		CPUs:          2,
 		MemoryMiB:     2048,
 		DiskPath:      "/var/lib/talos/node.img",
 		MAC:           "02:00:00:00:00:01",
-		TapFD:         3,
+		NetworkKind:   helper.AttachmentTapFD,
+		NetworkFD:     3,
 		ConsoleFD:     4,
 		GuestAgentFD:  5,
 		QMPSocketPath: "/run/talos/node.qmp.sock",
@@ -245,11 +338,15 @@ func TestBuildQEMUArgvRejectsUnsafePaths(t *testing.T) {
 
 	_, err := buildQEMUArgv(qemuLaunchConfig{
 		Architecture:  ArchitectureAMD64,
+		Machine:       "q35",
+		Accelerator:   "kvm",
+		CPU:           "host",
 		CPUs:          1,
 		MemoryMiB:     1024,
 		DiskPath:      "/var/lib/talos/bad\npath.img",
 		MAC:           "02:00:00:00:00:01",
-		TapFD:         3,
+		NetworkKind:   helper.AttachmentTapFD,
+		NetworkFD:     3,
 		ConsoleFD:     4,
 		QMPSocketPath: "/run/qmp.sock",
 		Firmware: qemuFirmware{

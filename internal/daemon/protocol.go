@@ -136,10 +136,11 @@ type Info struct {
 	// balloon device (TBX_DISABLE_BALLOON, #513), so tbx doctor can say why
 	// guest memory is never reclaimed. Additive and version-neutral: an older
 	// daemon omits it and the CLI reads that as ballooning on.
-	BalloonDisabled         bool                     `json:"balloonDisabled,omitempty"`
-	Hypervisors             []HypervisorInfo         `json:"hypervisors,omitempty"`
-	DefaultHypervisor       hypervisor.Name          `json:"defaultHypervisor,omitempty"`
-	DefaultHypervisorSource hypervisor.DefaultSource `json:"defaultHypervisorSource,omitempty"`
+	BalloonDisabled           bool                     `json:"balloonDisabled,omitempty"`
+	Hypervisors               []HypervisorInfo         `json:"hypervisors,omitempty"`
+	DefaultHypervisor         hypervisor.Name          `json:"defaultHypervisor,omitempty"`
+	DefaultHypervisorSource   hypervisor.DefaultSource `json:"defaultHypervisorSource,omitempty"`
+	CompiledDefaultHypervisor hypervisor.Name          `json:"compiledDefaultHypervisor,omitempty"`
 }
 
 // HypervisorInfo reports one daemon-probed backend and its feature gates.
@@ -147,6 +148,7 @@ type HypervisorInfo struct {
 	Name                         hypervisor.Name   `json:"name"`
 	Available                    bool              `json:"available,omitempty"`
 	AvailabilityReason           string            `json:"availabilityReason,omitempty"`
+	AvailabilityRemediation      string            `json:"availabilityRemediation,omitempty"`
 	BalloonReadback              FeatureStatusInfo `json:"balloonReadback,omitempty"`
 	SuspendSurvivesDaemonRestart bool              `json:"suspendSurvivesDaemonRestart,omitempty"`
 	GuestAgent                   FeatureStatusInfo `json:"guestAgent,omitempty"`

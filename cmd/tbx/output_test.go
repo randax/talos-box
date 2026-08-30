@@ -8,7 +8,43 @@ import (
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/daemon"
+	"github.com/randax/talos-box/internal/hypervisor"
 )
+
+func TestPrintStatusShowsHypervisor(t *testing.T) {
+	t.Parallel()
+	status := daemon.ClusterStatus{
+		Name: "demo", Subnet: "172.30.4.0/24", Domain: "demo.k8s.test", Hypervisor: hypervisor.NameQEMU,
+		Nodes: []daemon.NodeStatus{{Name: "demo-cp-1", Role: cluster.RoleControlPlane, MAC: "52:54:00:00:00:01", Phase: daemon.PhaseConfigured}},
+	}
+	var output bytes.Buffer
+	if err := printStatus(&output, []daemon.ClusterStatus{status}, false); err != nil {
+		t.Fatal(err)
+	}
+	rendered := output.String()
+	if !strings.Contains(rendered, "CLUSTER  SUBNET         DOMAIN         HYPERVISOR  TALOS") {
+		t.Fatalf("status header does not put HYPERVISOR after DOMAIN:\n%s", rendered)
+	}
+	lines := strings.Split(strings.TrimSpace(rendered), "\n")
+	if len(lines) < 2 || len(strings.Fields(lines[1])) < 4 || strings.Fields(lines[1])[3] != "qemu" {
+		t.Fatalf("status output missing hypervisor value after domain:\n%s", rendered)
+	}
+}
+
+func TestPrintStatusQuietKeepsHypervisor(t *testing.T) {
+	t.Parallel()
+	status := daemon.ClusterStatus{
+		Name: "demo", Subnet: "172.30.4.0/24", Domain: "demo.k8s.test", Hypervisor: hypervisor.NameVZ,
+		Nodes: []daemon.NodeStatus{{Name: "demo-cp-1", Role: cluster.RoleControlPlane, MAC: "52:54:00:00:00:01", Phase: daemon.PhaseConfigured}},
+	}
+	var output bytes.Buffer
+	if err := printStatus(&output, []daemon.ClusterStatus{status}, true); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "demo.k8s.test  vz") {
+		t.Fatalf("quiet status dropped the hypervisor fact:\n%s", output.String())
+	}
+}
 
 func TestPrintStatusRendersFlannelLiveVIPHint(t *testing.T) {
 	t.Parallel()

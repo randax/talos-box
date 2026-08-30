@@ -64,6 +64,7 @@ type Cluster struct {
 	// input would otherwise be lost.
 	BaseSchematic     string `json:"baseSchematic,omitempty"`
 	ImageArchitecture string `json:"imageArchitecture,omitempty"`
+	Hypervisor        string `json:"hypervisor,omitempty"`
 	// Domain is the canonical cluster domain when explicitly chosen at
 	// create; empty means the default, <name>.k8s.test. AllowUnsafeDomain
 	// records the opt-in the user passed for it, so emitted config

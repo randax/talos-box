@@ -78,7 +78,7 @@ func printStatus(output io.Writer, clusters []daemon.ClusterStatus, quiet bool) 
 		return err
 	}
 	table := tabwriter.NewWriter(output, 0, 4, 2, ' ', 0)
-	header := "CLUSTER\tSUBNET\tDOMAIN\tTALOS\tNODE\tROLE\tMAC\tIP\tPHASE"
+	header := "CLUSTER\tSUBNET\tDOMAIN\tHYPERVISOR\tTALOS\tNODE\tROLE\tMAC\tIP\tPHASE"
 	// The kubelet column only appears once some node actually carries a
 	// reading: a stopped cluster, a node in maintenance and an older daemon
 	// report none, and a column of dashes would claim a measurement that was
@@ -100,8 +100,8 @@ func printStatus(output io.Writer, clusters []daemon.ClusterStatus, quiet bool) 
 			if ip == "" {
 				ip = "-"
 			}
-			row := fmt.Sprintf("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s",
-				item.Name, item.Subnet, item.Domain, talos, node.Name, node.Role, node.MAC, ip, nodePhase(node))
+			row := fmt.Sprintf("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s",
+				item.Name, item.Subnet, item.Domain, item.Hypervisor, talos, node.Name, node.Role, node.MAC, ip, nodePhase(node))
 			if services {
 				row += "\t" + nodeKubelet(node)
 			}

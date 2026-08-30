@@ -100,6 +100,38 @@ func (s *Server) validateUp(raw json.RawMessage, maintenance map[string]maintena
 	return err
 }
 
+// validateUpHypervisors performs the immutable, local-only part of up
+// preflight before any maintenance or storage probes. The locked preflight
+// repeats this check after observation so a concurrent state change cannot
+// slip through.
+func (s *Server) validateUpHypervisors(raw json.RawMessage) error {
+	var args upArgs
+	if err := decodeArgs(raw, &args); err != nil {
+		return err
+	}
+	specs := make(map[string]config.ClusterSpec, len(args.Clusters))
+	for _, spec := range args.Clusters {
+		if spec.Hypervisor != "" {
+			specs[spec.Name] = spec
+		}
+	}
+	if len(specs) == 0 {
+		return nil
+	}
+	items, err := cluster.List()
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		if spec, ok := specs[item.Name]; ok {
+			if err := s.checkHypervisorUnchanged(item, spec); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // validateSpecVersions refuses an up request that would create a cluster
 // with an effective version outside the support window, before any cluster
 // is created or updated. Specs for existing clusters stay exempt: tbx echoes
@@ -407,6 +439,9 @@ func (s *Server) preflightUpWithStorage(
 		if err != nil {
 			return nil, fmt.Errorf("load %s: %w", spec.Name, err)
 		}
+		if err := s.checkHypervisorUnchanged(item, spec); err != nil {
+			return nil, err
+		}
 		if err := checkDomainUnchanged(item, spec); err != nil {
 			return nil, err
 		}
@@ -441,6 +476,20 @@ func (s *Server) preflightUpWithStorage(
 		}
 	}
 	return updates, nil
+}
+
+func (s *Server) checkHypervisorUnchanged(item cluster.Cluster, spec config.ClusterSpec) error {
+	if spec.Hypervisor == "" {
+		return nil
+	}
+	stored := s.hypervisorNameForCluster(item)
+	if spec.Hypervisor != stored {
+		return fmt.Errorf(
+			"cluster %q: hypervisor is immutable (cluster has %q, talosbox.yaml wants %q); destroy and recreate the cluster to change the hypervisor",
+			spec.Name, stored, spec.Hypervisor,
+		)
+	}
+	return nil
 }
 
 // reconcileProvisioningIntent returns the only allowed persisted intent
@@ -622,6 +671,7 @@ func resolveSpecTalos(spec config.ClusterSpec, fileTalos config.TalosSpec) confi
 func createArgsFromSpec(spec config.ClusterSpec, force bool) createArgs {
 	return createArgs{
 		Name:                    spec.Name,
+		Hypervisor:              spec.Hypervisor,
 		ControlPlanes:           &spec.ControlPlanes,
 		Workers:                 &spec.Workers,
 		Node:                    spec.Node,

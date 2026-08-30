@@ -84,6 +84,7 @@ func transientDaemonArgs(daemonPath string, pid int, getenv func(string) string)
 		"TBX_HELPER_SOCKET",
 		"TBX_BALLOON_RESERVE_MIB",
 		"TBX_DISABLE_BALLOON",
+		"TBX_HYPERVISOR",
 		"TBXD_K8S_WARNINGS",
 	} {
 		if value := getenv(name); value != "" {

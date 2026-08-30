@@ -1,7 +1,7 @@
 # talosbox — Specification v1
 
 **talosbox** (command: **`tbx`**) is a workshop-environment tool that attendees run on their own
-Apple Silicon macOS or amd64/arm64 Linux hosts to manage the full lifecycle of hypervisor-based
+Apple Silicon macOS, best-effort Intel macOS, or amd64/arm64 Linux hosts to manage the full lifecycle of hypervisor-based
 Talos Linux VM clusters. Nodes boot **unconfigured** (maintenance mode) on networking realistic
 enough for production-style Cilium: shared L2 with host-routable IPs by default, optional BGP
 peer mode, reachable ingress, and first-class inter-cluster routing.
@@ -23,7 +23,7 @@ remain **attendee work**; Cilium's built-in ingress controller is disabled.
 
 Out of scope ([original map](https://github.com/randax/talos-box/issues/1),
 [Linux map](https://github.com/randax/talos-box/issues/71)): workshop curriculum,
-instructor-side orchestration, Intel Macs, Windows/WSL2 hosts, machines under 16 GB RAM,
+instructor-side orchestration, Windows/WSL2 hosts, machines under 16 GB RAM,
 rootless Linux networking, and arbitrary application or ingress installation. The curated
 CNI/LoadBalancer path is an explicit opt-in; substrate-only clusters retain the original manual
 workflow and guided hints (§10).
@@ -34,7 +34,8 @@ All supported hosts require **16 GB RAM minimum**.
 
 | Host | Architecture | Version floor | Hypervisor | Notes |
 |---|---|---|---|---|
-| macOS | Apple Silicon (arm64) | macOS 14 (Sonoma) | Virtualization.framework | The macOS 14/15 boot gate remains open (§12 G1); Intel Macs are unsupported |
+| macOS | Apple Silicon (arm64) | macOS 14 (Sonoma) | Virtualization.framework; optional QEMU/HVF | VZ is the default; QEMU/HVF is the verified optional path on macOS 15+ |
+| macOS | Intel (amd64) | macOS 15 / QEMU 6.2 | Optional QEMU/HVF | Best effort only: community-verified, never on the parity bar |
 | Ubuntu LTS | amd64, arm64 | Ubuntu 22.04 / QEMU 6.2 | QEMU/KVM | Tier one; suspend requires QEMU 8.2+, normally Ubuntu 24.04+ |
 | Fedora | amd64, arm64 | Current stable / QEMU 6.2 | QEMU/KVM | Tier one |
 | Arch Linux | amd64, arm64 | Rolling / QEMU 6.2 | QEMU/KVM | Tier one |
@@ -48,8 +49,10 @@ be available through a readable+writable `/dev/kvm`, and the installed QEMU pack
 Suspend/resume is capability-gated rather than part of the general QEMU floor
 ([decision #83](https://github.com/randax/talos-box/issues/83)):
 
-- macOS requires macOS 14+ and retains the exact in-process Virtualization.framework device
+- macOS Virtualization.framework requires macOS 14+ and retains the exact in-process device
   graph; a daemon restart degrades resume to a warned cold boot.
+- macOS QEMU/HVF follows the QEMU save-file path: suspend is available only where the probed
+  QEMU version supports it, and a daemon restart does not discard the saved memory.
 - Linux requires QEMU 8.2+ (`migrate` to/from a file with raw disks). QEMU 6.2–8.1 supports
   every other operation, and `tbx doctor` reports the unavailable capability with an upgrade
   hint. Restore requires the same QEMU version, architecture, and machine type.
@@ -60,12 +63,16 @@ Suspend/resume is capability-gated rather than part of the general QEMU floor
 override of the owner's Rust default; ecosystem gravity: importable Talos machinery,
 `Code-Hex/vz`).
 
-The platform-neutral `internal/hypervisor` boundary has one host backend per operating system:
+The platform-neutral `internal/hypervisor` boundary is an eager per-host registry, not a
+single host-wide backend choice. Each platform constructs every backend it knows at daemon
+start, records availability and capability gates per backend, and resolves the active
+hypervisor per cluster from persisted state or, for legacy empty state, the platform's
+compiled default.
 
-- macOS uses **Virtualization.framework directly via `Code-Hex/vz` v3**
-  ([Select the macOS hypervisor stack](https://github.com/randax/talos-box/issues/2)). Fallback
-  if vz becomes untenable: wrapping `vfkit` over REST.
-- Linux uses **QEMU/KVM directly over QMP**, with no libvirt
+- macOS registers **Virtualization.framework directly via `Code-Hex/vz` v3** as the default,
+  plus optional **QEMU/HVF** where the host probe passes
+  ([Select the macOS hypervisor stack](https://github.com/randax/talos-box/issues/2)).
+- Linux registers **QEMU/KVM directly over QMP**, with no libvirt
   ([Linux hypervisor design](https://github.com/randax/talos-box/issues/77)).
 
 Lima and tart are not used on either platform.
@@ -438,6 +445,7 @@ clusters:
   - name: demo
     controlPlanes: 1
     workers: 2
+    hypervisor: qemu      # optional per-cluster hypervisor: vz | qemu
     talos: {}              # optional per-cluster override of the file-level talos
                            # block; unset fields inherit, set fields override,
                            # extension lists override (extensions: [] = none)
@@ -471,6 +479,13 @@ afterwards, but already-configured nodes are not re-patched (use `talosctl patch
 without a curated `cni:`. Substrate-only users own their machine config and can apply the same
 policy manually; [Guest memory and reclaim](guest-memory.md) documents the patch, trade-offs,
 and the bring-your-own-schematic balloon opt-out.
+
+**Hypervisor selection.** Cluster `hypervisor` overrides `TBX_HYPERVISOR`, which overrides the
+compiled default. The daemon stores the resolved choice in cluster state when a cluster is
+created; an empty legacy state value means the platform's compiled default, not the current
+environment-selected default. `tbx up` refuses drift with `cluster "<name>": hypervisor is
+immutable (cluster has "<old>", talosbox.yaml wants "<new>"); destroy and recreate the cluster
+to change the hypervisor`. `tbx status` reports the resolved choice in its `HYPERVISOR` column.
 
 **Curated CSI semantics.** `csi:` is a flat scalar and rejects any value without a curated
 `cni:` before anything mutates. Longhorn (pinned v1-series) is the multinode engine; local-path
@@ -510,8 +525,8 @@ too (§7).
 
 ## 10. Guided output
 
-`tbx status` is **state-aware**: alongside nodes/IPs/DNS names/LB pool/BGP state and the
-storage phase (provisioning → live, gated by the write/readback probe, §9) it appends
+`tbx status` is **state-aware**: alongside nodes/IPs/DNS names/hypervisor/LB pool/BGP state and
+the storage phase (provisioning → live, gated by the write/readback probe, §9) it appends
 copy-pasteable next-step hints keyed to observed state (maintenance node → the
 `talosctl --insecure` probe; provisioned clusters report convergence progress and the
 recovery that actually applies — a safe `tbx up` rerun for clusters a `talosbox.yaml` backs,
@@ -532,6 +547,12 @@ distinct from the per-phase budgets the daemon narrates (`CNI budget`, `CNI+stor
 The CLI stops waiting once that bound plus a grace passes **without any sign of life**: a
 narrated call re-arms the wait on every stage the daemon sends, so only a gate that goes silent
 fails the verb instead of hanging it.
+
+`tbx doctor` also prints an INFO `Hypervisors` section before the rest of the checks. Each line
+names one hypervisor, its availability, the current default source (`default=yes (source=compiled)`
+or `default=yes (source=TBX_HYPERVISOR)`), and the feature gates used by `tbx status`. When a
+hypervisor is unavailable, the line carries its exact reason and, if the hypervisor supplied
+one, `remediation: <text>` inside the parentheses.
 
 **State-changing verbs narrate their stages.** `cluster create`, `snapshot create|restore`,
 `node add|remove` and `node start|stop` stream the daemon's stages to stderr as the work

@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/randax/talos-box/internal/helper"
 )
 
 const qemuIncomingOffset = 1 << 20
@@ -57,11 +59,15 @@ type qemuFirmwareCandidate struct {
 
 type qemuLaunchConfig struct {
 	Architecture Architecture
+	Machine      string
+	Accelerator  string
+	CPU          string
 	CPUs         int
 	MemoryMiB    int
 	DiskPath     string
 	MAC          string
-	TapFD        int
+	NetworkKind  helper.AttachmentKind
+	NetworkFD    int
 	ConsoleFD    int
 	// GuestAgentFD is the inherited listening socket QEMU accepts guest-agent
 	// clients on. Zero means no guest-agent channel: QEMU inherits 0-2 as its
@@ -244,6 +250,13 @@ func buildQEMUArgv(cfg qemuLaunchConfig) ([]string, error) {
 	if err := validateQEMULaunchConfig(cfg); err != nil {
 		return nil, err
 	}
+	var netdev string
+	switch cfg.NetworkKind {
+	case helper.AttachmentTapFD:
+		netdev = qemuOption("tap", "id=net0", "fd="+strconv.Itoa(cfg.NetworkFD))
+	case helper.AttachmentDatagramFD:
+		netdev = qemuOption("dgram", "id=net0", "local.type=fd", "local.str="+strconv.Itoa(cfg.NetworkFD))
+	}
 
 	args := []string{
 		system.Binary,
@@ -251,9 +264,9 @@ func buildQEMUArgv(cfg qemuLaunchConfig) ([]string, error) {
 		"-display", "none",
 		"-no-reboot",
 		"-S",
-		"-machine", system.Machine,
-		"-accel", "kvm",
-		"-cpu", "host",
+		"-machine", cfg.Machine,
+		"-accel", cfg.Accelerator,
+		"-cpu", cfg.CPU,
 		"-smp", strconv.Itoa(cfg.CPUs),
 		"-m", strconv.Itoa(cfg.MemoryMiB),
 		"-drive", qemuOption(
@@ -283,11 +296,7 @@ func buildQEMUArgv(cfg qemuLaunchConfig) ([]string, error) {
 			"virtio-blk-pci",
 			"drive=osdisk",
 		),
-		"-netdev", qemuOption(
-			"tap",
-			"id=net0",
-			"fd="+strconv.Itoa(cfg.TapFD),
-		),
+		"-netdev", netdev,
 		"-device", qemuOption(
 			"virtio-net-pci",
 			"netdev=net0",
@@ -366,12 +375,18 @@ func buildQEMUArgv(cfg qemuLaunchConfig) ([]string, error) {
 
 func validateQEMULaunchConfig(cfg qemuLaunchConfig) error {
 	switch {
+	case cfg.Machine == "":
+		return errors.New("QEMU machine is required")
+	case cfg.Accelerator == "":
+		return errors.New("QEMU accelerator is required")
+	case cfg.CPU == "":
+		return errors.New("QEMU CPU is required")
 	case cfg.CPUs <= 0:
 		return errors.New("QEMU CPUs must be greater than zero")
 	case cfg.MemoryMiB <= 0:
 		return errors.New("QEMU memory must be greater than zero")
-	case cfg.TapFD < 0:
-		return errors.New("QEMU tap FD must be non-negative")
+	case cfg.NetworkFD < 0:
+		return errors.New("QEMU network FD must be non-negative")
 	case cfg.ConsoleFD < 0:
 		return errors.New("QEMU console FD must be non-negative")
 	case cfg.GuestAgentFD < 0:
@@ -380,6 +395,11 @@ func validateQEMULaunchConfig(cfg qemuLaunchConfig) error {
 		return errors.New("QEMU firmware code path is required")
 	case cfg.Firmware.VarsPath == "":
 		return errors.New("QEMU firmware vars path is required")
+	}
+	switch cfg.NetworkKind {
+	case helper.AttachmentTapFD, helper.AttachmentDatagramFD:
+	default:
+		return fmt.Errorf("%w: QEMU cannot use network attachment kind %q", ErrUnsupported, cfg.NetworkKind)
 	}
 	if _, err := net.ParseMAC(cfg.MAC); err != nil {
 		return fmt.Errorf("parse QEMU MAC address: %w", err)

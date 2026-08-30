@@ -56,7 +56,7 @@ func TestQEMUNewMachineClosesRejectedAttachment(t *testing.T) {
 		EFIVarsPath:       filepath.Join(dir, "node.efi"),
 		ConsoleSocketPath: filepath.Join(dir, "node.console.sock"),
 		Network: func() (*helper.Attachment, error) {
-			return &helper.Attachment{Kind: helper.AttachmentDatagramFD, File: read}, nil
+			return &helper.Attachment{Kind: helper.AttachmentKind("unknown-fd"), File: read}, nil
 		},
 	})
 	if !errors.Is(err, ErrUnsupported) {
@@ -64,6 +64,88 @@ func TestQEMUNewMachineClosesRejectedAttachment(t *testing.T) {
 	}
 	if _, err := read.Stat(); err == nil {
 		t.Fatal("rejected network attachment remained open")
+	}
+}
+
+func TestQEMUNewMachineAcceptsBothNetworkAttachmentKinds(t *testing.T) {
+	tests := []struct {
+		name       string
+		kind       helper.AttachmentKind
+		guestAgent bool
+	}{
+		{name: "tap without guest agent", kind: helper.AttachmentTapFD},
+		{name: "tap with guest agent", kind: helper.AttachmentTapFD, guestAgent: true},
+		{name: "datagram without guest agent", kind: helper.AttachmentDatagramFD},
+		{name: "datagram with guest agent", kind: helper.AttachmentDatagramFD, guestAgent: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir, err := os.MkdirTemp("/tmp", "tbx-qemu-network-test-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = os.RemoveAll(dir) }()
+			varsTemplate := filepath.Join(dir, "OVMF_VARS.fd")
+			if err := os.WriteFile(varsTemplate, []byte("vars"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			network, peer, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = peer.Close() }()
+			backend := &qemuHypervisor{
+				architecture: ArchitectureAMD64,
+				system:       qemuSystem{Machine: "q35"},
+				accelerator:  "kvm",
+				cpu:          "host",
+				firmware:     qemuFirmware{VarsPath: varsTemplate},
+				newConsole: func(string) (*consoleProxy, *os.File, error) {
+					file, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+					return nil, file, err
+				},
+			}
+			guestAgentPath := ""
+			if test.guestAgent {
+				guestAgentPath = filepath.Join(dir, "node.qga.sock")
+			}
+			machine, err := backend.newMachine(Spec{
+				CPUs:                 1,
+				MemoryMiB:            1024,
+				DiskPath:             filepath.Join(dir, "node.img"),
+				MAC:                  "02:00:00:00:00:01",
+				EFIVarsPath:          filepath.Join(dir, "node.efi"),
+				ConsoleSocketPath:    filepath.Join(dir, "node.console.sock"),
+				GuestAgentSocketPath: guestAgentPath,
+				Network: func() (*helper.Attachment, error) {
+					return &helper.Attachment{Kind: test.kind, File: network}, nil
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			files := machine.extraFiles()
+			wantFiles := 2
+			if test.guestAgent {
+				wantFiles = 3
+			}
+			if len(files) != wantFiles || files[0] != network || files[1] != machine.consoleGuest {
+				t.Fatalf("extraFiles() = %v, want network then console with length %d", files, wantFiles)
+			}
+			cfg := machine.launchConfig("/run/qmp.sock", "")
+			if cfg.NetworkKind != test.kind || cfg.NetworkFD != 3 {
+				t.Fatalf("launch network = %q fd %d, want %q fd 3", cfg.NetworkKind, cfg.NetworkFD, test.kind)
+			}
+			if cfg.Machine != "q35" || cfg.Accelerator != "kvm" || cfg.CPU != "host" {
+				t.Fatalf("launch platform = machine %q accelerator %q CPU %q", cfg.Machine, cfg.Accelerator, cfg.CPU)
+			}
+			if test.guestAgent && (cfg.GuestAgentFD != 5 || files[2] != machine.guestAgent) {
+				t.Fatalf("guest-agent launch mapping = fd %d files %v", cfg.GuestAgentFD, files)
+			}
+			if err := machine.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
@@ -121,6 +203,9 @@ func TestQEMUNewMachineBindsGuestAgentSocket(t *testing.T) {
 	if got, want := machine.launchConfig("/run/qmp.sock", "").GuestAgentFD, 5; got != want {
 		t.Fatalf("launchConfig().GuestAgentFD = %d, want %d", got, want)
 	}
+	if cfg := machine.launchConfig("/run/qmp.sock", ""); cfg.NetworkKind != helper.AttachmentTapFD || cfg.NetworkFD != 3 {
+		t.Fatalf("launchConfig() network = %q fd %d, want tap fd 3", cfg.NetworkKind, cfg.NetworkFD)
+	}
 	if err := machine.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -167,6 +252,9 @@ func TestQEMUNewMachineWithoutGuestAgent(t *testing.T) {
 	}
 	if got := machine.launchConfig("/run/qmp.sock", "").GuestAgentFD; got != 0 {
 		t.Fatalf("launchConfig().GuestAgentFD = %d, want 0", got)
+	}
+	if cfg := machine.launchConfig("/run/qmp.sock", ""); cfg.NetworkKind != helper.AttachmentTapFD || cfg.NetworkFD != 3 {
+		t.Fatalf("launchConfig() network = %q fd %d, want tap fd 3", cfg.NetworkKind, cfg.NetworkFD)
 	}
 }
 
@@ -223,6 +311,8 @@ func TestQEMULaunchStopAndCloseLifecycle(t *testing.T) {
 		architecture: ArchitectureAMD64,
 		system:       qemuSystem{Binary: "qemu-system-x86_64", Machine: "q35"},
 		binary:       os.Args[0],
+		accelerator:  "kvm",
+		cpu:          "host",
 		firmware:     qemuFirmware{CodePath: filepath.Join(dir, "OVMF_CODE.fd"), VarsPath: varsTemplate},
 		version:      qemuVersion{Major: 8, Minor: 2, Patch: 2},
 		capabilities: qemuCapabilities(qemuVersion{Major: 8, Minor: 2, Patch: 2}),
