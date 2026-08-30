@@ -34,6 +34,141 @@ func TestQEMULaunchValidatesBeforeAcquiringNetwork(t *testing.T) {
 	}
 }
 
+func TestQEMULaunchRefusesSaveIdentityMismatchBeforeStarting(t *testing.T) {
+	currentVersion := qemuVersion{Major: 8, Minor: 2, Patch: 2}
+	currentArchitecture := ArchitectureAMD64
+	currentMachine := "q35"
+	compatible := qemuSaveMetadata{
+		Schema:       qemuSaveSchema,
+		Backend:      qemuSaveBackend,
+		QEMUVersion:  currentVersion.String(),
+		Architecture: currentArchitecture,
+		Machine:      currentMachine,
+	}
+	tests := []struct {
+		name     string
+		metadata qemuSaveMetadata
+	}{
+		{name: "backend", metadata: func() qemuSaveMetadata {
+			metadata := compatible
+			metadata.Backend = "vz"
+			return metadata
+		}()},
+		{name: "QEMU version", metadata: func() qemuSaveMetadata {
+			metadata := compatible
+			metadata.QEMUVersion = "8.2.1"
+			return metadata
+		}()},
+		{name: "architecture", metadata: func() qemuSaveMetadata {
+			metadata := compatible
+			metadata.Architecture = ArchitectureARM64
+			return metadata
+		}()},
+		{name: "machine", metadata: func() qemuSaveMetadata {
+			metadata := compatible
+			metadata.Machine = "virt"
+			return metadata
+		}()},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			savePath := filepath.Join(dir, "node.vzstate")
+			encoded, err := json.Marshal(test.metadata)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(savePath, append(encoded, '\n'), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			varsTemplate := filepath.Join(dir, "OVMF_VARS.fd")
+			if err := os.WriteFile(varsTemplate, []byte("vars"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			fallbackCalled := false
+			networkAcquired := false
+			backend := &qemuHypervisor{
+				architecture: currentArchitecture,
+				system:       qemuSystem{Machine: currentMachine},
+				version:      currentVersion,
+				capabilities: qemuCapabilities(currentVersion),
+				firmware:     qemuFirmware{VarsPath: varsTemplate},
+			}
+			_, err = backend.Launch(context.Background(), Spec{
+				CPUs:              1,
+				MemoryMiB:         1024,
+				DiskPath:          filepath.Join(dir, "node.img"),
+				MAC:               "02:00:00:00:00:01",
+				EFIVarsPath:       filepath.Join(dir, "node.efi"),
+				ConsoleSocketPath: filepath.Join(dir, "node.console.sock"),
+				Network: func() (*helper.Attachment, error) {
+					networkAcquired = true
+					return nil, errors.New("cold boot attempted")
+				},
+				Restore: &Restore{Path: savePath, Fallback: func(error) {
+					fallbackCalled = true
+				}},
+			})
+			if !errors.Is(err, ErrIncompatibleSave) {
+				t.Fatalf("Launch() = %v, want ErrIncompatibleSave", err)
+			}
+			if fallbackCalled {
+				t.Fatal("identity mismatch was reported as a cold-boot fallback")
+			}
+			if networkAcquired {
+				t.Fatal("identity mismatch acquired the network for a cold boot")
+			}
+			if _, err := os.Stat(savePath); err != nil {
+				t.Fatalf("identity mismatch removed retryable save: %v", err)
+			}
+		})
+	}
+}
+
+func TestQEMULaunchMalformedSaveKeepsColdBootFallback(t *testing.T) {
+	dir := t.TempDir()
+	savePath := filepath.Join(dir, "node.vzstate")
+	if err := os.WriteFile(savePath, []byte("not-json\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	varsTemplate := filepath.Join(dir, "OVMF_VARS.fd")
+	if err := os.WriteFile(varsTemplate, []byte("vars"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	currentVersion := qemuVersion{Major: 8, Minor: 2, Patch: 2}
+	backend := &qemuHypervisor{
+		architecture: ArchitectureAMD64,
+		system:       qemuSystem{Machine: "q35"},
+		version:      currentVersion,
+		capabilities: qemuCapabilities(currentVersion),
+		firmware:     qemuFirmware{VarsPath: varsTemplate},
+	}
+	coldBootErr := errors.New("cold boot attempted")
+	var fallbackErr error
+	_, err := backend.Launch(context.Background(), Spec{
+		CPUs:              1,
+		MemoryMiB:         1024,
+		DiskPath:          filepath.Join(dir, "node.img"),
+		MAC:               "02:00:00:00:00:01",
+		EFIVarsPath:       filepath.Join(dir, "node.efi"),
+		ConsoleSocketPath: filepath.Join(dir, "node.console.sock"),
+		Network: func() (*helper.Attachment, error) {
+			return nil, coldBootErr
+		},
+		Restore: &Restore{Path: savePath, Fallback: func(err error) {
+			fallbackErr = err
+		}},
+	})
+	if !errors.Is(err, coldBootErr) {
+		t.Fatalf("Launch() = %v, want cold-boot attempt", err)
+	}
+	if !errors.Is(fallbackErr, ErrIncompatibleSave) {
+		t.Fatalf("fallback = %v, want malformed save reported as ErrIncompatibleSave", fallbackErr)
+	}
+}
+
 func TestQEMUNewMachineClosesRejectedAttachment(t *testing.T) {
 	dir := t.TempDir()
 	varsTemplate := filepath.Join(dir, "OVMF_VARS.fd")
