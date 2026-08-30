@@ -895,14 +895,20 @@ func (c cli) doctorDependencies() doctorDependencies {
 	return deps
 }
 
-// doctorCall deliberately uses exchange directly instead of cli.call: diagnostics
-// must report an absent daemon as SKIP, not start one as a side effect.
+// doctorCallTimeout bounds each diagnostic RPC. Doctor asks only for quick
+// inventory reads, so a daemon that accepts the socket but never answers must
+// surface as a finding, not hang the whole report (#392 for the mechanism).
+var doctorCallTimeout = 10 * time.Second
+
+// doctorCall deliberately uses exchangeWithin directly instead of cli.call:
+// diagnostics must report an absent daemon as SKIP, not start one as a side
+// effect, and must finish even when the daemon stalls.
 func (c cli) doctorCall(op string, args, destination any) error {
 	socketPath, err := daemon.SocketPath()
 	if err != nil {
 		return err
 	}
-	response, err := exchange(socketPath, op, args)
+	response, err := exchangeWithin(socketPath, op, args, doctorCallTimeout)
 	if err != nil {
 		return err
 	}
