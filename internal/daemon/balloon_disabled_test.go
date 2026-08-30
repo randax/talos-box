@@ -19,7 +19,7 @@ func TestDisabledBalloonLaunchesWithoutDeviceAndReclaimsNothing(t *testing.T) {
 		BalloonReadback: hypervisor.FeatureStatus{Supported: true},
 	}}
 	service := &Server{
-		hypervisor:      backend,
+		hypervisors:     singleFakeRegistry(backend),
 		vms:             make(map[string]map[string]hypervisor.Machine),
 		subnetSources:   emptySubnetSources(),
 		balloonDisabled: true,

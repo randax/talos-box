@@ -479,16 +479,7 @@ func (m *qemuMachine) Suspend(ctx context.Context, savePath string) (result erro
 			_ = m.qmp.execute(resumeCtx, "cont", nil, nil)
 		}
 	}()
-	if err := m.qmp.execute(ctx, "migrate", map[string]any{
-		"channels": []any{map[string]any{
-			"channel-type": "main",
-			"addr": map[string]any{
-				"transport": "file",
-				"filename":  temporary,
-				"offset":    fmt.Sprintf("0x%x", qemuSaveOffset),
-			},
-		}},
-	}, nil); err != nil {
+	if err := m.qmp.execute(ctx, "migrate", qemuFileMigrateArguments(temporary), nil); err != nil {
 		return fmt.Errorf("start QEMU file migration: %w", err)
 	}
 	if err := waitQEMUMigration(ctx, m.qmp); err != nil {
@@ -508,6 +499,19 @@ func (m *qemuMachine) Suspend(ctx context.Context, savePath string) (result erro
 	m.cleanupExitedQMP()
 	saved = true
 	return nil
+}
+
+func qemuFileMigrateArguments(path string) map[string]any {
+	return map[string]any{
+		"channels": []any{map[string]any{
+			"channel-type": "main",
+			"addr": map[string]any{
+				"transport": "file",
+				"filename":  path,
+				"offset":    uint64(qemuSaveOffset),
+			},
+		}},
+	}
 }
 
 func (m *qemuMachine) cleanupExitedQMP() {

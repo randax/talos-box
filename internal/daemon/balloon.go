@@ -3,6 +3,7 @@ package daemon
 import (
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"sync"
@@ -83,6 +84,7 @@ type balloonCandidate struct {
 	currentTargetMiB        int
 	ip                      string
 	tolerateDeviceNotActive bool
+	balloonReadback         bool
 }
 
 // Balloonables snapshots the CONFIGURED running nodes for the balloon manager,
@@ -95,17 +97,16 @@ func (s *Server) Balloonables() map[string]balloon.Balloonable {
 	if s.balloonDisabled {
 		return nil
 	}
-	balloonReadback := s.hypervisor.Capabilities().BalloonReadback.Supported
 	s.opMu.Lock()
-	candidates := s.balloonCandidatesLocked(balloonReadback)
+	candidates := s.balloonCandidatesLocked()
 	s.opMu.Unlock()
-	return s.balloonablesFrom(candidates, balloonReadback)
+	return s.balloonablesFrom(candidates)
 }
 
 // balloonablesFrom is the package-level constructor bound to this server's
 // target ledger and teardown latch.
-func (s *Server) balloonablesFrom(candidates map[string]balloonCandidate, balloonReadback bool) map[string]balloon.Balloonable {
-	return balloonablesFrom(candidates, balloonReadback, s.recordBalloonTarget, s.balloonQuiesced)
+func (s *Server) balloonablesFrom(candidates map[string]balloonCandidate) map[string]balloon.Balloonable {
+	return balloonablesFrom(candidates, s.recordBalloonTarget, s.balloonQuiesced)
 }
 
 // quiesceBalloon takes the teardown latch: while any caller holds it the
@@ -137,19 +138,24 @@ func (s *Server) balloonQuiesced() bool {
 // shortfall against the measured host, so the roomy-host path never probes, and
 // the probe is bounded by its own dial timeout.
 func (s *Server) balloonablesLocked() map[string]balloon.Balloonable {
-	balloonReadback := s.hypervisor.Capabilities().BalloonReadback.Supported
-	return s.balloonablesFrom(s.balloonCandidatesLocked(balloonReadback), balloonReadback)
+	return s.balloonablesFrom(s.balloonCandidatesLocked())
 }
 
 // balloonCandidatesLocked reads the running, configured nodes out of the VM
 // inventory. Callers must hold opMu.
-func (s *Server) balloonCandidatesLocked(balloonReadback bool) map[string]balloonCandidate {
+func (s *Server) balloonCandidatesLocked() map[string]balloonCandidate {
 	candidates := map[string]balloonCandidate{}
 	for clusterName, nodes := range s.vms {
 		item, err := cluster.Load(clusterName)
 		if err != nil {
 			continue
 		}
+		_, backend, err := s.hypervisorForCluster(item)
+		if err != nil {
+			log.Printf("resolve hypervisor for balloon candidates in cluster %s: %v", clusterName, err)
+			continue
+		}
+		balloonReadback := backend.Capabilities().BalloonReadback.Supported
 		byName := map[string]cluster.Node{}
 		for _, n := range item.Nodes {
 			byName[n.Name] = n
@@ -167,6 +173,7 @@ func (s *Server) balloonCandidatesLocked(balloonReadback bool) map[string]balloo
 				currentTargetMiB:        s.balloonTargetMiB(key),
 				ip:                      cluster.LookupIP(node.MAC, item.SubnetIndex),
 				tolerateDeviceNotActive: balloonReadback,
+				balloonReadback:         balloonReadback,
 			}
 		}
 	}
@@ -177,10 +184,10 @@ func (s *Server) balloonCandidatesLocked(balloonReadback bool) map[string]balloo
 }
 
 // balloonablesFrom applies the eligibility rule to the captured candidates.
-func balloonablesFrom(candidates map[string]balloonCandidate, balloonReadback bool, record func(string, int), quiesced func() bool) map[string]balloon.Balloonable {
+func balloonablesFrom(candidates map[string]balloonCandidate, record func(string, int), quiesced func() bool) map[string]balloon.Balloonable {
 	out := map[string]balloon.Balloonable{}
 	for key, e := range candidates {
-		if balloonReadback || (e.ip != "" && ClassifyPhase(true, probeAPID(e.ip)) == PhaseConfigured) {
+		if e.balloonReadback || (e.ip != "" && ClassifyPhase(true, probeAPID(e.ip)) == PhaseConfigured) {
 			machine := balloonMachine{
 				machine:                 e.machine,
 				configuredMiB:           e.configuredMiB,

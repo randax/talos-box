@@ -325,7 +325,17 @@ func TestQEMUBalloonSetAndReadback(t *testing.T) {
 	}
 }
 
-func TestQEMUSuspendUsesFileMigrationAndRetainsMachine(t *testing.T) {
+type qmpMigrateTestArguments struct {
+	Channels []struct {
+		Address struct {
+			Transport string `json:"transport"`
+			Filename  string `json:"filename"`
+			Offset    uint64 `json:"offset"`
+		} `json:"addr"`
+	} `json:"channels"`
+}
+
+func TestQEMUSuspendSendsUint64FileMigrationOffset(t *testing.T) {
 	dir := t.TempDir()
 	savePath := filepath.Join(dir, "node.vzstate")
 	process := &qemuProcess{done: make(chan struct{})}
@@ -338,18 +348,13 @@ func TestQEMUSuspendUsesFileMigrationAndRetainsMachine(t *testing.T) {
 		case "stop":
 			return map[string]any{}, false
 		case "migrate":
-			var arguments struct {
-				Channels []struct {
-					Address struct {
-						Transport string `json:"transport"`
-						Filename  string `json:"filename"`
-						Offset    string `json:"offset"`
-					} `json:"addr"`
-				} `json:"channels"`
-			}
+			var arguments qmpMigrateTestArguments
 			if err := json.Unmarshal(request.Arguments, &arguments); err != nil {
 				t.Errorf("decode migrate arguments: %v", err)
-			} else if len(arguments.Channels) != 1 || arguments.Channels[0].Address.Transport != "file" || arguments.Channels[0].Address.Offset != "0x100000" {
+
+				return map[string]any{}, false
+			}
+			if len(arguments.Channels) != 1 || arguments.Channels[0].Address.Transport != "file" || arguments.Channels[0].Address.Offset != uint64(qemuSaveOffset) {
 				t.Errorf("migrate arguments = %+v", arguments)
 			} else {
 				migrationPath = arguments.Channels[0].Address.Filename
@@ -404,6 +409,22 @@ func TestQEMUSuspendUsesFileMigrationAndRetainsMachine(t *testing.T) {
 	}
 	if machine.Active() {
 		t.Fatal("machine remained active after suspend")
+	}
+}
+
+func TestQMPMigrateArgumentsRejectStringOffset(t *testing.T) {
+	var arguments qmpMigrateTestArguments
+	if err := json.Unmarshal([]byte(`{"channels":[{"addr":{"offset":1048576}}]}`), &arguments); err != nil {
+		t.Fatalf("decode numeric offset: %v", err)
+	}
+	if got := arguments.Channels[0].Address.Offset; got != uint64(qemuSaveOffset) {
+		t.Fatalf("numeric offset = %d, want %d", got, uint64(qemuSaveOffset))
+	}
+
+	err := json.Unmarshal([]byte(`{"channels":[{"addr":{"offset":"0x100000"}}]}`), &arguments)
+	var typeError *json.UnmarshalTypeError
+	if !errors.As(err, &typeError) {
+		t.Fatalf("decode string offset error = %v, want JSON type error", err)
 	}
 }
 

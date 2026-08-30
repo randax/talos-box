@@ -28,9 +28,9 @@ func teardownTestServer(t *testing.T, machines ...hypervisor.Machine) (*Server, 
 		nodes[item.Nodes[i].Name] = machine
 	}
 	service := &Server{
-		hypervisor: &fakeHypervisor{capabilities: hypervisor.Capabilities{
+		hypervisors: singleFakeRegistry(&fakeHypervisor{capabilities: hypervisor.Capabilities{
 			BalloonReadback: hypervisor.FeatureStatus{Supported: true},
-		}},
+		}}),
 		vms: map[string]map[string]hypervisor.Machine{item.Name: nodes},
 	}
 	return service, item

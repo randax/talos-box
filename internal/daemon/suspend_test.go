@@ -69,7 +69,7 @@ func TestSuspendInvalidatesStorageLiveObservation(t *testing.T) {
 	}
 	machine := &suspendMachineFake{}
 	service := &Server{
-		hypervisor:    &fakeHypervisor{capabilities: hypervisor.Capabilities{Suspend: hypervisor.FeatureStatus{Supported: true}}},
+		hypervisors:   singleFakeRegistry(&fakeHypervisor{capabilities: hypervisor.Capabilities{Suspend: hypervisor.FeatureStatus{Supported: true}}}),
 		vms:           map[string]map[string]hypervisor.Machine{item.Name: {item.Nodes[0].Name: machine}},
 		storagePhases: map[string]StoragePhase{item.Name: StoragePhaseLive},
 	}
@@ -91,7 +91,7 @@ func TestUnsupportedSuspendPreservesStorageLiveObservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	service := &Server{
-		hypervisor:    &fakeHypervisor{},
+		hypervisors:   singleFakeRegistry(&fakeHypervisor{}),
 		vms:           map[string]map[string]hypervisor.Machine{item.Name: {item.Nodes[0].Name: &suspendMachineFake{}}},
 		storagePhases: map[string]StoragePhase{item.Name: StoragePhaseLive},
 	}
@@ -114,9 +114,9 @@ func TestSuspendCancelsActiveProvisioning(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	service := &Server{
-		hypervisor: &fakeHypervisor{capabilities: hypervisor.Capabilities{Suspend: hypervisor.FeatureStatus{Supported: true}}},
-		vms:        map[string]map[string]hypervisor.Machine{item.Name: {item.Nodes[0].Name: &suspendMachineFake{}}},
-		provisions: map[string]activeProvision{item.Name: {generation: 1, cancel: cancel}},
+		hypervisors: singleFakeRegistry(&fakeHypervisor{capabilities: hypervisor.Capabilities{Suspend: hypervisor.FeatureStatus{Supported: true}}}),
+		vms:         map[string]map[string]hypervisor.Machine{item.Name: {item.Nodes[0].Name: &suspendMachineFake{}}},
+		provisions:  map[string]activeProvision{item.Name: {generation: 1, cancel: cancel}},
 	}
 	if _, err := service.suspendCluster([]byte(`{"name":"demo"}`)); err != nil {
 		t.Fatal(err)
@@ -265,13 +265,13 @@ func TestSuspendClusterFastFailsWithCapabilityReason(t *testing.T) {
 
 	machine := &suspendMachineFake{}
 	service := &Server{
-		hypervisor: &fakeHypervisor{
+		hypervisors: singleFakeRegistry(&fakeHypervisor{
 			capabilities: hypervisor.Capabilities{
 				Suspend: hypervisor.FeatureStatus{
 					Reason: "suspend requires QEMU >= 8.2 (found 6.2) — upgrade to Ubuntu 24.04+",
 				},
 			},
-		},
+		}),
 		vms: map[string]map[string]hypervisor.Machine{
 			item.Name: {item.Nodes[0].Name: machine},
 		},
@@ -419,7 +419,7 @@ func TestResumeReportsClockDriftOnlyWhenANodeRestored(t *testing.T) {
 				return &fakeMachine{active: true}, nil
 			}}
 			service := &Server{
-				hypervisor:    backend,
+				hypervisors:   singleFakeRegistry(backend),
 				vms:           make(map[string]map[string]hypervisor.Machine),
 				subnetSources: emptySubnetSources(),
 			}
@@ -461,10 +461,10 @@ func TestSavedStateStaleOnlyWhereRestoreNeedsTheWritingProcess(t *testing.T) {
 			}
 
 			service := &Server{
-				hypervisor: &fakeHypervisor{capabilities: hypervisor.Capabilities{
+				hypervisors: singleFakeRegistry(&fakeHypervisor{capabilities: hypervisor.Capabilities{
 					Suspend:                      hypervisor.FeatureStatus{Supported: true},
 					SuspendSurvivesDaemonRestart: testCase.survives,
-				}},
+				}}),
 				vms: make(map[string]map[string]hypervisor.Machine),
 			}
 			statuses, err := service.status(mustRawJSON(t, statusArgs{Cluster: "qa-own"}))

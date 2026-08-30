@@ -81,7 +81,7 @@ func stoppedClusterForStart(t *testing.T) (*Server, cluster.Cluster) {
 		t.Fatal(err)
 	}
 	return &Server{
-		hypervisor:      &fakeHypervisor{architecture: hypervisor.ArchitectureARM64},
+		hypervisors:     singleFakeRegistry(&fakeHypervisor{architecture: hypervisor.ArchitectureARM64}),
 		vms:             make(map[string]map[string]hypervisor.Machine),
 		hostPressure:    noHostPressure,
 		hostTotalMemory: plentifulHostMemory,

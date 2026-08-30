@@ -73,7 +73,7 @@ func TestSnapshotCreateStopsRunningClusterBeforeCloningAndRestartsAfter(t *testi
 			t.Fatalf("snapshot disk for %s = %q, want the post-stop contents: cloning a live disk is not crash-consistent", node.Name, clone)
 		}
 	}
-	backend := service.hypervisor.(*fakeHypervisor)
+	backend := defaultFakeHypervisor(service)
 	if len(backend.specs) != len(item.Nodes) {
 		t.Fatalf("relaunched %d nodes, want the running cluster restarted with %d", len(backend.specs), len(item.Nodes))
 	}
@@ -92,7 +92,7 @@ func TestSnapshotCreateLeavesAStoppedClusterStopped(t *testing.T) {
 	if !response.OK {
 		t.Fatalf("snapshot.create on a stopped cluster failed: %s", response.Error)
 	}
-	if backend := service.hypervisor.(*fakeHypervisor); len(backend.specs) != 0 {
+	if backend := defaultFakeHypervisor(service); len(backend.specs) != 0 {
 		t.Fatalf("snapshot of a stopped cluster launched %d nodes, want none", len(backend.specs))
 	}
 	if service.clusterRunning(item.Name) {
@@ -107,12 +107,12 @@ func TestSnapshotCreateLeavesAStoppedClusterStopped(t *testing.T) {
 func TestSnapshotCreateReportsARestartFailureAsASucceededSnapshot(t *testing.T) {
 	service, item := runningLonghornClusterForNodeMutation(t, 1, 1)
 	dir := liveDisks(t, item, "running")
-	service.hypervisor = &fakeHypervisor{
+	setFakeHypervisor(service, &fakeHypervisor{
 		architecture: hypervisor.ArchitectureARM64,
 		launch: func(context.Context, hypervisor.Spec) (hypervisor.Machine, error) {
 			return nil, errors.New("no hypervisor")
 		},
-	}
+	})
 
 	response := dispatchSnapshotCreateRequest(t, service, item.Name, "baseline")
 

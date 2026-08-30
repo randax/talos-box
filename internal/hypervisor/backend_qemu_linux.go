@@ -15,8 +15,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// New probes the host QEMU/KVM backend once before the daemon accepts work.
-func New(ctx context.Context) (Hypervisor, error) {
+// newQEMU probes the host QEMU/KVM backend once before the daemon accepts work.
+func newQEMU(ctx context.Context) (Hypervisor, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -54,13 +54,6 @@ func New(ctx context.Context) (Hypervisor, error) {
 		verifyPeer:   verifyQMPPeer,
 		saved:        make(map[string]*qemuMachine),
 	}, nil
-}
-
-// GuestAgentSupport reports the host's guest-agent capability without probing a
-// backend, so `tbx doctor` can explain the gate with the daemon down. QEMU can
-// always carry the channel; only the extension itself is optional.
-func GuestAgentSupport() FeatureStatus {
-	return FeatureStatus{Supported: true}
 }
 
 func probeKVM(path string) error {

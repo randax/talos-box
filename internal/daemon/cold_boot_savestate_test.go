@@ -34,7 +34,7 @@ func TestStartClusterDiscardsStaleSavedState(t *testing.T) {
 	writeSavedState(t, item)
 
 	service := &Server{
-		hypervisor:      &fakeHypervisor{},
+		hypervisors:     singleFakeRegistry(&fakeHypervisor{}),
 		vms:             make(map[string]map[string]hypervisor.Machine),
 		hostPressure:    noHostPressure,
 		hostTotalMemory: plentifulHostMemory,
@@ -102,9 +102,9 @@ func TestStartClusterKeepsSavedStateWhenLaunchFails(t *testing.T) {
 	writeSavedState(t, item)
 
 	service := &Server{
-		hypervisor: &fakeHypervisor{launch: func(context.Context, hypervisor.Spec) (hypervisor.Machine, error) {
+		hypervisors: singleFakeRegistry(&fakeHypervisor{launch: func(context.Context, hypervisor.Spec) (hypervisor.Machine, error) {
 			return nil, errors.New("no hypervisor today")
-		}},
+		}}),
 		vms:             make(map[string]map[string]hypervisor.Machine),
 		hostPressure:    noHostPressure,
 		hostTotalMemory: plentifulHostMemory,
@@ -148,13 +148,13 @@ func TestStartClusterDiscardsOnlyLaunchedNodesSavedStateWhenALaterLaunchFails(t 
 
 	var launches int
 	service := &Server{
-		hypervisor: &fakeHypervisor{launch: func(context.Context, hypervisor.Spec) (hypervisor.Machine, error) {
+		hypervisors: singleFakeRegistry(&fakeHypervisor{launch: func(context.Context, hypervisor.Spec) (hypervisor.Machine, error) {
 			launches++
 			if launches == 1 {
 				return &fakeMachine{active: true}, nil
 			}
 			return nil, errors.New("no hypervisor today")
-		}},
+		}}),
 		vms:             make(map[string]map[string]hypervisor.Machine),
 		hostPressure:    noHostPressure,
 		hostTotalMemory: plentifulHostMemory,
@@ -205,9 +205,9 @@ func TestNodeStartKeepsSavedStateWhenLaunchFails(t *testing.T) {
 	stubNodeMutationReconcile(service)
 	writeSavedState(t, item)
 	delete(service.vms[item.Name], "demo-worker-1")
-	service.hypervisor = &fakeHypervisor{launch: func(context.Context, hypervisor.Spec) (hypervisor.Machine, error) {
+	setFakeHypervisor(service, &fakeHypervisor{launch: func(context.Context, hypervisor.Spec) (hypervisor.Machine, error) {
 		return nil, errors.New("no hypervisor today")
-	}}
+	}})
 
 	response := dispatchNodeRunState(t, service, "node.start", item.Name, "demo-worker-1")
 

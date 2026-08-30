@@ -872,7 +872,7 @@ func runningLonghornClusterForNodeMutation(t *testing.T, controlPlanes, workers 
 
 	return &Server{
 		cache:                imagecache.New(cacheRoot),
-		hypervisor:           &fakeHypervisor{architecture: hypervisor.ArchitectureARM64},
+		hypervisors:          singleFakeRegistry(&fakeHypervisor{architecture: hypervisor.ArchitectureARM64}),
 		vms:                  map[string]map[string]hypervisor.Machine{item.Name: nodes},
 		provisions:           make(map[string]activeProvision),
 		storagePhases:        make(map[string]StoragePhase),

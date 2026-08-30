@@ -36,10 +36,14 @@ func (s *Server) cacheImageClassifier() (*cacheImageClassifier, error) {
 	}
 	classifier := &cacheImageClassifier{cache: s.cache, hasDefault: hasDefault}
 	if hasDefault {
+		architecture, err := s.imageArchitecture()
+		if err != nil {
+			return nil, err
+		}
 		classifier.defaultCombination = imagecache.Combination{
 			Schematic:    defaultSchematic,
 			Version:      DefaultTalosVersion,
-			Architecture: s.imageArchitecture(),
+			Architecture: architecture,
 		}
 	}
 	if classifier.references, err = s.clusterImageReferences(defaultSchematic); err != nil {

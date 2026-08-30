@@ -916,11 +916,6 @@ func (c cli) callNarratedWithin(op string, args, destination any, onStage func(s
 	return nil
 }
 
-func exchange(socketPath, op string, args any) (daemon.Response, error) {
-	// no deadline: a lifecycle verb legitimately runs for minutes
-	return exchangeWithin(socketPath, op, args, 0)
-}
-
 // exchangeWithin runs one request/response with an optional overall deadline,
 // which the restart paths need: their queries are served under the daemon's
 // operation lock and must never outlast a courtesy check.

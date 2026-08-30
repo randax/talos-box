@@ -361,7 +361,7 @@ func newBootWaitCreateServer(t *testing.T) *Server {
 	}
 	return &Server{
 		cache:           imagecache.New(root),
-		hypervisor:      &fakeHypervisor{architecture: hypervisor.ArchitectureARM64},
+		hypervisors:     singleFakeRegistry(&fakeHypervisor{architecture: hypervisor.ArchitectureARM64}),
 		vms:             make(map[string]map[string]hypervisor.Machine),
 		helperCheck:     func() error { return nil },
 		hostPressure:    func(string) (hostpressure.Snapshot, error) { return hostpressure.Snapshot{}, nil },

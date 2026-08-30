@@ -666,7 +666,11 @@ func (s *Server) createCluster(raw json.RawMessage, progress stageFunc) (Cluster
 	item.ProvisioningIntent = intent
 	item.Domain = canonicalDomain
 	item.AllowUnsafeDomain = canonicalDomain != "" && args.AllowUnsafeDomain
-	item.ImageArchitecture = string(s.hypervisor.Architecture())
+	_, backend, err := s.hypervisorForCluster(item)
+	if err != nil {
+		return ClusterSummary{}, err
+	}
+	item.ImageArchitecture = string(backend.Architecture())
 	// A create that names no talosbox.yaml is imperative — including one from
 	// a CLI predating the flag, which is exactly what `tbx cluster create`
 	// sends.
@@ -691,7 +695,7 @@ func (s *Server) createCluster(raw json.RawMessage, progress stageFunc) (Cluster
 	// The image fetch is the long pole of a cold create — ~100 MB from the
 	// Image Factory — and used to happen behind a silent request (#273).
 	progress.stage("preparing the Talos %s image", item.TalosVersion)
-	cachedDisk, err := s.cache.Ensure(item.Schematic, item.TalosVersion, s.imageArchitecture())
+	cachedDisk, err := s.cache.Ensure(item.Schematic, item.TalosVersion, imagecache.Architecture(backend.Architecture()))
 	if err != nil {
 		return ClusterSummary{}, err
 	}
@@ -918,12 +922,16 @@ func (s *Server) launchMachine(item cluster.Cluster, node cluster.Node, restore 
 	if _, err := s.clusterImageArchitecture(item); err != nil {
 		return nil, err
 	}
+	_, backend, err := s.hypervisorForCluster(item)
+	if err != nil {
+		return nil, err
+	}
 	dir, err := cluster.Dir(item.Name)
 	if err != nil {
 		return nil, err
 	}
 	sizing := item.DefaultsFor(node.Role)
-	machine, err := s.hypervisor.Launch(context.Background(), hypervisor.Spec{
+	machine, err := backend.Launch(context.Background(), hypervisor.Spec{
 		CPUs:           sizing.CPUs,
 		MemoryMiB:      sizing.MemoryMiB,
 		DiskPath:       filepath.Join(dir, node.Name+".img"),
@@ -1570,7 +1578,7 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), AllowUnsafeDomain: item.AllowUnsafeDomain, TalosVersion: item.TalosVersion, Schematic: item.Schematic, BaseSchematic: item.BaseSchematic, TalosExtensions: item.TalosExtensions, ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: running,
 			// derived from disk, not from daemon memory, so a restarted
 			// daemon still reports its predecessor's suspension
-			Suspended: !running && clusterHasSavedState(item.Name), SavedStateStale: !running && s.savedStateStale(item.Name), Capabilities: s.clusterCapabilities(item), ConfigOrigin: item.ConfigOrigin, subnetIndex: item.SubnetIndex}
+			Suspended: !running && clusterHasSavedState(item.Name), SavedStateStale: !running && s.savedStateStale(item), Capabilities: s.clusterCapabilities(item), ConfigOrigin: item.ConfigOrigin, subnetIndex: item.SubnetIndex}
 		for _, node := range item.Nodes {
 			running := s.nodeRunning(item.Name, node.Name)
 			clusterStatus.Nodes = append(clusterStatus.Nodes, NodeStatus{Name: node.Name, Role: node.Role, MAC: node.MAC, Phase: ClassifyPhase(running, ProbeResult{}), StartedAt: s.vmStartedAt(item.Name, node.Name),
@@ -1588,10 +1596,14 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 // clusterCapabilities reports only the capabilities this cluster actually asked
 // for, so a status listing stays silent about gates nobody depends on.
 func (s *Server) clusterCapabilities(item cluster.Cluster) []CapabilityStatus {
-	if s.hypervisor == nil || !extensions.Requested(item.TalosExtensions, extensions.GuestAgent) {
+	if !extensions.Requested(item.TalosExtensions, extensions.GuestAgent) {
 		return nil
 	}
-	guestAgent := s.hypervisor.Capabilities().GuestAgent
+	_, backend, err := s.hypervisorForCluster(item)
+	if err != nil {
+		return []CapabilityStatus{{Name: extensions.GuestAgent, Reason: err.Error()}}
+	}
+	guestAgent := backend.Capabilities().GuestAgent
 	return []CapabilityStatus{{
 		Name:      extensions.GuestAgent,
 		Supported: guestAgent.Supported,
@@ -1600,6 +1612,10 @@ func (s *Server) clusterCapabilities(item cluster.Cluster) []CapabilityStatus {
 }
 
 func (s *Server) refreshNodeStatuses(statuses []ClusterStatus) {
+	s.refreshNodeStatusesNarrated(statuses, nil)
+}
+
+func (s *Server) refreshNodeStatusesNarrated(statuses []ClusterStatus, progress stageFunc) {
 	lookupIP := s.nodeIPLookup
 	if lookupIP == nil {
 		lookupIP = cluster.LookupIP
@@ -1612,6 +1628,7 @@ func (s *Server) refreshNodeStatuses(statuses []ClusterStatus) {
 	for i := range statuses {
 		for j, snapshot := range statuses[i].Nodes {
 			node := cluster.Node{Name: snapshot.Name, Role: snapshot.Role, MAC: snapshot.MAC}
+			progress.stage("probing node %s/%s", statuses[i].Name, node.Name)
 			refreshed := nodeStatusWith(node, statuses[i].subnetIndex, !snapshot.Phase.Stopped(), lookupIP, probe)
 			refreshed.StartedAt = snapshot.StartedAt
 			// Suspension is a disk fact the status handler already
@@ -1767,11 +1784,16 @@ func stalledServices(services []NodeService, startedAt *time.Time, now time.Time
 }
 
 func refreshKubernetesReadiness(statuses []ClusterStatus) {
+	refreshKubernetesReadinessNarrated(statuses, nil)
+}
+
+func refreshKubernetesReadinessNarrated(statuses []ClusterStatus, progress stageFunc) {
 	for index := range statuses {
 		status := &statuses[index]
 		if status.CNI != cluster.CNIFlannel && status.CNI != cluster.CNICilium {
 			continue
 		}
+		progress.stage("checking Kubernetes readiness for %s", status.Name)
 		if !status.Running {
 			status.KubernetesReady = false
 			status.VIP = ""
@@ -1855,7 +1877,11 @@ func (s *Server) pullCache(raw json.RawMessage) (CachePullResult, error) {
 	if len(combinations) == 0 {
 		combinations = []CachePullCombination{{Schematic: args.Schematic, Version: args.Version}}
 	}
-	architecture := s.hypervisor.Architecture()
+	_, backend, err := s.hypervisors.ResolveDefault()
+	if err != nil {
+		return CachePullResult{}, err
+	}
+	architecture := backend.Architecture()
 	var result CachePullResult
 	// Distinct clusters routinely share a pin, and re-composition resolves
 	// spellings apart: dedupe on the resolved combination so each image is
@@ -1950,7 +1976,11 @@ func (s *Server) warmClusterImages(items []cluster.Cluster) (*CacheWarmResult, e
 	}
 	ctx, cancel := s.lifecycleTimeoutContext(cacheWarmTimeout)
 	defer cancel()
-	result, err := s.warmCache(ctx, refs, s.imageArchitecture())
+	architecture, err := s.imageArchitecture()
+	if err != nil {
+		return nil, err
+	}
+	result, err := s.warmCache(ctx, refs, architecture)
 	if err != nil {
 		return nil, err
 	}
@@ -2051,10 +2081,18 @@ func (s *Server) warmMirrorCache(raw json.RawMessage, progress stageFunc) (Cache
 				progress.stage("%s%s", CacheWarmEntryStagePrefix, encoded)
 			}
 		}
-		summary, err := s.warmCacheWithOptions(ctx, args.Refs, s.imageArchitecture(), options)
+		architecture, err := s.imageArchitecture()
+		if err != nil {
+			return CacheWarmResult{}, err
+		}
+		summary, err := s.warmCacheWithOptions(ctx, args.Refs, architecture, options)
 		return cacheWarmResult(summary), err
 	}
-	return s.warmCache(ctx, args.Refs, s.imageArchitecture())
+	architecture, err := s.imageArchitecture()
+	if err != nil {
+		return CacheWarmResult{}, err
+	}
+	return s.warmCache(ctx, args.Refs, architecture)
 }
 
 func (s *Server) checkMirrorCache(raw json.RawMessage) (CacheCheckResult, error) {
@@ -2075,7 +2113,11 @@ func (s *Server) checkMirrorCache(raw json.RawMessage) (CacheCheckResult, error)
 	}
 	ctx, cancel := s.lifecycleTimeoutContext(cacheWarmTimeout)
 	defer cancel()
-	return s.checkCache(ctx, args.Refs, s.imageArchitecture(), args.Deep)
+	architecture, err := s.imageArchitecture()
+	if err != nil {
+		return CacheCheckResult{}, err
+	}
+	return s.checkCache(ctx, args.Refs, architecture, args.Deep)
 }
 
 func (s *Server) listCache() (CacheListResult, error) {
@@ -2456,8 +2498,12 @@ func (s *Server) cachedDisk(item cluster.Cluster) (string, error) {
 	return s.cache.Ensure(schematic, talosVersion, architecture)
 }
 
-func (s *Server) imageArchitecture() imagecache.Architecture {
-	return imagecache.Architecture(s.hypervisor.Architecture())
+func (s *Server) imageArchitecture() (imagecache.Architecture, error) {
+	_, backend, err := s.hypervisors.ResolveDefault()
+	if err != nil {
+		return "", err
+	}
+	return imagecache.Architecture(backend.Architecture()), nil
 }
 
 func (s *Server) clusterImageArchitecture(item cluster.Cluster) (imagecache.Architecture, error) {
@@ -2465,7 +2511,11 @@ func (s *Server) clusterImageArchitecture(item cluster.Cluster) (imagecache.Arch
 	if architecture == "" {
 		architecture = cluster.LegacyImageArchitecture
 	}
-	active := s.hypervisor.Architecture()
+	_, backend, err := s.hypervisorForCluster(item)
+	if err != nil {
+		return "", err
+	}
+	active := backend.Architecture()
 	if hypervisor.Architecture(architecture) != active {
 		return "", fmt.Errorf("cluster %q uses %s images, but the active hypervisor targets %s", item.Name, architecture, active)
 	}

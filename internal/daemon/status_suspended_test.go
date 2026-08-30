@@ -37,7 +37,10 @@ func TestStatusReportsSuspendedClusterAndHintsResume(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	service := &Server{vms: make(map[string]map[string]hypervisor.Machine)}
+	service := &Server{
+		hypervisors: singleFakeRegistry(&fakeHypervisor{}),
+		vms:         make(map[string]map[string]hypervisor.Machine),
+	}
 	statuses, err := service.status(mustRawJSON(t, statusArgs{Cluster: "napping"}))
 	if err != nil {
 		t.Fatal(err)

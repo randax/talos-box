@@ -146,7 +146,7 @@ func TestStatusDoesNotHoldOperationLockWhileProbing(t *testing.T) {
 	}
 	done := make(chan Response, 1)
 	go func() {
-		done <- service.dispatchStatus(Request{Op: "status", Args: json.RawMessage(`{"cluster":"demo"}`)})
+		done <- service.dispatchStatus(Request{Op: "status", Args: json.RawMessage(`{"cluster":"demo"}`)}, nil)
 	}()
 	waitForProvisionStart(t, started)
 

@@ -36,7 +36,7 @@ func TestCreateClusterWithCachedCompositionStaysOffline(t *testing.T) {
 	}
 	service := &Server{
 		cache:        cache,
-		hypervisor:   &fakeHypervisor{architecture: hypervisor.ArchitectureARM64},
+		hypervisors:  singleFakeRegistry(&fakeHypervisor{architecture: hypervisor.ArchitectureARM64}),
 		vms:          make(map[string]map[string]hypervisor.Machine),
 		helperCheck:  func() error { return nil },
 		hostPressure: func(string) (hostpressure.Snapshot, error) { return hostpressure.Snapshot{}, nil },
@@ -98,7 +98,7 @@ func TestCreateClusterRecordsRecomposedSchematicInputs(t *testing.T) {
 	}
 	service := &Server{
 		cache:        cache,
-		hypervisor:   &fakeHypervisor{architecture: hypervisor.ArchitectureARM64},
+		hypervisors:  singleFakeRegistry(&fakeHypervisor{architecture: hypervisor.ArchitectureARM64}),
 		vms:          make(map[string]map[string]hypervisor.Machine),
 		helperCheck:  func() error { return nil },
 		hostPressure: func(string) (hostpressure.Snapshot, error) { return hostpressure.Snapshot{}, nil },
@@ -142,7 +142,7 @@ func TestCreateClusterRefusesUnknownExtensionBeforeMutation(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	service := &Server{
 		cache:        imagecache.New(t.TempDir()),
-		hypervisor:   &fakeHypervisor{architecture: hypervisor.ArchitectureARM64},
+		hypervisors:  singleFakeRegistry(&fakeHypervisor{architecture: hypervisor.ArchitectureARM64}),
 		vms:          make(map[string]map[string]hypervisor.Machine),
 		helperCheck:  func() error { return nil },
 		hostPressure: func(string) (hostpressure.Snapshot, error) { return hostpressure.Snapshot{}, nil },
@@ -177,8 +177,8 @@ func TestStoredClusterNeverRecomposes(t *testing.T) {
 		t.Fatal(err)
 	}
 	service := &Server{
-		cache:      imagecache.New(root),
-		hypervisor: &fakeHypervisor{architecture: hypervisor.ArchitectureARM64},
+		cache:       imagecache.New(root),
+		hypervisors: singleFakeRegistry(&fakeHypervisor{architecture: hypervisor.ArchitectureARM64}),
 	}
 	item := cluster.Cluster{
 		Name: "sandboxed", Schematic: composed, TalosVersion: DefaultTalosVersion,

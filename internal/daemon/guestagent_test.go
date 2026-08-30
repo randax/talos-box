@@ -29,7 +29,7 @@ func TestLaunchRequestsGuestAgentChannelOnlyWhenExtensionRequested(t *testing.T)
 			item.TalosExtensions = test.extensions
 			backend := &fakeHypervisor{}
 			service := &Server{
-				hypervisor:    backend,
+				hypervisors:   singleFakeRegistry(backend),
 				vms:           make(map[string]map[string]hypervisor.Machine),
 				subnetSources: emptySubnetSources(),
 			}
@@ -63,9 +63,9 @@ func TestStatusGatesGuestAgentOnBackendsWithoutTheChannel(t *testing.T) {
 	}
 	const reason = "this backend has no guest-agent channel"
 	service := &Server{
-		hypervisor: &fakeHypervisor{capabilities: hypervisor.Capabilities{
+		hypervisors: singleFakeRegistry(&fakeHypervisor{capabilities: hypervisor.Capabilities{
 			GuestAgent: hypervisor.FeatureStatus{Reason: reason},
-		}},
+		}}),
 		vms: make(map[string]map[string]hypervisor.Machine),
 	}
 	statuses, err := service.status(nil)
@@ -98,9 +98,9 @@ func TestStatusReportsNoCapabilityGateWhenBackendSupportsTheChannel(t *testing.T
 		t.Fatal(err)
 	}
 	service := &Server{
-		hypervisor: &fakeHypervisor{capabilities: hypervisor.Capabilities{
+		hypervisors: singleFakeRegistry(&fakeHypervisor{capabilities: hypervisor.Capabilities{
 			GuestAgent: hypervisor.FeatureStatus{Supported: true},
-		}},
+		}}),
 		vms: make(map[string]map[string]hypervisor.Machine),
 	}
 	statuses, err := service.status(nil)

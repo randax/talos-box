@@ -22,8 +22,8 @@ type vzHypervisor struct {
 	saved   map[string]*vzMachine
 }
 
-// New probes the host Virtualization.framework backend once.
-func New(ctx context.Context) (Hypervisor, error) {
+// newVZ probes the host Virtualization.framework backend once.
+func newVZ(ctx context.Context) (Hypervisor, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("probe Virtualization.framework: %w", err)
 	}
@@ -57,15 +57,13 @@ func New(ctx context.Context) (Hypervisor, error) {
 			BalloonReadback: FeatureStatus{
 				Reason: "Virtualization.framework does not report the guest-visible balloon size",
 			},
-			GuestAgent: GuestAgentSupport(),
+			GuestAgent: vzGuestAgentSupport(),
 		},
 		saved: make(map[string]*vzMachine),
 	}, nil
 }
 
-// GuestAgentSupport reports the host's guest-agent capability without probing a
-// backend, so `tbx doctor` can explain the gate with the daemon down.
-func GuestAgentSupport() FeatureStatus {
+func vzGuestAgentSupport() FeatureStatus {
 	return FeatureStatus{
 		Reason: "Virtualization.framework has no virtio-serial guest-agent channel; the extension is baked into the image but its service never starts",
 	}

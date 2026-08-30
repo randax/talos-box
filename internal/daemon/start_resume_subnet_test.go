@@ -89,7 +89,7 @@ func TestStartClusterAcceptsOwnBridgeOccupyingTheSubnet(t *testing.T) {
 	item := savedClusterForSubnetTest(t, "own-bridge-start")
 
 	service := &Server{
-		hypervisor:    &fakeHypervisor{},
+		hypervisors:   singleFakeRegistry(&fakeHypervisor{}),
 		vms:           make(map[string]map[string]hypervisor.Machine),
 		hostPressure:  noHostPressure,
 		subnetSources: ownBridgeSubnetSources(t),
@@ -114,7 +114,7 @@ func TestStartClusterWarnsOnForeignSubnetConflict(t *testing.T) {
 	item := savedClusterForSubnetTest(t, "foreign-start")
 
 	service := &Server{
-		hypervisor:    &fakeHypervisor{},
+		hypervisors:   singleFakeRegistry(&fakeHypervisor{}),
 		vms:           make(map[string]map[string]hypervisor.Machine),
 		hostPressure:  noHostPressure,
 		subnetSources: ownBridgeSubnetSources(t, foreignSubnetInterface(t)),
@@ -140,7 +140,7 @@ func TestStartClusterWarnsOnForeignGatewaySquatter(t *testing.T) {
 	item := savedClusterForSubnetTest(t, "gateway-squatter-start")
 
 	service := &Server{
-		hypervisor:    &fakeHypervisor{},
+		hypervisors:   singleFakeRegistry(&fakeHypervisor{}),
 		vms:           make(map[string]map[string]hypervisor.Machine),
 		hostPressure:  noHostPressure,
 		subnetSources: gatewaySquatterSubnetSources(t),
@@ -166,7 +166,7 @@ func TestResumeClusterAcceptsOwnBridgeOccupyingTheSubnet(t *testing.T) {
 	writeSavedState(t, item)
 
 	service := &Server{
-		hypervisor:    &fakeHypervisor{},
+		hypervisors:   singleFakeRegistry(&fakeHypervisor{}),
 		vms:           make(map[string]map[string]hypervisor.Machine),
 		subnetSources: ownBridgeSubnetSources(t),
 	}
@@ -189,7 +189,7 @@ func TestResumeClusterWarnsOnForeignSubnetConflict(t *testing.T) {
 	writeSavedState(t, item)
 
 	service := &Server{
-		hypervisor:    &fakeHypervisor{},
+		hypervisors:   singleFakeRegistry(&fakeHypervisor{}),
 		vms:           make(map[string]map[string]hypervisor.Machine),
 		subnetSources: ownBridgeSubnetSources(t, foreignSubnetInterface(t)),
 	}

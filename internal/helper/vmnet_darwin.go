@@ -20,6 +20,13 @@ package helper
 #include <vmnet/vmnet.h>
 #include <xpc/xpc.h>
 
+#define TBX_VMNET_SOCKET_BUFFER_SIZE (4 * 1024 * 1024)
+#define TBX_VMNET_SOCKET_BUFFER_FLOOR (256 * 1024)
+
+static int tbx_configure_socketpair_buffers(int first_fd, int second_fd, int *out_buffer_size);
+static int tbx_vmnet_socket_buffer_size(void);
+static int tbx_vmnet_socket_buffer_floor(void);
+
 typedef struct tbx_vmnet {
 	interface_ref interface;
 	dispatch_queue_t queue;
@@ -30,6 +37,33 @@ typedef struct tbx_vmnet {
 	atomic_ulong drain_send_failures;
 	atomic_bool stopping;
 } tbx_vmnet_t;
+
+static int tbx_configure_socketpair_buffers(int first_fd, int second_fd, int *out_buffer_size) {
+	for (int buffer_size = TBX_VMNET_SOCKET_BUFFER_SIZE;
+		buffer_size >= TBX_VMNET_SOCKET_BUFFER_FLOOR;
+		buffer_size /= 2) {
+		if (setsockopt(first_fd, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size)) == 0 &&
+			setsockopt(first_fd, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size)) == 0 &&
+			setsockopt(second_fd, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size)) == 0 &&
+			setsockopt(second_fd, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size)) == 0) {
+			*out_buffer_size = buffer_size;
+			return 0;
+		}
+		if (errno != ENOBUFS || buffer_size == TBX_VMNET_SOCKET_BUFFER_FLOOR) {
+			return -1;
+		}
+	}
+	errno = ENOBUFS;
+	return -1;
+}
+
+static int tbx_vmnet_socket_buffer_size(void) {
+	return TBX_VMNET_SOCKET_BUFFER_SIZE;
+}
+
+static int tbx_vmnet_socket_buffer_floor(void) {
+	return TBX_VMNET_SOCKET_BUFFER_FLOOR;
+}
 
 static void tbx_dispatch_release(dispatch_object_t object) {
 #if !OS_OBJECT_USE_OBJC
@@ -221,6 +255,14 @@ static int tbx_vmnet_start(
 	}
 	state->pump_fd = sockets[0];
 	state->peer_fd = sockets[1];
+	int applied_buffer_size = 0;
+	if (tbx_configure_socketpair_buffers(state->pump_fd, state->peer_fd, &applied_buffer_size) != 0) {
+		int saved_errno = errno;
+		tbx_stop_and_release(interface, queue);
+		tbx_free_start_state(state);
+		*out_errno = saved_errno;
+		return -1;
+	}
 	if (fcntl(state->pump_fd, F_SETFD, FD_CLOEXEC) != 0 ||
 		fcntl(state->peer_fd, F_SETFD, FD_CLOEXEC) != 0) {
 		int saved_errno = errno;
@@ -381,6 +423,22 @@ var vmnetInterfaces = struct {
 }{byFD: make(map[int]*vmnetHandle)}
 
 var helperFrameRouter = newFrameRouter()
+
+func configureVMNetSocketpairBuffers(firstFD, secondFD int) (int, error) {
+	var applied C.int
+	if result, err := C.tbx_configure_socketpair_buffers(C.int(firstFD), C.int(secondFD), &applied); result != 0 {
+		return 0, err
+	}
+	return int(applied), nil
+}
+
+func vmnetSocketBufferSize() int {
+	return int(C.tbx_vmnet_socket_buffer_size())
+}
+
+func vmnetSocketBufferFloor() int {
+	return int(C.tbx_vmnet_socket_buffer_floor())
+}
 
 // StartInterface starts one shared-mode vmnet interface for a cluster subnet.
 func StartInterface(_ []int, subnetIndex int, _, _ string) (*platformAttachment, error) {

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/randax/talos-box/internal/hypervisor"
 	"github.com/randax/talos-box/internal/talosversion"
 	"github.com/randax/talos-box/internal/version"
 )
@@ -135,7 +136,31 @@ type Info struct {
 	// balloon device (TBX_DISABLE_BALLOON, #513), so tbx doctor can say why
 	// guest memory is never reclaimed. Additive and version-neutral: an older
 	// daemon omits it and the CLI reads that as ballooning on.
-	BalloonDisabled bool `json:"balloonDisabled,omitempty"`
+	BalloonDisabled         bool                     `json:"balloonDisabled,omitempty"`
+	Hypervisors             []HypervisorInfo         `json:"hypervisors,omitempty"`
+	DefaultHypervisor       hypervisor.Name          `json:"defaultHypervisor,omitempty"`
+	DefaultHypervisorSource hypervisor.DefaultSource `json:"defaultHypervisorSource,omitempty"`
+}
+
+// HypervisorInfo reports one daemon-probed backend and its feature gates.
+type HypervisorInfo struct {
+	Name                         hypervisor.Name   `json:"name"`
+	Available                    bool              `json:"available,omitempty"`
+	AvailabilityReason           string            `json:"availabilityReason,omitempty"`
+	BalloonReadback              FeatureStatusInfo `json:"balloonReadback,omitempty"`
+	SuspendSurvivesDaemonRestart bool              `json:"suspendSurvivesDaemonRestart,omitempty"`
+	GuestAgent                   FeatureStatusInfo `json:"guestAgent,omitempty"`
+}
+
+// FeatureStatusInfo is the daemon protocol representation of a feature gate.
+type FeatureStatusInfo struct {
+	Supported bool   `json:"supported,omitempty"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+// NewFeatureStatusInfo converts an internal feature gate to its wire representation.
+func NewFeatureStatusInfo(status hypervisor.FeatureStatus) FeatureStatusInfo {
+	return FeatureStatusInfo{Supported: status.Supported, Reason: status.Reason}
 }
 
 // NodeRunState is the answer to node.start and node.stop: the node's status

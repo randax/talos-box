@@ -22,6 +22,121 @@ type fakeHypervisor struct {
 	specs        []hypervisor.Spec
 }
 
+func fakeRegistry(defaultName hypervisor.Name, backends map[hypervisor.Name]hypervisor.Hypervisor) hypervisor.Registry {
+	registered := make(map[hypervisor.Name]hypervisor.Backend, len(backends))
+	for name, backend := range backends {
+		registered[name] = hypervisor.Backend{
+			Hypervisor:   backend,
+			Availability: hypervisor.Availability{Available: true},
+		}
+	}
+	return hypervisor.Registry{
+		Backends: registered,
+		Default:  hypervisor.Default{Name: defaultName, Source: hypervisor.DefaultSourceCompiled},
+	}
+}
+
+func singleFakeRegistry(backend hypervisor.Hypervisor) hypervisor.Registry {
+	return fakeRegistry("fake", map[hypervisor.Name]hypervisor.Hypervisor{"fake": backend})
+}
+
+func setFakeHypervisor(server *Server, backend *fakeHypervisor) {
+	server.hypervisors = singleFakeRegistry(backend)
+}
+
+func defaultFakeHypervisor(server *Server) *fakeHypervisor {
+	_, backend, err := server.hypervisors.ResolveDefault()
+	if err != nil {
+		panic(err)
+	}
+	return backend.(*fakeHypervisor)
+}
+
+func TestNewServerWithRegistryAllowsUnavailableNonDefaultHypervisor(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	registry := singleFakeRegistry(&fakeHypervisor{})
+	registry.Backends["optional"] = hypervisor.Backend{
+		Availability: hypervisor.Availability{Reason: "optional probe failed"},
+	}
+
+	server, err := newServer(context.Background(), registry)
+	if err != nil {
+		t.Fatalf("newServer() = %v, want unavailable optional backend to be retained", err)
+	}
+	t.Cleanup(func() { _ = server.Shutdown() })
+	if got := server.hypervisors.Backends["optional"].Availability.Reason; got != "optional probe failed" {
+		t.Fatalf("retained optional reason = %q", got)
+	}
+}
+
+func TestNewServerWithRegistryRejectsUnavailableDefaultHypervisor(t *testing.T) {
+	t.Parallel()
+	registry := hypervisor.Registry{
+		Backends: map[hypervisor.Name]hypervisor.Backend{
+			"primary": {Availability: hypervisor.Availability{Reason: "default probe failed"}},
+		},
+		Default: hypervisor.Default{Name: "primary", Source: hypervisor.DefaultSourceCompiled},
+	}
+
+	_, err := newServer(context.Background(), registry)
+	if !errors.Is(err, hypervisor.ErrUnsupported) || !strings.Contains(err.Error(), "default probe failed") {
+		t.Fatalf("newServer() error = %v, want ErrUnsupported preserving default probe reason", err)
+	}
+}
+
+func TestHypervisorForClusterUsesDefaultSelection(t *testing.T) {
+	t.Parallel()
+	first := &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64}
+	selected := &fakeHypervisor{architecture: hypervisor.ArchitectureARM64}
+	server := &Server{hypervisors: fakeRegistry("selected", map[hypervisor.Name]hypervisor.Hypervisor{
+		"first":    first,
+		"selected": selected,
+	})}
+
+	name, backend, err := server.hypervisorForCluster(cluster.Cluster{Name: "ordinary"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "selected" || backend != selected {
+		t.Fatalf("hypervisorForCluster() = (%q, %p), want selected backend %p", name, backend, selected)
+	}
+}
+
+func TestBalloonCandidatesUseResolvedHypervisorCapabilities(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("balloon-candidates", 0, 1, 0, cluster.NodeDefaults{MemoryMiB: 2048})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	key := item.Name + "/" + item.Nodes[0].Name
+	server := &Server{
+		hypervisors: singleFakeRegistry(&fakeHypervisor{capabilities: hypervisor.Capabilities{
+			BalloonReadback: hypervisor.FeatureStatus{Supported: true},
+		}}),
+		vms: map[string]map[string]hypervisor.Machine{
+			item.Name: {item.Nodes[0].Name: &fakeMachine{active: true}},
+		},
+	}
+	candidates := server.balloonCandidatesLocked()
+	if !candidates[key].balloonReadback {
+		t.Fatalf("candidate %+v does not carry resolved balloon readback", candidates[key])
+	}
+
+	setFakeHypervisor(server, &fakeHypervisor{})
+	candidates = server.balloonCandidatesLocked()
+	if candidates[key].balloonReadback {
+		t.Fatalf("candidate %+v unexpectedly carries balloon readback", candidates[key])
+	}
+	candidate := candidates[key]
+	candidate.ip = ""
+	if got := balloonablesFrom(map[string]balloonCandidate{key: candidate}, nil, func() bool { return false }); len(got) != 0 {
+		t.Fatalf("balloonablesFrom() = %v, want conservative eligibility without readback", got)
+	}
+}
+
 func (f *fakeHypervisor) Launch(ctx context.Context, spec hypervisor.Spec) (hypervisor.Machine, error) {
 	f.specs = append(f.specs, spec)
 	if f.launch != nil {
@@ -91,7 +206,7 @@ func TestStartLaunchesMachinesThroughInjectedHypervisor(t *testing.T) {
 	}
 	backend := &fakeHypervisor{}
 	service := &Server{
-		hypervisor:    backend,
+		hypervisors:   singleFakeRegistry(backend),
 		vms:           make(map[string]map[string]hypervisor.Machine),
 		subnetSources: emptySubnetSources(),
 	}
@@ -128,8 +243,8 @@ func TestCachedDiskUsesHypervisorArchitecture(t *testing.T) {
 	}
 
 	service := &Server{
-		cache:      imagecache.New(root),
-		hypervisor: &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
+		cache:       imagecache.New(root),
+		hypervisors: singleFakeRegistry(&fakeHypervisor{architecture: hypervisor.ArchitectureAMD64}),
 	}
 	item := cluster.Cluster{Schematic: "test-schematic", TalosVersion: "v1.2.3", ImageArchitecture: "amd64"}
 	path, err := service.cachedDisk(item)
@@ -146,8 +261,8 @@ func TestCachedDiskRejectsClusterHypervisorArchitectureMismatch(t *testing.T) {
 	t.Parallel()
 
 	service := &Server{
-		cache:      imagecache.New(t.TempDir()),
-		hypervisor: &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
+		cache:       imagecache.New(t.TempDir()),
+		hypervisors: singleFakeRegistry(&fakeHypervisor{architecture: hypervisor.ArchitectureAMD64}),
 	}
 	item := cluster.Cluster{
 		Name:              "arm-cluster",
@@ -207,7 +322,7 @@ func TestResumeUsesLaunchRestoreAndReportsColdBootFallback(t *testing.T) {
 		return &fakeMachine{active: true}, nil
 	}}
 	service := &Server{
-		hypervisor:    backend,
+		hypervisors:   singleFakeRegistry(backend),
 		vms:           make(map[string]map[string]hypervisor.Machine),
 		subnetSources: emptySubnetSources(),
 	}

@@ -52,7 +52,7 @@ func TestCacheCheckUsesBoundedContextAndOptions(t *testing.T) {
 	t.Parallel()
 
 	service := &Server{
-		hypervisor: &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
+		hypervisors: singleFakeRegistry(&fakeHypervisor{architecture: hypervisor.ArchitectureAMD64}),
 		checkCache: func(ctx context.Context, refs []string, architecture imagecache.Architecture, deep bool) (CacheCheckResult, error) {
 			deadline, ok := ctx.Deadline()
 			if !ok {
@@ -89,7 +89,7 @@ func TestShutdownCancelsInFlightCacheCheck(t *testing.T) {
 	lifecycle, cancel := context.WithCancel(context.Background())
 	started := make(chan struct{})
 	service := &Server{
-		hypervisor:       &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
+		hypervisors:      singleFakeRegistry(&fakeHypervisor{architecture: hypervisor.ArchitectureAMD64}),
 		lifecycleContext: lifecycle,
 		lifecycleCancel:  cancel,
 		checkCache: func(ctx context.Context, refs []string, architecture imagecache.Architecture, deep bool) (CacheCheckResult, error) {

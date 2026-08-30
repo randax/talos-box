@@ -29,7 +29,7 @@ import (
 // Server owns all VMs started by one daemon process.
 type Server struct {
 	cache                *imagecache.Cache
-	hypervisor           hypervisor.Hypervisor
+	hypervisors          hypervisor.Registry
 	warmCache            func(context.Context, []string, imagecache.Architecture) (CacheWarmResult, error)
 	warmCacheWithOptions func(context.Context, []string, imagecache.Architecture, mirror.WarmOptions) (mirror.WarmSummary, error)
 	checkCache           func(context.Context, []string, imagecache.Architecture, bool) (CacheCheckResult, error)
@@ -201,8 +201,14 @@ func (l *lockedListener) Close() error {
 // NewServer creates a daemon using the default image cache and probes the host
 // hypervisor once before accepting requests.
 func NewServer(ctx context.Context) (*Server, error) {
-	backend, err := hypervisor.New(ctx)
-	if err != nil {
+	return newServer(ctx, hypervisor.NewAll(ctx))
+}
+
+func newServer(ctx context.Context, registry hypervisor.Registry) (*Server, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if _, _, err := registry.ResolveDefault(); err != nil {
 		return nil, err
 	}
 	cache, err := imagecache.NewDefault()
@@ -216,7 +222,7 @@ func NewServer(ctx context.Context) (*Server, error) {
 	lifecycleContext, lifecycleCancel := context.WithCancel(ctx)
 	server := &Server{
 		cache:                 cache,
-		hypervisor:            backend,
+		hypervisors:           registry,
 		balloonDisabled:       balloon.Disabled(),
 		vms:                   make(map[string]map[string]hypervisor.Machine),
 		provisions:            make(map[string]activeProvision),
@@ -273,6 +279,12 @@ func NewServer(ctx context.Context) (*Server, error) {
 		return result, nil
 	}
 	return server, nil
+}
+
+// hypervisorForCluster is the single selection boundary for persisted
+// clusters. Later state and YAML tickets will change selection here only.
+func (s *Server) hypervisorForCluster(_ cluster.Cluster) (hypervisor.Name, hypervisor.Hypervisor, error) {
+	return s.hypervisors.ResolveDefault()
 }
 
 func cacheWarmResult(summary mirror.WarmSummary) CacheWarmResult {
@@ -494,7 +506,7 @@ func (s *Server) dispatch(request Request) Response {
 
 func (s *Server) dispatchWithProgress(request Request, progress stageFunc) Response {
 	if request.Op == "status" {
-		return s.dispatchStatus(request)
+		return s.dispatchStatus(request, progress)
 	}
 	if request.Op == "cluster.create" || request.Op == "cluster.start" || request.Op == "up" {
 		return s.dispatchProvisioning(request, progress)
@@ -855,8 +867,11 @@ func (s *Server) clusterMutationLock(clusterName string) *sync.Mutex {
 // dispatchStatus keeps the existing VM-state snapshot serialized, then probes
 // Kubernetes after releasing opMu so a slow API server cannot block lifecycle
 // operations.
-func (s *Server) dispatchStatus(request Request) Response {
-	s.opMu.Lock()
+// dispatchStatus narrates one stage per node probe and per readiness check
+// when the client asked for progress, so a client's silence deadline measures
+// a stalled daemon rather than the honest length of a many-node probe.
+func (s *Server) dispatchStatus(request Request, progress stageFunc) Response {
+	s.lockOperation(progress)
 	data, err := s.handle(request, nil)
 	s.opMu.Unlock()
 	if err != nil {
@@ -866,8 +881,8 @@ func (s *Server) dispatchStatus(request Request) Response {
 	if !ok {
 		return failure(errors.New("status returned an unexpected response"))
 	}
-	s.refreshNodeStatuses(statuses)
-	refreshKubernetesReadiness(statuses)
+	s.refreshNodeStatusesNarrated(statuses, progress)
+	refreshKubernetesReadinessNarrated(statuses, progress)
 	s.observeKubernetesReadiness(statuses, time.Now())
 	s.refreshStoragePhases(statuses)
 	return success(statuses)
@@ -878,7 +893,7 @@ func (s *Server) handle(request Request, progress stageFunc) (any, error) {
 	case "daemon.ping":
 		return map[string]bool{"pong": true}, nil
 	case "daemon.info":
-		return Info{ProtocolVersion: ProtocolVersion, BalloonReserveMiB: balloon.DefaultConfig().ReserveMiB, BalloonDisabled: s.balloonDisabled}, nil
+		return s.info(), nil
 	case "up":
 		return s.up(request.Args)
 	case "down":
@@ -939,6 +954,32 @@ func (s *Server) handle(request Request, progress stageFunc) (any, error) {
 	default:
 		return nil, fmt.Errorf("unknown operation %q", request.Op)
 	}
+}
+
+func (s *Server) info() Info {
+	info := Info{
+		ProtocolVersion:         ProtocolVersion,
+		BalloonReserveMiB:       balloon.DefaultConfig().ReserveMiB,
+		BalloonDisabled:         s.balloonDisabled,
+		DefaultHypervisor:       s.hypervisors.Default.Name,
+		DefaultHypervisorSource: s.hypervisors.Default.Source,
+	}
+	for _, name := range s.hypervisors.Names() {
+		entry := s.hypervisors.Backends[name]
+		backendInfo := HypervisorInfo{
+			Name:               name,
+			Available:          entry.Availability.Available,
+			AvailabilityReason: entry.Availability.Reason,
+		}
+		if entry.Availability.Available && entry.Hypervisor != nil {
+			capabilities := entry.Hypervisor.Capabilities()
+			backendInfo.BalloonReadback = NewFeatureStatusInfo(capabilities.BalloonReadback)
+			backendInfo.SuspendSurvivesDaemonRestart = capabilities.SuspendSurvivesDaemonRestart
+			backendInfo.GuestAgent = NewFeatureStatusInfo(capabilities.GuestAgent)
+		}
+		info.Hypervisors = append(info.Hypervisors, backendInfo)
+	}
+	return info
 }
 
 func decodeArgs(raw json.RawMessage, destination any) error {

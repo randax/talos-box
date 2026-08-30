@@ -44,8 +44,8 @@ func TestListCacheIncludesMirrorSectionForWarmedLayout(t *testing.T) {
 	}
 
 	service := &Server{
-		cache:      imagecache.New(root),
-		hypervisor: &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
+		cache:       imagecache.New(root),
+		hypervisors: singleFakeRegistry(&fakeHypervisor{architecture: hypervisor.ArchitectureAMD64}),
 	}
 	result, err := service.listCache()
 	if err != nil {
@@ -75,9 +75,9 @@ func TestDestroyClusterLeavesMirrorCacheByteForByteIntact(t *testing.T) {
 
 	root := t.TempDir()
 	service := &Server{
-		cache:      imagecache.New(root),
-		hypervisor: &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
-		vms:        make(map[string]map[string]hypervisor.Machine),
+		cache:       imagecache.New(root),
+		hypervisors: singleFakeRegistry(&fakeHypervisor{architecture: hypervisor.ArchitectureAMD64}),
+		vms:         make(map[string]map[string]hypervisor.Machine),
 	}
 	manifestPath := filepath.Join(root, "mirror", "registry.example", "manifests", "demo_latest")
 	blobPath := filepath.Join(root, "mirror", "registry.example", "blobs", "sha256-abc")
@@ -180,8 +180,8 @@ func TestPruneCacheScopesReportDeletedBytesAndIsolateDiskFromMirror(t *testing.T
 			}
 
 			service := &Server{
-				cache:      imagecache.New(root),
-				hypervisor: &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
+				cache:       imagecache.New(root),
+				hypervisors: singleFakeRegistry(&fakeHypervisor{architecture: hypervisor.ArchitectureAMD64}),
 			}
 			raw := mustRawJSON(t, CachePruneArgs{Scope: test.scope})
 			result, err := service.pruneCache(raw)
@@ -212,7 +212,7 @@ func TestListCacheIncludesMirrorServingStatusFromBindings(t *testing.T) {
 	root := t.TempDir()
 	service := &Server{
 		cache:               imagecache.New(root),
-		hypervisor:          &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
+		hypervisors:         singleFakeRegistry(&fakeHypervisor{architecture: hypervisor.ArchitectureAMD64}),
 		boundMirrorGateways: func() []string { return nil },
 	}
 
@@ -501,8 +501,8 @@ func TestClusterReferencesResolveDefaultsWithoutTheFactory(t *testing.T) {
 func newCacheReferenceTestServer(t *testing.T, root string) *Server {
 	t.Helper()
 	return &Server{
-		cache:      imagecache.New(root),
-		hypervisor: &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
+		cache:       imagecache.New(root),
+		hypervisors: singleFakeRegistry(&fakeHypervisor{architecture: hypervisor.ArchitectureAMD64}),
 	}
 }
 
