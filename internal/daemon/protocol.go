@@ -88,9 +88,10 @@ const (
 // Version 20 honors cache.warm's jobs field and narrates each finished ref as
 // a stage. Older daemons would silently warm serially and answer only at the
 // end (#506).
-// Version 21 adds the additive Info.balloonDisabled field, so tbx doctor can
-// report a daemon started with TBX_DISABLE_BALLOON (#513).
-const ProtocolVersion = 21
+// Info.balloonDisabled (#513) is additive and omitted by older daemons, whose
+// absence already reads as "ballooning on"; it did not move the version, so a
+// protocol-20 daemon keeps serving every verb.
+const ProtocolVersion = 20
 
 // Request is one newline-delimited daemon request.
 type Request struct {
@@ -132,7 +133,8 @@ type Info struct {
 	BalloonReserveMiB int `json:"balloonReserveMiB,omitempty"`
 	// BalloonDisabled reports that the daemon launches guests without a
 	// balloon device (TBX_DISABLE_BALLOON, #513), so tbx doctor can say why
-	// guest memory is never reclaimed. Additive: an older daemon omits it.
+	// guest memory is never reclaimed. Additive and version-neutral: an older
+	// daemon omits it and the CLI reads that as ballooning on.
 	BalloonDisabled bool `json:"balloonDisabled,omitempty"`
 }
 
