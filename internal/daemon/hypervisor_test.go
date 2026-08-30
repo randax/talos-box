@@ -288,7 +288,14 @@ func TestInfoReportsHypervisorSuspendCapability(t *testing.T) {
 	})}
 
 	info := service.info()
-	if len(info.Hypervisors) != 1 || !info.Hypervisors[0].Suspend.Supported || !info.Hypervisors[0].SuspendSurvivesDaemonRestart {
+	if len(info.Hypervisors) != 1 {
+		t.Fatalf("info hypervisors = %+v, want exactly one backend", info.Hypervisors)
+	}
+	suspend := info.Hypervisors[0].Suspend
+	if suspend == nil {
+		t.Fatalf("info hypervisors = %+v, want the suspend gate populated for an available backend", info.Hypervisors)
+	}
+	if !suspend.Supported || !info.Hypervisors[0].SuspendSurvivesDaemonRestart {
 		t.Fatalf("info hypervisors = %+v, want suspend and restart-survival capabilities", info.Hypervisors)
 	}
 }

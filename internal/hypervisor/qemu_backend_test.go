@@ -137,6 +137,68 @@ func TestQEMULaunchRefusesSaveIdentityMismatchBeforeStarting(t *testing.T) {
 	}
 }
 
+func TestQEMULaunchIdentityRefusalKeepsMachineRetainedWhenCloseFails(t *testing.T) {
+	dir := t.TempDir()
+	savePath := filepath.Join(dir, "node.vzstate")
+	metadata := qemuSaveMetadata{Schema: qemuSaveSchema, Backend: qemuSaveBackend, QEMUVersion: "8.2.2", Architecture: ArchitectureARM64, Machine: "virt"}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(savePath, append(encoded, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	varsTemplate := filepath.Join(dir, "OVMF_VARS.fd")
+	if err := os.WriteFile(varsTemplate, []byte("vars"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	currentVersion := qemuVersion{Major: 8, Minor: 2, Patch: 2}
+	backend := &qemuHypervisor{
+		architecture: ArchitectureAMD64,
+		system:       qemuSystem{Machine: "q35"},
+		version:      currentVersion,
+		capabilities: qemuCapabilities(currentVersion),
+		firmware:     qemuFirmware{VarsPath: varsTemplate},
+		saved:        map[string]*qemuMachine{},
+	}
+	closeFailure := errors.New("qmp connection stuck")
+	retained := &qemuMachine{owner: backend, qmp: &qmpClient{conn: closeErrorConn{err: closeFailure}}}
+	backend.saved[savePath] = retained
+
+	_, err = backend.Launch(context.Background(), Spec{
+		CPUs:              1,
+		MemoryMiB:         1024,
+		DiskPath:          filepath.Join(dir, "node.img"),
+		MAC:               "02:00:00:00:00:01",
+		EFIVarsPath:       filepath.Join(dir, "node.efi"),
+		ConsoleSocketPath: filepath.Join(dir, "node.console.sock"),
+		Network: func() (*helper.Attachment, error) {
+			return nil, errors.New("cold boot attempted")
+		},
+		Restore: &Restore{Path: savePath},
+	})
+	if !errors.Is(err, closeFailure) {
+		t.Fatalf("Launch() = %v, want the close failure surfaced", err)
+	}
+	// ErrIncompatibleSave is what makes the daemon advertise an immediate
+	// cold boot; a failed release must not carry it.
+	if errors.Is(err, ErrIncompatibleSave) {
+		t.Fatalf("Launch() = %v, failed cleanup must not advertise cold-boot recovery", err)
+	}
+	if backend.saved[savePath] != retained {
+		t.Fatal("failed close dropped the only ownership record of the retained machine")
+	}
+	retained.closeMu.Lock()
+	closed := retained.closed
+	retained.closeMu.Unlock()
+	if closed {
+		t.Fatal("machine marked closed although its cleanup failed")
+	}
+	if _, err := os.Stat(savePath); err != nil {
+		t.Fatalf("failed cleanup removed retryable save: %v", err)
+	}
+}
+
 func TestQEMULaunchMalformedSaveKeepsColdBootFallback(t *testing.T) {
 	dir := t.TempDir()
 	savePath := filepath.Join(dir, "node.vzstate")

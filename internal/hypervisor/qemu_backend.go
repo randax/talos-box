@@ -57,9 +57,19 @@ func (h *qemuHypervisor) Launch(ctx context.Context, spec Spec) (Machine, error)
 			// The refusal keeps the save file for the user to act on, but a
 			// machine retained from a same-daemon suspend still holds the
 			// node's console proxy and network attachment. Release it, or the
-			// advertised cold-boot recovery collides with those resources.
+			// advertised cold-boot recovery collides with those resources. A
+			// failed release keeps the machine retained so a later resume,
+			// start or shutdown can retry, and the refusal must then not
+			// carry ErrIncompatibleSave: that sentinel is what makes the
+			// daemon advertise an immediate cold boot, which these still-held
+			// resources would collide with.
 			if retained := h.takeSaved(spec.Restore.Path); retained != nil {
-				_ = retained.Close()
+				if closeErr := retained.Close(); closeErr != nil {
+					if retainErr := h.retain(spec.Restore.Path, retained); retainErr != nil {
+						closeErr = errors.Join(closeErr, retainErr)
+					}
+					return nil, fmt.Errorf("refusing incompatible save (%v): release suspended machine: %w", err, closeErr)
+				}
 			}
 			return nil, err
 		} else if err := validateQEMUSaveVersion(metadata, h.version.String()); err != nil {
