@@ -56,6 +56,35 @@ func TestSecurityInventoryWarnsContentFilterOnMTEHost(t *testing.T) {
 	}
 }
 
+// Several filter extensions share one exposure and one remediation, so they
+// share one WARN line naming them all — never a wall of near-duplicates.
+func TestSecurityInventoryOneWarnForManyFilters(t *testing.T) {
+	t.Parallel()
+
+	list := activatedGlobalProtect +
+		"* * PXPZ95SK77 com.paloaltonetworks.GlobalProtect.filter.extension (6.2.5/6.2.5) GlobalProtect Filter [activated enabled]\n" +
+		"* * ZSCALER123 com.zscaler.tunnel (4.3/4.3) Zscaler [activated enabled]\n"
+	findings := securityInventoryFindings(fakeSecurityHost(t, list, "1", nil))
+	var warns []doctorFinding
+	for _, finding := range findings {
+		if finding.level == "WARN" {
+			warns = append(warns, finding)
+		}
+	}
+	if len(warns) != 1 {
+		t.Fatalf("got %d WARN findings %+v, want exactly one", len(warns), warns)
+	}
+	for _, want := range []string{
+		"com.paloaltonetworks.GlobalProtect.client.extension",
+		"com.paloaltonetworks.GlobalProtect.filter.extension",
+		"com.zscaler.tunnel",
+	} {
+		if !strings.Contains(warns[0].detail, want) {
+			t.Fatalf("detail %q does not name %q", warns[0].detail, want)
+		}
+	}
+}
+
 // The same filter on silicon without memory tagging cannot panic the host, so
 // the risk line stays absent and the inventory remains informational.
 func TestSecurityInventoryNoPanicRiskWithoutMTE(t *testing.T) {

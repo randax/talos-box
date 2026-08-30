@@ -50,37 +50,43 @@ func panicRiskFindings(command commandOutput, bundleIDs []string) []doctorFindin
 			filters = append(filters, bundleID)
 		}
 	}
-	if len(filters) == 0 || !hostEnforcesMemoryTagging(command) {
+	if len(filters) == 0 || !hostHasMemoryTagging(command) {
 		return nil
 	}
-	findings := make([]doctorFinding, 0, len(filters))
-	for _, bundleID := range filters {
-		findings = append(findings, doctorFinding{
-			level: "WARN", check: "security-inventory",
-			detail: bundleID + ": content filter active on a memory-tagging (MTE) host; " +
-				"a macOS kernel bug can panic this Mac when filtered TCP sockets close, " +
-				"which cluster lifecycle transitions do in bulk (#513); " +
-				"exempt tbx traffic from the filter or deactivate the extension to remove the exposure",
-		})
-	}
-	return findings
+	// One WARN covers the exposure however many filter extensions share it:
+	// the remediation is the same, and a vendor shipping several bundles must
+	// not turn one condition into a wall of near-identical lines.
+	return []doctorFinding{{
+		level: "WARN", check: "security-inventory",
+		detail: strings.Join(filters, ", ") + ": content filter active on a memory-tagging (MTE) host; " +
+			"a macOS kernel bug can panic this Mac when filtered TCP sockets close, " +
+			"which cluster lifecycle transitions do in bulk (#513); " +
+			"exempt tbx traffic from the filter or deactivate the extension to remove the exposure " +
+			"(docs/macos-panics.md)",
+	}}
 }
 
 // isContentFilterExtension reports whether the bundle is a known socket
-// content-filter provider — the class that leaves cfil state on TCP sockets.
-// Plain VPNs and EDR agents without a filter data provider are not the #513
-// shape, so they stay out.
+// filter-provider — the class that leaves cfil state on TCP sockets. That
+// includes the EDR network extensions, whose protection modules are socket
+// filters too; only plain VPNs stay out. The vendor table is shared with
+// securityExtensionWarning so a vendor is never listed in one and forgotten
+// in the other.
 func isContentFilterExtension(bundleID string) bool {
-	return containsAny(strings.ToLower(bundleID),
-		"paloaltonetworks", "globalprotect",
-		"zscaler", "netskope", "cisco.anyconnect", "cisco.secureclient",
-	)
+	lower := strings.ToLower(bundleID)
+	for _, class := range securityExtensionClasses {
+		if class.contentFilter && containsAny(lower, class.substrings...) {
+			return true
+		}
+	}
+	return false
 }
 
-// hostEnforcesMemoryTagging asks the kernel whether the silicon has MTE —
-// hw.optional.arm.FEAT_MTE is 1 on M5-generation Macs, 0 before, and only
-// MTE hardware can turn the #513 use-after-free into a panic.
-func hostEnforcesMemoryTagging(command commandOutput) bool {
+// hostHasMemoryTagging asks the kernel whether the silicon supports MTE —
+// hw.optional.arm.FEAT_MTE is 1 where it does — because only MTE hardware
+// can turn the #513 use-after-free into a panic. The bit reports the ISA
+// capability, which is the best userspace proxy for kernel tag enforcement.
+func hostHasMemoryTagging(command commandOutput) bool {
 	output, err := command("/usr/sbin/sysctl", "-n", "hw.optional.arm.FEAT_MTE")
 	if err != nil {
 		return false
@@ -103,20 +109,44 @@ func parseActivatedSystemExtensions(output []byte) []string {
 	return bundleIDs
 }
 
+// securityExtensionClasses is the one table of known security-software
+// vendors: the INFO annotation each class gets, and whether its extension is
+// a socket filter-provider (the #513 panic-exposure class).
+var securityExtensionClasses = []struct {
+	substrings    []string
+	warning       string
+	contentFilter bool
+}{
+	{
+		substrings:    []string{"paloaltonetworks", "globalprotect"},
+		warning:       "guest TLS will be reset; registry mirrors are required",
+		contentFilter: true,
+	},
+	{
+		substrings:    []string{"zscaler", "netskope", "cisco.anyconnect", "cisco.secureclient"},
+		warning:       "may filter local/guest traffic or DNS",
+		contentFilter: true,
+	},
+	{
+		substrings:    []string{"crowdstrike", "wdav", "sentinelone"},
+		warning:       "EDR present; ad-hoc-signed binaries may be blocked",
+		contentFilter: true,
+	},
+	{
+		substrings:    []string{"tailscale", "protonvpn", "wireguard"},
+		warning:       "VPN present; check route capture",
+		contentFilter: false,
+	},
+}
+
 func securityExtensionWarning(bundleID string) string {
 	lower := strings.ToLower(bundleID)
-	switch {
-	case containsAny(lower, "paloaltonetworks", "globalprotect"):
-		return "guest TLS will be reset; registry mirrors are required"
-	case containsAny(lower, "zscaler", "netskope", "cisco.anyconnect", "cisco.secureclient"):
-		return "may filter local/guest traffic or DNS"
-	case containsAny(lower, "crowdstrike", "wdav", "sentinelone"):
-		return "EDR present; ad-hoc-signed binaries may be blocked"
-	case containsAny(lower, "tailscale", "protonvpn", "wireguard"):
-		return "VPN present; check route capture"
-	default:
-		return ""
+	for _, class := range securityExtensionClasses {
+		if containsAny(lower, class.substrings...) {
+			return class.warning
+		}
 	}
+	return ""
 }
 
 func containsAny(value string, substrings ...string) bool {
