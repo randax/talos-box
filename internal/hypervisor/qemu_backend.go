@@ -53,8 +53,10 @@ func (h *qemuHypervisor) Launch(ctx context.Context, spec Spec) (Machine, error)
 		metadata, err := readQEMUSave(spec.Restore.Path)
 		if err != nil {
 			reportRestoreFallback(spec.Restore, err)
-		} else if err := validateQEMUSave(metadata, h.version.String(), h.architecture, h.system.Machine); err != nil {
+		} else if err := validateQEMUSave(metadata, h.architecture, h.system.Machine); err != nil {
 			return nil, err
+		} else if err := validateQEMUSaveVersion(metadata, h.version.String()); err != nil {
+			reportRestoreFallback(spec.Restore, err)
 		} else if !h.capabilities.Suspend.Supported {
 			err = fmt.Errorf("%w: %s", ErrIncompatibleSave, h.capabilities.Suspend.Reason)
 			reportRestoreFallback(spec.Restore, err)

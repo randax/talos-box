@@ -176,6 +176,13 @@ func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
 		}
 		machine, err := s.launchMachine(item, node, restore)
 		if err != nil {
+			if errors.Is(err, hypervisor.ErrIncompatibleSave) {
+				// The backend refused the save outright (its header names a
+				// different backend, architecture or machine): the memory is
+				// intact on disk but can never be applied here. Say how to
+				// get the cluster back rather than leave a bare refusal.
+				return resumedNode{}, fmt.Errorf("resume %s: %w; the saved memory cannot be restored on this hypervisor — run `tbx cluster start %s` to cold-boot and discard it", node.Name, err, item.Name)
+			}
 			return resumedNode{}, fmt.Errorf("resume %s: %w", node.Name, err)
 		}
 		nodes[node.Name] = machine

@@ -54,11 +54,6 @@ func TestQEMULaunchRefusesSaveIdentityMismatchBeforeStarting(t *testing.T) {
 			metadata.Backend = "vz"
 			return metadata
 		}()},
-		{name: "QEMU version", metadata: func() qemuSaveMetadata {
-			metadata := compatible
-			metadata.QEMUVersion = "8.2.1"
-			return metadata
-		}()},
 		{name: "architecture", metadata: func() qemuSaveMetadata {
 			metadata := compatible
 			metadata.Architecture = ArchitectureARM64
@@ -166,6 +161,53 @@ func TestQEMULaunchMalformedSaveKeepsColdBootFallback(t *testing.T) {
 	}
 	if !errors.Is(fallbackErr, ErrIncompatibleSave) {
 		t.Fatalf("fallback = %v, want malformed save reported as ErrIncompatibleSave", fallbackErr)
+	}
+}
+
+func TestQEMULaunchVersionMismatchKeepsColdBootFallback(t *testing.T) {
+	dir := t.TempDir()
+	savePath := filepath.Join(dir, "node.vzstate")
+	metadata := qemuSaveMetadata{Schema: qemuSaveSchema, Backend: qemuSaveBackend, QEMUVersion: "8.2.1", Architecture: ArchitectureAMD64, Machine: "q35"}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(savePath, append(encoded, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	varsTemplate := filepath.Join(dir, "OVMF_VARS.fd")
+	if err := os.WriteFile(varsTemplate, []byte("vars"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	currentVersion := qemuVersion{Major: 8, Minor: 2, Patch: 2}
+	backend := &qemuHypervisor{
+		architecture: ArchitectureAMD64,
+		system:       qemuSystem{Machine: "q35"},
+		version:      currentVersion,
+		capabilities: qemuCapabilities(currentVersion),
+		firmware:     qemuFirmware{VarsPath: varsTemplate},
+	}
+	coldBootErr := errors.New("cold boot attempted")
+	var fallbackErr error
+	_, err = backend.Launch(context.Background(), Spec{
+		CPUs:              1,
+		MemoryMiB:         1024,
+		DiskPath:          filepath.Join(dir, "node.img"),
+		MAC:               "02:00:00:00:00:01",
+		EFIVarsPath:       filepath.Join(dir, "node.efi"),
+		ConsoleSocketPath: filepath.Join(dir, "node.console.sock"),
+		Network: func() (*helper.Attachment, error) {
+			return nil, coldBootErr
+		},
+		Restore: &Restore{Path: savePath, Fallback: func(err error) {
+			fallbackErr = err
+		}},
+	})
+	if !errors.Is(err, coldBootErr) {
+		t.Fatalf("Launch() = %v, want cold-boot attempt after a QEMU upgrade", err)
+	}
+	if !errors.Is(fallbackErr, ErrIncompatibleSave) || !strings.Contains(fallbackErr.Error(), "8.2.1") {
+		t.Fatalf("fallback = %v, want version mismatch reported as ErrIncompatibleSave", fallbackErr)
 	}
 }
 
@@ -623,7 +665,10 @@ func TestQEMUSuspendSendsUint64FileMigrationOffset(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := validateQEMUSave(metadata, "8.2.2", ArchitectureAMD64, "q35"); err != nil {
+	if err := validateQEMUSave(metadata, ArchitectureAMD64, "q35"); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateQEMUSaveVersion(metadata, "8.2.2"); err != nil {
 		t.Fatal(err)
 	}
 	if backend.saved[savePath] != machine {

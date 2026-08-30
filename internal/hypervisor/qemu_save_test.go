@@ -91,15 +91,6 @@ func TestValidateQEMUSaveRejectsIdentityMismatch(t *testing.T) {
 			values: []string{"vz", compatible.Backend},
 		},
 		{
-			name: "QEMU version",
-			metadata: func() qemuSaveMetadata {
-				metadata := compatible
-				metadata.QEMUVersion = "8.2.1"
-				return metadata
-			}(),
-			values: []string{"8.2.1", currentVersion},
-		},
-		{
 			name: "architecture",
 			metadata: func() qemuSaveMetadata {
 				metadata := compatible
@@ -121,7 +112,7 @@ func TestValidateQEMUSaveRejectsIdentityMismatch(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			err := validateQEMUSave(test.metadata, currentVersion, currentArchitecture, currentMachine)
+			err := validateQEMUSave(test.metadata, currentArchitecture, currentMachine)
 			if !errors.Is(err, ErrIncompatibleSave) {
 				t.Fatalf("validateQEMUSave() = %v, want ErrIncompatibleSave", err)
 			}
@@ -131,5 +122,19 @@ func TestValidateQEMUSaveRejectsIdentityMismatch(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestValidateQEMUSaveVersionIsSeparateFromIdentity(t *testing.T) {
+	metadata := qemuSaveMetadata{Schema: qemuSaveSchema, Backend: qemuSaveBackend, QEMUVersion: "8.2.1", Architecture: ArchitectureAMD64, Machine: "q35"}
+	if err := validateQEMUSave(metadata, ArchitectureAMD64, "q35"); err != nil {
+		t.Fatalf("validateQEMUSave() = %v, want a version-only difference to pass the identity check", err)
+	}
+	err := validateQEMUSaveVersion(metadata, "8.2.2")
+	if !errors.Is(err, ErrIncompatibleSave) || !strings.Contains(err.Error(), "8.2.1") || !strings.Contains(err.Error(), "8.2.2") {
+		t.Fatalf("validateQEMUSaveVersion() = %v, want ErrIncompatibleSave naming both versions", err)
+	}
+	if err := validateQEMUSaveVersion(metadata, "8.2.1"); err != nil {
+		t.Fatalf("validateQEMUSaveVersion() = %v, want nil", err)
 	}
 }

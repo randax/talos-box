@@ -119,12 +119,13 @@ func readQEMUSave(path string) (qemuSaveMetadata, error) {
 	return metadata, nil
 }
 
-func validateQEMUSave(metadata qemuSaveMetadata, version string, architecture Architecture, machine string) error {
+// validateQEMUSave checks the save's identity — backend, architecture and
+// machine. A mismatch there means the save could only ever be misapplied, so
+// Launch refuses it outright rather than falling back to a cold boot.
+func validateQEMUSave(metadata qemuSaveMetadata, architecture Architecture, machine string) error {
 	switch {
 	case metadata.Backend != qemuSaveBackend:
 		return fmt.Errorf("%w: save uses backend %q, current backend is %q", ErrIncompatibleSave, metadata.Backend, qemuSaveBackend)
-	case metadata.QEMUVersion != version:
-		return fmt.Errorf("%w: save uses QEMU %q, host has QEMU %q", ErrIncompatibleSave, metadata.QEMUVersion, version)
 	case metadata.Architecture != architecture:
 		return fmt.Errorf("%w: save targets %s, host targets %s", ErrIncompatibleSave, metadata.Architecture, architecture)
 	case metadata.Machine != machine:
@@ -132,4 +133,15 @@ func validateQEMUSave(metadata qemuSaveMetadata, version string, architecture Ar
 	default:
 		return nil
 	}
+}
+
+// validateQEMUSaveVersion checks the QEMU release the save was written by. A
+// different release is the ordinary outcome of upgrading QEMU under a
+// suspended cluster, so Launch treats it as a cold-boot fallback rather than a
+// refusal: the user must be able to get the cluster back without downgrading.
+func validateQEMUSaveVersion(metadata qemuSaveMetadata, version string) error {
+	if metadata.QEMUVersion != version {
+		return fmt.Errorf("%w: save uses QEMU %q, host has QEMU %q", ErrIncompatibleSave, metadata.QEMUVersion, version)
+	}
+	return nil
 }
