@@ -1,14 +1,11 @@
-//go:build darwin && arm64
+//go:build darwin && amd64
 
 package hypervisor
 
 import "context"
 
 func platformRegistrySpec() (Default, []backendFactory) {
-	return Default{Name: NameVZ, Source: DefaultSourceCompiled}, []backendFactory{
-		{name: NameVZ, new: newVZ},
-		{name: NameQEMU, new: newQEMU},
-	}
+	return Default{Name: NameQEMU, Source: DefaultSourceCompiled}, []backendFactory{{name: NameQEMU, new: newQEMU}}
 }
 
 // NewAll probes every backend compiled for this platform.
