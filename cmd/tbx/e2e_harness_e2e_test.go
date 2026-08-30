@@ -252,7 +252,7 @@ func registerE2EClusterCleanup(t *testing.T, name string, cleanupOutput *strings
 		e2eOwnedClusters.Lock()
 		delete(e2eOwnedClusters.names, name)
 		e2eOwnedClusters.Unlock()
-		if err != nil {
+		if err != nil && !strings.Contains(output, "does not exist") {
 			t.Errorf("cleanup cluster %q: %v\n%s", name, err, output)
 		}
 	})
@@ -291,7 +291,7 @@ func requireNoForeignClusters(t *testing.T) {
 	}
 }
 
-func registerE2EFailureDiagnostics(t *testing.T, logOffset int64, cleanupOutput *strings.Builder) {
+func registerE2EFailureDiagnostics(t *testing.T, logOffset int64) {
 	t.Helper()
 	t.Cleanup(func() {
 		if !t.Failed() {
@@ -307,9 +307,6 @@ func registerE2EFailureDiagnostics(t *testing.T, logOffset int64, cleanupOutput 
 		fmt.Fprintf(&diagnostic, "\ntbxd.log from offset %d:\n%s", logOffset, logTail)
 		if logErr != nil {
 			fmt.Fprintf(&diagnostic, "\nlog diagnostic error: %v", logErr)
-		}
-		if cleanupOutput != nil {
-			fmt.Fprintf(&diagnostic, "\ncleanup output:\n%s", cleanupOutput.String())
 		}
 		t.Log(diagnostic.String())
 	})

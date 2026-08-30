@@ -31,14 +31,17 @@ func TestQEMUSuspendSurvivesDaemonRestartE2E(t *testing.T) {
 	configPath := writeE2EConfig(t, yaml)
 	logOffset := captureTBXDLogOffset(t)
 	var cleanupOutput strings.Builder
-	registerE2EFailureDiagnostics(t, logOffset, &cleanupOutput)
-	runTBX(t, "up", "-f", configPath)
 	registerE2EClusterCleanup(t, name, &cleanupOutput)
+	registerE2EFailureDiagnostics(t, logOffset)
+	runTBX(t, "up", "-f", configPath)
 
 	status, _ := waitForHypervisorLifecycleStatus(t, name, hypervisorLifecycleStatusTimeout, func(status daemon.ClusterStatus) bool {
 		return lifecycleNodeRunning(status, hypervisor.NameQEMU)
 	})
 	nodeName := status.Nodes[0].Name
+	bootBanner := regexp.MustCompile(`(?m)Linux version \S+.*#1\b`)
+	preSuspendConsole := runTBX(t, "console", name, nodeName, "--no-follow", "--lines", "300")
+	preSuspendBannerCount := len(bootBanner.FindAllString(preSuspendConsole, -1))
 
 	runTBX(t, "cluster", "suspend", name)
 	// Leave a full clock-drift reporting interval after the save timestamp.
@@ -48,9 +51,8 @@ func TestQEMUSuspendSurvivesDaemonRestartE2E(t *testing.T) {
 			len(status.Nodes) == 1 && status.Nodes[0].Suspended && status.Nodes[0].Phase == daemon.PhaseSuspended
 	})
 
-	// Add no command-scoped environment override: the replacement daemon must
-	// use the cluster's persisted QEMU selection, not TBX_HYPERVISOR.
-	runTBX(t, "system", "restart")
+	// Clear ambient TBX_HYPERVISOR so it cannot override the persisted per-cluster QEMU selection.
+	runTBXWithEnv(t, []string{"TBX_HYPERVISOR="}, "system", "restart")
 	_, restartedStatus := waitForHypervisorLifecycleStatus(t, name, hypervisorLifecycleStatusTimeout, func(status daemon.ClusterStatus) bool {
 		return status.Hypervisor == hypervisor.NameQEMU && !status.Running && status.Suspended &&
 			len(status.Nodes) == 1 && status.Nodes[0].Phase == daemon.PhaseSuspended
@@ -70,12 +72,10 @@ func TestQEMUSuspendSurvivesDaemonRestartE2E(t *testing.T) {
 		return lifecycleNodeRunning(status, hypervisor.NameQEMU) && status.Nodes[0].Name == nodeName
 	})
 
-	console := runTBX(t, "console", name, nodeName, "--no-follow", "--lines", "300")
-	// The bounded console tail can retain the original kernel banner; a second
-	// banner would prove resume cold-booted instead of restoring saved memory.
-	bootBanner := regexp.MustCompile(`(?m)Linux version \S+.*#1\b`)
-	if count := len(bootBanner.FindAllString(console, -1)); count > 1 {
-		t.Fatalf("console tail contains %d kernel boot banners after resume, want at most the original:\n%s", count, console)
+	postResumeConsole := runTBX(t, "console", name, nodeName, "--no-follow", "--lines", "300")
+	postResumeBannerCount := len(bootBanner.FindAllString(postResumeConsole, -1))
+	if postResumeBannerCount > preSuspendBannerCount {
+		t.Fatalf("kernel boot banner count increased across suspend/resume: before=%d after=%d\npre-suspend console tail:\n%s\npost-resume console tail:\n%s", preSuspendBannerCount, postResumeBannerCount, preSuspendConsole, postResumeConsole)
 	}
 }
 
@@ -89,9 +89,9 @@ func TestUpRefusesHypervisorDriftE2E(t *testing.T) {
 	configPath := writeE2EConfig(t, yaml)
 	logOffset := captureTBXDLogOffset(t)
 	var cleanupOutput strings.Builder
-	registerE2EFailureDiagnostics(t, logOffset, &cleanupOutput)
-	runTBX(t, "up", "-f", configPath)
 	registerE2EClusterCleanup(t, name, &cleanupOutput)
+	registerE2EFailureDiagnostics(t, logOffset)
+	runTBX(t, "up", "-f", configPath)
 	waitForHypervisorLifecycleStatus(t, name, hypervisorLifecycleStatusTimeout, func(status daemon.ClusterStatus) bool {
 		return lifecycleNodeRunning(status, backend.Name)
 	})
@@ -110,8 +110,21 @@ func TestUpRefusesHypervisorDriftE2E(t *testing.T) {
 		"cluster %q: hypervisor is immutable (cluster has %q, talosbox.yaml wants %q); destroy and recreate the cluster to change the hypervisor",
 		name, backend.Name, newBackend,
 	)
-	if !strings.Contains(output, expected) {
-		t.Fatalf("drift refusal output = %q, want it to contain %q", output, expected)
+	containsExpected := strings.Contains(output, expected)
+	var immutableLine string
+	for _, line := range strings.Split(output, "\n") {
+		if strings.Contains(line, "hypervisor is immutable") {
+			immutableLine = line
+			break
+		}
+	}
+	if immutableLine == "" {
+		t.Fatalf("drift refusal output contains no line with %q (contains full expected text: %t):\n%s", "hypervisor is immutable", containsExpected, output)
+	}
+	actual := strings.TrimSpace(immutableLine)
+	actual = strings.TrimSpace(strings.TrimPrefix(actual, "tbx: "))
+	if actual != expected {
+		t.Fatalf("drift refusal line = %q, want exactly %q (full output contains expected text: %t):\n%s", actual, expected, containsExpected, output)
 	}
 
 	waitForHypervisorLifecycleStatus(t, name, hypervisorLifecycleStatusTimeout, func(status daemon.ClusterStatus) bool {

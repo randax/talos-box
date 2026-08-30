@@ -17,7 +17,10 @@ import (
 )
 
 const (
-	mixedE2EReadyTimeout = 25 * time.Minute
+	// upWithObservations provisions clusters sequentially, not in parallel, so
+	// two clusters need twice cniProvisionDeadline plus image-pull/VM-boot grace.
+	mixedE2EUpTimeout    = 2*cniProvisionDeadline + 5*time.Minute
+	mixedE2EReadyTimeout = 10 * time.Minute
 	mixedE2EPollInterval = 15 * time.Second
 )
 
@@ -66,15 +69,15 @@ func TestMixedHypervisorsInterClusterE2E(t *testing.T) {
 
 	logOffset := captureTBXDLogOffset(t)
 	var cleanupOutput strings.Builder
-	registerE2EFailureDiagnostics(t, logOffset, &cleanupOutput)
-	readyDeadline := time.Now().Add(mixedE2EReadyTimeout)
-	upOutput, upErr := runTBXCommand(t, nil, mixedE2EReadyTimeout, "up", "--force", "-f", configPath)
 	registerE2EClusterCleanup(t, vzName, &cleanupOutput)
 	registerE2EClusterCleanup(t, qemuName, &cleanupOutput)
+	registerE2EFailureDiagnostics(t, logOffset)
+	upOutput, upErr := runTBXCommand(t, nil, mixedE2EUpTimeout, "up", "--force", "-f", configPath)
 	if upErr != nil {
 		t.Fatalf("tbx up --force -f %s: %v\n%s", configPath, upErr, upOutput)
 	}
 
+	readyDeadline := time.Now().Add(mixedE2EReadyTimeout)
 	waitForMixedE2EClusters(t, readyDeadline, map[string]hypervisor.Name{
 		vzName:   hypervisor.NameVZ,
 		qemuName: hypervisor.NameQEMU,
