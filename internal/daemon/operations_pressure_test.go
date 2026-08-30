@@ -18,7 +18,11 @@ import (
 
 func TestCreateClusterChecksHostPressureBeforeMutation(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	service := &Server{hostPressure: extremeSwapPressure, hostFreeMemory: scarceHostMemory}
+	service := &Server{
+		hypervisors:    singleFakeRegistry(&fakeHypervisor{}),
+		hostPressure:   extremeSwapPressure,
+		hostFreeMemory: scarceHostMemory,
+	}
 	raw, err := json.Marshal(createArgs{Name: "unsafe-create"})
 	if err != nil {
 		t.Fatal(err)

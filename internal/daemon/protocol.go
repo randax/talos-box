@@ -147,6 +147,7 @@ type HypervisorInfo struct {
 	Name                         hypervisor.Name   `json:"name"`
 	Available                    bool              `json:"available,omitempty"`
 	AvailabilityReason           string            `json:"availabilityReason,omitempty"`
+	AvailabilityRemediation      string            `json:"availabilityRemediation,omitempty"`
 	BalloonReadback              FeatureStatusInfo `json:"balloonReadback,omitempty"`
 	SuspendSurvivesDaemonRestart bool              `json:"suspendSurvivesDaemonRestart,omitempty"`
 	GuestAgent                   FeatureStatusInfo `json:"guestAgent,omitempty"`

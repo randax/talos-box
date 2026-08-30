@@ -407,6 +407,9 @@ func (s *Server) preflightUpWithStorage(
 		if err != nil {
 			return nil, fmt.Errorf("load %s: %w", spec.Name, err)
 		}
+		if err := s.checkHypervisorUnchanged(item, spec); err != nil {
+			return nil, err
+		}
 		if err := checkDomainUnchanged(item, spec); err != nil {
 			return nil, err
 		}
@@ -441,6 +444,20 @@ func (s *Server) preflightUpWithStorage(
 		}
 	}
 	return updates, nil
+}
+
+func (s *Server) checkHypervisorUnchanged(item cluster.Cluster, spec config.ClusterSpec) error {
+	if spec.Hypervisor == "" {
+		return nil
+	}
+	stored := s.hypervisorNameForCluster(item)
+	if spec.Hypervisor != stored {
+		return fmt.Errorf(
+			"cluster %q: hypervisor is immutable (cluster has %q, talosbox.yaml wants %q); destroy and recreate the cluster to change the hypervisor",
+			spec.Name, stored, spec.Hypervisor,
+		)
+	}
+	return nil
 }
 
 // reconcileProvisioningIntent returns the only allowed persisted intent
@@ -622,6 +639,7 @@ func resolveSpecTalos(spec config.ClusterSpec, fileTalos config.TalosSpec) confi
 func createArgsFromSpec(spec config.ClusterSpec, force bool) createArgs {
 	return createArgs{
 		Name:                    spec.Name,
+		Hypervisor:              spec.Hypervisor,
 		ControlPlanes:           &spec.ControlPlanes,
 		Workers:                 &spec.Workers,
 		Node:                    spec.Node,

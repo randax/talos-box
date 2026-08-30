@@ -32,13 +32,13 @@ func TestRunDoctorPrintsOneLinePerHypervisor(t *testing.T) {
 		return daemon.Info{
 			Hypervisors: []daemon.HypervisorInfo{
 				{
-					Name: "primary", Available: true,
+					Name: hypervisor.NameVZ, Available: true,
 					BalloonReadback: daemon.FeatureStatusInfo{Supported: true},
 					GuestAgent:      daemon.FeatureStatusInfo{Reason: "no channel"},
 				},
-				{Name: "optional", AvailabilityReason: "optional probe failed"},
+				{Name: hypervisor.NameQEMU, AvailabilityReason: "optional probe failed", AvailabilityRemediation: "install optional support"},
 			},
-			DefaultHypervisor:       "primary",
+			DefaultHypervisor:       hypervisor.NameVZ,
 			DefaultHypervisorSource: hypervisor.DefaultSourceCompiled,
 		}, nil
 	}
@@ -47,8 +47,8 @@ func TestRunDoctorPrintsOneLinePerHypervisor(t *testing.T) {
 	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
 		t.Fatal(err)
 	}
-	wantOptional := "INFO Hypervisors: optional: availability=unavailable (optional probe failed); default=no; balloon-readback=unavailable; suspend-survives-restart=unavailable; guest-agent=unavailable"
-	wantPrimary := "INFO Hypervisors: primary: availability=available; default=yes (source=compiled); balloon-readback=supported; suspend-survives-restart=unsupported; guest-agent=unsupported (no channel)"
+	wantOptional := "INFO Hypervisors: qemu: availability=unavailable (optional probe failed; remediation: install optional support); default=no; balloon-readback=unavailable; suspend-survives-restart=unavailable; guest-agent=unavailable"
+	wantPrimary := "INFO Hypervisors: vz: availability=available; default=yes (source=compiled); balloon-readback=supported; suspend-survives-restart=unsupported; guest-agent=unsupported (no channel)"
 	text := output.String()
 	optionalIndex, primaryIndex := strings.Index(text, wantOptional), strings.Index(text, wantPrimary)
 	if optionalIndex < 0 || primaryIndex < 0 {
@@ -56,6 +56,26 @@ func TestRunDoctorPrintsOneLinePerHypervisor(t *testing.T) {
 	}
 	if optionalIndex > primaryIndex {
 		t.Fatalf("hypervisor lines are not lexically sorted:\n%s", text)
+	}
+}
+
+func TestRunDoctorShowsEnvironmentHypervisorDefaultSource(t *testing.T) {
+	t.Parallel()
+	deps := hypervisorDoctorDependencies()
+	deps.daemonInfo = func() (daemon.Info, error) {
+		return daemon.Info{
+			Hypervisors:             []daemon.HypervisorInfo{{Name: "selected", Available: true}},
+			DefaultHypervisor:       "selected",
+			DefaultHypervisorSource: hypervisor.DefaultSourceEnvironment,
+		}, nil
+	}
+
+	var output strings.Builder
+	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "default=yes (source=TBX_HYPERVISOR)") {
+		t.Fatalf("doctor output missing environment default source:\n%s", output.String())
 	}
 }
 

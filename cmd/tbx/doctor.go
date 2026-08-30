@@ -690,9 +690,10 @@ func doctorHypervisors(deps doctorDependencies) doctorHypervisorInventory {
 	for _, name := range registry.Names() {
 		entry := registry.Backends[name]
 		item := daemon.HypervisorInfo{
-			Name:               name,
-			Available:          entry.Availability.Available,
-			AvailabilityReason: entry.Availability.Reason,
+			Name:                    name,
+			Available:               entry.Availability.Available,
+			AvailabilityReason:      entry.Availability.Reason,
+			AvailabilityRemediation: entry.Availability.Remediation,
 		}
 		if entry.Availability.Available && entry.Hypervisor != nil {
 			capabilities := entry.Hypervisor.Capabilities()
@@ -728,8 +729,15 @@ func hypervisorFindings(inventory doctorHypervisorInventory) []doctorFinding {
 		guestAgent := featureGate(item.GuestAgent)
 		if !item.Available {
 			availability = "unavailable"
+			details := make([]string, 0, 2)
 			if item.AvailabilityReason != "" {
-				availability += " (" + item.AvailabilityReason + ")"
+				details = append(details, item.AvailabilityReason)
+			}
+			if item.AvailabilityRemediation != "" {
+				details = append(details, "remediation: "+item.AvailabilityRemediation)
+			}
+			if len(details) != 0 {
+				availability += " (" + strings.Join(details, "; ") + ")"
 			}
 			balloonReadback, suspendRestart, guestAgent = "unavailable", "unavailable", "unavailable"
 		}

@@ -31,6 +31,7 @@ import (
 
 type createArgs struct {
 	Name          string                `json:"name"`
+	Hypervisor    hypervisor.Name       `json:"hypervisor,omitempty"`
 	ControlPlanes *int                  `json:"controlPlanes"`
 	Workers       *int                  `json:"workers"`
 	Node          cluster.NodeDefaults  `json:"node"`
@@ -311,8 +312,9 @@ const (
 
 // ClusterStatus is the status result for one cluster.
 type ClusterStatus struct {
-	Name   string `json:"name"`
-	Subnet string `json:"subnet"`
+	Name       string          `json:"name"`
+	Subnet     string          `json:"subnet"`
+	Hypervisor hypervisor.Name `json:"hypervisor,omitempty"`
 	// Domain is the cluster's effective domain (explicit or defaulted).
 	Domain string `json:"domain"`
 	// AllowUnsafeDomain records the opt-in the domain was accepted under, so
@@ -589,6 +591,10 @@ func (s *Server) createCluster(raw json.RawMessage, progress stageFunc) (Cluster
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return ClusterSummary{}, fmt.Errorf("inspect cluster directory: %w", err)
 	}
+	name, backend, err := s.hypervisorForCreate(args.Hypervisor)
+	if err != nil {
+		return ClusterSummary{}, err
+	}
 	// Charge the steady-state pressure verdict for the same guests the
 	// provision-start gate is about to admit: stale swap is safe only when free
 	// RAM covers both this allocation and the balloon reserve (#483).
@@ -666,10 +672,7 @@ func (s *Server) createCluster(raw json.RawMessage, progress stageFunc) (Cluster
 	item.ProvisioningIntent = intent
 	item.Domain = canonicalDomain
 	item.AllowUnsafeDomain = canonicalDomain != "" && args.AllowUnsafeDomain
-	_, backend, err := s.hypervisorForCluster(item)
-	if err != nil {
-		return ClusterSummary{}, err
-	}
+	item.Hypervisor = string(name)
 	item.ImageArchitecture = string(backend.Architecture())
 	// A create that names no talosbox.yaml is imperative — including one from
 	// a CLI predating the flag, which is exactly what `tbx cluster create`
@@ -1575,7 +1578,7 @@ func (s *Server) status(raw json.RawMessage) ([]ClusterStatus, error) {
 	result := make([]ClusterStatus, 0, len(items))
 	for _, item := range items {
 		running := s.clusterRunning(item.Name)
-		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), AllowUnsafeDomain: item.AllowUnsafeDomain, TalosVersion: item.TalosVersion, Schematic: item.Schematic, BaseSchematic: item.BaseSchematic, TalosExtensions: item.TalosExtensions, ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: running,
+		clusterStatus := ClusterStatus{Name: item.Name, Subnet: cluster.SubnetCIDR(item.SubnetIndex), Domain: item.EffectiveDomain(), Hypervisor: s.hypervisorNameForCluster(item), AllowUnsafeDomain: item.AllowUnsafeDomain, TalosVersion: item.TalosVersion, Schematic: item.Schematic, BaseSchematic: item.BaseSchematic, TalosExtensions: item.TalosExtensions, ProvisioningIntent: item.ProvisioningIntent, BGP: item.BGP, Running: running,
 			// derived from disk, not from daemon memory, so a restarted
 			// daemon still reports its predecessor's suspension
 			Suspended: !running && clusterHasSavedState(item.Name), SavedStateStale: !running && s.savedStateStale(item), Capabilities: s.clusterCapabilities(item), ConfigOrigin: item.ConfigOrigin, subnetIndex: item.SubnetIndex}

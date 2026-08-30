@@ -40,6 +40,13 @@ func TestCreateFromSpecWithoutCNIUsesLegacyProvisioningFields(t *testing.T) {
 	}
 }
 
+func TestCreateArgsFromSpecCarriesHypervisor(t *testing.T) {
+	args := createArgsFromSpec(config.ClusterSpec{Name: "demo", Hypervisor: hypervisor.NameQEMU}, false)
+	if args.Hypervisor != hypervisor.NameQEMU {
+		t.Fatalf("createArgsFromSpec() hypervisor = %q, want %q", args.Hypervisor, hypervisor.NameQEMU)
+	}
+}
+
 func TestCreateArgsFromSpecCarriesKubeletMemoryProtectionOptOut(t *testing.T) {
 	spec := config.ClusterSpec{
 		Name: "demo",
@@ -469,6 +476,107 @@ func TestPreflightUpRejectsEveryInvalidClusterBeforeAnyIntentIsPersisted(t *test
 	}
 	if updated.CNI != "" {
 		t.Fatalf("preflight persisted first cluster before second failed: %+v", updated.ProvisioningIntent)
+	}
+}
+
+func TestPreflightUpRejectsHypervisorDriftBeforeDomainDrift(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.Hypervisor = string(hypervisor.NameVZ)
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	service := &Server{hypervisors: hypervisor.Registry{CompiledDefault: hypervisor.NameVZ}}
+
+	updates, err := service.preflightUp([]config.ClusterSpec{{
+		Name: "demo", Hypervisor: hypervisor.NameQEMU, Domain: "changed.example",
+	}}, map[string]ClusterState{"demo": {Exists: true}}, nil)
+	if err == nil || !strings.Contains(err.Error(), `hypervisor is immutable (cluster has "vz", talosbox.yaml wants "qemu")`) {
+		t.Fatalf("preflightUp() error = %v, want hypervisor drift before domain drift", err)
+	}
+	if strings.Contains(err.Error(), "domain is immutable") {
+		t.Fatalf("preflightUp() returned domain drift before hypervisor drift: %v", err)
+	}
+	if len(updates) != 0 {
+		t.Fatalf("preflightUp() updates = %+v, want none after drift", updates)
+	}
+	stored, err := cluster.Load("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ConfigOrigin == cluster.OriginManaged {
+		t.Fatal("preflightUp() persisted an intent update before refusing hypervisor drift")
+	}
+}
+
+func TestPreflightUpAllowsSilentHypervisor(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.Hypervisor = string(hypervisor.NameQEMU)
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	service := &Server{hypervisors: hypervisor.Registry{CompiledDefault: hypervisor.NameVZ}}
+
+	if _, err := service.preflightUp(
+		[]config.ClusterSpec{{Name: "demo"}},
+		map[string]ClusterState{"demo": {Exists: true}}, nil,
+	); err != nil {
+		t.Fatalf("preflightUp() rejected a silent hypervisor: %v", err)
+	}
+}
+
+func TestLegacyEmptyHypervisorComparesAsCompiledDefault(t *testing.T) {
+	t.Parallel()
+	service := &Server{hypervisors: hypervisor.Registry{CompiledDefault: hypervisor.NameVZ}}
+	item := cluster.Cluster{Name: "legacy"}
+
+	if err := service.checkHypervisorUnchanged(item, config.ClusterSpec{Name: "legacy", Hypervisor: hypervisor.NameVZ}); err != nil {
+		t.Fatalf("checkHypervisorUnchanged(compiled default) = %v", err)
+	}
+	err := service.checkHypervisorUnchanged(item, config.ClusterSpec{Name: "legacy", Hypervisor: hypervisor.NameQEMU})
+	if err == nil || !strings.Contains(err.Error(), `cluster has "vz"`) {
+		t.Fatalf("checkHypervisorUnchanged(other) = %v, want compiled-default drift", err)
+	}
+}
+
+func TestUpStartsPersistedHypervisorAfterDefaultFlip(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{MemoryMiB: 1, CPUs: 1, DiskGiB: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.Hypervisor = "persisted"
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+	persisted := &fakeHypervisor{}
+	flipped := &fakeHypervisor{}
+	registry := fakeRegistry("flipped", map[hypervisor.Name]hypervisor.Hypervisor{
+		"persisted": persisted,
+		"flipped":   flipped,
+	})
+	registry.CompiledDefault = "persisted"
+	service := &Server{
+		hypervisors: registry, vms: make(map[string]map[string]hypervisor.Machine),
+		hostPressure: noHostPressure, subnetSources: emptySubnetSources(),
+	}
+	raw, err := json.Marshal(upArgs{Clusters: []config.ClusterSpec{{Name: "demo"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := service.up(raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted.specs) != 1 || len(flipped.specs) != 0 {
+		t.Fatalf("launch calls persisted=%d flipped=%d, want persisted backend only", len(persisted.specs), len(flipped.specs))
 	}
 }
 

@@ -199,16 +199,17 @@ func (l *lockedListener) Close() error {
 }
 
 // NewServer creates a daemon using the default image cache and probes the host
-// hypervisor once before accepting requests.
+// hypervisors once before accepting requests.
 func NewServer(ctx context.Context) (*Server, error) {
-	return newServer(ctx, hypervisor.NewAll(ctx))
+	registry, err := hypervisor.NewAllFromEnvironment(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return newServer(ctx, registry)
 }
 
 func newServer(ctx context.Context, registry hypervisor.Registry) (*Server, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if _, _, err := registry.ResolveDefault(); err != nil {
 		return nil, err
 	}
 	cache, err := imagecache.NewDefault()
@@ -281,10 +282,28 @@ func newServer(ctx context.Context, registry hypervisor.Registry) (*Server, erro
 	return server, nil
 }
 
+func (s *Server) hypervisorNameForCluster(item cluster.Cluster) hypervisor.Name {
+	if item.Hypervisor != "" {
+		return hypervisor.Name(item.Hypervisor)
+	}
+	return s.hypervisors.CompiledDefault
+}
+
 // hypervisorForCluster is the single selection boundary for persisted
-// clusters. Later state and YAML tickets will change selection here only.
-func (s *Server) hypervisorForCluster(_ cluster.Cluster) (hypervisor.Name, hypervisor.Hypervisor, error) {
-	return s.hypervisors.ResolveDefault()
+// clusters. Legacy state follows the compiled platform default, never a later
+// environment-selected default.
+func (s *Server) hypervisorForCluster(item cluster.Cluster) (hypervisor.Name, hypervisor.Hypervisor, error) {
+	name := s.hypervisorNameForCluster(item)
+	backend, err := s.hypervisors.Resolve(name)
+	return name, backend, err
+}
+
+func (s *Server) hypervisorForCreate(requested hypervisor.Name) (hypervisor.Name, hypervisor.Hypervisor, error) {
+	if requested == "" {
+		return s.hypervisors.ResolveDefault()
+	}
+	backend, err := s.hypervisors.Resolve(requested)
+	return requested, backend, err
 }
 
 func cacheWarmResult(summary mirror.WarmSummary) CacheWarmResult {
@@ -967,9 +986,10 @@ func (s *Server) info() Info {
 	for _, name := range s.hypervisors.Names() {
 		entry := s.hypervisors.Backends[name]
 		backendInfo := HypervisorInfo{
-			Name:               name,
-			Available:          entry.Availability.Available,
-			AvailabilityReason: entry.Availability.Reason,
+			Name:                    name,
+			Available:               entry.Availability.Available,
+			AvailabilityReason:      entry.Availability.Reason,
+			AvailabilityRemediation: entry.Availability.Remediation,
 		}
 		if entry.Availability.Available && entry.Hypervisor != nil {
 			capabilities := entry.Hypervisor.Capabilities()
