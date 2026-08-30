@@ -279,11 +279,13 @@ func configureVZDevices(machineConfig *vz.VirtualMachineConfiguration, spec Spec
 	}
 	machineConfig.SetEntropyDevicesVirtualMachineConfiguration([]*vz.VirtioEntropyDeviceConfiguration{entropy})
 
-	balloon, err := vz.NewVirtioTraditionalMemoryBalloonDeviceConfiguration()
-	if err != nil {
-		return fmt.Errorf("create memory balloon device: %w", err)
+	if !spec.DisableBalloon {
+		balloon, err := vz.NewVirtioTraditionalMemoryBalloonDeviceConfiguration()
+		if err != nil {
+			return fmt.Errorf("create memory balloon device: %w", err)
+		}
+		machineConfig.SetMemoryBalloonDevicesVirtualMachineConfiguration([]vz.MemoryBalloonDeviceConfiguration{balloon})
 	}
-	machineConfig.SetMemoryBalloonDevicesVirtualMachineConfiguration([]vz.MemoryBalloonDeviceConfiguration{balloon})
 
 	serialAttachment, err := vz.NewFileHandleSerialPortAttachment(guestRead, guestWrite)
 	if err != nil {

@@ -107,10 +107,10 @@ func TestNodeStatusRebootFieldsRoundTripJSON(t *testing.T) {
 	}
 }
 
-func TestProtocolVersionIncludesCacheWarmJobs(t *testing.T) {
+func TestProtocolVersionIncludesBalloonDisabled(t *testing.T) {
 	t.Parallel()
-	if ProtocolVersion != 20 {
-		t.Fatalf("ProtocolVersion = %d, want 20 for cache.warm jobs and entry narration", ProtocolVersion)
+	if ProtocolVersion != 21 {
+		t.Fatalf("ProtocolVersion = %d, want 21 for Info.BalloonDisabled", ProtocolVersion)
 	}
 }
 

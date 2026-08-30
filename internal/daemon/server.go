@@ -72,6 +72,10 @@ type Server struct {
 	// is retargeted while its VM stops (#513).
 	balloonTeardowns atomic.Int32
 	balloonShutdown  atomic.Bool
+	// balloonDisabled launches every guest without a balloon device and keeps
+	// the manager and the pre-balloon reclaim away from them (#513). Read once
+	// from TBX_DISABLE_BALLOON when the server is built.
+	balloonDisabled bool
 
 	provisions           map[string]activeProvision
 	storagePhases        map[string]StoragePhase
@@ -213,6 +217,7 @@ func NewServer(ctx context.Context) (*Server, error) {
 	server := &Server{
 		cache:                 cache,
 		hypervisor:            backend,
+		balloonDisabled:       balloon.Disabled(),
 		vms:                   make(map[string]map[string]hypervisor.Machine),
 		provisions:            make(map[string]activeProvision),
 		storagePhases:         make(map[string]StoragePhase),
@@ -873,7 +878,7 @@ func (s *Server) handle(request Request, progress stageFunc) (any, error) {
 	case "daemon.ping":
 		return map[string]bool{"pong": true}, nil
 	case "daemon.info":
-		return Info{ProtocolVersion: ProtocolVersion, BalloonReserveMiB: balloon.DefaultConfig().ReserveMiB}, nil
+		return Info{ProtocolVersion: ProtocolVersion, BalloonReserveMiB: balloon.DefaultConfig().ReserveMiB, BalloonDisabled: s.balloonDisabled}, nil
 	case "up":
 		return s.up(request.Args)
 	case "down":
@@ -1016,7 +1021,7 @@ func removeNodeFiles(clusterName, nodeName string) error {
 	// nothing left to restore into, and clusterHasSavedState only globs the
 	// directory — an orphaned save would keep reporting the whole cluster
 	// Suspended and keep the hint recommending a resume forever.
-	for _, suffix := range []string{".img", ".efi", ".console.sock", ".qga.sock", saveStateSuffix, saveStateOwnerSuffix} {
+	for _, suffix := range []string{".img", ".efi", ".console.sock", ".qga.sock", saveStateSuffix, saveStateOwnerSuffix, saveStateBalloonSuffix} {
 		if err := os.Remove(filepath.Join(dir, nodeName+suffix)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("remove node file: %w", err)
 		}
