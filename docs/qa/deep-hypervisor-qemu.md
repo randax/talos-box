@@ -16,7 +16,7 @@ You are running QA, not demos. For every charter: run the steps exactly, compare
 
 ## Preflight
 
-BLOCKED unless: `tbx version` recorded; none of the names reserved by this runbook (`qa-hv`, `qa-balloon`, `qa-suspend`, `qa-mixed-vz`, `qa-mixed-qemu`, `qa-soak-vz`, `qa-soak-qemu`) already exists; tbxd is running unsupervised, with no attached debugger or foreground session that would make daemon restarts unrepresentative; for provisioning charters C1, C4, C5, C6, and C7 the host has online access to the Talos factory and image registries; on a macOS 14/Sonoma host this runbook may run **only C2**, and all other charters require macOS 15+ on Apple Silicon.
+BLOCKED unless: `tbx version` recorded; `tbx cluster list -o json` reports an empty cluster inventory (zero clusters); tbxd is running unsupervised, with no attached debugger or foreground session that would make daemon restarts unrepresentative; for provisioning charters C1, C4, C5, C6, and C7 the host has online access to the Talos factory and image registries; on a macOS 14/Sonoma host this runbook may run **only C2**, and all other charters require macOS 15+ on Apple Silicon.
 
 ## Charters
 
@@ -35,7 +35,7 @@ Steps:
 
 Expected observations: all three make invocations are green on an Apple Silicon host where QEMU/HVF is available; the inventory contains one lexically ordered line per registered backend, every line contains all six fields, and exactly one backend is the default. On a VZ-only host, QEMU is `availability=unavailable` with a reason and remediation, and the explicit QEMU lane skips cleanly rather than failing.
 
-Pass criteria: doctor inventory is parseable and honest, exactly one default is identified, all available lanes pass, unavailable QEMU is explained and skipped cleanly, and status emits valid JSON.
+Pass criteria: doctor inventory is parseable and honest, exactly one default is identified, all available lanes pass, unavailable QEMU is explained and skipped cleanly, and status emits valid JSON. The run report explicitly lists every skipped test and its stated skip reason. If doctor reports QEMU as `availability=available`, any skipped test case in a QEMU lane is unexpected and makes C1 FAIL; documented conditional charter skips, including C2's `SKIPPED-not-Sonoma`, remain valid and do not by themselves fail C1.
 
 On failure: capture the complete doctor transcript, the failing make command and output, `tbx status -o json`, and the relevant tail of `~/.talosbox/tbxd.log`.
 
@@ -45,12 +45,13 @@ On failure: capture the complete doctor transcript, the failing make command and
 
 Steps:
 1. **[macOS 14/Sonoma]** Run `tbx doctor | tee /tmp/qa-sonoma-doctor.txt`; do not run `tbx up`, `tbx cluster create`, or any make e2e lane in this charter.
-2. Confirm the QEMU `INFO Hypervisors:` line reports `availability=unavailable` because HVF is missing and includes remediation that tells the operator to upgrade to macOS 15+, reinstall QEMU with Homebrew, run `tbx system restart`, and then rerun `tbx doctor`.
-3. **[macOS 15+]** Record this charter as `SKIPPED-not-Sonoma` and continue to C3; do not attempt to reproduce or emulate a Sonoma environment.
+2. Confirm the QEMU `INFO Hypervisors:` line reports `availability=unavailable` because HVF is missing and its `remediation:` field contains exactly `HVF not built in: Homebrew builds without HVF on macOS 14; upgrade to macOS 15+ and reinstall QEMU`.
+3. After the operator completes that upgrade and reinstall, the runbook separately directs them to restart the daemon with `tbx system restart` and rerun `tbx doctor` to confirm QEMU availability; these commands are not part of the doctor's remediation text.
+4. **[macOS 15+]** Record this charter as `SKIPPED-not-Sonoma` and continue to C3; do not attempt to reproduce or emulate a Sonoma environment.
 
-Expected observations: Sonoma reports QEMU unavailable with the complete upgrade, reinstall, restart, and recheck sequence; no VM launches. A macOS 15+ run records the explicit conditional skip.
+Expected observations: Sonoma reports QEMU unavailable with the doctor remediation `HVF not built in: Homebrew builds without HVF on macOS 14; upgrade to macOS 15+ and reinstall QEMU`; no VM launches. The runbook separately directs the post-remediation daemon restart and doctor recheck. A macOS 15+ run records the explicit conditional skip.
 
-Pass criteria: on physical Sonoma hardware, the unavailability reason and remediation are truthful and complete; on macOS 15+, the report says `SKIPPED-not-Sonoma`.
+Pass criteria: on physical Sonoma hardware, the doctor truthfully reports that HVF is not built in and its remediation directs the upgrade and QEMU reinstall; the run report separately records the daemon restart and doctor recheck after remediation. On macOS 15+, the report says `SKIPPED-not-Sonoma`.
 
 On failure: capture the full doctor transcript, Homebrew QEMU version/package facts, `sw_vers`, and `uname -m`; do not attempt an improvised QEMU launch.
 
@@ -59,7 +60,7 @@ On failure: capture the full doctor transcript, Homebrew QEMU version/package fa
 **Goal**: explicit YAML wins over the daemon environment, the daemon environment wins over the compiled default, and stored backend identity cannot drift.
 
 Steps:
-1. Record the current daemon default and source with `tbx doctor | grep 'INFO Hypervisors:'`; record whether the original effective default came from `compiled` or `TBX_HYPERVISOR` so it can be restored.
+1. Record the current daemon default and source with `tbx doctor | grep 'INFO Hypervisors:'`; record whether the original effective default came from `compiled` or `TBX_HYPERVISOR` so it can be restored, and if it came from `TBX_HYPERVISOR`, record that original value.
 2. With no clusters running, run `TBX_HYPERVISOR=qemu tbx system restart --force`, then `tbx doctor | grep 'INFO Hypervisors:'`; the QEMU line must contain `default=yes (source=TBX_HYPERVISOR)`. Next run `TBX_HYPERVISOR=vz tbx system restart --force`, then rerun doctor; the VZ line must contain the same source field. This proves `TBX_HYPERVISOR` overrides the compiled default.
 3. Write `/tmp/qa-hv-qemu.yaml` with the following content, run `tbx up -f /tmp/qa-hv-qemu.yaml`, then run `tbx status qa-hv -o json | python3 -m json.tool`. With the daemon default still VZ, status must report QEMU, proving `clusters[].hypervisor` wins over `TBX_HYPERVISOR`.
 
@@ -100,7 +101,7 @@ Steps:
 1. Run `tbx doctor | tee /tmp/qa-balloon-doctor-before.txt`. Record the daemon's current effective `BalloonReserveMiB` from the `host-pressure` line (or directly from `daemon.info` when using an instrumented client), including whether it is the compiled default; also record whether doctor says `TBX_DISABLE_BALLOON` is active. If ballooning is disabled, mark FAIL with remediation rather than continuing.
 2. Read the same doctor `host-pressure` line's `<n> MiB free memory` value as `hostAvailable`, corroborate it with `memory_pressure`, and set `syntheticReserve = hostAvailable + 2048`.
 3. In one shell, run `export TBX_BALLOON_RESERVE_MIB=<syntheticReserve>` followed by `tbx system restart --force`; rerun doctor and confirm its balloon-reserve arithmetic reflects the synthetic reserve.
-4. Record the current end of `~/.talosbox/tbxd.log` before provisioning, for example with `wc -l ~/.talosbox/tbxd.log`; only lines written after this point count.
+4. Record the current end of `~/.talosbox/tbxd.log` before provisioning with `offset=$(wc -l < ~/.talosbox/tbxd.log)`; only lines written after this offset count.
 5. Write `/tmp/qa-balloon.yaml` with the following content; the absent `cni` is intentional. Run `tbx up --force -f /tmp/qa-balloon.yaml`.
 
    ```yaml
@@ -117,7 +118,7 @@ Steps:
    ```
 
 6. Run `tbx status qa-balloon -o json | python3 -m json.tool`; confirm the backend is `qemu` and every `nodes[].phase` equals `maintenance`.
-7. Watch only new log output, for example `tail -f ~/.talosbox/tbxd.log | grep 'balloon qa-balloon/'`, until a line appears in the shape `balloon qa-balloon/<node>: target=<n>MiB (configured=4096 hostFree=... reserve=... deficit=...)`. Stop the tail and verify `1024 <= target < 4096`.
+7. Starting from the recorded offset, watch only newly appended log output with `tail -n +$((offset+1)) -f ~/.talosbox/tbxd.log | grep 'balloon qa-balloon/'` until a line appears in the shape `balloon qa-balloon/<node>: target=<n>MiB (configured=4096 hostFree=... reserve=... deficit=...)`. Stop the tail and verify `1024 <= target < 4096`.
 8. Run `tbx cluster destroy qa-balloon --force`. Restore the captured reserve immediately: if it was the compiled default, run `unset TBX_BALLOON_RESERVE_MIB` and then `tbx system restart --force`; otherwise export the captured value and restart. Confirm doctor reports the restored reserve.
 
 Expected observations: the QEMU cluster remains in maintenance, a new cluster-specific balloon line reports an applied target between 1024 MiB inclusive and 4096 MiB exclusive, and the synthetic reserve is removed after cleanup.
@@ -226,13 +227,13 @@ Steps:
 
 2. Run `tbx up --force -f /tmp/qa-soak.yaml`; wait for both clusters to report their intended backend, all nodes running, Kubernetes ready, and a live VIP.
 3. Apply the same recorded workload manifest and request pattern to both clusters. Record the manifest, image digests, workload start time, and expected resource envelope.
-4. Record an ISO-8601 start timestamp, then sample both clusters every 5 minutes for 24 hours: 288 samples per cluster. Each sample must record node phase, pod health and restart counts, VIP reachability, memory use, CPU use, and a timestamp.
+4. Record an ISO-8601 start timestamp, take an initial sample at t=0, then sample both clusters at every 5-minute mark through t=24h: 289 endpoint-inclusive samples per cluster (0, 5, 10, ..., 1440 minutes). Each sample must record node phase, pod health and restart counts, VIP reachability, memory use, CPU use, and a timestamp.
 5. After the full elapsed interval, record an ISO-8601 end timestamp and attach the sample log or CSV plus the collector output. Check for unexpected restarts, phase flaps, any unreachable VIP sample, and memory or CPU outside the workload's expected bounds.
 6. An agent may prepare the clusters and start the sampling/collection job, but must **not** claim this charter complete without actually waiting the full elapsed wall-clock time and attaching the resulting artifacts, including the sample log/CSV and timestamps of the first and last samples. A report claiming PASS without those artifacts is invalid.
 
-Expected observations: both matched clusters remain stable for the entire 24 hours; every one of the 288 samples per cluster reports steady phases, healthy pods, reachable VIPs, and resources inside the recorded envelope.
+Expected observations: both matched clusters remain stable for the entire 24 hours; every one of the 289 endpoint-inclusive samples per cluster reports steady phases, healthy pods, reachable VIPs, and resources inside the recorded envelope.
 
-Pass criteria: full wall-clock duration elapsed; first and last timestamps span at least 24 hours; 288 samples per cluster are attached; there are no unexpected restarts or phase flaps; every VIP sample succeeds; memory and CPU remain within expected bounds.
+Pass criteria: full wall-clock duration elapsed; first and last timestamps span at least 24 hours; 289 endpoint-inclusive samples per cluster are attached; there are no unexpected restarts or phase flaps; every VIP sample succeeds; memory and CPU remain within expected bounds.
 
 On failure: preserve the complete collector artifacts, workload manifest and digests, first failing sample, surrounding status/doctor/log evidence, and all timestamps; do not restart the sample count after hiding an incident.
 
@@ -244,11 +245,12 @@ Steps:
 1. Destroy every cluster created in this run by exact name: run `tbx cluster destroy qa-hv --force`, `tbx cluster destroy qa-balloon --force`, `tbx cluster destroy qa-suspend --force`, `tbx cluster destroy qa-mixed-vz --force`, `tbx cluster destroy qa-mixed-qemu --force`, `tbx cluster destroy qa-soak-vz --force`, and `tbx cluster destroy qa-soak-qemu --force` for each name that exists.
 2. Run `tbx status -o json | python3 -m json.tool` and `tbx cluster list -o json | python3 -m json.tool`; confirm none of those exact names remains.
 3. If C4's `TBX_BALLOON_RESERVE_MIB` override was not already restored, restore the captured value now, omitting the variable entirely when the captured value was the compiled default, and run `tbx system restart --force`.
-4. Run `pgrep -fl 'qemu-system-(aarch64|x86_64)'`; expect no QEMU process left by this runbook. Do not run `tbx system uninstall` and do not remove the helper.
+4. If C3's `TBX_HYPERVISOR` daemon default was not already restored, restore the value captured in C3 step 1: if its original source was compiled, run `env -u TBX_HYPERVISOR tbx system restart --force`; otherwise run `TBX_HYPERVISOR=<original-value> tbx system restart --force` with the recorded original value.
+5. Run `pgrep -fl 'qemu-system-(aarch64|x86_64)'`; expect no QEMU process left by this runbook. Do not run `tbx system uninstall` and do not remove the helper.
 
-Expected observations: every runbook cluster is absent from status and cluster-list JSON, the daemon has its original balloon reserve, no runbook-owned QEMU process remains, and the helper installation is untouched.
+Expected observations: every runbook cluster is absent from status and cluster-list JSON, the daemon has its original balloon reserve and `TBX_HYPERVISOR` default, no runbook-owned QEMU process remains, and the helper installation is untouched.
 
-Pass criteria: zero cluster or QEMU-process residue, original daemon balloon configuration restored, and helper still installed.
+Pass criteria: zero cluster or QEMU-process residue, original daemon balloon configuration and `TBX_HYPERVISOR` default restored, and helper still installed.
 
 On failure: capture destroy output for each exact name, both JSON listings, doctor reserve evidence, and `pgrep`/`ps` details for every residual QEMU process.
 

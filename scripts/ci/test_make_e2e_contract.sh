@@ -18,6 +18,31 @@ require() {
   fi
 }
 
+require_build_commands() {
+  local output=$1
+  local context=$2
+  local command
+
+  for command in '-o ./bin/tbx ./cmd/tbx' '-o ./bin/tbxd ./cmd/tbxd' '-o ./bin/tbx-helper ./cmd/tbx-helper'; do
+    if ! awk -v command="$command" 'index($0, "go build ") && index($0, command) { found = 1 } END { exit !found }' <<< "$output"; then
+      fail "$context must contain a go build command matching: $command"
+    fi
+  done
+}
+
+require_build_commands_once() {
+  local output=$1
+  local context=$2
+  local command count
+
+  for command in '-o ./bin/tbx ./cmd/tbx' '-o ./bin/tbxd ./cmd/tbxd' '-o ./bin/tbx-helper ./cmd/tbx-helper'; do
+    count=$(awk -v command="$command" 'index($0, "go build ") && index($0, command) { count++ } END { print count + 0 }' <<< "$output")
+    if [[ "$count" -ne 1 ]]; then
+      fail "$context must contain exactly one build command matching: $command"
+    fi
+  done
+}
+
 if ! darwin_e2e=$(UNAME_S=Darwin VERSION=contract make -C "$root" -n e2e); then
   fail 'Darwin e2e dry run failed'
 fi
@@ -25,7 +50,11 @@ if ! linux_e2e=$(UNAME_S=Linux VERSION=contract make -C "$root" -n e2e); then
   fail 'Linux e2e dry run failed'
 fi
 
+require_build_commands "$darwin_e2e" 'Darwin e2e'
 require 'codesign' "$darwin_e2e" 'Darwin e2e must run the signed build prerequisite'
+require 'codesign --force --sign - --entitlements ./build/entitlements.plist ./bin/tbxd' "$darwin_e2e" 'Darwin e2e must codesign tbxd'
+require 'codesign --force --sign - --entitlements ./build/entitlements.plist ./bin/tbx' "$darwin_e2e" 'Darwin e2e must codesign tbx'
+require_build_commands "$linux_e2e" 'Linux e2e'
 if grep -Fq -- 'codesign' <<< "$linux_e2e"; then
   fail 'Linux e2e must build binaries without codesign'
 fi
@@ -46,6 +75,11 @@ check_e2e_all() {
 
   if ! output=$(UNAME_S="$uname_s" VERSION=contract make -C "$root" -n e2e-all); then
     fail "$uname_s e2e-all dry run failed"
+  fi
+
+  require_build_commands_once "$output" "$uname_s e2e-all"
+  if grep -Eq -- '(^|[[:space:]])(\$\(MAKE\)|([^[:space:]/]*/)?make)[[:space:]]+e2e([[:space:]]|$)' <<< "$output"; then
+    fail "$uname_s e2e-all must not recursively invoke the e2e target"
   fi
 
   test_lines=$(awk 'index($0, "-tags e2e") { print }' <<< "$output")

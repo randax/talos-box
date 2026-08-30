@@ -191,10 +191,10 @@ When `TBX_HYPERVISOR` selects that backend as the daemon default, the line reads
 INFO Hypervisors: qemu: availability=available; default=yes (source=TBX_HYPERVISOR); balloon-readback=supported; suspend=supported; suspend-survives-restart=supported; guest-agent=supported
 ```
 
-On a usable Intel Mac, the QEMU line instead begins exactly:
+On a usable Intel Mac with QEMU 8.2 or newer and the compiled default selected, the QEMU line reads exactly:
 
 ```text
-qemu: availability=available (best-effort platform)
+INFO Hypervisors: qemu: availability=available (best-effort platform); default=yes (source=compiled); balloon-readback=supported; suspend=supported; suspend-survives-restart=supported; guest-agent=supported
 ```
 
 An unavailable probe keeps its own reason and remediation text unchanged on every platform
