@@ -1612,6 +1612,10 @@ func (s *Server) clusterCapabilities(item cluster.Cluster) []CapabilityStatus {
 }
 
 func (s *Server) refreshNodeStatuses(statuses []ClusterStatus) {
+	s.refreshNodeStatusesNarrated(statuses, nil)
+}
+
+func (s *Server) refreshNodeStatusesNarrated(statuses []ClusterStatus, progress stageFunc) {
 	lookupIP := s.nodeIPLookup
 	if lookupIP == nil {
 		lookupIP = cluster.LookupIP
@@ -1624,6 +1628,7 @@ func (s *Server) refreshNodeStatuses(statuses []ClusterStatus) {
 	for i := range statuses {
 		for j, snapshot := range statuses[i].Nodes {
 			node := cluster.Node{Name: snapshot.Name, Role: snapshot.Role, MAC: snapshot.MAC}
+			progress.stage("probing node %s/%s", statuses[i].Name, node.Name)
 			refreshed := nodeStatusWith(node, statuses[i].subnetIndex, !snapshot.Phase.Stopped(), lookupIP, probe)
 			refreshed.StartedAt = snapshot.StartedAt
 			// Suspension is a disk fact the status handler already
@@ -1779,11 +1784,16 @@ func stalledServices(services []NodeService, startedAt *time.Time, now time.Time
 }
 
 func refreshKubernetesReadiness(statuses []ClusterStatus) {
+	refreshKubernetesReadinessNarrated(statuses, nil)
+}
+
+func refreshKubernetesReadinessNarrated(statuses []ClusterStatus, progress stageFunc) {
 	for index := range statuses {
 		status := &statuses[index]
 		if status.CNI != cluster.CNIFlannel && status.CNI != cluster.CNICilium {
 			continue
 		}
+		progress.stage("checking Kubernetes readiness for %s", status.Name)
 		if !status.Running {
 			status.KubernetesReady = false
 			status.VIP = ""

@@ -895,9 +895,11 @@ func (c cli) doctorDependencies() doctorDependencies {
 	return deps
 }
 
-// doctorCallTimeout bounds each diagnostic RPC. Doctor asks only for quick
-// inventory reads, so a daemon that accepts the socket but never answers must
-// surface as a finding, not hang the whole report (#392 for the mechanism).
+// doctorCallTimeout bounds the daemon's silence on each diagnostic RPC, not
+// the RPC itself: doctor asks for narration, and a status walking many nodes
+// re-arms the deadline on every probe it reports, while a daemon that accepts
+// the socket and then says nothing surfaces as a finding instead of a hang
+// (#392 for the mechanism).
 var doctorCallTimeout = 10 * time.Second
 
 // doctorCall deliberately uses exchangeWithin directly instead of cli.call:
@@ -908,7 +910,7 @@ func (c cli) doctorCall(op string, args, destination any) error {
 	if err != nil {
 		return err
 	}
-	response, err := exchangeWithin(socketPath, op, args, doctorCallTimeout)
+	response, err := exchangeDeadlined(socketPath, op, args, doctorCallTimeout, func(string) {})
 	if err != nil {
 		return err
 	}

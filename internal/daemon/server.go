@@ -506,7 +506,7 @@ func (s *Server) dispatch(request Request) Response {
 
 func (s *Server) dispatchWithProgress(request Request, progress stageFunc) Response {
 	if request.Op == "status" {
-		return s.dispatchStatus(request)
+		return s.dispatchStatus(request, progress)
 	}
 	if request.Op == "cluster.create" || request.Op == "cluster.start" || request.Op == "up" {
 		return s.dispatchProvisioning(request, progress)
@@ -867,7 +867,10 @@ func (s *Server) clusterMutationLock(clusterName string) *sync.Mutex {
 // dispatchStatus keeps the existing VM-state snapshot serialized, then probes
 // Kubernetes after releasing opMu so a slow API server cannot block lifecycle
 // operations.
-func (s *Server) dispatchStatus(request Request) Response {
+// dispatchStatus narrates one stage per node probe and per readiness check
+// when the client asked for progress, so a client's silence deadline measures
+// a stalled daemon rather than the honest length of a many-node probe.
+func (s *Server) dispatchStatus(request Request, progress stageFunc) Response {
 	s.opMu.Lock()
 	data, err := s.handle(request, nil)
 	s.opMu.Unlock()
@@ -878,8 +881,8 @@ func (s *Server) dispatchStatus(request Request) Response {
 	if !ok {
 		return failure(errors.New("status returned an unexpected response"))
 	}
-	s.refreshNodeStatuses(statuses)
-	refreshKubernetesReadiness(statuses)
+	s.refreshNodeStatusesNarrated(statuses, progress)
+	refreshKubernetesReadinessNarrated(statuses, progress)
 	s.observeKubernetesReadiness(statuses, time.Now())
 	s.refreshStoragePhases(statuses)
 	return success(statuses)
