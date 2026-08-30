@@ -20,6 +20,9 @@ func Marshal(cfg Config) string {
 	b.WriteString("clusters:\n")
 	for _, c := range cfg.Clusters {
 		fmt.Fprintf(&b, "  - name: %s\n", c.Name)
+		if c.Hypervisor != "" {
+			fmt.Fprintf(&b, "    hypervisor: %s\n", c.Hypervisor)
+		}
 		fmt.Fprintf(&b, "    controlPlanes: %d\n", c.ControlPlanes)
 		fmt.Fprintf(&b, "    workers: %d\n", c.Workers)
 		if c.CNI != "" {

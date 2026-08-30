@@ -2,7 +2,10 @@
 
 package hypervisor
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func TestPlatformRegistryIncludesCompiledDefaultFactory(t *testing.T) {
 	t.Parallel()
@@ -13,6 +16,10 @@ func TestPlatformRegistryIncludesCompiledDefaultFactory(t *testing.T) {
 	}
 	if selection.Source != DefaultSourceCompiled {
 		t.Fatalf("default source = %q, want %q", selection.Source, DefaultSourceCompiled)
+	}
+	registry := newRegistry(context.Background(), selection, nil)
+	if registry.CompiledDefault != registry.Default.Name {
+		t.Fatalf("compiled default = %q, effective default = %q", registry.CompiledDefault, registry.Default.Name)
 	}
 	for _, factory := range factories {
 		if factory.name == NameVZ {

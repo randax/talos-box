@@ -14,6 +14,7 @@ import (
 
 	"github.com/randax/talos-box/internal/daemon"
 	"github.com/randax/talos-box/internal/helper"
+	"github.com/randax/talos-box/internal/hypervisor"
 	"github.com/randax/talos-box/internal/resolverset"
 )
 
@@ -437,7 +438,7 @@ func reexecSystemWithSudo(args []string) error {
 		return fmt.Errorf("find tbx executable: %w", err)
 	}
 	commandArgs := append([]string{executable, "system"}, args...)
-	command := exec.Command("sudo", commandArgs...)
+	command := exec.Command("sudo", systemSudoArgs(commandArgs, os.Getenv)...)
 	command.Stdin = os.Stdin
 	command.Stdout = os.Stdout
 	command.Stderr = os.Stderr
@@ -445,6 +446,13 @@ func reexecSystemWithSudo(args []string) error {
 		return fmt.Errorf("run sudo: %w", err)
 	}
 	return nil
+}
+
+func systemSudoArgs(commandArgs []string, getenv func(string) string) []string {
+	if getenv(hypervisor.DefaultEnv) == "" {
+		return commandArgs
+	}
+	return append([]string{"--preserve-env=" + hypervisor.DefaultEnv}, commandArgs...)
 }
 
 func runLaunchctl(args ...string) error {

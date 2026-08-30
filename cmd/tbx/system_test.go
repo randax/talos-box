@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -289,6 +290,25 @@ func TestRenderLaunchdPlistRejectsRelativePath(t *testing.T) {
 
 	if _, err := renderLaunchdPlist("tbx-helper", uidPtr(501)); err == nil {
 		t.Fatal("renderLaunchdPlist accepted a relative path")
+	}
+}
+
+func TestSystemSudoArgsPreserveHypervisorOnlyWhenSet(t *testing.T) {
+	t.Parallel()
+
+	base := []string{"/opt/tbx", "system", "install"}
+	if got := systemSudoArgs(base, func(string) string { return "" }); !reflect.DeepEqual(got, base) {
+		t.Fatalf("unset environment args = %q, want %q", got, base)
+	}
+	got := systemSudoArgs(base, func(name string) string {
+		if name == "TBX_HYPERVISOR" {
+			return "qemu"
+		}
+		return "secret"
+	})
+	want := []string{"--preserve-env=TBX_HYPERVISOR", "/opt/tbx", "system", "install"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("set environment args = %q, want %q", got, want)
 	}
 }
 

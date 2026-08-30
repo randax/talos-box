@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/randax/talos-box/internal/cluster"
+	"github.com/randax/talos-box/internal/hypervisor"
 )
 
 func TestParseDefaults(t *testing.T) {
@@ -86,6 +87,9 @@ clusters:
 			}
 			for i, want := range tt.want {
 				got := cfg.Clusters[i]
+				if got.Hypervisor != "" {
+					t.Errorf("cluster %d hypervisor = %q, want silent selection", i, got.Hypervisor)
+				}
 				if got.Name != want.Name || got.ControlPlanes != want.ControlPlanes || got.Workers != want.Workers {
 					t.Errorf("cluster %d shape = %+v, want %+v", i, got, want)
 				}
@@ -102,6 +106,58 @@ clusters:
 				}
 			}
 		})
+	}
+}
+
+func TestParseHypervisorAcceptsVZAndQEMU(t *testing.T) {
+	t.Parallel()
+
+	for _, want := range []hypervisor.Name{hypervisor.NameVZ, hypervisor.NameQEMU} {
+		cfg, err := Parse([]byte("version: 1\nclusters:\n  - name: demo\n    hypervisor: " + string(want) + "\n"))
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", want, err)
+		}
+		if got := cfg.Clusters[0].Hypervisor; got != want {
+			t.Fatalf("hypervisor = %q, want %q", got, want)
+		}
+	}
+}
+
+func TestParseHypervisorRejectsUnknownValue(t *testing.T) {
+	t.Parallel()
+
+	_, err := Parse([]byte("version: 1\nclusters:\n  - name: demo\n    hypervisor: xen\n"))
+	if got, want := err.Error(), `cluster "demo": hypervisor must be one of vz | qemu (got "xen")`; got != want {
+		t.Fatalf("Parse() error = %q, want %q", got, want)
+	}
+}
+
+func TestParseRejectsFileLevelHypervisor(t *testing.T) {
+	t.Parallel()
+
+	_, err := Parse([]byte("version: 1\nhypervisor: qemu\nclusters:\n  - name: demo\n"))
+	if err == nil || !strings.Contains(err.Error(), "field hypervisor not found") {
+		t.Fatalf("Parse() error = %v, want unknown file-level key refusal", err)
+	}
+}
+
+func TestMarshalHypervisorRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	spec := ClusterSpec{
+		Name: "demo", Hypervisor: hypervisor.NameQEMU, ControlPlanes: 1, Workers: 2,
+		Node: cluster.NodeDefaults{MemoryMiB: 2048, CPUs: 2, DiskGiB: 20},
+	}
+	out := Marshal(Config{Clusters: []ClusterSpec{spec}})
+	if !strings.Contains(out, "  - name: demo\n    hypervisor: qemu\n") {
+		t.Fatalf("Marshal() did not emit hypervisor immediately after name:\n%s", out)
+	}
+	back, err := Parse([]byte(out))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(back.Clusters[0], spec) {
+		t.Fatalf("round trip = %+v, want %+v", back.Clusters[0], spec)
 	}
 }
 

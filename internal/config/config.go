@@ -14,6 +14,7 @@ import (
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/domain"
+	"github.com/randax/talos-box/internal/hypervisor"
 )
 
 // Defaults per SPEC §8.
@@ -57,6 +58,7 @@ func (t TalosSpec) IsZero() bool {
 // ClusterSpec is one desired cluster with all defaults applied.
 type ClusterSpec struct {
 	Name          string
+	Hypervisor    hypervisor.Name
 	ControlPlanes int
 	Workers       int
 	cluster.ProvisioningIntent
@@ -92,6 +94,7 @@ type rawTalos struct {
 
 type rawCluster struct {
 	Name                            string `yaml:"name"`
+	Hypervisor                      string `yaml:"hypervisor"`
 	ControlPlanes                   *int   `yaml:"controlPlanes"`
 	Workers                         *int   `yaml:"workers"`
 	cluster.ProvisioningIntentInput `yaml:",inline"`
@@ -138,13 +141,21 @@ func Parse(data []byte) (Config, error) {
 			return Config{}, fmt.Errorf("duplicate cluster name %q", rc.Name)
 		}
 		seen[rc.Name] = true
+		var hypervisorName hypervisor.Name
+		if rc.Hypervisor != "" {
+			var err error
+			hypervisorName, err = hypervisor.ParseName(rc.Hypervisor)
+			if err != nil {
+				return Config{}, fmt.Errorf("cluster %q: %w", rc.Name, err)
+			}
+		}
 
 		intent, err := rc.Intent()
 		if err != nil {
 			return Config{}, fmt.Errorf("cluster %q: %w", rc.Name, err)
 		}
 		spec := ClusterSpec{
-			Name: rc.Name, ControlPlanes: defaultControlPlanes, Workers: defaultWorkers,
+			Name: rc.Name, Hypervisor: hypervisorName, ControlPlanes: defaultControlPlanes, Workers: defaultWorkers,
 			ProvisioningIntent: intent,
 			AllowUnsafeDomain:  rc.AllowUnsafeDomain,
 			Talos:              resolveTalos(cfg.Talos, rc.Talos),
