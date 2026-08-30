@@ -27,7 +27,7 @@ const (
 type qemuDarwinProbeDeps struct {
 	lookPath     func(string) (string, error)
 	accelHelp    func(context.Context, string) ([]byte, error)
-	sysctl       func(string) (string, error)
+	sysctl       func(string) (uint32, error)
 	entitled     func(context.Context, string) (bool, error)
 	probe        func(context.Context, string, qemuPeerVerifier) (qemuProbe, error)
 	evalSymlinks func(string) (string, error)
@@ -43,7 +43,7 @@ func defaultQEMUDarwinProbeDeps() qemuDarwinProbeDeps {
 		accelHelp: func(ctx context.Context, binary string) ([]byte, error) {
 			return runQEMUDarwinCommand(ctx, binary, "-accel", "help")
 		},
-		sysctl:       unix.Sysctl,
+		sysctl:       unix.SysctlUint32,
 		entitled:     qemuDarwinEntitled,
 		probe:        probeQEMU,
 		evalSymlinks: filepath.EvalSymlinks,

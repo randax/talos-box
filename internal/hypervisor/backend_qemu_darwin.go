@@ -35,7 +35,7 @@ func newQEMUWith(ctx context.Context, deps qemuDarwinProbeDeps) (Hypervisor, err
 		return nil, newUnavailableError("QEMU does not list the hvf accelerator", qemuDarwinHVFBuildRemediation, nil)
 	}
 	hvSupport, err := deps.sysctl("kern.hv_support")
-	if err != nil || strings.TrimSpace(hvSupport) != "1" {
+	if err != nil || hvSupport != 1 {
 		return nil, newUnavailableError("HVF denied: kern.hv_support is not 1", qemuDarwinHostRemediation, err)
 	}
 	entitled, err := deps.entitled(ctx, binary)

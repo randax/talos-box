@@ -51,7 +51,7 @@ func TestDarwinQEMUAvailabilityProbe(t *testing.T) {
 		{
 			name: "sysctl zero",
 			change: func(deps *qemuDarwinProbeDeps) {
-				deps.sysctl = func(string) (string, error) { return "0\n", nil }
+				deps.sysctl = func(string) (uint32, error) { return 0, nil }
 			},
 			wantReason:      "HVF denied: kern.hv_support is not 1",
 			wantRemediation: "use a Mac with Hypervisor.framework support enabled",
@@ -254,7 +254,7 @@ func passingDarwinQEMUProbeDeps(t *testing.T, architecture Architecture) qemuDar
 	return qemuDarwinProbeDeps{
 		lookPath:  func(string) (string, error) { return binary, nil },
 		accelHelp: func(context.Context, string) ([]byte, error) { return []byte("hvf\ntcg\n"), nil },
-		sysctl:    func(string) (string, error) { return "1\n", nil },
+		sysctl:    func(string) (uint32, error) { return 1, nil },
 		entitled:  func(context.Context, string) (bool, error) { return true, nil },
 		probe: func(_ context.Context, _ string, verifyPeer qemuPeerVerifier) (qemuProbe, error) {
 			if verifyPeer == nil {
