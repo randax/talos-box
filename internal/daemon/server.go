@@ -970,9 +970,9 @@ func (s *Server) info() Info {
 		}
 		if entry.Availability.Available && entry.Hypervisor != nil {
 			capabilities := entry.Hypervisor.Capabilities()
-			backendInfo.BalloonReadback = capabilities.BalloonReadback
+			backendInfo.BalloonReadback = NewFeatureStatusInfo(capabilities.BalloonReadback)
 			backendInfo.SuspendSurvivesDaemonRestart = capabilities.SuspendSurvivesDaemonRestart
-			backendInfo.GuestAgent = capabilities.GuestAgent
+			backendInfo.GuestAgent = NewFeatureStatusInfo(capabilities.GuestAgent)
 		}
 		info.Hypervisors = append(info.Hypervisors, backendInfo)
 	}

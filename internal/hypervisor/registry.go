@@ -32,6 +32,7 @@ type Default struct {
 type Availability struct {
 	Available bool
 	Reason    string
+	Err       error
 }
 
 // Backend pairs a successful probe with its availability gate.
@@ -67,6 +68,9 @@ func (r Registry) Resolve(name Name) (Hypervisor, error) {
 		if reason == "" {
 			reason = "backend is unavailable"
 		}
+		if backend.Availability.Err != nil {
+			return nil, fmt.Errorf("%w: hypervisor %q: %w", ErrUnsupported, name, backend.Availability.Err)
+		}
 		return nil, fmt.Errorf("%w: hypervisor %q: %s", ErrUnsupported, name, reason)
 	}
 	return backend.Hypervisor, nil
@@ -88,7 +92,7 @@ func newRegistry(ctx context.Context, selection Default, factories []backendFact
 	for _, factory := range factories {
 		backend, err := factory.new(ctx)
 		if err != nil {
-			registry.Backends[factory.name] = Backend{Availability: Availability{Reason: err.Error()}}
+			registry.Backends[factory.name] = Backend{Availability: Availability{Reason: err.Error(), Err: err}}
 			continue
 		}
 		registry.Backends[factory.name] = Backend{

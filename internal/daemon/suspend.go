@@ -583,6 +583,7 @@ func recordSaveStateOwner(savePath string) {
 func (s *Server) savedStateStale(item cluster.Cluster) bool {
 	_, backend, err := s.hypervisorForCluster(item)
 	if err != nil {
+		log.Printf("resolve hypervisor for saved-state check in cluster %s: %v", item.Name, err)
 		return true
 	}
 	if backend.Capabilities().SuspendSurvivesDaemonRestart {

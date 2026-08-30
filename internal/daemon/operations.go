@@ -695,11 +695,7 @@ func (s *Server) createCluster(raw json.RawMessage, progress stageFunc) (Cluster
 	// The image fetch is the long pole of a cold create — ~100 MB from the
 	// Image Factory — and used to happen behind a silent request (#273).
 	progress.stage("preparing the Talos %s image", item.TalosVersion)
-	architecture, err := s.imageArchitecture()
-	if err != nil {
-		return ClusterSummary{}, err
-	}
-	cachedDisk, err := s.cache.Ensure(item.Schematic, item.TalosVersion, architecture)
+	cachedDisk, err := s.cache.Ensure(item.Schematic, item.TalosVersion, imagecache.Architecture(backend.Architecture()))
 	if err != nil {
 		return ClusterSummary{}, err
 	}
@@ -1871,11 +1867,11 @@ func (s *Server) pullCache(raw json.RawMessage) (CachePullResult, error) {
 	if len(combinations) == 0 {
 		combinations = []CachePullCombination{{Schematic: args.Schematic, Version: args.Version}}
 	}
-	defaultArchitecture, err := s.imageArchitecture()
+	_, backend, err := s.hypervisors.ResolveDefault()
 	if err != nil {
 		return CachePullResult{}, err
 	}
-	architecture := hypervisor.Architecture(defaultArchitecture)
+	architecture := backend.Architecture()
 	var result CachePullResult
 	// Distinct clusters routinely share a pin, and re-composition resolves
 	// spellings apart: dedupe on the resolved combination so each image is

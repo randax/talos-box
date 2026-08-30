@@ -44,7 +44,7 @@ func TestNewRegistryEagerlyRecordsUnavailableBackends(t *testing.T) {
 		t.Fatalf("optional reason = %q, want %q", optional.Availability.Reason, sentinel)
 	}
 	_, err := registry.Resolve("optional")
-	if !errors.Is(err, ErrUnsupported) || !strings.Contains(err.Error(), "optional") {
+	if !errors.Is(err, ErrUnsupported) || !errors.Is(err, sentinel) || !strings.Contains(err.Error(), "optional") {
 		t.Fatalf("Resolve(optional) error = %v, want ErrUnsupported naming backend", err)
 	}
 }

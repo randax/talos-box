@@ -9,17 +9,23 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
 
 func TestRealMigrateRequiresUint64FileOffset(t *testing.T) {
-	qemuPath, err := exec.LookPath("qemu-system-aarch64")
+	system, err := qemuSystemForArchitecture(Architecture(runtime.GOARCH))
 	if err != nil {
-		t.Skip("qemu-system-aarch64 is not on PATH")
+		t.Fatal(err)
+	}
+	qemuPath, err := exec.LookPath(system.Binary)
+	if err != nil {
+		t.Skipf("%s is not on PATH", system.Binary)
 	}
 
+	// Keep the QMP socket under /tmp to stay below Unix socket path limits.
 	dir, err := os.MkdirTemp("/tmp", "tbx-qmp-")
 	if err != nil {
 		t.Fatal(err)
@@ -28,7 +34,7 @@ func TestRealMigrateRequiresUint64FileOffset(t *testing.T) {
 	socketPath := filepath.Join(dir, "qmp.sock")
 	var output bytes.Buffer
 	command := exec.Command(qemuPath,
-		"-machine", "virt,accel=tcg",
+		"-machine", system.Machine+",accel=tcg",
 		"-cpu", "max",
 		"-m", "128M",
 		"-S",
@@ -91,16 +97,7 @@ func TestRealMigrateRequiresUint64FileOffset(t *testing.T) {
 		t.Fatalf("migrate with string offset error = %v, want error mentioning uint64", err)
 	}
 
-	numericOffset := map[string]any{
-		"channels": []any{map[string]any{
-			"channel-type": "main",
-			"addr": map[string]any{
-				"transport": "file",
-				"filename":  filepath.Join(dir, "numeric-offset.state"),
-				"offset":    uint64(qemuSaveOffset),
-			},
-		}},
-	}
+	numericOffset := qemuFileMigrateArguments(filepath.Join(dir, "numeric-offset.state"))
 	if err := client.execute(ctx, "migrate", numericOffset, nil); err != nil {
 		t.Fatalf("migrate with numeric offset: %v", err)
 	}

@@ -34,7 +34,7 @@ func TestNewHonorsCanceledProbeContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	_, _, err := NewAll(ctx).ResolveDefault()
-	if !errors.Is(err, ErrUnsupported) || !strings.Contains(err.Error(), context.Canceled.Error()) {
+	if !errors.Is(err, ErrUnsupported) || !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), context.Canceled.Error()) {
 		t.Fatalf("NewAll(canceled context) default error = %v, want gated backend preserving cancellation", err)
 	}
 }

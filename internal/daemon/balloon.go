@@ -3,6 +3,7 @@ package daemon
 import (
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"sync"
@@ -151,6 +152,7 @@ func (s *Server) balloonCandidatesLocked() map[string]balloonCandidate {
 		}
 		_, backend, err := s.hypervisorForCluster(item)
 		if err != nil {
+			log.Printf("resolve hypervisor for balloon candidates in cluster %s: %v", clusterName, err)
 			continue
 		}
 		balloonReadback := backend.Capabilities().BalloonReadback.Supported

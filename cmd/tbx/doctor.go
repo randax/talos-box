@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/randax/talos-box/internal/balloon"
@@ -168,6 +169,24 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 	}
 	if len(args) != 0 {
 		return errors.New("usage: tbx doctor")
+	}
+	if deps.daemonInfo != nil {
+		// One bounded daemon.info call feeds the balloon findings and the
+		// hypervisor inventory; a daemon that accepts the socket but never
+		// answers must not hang doctor past hypervisorProbeTimeout.
+		deps.daemonInfo = boundedOnce(deps.daemonInfo, hypervisorProbeTimeout)
+		if deps.balloonReserveMiB == nil {
+			deps.balloonReserveMiB = func() (int, error) {
+				info, err := deps.daemonInfo()
+				return info.BalloonReserveMiB, err
+			}
+		}
+		if deps.balloonDisabled == nil {
+			deps.balloonDisabled = func() (bool, error) {
+				info, err := deps.daemonInfo()
+				return info.BalloonDisabled, err
+			}
+		}
 	}
 
 	identity := runtimeIdentity{
@@ -640,7 +659,7 @@ type doctorHypervisorInventory struct {
 	items         []daemon.HypervisorInfo
 	defaultName   hypervisor.Name
 	defaultSource hypervisor.DefaultSource
-	locallyProbed bool
+	localProbeTag string
 	err           error
 }
 
@@ -649,16 +668,23 @@ func doctorHypervisors(deps doctorDependencies) doctorHypervisorInventory {
 		return doctorHypervisorInventory{err: errors.New("daemon hypervisor inventory probe unavailable")}
 	}
 	info, err := deps.daemonInfo()
-	if err == nil {
+	if err == nil && len(info.Hypervisors) > 0 {
 		return doctorHypervisorInventory{items: info.Hypervisors, defaultName: info.DefaultHypervisor, defaultSource: info.DefaultHypervisorSource}
 	}
-	if !isDaemonUnavailable(err) || deps.hypervisors == nil {
+	if deps.hypervisors == nil {
+		if err == nil {
+			err = errors.New("daemon does not report hypervisor inventory")
+		}
 		return doctorHypervisorInventory{err: err}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), hypervisorProbeTimeout)
-	defer cancel()
-	registry := deps.hypervisors(ctx)
-	result := make([]daemon.HypervisorInfo, 0, len(registry.Backends))
+	localProbeTag := "probed locally; daemon unavailable"
+	if err == nil {
+		localProbeTag = "probed locally; daemon does not report hypervisor inventory"
+	}
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), hypervisorProbeTimeout)
+	defer probeCancel()
+	registry := deps.hypervisors(probeCtx)
+	items := make([]daemon.HypervisorInfo, 0, len(registry.Backends))
 	for _, name := range registry.Names() {
 		entry := registry.Backends[name]
 		item := daemon.HypervisorInfo{
@@ -668,14 +694,14 @@ func doctorHypervisors(deps doctorDependencies) doctorHypervisorInventory {
 		}
 		if entry.Availability.Available && entry.Hypervisor != nil {
 			capabilities := entry.Hypervisor.Capabilities()
-			item.BalloonReadback = capabilities.BalloonReadback
+			item.BalloonReadback = daemon.NewFeatureStatusInfo(capabilities.BalloonReadback)
 			item.SuspendSurvivesDaemonRestart = capabilities.SuspendSurvivesDaemonRestart
-			item.GuestAgent = capabilities.GuestAgent
+			item.GuestAgent = daemon.NewFeatureStatusInfo(capabilities.GuestAgent)
 		}
-		result = append(result, item)
+		items = append(items, item)
 	}
 	return doctorHypervisorInventory{
-		items: result, defaultName: registry.Default.Name, defaultSource: registry.Default.Source, locallyProbed: true,
+		items: items, defaultName: registry.Default.Name, defaultSource: registry.Default.Source, localProbeTag: localProbeTag,
 	}
 }
 
@@ -710,15 +736,49 @@ func hypervisorFindings(inventory doctorHypervisorInventory) []doctorFinding {
 			defaultStatus = "yes (source=" + string(inventory.defaultSource) + ")"
 		}
 		detail := fmt.Sprintf("%s: availability=%s; default=%s; balloon-readback=%s; suspend-survives-restart=%s; guest-agent=%s", item.Name, availability, defaultStatus, balloonReadback, suspendRestart, guestAgent)
-		if inventory.locallyProbed {
-			detail += "; probed locally; daemon unavailable"
+		if inventory.localProbeTag != "" {
+			detail += "; " + inventory.localProbeTag
 		}
 		findings = append(findings, doctorFinding{level: "INFO", check: "Hypervisors", detail: detail})
 	}
 	return findings
 }
 
-func featureGate(status hypervisor.FeatureStatus) string {
+// boundedOnce runs call at most once and hands every caller the same result;
+// callers give up after timeout with context.DeadlineExceeded while the call
+// keeps running so a late answer still serves later callers.
+func boundedOnce[T any](call func() (T, error), timeout time.Duration) func() (T, error) {
+	type result struct {
+		value T
+		err   error
+	}
+	done := make(chan result, 1)
+	var start sync.Once
+	var mu sync.Mutex
+	var cached *result
+	return func() (T, error) {
+		start.Do(func() {
+			go func() {
+				value, err := call()
+				done <- result{value, err}
+			}()
+		})
+		mu.Lock()
+		defer mu.Unlock()
+		if cached == nil {
+			select {
+			case r := <-done:
+				cached = &r
+			case <-time.After(timeout):
+				var zero T
+				return zero, context.DeadlineExceeded
+			}
+		}
+		return cached.value, cached.err
+	}
+}
+
+func featureGate(status daemon.FeatureStatusInfo) string {
 	if status.Supported {
 		return "supported"
 	}
@@ -731,7 +791,7 @@ func featureGate(status hypervisor.FeatureStatus) string {
 func defaultGuestAgentStatus(inventory doctorHypervisorInventory) (hypervisor.FeatureStatus, bool) {
 	for _, item := range inventory.items {
 		if item.Name == inventory.defaultName && item.Available {
-			return item.GuestAgent, true
+			return hypervisor.FeatureStatus{Supported: item.GuestAgent.Supported, Reason: item.GuestAgent.Reason}, true
 		}
 	}
 	return hypervisor.FeatureStatus{}, false
@@ -797,16 +857,6 @@ func (c cli) doctorDependencies() doctorDependencies {
 			ctx, cancel := context.WithTimeout(context.Background(), commandProbeTimeout)
 			defer cancel()
 			return balloon.HostFreeMiBContext(ctx)
-		},
-		balloonReserveMiB: func() (int, error) {
-			var result daemon.Info
-			err := c.doctorCall("daemon.info", struct{}{}, &result)
-			return result.BalloonReserveMiB, err
-		},
-		balloonDisabled: func() (bool, error) {
-			var result daemon.Info
-			err := c.doctorCall("daemon.info", struct{}{}, &result)
-			return result.BalloonDisabled, err
 		},
 		mirrorOffline: func() (bool, error) {
 			var result daemon.MirrorOfflineStatus

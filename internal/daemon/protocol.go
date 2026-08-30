@@ -144,12 +144,23 @@ type Info struct {
 
 // HypervisorInfo reports one daemon-probed backend and its feature gates.
 type HypervisorInfo struct {
-	Name                         hypervisor.Name          `json:"name"`
-	Available                    bool                     `json:"available,omitempty"`
-	AvailabilityReason           string                   `json:"availabilityReason,omitempty"`
-	BalloonReadback              hypervisor.FeatureStatus `json:"balloonReadback,omitempty"`
-	SuspendSurvivesDaemonRestart bool                     `json:"suspendSurvivesDaemonRestart,omitempty"`
-	GuestAgent                   hypervisor.FeatureStatus `json:"guestAgent,omitempty"`
+	Name                         hypervisor.Name   `json:"name"`
+	Available                    bool              `json:"available,omitempty"`
+	AvailabilityReason           string            `json:"availabilityReason,omitempty"`
+	BalloonReadback              FeatureStatusInfo `json:"balloonReadback,omitempty"`
+	SuspendSurvivesDaemonRestart bool              `json:"suspendSurvivesDaemonRestart,omitempty"`
+	GuestAgent                   FeatureStatusInfo `json:"guestAgent,omitempty"`
+}
+
+// FeatureStatusInfo is the daemon protocol representation of a feature gate.
+type FeatureStatusInfo struct {
+	Supported bool   `json:"supported,omitempty"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+// NewFeatureStatusInfo converts an internal feature gate to its wire representation.
+func NewFeatureStatusInfo(status hypervisor.FeatureStatus) FeatureStatusInfo {
+	return FeatureStatusInfo{Supported: status.Supported, Reason: status.Reason}
 }
 
 // NodeRunState is the answer to node.start and node.stop: the node's status

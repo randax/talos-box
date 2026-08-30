@@ -31,8 +31,8 @@ func TestRunDoctorPrintsOneLinePerHypervisor(t *testing.T) {
 			Hypervisors: []daemon.HypervisorInfo{
 				{
 					Name: "primary", Available: true,
-					BalloonReadback: hypervisor.FeatureStatus{Supported: true},
-					GuestAgent:      hypervisor.FeatureStatus{Reason: "no channel"},
+					BalloonReadback: daemon.FeatureStatusInfo{Supported: true},
+					GuestAgent:      daemon.FeatureStatusInfo{Reason: "no channel"},
 				},
 				{Name: "optional", AvailabilityReason: "optional probe failed"},
 			},
@@ -74,6 +74,9 @@ func TestRunDoctorReportsHypervisorsWithDaemonDown(t *testing.T) {
 			Default: hypervisor.Default{Name: "primary", Source: hypervisor.DefaultSourceCompiled},
 		}
 	}
+	deps.listConfig = func() ([]cluster.Cluster, error) {
+		return []cluster.Cluster{{Name: "demo", TalosExtensions: []string{"qemu-guest-agent"}}}, nil
+	}
 
 	var output strings.Builder
 	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
@@ -83,10 +86,121 @@ func TestRunDoctorReportsHypervisorsWithDaemonDown(t *testing.T) {
 		"INFO Hypervisors: primary: availability=available; default=yes (source=compiled)",
 		"probed locally; daemon unavailable",
 		"guest-agent=supported",
+		"PASS guest-agent: channel available for cluster(s) demo",
 	} {
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("doctor output missing %q:\n%s", want, output.String())
 		}
+	}
+}
+
+func TestRunDoctorFallsBackWhenDaemonReportsNoHypervisorInventory(t *testing.T) {
+	t.Parallel()
+	deps := hypervisorDoctorDependencies()
+	deps.daemonInfo = func() (daemon.Info, error) { return daemon.Info{}, nil }
+	deps.hypervisors = func(context.Context) hypervisor.Registry {
+		return hypervisor.Registry{
+			Backends: map[hypervisor.Name]hypervisor.Backend{
+				"primary": {
+					Hypervisor:   doctorTestHypervisor{capabilities: hypervisor.Capabilities{GuestAgent: hypervisor.FeatureStatus{Supported: true}}},
+					Availability: hypervisor.Availability{Available: true},
+				},
+			},
+			Default: hypervisor.Default{Name: "primary", Source: hypervisor.DefaultSourceCompiled},
+		}
+	}
+	deps.listConfig = func() ([]cluster.Cluster, error) {
+		return []cluster.Cluster{{Name: "demo", TalosExtensions: []string{"qemu-guest-agent"}}}, nil
+	}
+
+	var output strings.Builder
+	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"INFO Hypervisors: primary: availability=available; default=yes (source=compiled)",
+		"probed locally; daemon does not report hypervisor inventory",
+		"PASS guest-agent: channel available for cluster(s) demo",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("doctor output missing %q:\n%s", want, output.String())
+		}
+	}
+}
+
+func TestRunDoctorHypervisorInventoryFallsBackWhenDaemonStalls(t *testing.T) {
+	t.Parallel()
+	deps := hypervisorDoctorDependencies()
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	deps.daemonInfo = func() (daemon.Info, error) {
+		<-release
+		return daemon.Info{}, nil
+	}
+	deps.hypervisors = func(context.Context) hypervisor.Registry {
+		return hypervisor.Registry{
+			Backends: map[hypervisor.Name]hypervisor.Backend{
+				"primary": {Hypervisor: doctorTestHypervisor{}, Availability: hypervisor.Availability{Available: true}},
+			},
+			Default: hypervisor.Default{Name: "primary", Source: hypervisor.DefaultSourceCompiled},
+		}
+	}
+
+	var output strings.Builder
+	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "probed locally; daemon unavailable") {
+		t.Fatalf("doctor output missing bounded fallback:\n%s", output.String())
+	}
+}
+
+func TestRunDoctorMemoizesDaemonInfo(t *testing.T) {
+	t.Parallel()
+	deps := hypervisorDoctorDependencies()
+	calls := 0
+	deps.daemonInfo = func() (daemon.Info, error) {
+		calls++
+		return daemon.Info{
+			BalloonReserveMiB:       4096,
+			BalloonDisabled:         true,
+			Hypervisors:             []daemon.HypervisorInfo{{Name: "primary", Available: true}},
+			DefaultHypervisor:       "primary",
+			DefaultHypervisorSource: hypervisor.DefaultSourceCompiled,
+		}, nil
+	}
+
+	var output strings.Builder
+	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("daemonInfo calls = %d, want 1", calls)
+	}
+	if !strings.Contains(output.String(), "INFO balloon: daemon started with TBX_DISABLE_BALLOON") {
+		t.Fatalf("doctor output missing balloon state from memoized daemon info:\n%s", output.String())
+	}
+}
+
+func TestRunDoctorFallsBackOnDaemonInfoError(t *testing.T) {
+	t.Parallel()
+	deps := hypervisorDoctorDependencies()
+	deps.daemonInfo = func() (daemon.Info, error) { return daemon.Info{}, errors.New("protocol decode failed") }
+	deps.hypervisors = func(context.Context) hypervisor.Registry {
+		return hypervisor.Registry{
+			Backends: map[hypervisor.Name]hypervisor.Backend{
+				"primary": {Hypervisor: doctorTestHypervisor{}, Availability: hypervisor.Availability{Available: true}},
+			},
+			Default: hypervisor.Default{Name: "primary", Source: hypervisor.DefaultSourceCompiled},
+		}
+	}
+
+	var output strings.Builder
+	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "probed locally; daemon unavailable") {
+		t.Fatalf("doctor output missing fallback for daemon info error:\n%s", output.String())
 	}
 }
 
@@ -145,7 +259,7 @@ func TestRunDoctorReportsGuestAgentCapabilityGate(t *testing.T) {
 			deps.listConfig = func() ([]cluster.Cluster, error) { return test.clusters, test.listErr }
 			deps.daemonInfo = func() (daemon.Info, error) {
 				return daemon.Info{
-					Hypervisors:             []daemon.HypervisorInfo{{Name: "primary", Available: true, GuestAgent: test.support}},
+					Hypervisors:             []daemon.HypervisorInfo{{Name: "primary", Available: true, GuestAgent: daemon.NewFeatureStatusInfo(test.support)}},
 					DefaultHypervisor:       "primary",
 					DefaultHypervisorSource: hypervisor.DefaultSourceCompiled,
 				}, nil
