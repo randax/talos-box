@@ -90,7 +90,13 @@ func TestQEMULaunchRefusesSaveIdentityMismatchBeforeStarting(t *testing.T) {
 				version:      currentVersion,
 				capabilities: qemuCapabilities(currentVersion),
 				firmware:     qemuFirmware{VarsPath: varsTemplate},
+				saved:        map[string]*qemuMachine{},
 			}
+			// A same-daemon suspend retains the stopped machine with its host
+			// resources; the refusal must release it so the advertised
+			// cold-boot recovery does not collide with them (#538 review).
+			retained := &qemuMachine{owner: backend}
+			backend.saved[savePath] = retained
 			_, err = backend.Launch(context.Background(), Spec{
 				CPUs:              1,
 				MemoryMiB:         1024,
@@ -117,6 +123,15 @@ func TestQEMULaunchRefusesSaveIdentityMismatchBeforeStarting(t *testing.T) {
 			}
 			if _, err := os.Stat(savePath); err != nil {
 				t.Fatalf("identity mismatch removed retryable save: %v", err)
+			}
+			if backend.saved[savePath] != nil {
+				t.Fatal("identity mismatch left the suspended machine retained")
+			}
+			retained.closeMu.Lock()
+			closed := retained.closed
+			retained.closeMu.Unlock()
+			if !closed {
+				t.Fatal("identity mismatch did not close the retained machine's host resources")
 			}
 		})
 	}

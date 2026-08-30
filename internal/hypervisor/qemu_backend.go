@@ -54,6 +54,13 @@ func (h *qemuHypervisor) Launch(ctx context.Context, spec Spec) (Machine, error)
 		if err != nil {
 			reportRestoreFallback(spec.Restore, err)
 		} else if err := validateQEMUSave(metadata, h.architecture, h.system.Machine); err != nil {
+			// The refusal keeps the save file for the user to act on, but a
+			// machine retained from a same-daemon suspend still holds the
+			// node's console proxy and network attachment. Release it, or the
+			// advertised cold-boot recovery collides with those resources.
+			if retained := h.takeSaved(spec.Restore.Path); retained != nil {
+				_ = retained.Close()
+			}
 			return nil, err
 		} else if err := validateQEMUSaveVersion(metadata, h.version.String()); err != nil {
 			reportRestoreFallback(spec.Restore, err)

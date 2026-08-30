@@ -199,6 +199,28 @@ func TestHypervisorFindingsBestEffortPlatformTag(t *testing.T) {
 	}
 }
 
+func TestRunDoctorBestEffortTagSurvivesOldDaemonWithoutPlatform(t *testing.T) {
+	originalGOOS, originalGOARCH := doctorGOOS, doctorGOARCH
+	t.Cleanup(func() { doctorGOOS, doctorGOARCH = originalGOOS, originalGOARCH })
+	doctorGOOS, doctorGOARCH = "darwin", "amd64"
+	deps := hypervisorDoctorDependencies()
+	// A main-era daemon: inventory present, no Platform field.
+	deps.daemonInfo = func() (daemon.Info, error) {
+		return daemon.Info{
+			Hypervisors:             []daemon.HypervisorInfo{{Name: hypervisor.NameQEMU, Available: true}},
+			DefaultHypervisor:       hypervisor.NameQEMU,
+			DefaultHypervisorSource: hypervisor.DefaultSourceCompiled,
+		}, nil
+	}
+	var output strings.Builder
+	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "qemu: availability=available (best-effort platform)") {
+		t.Fatalf("doctor output lost the best-effort tag against an old daemon:\n%s", output.String())
+	}
+}
+
 func TestHypervisorFindingsPlatformTagPrefersDaemonPlatform(t *testing.T) {
 	originalGOOS, originalGOARCH := doctorGOOS, doctorGOARCH
 	t.Cleanup(func() { doctorGOOS, doctorGOARCH = originalGOOS, originalGOARCH })

@@ -737,8 +737,14 @@ func doctorHypervisors(deps doctorDependencies) doctorHypervisorInventory {
 	}
 	info, err := deps.daemonInfo()
 	if err == nil && len(info.Hypervisors) > 0 {
+		// A daemon predating Info.Platform reports none; fall back to this
+		// client's runtime, the pre-platform-field behaviour.
+		platform := info.Platform
+		if platform == "" {
+			platform = doctorGOOS + "/" + doctorGOARCH
+		}
 		inventory := doctorHypervisorInventory{
-			platform:      info.Platform,
+			platform:      platform,
 			items:         info.Hypervisors,
 			defaultName:   info.DefaultHypervisor,
 			defaultSource: info.DefaultHypervisorSource,
