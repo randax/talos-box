@@ -357,6 +357,11 @@ type vzMachine struct {
 	network     *helper.Attachment
 	balloon     *vz.VirtioTraditionalMemoryBalloonDevice
 
+	// lifecycleMu serializes balloon retargets against Stop/Suspend/Close:
+	// a target set on a VM whose stop is in flight is the teardown shape
+	// behind the #513 host panics, and the Running check alone is a TOCTOU.
+	lifecycleMu sync.Mutex
+
 	closeMu sync.Mutex
 	closed  bool
 }
@@ -367,6 +372,8 @@ func (v *vzMachine) Active() bool {
 }
 
 func (v *vzMachine) SetMemoryTargetMiB(targetMiB int) error {
+	v.lifecycleMu.Lock()
+	defer v.lifecycleMu.Unlock()
 	if v.machine.State() != vz.VirtualMachineStateRunning {
 		return ErrDeviceNotActive
 	}
@@ -378,6 +385,8 @@ func (v *vzMachine) SetMemoryTargetMiB(targetMiB int) error {
 }
 
 func (v *vzMachine) Stop(ctx context.Context) error {
+	v.lifecycleMu.Lock()
+	defer v.lifecycleMu.Unlock()
 	state := v.machine.State()
 	if state == vz.VirtualMachineStateStopped || state == vz.VirtualMachineStateError {
 		return nil
@@ -411,6 +420,8 @@ func (v *vzMachine) Suspend(ctx context.Context, savePath string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	v.lifecycleMu.Lock()
+	defer v.lifecycleMu.Unlock()
 	if v.machine.State() != vz.VirtualMachineStateRunning {
 		return ErrDeviceNotActive
 	}
@@ -435,7 +446,10 @@ func (v *vzMachine) Close() error {
 	if v.closed {
 		return nil
 	}
-	if err := v.forceStop(nil); err != nil {
+	v.lifecycleMu.Lock()
+	err := v.forceStop(nil)
+	v.lifecycleMu.Unlock()
+	if err != nil {
 		return err
 	}
 	v.owner.forget(v)
@@ -451,11 +465,19 @@ func (v *vzMachine) Close() error {
 	return nil
 }
 
+// hardStopMu serializes the hypervisor-side hard stop across every VM of this
+// process. A guest that never answers ACPI, or one that cannot be asked, is
+// torn down by the kernel here rather than in Close — and N of those at once
+// is the mass-teardown shape behind the #513 host panics, so they queue.
+var hardStopMu sync.Mutex
+
 func (v *vzMachine) forceStop(prior error) error {
 	state := v.machine.State()
 	if state == vz.VirtualMachineStateStopped || state == vz.VirtualMachineStateError {
 		return nil
 	}
+	hardStopMu.Lock()
+	defer hardStopMu.Unlock()
 	if err := v.machine.Stop(); err != nil {
 		return errors.Join(prior, fmt.Errorf("force stop VM: %w", err))
 	}

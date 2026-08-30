@@ -92,8 +92,14 @@ func (s *Server) startNodeLocked(raw json.RawMessage, progress stageFunc) (NodeR
 		s.vms[item.Name] = nodes
 	}
 	if existing := nodes[node.Name]; existing != nil {
-		// an inactive machine still holds its host resources until it is released
-		if err := existing.Close(); err != nil {
+		// an inactive machine still holds its host resources until it is
+		// released; the latch covers the case where it is not inactive after
+		// all (#513)
+		err := func() error {
+			defer s.quiesceBalloon()()
+			return existing.Close()
+		}()
+		if err != nil {
 			return NodeRunState{}, nil, fmt.Errorf("release inactive VM %s: %w", node.Name, err)
 		}
 		delete(nodes, node.Name)

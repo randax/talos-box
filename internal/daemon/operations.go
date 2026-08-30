@@ -1041,19 +1041,12 @@ func (s *Server) unbindMirrors(subnetIndex int) {
 }
 
 func (s *Server) closeNodes(clusterName string, nodes map[string]hypervisor.Machine, names []string) error {
-	type result struct {
-		name string
-		err  error
-	}
-	results := make(chan result, len(names))
-	for _, name := range names {
-		machine := nodes[name]
-		go func() { results <- result{name: name, err: closeMachine(machine)} }()
-	}
+	// no balloon retarget may land on a guest while its VM stops (#513)
+	defer s.quiesceBalloon()()
+	errs := closeEach(names, func(name string) hypervisor.Machine { return nodes[name] })
 	errorsByName := make(map[string]error, len(names))
-	for range names {
-		item := <-results
-		errorsByName[item.name] = item.err
+	for i, name := range names {
+		errorsByName[name] = errs[i]
 	}
 
 	var resultErr error
@@ -1487,7 +1480,12 @@ func (s *Server) removeNodeLocked(raw json.RawMessage, progress stageFunc) (Node
 	}
 	if machine := s.vms[item.Name][node.Name]; machine != nil {
 		progress.stage("stopping node %s", node.Name)
-		if err := closeMachine(machine); err != nil {
+		// an active VM is going down: no balloon retarget may land on it (#513)
+		err := func() error {
+			defer s.quiesceBalloon()()
+			return closeMachine(machine)
+		}()
+		if err != nil {
 			log.Printf("node.remove %s/%s: stop VM failed: %v", item.Name, node.Name, err)
 			return NodeStatus{}, nil, fmt.Errorf("stop node %s: %w", node.Name, err)
 		}
