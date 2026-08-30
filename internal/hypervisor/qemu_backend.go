@@ -23,12 +23,14 @@ type qemuHypervisor struct {
 	architecture Architecture
 	system       qemuSystem
 	binary       string
+	accelerator  string
+	cpu          string
 	firmware     qemuFirmware
 	version      qemuVersion
 	capabilities Capabilities
 	newConsole   qemuConsoleFactory
 	command      func(string, ...string) *exec.Cmd
-	verifyPeer   func(net.Conn, *qemuProcess) error
+	verifyPeer   qemuPeerVerifier
 
 	savedMu sync.Mutex
 	saved   map[string]*qemuMachine
@@ -128,8 +130,10 @@ func (h *qemuHypervisor) newMachine(spec Spec) (*qemuMachine, error) {
 			_ = attachment.Close()
 		}
 	}()
-	if attachment.Kind != helper.AttachmentTapFD {
-		return nil, fmt.Errorf("%w: QEMU requires %q network attachment, got %q", ErrUnsupported, helper.AttachmentTapFD, attachment.Kind)
+	switch attachment.Kind {
+	case helper.AttachmentTapFD, helper.AttachmentDatagramFD:
+	default:
+		return nil, fmt.Errorf("%w: QEMU cannot use network attachment kind %q", ErrUnsupported, attachment.Kind)
 	}
 	if attachment.File == nil {
 		return nil, errors.New("network attachment has no descriptor")
@@ -327,7 +331,7 @@ func (m *qemuMachine) start(ctx context.Context, incoming string) error {
 }
 
 // extraFiles is the descriptor table QEMU inherits. The argv addresses these by
-// number, so the order here fixes them: tap 3, console 4, guest agent 5.
+// number, so the order here fixes them: network 3, console 4, guest agent 5.
 func (m *qemuMachine) extraFiles() []*os.File {
 	files := []*os.File{m.attachment.File, m.consoleGuest}
 	if m.guestAgent != nil {
@@ -339,11 +343,15 @@ func (m *qemuMachine) extraFiles() []*os.File {
 func (m *qemuMachine) launchConfig(qmpPath, incoming string) qemuLaunchConfig {
 	cfg := qemuLaunchConfig{
 		Architecture:   m.owner.architecture,
+		Machine:        m.owner.system.Machine,
+		Accelerator:    m.owner.accelerator,
+		CPU:            m.owner.cpu,
 		CPUs:           m.spec.CPUs,
 		MemoryMiB:      m.spec.MemoryMiB,
 		DiskPath:       m.spec.DiskPath,
 		MAC:            m.spec.MAC,
-		TapFD:          3,
+		NetworkKind:    m.attachment.Kind,
+		NetworkFD:      3,
 		ConsoleFD:      4,
 		DisableBalloon: m.spec.DisableBalloon,
 		QMPSocketPath:  qmpPath,
