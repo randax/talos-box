@@ -81,6 +81,81 @@ func TestBalloonablesKeepAPIDGateWithoutBalloonReadback(t *testing.T) {
 	}
 }
 
+func TestBalloonablesUseResolvedReadbackAndInjectedProbeInOneSnapshot(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	qemu, err := cluster.New("mixed-qemu", 0, 1, 0, cluster.NodeDefaults{MemoryMiB: 2048})
+	if err != nil {
+		t.Fatal(err)
+	}
+	qemu.Hypervisor = string(hypervisor.NameQEMU)
+	if err := cluster.Save(qemu); err != nil {
+		t.Fatal(err)
+	}
+	vz, err := cluster.New("mixed-vz", 1, 1, 1, cluster.NodeDefaults{MemoryMiB: 2048})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vz.Hypervisor = string(hypervisor.NameVZ)
+	if err := cluster.Save(vz); err != nil {
+		t.Fatal(err)
+	}
+
+	qemuNode := qemu.Nodes[0]
+	vzConfigured := vz.Nodes[0]
+	vzMaintenance := vz.Nodes[1]
+	nodeIPs := map[string]string{
+		qemuNode.MAC:      qemuNode.IP,
+		vzConfigured.MAC:  vzConfigured.IP,
+		vzMaintenance.MAC: vzMaintenance.IP,
+	}
+	probeResults := map[string]ProbeResult{
+		qemuNode.IP:      {Dialed: true, TLS: true, MaintenanceCert: true},
+		vzConfigured.IP:  {Dialed: true, TLS: true},
+		vzMaintenance.IP: {Dialed: true, TLS: true, MaintenanceCert: true},
+	}
+	probeCalls := map[string]int{}
+	service := &Server{
+		hypervisors: fakeRegistry(hypervisor.NameQEMU, map[hypervisor.Name]hypervisor.Hypervisor{
+			hypervisor.NameQEMU: &fakeHypervisor{capabilities: hypervisor.Capabilities{
+				BalloonReadback: hypervisor.FeatureStatus{Supported: true},
+			}},
+			hypervisor.NameVZ: &fakeHypervisor{},
+		}),
+		vms: map[string]map[string]hypervisor.Machine{
+			qemu.Name: {qemuNode.Name: &fakeMachine{active: true}},
+			vz.Name: {
+				vzConfigured.Name:  &fakeMachine{active: true},
+				vzMaintenance.Name: &fakeMachine{active: true},
+			},
+		},
+		nodeIPLookup: func(mac string, _ int) string { return nodeIPs[mac] },
+		nodeProbe: func(ip string) ProbeResult {
+			probeCalls[ip]++
+			return probeResults[ip]
+		},
+	}
+
+	got := service.Balloonables()
+	wantKeys := []string{
+		qemu.Name + "/" + qemuNode.Name,
+		vz.Name + "/" + vzConfigured.Name,
+	}
+	if len(got) != len(wantKeys) {
+		t.Fatalf("Balloonables() = %v, want exactly QEMU maintenance and configured VZ nodes", got)
+	}
+	for _, key := range wantKeys {
+		if _, ok := got[key]; !ok {
+			t.Errorf("Balloonables() missing %q: %v", key, got)
+		}
+	}
+	if key := vz.Name + "/" + vzMaintenance.Name; got[key] != nil {
+		t.Errorf("Balloonables() includes VZ maintenance node %q", key)
+	}
+	if ip := qemuNode.IP; probeCalls[ip] != 0 {
+		t.Errorf("QEMU maintenance node probe calls = %d, want readback eligibility without probing", probeCalls[ip])
+	}
+}
+
 func TestBalloonMachineOnlyToleratesInactiveDeviceOnCapabilityDrivenPath(t *testing.T) {
 	errDeviceInactive := hypervisor.ErrDeviceNotActive
 	recorded := 0
