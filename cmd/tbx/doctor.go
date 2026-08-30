@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -702,6 +703,18 @@ func guestAgentFinding(
 
 const hypervisorProbeTimeout = 2 * time.Second
 
+var (
+	doctorGOOS   = runtime.GOOS
+	doctorGOARCH = runtime.GOARCH
+)
+
+func hypervisorPlatformTag(goos, goarch string, name string) string {
+	if goos == "darwin" && goarch == "amd64" && name == string(hypervisor.NameQEMU) {
+		return "best-effort platform"
+	}
+	return ""
+}
+
 type doctorHypervisorInventory struct {
 	items         []daemon.HypervisorInfo
 	defaultName   hypervisor.Name
@@ -759,6 +772,7 @@ func doctorHypervisors(deps doctorDependencies) doctorHypervisorInventory {
 		if entry.Availability.Available && entry.Hypervisor != nil {
 			capabilities := entry.Hypervisor.Capabilities()
 			item.BalloonReadback = daemon.NewFeatureStatusInfo(capabilities.BalloonReadback)
+			item.Suspend = daemon.NewFeatureStatusInfo(capabilities.Suspend)
 			item.SuspendSurvivesDaemonRestart = capabilities.SuspendSurvivesDaemonRestart
 			item.GuestAgent = daemon.NewFeatureStatusInfo(capabilities.GuestAgent)
 		}
@@ -782,7 +796,11 @@ func hypervisorFindings(inventory doctorHypervisorInventory) []doctorFinding {
 	findings := make([]doctorFinding, 0, len(items))
 	for _, item := range items {
 		availability := "available"
+		if tag := hypervisorPlatformTag(doctorGOOS, doctorGOARCH, string(item.Name)); item.Available && tag != "" {
+			availability += " (" + tag + ")"
+		}
 		balloonReadback := featureGate(item.BalloonReadback)
+		suspend := featureGate(item.Suspend)
 		suspendRestart := "unsupported"
 		if item.SuspendSurvivesDaemonRestart {
 			suspendRestart = "supported"
@@ -800,13 +818,13 @@ func hypervisorFindings(inventory doctorHypervisorInventory) []doctorFinding {
 			if len(details) != 0 {
 				availability += " (" + strings.Join(details, "; ") + ")"
 			}
-			balloonReadback, suspendRestart, guestAgent = "unavailable", "unavailable", "unavailable"
+			balloonReadback, suspend, suspendRestart, guestAgent = "unavailable", "unavailable", "unavailable", "unavailable"
 		}
 		defaultStatus := "no"
 		if item.Name == inventory.defaultName {
 			defaultStatus = "yes (source=" + string(inventory.defaultSource) + ")"
 		}
-		detail := fmt.Sprintf("%s: availability=%s; default=%s; balloon-readback=%s; suspend-survives-restart=%s; guest-agent=%s", item.Name, availability, defaultStatus, balloonReadback, suspendRestart, guestAgent)
+		detail := fmt.Sprintf("%s: availability=%s; default=%s; balloon-readback=%s; suspend=%s; suspend-survives-restart=%s; guest-agent=%s", item.Name, availability, defaultStatus, balloonReadback, suspend, suspendRestart, guestAgent)
 		if inventory.localProbeTag != "" {
 			detail += "; " + inventory.localProbeTag
 		}

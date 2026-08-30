@@ -18,6 +18,7 @@ func TestInfoHypervisorFeatureStatusJSONRoundTrip(t *testing.T) {
 			Available:               true,
 			AvailabilityRemediation: "install the hypervisor",
 			BalloonReadback:         FeatureStatusInfo{Supported: true},
+			Suspend:                 FeatureStatusInfo{Reason: "save unavailable"},
 			GuestAgent:              FeatureStatusInfo{Reason: "no channel"},
 		}},
 	}
@@ -28,6 +29,7 @@ func TestInfoHypervisorFeatureStatusJSONRoundTrip(t *testing.T) {
 	encoded := string(raw)
 	for _, fragment := range []string{
 		`"balloonReadback":{"supported":true}`,
+		`"suspend":{"reason":"save unavailable"}`,
 		`"guestAgent":{"reason":"no channel"}`,
 		`"availabilityRemediation":"install the hypervisor"`,
 		`"compiledDefaultHypervisor":"vz"`,
@@ -41,7 +43,7 @@ func TestInfoHypervisorFeatureStatusJSONRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Hypervisors) != 1 || !got.Hypervisors[0].BalloonReadback.Supported || got.Hypervisors[0].GuestAgent.Reason != "no channel" || got.Hypervisors[0].AvailabilityRemediation != "install the hypervisor" || got.CompiledDefaultHypervisor != hypervisor.NameVZ {
+	if len(got.Hypervisors) != 1 || !got.Hypervisors[0].BalloonReadback.Supported || got.Hypervisors[0].Suspend.Reason != "save unavailable" || got.Hypervisors[0].GuestAgent.Reason != "no channel" || got.Hypervisors[0].AvailabilityRemediation != "install the hypervisor" || got.CompiledDefaultHypervisor != hypervisor.NameVZ {
 		t.Fatalf("round trip = %+v, want feature statuses preserved", got)
 	}
 

@@ -998,6 +998,7 @@ func (s *Server) info() Info {
 		if entry.Availability.Available && entry.Hypervisor != nil {
 			capabilities := entry.Hypervisor.Capabilities()
 			backendInfo.BalloonReadback = NewFeatureStatusInfo(capabilities.BalloonReadback)
+			backendInfo.Suspend = NewFeatureStatusInfo(capabilities.Suspend)
 			backendInfo.SuspendSurvivesDaemonRestart = capabilities.SuspendSurvivesDaemonRestart
 			backendInfo.GuestAgent = NewFeatureStatusInfo(capabilities.GuestAgent)
 		}

@@ -278,6 +278,21 @@ func TestInfoReportsHypervisorAvailabilityRemediation(t *testing.T) {
 	}
 }
 
+func TestInfoReportsHypervisorSuspendCapability(t *testing.T) {
+	t.Parallel()
+	service := &Server{hypervisors: fakeRegistry(hypervisor.NameQEMU, map[hypervisor.Name]hypervisor.Hypervisor{
+		hypervisor.NameQEMU: &fakeHypervisor{capabilities: hypervisor.Capabilities{
+			Suspend:                      hypervisor.FeatureStatus{Supported: true},
+			SuspendSurvivesDaemonRestart: true,
+		}},
+	})}
+
+	info := service.info()
+	if len(info.Hypervisors) != 1 || !info.Hypervisors[0].Suspend.Supported || !info.Hypervisors[0].SuspendSurvivesDaemonRestart {
+		t.Fatalf("info hypervisors = %+v, want suspend and restart-survival capabilities", info.Hypervisors)
+	}
+}
+
 func TestBalloonCandidatesUseResolvedHypervisorCapabilities(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	items := make([]cluster.Cluster, 0, 2)

@@ -150,6 +150,7 @@ type HypervisorInfo struct {
 	AvailabilityReason           string            `json:"availabilityReason,omitempty"`
 	AvailabilityRemediation      string            `json:"availabilityRemediation,omitempty"`
 	BalloonReadback              FeatureStatusInfo `json:"balloonReadback,omitempty"`
+	Suspend                      FeatureStatusInfo `json:"suspend,omitempty"`
 	SuspendSurvivesDaemonRestart bool              `json:"suspendSurvivesDaemonRestart,omitempty"`
 	GuestAgent                   FeatureStatusInfo `json:"guestAgent,omitempty"`
 }
