@@ -14,12 +14,15 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/randax/talos-box/internal/balloon"
 	"github.com/randax/talos-box/internal/daemon"
+	"github.com/randax/talos-box/internal/hypervisor"
 )
 
 const (
@@ -154,6 +157,51 @@ func mergeE2EEnv(base, overrides []string) []string {
 		result = append(result, values[key])
 	}
 	return result
+}
+
+// e2eDaemonEnvState captures the running daemon's environment-derived
+// settings so a test that replaces the daemon can carry them through its own
+// restarts and put them back afterwards, instead of silently stripping a
+// TBX_HYPERVISOR default or a custom balloon reserve the user's daemon was
+// started with.
+type e2eDaemonEnvState struct {
+	reserveMiB     int
+	reserveDefault bool
+	hypervisorEnv  string // TBX_HYPERVISOR value to carry, "" for none
+}
+
+func captureE2EDaemonEnvState(t *testing.T) e2eDaemonEnvState {
+	t.Helper()
+	socketPath, err := daemon.SocketPath()
+	if err != nil {
+		t.Fatalf("resolve daemon socket path: %v", err)
+	}
+	info, _, err := daemonHandshake(socketPath)
+	if err != nil {
+		t.Fatalf("read running daemon info from %s: %v", socketPath, err)
+	}
+	state := e2eDaemonEnvState{reserveMiB: info.BalloonReserveMiB}
+	compiled := balloon.DefaultConfig().ReserveMiB
+	if state.reserveMiB == 0 {
+		state.reserveMiB = compiled
+	}
+	state.reserveDefault = state.reserveMiB == compiled
+	if info.DefaultHypervisorSource == hypervisor.DefaultSourceEnvironment {
+		state.hypervisorEnv = string(info.DefaultHypervisor)
+	}
+	return state
+}
+
+// env renders the captured daemon environment as restart overrides, with any
+// extra overrides appended so they win in mergeE2EEnv. An empty value means
+// "unset" to both consumers: the registry treats an empty TBX_HYPERVISOR as
+// no override, and the balloon manager treats an empty reserve as default.
+func (s e2eDaemonEnvState) env(overrides ...string) []string {
+	env := []string{"TBX_HYPERVISOR=" + s.hypervisorEnv, "TBX_BALLOON_RESERVE_MIB="}
+	if !s.reserveDefault {
+		env[1] = "TBX_BALLOON_RESERVE_MIB=" + strconv.Itoa(s.reserveMiB)
+	}
+	return append(env, overrides...)
 }
 
 func binPath(t *testing.T, name string) string {

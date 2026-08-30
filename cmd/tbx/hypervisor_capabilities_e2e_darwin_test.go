@@ -122,12 +122,7 @@ func TestQEMUBalloonReadbackInMaintenanceE2E(t *testing.T) {
 		t.Fatalf("TBX_DISABLE_BALLOON=%q disables ballooning required by this test; unset TBX_DISABLE_BALLOON and restart tbxd", value)
 	}
 
-	originalReserveMiB := info.BalloonReserveMiB
-	compiledReserveMiB := balloon.DefaultConfig().ReserveMiB
-	if originalReserveMiB == 0 {
-		originalReserveMiB = compiledReserveMiB
-	}
-	originalWasDefault := originalReserveMiB == compiledReserveMiB
+	daemonEnv := captureE2EDaemonEnvState(t)
 	hostFreeMiB, err := balloon.HostFreeMiB()
 	if err != nil {
 		t.Fatalf("read host free memory: %v", err)
@@ -137,17 +132,18 @@ func TestQEMUBalloonReadbackInMaintenanceE2E(t *testing.T) {
 	}
 	newReserveMiB := hostFreeMiB + 2048
 
+	// Restore the captured daemon environment — reserve AND any
+	// TBX_HYPERVISOR default — after the owned cluster is destroyed (LIFO:
+	// this runs last because it is registered first).
 	t.Cleanup(func() {
-		var env []string
-		if !originalWasDefault {
-			env = []string{"TBX_BALLOON_RESERVE_MIB=" + strconv.Itoa(originalReserveMiB)}
-		}
-		output, err := runTBXCommand(t, env, e2eCleanupTimeout, "system", "restart", "--force")
+		output, err := runTBXCommand(t, daemonEnv.env(), e2eCleanupTimeout, "system", "restart", "--force")
 		if err != nil {
-			t.Errorf("restore tbxd balloon reserve to %d MiB: %v\n%s", originalReserveMiB, err, output)
+			t.Errorf("restore tbxd daemon environment (reserve %d MiB): %v\n%s", daemonEnv.reserveMiB, err, output)
 		}
 	})
-	runTBXWithEnv(t, []string{"TBX_BALLOON_RESERVE_MIB=" + strconv.Itoa(newReserveMiB)}, "system", "restart", "--force")
+	// The mutating restart carries the captured environment too, so only the
+	// reserve differs from what the user's daemon was started with.
+	runTBXWithEnv(t, daemonEnv.env("TBX_BALLOON_RESERVE_MIB="+strconv.Itoa(newReserveMiB)), "system", "restart", "--force")
 
 	logOffset := captureTBXDLogOffset(t)
 	name := uniqueE2EClusterName("balloon")

@@ -17,9 +17,6 @@ import (
 )
 
 const (
-	// upWithObservations provisions clusters sequentially, not in parallel, so
-	// two clusters need twice cniProvisionDeadline plus image-pull/VM-boot grace.
-	mixedE2EUpTimeout    = 2*cniProvisionDeadline + 5*time.Minute
 	mixedE2EReadyTimeout = 10 * time.Minute
 	mixedE2EPollInterval = 15 * time.Second
 )
@@ -33,10 +30,12 @@ func TestMixedHypervisorsInterClusterE2E(t *testing.T) {
 	if lane.Name != hypervisor.NameQEMU {
 		t.Fatalf("mixed inter-cluster e2e requires the qemu lane, got %q", lane.Name)
 	}
-	requireMixedE2EVZ(t)
+	// The Intel skip must precede the VZ requirement: darwin/amd64 registers
+	// no VZ backend at all, so requireMixedE2EVZ would fail there instead.
 	if runtime.GOARCH == "amd64" {
 		t.Skip("mixed VZ+QEMU topology is unavailable on Intel Darwin; Apple Silicon is required")
 	}
+	requireMixedE2EVZ(t)
 	requireNoForeignClusters(t)
 
 	vzName := uniqueE2EClusterName("mixed-vz")
@@ -72,7 +71,10 @@ func TestMixedHypervisorsInterClusterE2E(t *testing.T) {
 	registerE2EClusterCleanup(t, vzName, &cleanupOutput)
 	registerE2EClusterCleanup(t, qemuName, &cleanupOutput)
 	registerE2EFailureDiagnostics(t, logOffset)
-	upOutput, upErr := runTBXCommand(t, nil, mixedE2EUpTimeout, "up", "--force", "-f", configPath)
+	// The client's own request bound for this config, plus grace, so the test
+	// can never time out a run the production deadline still allows.
+	upTimeout := upProvisionDeadline(cfg) + 5*time.Minute
+	upOutput, upErr := runTBXCommand(t, nil, upTimeout, "up", "--force", "-f", configPath)
 	if upErr != nil {
 		t.Fatalf("tbx up --force -f %s: %v\n%s", configPath, upErr, upOutput)
 	}

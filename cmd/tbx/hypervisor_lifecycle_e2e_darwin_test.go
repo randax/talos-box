@@ -22,6 +22,19 @@ func TestQEMUSuspendSurvivesDaemonRestartE2E(t *testing.T) {
 		t.Skipf("test runs in the QEMU lane (TBX_E2E_HYPERVISOR=qemu); selected %s", backend.Name)
 	}
 	requireNoForeignClusters(t)
+	daemonEnv := captureE2EDaemonEnvState(t)
+	if daemonEnv.hypervisorEnv != "" || !daemonEnv.reserveDefault {
+		// The mid-test restart deliberately clears TBX_HYPERVISOR (the proof
+		// needs the stored cluster state to win, not an env default), so a
+		// daemon started with overrides must get them back afterwards. LIFO:
+		// registered first, this runs after the owned cluster is destroyed.
+		t.Cleanup(func() {
+			output, err := runTBXCommand(t, daemonEnv.env(), e2eCleanupTimeout, "system", "restart", "--force")
+			if err != nil {
+				t.Errorf("restore tbxd daemon environment: %v\n%s", err, output)
+			}
+		})
+	}
 
 	name := uniqueE2EClusterName("qemu-restart")
 	yaml, err := renderE2EConfig(validE2ETestConfig(name, hypervisor.NameQEMU))
@@ -40,8 +53,6 @@ func TestQEMUSuspendSurvivesDaemonRestartE2E(t *testing.T) {
 	})
 	nodeName := status.Nodes[0].Name
 	bootBanner := regexp.MustCompile(`(?m)Linux version \S+.*#1\b`)
-	preSuspendConsole := runTBX(t, "console", name, nodeName, "--no-follow", "--lines", "300")
-	preSuspendBannerCount := len(bootBanner.FindAllString(preSuspendConsole, -1))
 
 	runTBX(t, "cluster", "suspend", name)
 	// Leave a full clock-drift reporting interval after the save timestamp.
@@ -51,14 +62,29 @@ func TestQEMUSuspendSurvivesDaemonRestartE2E(t *testing.T) {
 			len(status.Nodes) == 1 && status.Nodes[0].Suspended && status.Nodes[0].Phase == daemon.PhaseSuspended
 	})
 
-	// Clear ambient TBX_HYPERVISOR so it cannot override the persisted per-cluster QEMU selection.
-	runTBXWithEnv(t, []string{"TBX_HYPERVISOR="}, "system", "restart")
+	// Clear TBX_HYPERVISOR — ambient or carried from the daemon's own
+	// environment — so the persisted per-cluster QEMU selection must win on
+	// its own; keep the captured balloon reserve so only that one variable
+	// differs from the daemon being replaced.
+	runTBXWithEnv(t, daemonEnv.env("TBX_HYPERVISOR="), "system", "restart")
 	_, restartedStatus := waitForHypervisorLifecycleStatus(t, name, hypervisorLifecycleStatusTimeout, func(status daemon.ClusterStatus) bool {
 		return status.Hypervisor == hypervisor.NameQEMU && !status.Running && status.Suspended &&
 			len(status.Nodes) == 1 && status.Nodes[0].Phase == daemon.PhaseSuspended
 	})
 	if strings.Contains(restartedStatus, "will cold-boot") {
 		t.Fatalf("status after daemon restart says the QEMU save will cold-boot:\n%s", restartedStatus)
+	}
+
+	// Baseline the boot-banner count from the REPLACEMENT daemon's console
+	// buffer, so both reads come from the same proxy lifetime: a cold boot
+	// during resume then adds exactly one banner and is caught, where a
+	// pre-suspend baseline from the old daemon's buffer would mask it. The
+	// read may fail while the node is suspended; treat that as an empty
+	// buffer.
+	preResumeConsole, preResumeErr := runTBXCommand(t, nil, e2eCleanupTimeout, "console", name, nodeName, "--no-follow", "--lines", "300")
+	preResumeBannerCount := 0
+	if preResumeErr == nil {
+		preResumeBannerCount = len(bootBanner.FindAllString(preResumeConsole, -1))
 	}
 
 	resumeOutput := runTBX(t, "cluster", "resume", name)
@@ -74,8 +100,8 @@ func TestQEMUSuspendSurvivesDaemonRestartE2E(t *testing.T) {
 
 	postResumeConsole := runTBX(t, "console", name, nodeName, "--no-follow", "--lines", "300")
 	postResumeBannerCount := len(bootBanner.FindAllString(postResumeConsole, -1))
-	if postResumeBannerCount > preSuspendBannerCount {
-		t.Fatalf("kernel boot banner count increased across suspend/resume: before=%d after=%d\npre-suspend console tail:\n%s\npost-resume console tail:\n%s", preSuspendBannerCount, postResumeBannerCount, preSuspendConsole, postResumeConsole)
+	if postResumeBannerCount > preResumeBannerCount {
+		t.Fatalf("kernel boot banner appeared during resume (cold boot): before=%d after=%d\npre-resume console tail:\n%s\npost-resume console tail:\n%s", preResumeBannerCount, postResumeBannerCount, preResumeConsole, postResumeConsole)
 	}
 }
 
