@@ -27,6 +27,25 @@ jobs:
       - run: make test
       # E2E tests require Virtualization.framework, which is unavailable on GitHub-hosted runners.
 
+  darwin-amd64:
+    name: Darwin (amd64)
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26"
+          cache: false
+      - name: Guard native target
+        run: test "$(go env GOOS)/$(go env GOARCH)" = darwin/amd64
+      - run: make build
+      - name: lint
+        uses: golangci/golangci-lint-action@4afd733a84b1f43292c63897423277bb7f4313a9 # v8
+        with:
+          version: v2.12
+      - run: make test
+      # E2E tests require HVF or Virtualization.framework, which is unavailable on GitHub-hosted runners.
+
   linux-arm64:
     name: Linux (arm64)
     runs-on: ubuntu-24.04-arm
