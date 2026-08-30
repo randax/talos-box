@@ -50,7 +50,12 @@ func (s *Server) suspendCluster(raw json.RawMessage) (ClusterSummary, error) {
 		retain, err := prepareSavedMachine(machine, savePath)
 		if err == nil {
 			recordSaveStateOwner(savePath)
-			recordSaveStateBalloon(savePath, s.balloonDisabled)
+			// the save and its device-set metadata commit together: a save
+			// whose marker could not be settled would be misread by the next
+			// resume and cold-booted, losing the memory it claims to hold
+			if err = recordSaveStateBalloon(savePath, s.balloonDisabled); err != nil {
+				retain = true
+			}
 		}
 		if err != nil {
 			errs = append(errs, fmt.Errorf("suspend %s: %w", name, err))
@@ -434,7 +439,7 @@ func removeSaveStateFiles(paths []string) {
 	for _, path := range paths {
 		_ = os.Remove(path)
 		_ = os.Remove(saveStateOwnerPath(path))
-		_ = os.Remove(saveStateBalloonPath(path))
+		removeSaveStateBalloonMarker(path)
 	}
 }
 
@@ -442,14 +447,31 @@ func removeSaveStateFiles(paths []string) {
 // device (TBX_DISABLE_BALLOON, #513). Absent means the guest had one.
 func saveStateBalloonPath(savePath string) string { return savePath + ".noballoon" }
 
-func recordSaveStateBalloon(savePath string, disabled bool) {
+// recordSaveStateBalloon settles the marker for a fresh save: present when the
+// guest had no balloon device, absent otherwise. Both directions must land —
+// a stale marker beside a balloon-enabled save reads as a mismatch on resume
+// and discards a valid save — so a failure is the caller's to fail the save on.
+func recordSaveStateBalloon(savePath string, disabled bool) error {
 	marker := saveStateBalloonPath(savePath)
 	if !disabled {
-		_ = os.Remove(marker)
-		return
+		if err := os.Remove(marker); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("clear saved state balloon marker %s: %w", marker, err)
+		}
+		return nil
 	}
 	if err := os.WriteFile(marker, nil, 0o600); err != nil {
-		log.Printf("record saved state balloon marker %s: %v", marker, err)
+		return fmt.Errorf("record saved state balloon marker %s: %w", marker, err)
+	}
+	return nil
+}
+
+// removeSaveStateBalloonMarker drops the marker beside a save that is going
+// away. It cannot be best effort either: a marker that outlives its save would
+// stamp the next save at this path, so a failure is reported loudly.
+func removeSaveStateBalloonMarker(savePath string) {
+	marker := saveStateBalloonPath(savePath)
+	if err := os.Remove(marker); err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Printf("remove saved state balloon marker %s: %v (the next save here settles it again)", marker, err)
 	}
 }
 
@@ -596,7 +618,7 @@ func discardSavedState(dir, nodeName string) (bool, string) {
 		return false, undiscardedSaveStateWarning(nodeName, err)
 	}
 	_ = os.Remove(saveStateOwnerPath(path))
-	_ = os.Remove(saveStateBalloonPath(path))
+	removeSaveStateBalloonMarker(path)
 	log.Printf("discarded saved state %s: cold boot", path)
 	return true, ""
 }
@@ -626,7 +648,7 @@ func discardClusterSavedStates(dir string) (bool, []string) {
 			continue
 		}
 		_ = os.Remove(saveStateOwnerPath(path))
-		_ = os.Remove(saveStateBalloonPath(path))
+		removeSaveStateBalloonMarker(path)
 		log.Printf("discarded saved state %s: disks were replaced", path)
 		discarded = true
 	}
