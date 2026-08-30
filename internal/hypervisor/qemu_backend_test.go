@@ -199,6 +199,79 @@ func TestQEMULaunchIdentityRefusalKeepsMachineRetainedWhenCloseFails(t *testing.
 	}
 }
 
+func TestQEMULaunchIdentityRefusalRetainsMachineOnLateAttachmentCloseFailure(t *testing.T) {
+	dir := t.TempDir()
+	savePath := filepath.Join(dir, "node.vzstate")
+	metadata := qemuSaveMetadata{Schema: qemuSaveSchema, Backend: qemuSaveBackend, QEMUVersion: "8.2.2", Architecture: ArchitectureARM64, Machine: "virt"}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(savePath, append(encoded, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	currentVersion := qemuVersion{Major: 8, Minor: 2, Patch: 2}
+	backend := &qemuHypervisor{
+		architecture: ArchitectureAMD64,
+		system:       qemuSystem{Machine: "q35"},
+		version:      currentVersion,
+		capabilities: qemuCapabilities(currentVersion),
+		saved:        map[string]*qemuMachine{},
+	}
+	// An attachment whose descriptor is already gone fails its close, and the
+	// failure happens after the infallible releases: the late step must still
+	// keep the machine open and owned.
+	stuck, pipeWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = pipeWriter.Close()
+	_ = stuck.Close()
+	retained := &qemuMachine{owner: backend, attachment: &helper.Attachment{Kind: helper.AttachmentTapFD, File: stuck}}
+	backend.saved[savePath] = retained
+
+	_, err = backend.Launch(context.Background(), Spec{
+		CPUs:              1,
+		MemoryMiB:         1024,
+		DiskPath:          filepath.Join(dir, "node.img"),
+		MAC:               "02:00:00:00:00:01",
+		EFIVarsPath:       filepath.Join(dir, "node.efi"),
+		ConsoleSocketPath: filepath.Join(dir, "node.console.sock"),
+		Network: func() (*helper.Attachment, error) {
+			return nil, errors.New("cold boot attempted")
+		},
+		Restore: &Restore{Path: savePath},
+	})
+	if err == nil || errors.Is(err, ErrIncompatibleSave) {
+		t.Fatalf("Launch() = %v, want a cleanup error without the cold-boot sentinel", err)
+	}
+	if backend.saved[savePath] != retained {
+		t.Fatal("late close failure dropped the only ownership record of the retained machine")
+	}
+	retained.closeMu.Lock()
+	closed := retained.closed
+	retained.closeMu.Unlock()
+	if closed {
+		t.Fatal("machine entered the terminal closed state although attachment cleanup failed")
+	}
+
+	// The failure is not terminal: once the stuck resource is gone, a retry
+	// completes the close and releases ownership.
+	retained.attachment = nil
+	if err := retained.Close(); err != nil {
+		t.Fatalf("retried Close() = %v, want success after the stuck resource cleared", err)
+	}
+	if backend.saved[savePath] != nil {
+		t.Fatal("completed retry left the machine retained")
+	}
+	retained.closeMu.Lock()
+	closed = retained.closed
+	retained.closeMu.Unlock()
+	if !closed {
+		t.Fatal("completed retry did not mark the machine closed")
+	}
+}
+
 func TestQEMULaunchMalformedSaveKeepsColdBootFallback(t *testing.T) {
 	dir := t.TempDir()
 	savePath := filepath.Join(dir, "node.vzstate")

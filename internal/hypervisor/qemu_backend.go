@@ -584,6 +584,11 @@ func waitQEMUMigration(ctx context.Context, client *qmpClient) error {
 	}
 }
 
+// Close releases the machine's host resources. It enters the terminal closed
+// state — and drops the owner's retention record — only once every fallible
+// release has succeeded: a failure leaves the machine open and still owned, so
+// a later Close can retry what remains. Already-released resources are nil'd,
+// which is what makes that retry idempotent.
 func (m *qemuMachine) Close() error {
 	m.closeMu.Lock()
 	defer m.closeMu.Unlock()
@@ -601,29 +606,36 @@ func (m *qemuMachine) Close() error {
 		m.opMu.Unlock()
 		return stopErr
 	}
-	m.closed = true
 	m.opMu.Unlock()
-	m.owner.forget(m)
 	if m.console != nil {
 		m.console.close()
+		m.console = nil
 	}
 	if m.consoleGuest != nil {
 		_ = m.consoleGuest.Close()
+		m.consoleGuest = nil
 	}
 	if m.guestAgent != nil {
 		_ = m.guestAgent.Close()
 		// The listener was detached from the path so QEMU could keep serving it;
 		// nothing else will unlink it.
 		_ = os.Remove(m.spec.GuestAgentSocketPath)
+		m.guestAgent = nil
 	}
 	if m.attachment != nil {
 		if err := m.attachment.Close(); err != nil {
 			return err
 		}
+		m.attachment = nil
 	}
 	if m.qmpPath != "" {
 		_ = os.Remove(m.qmpPath)
+		m.qmpPath = ""
 	}
+	m.opMu.Lock()
+	m.closed = true
+	m.opMu.Unlock()
+	m.owner.forget(m)
 	return nil
 }
 
