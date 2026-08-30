@@ -485,3 +485,67 @@ func TestSavedStateStaleOnlyWhereRestoreNeedsTheWritingProcess(t *testing.T) {
 		})
 	}
 }
+
+func TestStatusUsesPerClusterRestartSafetyForStaleWording(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	for index, backendName := range []hypervisor.Name{hypervisor.NameVZ, hypervisor.NameQEMU} {
+		name := string(backendName) + "-saved"
+		item, err := cluster.New(name, index, 1, 0, cluster.NodeDefaults{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		item.Hypervisor = string(backendName)
+		if err := cluster.Save(item); err != nil {
+			t.Fatal(err)
+		}
+		dir, err := cluster.Dir(item.Name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		save := saveStatePath(dir, item.Nodes[0].Name)
+		if err := os.WriteFile(save, []byte("saved"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(saveStateOwnerPath(save), []byte("predecessor"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	service := &Server{
+		hypervisors: fakeRegistry(hypervisor.NameVZ, map[hypervisor.Name]hypervisor.Hypervisor{
+			hypervisor.NameVZ: &fakeHypervisor{},
+			hypervisor.NameQEMU: &fakeHypervisor{capabilities: hypervisor.Capabilities{
+				SuspendSurvivesDaemonRestart: true,
+			}},
+		}),
+		vms: make(map[string]map[string]hypervisor.Machine),
+	}
+	statuses, err := service.status(mustRawJSON(t, statusArgs{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := make(map[string]ClusterStatus, len(statuses))
+	for _, status := range statuses {
+		byName[status.Name] = status
+	}
+	staleWording := "daemon that saved its memory has been replaced"
+	for _, test := range []struct {
+		name      string
+		wantStale bool
+	}{
+		{name: string(hypervisor.NameVZ) + "-saved", wantStale: true},
+		{name: string(hypervisor.NameQEMU) + "-saved"},
+	} {
+		status := byName[test.name]
+		if status.SavedStateStale != test.wantStale {
+			t.Errorf("%s SavedStateStale = %t, want %t", test.name, status.SavedStateStale, test.wantStale)
+		}
+		hints := strings.Join(status.Hints, "\n")
+		if got := strings.Contains(hints, staleWording); got != test.wantStale {
+			t.Errorf("%s stale wording present = %t, want %t (hints: %q)", test.name, got, test.wantStale, hints)
+		}
+		if !test.wantStale && !strings.Contains(hints, "tbx cluster start discards the saved memory") {
+			t.Errorf("%s hints = %q, want normal resume/discard-start guidance", test.name, hints)
+		}
+	}
+}

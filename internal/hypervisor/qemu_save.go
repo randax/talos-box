@@ -15,6 +15,7 @@ import (
 const qemuSaveOffset int64 = qemuIncomingOffset
 
 const qemuSaveSchema = 1
+const qemuSaveBackend = "qemu"
 
 type qemuSaveMetadata struct {
 	Schema       int          `json:"schema"`
@@ -26,7 +27,7 @@ type qemuSaveMetadata struct {
 
 func prepareQEMUSave(path string, metadata qemuSaveMetadata) (string, error) {
 	metadata.Schema = qemuSaveSchema
-	metadata.Backend = "qemu"
+	metadata.Backend = qemuSaveBackend
 	encoded, err := json.Marshal(metadata)
 	if err != nil {
 		return "", fmt.Errorf("encode QEMU save metadata: %w", err)
@@ -109,20 +110,25 @@ func readQEMUSave(path string) (qemuSaveMetadata, error) {
 	if err := json.Unmarshal(line, &metadata); err != nil {
 		return qemuSaveMetadata{}, fmt.Errorf("%w: decode save metadata: %v", ErrIncompatibleSave, err)
 	}
-	if metadata.Schema != qemuSaveSchema || metadata.Backend != "qemu" || metadata.QEMUVersion == "" || metadata.Machine == "" {
+	if metadata.Schema != qemuSaveSchema {
 		return qemuSaveMetadata{}, fmt.Errorf("%w: unrecognized QEMU save metadata", ErrIncompatibleSave)
+	}
+	if metadata.Backend == "" || metadata.QEMUVersion == "" || metadata.Architecture == "" || metadata.Machine == "" {
+		return qemuSaveMetadata{}, fmt.Errorf("%w: incomplete QEMU save metadata", ErrIncompatibleSave)
 	}
 	return metadata, nil
 }
 
 func validateQEMUSave(metadata qemuSaveMetadata, version string, architecture Architecture, machine string) error {
 	switch {
+	case metadata.Backend != qemuSaveBackend:
+		return fmt.Errorf("%w: save uses backend %q, current backend is %q", ErrIncompatibleSave, metadata.Backend, qemuSaveBackend)
 	case metadata.QEMUVersion != version:
-		return fmt.Errorf("%w: save uses QEMU %s, host has QEMU %s", ErrIncompatibleSave, metadata.QEMUVersion, version)
+		return fmt.Errorf("%w: save uses QEMU %q, host has QEMU %q", ErrIncompatibleSave, metadata.QEMUVersion, version)
 	case metadata.Architecture != architecture:
 		return fmt.Errorf("%w: save targets %s, host targets %s", ErrIncompatibleSave, metadata.Architecture, architecture)
 	case metadata.Machine != machine:
-		return fmt.Errorf("%w: save uses machine %s, host requires %s", ErrIncompatibleSave, metadata.Machine, machine)
+		return fmt.Errorf("%w: save uses machine %q, host requires %q", ErrIncompatibleSave, metadata.Machine, machine)
 	default:
 		return nil
 	}

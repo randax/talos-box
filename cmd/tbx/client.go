@@ -326,11 +326,13 @@ func isTimeout(err error) bool {
 }
 
 // clusterActivity names the clusters a tbxd restart would disturb. Suspended
-// clusters are kept apart from running ones because they lose more than power:
-// their saved memory does not survive the daemon that wrote it.
+// clusters are kept apart from running ones because restart-unsafe saves lose
+// more than power. Restart-safe names are retained only so the conservative
+// disk scan cannot downgrade the live daemon's capability classification.
 type clusterActivity struct {
-	running   []string
-	suspended []string
+	running              []string
+	suspended            []string
+	restartSafeSuspended []string
 	// runningVMs is how many VMs the daemon has to power off before it can
 	// exit. Stopping them is what makes a restart slow, so it is what the
 	// stop-wait is scaled against (#319).
@@ -399,11 +401,11 @@ func supervisionRefusal(state supervision, reason string) string {
 	}
 }
 
-// addSuspended merges names the daemon did not report, skipping anything
-// already named.
+// addSuspended merges names the daemon did not report, skipping anything the
+// live daemon already classified, including restart-safe suspended clusters.
 func (a *clusterActivity) addSuspended(names ...string) {
 	for _, name := range names {
-		if slices.Contains(a.running, name) || slices.Contains(a.suspended, name) {
+		if slices.Contains(a.running, name) || slices.Contains(a.suspended, name) || slices.Contains(a.restartSafeSuspended, name) {
 			continue
 		}
 		a.suspended = append(a.suspended, name)
@@ -456,11 +458,12 @@ func runningClusters(socketPath string) (clusterActivity, error) {
 		return clusterActivity{}, errors.New(response.Error)
 	}
 	var summaries []struct {
-		Name          string `json:"name"`
-		Running       bool   `json:"running"`
-		Suspended     bool   `json:"suspended"`
-		ControlPlanes int    `json:"controlPlanes"`
-		Workers       int    `json:"workers"`
+		Name                         string `json:"name"`
+		Running                      bool   `json:"running"`
+		Suspended                    bool   `json:"suspended"`
+		SuspendSurvivesDaemonRestart bool   `json:"suspendSurvivesDaemonRestart"`
+		ControlPlanes                int    `json:"controlPlanes"`
+		Workers                      int    `json:"workers"`
 	}
 	if len(response.Data) > 0 {
 		if err := json.Unmarshal(response.Data, &summaries); err != nil {
@@ -473,6 +476,8 @@ func runningClusters(socketPath string) (clusterActivity, error) {
 		case summary.Running:
 			activity.running = append(activity.running, summary.Name)
 			activity.runningVMs += summary.ControlPlanes + summary.Workers
+		case summary.Suspended && summary.SuspendSurvivesDaemonRestart:
+			activity.restartSafeSuspended = append(activity.restartSafeSuspended, summary.Name)
 		case summary.Suspended:
 			activity.suspended = append(activity.suspended, summary.Name)
 		}

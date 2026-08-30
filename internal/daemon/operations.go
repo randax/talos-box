@@ -181,10 +181,13 @@ type ClusterSummary struct {
 	AllowUnsafeDomain bool   `json:"allowUnsafeDomain,omitempty"`
 	Running           bool   `json:"running"`
 	// Suspended reports saved VM memory on disk. Unlike Running it survives a
-	// daemon restart, which is what lets a client tell a suspended cluster
-	// (whose memory a restart would discard) from a merely stopped one.
-	Suspended bool   `json:"suspended,omitempty"`
-	Warning   string `json:"warning,omitempty"`
+	// daemon restart, which is what lets a client tell a suspended cluster from
+	// a merely stopped one.
+	Suspended bool `json:"suspended,omitempty"`
+	// SuspendSurvivesDaemonRestart is set only when the live daemon can resolve
+	// a suspended cluster's backend and that backend restores from disk alone.
+	SuspendSurvivesDaemonRestart bool   `json:"suspendSurvivesDaemonRestart,omitempty"`
+	Warning                      string `json:"warning,omitempty"`
 	// Warnings is the same advisory set as Warning, one entry per finding.
 	// Warning stays populated for older clients that only read it.
 	Warnings  []string `json:"warnings,omitempty"`
@@ -1326,7 +1329,14 @@ func (s *Server) listClusters() ([]ClusterSummary, error) {
 	}
 	result := make([]ClusterSummary, 0, len(items))
 	for _, item := range items {
-		result = append(result, summary(item, s.clusterRunning(item.Name)))
+		itemSummary := summary(item, s.clusterRunning(item.Name))
+		if itemSummary.Suspended {
+			_, backend, err := s.hypervisorForCluster(item)
+			if err == nil {
+				itemSummary.SuspendSurvivesDaemonRestart = backend.Capabilities().SuspendSurvivesDaemonRestart
+			}
+		}
+		result = append(result, itemSummary)
 	}
 	return result, nil
 }
