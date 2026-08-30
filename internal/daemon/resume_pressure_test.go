@@ -47,7 +47,7 @@ func suspendedClusterForResume(t *testing.T) *Server {
 		resident[node.Name] = &fakeMachine{active: true}
 	}
 	return &Server{
-		hypervisor:    backend,
+		hypervisors:   singleFakeRegistry(backend),
 		vms:           map[string]map[string]hypervisor.Machine{busy.Name: resident},
 		subnetSources: emptySubnetSources(),
 	}
@@ -76,9 +76,9 @@ func TestResumeGatesOnHostPressureWithNoOtherGuestsResident(t *testing.T) {
 				t.Fatal(err)
 			}
 			service := &Server{
-				hypervisor: &fakeHypervisor{launch: func(context.Context, hypervisor.Spec) (hypervisor.Machine, error) {
+				hypervisors: singleFakeRegistry(&fakeHypervisor{launch: func(context.Context, hypervisor.Spec) (hypervisor.Machine, error) {
 					return &fakeMachine{active: true}, nil
-				}},
+				}}),
 				vms:             map[string]map[string]hypervisor.Machine{},
 				subnetSources:   emptySubnetSources(),
 				hostPressure:    extremeSwapPressure,

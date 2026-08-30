@@ -3,6 +3,7 @@ package hypervisor
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -32,8 +33,8 @@ func TestNewHonorsCanceledProbeContext(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := New(ctx)
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("New(canceled context) = %v, want context.Canceled", err)
+	_, _, err := NewAll(ctx).ResolveDefault()
+	if !errors.Is(err, ErrUnsupported) || !strings.Contains(err.Error(), context.Canceled.Error()) {
+		t.Fatalf("NewAll(canceled context) default error = %v, want gated backend preserving cancellation", err)
 	}
 }

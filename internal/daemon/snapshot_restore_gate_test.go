@@ -246,12 +246,12 @@ func TestSnapshotRestoreOfSnapshotWithoutStateLeavesTheClusterIntact(t *testing.
 func TestSnapshotRestoreKeepsDataLossWarningWhenRestoreFails(t *testing.T) {
 	service, item := runningLonghornClusterForNodeMutation(t, 1, 2)
 	captureSnapshot(t, item, "before", "demo-cp-1", "demo-worker-1")
-	service.hypervisor = &fakeHypervisor{
+	setFakeHypervisor(service, &fakeHypervisor{
 		architecture: hypervisor.ArchitectureARM64,
 		launch: func(context.Context, hypervisor.Spec) (hypervisor.Machine, error) {
 			return nil, errors.New("no hypervisor")
 		},
-	}
+	})
 	service.nodeVolumeCount = func(context.Context, cluster.Cluster, string) (int, error) {
 		return 1, nil
 	}

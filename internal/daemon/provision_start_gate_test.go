@@ -359,10 +359,10 @@ func balloonableFixture(t *testing.T, memoryMiB int) (*Server, cluster.Cluster) 
 	if err := cluster.Save(item); err != nil {
 		t.Fatal(err)
 	}
-	service.hypervisor = &fakeHypervisor{
+	setFakeHypervisor(service, &fakeHypervisor{
 		architecture: hypervisor.ArchitectureARM64,
 		capabilities: hypervisor.Capabilities{BalloonReadback: hypervisor.FeatureStatus{Supported: true}},
-	}
+	})
 	service.hostPressure = noHostPressure
 	service.hostTotalMemory = plentifulHostMemory
 	return service, item
@@ -849,7 +849,7 @@ func TestStartClusterReleasesThePreBalloonHoldWhenTheLaunchFails(t *testing.T) {
 	// the two still-running guests the pre-balloon squeezes.
 	stopped := item.Nodes[len(item.Nodes)-1].Name
 	delete(service.vms[item.Name], stopped)
-	service.hypervisor.(*fakeHypervisor).launch = func(context.Context, hypervisor.Spec) (hypervisor.Machine, error) {
+	defaultFakeHypervisor(service).launch = func(context.Context, hypervisor.Spec) (hypervisor.Machine, error) {
 		return nil, errors.New("vz: failed to start the virtual machine")
 	}
 
@@ -874,7 +874,7 @@ func TestAddNodeReleasesThePreBalloonHoldWhenTheLaunchFails(t *testing.T) {
 	service, item := balloonableFixture(t, nodeMiB)
 	stubNodeMutationReconcile(service)
 	service.hostFreeMemory = func() (int, error) { return reserve + nodeMiB - shortfall, nil }
-	service.hypervisor.(*fakeHypervisor).launch = func(context.Context, hypervisor.Spec) (hypervisor.Machine, error) {
+	defaultFakeHypervisor(service).launch = func(context.Context, hypervisor.Spec) (hypervisor.Machine, error) {
 		return nil, errors.New("vz: failed to start the virtual machine")
 	}
 

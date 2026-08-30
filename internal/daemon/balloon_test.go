@@ -34,11 +34,11 @@ func TestBalloonablesBypassAPIDProbeWhenBackendReportsBalloonReadback(t *testing
 
 	machine := &fakeMachine{active: true, setMemoryErr: hypervisor.ErrDeviceNotActive}
 	service := &Server{
-		hypervisor: &fakeHypervisor{
+		hypervisors: singleFakeRegistry(&fakeHypervisor{
 			capabilities: hypervisor.Capabilities{
 				BalloonReadback: hypervisor.FeatureStatus{Supported: true},
 			},
-		},
+		}),
 		vms: map[string]map[string]hypervisor.Machine{
 			item.Name: {item.Nodes[0].Name: machine},
 		},
@@ -64,13 +64,13 @@ func TestBalloonablesKeepAPIDGateWithoutBalloonReadback(t *testing.T) {
 	}
 
 	service := &Server{
-		hypervisor: &fakeHypervisor{
+		hypervisors: singleFakeRegistry(&fakeHypervisor{
 			capabilities: hypervisor.Capabilities{
 				BalloonReadback: hypervisor.FeatureStatus{
 					Reason: "Virtualization.framework does not report the guest-visible balloon size",
 				},
 			},
-		},
+		}),
 		vms: map[string]map[string]hypervisor.Machine{
 			item.Name: {item.Nodes[0].Name: &fakeMachine{active: true}},
 		},

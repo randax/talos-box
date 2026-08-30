@@ -149,7 +149,7 @@ func newVersionTestServer(t *testing.T, schematic, version string) *Server {
 	}
 	return &Server{
 		cache:        imagecache.New(root),
-		hypervisor:   &fakeHypervisor{architecture: hypervisor.ArchitectureARM64},
+		hypervisors:  singleFakeRegistry(&fakeHypervisor{architecture: hypervisor.ArchitectureARM64}),
 		vms:          make(map[string]map[string]hypervisor.Machine),
 		helperCheck:  func() error { return nil },
 		hostPressure: func(string) (hostpressure.Snapshot, error) { return hostpressure.Snapshot{}, nil },
@@ -189,12 +189,12 @@ func TestVersionWarningReachesUserWhenCreatedClusterFailsToStart(t *testing.T) {
 	// where the newer-than-tested line is the diagnosis.
 	t.Setenv("HOME", t.TempDir())
 	service := newVersionTestServer(t, "aaa", "v1.14.0")
-	service.hypervisor = &fakeHypervisor{
+	setFakeHypervisor(service, &fakeHypervisor{
 		architecture: hypervisor.ArchitectureARM64,
 		launch: func(context.Context, hypervisor.Spec) (hypervisor.Machine, error) {
 			return nil, errors.New("boot failure")
 		},
-	}
+	})
 	raw, err := json.Marshal(createArgs{
 		Name: "canary", Schematic: "aaa", Version: "v1.14.0",
 		Node: cluster.NodeDefaults{MemoryMiB: 1, CPUs: 1, DiskGiB: 1},

@@ -83,7 +83,10 @@ func TestSuspendHintNamesColdBootOnceTheOwningDaemonIsGone(t *testing.T) {
 				}
 			}
 
-			service := &Server{vms: make(map[string]map[string]hypervisor.Machine)}
+			service := &Server{
+				hypervisors: singleFakeRegistry(&fakeHypervisor{}),
+				vms:         make(map[string]map[string]hypervisor.Machine),
+			}
 			statuses, err := service.status(mustRawJSON(t, statusArgs{Cluster: "qa-sta"}))
 			if err != nil {
 				t.Fatal(err)

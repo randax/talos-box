@@ -53,15 +53,14 @@ type doctorDependencies struct {
 	// balloon device (TBX_DISABLE_BALLOON, #513); only a disabled balloon
 	// prints a line, as INFO, so the operator's own choice never nags.
 	balloonDisabled func() (bool, error)
-	// guestAgentSupport is the host capability, not a running backend's, so the
-	// gate is explained even with the daemon down.
-	guestAgentSupport func() hypervisor.FeatureStatus
-	command           commandOutput
-	readFile          func(string) ([]byte, error)
-	accessRW          func(string) error
-	listenPacket      func(string, string) (net.PacketConn, error)
-	listenStream      func(string, string) (io.Closer, error)
-	doHTTP            httpDo
+	daemonInfo      func() (daemon.Info, error)
+	hypervisors     func(context.Context) hypervisor.Registry
+	command         commandOutput
+	readFile        func(string) ([]byte, error)
+	accessRW        func(string) error
+	listenPacket    func(string, string) (net.PacketConn, error)
+	listenStream    func(string, string) (io.Closer, error)
+	doHTTP          httpDo
 	// doVIPHTTP probes cluster VIPs. It is separate from doHTTP because those
 	// addresses are host-local and must never go through an HTTP proxy.
 	doVIPHTTP httpDo
@@ -83,6 +82,7 @@ block names the client, daemon, and helper before those findings.
 
 Checks:
   runtime-compat       client, daemon, and helper version/protocol agreement
+  Hypervisors          known backends, availability, default source, and feature gates
   installations       distinct tbx executables found on PATH (WARN only)
   helper              privileged helper is installed and answers
   resolver            per-domain resolver wiring for the cluster domains
@@ -180,6 +180,12 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 	}
 	if err := renderRuntimeIdentity(c.out, identity); err != nil {
 		return err
+	}
+	hypervisorInventory := doctorHypervisors(deps)
+	for _, finding := range hypervisorFindings(hypervisorInventory) {
+		if err := writeRuntimeIdentityFinding(c.out, finding); err != nil {
+			return err
+		}
 	}
 	failed := false
 	for _, finding := range identity.Findings {
@@ -375,7 +381,8 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		return err
 	}
 
-	if err := writeFindings(guestAgentFinding(deps.listConfig, deps.guestAgentSupport)); err != nil {
+	guestAgent, guestAgentKnown := defaultGuestAgentStatus(hypervisorInventory)
+	if err := writeFindings(guestAgentFinding(deps.listConfig, guestAgent, guestAgentKnown)); err != nil {
 		return err
 	}
 
@@ -594,10 +601,11 @@ func imageCacheFinding(images []daemon.CacheImageEntry) (level, detail string) {
 // and portable, the extension is simply inert on this host.
 func guestAgentFinding(
 	listConfig func() ([]cluster.Cluster, error),
-	support func() hypervisor.FeatureStatus,
+	support hypervisor.FeatureStatus,
+	supportKnown bool,
 ) doctorFinding {
 	finding := doctorFinding{check: "guest-agent"}
-	if listConfig == nil || support == nil {
+	if listConfig == nil || !supportKnown {
 		finding.level, finding.detail = "SKIP", "probe unavailable"
 		return finding
 	}
@@ -616,14 +624,117 @@ func guestAgentFinding(
 		finding.level, finding.detail = "SKIP", "no cluster requests "+extensions.GuestAgent
 		return finding
 	}
-	if status := support(); !status.Supported {
+	if !support.Supported {
 		finding.level = "WARN"
-		finding.detail = fmt.Sprintf("cluster(s) %s request %s: %s", strings.Join(requesting, ", "), extensions.GuestAgent, status.Reason)
+		finding.detail = fmt.Sprintf("cluster(s) %s request %s: %s", strings.Join(requesting, ", "), extensions.GuestAgent, support.Reason)
 		return finding
 	}
 	finding.level = "PASS"
 	finding.detail = fmt.Sprintf("channel available for cluster(s) %s", strings.Join(requesting, ", "))
 	return finding
+}
+
+const hypervisorProbeTimeout = 2 * time.Second
+
+type doctorHypervisorInventory struct {
+	items         []daemon.HypervisorInfo
+	defaultName   hypervisor.Name
+	defaultSource hypervisor.DefaultSource
+	locallyProbed bool
+	err           error
+}
+
+func doctorHypervisors(deps doctorDependencies) doctorHypervisorInventory {
+	if deps.daemonInfo == nil {
+		return doctorHypervisorInventory{err: errors.New("daemon hypervisor inventory probe unavailable")}
+	}
+	info, err := deps.daemonInfo()
+	if err == nil {
+		return doctorHypervisorInventory{items: info.Hypervisors, defaultName: info.DefaultHypervisor, defaultSource: info.DefaultHypervisorSource}
+	}
+	if !isDaemonUnavailable(err) || deps.hypervisors == nil {
+		return doctorHypervisorInventory{err: err}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), hypervisorProbeTimeout)
+	defer cancel()
+	registry := deps.hypervisors(ctx)
+	result := make([]daemon.HypervisorInfo, 0, len(registry.Backends))
+	for _, name := range registry.Names() {
+		entry := registry.Backends[name]
+		item := daemon.HypervisorInfo{
+			Name:               name,
+			Available:          entry.Availability.Available,
+			AvailabilityReason: entry.Availability.Reason,
+		}
+		if entry.Availability.Available && entry.Hypervisor != nil {
+			capabilities := entry.Hypervisor.Capabilities()
+			item.BalloonReadback = capabilities.BalloonReadback
+			item.SuspendSurvivesDaemonRestart = capabilities.SuspendSurvivesDaemonRestart
+			item.GuestAgent = capabilities.GuestAgent
+		}
+		result = append(result, item)
+	}
+	return doctorHypervisorInventory{
+		items: result, defaultName: registry.Default.Name, defaultSource: registry.Default.Source, locallyProbed: true,
+	}
+}
+
+func hypervisorFindings(inventory doctorHypervisorInventory) []doctorFinding {
+	items := inventory.items
+	if len(items) == 0 {
+		detail := "inventory unavailable"
+		if inventory.err != nil {
+			detail += ": " + inventory.err.Error()
+		}
+		return []doctorFinding{{level: "INFO", check: "Hypervisors", detail: detail}}
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].Name < items[j].Name })
+	findings := make([]doctorFinding, 0, len(items))
+	for _, item := range items {
+		availability := "available"
+		balloonReadback := featureGate(item.BalloonReadback)
+		suspendRestart := "unsupported"
+		if item.SuspendSurvivesDaemonRestart {
+			suspendRestart = "supported"
+		}
+		guestAgent := featureGate(item.GuestAgent)
+		if !item.Available {
+			availability = "unavailable"
+			if item.AvailabilityReason != "" {
+				availability += " (" + item.AvailabilityReason + ")"
+			}
+			balloonReadback, suspendRestart, guestAgent = "unavailable", "unavailable", "unavailable"
+		}
+		defaultStatus := "no"
+		if item.Name == inventory.defaultName {
+			defaultStatus = "yes (source=" + string(inventory.defaultSource) + ")"
+		}
+		detail := fmt.Sprintf("%s: availability=%s; default=%s; balloon-readback=%s; suspend-survives-restart=%s; guest-agent=%s", item.Name, availability, defaultStatus, balloonReadback, suspendRestart, guestAgent)
+		if inventory.locallyProbed {
+			detail += "; probed locally; daemon unavailable"
+		}
+		findings = append(findings, doctorFinding{level: "INFO", check: "Hypervisors", detail: detail})
+	}
+	return findings
+}
+
+func featureGate(status hypervisor.FeatureStatus) string {
+	if status.Supported {
+		return "supported"
+	}
+	if status.Reason != "" {
+		return "unsupported (" + status.Reason + ")"
+	}
+	return "unsupported"
+}
+
+func defaultGuestAgentStatus(inventory doctorHypervisorInventory) (hypervisor.FeatureStatus, bool) {
+	for _, item := range inventory.items {
+		if item.Name == inventory.defaultName && item.Available {
+			return item.GuestAgent, true
+		}
+	}
+	return hypervisor.FeatureStatus{}, false
 }
 
 func stringSlicesEqual(left, right []string) bool {
@@ -653,13 +764,18 @@ func isDaemonUnavailable(err error) bool {
 func (c cli) doctorDependencies() doctorDependencies {
 	command := execCombinedOutput
 	deps := doctorDependencies{
-		runtimeIdentity:   c.collectRuntimeIdentity,
-		checkHelper:       checkHelper,
-		checkResolver:     checkResolver,
-		checkDirectDNS:    checkPlatformDirectDNS,
-		checkForwarding:   checkForwarding,
-		listConfig:        cluster.List,
-		guestAgentSupport: hypervisor.GuestAgentSupport,
+		runtimeIdentity: c.collectRuntimeIdentity,
+		checkHelper:     checkHelper,
+		checkResolver:   checkResolver,
+		checkDirectDNS:  checkPlatformDirectDNS,
+		checkForwarding: checkForwarding,
+		listConfig:      cluster.List,
+		daemonInfo: func() (daemon.Info, error) {
+			var result daemon.Info
+			err := c.doctorCall("daemon.info", struct{}{}, &result)
+			return result, err
+		},
+		hypervisors: hypervisor.NewAll,
 		listClusters: func() ([]daemon.ClusterSummary, error) {
 			var result []daemon.ClusterSummary
 			err := c.doctorCall("cluster.list", struct{}{}, &result)

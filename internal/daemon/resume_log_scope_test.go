@@ -47,7 +47,7 @@ func TestResumeColdBootLogLineIsClusterScoped(t *testing.T) {
 		return &fakeMachine{active: true}, nil
 	}}
 	service := &Server{
-		hypervisor:    backend,
+		hypervisors:   singleFakeRegistry(backend),
 		vms:           make(map[string]map[string]hypervisor.Machine),
 		subnetSources: emptySubnetSources(),
 	}

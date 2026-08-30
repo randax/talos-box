@@ -22,8 +22,8 @@ func TestListCacheReportsAllocatedSize(t *testing.T) {
 	}
 
 	service := &Server{
-		cache:      imagecache.New(root),
-		hypervisor: &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
+		cache:       imagecache.New(root),
+		hypervisors: singleFakeRegistry(&fakeHypervisor{architecture: hypervisor.ArchitectureAMD64}),
 	}
 	result, err := service.listCache()
 	if err != nil {

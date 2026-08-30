@@ -17,7 +17,7 @@ func TestCacheWarmForwardsRefreshOptionAndTypedCounts(t *testing.T) {
 
 	ref := "docker.io/library/nginx:1.27.0"
 	service := &Server{
-		hypervisor: &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
+		hypervisors: singleFakeRegistry(&fakeHypervisor{architecture: hypervisor.ArchitectureAMD64}),
 		warmCacheWithOptions: func(_ context.Context, refs []string, architecture imagecache.Architecture, options mirror.WarmOptions) (mirror.WarmSummary, error) {
 			if len(refs) != 1 || refs[0] != ref {
 				t.Fatalf("refs = %v, want [%q]", refs, ref)
@@ -70,7 +70,7 @@ func TestCacheWarmNarratesEachFinishedEntryInOrder(t *testing.T) {
 	t.Parallel()
 	refs := []string{"registry.example/one:v1", "registry.example/two:v1"}
 	service := &Server{
-		hypervisor: &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
+		hypervisors: singleFakeRegistry(&fakeHypervisor{architecture: hypervisor.ArchitectureAMD64}),
 		warmCacheWithOptions: func(_ context.Context, refs []string, _ imagecache.Architecture, options mirror.WarmOptions) (mirror.WarmSummary, error) {
 			if options.OnResult == nil {
 				t.Fatal("OnResult = nil, want narration wired for a narrated request")
@@ -116,7 +116,7 @@ func TestCacheWarmNarratesEachFinishedEntryInOrder(t *testing.T) {
 func TestCacheWarmSkipsNarrationWithoutAListener(t *testing.T) {
 	t.Parallel()
 	service := &Server{
-		hypervisor: &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
+		hypervisors: singleFakeRegistry(&fakeHypervisor{architecture: hypervisor.ArchitectureAMD64}),
 		warmCacheWithOptions: func(_ context.Context, _ []string, _ imagecache.Architecture, options mirror.WarmOptions) (mirror.WarmSummary, error) {
 			if options.OnResult != nil {
 				t.Fatal("OnResult set for an unnarrated request")
@@ -133,7 +133,7 @@ func TestCacheWarmBudgetScalesWithTheList(t *testing.T) {
 	t.Parallel()
 	refs := []string{"registry.example/one:v1", "registry.example/two:v1", "registry.example/three:v1"}
 	service := &Server{
-		hypervisor: &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
+		hypervisors: singleFakeRegistry(&fakeHypervisor{architecture: hypervisor.ArchitectureAMD64}),
 		warmCacheWithOptions: func(ctx context.Context, _ []string, _ imagecache.Architecture, _ mirror.WarmOptions) (mirror.WarmSummary, error) {
 			deadline, ok := ctx.Deadline()
 			if !ok {
@@ -154,7 +154,7 @@ func TestCacheWarmBudgetScalesWithTheList(t *testing.T) {
 func TestCacheWarmRejectsJobsOutsideItsRange(t *testing.T) {
 	t.Parallel()
 	service := &Server{
-		hypervisor: &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
+		hypervisors: singleFakeRegistry(&fakeHypervisor{architecture: hypervisor.ArchitectureAMD64}),
 		warmCacheWithOptions: func(context.Context, []string, imagecache.Architecture, mirror.WarmOptions) (mirror.WarmSummary, error) {
 			t.Fatal("warm must not start with negative jobs")
 			return mirror.WarmSummary{}, nil
@@ -240,7 +240,7 @@ func TestCacheWarmUsesBoundedContext(t *testing.T) {
 	t.Parallel()
 
 	service := &Server{
-		hypervisor: &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
+		hypervisors: singleFakeRegistry(&fakeHypervisor{architecture: hypervisor.ArchitectureAMD64}),
 		warmCache: func(ctx context.Context, refs []string, architecture imagecache.Architecture) (CacheWarmResult, error) {
 			deadline, ok := ctx.Deadline()
 			if !ok {
@@ -287,7 +287,7 @@ func TestShutdownCancelsInFlightCacheWarm(t *testing.T) {
 	lifecycle, cancel := context.WithCancel(context.Background())
 	started := make(chan struct{})
 	service := &Server{
-		hypervisor:       &fakeHypervisor{architecture: hypervisor.ArchitectureAMD64},
+		hypervisors:      singleFakeRegistry(&fakeHypervisor{architecture: hypervisor.ArchitectureAMD64}),
 		lifecycleContext: lifecycle,
 		lifecycleCancel:  cancel,
 		warmCache: func(ctx context.Context, refs []string, architecture imagecache.Architecture) (CacheWarmResult, error) {

@@ -30,7 +30,11 @@ func (s *Server) suspendCluster(raw json.RawMessage) (ClusterSummary, error) {
 	if !s.clusterRunning(item.Name) {
 		return ClusterSummary{}, fmt.Errorf("cluster %q is not running", item.Name)
 	}
-	capability := s.hypervisor.Capabilities().Suspend
+	_, backend, err := s.hypervisorForCluster(item)
+	if err != nil {
+		return ClusterSummary{}, err
+	}
+	capability := backend.Capabilities().Suspend
 	if !capability.Supported {
 		return ClusterSummary{}, fmt.Errorf("%w: %s", hypervisor.ErrUnsupported, capability.Reason)
 	}
@@ -576,11 +580,15 @@ func recordSaveStateOwner(savePath string) {
 // process: QEMU restores from the versioned save file alone, so on Linux a
 // replaced daemon changes nothing and the save stays as good as it was (#413
 // review). The owner sidecar is therefore the vz-only signal it was written as.
-func (s *Server) savedStateStale(clusterName string) bool {
-	if s.hypervisor != nil && s.hypervisor.Capabilities().SuspendSurvivesDaemonRestart {
+func (s *Server) savedStateStale(item cluster.Cluster) bool {
+	_, backend, err := s.hypervisorForCluster(item)
+	if err != nil {
+		return true
+	}
+	if backend.Capabilities().SuspendSurvivesDaemonRestart {
 		return false
 	}
-	return savedStateOwnerReplaced(clusterName)
+	return savedStateOwnerReplaced(item.Name)
 }
 
 // savedStateOwnerReplaced reports suspended memory this daemon process did not

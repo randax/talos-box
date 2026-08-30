@@ -36,9 +36,9 @@ func TestSuspendFailsWhenBalloonMarkerCannotCommit(t *testing.T) {
 	}
 	machine := &fakeMachine{active: true, onSuspend: func(path string) error { return os.WriteFile(path, []byte("mem"), 0o600) }}
 	service := &Server{
-		hypervisor: &fakeHypervisor{capabilities: hypervisor.Capabilities{
+		hypervisors: singleFakeRegistry(&fakeHypervisor{capabilities: hypervisor.Capabilities{
 			Suspend: hypervisor.FeatureStatus{Supported: true},
-		}},
+		}}),
 		vms:             map[string]map[string]hypervisor.Machine{item.Name: {node: machine}},
 		balloonDisabled: true,
 	}

@@ -41,7 +41,7 @@ func TestResumeColdBootWarningCarriesTheHypervisorCause(t *testing.T) {
 		return &fakeMachine{active: true}, nil
 	}}
 	service := &Server{
-		hypervisor:    backend,
+		hypervisors:   singleFakeRegistry(backend),
 		vms:           make(map[string]map[string]hypervisor.Machine),
 		subnetSources: emptySubnetSources(),
 	}
@@ -81,7 +81,7 @@ func TestResumeMissingSaveWarningPointsAtTheDaemonLog(t *testing.T) {
 		return &fakeMachine{active: true}, nil
 	}}
 	service := &Server{
-		hypervisor:    backend,
+		hypervisors:   singleFakeRegistry(backend),
 		vms:           make(map[string]map[string]hypervisor.Machine),
 		subnetSources: emptySubnetSources(),
 	}
@@ -121,7 +121,7 @@ func TestResumeWarningsStayOnePerEntry(t *testing.T) {
 		return &fakeMachine{active: true}, nil
 	}}
 	service := &Server{
-		hypervisor:    backend,
+		hypervisors:   singleFakeRegistry(backend),
 		vms:           make(map[string]map[string]hypervisor.Machine),
 		subnetSources: emptySubnetSources(),
 	}

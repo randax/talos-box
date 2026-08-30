@@ -259,10 +259,10 @@ func TestNodeStopOfAWorkerCarriesNoQuorumWarning(t *testing.T) {
 
 func TestNodeStartIsIdempotentForARunningNode(t *testing.T) {
 	service, item := runningLonghornClusterForNodeMutation(t, 1, 1)
-	service.hypervisor = &fakeHypervisor{launch: func(context.Context, hypervisor.Spec) (hypervisor.Machine, error) {
+	setFakeHypervisor(service, &fakeHypervisor{launch: func(context.Context, hypervisor.Spec) (hypervisor.Machine, error) {
 		t.Error("node.start launched a VM for a node that is already running")
 		return &fakeMachine{active: true}, nil
-	}}
+	}})
 
 	response := dispatchNodeRunState(t, service, "node.start", item.Name, "demo-worker-1")
 

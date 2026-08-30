@@ -49,7 +49,7 @@ func newPullTestServer(t *testing.T) (*Server, *imagecache.Cache) {
 	}
 	return &Server{
 		cache:        cache,
-		hypervisor:   &fakeHypervisor{architecture: hypervisor.ArchitectureARM64},
+		hypervisors:  singleFakeRegistry(&fakeHypervisor{architecture: hypervisor.ArchitectureARM64}),
 		vms:          make(map[string]map[string]hypervisor.Machine),
 		helperCheck:  func() error { return nil },
 		hostPressure: func(string) (hostpressure.Snapshot, error) { return hostpressure.Snapshot{}, nil },
@@ -165,7 +165,7 @@ func TestUpAfterPullCreatesEveryClusterOffline(t *testing.T) {
 	// memory any more, so every id below comes off disk.
 	restarted := &Server{
 		cache:        service.cache,
-		hypervisor:   &fakeHypervisor{architecture: hypervisor.ArchitectureARM64},
+		hypervisors:  singleFakeRegistry(&fakeHypervisor{architecture: hypervisor.ArchitectureARM64}),
 		vms:          make(map[string]map[string]hypervisor.Machine),
 		helperCheck:  func() error { return nil },
 		hostPressure: func(string) (hostpressure.Snapshot, error) { return hostpressure.Snapshot{}, nil },

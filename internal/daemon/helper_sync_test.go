@@ -90,7 +90,7 @@ func TestStartSyncsReservationsBeforeLaunchingNodes(t *testing.T) {
 	stubHelperSync(t, client, nil, []cluster.Cluster{item})
 
 	service := &Server{
-		hypervisor:    backend,
+		hypervisors:   singleFakeRegistry(backend),
 		vms:           make(map[string]map[string]hypervisor.Machine),
 		subnetSources: emptySubnetSources(),
 	}
@@ -115,7 +115,7 @@ func TestStartRefusesToLaunchWhenTheHelperCannotBeSynced(t *testing.T) {
 	stubHelperSync(t, nil, errors.New("helper unavailable"), []cluster.Cluster{item})
 
 	service := &Server{
-		hypervisor:    backend,
+		hypervisors:   singleFakeRegistry(backend),
 		vms:           make(map[string]map[string]hypervisor.Machine),
 		subnetSources: emptySubnetSources(),
 	}
