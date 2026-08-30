@@ -38,6 +38,10 @@ A marker recording that a combination was explicitly pulled for offline use. A p
 
 The platform-specific VM, networking, DNS, and service-manager implementation beneath the shared talosbox cluster model. A host substrate may have different mechanics without changing the guest-visible contract.
 
+## Hypervisor
+
+The VM engine a cluster's nodes run on, one of a fixed set the host substrate knows (`vz`, `qemu`). Chosen per cluster at create and immutable thereafter; absent, it is the host default. A host substrate may offer more than one hypervisor, each with its own capability gates, so "which hypervisor" is a property of a cluster, not of the host.
+
 ## Capability gate
 
 A host feature whose availability is detected at runtime and reported with a reason. An unavailable capability disables only that feature rather than making the whole host unsupported.
