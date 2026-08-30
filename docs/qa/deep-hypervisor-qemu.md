@@ -16,7 +16,7 @@ You are running QA, not demos. For every charter: run the steps exactly, compare
 
 ## Preflight
 
-BLOCKED unless: `tbx version` recorded; none of the names reserved by this runbook (`qa-hv`, `qa-balloon`, `qa-suspend`, `qa-vz`, `qa-qemu`, `qa-soak-vz`, `qa-soak-qemu`) already exists; tbxd is running unsupervised, with no attached debugger or foreground session that would make daemon restarts unrepresentative; for provisioning charters C1, C4, C5, C6, and C7 the host has online access to the Talos factory and image registries; on a macOS 14/Sonoma host this runbook may run **only C2**, and all other charters require macOS 15+ on Apple Silicon.
+BLOCKED unless: `tbx version` recorded; none of the names reserved by this runbook (`qa-hv`, `qa-balloon`, `qa-suspend`, `qa-mixed-vz`, `qa-mixed-qemu`, `qa-soak-vz`, `qa-soak-qemu`) already exists; tbxd is running unsupervised, with no attached debugger or foreground session that would make daemon restarts unrepresentative; for provisioning charters C1, C4, C5, C6, and C7 the host has online access to the Talos factory and image registries; on a macOS 14/Sonoma host this runbook may run **only C2**, and all other charters require macOS 15+ on Apple Silicon.
 
 ## Charters
 
@@ -167,7 +167,7 @@ Steps:
    ```yaml
    version: 1
    clusters:
-     - name: qa-vz
+     - name: qa-mixed-vz
        controlPlanes: 1
        workers: 0
        hypervisor: vz
@@ -177,7 +177,7 @@ Steps:
          memory: 2048
          cpus: 2
          diskSize: 10GiB
-     - name: qa-qemu
+     - name: qa-mixed-qemu
        controlPlanes: 1
        workers: 0
        hypervisor: qemu
@@ -190,9 +190,9 @@ Steps:
    ```
 
 3. Run `tbx up --force -f /tmp/qa-mixed.yaml`.
-4. Poll `tbx status qa-vz -o json` and `tbx status qa-qemu -o json` until each reports its intended hypervisor, running nodes, Kubernetes ready, and a live VIP.
+4. Poll `tbx status qa-mixed-vz -o json` and `tbx status qa-mixed-qemu -o json` until each reports its intended hypervisor, running nodes, Kubernetes ready, and a live VIP.
 5. Run `tbx doctor | tee /tmp/qa-mixed-doctor-after.txt`; it must print exactly `PASS inter-cluster: 2 cluster VIP(s) reachable from the host and from each sibling`.
-6. After capturing the evidence, run `tbx cluster destroy qa-vz --force` and `tbx cluster destroy qa-qemu --force` so the soak starts with only its matched pair.
+6. After capturing the evidence, run `tbx cluster destroy qa-mixed-vz --force` and `tbx cluster destroy qa-mixed-qemu --force` so the soak starts with only its matched pair.
 
 Expected observations: VZ and QEMU run concurrently with their pinned backends; both Kubernetes clusters and VIPs become ready; doctor proves host reachability and both directed workload-origin sibling paths with the exact PASS line.
 
@@ -241,7 +241,7 @@ On failure: preserve the complete collector artifacts, workload manifest and dig
 **Goal**: remove every cluster and temporary daemon override created by this runbook without altering the installed helper.
 
 Steps:
-1. Destroy every cluster created in this run by exact name: run `tbx cluster destroy qa-hv --force`, `tbx cluster destroy qa-balloon --force`, `tbx cluster destroy qa-suspend --force`, `tbx cluster destroy qa-vz --force`, `tbx cluster destroy qa-qemu --force`, `tbx cluster destroy qa-soak-vz --force`, and `tbx cluster destroy qa-soak-qemu --force` for each name that exists.
+1. Destroy every cluster created in this run by exact name: run `tbx cluster destroy qa-hv --force`, `tbx cluster destroy qa-balloon --force`, `tbx cluster destroy qa-suspend --force`, `tbx cluster destroy qa-mixed-vz --force`, `tbx cluster destroy qa-mixed-qemu --force`, `tbx cluster destroy qa-soak-vz --force`, and `tbx cluster destroy qa-soak-qemu --force` for each name that exists.
 2. Run `tbx status -o json | python3 -m json.tool` and `tbx cluster list -o json | python3 -m json.tool`; confirm none of those exact names remains.
 3. If C4's `TBX_BALLOON_RESERVE_MIB` override was not already restored, restore the captured value now, omitting the variable entirely when the captured value was the compiled default, and run `tbx system restart --force`.
 4. Run `pgrep -fl 'qemu-system-(aarch64|x86_64)'`; expect no QEMU process left by this runbook. Do not run `tbx system uninstall` and do not remove the helper.
