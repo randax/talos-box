@@ -485,7 +485,7 @@ func (m *qemuMachine) Suspend(ctx context.Context, savePath string) (result erro
 			"addr": map[string]any{
 				"transport": "file",
 				"filename":  temporary,
-				"offset":    fmt.Sprintf("0x%x", qemuSaveOffset),
+				"offset":    uint64(qemuSaveOffset),
 			},
 		}},
 	}, nil); err != nil {
