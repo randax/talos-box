@@ -129,22 +129,23 @@ func TestParseActivatedSystemExtensions(t *testing.T) {
 	tests := []struct {
 		name   string
 		output string
-		want   []string
+		want   []activatedExtension
 	}{
 		{
-			name: "activated extensions only",
-			output: `3 extension(s)
+			name: "activated extensions only, category tracked per section",
+			output: `4 extension(s)
+--- com.apple.system_extension.endpoint_security
+* * ZMCG7MLDV9 com.crowdstrike.falcon.Agent (7.20/7.20) Falcon Sensor [activated enabled]
 --- com.apple.system_extension.network_extension (Go to 'System Settings > General > Login Items & Extensions > Network Extensions' to modify these system extension(s))
 enabled active teamID bundleID (version) name [state]
 * * 9PTGMPNXZ2 com.microsoft.wdav.netext (101.25082.0003/101.25082.0003) Microsoft Defender Network Extension [activated enabled]
 * - PXPZ95SK77 com.example.disabled (1.0/1.0) Disabled Extension [terminated waiting to uninstall on reboot]
-* * ZMCG7MLDV9 com.crowdstrike.falcon.Agent (7.20/7.20) Falcon Sensor [activated enabled]
 * * ABCDE12345 com.example.unknown-filter (2.0/2.0) Unknown Filter [activated enabled]
 			`,
-			want: []string{
-				"com.microsoft.wdav.netext",
-				"com.crowdstrike.falcon.Agent",
-				"com.example.unknown-filter",
+			want: []activatedExtension{
+				{bundleID: "com.crowdstrike.falcon.Agent", category: "com.apple.system_extension.endpoint_security"},
+				{bundleID: "com.microsoft.wdav.netext", category: "com.apple.system_extension.network_extension"},
+				{bundleID: "com.example.unknown-filter", category: "com.apple.system_extension.network_extension"},
 			},
 		},
 		{name: "no extensions", output: "0 extension(s)\n", want: nil},

@@ -104,7 +104,9 @@ Checks:
   mirror-offline      whether the registry mirror is serving from cache only
   image-cache         cached Talos disk images, including incomplete pulls
   egress              image-factory reachability for schematic builds
-  security-inventory  host security posture, informational only
+  security-inventory  host security posture; INFO per activated system
+                      extension, WARN when a content filter is active on a
+                      memory-tagging host (the #513 kernel-panic exposure)
 `)
 	if names := platformDoctorCheckNames(); len(names) > 0 {
 		fmt.Fprintf(&b, "\nOn this platform doctor also checks: %s.\n", strings.Join(names, ", "))

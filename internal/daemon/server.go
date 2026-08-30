@@ -446,8 +446,9 @@ func (s *Server) Shutdown() error {
 		connections = append(connections, connection)
 	}
 	s.listenerMu.Unlock()
-	// park the balloon manager first: a retarget racing a VM stop is the
-	// teardown shape behind the #513 host panics
+	// park the balloon manager first: a retarget racing a VM stop targets a
+	// device that may already be gone (suspected in #513; since ruled out —
+	// docs/macos-panics.md — but still not a race worth having)
 	s.balloonShutdown.Store(true)
 	// stop the stall watch before anything is torn down: it takes opMu and
 	// reads the VM map this shutdown is about to empty
@@ -1021,8 +1022,10 @@ func decodeArgs(raw json.RawMessage, destination any) error {
 
 // closeVMsSequentially serializes the host-side teardown of VMs. On macOS a
 // fan-out destroys N hypervisor VMs, their vmnet interfaces and balloon
-// devices at once — the shape of the kernel panics in #513 — and the seconds
-// it saves are not worth a host reboot. Guest shutdown (Stop) still runs in
+// devices at once. Serializing was added while #513 was suspected to be a
+// mass-teardown race (since ruled out — the panics are an unrelated XNU
+// content-filter bug, docs/macos-panics.md); it stays because the seconds a
+// fan-out saves buy nothing. Guest shutdown (Stop) still runs in
 // parallel: that is the ~20s ACPI wait, which is guest work. The hard stop a
 // Stop falls back to is kernel work again, and the vz backend queues those on
 // its own mutex, so a cluster of wedged guests never fans out either.
