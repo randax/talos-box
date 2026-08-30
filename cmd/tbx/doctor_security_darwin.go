@@ -16,24 +16,24 @@ func securityInventoryFindings(command commandOutput) []doctorFinding {
 			detail: fmt.Sprintf("system extension inventory unavailable: %v", err),
 		}}
 	}
-	bundleIDs := parseActivatedSystemExtensions(output)
-	if len(bundleIDs) == 0 {
+	extensions := parseActivatedSystemExtensions(output)
+	if len(extensions) == 0 {
 		return []doctorFinding{{
 			level: "INFO", check: "security-inventory",
 			detail: "no activated system extensions found",
 		}}
 	}
-	findings := make([]doctorFinding, 0, len(bundleIDs))
-	for _, bundleID := range bundleIDs {
-		detail := bundleID
-		if warning := securityExtensionWarning(bundleID); warning != "" {
+	findings := make([]doctorFinding, 0, len(extensions))
+	for _, extension := range extensions {
+		detail := extension.bundleID
+		if warning := securityExtensionWarning(extension.bundleID); warning != "" {
 			detail += ": " + warning
 		}
 		findings = append(findings, doctorFinding{
 			level: "INFO", check: "security-inventory", detail: detail,
 		})
 	}
-	findings = append(findings, panicRiskFindings(command, bundleIDs)...)
+	findings = append(findings, panicRiskFindings(command, extensions)...)
 	return findings
 }
 
@@ -43,11 +43,11 @@ func securityInventoryFindings(command commandOutput) []doctorFinding {
 // included — closes a filtered TCP socket. Both ingredients are required, so
 // nothing prints without them, and an unreadable capability probe stays
 // silent rather than guessing.
-func panicRiskFindings(command commandOutput, bundleIDs []string) []doctorFinding {
+func panicRiskFindings(command commandOutput, extensions []activatedExtension) []doctorFinding {
 	var filters []string
-	for _, bundleID := range bundleIDs {
-		if isContentFilterExtension(bundleID) {
-			filters = append(filters, bundleID)
+	for _, extension := range extensions {
+		if isContentFilterExtension(extension) {
+			filters = append(filters, extension.bundleID)
 		}
 	}
 	if len(filters) == 0 || !hostHasMemoryTagging(command) {
@@ -66,14 +66,24 @@ func panicRiskFindings(command commandOutput, bundleIDs []string) []doctorFindin
 	}}
 }
 
-// isContentFilterExtension reports whether the bundle is a known socket
-// filter-provider — the class that leaves cfil state on TCP sockets. That
-// includes the EDR network extensions, whose protection modules are socket
-// filters too; only plain VPNs stay out. The vendor table is shared with
-// securityExtensionWarning so a vendor is never listed in one and forgotten
-// in the other.
-func isContentFilterExtension(bundleID string) bool {
-	lower := strings.ToLower(bundleID)
+// networkExtensionCategory is the systemextensionsctl category that holds
+// Network Extension bundles — the only category whose members can be socket
+// filter-providers and leave cfil state on TCP sockets.
+const networkExtensionCategory = "com.apple.system_extension.network_extension"
+
+// isContentFilterExtension reports whether the extension is a known socket
+// filter-provider — the class that leaves cfil state on TCP sockets. Two
+// gates, both required: the bundle sits in the network-extension category
+// (an EDR vendor's endpoint-security bundle shares the vendor name but holds
+// no cfil state, so the vendor match alone must not fire), and the vendor's
+// network extension is a filter rather than a plain VPN. The vendor table is
+// shared with securityExtensionWarning so a vendor is never listed in one
+// and forgotten in the other.
+func isContentFilterExtension(extension activatedExtension) bool {
+	if extension.category != networkExtensionCategory {
+		return false
+	}
+	lower := strings.ToLower(extension.bundleID)
 	for _, class := range securityExtensionClasses {
 		if class.contentFilter && containsAny(lower, class.substrings...) {
 			return true
@@ -94,24 +104,39 @@ func hostHasMemoryTagging(command commandOutput) bool {
 	return strings.TrimSpace(string(output)) == "1"
 }
 
-func parseActivatedSystemExtensions(output []byte) []string {
-	var bundleIDs []string
+// activatedExtension is one activated system extension: its bundle ID and
+// the systemextensionsctl category section it was listed under. The category
+// is what distinguishes a vendor's network filter from its other bundles.
+type activatedExtension struct {
+	bundleID string
+	category string
+}
+
+func parseActivatedSystemExtensions(output []byte) []activatedExtension {
+	var extensions []activatedExtension
+	category := ""
 	scanner := bufio.NewScanner(strings.NewReader(string(output)))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == "---" {
+			category = fields[1]
+			continue
+		}
 		if len(fields) < 4 || fields[0] != "*" || fields[1] != "*" ||
 			!strings.Contains(strings.ToLower(line), "[activated") {
 			continue
 		}
-		bundleIDs = append(bundleIDs, fields[3])
+		extensions = append(extensions, activatedExtension{bundleID: fields[3], category: category})
 	}
-	return bundleIDs
+	return extensions
 }
 
 // securityExtensionClasses is the one table of known security-software
-// vendors: the INFO annotation each class gets, and whether its extension is
-// a socket filter-provider (the #513 panic-exposure class).
+// vendors: the INFO annotation each class gets, and whether the vendor's
+// network extension is a socket filter-provider (the #513 panic-exposure
+// class — a vendor's bundles outside the network-extension category never
+// count regardless of this flag).
 var securityExtensionClasses = []struct {
 	substrings    []string
 	warning       string

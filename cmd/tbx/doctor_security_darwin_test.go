@@ -28,7 +28,12 @@ func fakeSecurityHost(t *testing.T, extensionList string, mte string, mteErr err
 	}
 }
 
-const activatedGlobalProtect = "* * PXPZ95SK77 com.paloaltonetworks.GlobalProtect.client.extension (6.2.5/6.2.5) GlobalProtect [activated enabled]\n"
+const networkExtensionHeader = "--- com.apple.system_extension.network_extension (Go to 'System Settings' to modify these system extension(s))\n"
+
+const endpointSecurityHeader = "--- com.apple.system_extension.endpoint_security\n"
+
+const activatedGlobalProtect = networkExtensionHeader +
+	"* * PXPZ95SK77 com.paloaltonetworks.GlobalProtect.client.extension (6.2.5/6.2.5) GlobalProtect [activated enabled]\n"
 
 // A content-filter system extension on a host whose silicon enforces memory
 // tagging is the #513 panic shape: closing a filtered TCP socket can take the
@@ -85,6 +90,47 @@ func TestSecurityInventoryOneWarnForManyFilters(t *testing.T) {
 	}
 }
 
+// A filter vendor's non-filter bundles are not the #513 shape: Defender's
+// endpoint-security extension shares the wdav name with its network filter
+// but holds no cfil state, so on its own it must not WARN even on MTE.
+func TestSecurityInventoryNoPanicRiskForEndpointSecurityBundle(t *testing.T) {
+	t.Parallel()
+
+	list := endpointSecurityHeader +
+		"* * UBF8T346G9 com.microsoft.wdav.epsext (101.25082.0003/101.25082.0003) Microsoft Defender Security Extension [activated enabled]\n"
+	findings := securityInventoryFindings(fakeSecurityHost(t, list, "1", nil))
+	for _, finding := range findings {
+		if finding.level != "INFO" {
+			t.Fatalf("finding %+v, want INFO only for an endpoint-security bundle", finding)
+		}
+	}
+}
+
+// The same vendor's network extension IS a socket filter: only that bundle
+// carries the exposure, and the WARN must name it alone.
+func TestSecurityInventoryWarnsOnlyOnFilterBundleOfMixedVendor(t *testing.T) {
+	t.Parallel()
+
+	list := endpointSecurityHeader +
+		"* * UBF8T346G9 com.microsoft.wdav.epsext (101.25082.0003/101.25082.0003) Microsoft Defender Security Extension [activated enabled]\n" +
+		networkExtensionHeader +
+		"* * UBF8T346G9 com.microsoft.wdav.netext (101.25082.0003/101.25082.0003) Microsoft Defender Network Extension [activated enabled]\n"
+	findings := securityInventoryFindings(fakeSecurityHost(t, list, "1", nil))
+	var warns []doctorFinding
+	for _, finding := range findings {
+		if finding.level == "WARN" {
+			warns = append(warns, finding)
+		}
+	}
+	if len(warns) != 1 {
+		t.Fatalf("got %d WARN findings %+v, want exactly one", len(warns), warns)
+	}
+	if !strings.Contains(warns[0].detail, "com.microsoft.wdav.netext") ||
+		strings.Contains(warns[0].detail, "com.microsoft.wdav.epsext") {
+		t.Fatalf("detail %q must name the network filter and not the endpoint-security bundle", warns[0].detail)
+	}
+}
+
 // The same filter on silicon without memory tagging cannot panic the host, so
 // the risk line stays absent and the inventory remains informational.
 func TestSecurityInventoryNoPanicRiskWithoutMTE(t *testing.T) {
@@ -102,7 +148,8 @@ func TestSecurityInventoryNoPanicRiskWithoutMTE(t *testing.T) {
 func TestSecurityInventoryNoPanicRiskWithoutFilter(t *testing.T) {
 	t.Parallel()
 
-	tailscaleOnly := "* * XYZ1234567 com.tailscale.ipn.macsys.network-extension (1.66/1.66) Tailscale [activated enabled]\n"
+	tailscaleOnly := networkExtensionHeader +
+		"* * XYZ1234567 com.tailscale.ipn.macsys.network-extension (1.66/1.66) Tailscale [activated enabled]\n"
 	findings := securityInventoryFindings(fakeSecurityHost(t, tailscaleOnly, "1", nil))
 	for _, finding := range findings {
 		if finding.level != "INFO" {
