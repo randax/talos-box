@@ -671,6 +671,9 @@ func (s *Server) dispatchProvisioning(request Request, progress stageFunc) Respo
 	}
 	var maintenance map[string]maintenanceObservation
 	if request.Op == "up" {
+		if err := s.validateUpHypervisors(request.Args); err != nil {
+			return failure(err)
+		}
 		discovered, err := s.observeUpMaintenance(request.Args)
 		if err != nil {
 			return failure(err)
@@ -977,11 +980,12 @@ func (s *Server) handle(request Request, progress stageFunc) (any, error) {
 
 func (s *Server) info() Info {
 	info := Info{
-		ProtocolVersion:         ProtocolVersion,
-		BalloonReserveMiB:       balloon.DefaultConfig().ReserveMiB,
-		BalloonDisabled:         s.balloonDisabled,
-		DefaultHypervisor:       s.hypervisors.Default.Name,
-		DefaultHypervisorSource: s.hypervisors.Default.Source,
+		ProtocolVersion:           ProtocolVersion,
+		BalloonReserveMiB:         balloon.DefaultConfig().ReserveMiB,
+		BalloonDisabled:           s.balloonDisabled,
+		DefaultHypervisor:         s.hypervisors.Default.Name,
+		DefaultHypervisorSource:   s.hypervisors.Default.Source,
+		CompiledDefaultHypervisor: s.hypervisors.CompiledDefault,
 	}
 	for _, name := range s.hypervisors.Names() {
 		entry := s.hypervisors.Backends[name]

@@ -27,17 +27,23 @@ func newQEMUWith(ctx context.Context, deps qemuDarwinProbeDeps) (Hypervisor, err
 	}
 	accelerators, err := deps.accelHelp(ctx, binary)
 	if err != nil {
-		return nil, newUnavailableError("QEMU does not list the hvf accelerator", qemuDarwinHVFBuildRemediation, err)
+		return nil, newUnavailableError(fmt.Sprintf("run QEMU -accel help: %v", err), qemuDarwinHVFBuildRemediation, err)
 	}
 	if !hasDarwinQEMUAccelerator(accelerators, "hvf") {
 		return nil, newUnavailableError("QEMU does not list the hvf accelerator", qemuDarwinHVFBuildRemediation, nil)
 	}
 	hvSupport, err := deps.sysctl("kern.hv_support")
-	if err != nil || hvSupport != 1 {
+	if err != nil {
+		return nil, newUnavailableError(fmt.Sprintf("read kern.hv_support: %v", err), qemuDarwinHostRemediation, err)
+	}
+	if hvSupport != 1 {
 		return nil, newUnavailableError("HVF denied: kern.hv_support is not 1", qemuDarwinHostRemediation, err)
 	}
 	entitled, err := deps.entitled(ctx, binary)
-	if err != nil || !entitled {
+	if err != nil {
+		return nil, newUnavailableError(fmt.Sprintf("inspect QEMU entitlements: %v", err), qemuDarwinEntitlementRemediation, err)
+	}
+	if !entitled {
 		return nil, newUnavailableError("HVF denied: "+binary+" lacks com.apple.security.hypervisor", qemuDarwinEntitlementRemediation, err)
 	}
 	probe, err := deps.probe(ctx, binary, verifyQMPPeerDarwin)

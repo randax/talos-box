@@ -313,14 +313,88 @@ func TestRunDoctorReportsGuestAgentCapabilityGate(t *testing.T) {
 	tests := []struct {
 		name     string
 		clusters []cluster.Cluster
+		statuses []daemon.ClusterStatus
 		listErr  error
-		support  hypervisor.FeatureStatus
+		info     daemon.Info
 		want     string
 	}{
-		{name: "gated host", clusters: []cluster.Cluster{{Name: "demo", TalosExtensions: []string{"qemu-guest-agent"}}}, support: hypervisor.FeatureStatus{Reason: "backend has no guest-agent channel"}, want: "WARN guest-agent: cluster(s) demo request qemu-guest-agent: backend has no guest-agent channel"},
-		{name: "capable host", clusters: []cluster.Cluster{{Name: "demo", TalosExtensions: []string{"qemu-guest-agent"}}}, support: hypervisor.FeatureStatus{Supported: true}, want: "PASS guest-agent: channel available for cluster(s) demo"},
-		{name: "no cluster requests it", clusters: []cluster.Cluster{{Name: "demo", TalosExtensions: []string{"gvisor"}}}, support: hypervisor.FeatureStatus{Reason: "backend has no guest-agent channel"}, want: "SKIP guest-agent: no cluster requests qemu-guest-agent"},
-		{name: "cluster state unreadable", listErr: errors.New("state unreadable"), support: hypervisor.FeatureStatus{Supported: true}, want: "SKIP guest-agent: cluster state unavailable: state unreadable"},
+		{
+			name:     "unsupported cluster",
+			clusters: []cluster.Cluster{{Name: "demo", Hypervisor: string(hypervisor.NameVZ), TalosExtensions: []string{"qemu-guest-agent"}}},
+			info: daemon.Info{
+				Hypervisors: []daemon.HypervisorInfo{
+					{Name: hypervisor.NameVZ, Available: true, GuestAgent: daemon.FeatureStatusInfo{Reason: "backend has no guest-agent channel"}},
+					{Name: hypervisor.NameQEMU, Available: true, GuestAgent: daemon.FeatureStatusInfo{Supported: true}},
+				},
+				DefaultHypervisor:       hypervisor.NameQEMU,
+				DefaultHypervisorSource: hypervisor.DefaultSourceEnvironment,
+			},
+			want: "WARN guest-agent: cluster(s) demo request qemu-guest-agent: backend has no guest-agent channel",
+		},
+		{
+			name:     "supported cluster",
+			clusters: []cluster.Cluster{{Name: "demo", Hypervisor: string(hypervisor.NameQEMU), TalosExtensions: []string{"qemu-guest-agent"}}},
+			info: daemon.Info{
+				Hypervisors:             []daemon.HypervisorInfo{{Name: hypervisor.NameQEMU, Available: true, GuestAgent: daemon.FeatureStatusInfo{Supported: true}}},
+				DefaultHypervisor:       hypervisor.NameVZ,
+				DefaultHypervisorSource: hypervisor.DefaultSourceCompiled,
+			},
+			want: "PASS guest-agent: channel available for cluster(s) demo",
+		},
+		{
+			name: "mixed supported and unsupported clusters",
+			clusters: []cluster.Cluster{
+				{Name: "qemu-demo", Hypervisor: string(hypervisor.NameQEMU), TalosExtensions: []string{"qemu-guest-agent"}},
+				{Name: "vz-demo", Hypervisor: string(hypervisor.NameVZ), TalosExtensions: []string{"qemu-guest-agent"}},
+			},
+			statuses: []daemon.ClusterStatus{
+				{Name: "qemu-demo", Hypervisor: hypervisor.NameQEMU, Capabilities: []daemon.CapabilityStatus{{Name: "qemu-guest-agent", Supported: true}}},
+				{Name: "vz-demo", Hypervisor: hypervisor.NameVZ, Capabilities: []daemon.CapabilityStatus{{Name: "qemu-guest-agent", Reason: "backend has no guest-agent channel"}}},
+			},
+			info: daemon.Info{
+				Hypervisors: []daemon.HypervisorInfo{
+					{Name: hypervisor.NameVZ, Available: true, GuestAgent: daemon.FeatureStatusInfo{Reason: "backend has no guest-agent channel"}},
+					{Name: hypervisor.NameQEMU, Available: true, GuestAgent: daemon.FeatureStatusInfo{Supported: true}},
+				},
+				DefaultHypervisor:       hypervisor.NameVZ,
+				DefaultHypervisorSource: hypervisor.DefaultSourceCompiled,
+			},
+			want: "WARN guest-agent: channel available for cluster(s) qemu-demo; cluster(s) vz-demo request qemu-guest-agent: backend has no guest-agent channel",
+		},
+		{
+			name:     "legacy empty state uses compiled default",
+			clusters: []cluster.Cluster{{Name: "legacy", TalosExtensions: []string{"qemu-guest-agent"}}},
+			info: daemon.Info{
+				Hypervisors: []daemon.HypervisorInfo{
+					{Name: hypervisor.NameVZ, Available: true, GuestAgent: daemon.FeatureStatusInfo{Reason: "backend has no guest-agent channel"}},
+					{Name: hypervisor.NameQEMU, Available: true, GuestAgent: daemon.FeatureStatusInfo{Supported: true}},
+				},
+				DefaultHypervisor:         hypervisor.NameQEMU,
+				DefaultHypervisorSource:   hypervisor.DefaultSourceEnvironment,
+				CompiledDefaultHypervisor: hypervisor.NameVZ,
+			},
+			want: "WARN guest-agent: cluster(s) legacy request qemu-guest-agent: backend has no guest-agent channel",
+		},
+		{
+			name:     "no cluster requests it",
+			clusters: []cluster.Cluster{{Name: "demo", TalosExtensions: []string{"gvisor"}}},
+			info: daemon.Info{
+				Hypervisors:             []daemon.HypervisorInfo{{Name: "primary", Available: true, GuestAgent: daemon.FeatureStatusInfo{Reason: "backend has no guest-agent channel"}}},
+				DefaultHypervisor:       "primary",
+				DefaultHypervisorSource: hypervisor.DefaultSourceCompiled,
+			},
+			want: "SKIP guest-agent: no cluster requests qemu-guest-agent",
+		},
+		{
+			name:    "cluster state unreadable",
+			listErr: errors.New("state unreadable"),
+			info: daemon.Info{
+				Hypervisors:             []daemon.HypervisorInfo{{Name: "primary", Available: true, GuestAgent: daemon.FeatureStatusInfo{Supported: true}}},
+				DefaultHypervisor:       "primary",
+				DefaultHypervisorSource: hypervisor.DefaultSourceCompiled,
+			},
+			want: "SKIP guest-agent: cluster state unavailable: state unreadable",
+		},
 	}
 
 	for _, test := range tests {
@@ -328,13 +402,8 @@ func TestRunDoctorReportsGuestAgentCapabilityGate(t *testing.T) {
 			t.Parallel()
 			deps := hypervisorDoctorDependencies()
 			deps.listConfig = func() ([]cluster.Cluster, error) { return test.clusters, test.listErr }
-			deps.daemonInfo = func() (daemon.Info, error) {
-				return daemon.Info{
-					Hypervisors:             []daemon.HypervisorInfo{{Name: "primary", Available: true, GuestAgent: daemon.NewFeatureStatusInfo(test.support)}},
-					DefaultHypervisor:       "primary",
-					DefaultHypervisorSource: hypervisor.DefaultSourceCompiled,
-				}, nil
-			}
+			deps.getStatus = func() ([]daemon.ClusterStatus, error) { return test.statuses, nil }
+			deps.daemonInfo = func() (daemon.Info, error) { return test.info, nil }
 
 			var output strings.Builder
 			if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {

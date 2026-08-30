@@ -41,6 +41,15 @@ func TestDarwinQEMUAvailabilityProbe(t *testing.T) {
 			wantWrapped:     probeErr,
 		},
 		{
+			name: "accelerator probe execution failed",
+			change: func(deps *qemuDarwinProbeDeps) {
+				deps.accelHelp = func(context.Context, string) ([]byte, error) { return nil, probeErr }
+			},
+			wantReason:      "run QEMU -accel help: probe failed",
+			wantRemediation: "HVF not built in: Homebrew builds without HVF on macOS 14; upgrade to macOS 15+ and reinstall QEMU",
+			wantWrapped:     probeErr,
+		},
+		{
 			name: "hvf absent",
 			change: func(deps *qemuDarwinProbeDeps) {
 				deps.accelHelp = func(context.Context, string) ([]byte, error) { return []byte("tcg\n"), nil }
@@ -49,12 +58,30 @@ func TestDarwinQEMUAvailabilityProbe(t *testing.T) {
 			wantRemediation: "HVF not built in: Homebrew builds without HVF on macOS 14; upgrade to macOS 15+ and reinstall QEMU",
 		},
 		{
+			name: "sysctl probe failed",
+			change: func(deps *qemuDarwinProbeDeps) {
+				deps.sysctl = func(string) (uint32, error) { return 0, probeErr }
+			},
+			wantReason:      "read kern.hv_support: probe failed",
+			wantRemediation: "use a Mac with Hypervisor.framework support enabled",
+			wantWrapped:     probeErr,
+		},
+		{
 			name: "sysctl zero",
 			change: func(deps *qemuDarwinProbeDeps) {
 				deps.sysctl = func(string) (uint32, error) { return 0, nil }
 			},
 			wantReason:      "HVF denied: kern.hv_support is not 1",
 			wantRemediation: "use a Mac with Hypervisor.framework support enabled",
+		},
+		{
+			name: "entitlement probe failed",
+			change: func(deps *qemuDarwinProbeDeps) {
+				deps.entitled = func(context.Context, string) (bool, error) { return false, probeErr }
+			},
+			wantReason:      "inspect QEMU entitlements: probe failed",
+			wantRemediation: "install or reinstall a signed Homebrew/nixpkgs QEMU; do not re-sign it without the hypervisor entitlement",
+			wantWrapped:     probeErr,
 		},
 		{
 			name: "entitlement false",

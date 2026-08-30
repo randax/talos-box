@@ -3,6 +3,7 @@ package hypervisor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -208,6 +209,53 @@ func TestRegistryResolveAvoidsDuplicatingReasonWhenWrappedErrorMatches(t *testin
 	}
 	if strings.Count(err.Error(), inner.Error()) != 1 {
 		t.Fatalf("Resolve(qemu) error = %q, expected inner message once", err)
+	}
+}
+
+func TestRegistryResolveAvoidsDuplicatingReasonWhenWrappedErrorAlreadyWrapsUnsupported(t *testing.T) {
+	t.Parallel()
+
+	const reason = "no matching EFI firmware pair found for arm64"
+	tests := []struct {
+		name  string
+		inner error
+	}{
+		{
+			name:  "direct unsupported wrap",
+			inner: fmt.Errorf("%w: %s", ErrUnsupported, reason),
+		},
+		{
+			name:  "nested unsupported wrap",
+			inner: fmt.Errorf("discover firmware: %w", fmt.Errorf("%w: %s", ErrUnsupported, reason)),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			registry := Registry{Backends: map[Name]Backend{
+				NameQEMU: {Availability: Availability{Reason: reason, Err: test.inner}},
+			}}
+
+			_, err := registry.Resolve(NameQEMU)
+			if !errors.Is(err, ErrUnsupported) {
+				t.Fatalf("Resolve(qemu) error = %v, want ErrUnsupported", err)
+			}
+			if !errors.Is(err, test.inner) {
+				t.Fatalf("Resolve(qemu) error = %v, want wrapped %v", err, test.inner)
+			}
+			if got, want := err.Error(), `hypervisor feature unsupported: hypervisor "qemu": `+reason; got != want {
+				t.Fatalf("Resolve(qemu) error = %q, want %q", got, want)
+			}
+			unwraps, ok := err.(interface{ Unwrap() []error })
+			if !ok {
+				t.Fatalf("Resolve(qemu) error %T does not expose multi-unwrapping", err)
+			}
+			if got := unwraps.Unwrap(); len(got) != 2 || got[0] != ErrUnsupported || got[1] != test.inner {
+				t.Fatalf("Resolve(qemu) unwrap = %#v, want [ErrUnsupported inner]", got)
+			}
+		})
 	}
 }
 

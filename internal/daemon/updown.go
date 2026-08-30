@@ -100,6 +100,38 @@ func (s *Server) validateUp(raw json.RawMessage, maintenance map[string]maintena
 	return err
 }
 
+// validateUpHypervisors performs the immutable, local-only part of up
+// preflight before any maintenance or storage probes. The locked preflight
+// repeats this check after observation so a concurrent state change cannot
+// slip through.
+func (s *Server) validateUpHypervisors(raw json.RawMessage) error {
+	var args upArgs
+	if err := decodeArgs(raw, &args); err != nil {
+		return err
+	}
+	specs := make(map[string]config.ClusterSpec, len(args.Clusters))
+	for _, spec := range args.Clusters {
+		if spec.Hypervisor != "" {
+			specs[spec.Name] = spec
+		}
+	}
+	if len(specs) == 0 {
+		return nil
+	}
+	items, err := cluster.List()
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		if spec, ok := specs[item.Name]; ok {
+			if err := s.checkHypervisorUnchanged(item, spec); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // validateSpecVersions refuses an up request that would create a cluster
 // with an effective version outside the support window, before any cluster
 // is created or updated. Specs for existing clusters stay exempt: tbx echoes

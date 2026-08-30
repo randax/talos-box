@@ -512,6 +512,86 @@ func TestPreflightUpRejectsHypervisorDriftBeforeDomainDrift(t *testing.T) {
 	}
 }
 
+func TestUpRejectsHypervisorDriftBeforeStorageObservation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.Hypervisor = string(hypervisor.NameQEMU)
+	item.ProvisioningIntent = cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, CSI: cluster.CSILocalPath}
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+
+	observations := 0
+	service := &Server{
+		hypervisors: hypervisor.Registry{CompiledDefault: hypervisor.NameVZ},
+		storageVolumeClaims: func(context.Context, cluster.Cluster) ([]string, error) {
+			observations++
+			return nil, errors.New("storage probe should not run")
+		},
+	}
+	raw, err := json.Marshal(upArgs{Clusters: []config.ClusterSpec{{
+		Name:       item.Name,
+		Hypervisor: hypervisor.NameVZ,
+		ProvisioningIntent: cluster.ProvisioningIntent{
+			CNI: cluster.CNIFlannel,
+			CSI: cluster.CSILonghorn,
+		},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	response := service.dispatchProvisioning(Request{Op: "up", Args: raw}, nil)
+	if response.OK || !strings.Contains(response.Error, `hypervisor is immutable (cluster has "qemu", talosbox.yaml wants "vz")`) {
+		t.Fatalf("up response = %+v, want hypervisor drift", response)
+	}
+	if observations != 0 {
+		t.Fatalf("storage observations = %d, want none before hypervisor drift refusal", observations)
+	}
+}
+
+func TestUpRejectsHypervisorDriftBeforeMaintenanceObservation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.Hypervisor = string(hypervisor.NameQEMU)
+	if err := cluster.Save(item); err != nil {
+		t.Fatal(err)
+	}
+
+	observations := 0
+	service := &Server{
+		hypervisors: hypervisor.Registry{CompiledDefault: hypervisor.NameVZ},
+		maintenanceLoad: func(string) (cluster.Cluster, error) {
+			observations++
+			return item, nil
+		},
+	}
+	raw, err := json.Marshal(upArgs{Clusters: []config.ClusterSpec{{
+		Name:       item.Name,
+		Hypervisor: hypervisor.NameVZ,
+		ProvisioningIntent: cluster.ProvisioningIntent{
+			CNI: cluster.CNIFlannel,
+		},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	response := service.dispatchProvisioning(Request{Op: "up", Args: raw}, nil)
+	if response.OK || !strings.Contains(response.Error, `hypervisor is immutable (cluster has "qemu", talosbox.yaml wants "vz")`) {
+		t.Fatalf("up response = %+v, want hypervisor drift", response)
+	}
+	if observations != 0 {
+		t.Fatalf("maintenance observations = %d, want none before hypervisor drift refusal", observations)
+	}
+}
+
 func TestPreflightUpAllowsSilentHypervisor(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	item, err := cluster.New("demo", 0, 1, 0, cluster.NodeDefaults{})

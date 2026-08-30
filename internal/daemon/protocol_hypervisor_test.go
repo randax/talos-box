@@ -11,13 +11,16 @@ import (
 func TestInfoHypervisorFeatureStatusJSONRoundTrip(t *testing.T) {
 	t.Parallel()
 
-	want := Info{Hypervisors: []HypervisorInfo{{
-		Name:                    "qemu",
-		Available:               true,
-		AvailabilityRemediation: "install the hypervisor",
-		BalloonReadback:         FeatureStatusInfo{Supported: true},
-		GuestAgent:              FeatureStatusInfo{Reason: "no channel"},
-	}}}
+	want := Info{
+		CompiledDefaultHypervisor: hypervisor.NameVZ,
+		Hypervisors: []HypervisorInfo{{
+			Name:                    "qemu",
+			Available:               true,
+			AvailabilityRemediation: "install the hypervisor",
+			BalloonReadback:         FeatureStatusInfo{Supported: true},
+			GuestAgent:              FeatureStatusInfo{Reason: "no channel"},
+		}},
+	}
 	raw, err := json.Marshal(want)
 	if err != nil {
 		t.Fatal(err)
@@ -27,6 +30,7 @@ func TestInfoHypervisorFeatureStatusJSONRoundTrip(t *testing.T) {
 		`"balloonReadback":{"supported":true}`,
 		`"guestAgent":{"reason":"no channel"}`,
 		`"availabilityRemediation":"install the hypervisor"`,
+		`"compiledDefaultHypervisor":"vz"`,
 	} {
 		if !strings.Contains(encoded, fragment) {
 			t.Fatalf("JSON = %s, want camelCase fragment %s", encoded, fragment)
@@ -37,7 +41,7 @@ func TestInfoHypervisorFeatureStatusJSONRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Hypervisors) != 1 || !got.Hypervisors[0].BalloonReadback.Supported || got.Hypervisors[0].GuestAgent.Reason != "no channel" || got.Hypervisors[0].AvailabilityRemediation != "install the hypervisor" {
+	if len(got.Hypervisors) != 1 || !got.Hypervisors[0].BalloonReadback.Supported || got.Hypervisors[0].GuestAgent.Reason != "no channel" || got.Hypervisors[0].AvailabilityRemediation != "install the hypervisor" || got.CompiledDefaultHypervisor != hypervisor.NameVZ {
 		t.Fatalf("round trip = %+v, want feature statuses preserved", got)
 	}
 
@@ -45,7 +49,7 @@ func TestInfoHypervisorFeatureStatusJSONRoundTrip(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"protocolVersion":20}`), &old); err != nil {
 		t.Fatal(err)
 	}
-	if len(old.Hypervisors) != 0 || old.DefaultHypervisor != "" || old.DefaultHypervisorSource != "" {
+	if len(old.Hypervisors) != 0 || old.DefaultHypervisor != "" || old.DefaultHypervisorSource != "" || old.CompiledDefaultHypervisor != "" {
 		t.Fatalf("old daemon info = %+v, want empty hypervisor inventory", old)
 	}
 }

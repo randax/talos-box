@@ -69,6 +69,23 @@ type Registry struct {
 	CompiledDefault Name
 }
 
+type resolutionError struct {
+	name   Name
+	reason string
+	err    error
+}
+
+func (e resolutionError) Error() string {
+	return fmt.Sprintf("%s: hypervisor %q: %s", ErrUnsupported, e.name, e.reason)
+}
+
+func (e resolutionError) Unwrap() []error {
+	if e.err == nil {
+		return []error{ErrUnsupported}
+	}
+	return []error{ErrUnsupported, e.err}
+}
+
 // WithDefault returns a copy with a different effective default.
 func (r Registry) WithDefault(raw string, source DefaultSource) (Registry, error) {
 	name, err := ParseName(raw)
@@ -120,13 +137,7 @@ func (r Registry) Resolve(name Name) (Hypervisor, error) {
 		if reason == "" {
 			reason = "backend is unavailable"
 		}
-		if backend.Availability.Err != nil {
-			if reason != backend.Availability.Err.Error() {
-				return nil, fmt.Errorf("%w: hypervisor %q: %s: %w", ErrUnsupported, name, reason, backend.Availability.Err)
-			}
-			return nil, fmt.Errorf("%w: hypervisor %q: %w", ErrUnsupported, name, backend.Availability.Err)
-		}
-		return nil, fmt.Errorf("%w: hypervisor %q: %s", ErrUnsupported, name, reason)
+		return nil, resolutionError{name: name, reason: reason, err: backend.Availability.Err}
 	}
 	return backend.Hypervisor, nil
 }
