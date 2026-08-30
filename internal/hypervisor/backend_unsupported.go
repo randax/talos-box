@@ -1,4 +1,4 @@
-//go:build (!darwin || !arm64) && !linux
+//go:build !darwin && !linux
 
 package hypervisor
 
