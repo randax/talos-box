@@ -158,29 +158,39 @@ func TestQEMUBalloonReadbackInMaintenanceE2E(t *testing.T) {
 	runTBX(t, "up", "--force", "-f", configPath)
 	registerE2EClusterCleanup(t, name, &cleanupOutput)
 
-	statusOutput := runTBX(t, "status", "-o", "json")
-	var statuses []daemon.ClusterStatus
-	if err := json.Unmarshal([]byte(statusOutput), &statuses); err != nil {
-		t.Fatalf("decode `tbx status -o json`: %v\n%s", err, statusOutput)
-	}
+	// A node that just booted reads "unreachable" until Talos's maintenance
+	// apid answers, so the phase needs a bounded wait, not a one-shot read.
 	var status *daemon.ClusterStatus
-	for index := range statuses {
-		if statuses[index].Name == name {
-			status = &statuses[index]
+	deadline := time.Now().Add(3 * time.Minute)
+	for {
+		statusOutput := runTBX(t, "status", "-o", "json")
+		var statuses []daemon.ClusterStatus
+		if err := json.Unmarshal([]byte(statusOutput), &statuses); err != nil {
+			t.Fatalf("decode `tbx status -o json`: %v\n%s", err, statusOutput)
+		}
+		status = nil
+		for index := range statuses {
+			if statuses[index].Name == name {
+				status = &statuses[index]
+				break
+			}
+		}
+		if status == nil {
+			t.Fatalf("`tbx status -o json` is missing cluster %q: %s", name, statusOutput)
+		}
+		if status.Hypervisor != hypervisor.NameQEMU {
+			t.Fatalf("cluster %q hypervisor = %q, want qemu", name, status.Hypervisor)
+		}
+		if len(status.Nodes) != 1 {
+			t.Fatalf("cluster %q has %d nodes, want exactly one: %+v", name, len(status.Nodes), status.Nodes)
+		}
+		if status.Nodes[0].Phase == daemon.PhaseMaintenance {
 			break
 		}
-	}
-	if status == nil {
-		t.Fatalf("`tbx status -o json` is missing cluster %q: %s", name, statusOutput)
-	}
-	if status.Hypervisor != hypervisor.NameQEMU {
-		t.Fatalf("cluster %q hypervisor = %q, want qemu", name, status.Hypervisor)
-	}
-	if len(status.Nodes) != 1 {
-		t.Fatalf("cluster %q has %d nodes, want exactly one: %+v", name, len(status.Nodes), status.Nodes)
-	}
-	if status.Nodes[0].Phase != daemon.PhaseMaintenance {
-		t.Fatalf("cluster %q node %q phase = %q, want %q", name, status.Nodes[0].Name, status.Nodes[0].Phase, daemon.PhaseMaintenance)
+		if time.Now().After(deadline) {
+			t.Fatalf("cluster %q node %q phase = %q, want %q after %s", name, status.Nodes[0].Name, status.Nodes[0].Phase, daemon.PhaseMaintenance, 3*time.Minute)
+		}
+		time.Sleep(5 * time.Second)
 	}
 
 	nodeName := status.Nodes[0].Name
