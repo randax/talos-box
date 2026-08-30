@@ -7,6 +7,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/randax/talos-box/internal/hostmem"
@@ -472,6 +473,39 @@ type Config struct {
 	// snapshot taken mid-teardown (#513). Nil means never paused.
 	Paused func() bool
 	Now    func() time.Time
+}
+
+// DisableEnv is the environment variable that removes the host balloon
+// device from every guest tbxd launches (#513). Read in the daemon process.
+const DisableEnv = "TBX_DISABLE_BALLOON"
+
+// Disabled reports whether TBX_DISABLE_BALLOON asks for guests without a
+// balloon device: "1", "true", "yes" (case-insensitive) disable; anything
+// else, including unset, keeps the default.
+func Disabled() bool {
+	disabled, _ := DisableSetting()
+	return disabled
+}
+
+// DisableSetting is Disabled plus the raw value, so a daemon can log a value
+// that was set but not understood instead of silently keeping the balloon.
+func DisableSetting() (disabled bool, raw string) {
+	raw = os.Getenv(DisableEnv)
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes":
+		return true, raw
+	}
+	return false, raw
+}
+
+// RecognizedOff reports an explicit "keep the balloon" value ("0", "false",
+// "no"), so a daemon does not log it as a value it failed to understand.
+func RecognizedOff(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "0", "false", "no":
+		return true
+	}
+	return false
 }
 
 // DefaultConfig is the G3-tuned default: 6 GiB host reserve, 1 GiB per-node

@@ -49,6 +49,7 @@ type fakeMachine struct {
 	stopErr       error
 	closeErr      error
 	onClose       func()
+	onSuspend     func(savePath string) error
 }
 
 func (f *fakeMachine) Active() bool { return f.active }
@@ -68,7 +69,12 @@ func (f *fakeMachine) Stop(ctx context.Context) error {
 	f.active = false
 	return f.stopErr
 }
-func (f *fakeMachine) Suspend(context.Context, string) error { return nil }
+func (f *fakeMachine) Suspend(_ context.Context, savePath string) error {
+	if f.onSuspend != nil {
+		return f.onSuspend(savePath)
+	}
+	return nil
+}
 func (f *fakeMachine) Close() error {
 	f.calls = append(f.calls, "close")
 	if f.onClose != nil {

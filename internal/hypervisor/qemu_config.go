@@ -66,7 +66,9 @@ type qemuLaunchConfig struct {
 	// GuestAgentFD is the inherited listening socket QEMU accepts guest-agent
 	// clients on. Zero means no guest-agent channel: QEMU inherits 0-2 as its
 	// standard streams, so a descriptor tbx passes is never zero.
-	GuestAgentFD   int
+	GuestAgentFD int
+	// DisableBalloon leaves out the virtio-balloon device (#513).
+	DisableBalloon bool
 	QMPSocketPath  string
 	Firmware       qemuFirmware
 	IncomingPath   string
@@ -300,17 +302,19 @@ func buildQEMUArgv(cfg qemuLaunchConfig) ([]string, error) {
 			"virtio-rng-pci",
 			"rng=rng0",
 		),
-		"-device", qemuOption(
+	}
+	if !cfg.DisableBalloon {
+		args = append(args, "-device", qemuOption(
 			"virtio-balloon-pci",
 			"deflate-on-oom=on",
 			"free-page-reporting=on",
-		),
-		"-chardev", qemuOption(
-			"socket",
-			"id=charconsole",
-			"fd="+strconv.Itoa(cfg.ConsoleFD),
-		),
+		))
 	}
+	args = append(args, "-chardev", qemuOption(
+		"socket",
+		"id=charconsole",
+		"fd="+strconv.Itoa(cfg.ConsoleFD),
+	))
 	// The virtio-serial controller carries the console on port 0; the guest
 	// agent needs a second port, and only clusters that asked for it get the
 	// wider controller so every other device graph stays byte-identical.

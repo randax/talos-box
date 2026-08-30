@@ -69,7 +69,11 @@ type Spec struct {
 	// on that path. Empty means the cluster did not request qemu-guest-agent;
 	// backends without the capability ignore it, so the config stays portable.
 	GuestAgentSocketPath string
-	Restore              *Restore
+	// DisableBalloon launches the guest without a memory balloon device, so
+	// the host never retargets its memory (#513). The daemon sets it from
+	// TBX_DISABLE_BALLOON; a guest without the device is never ballooned.
+	DisableBalloon bool
+	Restore        *Restore
 }
 
 // Hypervisor creates machines and reports runtime capabilities.

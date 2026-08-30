@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"testing"
 )
 
@@ -158,6 +159,40 @@ func TestBuildQEMUArgv(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("buildQEMUArgv() = %#v, want %#v", got, want)
+	}
+}
+
+// TBX_DISABLE_BALLOON drops the balloon device and nothing else (#513).
+func TestBuildQEMUArgvOmitsBalloonWhenDisabled(t *testing.T) {
+	cfg := qemuLaunchConfig{
+		Architecture:  ArchitectureAMD64,
+		CPUs:          2,
+		MemoryMiB:     2048,
+		DiskPath:      "/var/lib/talos/disk.img",
+		MAC:           "02:00:00:00:00:01",
+		TapFD:         9,
+		ConsoleFD:     7,
+		QMPSocketPath: "/run/talos/qmp.sock",
+		Firmware:      qemuFirmware{CodePath: "/usr/share/OVMF/OVMF_CODE.fd", VarsPath: "/var/lib/talos/VARS.fd"},
+	}
+	with, err := buildQEMUArgv(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.DisableBalloon = true
+	without, err := buildQEMUArgv(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	balloon := "virtio-balloon-pci,deflate-on-oom=on,free-page-reporting=on"
+	if !slices.Contains(with, balloon) {
+		t.Fatalf("default argv lacks the balloon device: %v", with)
+	}
+	if slices.Contains(without, balloon) {
+		t.Fatalf("DisableBalloon argv still carries the balloon device: %v", without)
+	}
+	if len(with)-len(without) != 2 {
+		t.Fatalf("DisableBalloon changed %d argv entries, want exactly the -device pair", len(with)-len(without))
 	}
 }
 

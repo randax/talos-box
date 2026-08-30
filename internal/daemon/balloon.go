@@ -92,6 +92,9 @@ type balloonCandidate struct {
 // guest has no virtio_balloon driver, and setting a target on one crashes vz,
 // so only TLS-configured nodes observed through apid are managed.
 func (s *Server) Balloonables() map[string]balloon.Balloonable {
+	if s.balloonDisabled {
+		return nil
+	}
 	balloonReadback := s.hypervisor.Capabilities().BalloonReadback.Supported
 	s.opMu.Lock()
 	candidates := s.balloonCandidatesLocked(balloonReadback)
@@ -123,7 +126,7 @@ func (s *Server) BalloonPaused() bool { return s.balloonQuiesced() }
 // balloonQuiesced reports whether ballooning is parked: a teardown is in
 // flight, or the daemon is shutting down (which never releases).
 func (s *Server) balloonQuiesced() bool {
-	return s.balloonShutdown.Load() || s.balloonTeardowns.Load() > 0
+	return s.balloonDisabled || s.balloonShutdown.Load() || s.balloonTeardowns.Load() > 0
 }
 
 // balloonablesLocked is Balloonables for a caller that already holds opMu —
@@ -410,7 +413,8 @@ type balloonReclaim struct {
 // nothing running sits above the per-node floor.
 func (s *Server) balloonReclaim() balloonReclaim {
 	floorMiB := balloon.DefaultConfig().FloorMiB
-	if s.reclaimCeilingMiB(floorMiB) <= 0 {
+	// guests without a balloon device have nothing to give back (#513)
+	if s.balloonDisabled || s.reclaimCeilingMiB(floorMiB) <= 0 {
 		return balloonReclaim{floorMiB: floorMiB}
 	}
 	list := s.balloonables

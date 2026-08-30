@@ -50,6 +50,12 @@ func (s *Server) suspendCluster(raw json.RawMessage) (ClusterSummary, error) {
 		retain, err := prepareSavedMachine(machine, savePath)
 		if err == nil {
 			recordSaveStateOwner(savePath)
+			// the save and its device-set metadata commit together: a save
+			// whose marker could not be settled would be misread by the next
+			// resume and cold-booted, losing the memory it claims to hold
+			if err = recordSaveStateBalloon(savePath, s.balloonDisabled); err != nil {
+				retain = true
+			}
 		}
 		if err != nil {
 			errs = append(errs, fmt.Errorf("suspend %s: %w", name, err))
@@ -147,28 +153,41 @@ func (s *Server) resumeCluster(raw json.RawMessage) (ClusterSummary, error) {
 	warnings, restored, err := resumeNodeBatch(item.Nodes, func(node cluster.Node) (resumedNode, error) {
 		savePath := saveStatePath(dir, node.Name)
 		_, saveErr := os.Stat(savePath)
+		// A save carries the device set it was taken with: restoring memory
+		// that has (or lacks) a balloon device into a guest built the other
+		// way is not a resume, so the node cold-boots instead. The save is
+		// left in place for the batch to consume on commit, so a rollback
+		// still keeps every save it started with (#513).
+		balloonMismatch := saveErr == nil && savedWithoutBalloon(savePath) != s.balloonDisabled
 		var fallbackErr error
 		delete(nodes, node.Name)
-		machine, err := s.launchMachine(item, node, &hypervisor.Restore{
+		restore := &hypervisor.Restore{
 			Path: savePath,
 			Fallback: func(err error) {
 				fallbackErr = err
 			},
-		})
+		}
+		if balloonMismatch {
+			restore = nil
+		}
+		machine, err := s.launchMachine(item, node, restore)
 		if err != nil {
 			return resumedNode{}, fmt.Errorf("resume %s: %w", node.Name, err)
 		}
 		nodes[node.Name] = machine
 		attempted = append(attempted, node.Name)
 		var nodeWarning string
-		if fallbackErr != nil {
+		if balloonMismatch {
+			nodeWarning = balloonMismatchWarning(node.Name, s.balloonDisabled)
+			log.Printf("resume %s/%s: %s", item.Name, node.Name, nodeWarning)
+		} else if fallbackErr != nil {
 			nodeWarning = coldBootWarning(node.Name, saveErr != nil, fallbackErr)
 			// Cluster-scoped subject: `tbx logs <cluster>` filters on the
 			// cluster name, so a bare node name would hide the very line
 			// the cold-boot warning sends the operator to read (#411).
 			log.Printf("resume %s/%s: %v", item.Name, node.Name, fallbackErr)
 		}
-		return resumedNode{savePath: savePath, warning: nodeWarning, restored: fallbackErr == nil}, nil
+		return resumedNode{savePath: savePath, warning: nodeWarning, restored: fallbackErr == nil && !balloonMismatch}, nil
 	}, func() error {
 		return s.closeNodes(item.Name, nodes, attempted)
 	})
@@ -410,17 +429,87 @@ func resumeNodeBatch[T any](nodes []T, resume func(T) (resumedNode, error), roll
 			warnings = append(warnings, result.warning)
 		}
 	}
-	removeSaveStateFiles(savePaths)
+	warnings = append(warnings, removeSaveStateFiles(savePaths)...)
 	return warnings, restored, nil
 }
 
 // removeSaveStateFiles commits a successful cluster-wide resume. Callers keep
 // the batch intact on rollback so a later resume can retry every saved node.
-func removeSaveStateFiles(paths []string) {
+// It returns one warning per balloon marker that could not be cleared: the
+// resume itself succeeded, but the next suspend of that node will refuse to
+// save over the stale marker until it is removed.
+func removeSaveStateFiles(paths []string) []string {
+	var warnings []string
 	for _, path := range paths {
 		_ = os.Remove(path)
 		_ = os.Remove(saveStateOwnerPath(path))
+		if err := removeSaveStateBalloonMarker(path); err != nil {
+			warnings = append(warnings, staleBalloonMarkerWarning(nodeNameOfSave(path), err))
+		}
 	}
+	return warnings
+}
+
+// nodeNameOfSave recovers the node name from a save path.
+func nodeNameOfSave(savePath string) string {
+	return strings.TrimSuffix(filepath.Base(savePath), saveStateSuffix)
+}
+
+// staleBalloonMarkerWarning tells the operator that a marker outlived its
+// save, and what it will block.
+func staleBalloonMarkerWarning(nodeName string, err error) string {
+	return fmt.Sprintf(
+		"could not clear the balloon marker beside %s's discarded suspended memory: %v; the next suspend of that node will fail until %s is removed",
+		nodeName, err, saveStateBalloonSuffix,
+	)
+}
+
+// saveStateBalloonPath marks a save taken from a guest that had no balloon
+// device (TBX_DISABLE_BALLOON, #513). Absent means the guest had one.
+func saveStateBalloonPath(savePath string) string { return savePath + ".noballoon" }
+
+// recordSaveStateBalloon settles the marker for a fresh save: present when the
+// guest had no balloon device, absent otherwise. Both directions must land —
+// a stale marker beside a balloon-enabled save reads as a mismatch on resume
+// and discards a valid save — so a failure is the caller's to fail the save on.
+func recordSaveStateBalloon(savePath string, disabled bool) error {
+	marker := saveStateBalloonPath(savePath)
+	if !disabled {
+		if err := os.Remove(marker); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("clear saved state balloon marker %s: %w", marker, err)
+		}
+		return nil
+	}
+	if err := os.WriteFile(marker, nil, 0o600); err != nil {
+		return fmt.Errorf("record saved state balloon marker %s: %w", marker, err)
+	}
+	return nil
+}
+
+// removeSaveStateBalloonMarker drops the marker beside a save that is going
+// away. It cannot be best effort either: a marker that outlives its save makes
+// the next suspend at this path refuse to save (recordSaveStateBalloon fails
+// to clear it), so the failure goes back to the caller to surface.
+func removeSaveStateBalloonMarker(savePath string) error {
+	marker := saveStateBalloonPath(savePath)
+	if err := os.Remove(marker); err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Printf("remove saved state balloon marker %s: %v", marker, err)
+		return err
+	}
+	return nil
+}
+
+func savedWithoutBalloon(savePath string) bool {
+	_, err := os.Stat(saveStateBalloonPath(savePath))
+	return err == nil
+}
+
+func balloonMismatchWarning(nodeName string, disabledNow bool) string {
+	saved, now := "with", "without"
+	if !disabledNow {
+		saved, now = "without", "with"
+	}
+	return fmt.Sprintf("node %s cold-booted: its saved memory was taken %s a balloon device but the daemon now launches guests %s one (TBX_DISABLE_BALLOON changed); the save was discarded", nodeName, saved, now)
 }
 
 // prepareSavedMachine leaves a successfully-saved VM stopped but otherwise
@@ -453,6 +542,9 @@ func saveStatePath(dir, node string) string {
 // on disk is already lost, and only the recorded owner can tell status that
 // (#413).
 const saveStateOwnerSuffix = saveStateSuffix + ".owner"
+
+// saveStateBalloonSuffix is the removeNodeFiles spelling of saveStateBalloonPath.
+const saveStateBalloonSuffix = saveStateSuffix + ".noballoon"
 
 func saveStateOwnerPath(savePath string) string { return savePath + ".owner" }
 
@@ -551,6 +643,11 @@ func discardSavedState(dir, nodeName string) (bool, string) {
 	}
 	_ = os.Remove(saveStateOwnerPath(path))
 	log.Printf("discarded saved state %s: cold boot", path)
+	if err := removeSaveStateBalloonMarker(path); err != nil {
+		// the save is gone, so the cold boot stands; the marker is what the
+		// operator has to deal with before the next suspend
+		return true, staleBalloonMarkerWarning(nodeName, err)
+	}
 	return true, ""
 }
 
@@ -574,13 +671,15 @@ func discardClusterSavedStates(dir string) (bool, []string) {
 				continue
 			}
 			log.Printf("discard saved state %s: %v", path, err)
-			node := strings.TrimSuffix(filepath.Base(path), saveStateSuffix)
-			failures = append(failures, undiscardedSaveStateWarning(node, err))
+			failures = append(failures, undiscardedSaveStateWarning(nodeNameOfSave(path), err))
 			continue
 		}
 		_ = os.Remove(saveStateOwnerPath(path))
 		log.Printf("discarded saved state %s: disks were replaced", path)
 		discarded = true
+		if err := removeSaveStateBalloonMarker(path); err != nil {
+			failures = append(failures, staleBalloonMarkerWarning(nodeNameOfSave(path), err))
+		}
 	}
 	return discarded, failures
 }
