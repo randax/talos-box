@@ -27,9 +27,9 @@ func TestConsoleE2E(t *testing.T) {
 	configPath := writeE2EConfig(t, yaml)
 	logOffset := captureTBXDLogOffset(t)
 	var cleanupOutput strings.Builder
-	registerE2EFailureDiagnostics(t, logOffset, &cleanupOutput)
-	runTBX(t, "up", "-f", configPath)
 	registerE2EClusterCleanup(t, name, &cleanupOutput)
+	registerE2EFailureDiagnostics(t, logOffset)
+	runTBX(t, "up", "-f", configPath)
 
 	home, _ := os.UserHomeDir()
 	sock := filepath.Join(home, ".talosbox", "clusters", name, name+"-cp-1.console.sock")

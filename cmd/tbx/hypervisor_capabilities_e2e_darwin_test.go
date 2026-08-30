@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,10 +19,6 @@ import (
 	"github.com/randax/talos-box/internal/config"
 	"github.com/randax/talos-box/internal/daemon"
 	"github.com/randax/talos-box/internal/hypervisor"
-)
-
-var doctorHostPressureNumbers = regexp.MustCompile(
-	`(?m)^(?:PASS|WARN|FAIL) host-pressure: (?:(\d+) MiB free memory[^\n]*leave the (\d+) MiB balloon reserve free|[^\n]*with (\d+) MiB free memory against (\d+) MiB required)`,
 )
 
 func TestDoctorHypervisorsE2E(t *testing.T) {
@@ -37,6 +34,18 @@ func TestDoctorHypervisorsE2E(t *testing.T) {
 		names = append(names, string(name))
 	}
 	sort.Strings(names)
+	var expectedNames []string
+	switch runtime.GOARCH {
+	case "arm64":
+		expectedNames = []string{"qemu", "vz"}
+	case "amd64":
+		expectedNames = []string{"qemu"}
+	default:
+		t.Fatalf("unexpected Darwin architecture %q", runtime.GOARCH)
+	}
+	if strings.Join(names, ",") != strings.Join(expectedNames, ",") {
+		t.Fatalf("doctor hypervisor backend names = %v, want exactly %v on darwin/%s", names, expectedNames, runtime.GOARCH)
+	}
 	previousIndex := -1
 	for _, name := range names {
 		prefix := doctorHypervisorPrefix + name + ":"
@@ -98,31 +107,35 @@ func TestQEMUBalloonReadbackInMaintenanceE2E(t *testing.T) {
 		t.Skip("runs in the QEMU lane (TBX_E2E_HYPERVISOR=qemu)")
 	}
 	requireNoForeignClusters(t)
+	socketPath, err := daemon.SocketPath()
+	if err != nil {
+		t.Fatalf("resolve daemon socket path: %v", err)
+	}
+	info, _, err := daemonHandshake(socketPath)
+	if err != nil {
+		t.Fatalf("read running daemon info from %s: %v", socketPath, err)
+	}
+	if info.BalloonDisabled {
+		t.Fatal("ballooning is disabled on the running daemon; unset TBX_DISABLE_BALLOON and restart tbxd")
+	}
 	if value := os.Getenv("TBX_DISABLE_BALLOON"); value != "" {
 		t.Fatalf("TBX_DISABLE_BALLOON=%q disables ballooning required by this test; unset TBX_DISABLE_BALLOON and restart tbxd", value)
 	}
 
-	doctorOutput, doctorErr := runTBXCommand(t, nil, e2eCommandTimeout, "doctor")
-	matches := doctorHostPressureNumbers.FindStringSubmatch(doctorOutput)
-	if matches == nil {
-		t.Fatalf("parse daemon balloon reserve and host free memory from `tbx doctor` host-pressure finding (doctor error: %v):\n%s", doctorErr, doctorOutput)
-	}
-	freeText, reserveText := matches[1], matches[2]
-	if freeText == "" {
-		freeText, reserveText = matches[3], matches[4]
-	}
-	hostFreeMiB, err := strconv.Atoi(freeText)
-	if err != nil || hostFreeMiB <= 0 {
-		t.Fatalf("parse host free memory %q from `tbx doctor`: %v\n%s", freeText, err, doctorOutput)
-	}
-	originalReserveMiB, err := strconv.Atoi(reserveText)
-	if err != nil || originalReserveMiB <= 0 {
-		t.Fatalf("parse balloon reserve %q from `tbx doctor`: %v\n%s", reserveText, err, doctorOutput)
-	}
+	originalReserveMiB := info.BalloonReserveMiB
 	compiledReserveMiB := balloon.DefaultConfig().ReserveMiB
+	if originalReserveMiB == 0 {
+		originalReserveMiB = compiledReserveMiB
+	}
 	originalWasDefault := originalReserveMiB == compiledReserveMiB
+	hostFreeMiB, err := balloon.HostFreeMiB()
+	if err != nil {
+		t.Fatalf("read host free memory: %v", err)
+	}
+	if hostFreeMiB <= 0 {
+		t.Fatalf("host free memory = %d MiB, want a positive value", hostFreeMiB)
+	}
 	newReserveMiB := hostFreeMiB + 2048
-	runTBXWithEnv(t, []string{"TBX_BALLOON_RESERVE_MIB=" + strconv.Itoa(newReserveMiB)}, "system", "restart", "--force")
 
 	t.Cleanup(func() {
 		var env []string
@@ -134,6 +147,7 @@ func TestQEMUBalloonReadbackInMaintenanceE2E(t *testing.T) {
 			t.Errorf("restore tbxd balloon reserve to %d MiB: %v\n%s", originalReserveMiB, err, output)
 		}
 	})
+	runTBXWithEnv(t, []string{"TBX_BALLOON_RESERVE_MIB=" + strconv.Itoa(newReserveMiB)}, "system", "restart", "--force")
 
 	logOffset := captureTBXDLogOffset(t)
 	name := uniqueE2EClusterName("balloon")
@@ -154,9 +168,9 @@ func TestQEMUBalloonReadbackInMaintenanceE2E(t *testing.T) {
 	}
 	configPath := writeE2EConfig(t, yaml)
 	var cleanupOutput strings.Builder
-	registerE2EFailureDiagnostics(t, logOffset, &cleanupOutput)
-	runTBX(t, "up", "--force", "-f", configPath)
 	registerE2EClusterCleanup(t, name, &cleanupOutput)
+	registerE2EFailureDiagnostics(t, logOffset)
+	runTBX(t, "up", "--force", "-f", configPath)
 
 	// A node that just booted reads "unreachable" until Talos's maintenance
 	// apid answers, so the phase needs a bounded wait, not a one-shot read.
