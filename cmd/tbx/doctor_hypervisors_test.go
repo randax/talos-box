@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/daemon"
@@ -146,12 +147,19 @@ func TestRunDoctorHypervisorInventoryFallsBackWhenDaemonStalls(t *testing.T) {
 		}
 	}
 
+	started := time.Now()
 	var output strings.Builder
 	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(output.String(), "probed locally; daemon unavailable") {
+	if !strings.Contains(output.String(), "probed locally; daemon info unavailable") {
 		t.Fatalf("doctor output missing bounded fallback:\n%s", output.String())
+	}
+	if elapsed := time.Since(started); elapsed > 2*hypervisorProbeTimeout {
+		t.Fatalf("doctor took %v with a stalled daemon; the timeout must be paid once, not per finding", elapsed)
+	}
+	if !strings.Contains(output.String(), "probed locally; daemon info unavailable: context deadline exceeded") {
+		t.Fatalf("doctor output missing stalled-daemon wording:\n%s", output.String())
 	}
 }
 
@@ -199,7 +207,7 @@ func TestRunDoctorFallsBackOnDaemonInfoError(t *testing.T) {
 	if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(output.String(), "probed locally; daemon unavailable") {
+	if !strings.Contains(output.String(), "probed locally; daemon info unavailable: protocol decode failed") {
 		t.Fatalf("doctor output missing fallback for daemon info error:\n%s", output.String())
 	}
 }

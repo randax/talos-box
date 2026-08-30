@@ -678,8 +678,11 @@ func doctorHypervisors(deps doctorDependencies) doctorHypervisorInventory {
 		return doctorHypervisorInventory{err: err}
 	}
 	localProbeTag := "probed locally; daemon unavailable"
-	if err == nil {
+	switch {
+	case err == nil:
 		localProbeTag = "probed locally; daemon does not report hypervisor inventory"
+	case !isDaemonUnavailable(err):
+		localProbeTag = "probed locally; daemon info unavailable: " + err.Error()
 	}
 	probeCtx, probeCancel := context.WithTimeout(context.Background(), hypervisorProbeTimeout)
 	defer probeCancel()
@@ -744,9 +747,9 @@ func hypervisorFindings(inventory doctorHypervisorInventory) []doctorFinding {
 	return findings
 }
 
-// boundedOnce runs call at most once and hands every caller the same result;
-// callers give up after timeout with context.DeadlineExceeded while the call
-// keeps running so a late answer still serves later callers.
+// boundedOnce runs call at most once and hands every caller the same result.
+// The first caller waits up to timeout; a timeout is cached too, so a stalled
+// daemon costs doctor one wait, not one per finding.
 func boundedOnce[T any](call func() (T, error), timeout time.Duration) func() (T, error) {
 	type result struct {
 		value T
@@ -771,7 +774,7 @@ func boundedOnce[T any](call func() (T, error), timeout time.Duration) func() (T
 				cached = &r
 			case <-time.After(timeout):
 				var zero T
-				return zero, context.DeadlineExceeded
+				cached = &result{zero, context.DeadlineExceeded}
 			}
 		}
 		return cached.value, cached.err

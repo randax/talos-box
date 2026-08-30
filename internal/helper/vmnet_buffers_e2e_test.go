@@ -22,7 +22,9 @@ func TestVMNetAttachmentReportsRaisedBuffers(t *testing.T) {
 	}()
 
 	fd := int(attachment.File.Fd())
-	target := vmnetSocketBufferSize()
+	// The helper negotiates down from vmnetSocketBufferSize on ENOBUFS, so the
+	// floor is the only size every host must reach.
+	target := vmnetSocketBufferFloor()
 	for _, option := range []int{unix.SO_SNDBUF, unix.SO_RCVBUF} {
 		got, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, option)
 		if err != nil {
