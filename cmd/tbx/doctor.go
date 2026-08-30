@@ -708,14 +708,21 @@ var (
 	doctorGOARCH = runtime.GOARCH
 )
 
-func hypervisorPlatformTag(goos, goarch string, name string) string {
-	if goos == "darwin" && goarch == "amd64" && name == string(hypervisor.NameQEMU) {
+// hypervisorPlatformTag labels support tiers that are a property of the
+// platform rather than of a probe. platform is the GOOS/GOARCH pair of the
+// process that owns the hypervisors: the daemon's when the inventory came over
+// the wire, this client's for a local probe.
+func hypervisorPlatformTag(platform string, name string) string {
+	if platform == "darwin/amd64" && name == string(hypervisor.NameQEMU) {
 		return "best-effort platform"
 	}
 	return ""
 }
 
 type doctorHypervisorInventory struct {
+	// platform is the inventory owner's GOOS/GOARCH pair (see
+	// hypervisorPlatformTag). Empty when an older daemon did not report one.
+	platform      string
 	items         []daemon.HypervisorInfo
 	defaultName   hypervisor.Name
 	defaultSource hypervisor.DefaultSource
@@ -731,6 +738,7 @@ func doctorHypervisors(deps doctorDependencies) doctorHypervisorInventory {
 	info, err := deps.daemonInfo()
 	if err == nil && len(info.Hypervisors) > 0 {
 		inventory := doctorHypervisorInventory{
+			platform:      info.Platform,
 			items:         info.Hypervisors,
 			defaultName:   info.DefaultHypervisor,
 			defaultSource: info.DefaultHypervisorSource,
@@ -772,14 +780,16 @@ func doctorHypervisors(deps doctorDependencies) doctorHypervisorInventory {
 		if entry.Availability.Available && entry.Hypervisor != nil {
 			capabilities := entry.Hypervisor.Capabilities()
 			item.BalloonReadback = daemon.NewFeatureStatusInfo(capabilities.BalloonReadback)
-			item.Suspend = daemon.NewFeatureStatusInfo(capabilities.Suspend)
+			suspend := daemon.NewFeatureStatusInfo(capabilities.Suspend)
+			item.Suspend = &suspend
 			item.SuspendSurvivesDaemonRestart = capabilities.SuspendSurvivesDaemonRestart
 			item.GuestAgent = daemon.NewFeatureStatusInfo(capabilities.GuestAgent)
 		}
 		items = append(items, item)
 	}
 	return doctorHypervisorInventory{
-		items: items, defaultName: registry.Default.Name, defaultSource: registry.Default.Source, compiledName: registry.CompiledDefault, localProbeTag: localProbeTag,
+		platform: doctorGOOS + "/" + doctorGOARCH,
+		items:    items, defaultName: registry.Default.Name, defaultSource: registry.Default.Source, compiledName: registry.CompiledDefault, localProbeTag: localProbeTag,
 	}
 }
 
@@ -796,11 +806,16 @@ func hypervisorFindings(inventory doctorHypervisorInventory) []doctorFinding {
 	findings := make([]doctorFinding, 0, len(items))
 	for _, item := range items {
 		availability := "available"
-		if tag := hypervisorPlatformTag(doctorGOOS, doctorGOARCH, string(item.Name)); item.Available && tag != "" {
+		if tag := hypervisorPlatformTag(inventory.platform, string(item.Name)); item.Available && tag != "" {
 			availability += " (" + tag + ")"
 		}
 		balloonReadback := featureGate(item.BalloonReadback)
-		suspend := featureGate(item.Suspend)
+		// A daemon predating the suspend gate omits the field; that is not
+		// evidence of "unsupported", so say so.
+		suspend := "unknown"
+		if item.Suspend != nil {
+			suspend = featureGate(*item.Suspend)
+		}
 		suspendRestart := "unsupported"
 		if item.SuspendSurvivesDaemonRestart {
 			suspendRestart = "supported"

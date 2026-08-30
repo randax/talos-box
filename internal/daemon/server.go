@@ -981,6 +981,7 @@ func (s *Server) handle(request Request, progress stageFunc) (any, error) {
 func (s *Server) info() Info {
 	info := Info{
 		ProtocolVersion:           ProtocolVersion,
+		Platform:                  runtime.GOOS + "/" + runtime.GOARCH,
 		BalloonReserveMiB:         balloon.DefaultConfig().ReserveMiB,
 		BalloonDisabled:           s.balloonDisabled,
 		DefaultHypervisor:         s.hypervisors.Default.Name,
@@ -998,7 +999,8 @@ func (s *Server) info() Info {
 		if entry.Availability.Available && entry.Hypervisor != nil {
 			capabilities := entry.Hypervisor.Capabilities()
 			backendInfo.BalloonReadback = NewFeatureStatusInfo(capabilities.BalloonReadback)
-			backendInfo.Suspend = NewFeatureStatusInfo(capabilities.Suspend)
+			suspend := NewFeatureStatusInfo(capabilities.Suspend)
+			backendInfo.Suspend = &suspend
 			backendInfo.SuspendSurvivesDaemonRestart = capabilities.SuspendSurvivesDaemonRestart
 			backendInfo.GuestAgent = NewFeatureStatusInfo(capabilities.GuestAgent)
 		}

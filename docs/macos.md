@@ -41,7 +41,10 @@ macOS requires:
 Suspend/resume is capability-gated rather than version-gated here: memory is preserved while
 the same `tbxd` process stays alive. VZ still warns and safely cold-boots after a daemon
 restart because Virtualization.framework device identity cannot be reconstructed, while QEMU
-retains its saved state across that restart.
+retains its saved state across that restart as long as the save's identity still matches the
+host: a save written under a different backend, architecture or machine type is refused
+outright, and a QEMU version change (a `brew upgrade` between suspend and resume) safely
+cold-boots instead of restoring.
 
 ## Hypervisor selection
 

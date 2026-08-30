@@ -18,7 +18,7 @@ func TestInfoHypervisorFeatureStatusJSONRoundTrip(t *testing.T) {
 			Available:               true,
 			AvailabilityRemediation: "install the hypervisor",
 			BalloonReadback:         FeatureStatusInfo{Supported: true},
-			Suspend:                 FeatureStatusInfo{Reason: "save unavailable"},
+			Suspend:                 &FeatureStatusInfo{Reason: "save unavailable"},
 			GuestAgent:              FeatureStatusInfo{Reason: "no channel"},
 		}},
 	}

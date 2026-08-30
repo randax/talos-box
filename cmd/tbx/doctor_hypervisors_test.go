@@ -48,7 +48,7 @@ func TestRunDoctorPrintsOneLinePerHypervisor(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantOptional := "INFO Hypervisors: qemu: availability=unavailable (optional probe failed; remediation: install optional support); default=no; balloon-readback=unavailable; suspend=unavailable; suspend-survives-restart=unavailable; guest-agent=unavailable"
-	wantPrimary := "INFO Hypervisors: vz: availability=available; default=yes (source=compiled); balloon-readback=supported; suspend=unsupported; suspend-survives-restart=unsupported; guest-agent=unsupported (no channel)"
+	wantPrimary := "INFO Hypervisors: vz: availability=available; default=yes (source=compiled); balloon-readback=supported; suspend=unknown; suspend-survives-restart=unsupported; guest-agent=unsupported (no channel)"
 	text := output.String()
 	optionalIndex, primaryIndex := strings.Index(text, wantOptional), strings.Index(text, wantPrimary)
 	if optionalIndex < 0 || primaryIndex < 0 {
@@ -127,13 +127,13 @@ func TestHypervisorFindingsReportSuspendSeparatelyFromRestartSurvival(t *testing
 			{
 				Name:                         hypervisor.NameQEMU,
 				Available:                    true,
-				Suspend:                      daemon.FeatureStatusInfo{Supported: true},
+				Suspend:                      &daemon.FeatureStatusInfo{Supported: true},
 				SuspendSurvivesDaemonRestart: true,
 			},
 			{
 				Name:      hypervisor.NameVZ,
 				Available: true,
-				Suspend:   daemon.FeatureStatusInfo{Supported: true},
+				Suspend:   &daemon.FeatureStatusInfo{Supported: true},
 			},
 		},
 	})
@@ -191,11 +191,26 @@ func TestHypervisorFindingsBestEffortPlatformTag(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			doctorGOOS, doctorGOARCH = test.goos, test.goarch
-			findings := hypervisorFindings(doctorHypervisorInventory{items: []daemon.HypervisorInfo{test.backend}})
+			findings := hypervisorFindings(doctorHypervisorInventory{platform: test.goos + "/" + test.goarch, items: []daemon.HypervisorInfo{test.backend}})
 			if got := findings[0].detail; !strings.Contains(got, test.availability) {
 				t.Fatalf("finding = %q, want %q", got, test.availability)
 			}
 		})
+	}
+}
+
+func TestHypervisorFindingsPlatformTagPrefersDaemonPlatform(t *testing.T) {
+	originalGOOS, originalGOARCH := doctorGOOS, doctorGOARCH
+	t.Cleanup(func() { doctorGOOS, doctorGOARCH = originalGOOS, originalGOARCH })
+	// A Rosetta-translated client (amd64) talking to a native arm64 daemon must
+	// not label the daemon's verified arm64 backend best-effort.
+	doctorGOOS, doctorGOARCH = "darwin", "amd64"
+	findings := hypervisorFindings(doctorHypervisorInventory{
+		platform: "darwin/arm64",
+		items:    []daemon.HypervisorInfo{{Name: hypervisor.NameQEMU, Available: true}},
+	})
+	if got := findings[0].detail; strings.Contains(got, "best-effort") {
+		t.Fatalf("finding = %q, want no best-effort tag when the daemon platform is arm64", got)
 	}
 }
 
