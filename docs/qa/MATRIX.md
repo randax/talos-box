@@ -16,6 +16,7 @@ All runbooks follow the format decided in [#214](https://github.com/randax/talos
 | [deep-domains-dns](deep-domains-dns.md) | covered | covered | C4 hygiene charter is split: resolver files (macOS) vs resolved registration (Linux) |
 | [deep-mirror-offline-cache](deep-mirror-offline-cache.md) | covered | covered | port-5000/AirPlay check is macOS-only |
 | [deep-cluster-state](deep-cluster-state.md) | covered | covered | Suspend charters gate differently: macOS 14+/same-daemon vs QEMU 8.2+/identity; QEMU 6.2–8.1 hosts run the refusal check only |
+| [deep-hypervisor-qemu](deep-hypervisor-qemu.md) | covered (VZ + QEMU/HVF) | platform-N/A | Apple Silicon backend-parity battery; Sonoma remediation charter is conditional; the 24h soak is human-run |
 | [deep-multicluster](deep-multicluster.md) | covered | covered | BGP-as-fast-failover comparison is macOS-flavored |
 | [deep-host-integration](deep-host-integration.md) | covered | covered | C2 ballooning/overcommit is **macOS-only by implementation** — Linux side verifies the honest SKIP/absence |
 | [scenario-offline-venue](scenario-offline-venue.md) | covered | covered | |
@@ -29,7 +30,7 @@ All runbooks follow the format decided in [#214](https://github.com/randax/talos
 | Gap | Why it is not covered | Where it lives |
 |---|---|---|
 | G4 — mirror through corporate security agents (GlobalProtect) | Needs a managed machine; `cache warm --check` explicitly does not prove it | SPEC §12 G4, open gate |
-| G1 — macOS 14/15 boot floor | Needs physical macOS 14/15 hardware | v1 map ticket [#18](https://github.com/randax/talos-box/issues/18), non-blocking |
+| G1 — macOS 14/15 boot floor | Needs physical macOS 14/15 hardware | v1 map ticket [#18](https://github.com/randax/talos-box/issues/18), non-blocking; [deep-hypervisor-qemu C2](deep-hypervisor-qemu.md#c2--homebrew-on-sonoma-remediation-macos-14-only) conditionally exercises Homebrew-on-Sonoma remediation when physical macOS 14 hardware is available |
 | Talos dashboard TUI interactivity on hvc0 | Logs verified; interactive rendering never verified (G6 residual) | deep-cilium/console charters observe logs only |
 | Repeated-GARP bursts under vmnet | G2 residual; no harness | uncovered |
 | Linux QEMU-identity-mismatch restore degradation | Requires two QEMU versions on one host | scenario-suspend-storage C4 marks it SKIPPED |
