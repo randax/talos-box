@@ -193,6 +193,50 @@ func TestSystemRestartRefusesRunningClustersWithoutForce(t *testing.T) {
 	}
 }
 
+func TestSystemRestartAllowsRestartSafeSuspensionWithoutForce(t *testing.T) {
+	fake := newFakeDaemon(t, daemon.ProtocolVersion)
+	terminated := stubDaemonRestart(t, fake, unsupervisedDaemon)
+	writeSavedState(t, "qemu-safe")
+	stubRunningClusters(t, func(string) (clusterActivity, error) {
+		return clusterActivity{restartSafeSuspended: []string{"qemu-safe"}}, nil
+	})
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr}
+
+	if err := command.run([]string{"system", "restart"}); err != nil {
+		t.Fatalf("restart-safe suspension required force: %v", err)
+	}
+	if *terminated != 1 {
+		t.Fatalf("terminate calls = %d, want 1", *terminated)
+	}
+	if strings.Contains(stdout.String(), "lose their saved memory") {
+		t.Fatalf("stdout = %q, restart-safe suspension was reported as memory loss", stdout.String())
+	}
+}
+
+func TestDiskScanCannotDowngradeLiveRestartSafeClassification(t *testing.T) {
+	stubRunningClusters(t, func(string) (clusterActivity, error) {
+		return clusterActivity{restartSafeSuspended: []string{"qemu-safe"}}, nil
+	})
+	previous := savedStateClustersQuery
+	t.Cleanup(func() { savedStateClustersQuery = previous })
+	savedStateClustersQuery = func() ([]string, error) { return []string{"qemu-safe"}, nil }
+
+	activity, err := daemonClusterActivity("unused")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !activity.empty() {
+		t.Fatalf("activity = %+v, restart-safe suspension must not block restart", activity)
+	}
+	if !slices.Equal(activity.restartSafeSuspended, []string{"qemu-safe"}) {
+		t.Fatalf("restart-safe suspended = %v, want qemu-safe", activity.restartSafeSuspended)
+	}
+	if len(activity.suspended) != 0 {
+		t.Fatalf("restart-unsafe suspended = %v, disk scan downgraded live classification", activity.suspended)
+	}
+}
+
 func TestSystemRestartWithForceStopsAndReportsRunningClusters(t *testing.T) {
 	fake := newFakeDaemon(t, daemon.ProtocolVersion)
 	fake.runs("alpha", "beta")
@@ -890,6 +934,33 @@ func TestRunningClustersCountsTheVMsARestartMustStop(t *testing.T) {
 	}
 	if activity.runningVMs != 5 {
 		t.Fatalf("runningVMs = %d, want 5 (3 control planes + 2 workers)", activity.runningVMs)
+	}
+}
+
+func TestRunningClustersClassifiesRestartSafeSuspension(t *testing.T) {
+	scripted := newScriptedDaemon(t, func(_ int, connection net.Conn, request *daemon.Request) {
+		defer func() { _ = connection.Close() }()
+		if request == nil || request.Op != "cluster.list" {
+			_ = json.NewEncoder(connection).Encode(daemon.Response{Error: "unexpected request"})
+			return
+		}
+		data, _ := json.Marshal([]daemon.ClusterSummary{{
+			Name:                         "qemu-safe",
+			Suspended:                    true,
+			SuspendSurvivesDaemonRestart: true,
+		}})
+		_ = json.NewEncoder(connection).Encode(daemon.Response{OK: true, Data: data})
+	})
+
+	activity, err := runningClusters(scripted.socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(activity.restartSafeSuspended, []string{"qemu-safe"}) {
+		t.Fatalf("restart-safe suspended = %v, want qemu-safe", activity.restartSafeSuspended)
+	}
+	if len(activity.suspended) != 0 {
+		t.Fatalf("restart-unsafe suspended = %v, want none", activity.suspended)
 	}
 }
 

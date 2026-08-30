@@ -1,17 +1,17 @@
 # macOS host setup
 
-talosbox runs Talos guests on Apple Silicon through Virtualization.framework. VZ is the
-zero-install default on Apple Silicon; QEMU/HVF is optional and best-effort. The unprivileged `tbxd`
-daemon owns the VMs, while a root launchd `tbx-helper` daemon owns the small set of host
-operations that require privilege: vmnet attachments, `/etc/resolver` files, IP forwarding, and
-route injection.
+talosbox runs Talos guests on macOS through Virtualization.framework or QEMU/HVF. VZ is the
+zero-install default on Apple Silicon; QEMU/HVF is optional and best-effort there and is the only
+backend on Intel Macs. The unprivileged `tbxd` daemon owns the VMs, while a root launchd
+`tbx-helper` daemon owns the small set of host operations that require privilege: vmnet
+attachments, `/etc/resolver` files, IP forwarding, and route injection.
 
 ## Availability
 
 | Channel | Intended users | Current state |
 |---|---|---|
 | Homebrew `randax/tap/talosbox` | Everyone on Apple Silicon | Planned; the Developer-ID-signed, notarized build is not published yet |
-| Source build (`make build`) | Everyone today | The currently validated path — use the setup below |
+| Source build (`make build`) | Apple Silicon and best-effort Intel users | The currently validated path — use the setup below |
 
 `make build` ad-hoc signs `bin/tbx` and `bin/tbxd` with the
 `com.apple.security.virtualization` entitlement. Unsigned binaries cannot start VMs, so always
@@ -23,12 +23,13 @@ build through `make build` rather than a bare `go build`.
 |---|---|---|
 | Apple Silicon (M1 or newer), macOS 14+ | Tier one | The validated development and workshop target |
 | Apple Silicon, macOS 13 | Unsupported | Suspend/resume and the current Virtualization.framework surface need macOS 14 |
-| Intel Macs | Best effort | Community-verified only; talosbox does not emulate, and the guest architecture must match the host |
+| Intel Macs, macOS 15+ | Best effort | QEMU/HVF-only and community-verified; outside the parity bar |
 
 macOS requires:
 
 - an Apple Silicon Mac running macOS 14 or newer for the default VZ path, or macOS 15+ for the
-  optional QEMU/HVF path; Intel Macs use QEMU/HVF and remain community-verified;
+  optional QEMU/HVF path; Intel Macs require macOS 15+, `kern.hv_support=1`,
+  `qemu-system-x86_64`, and matching x86_64 edk2 firmware;
 - 16 GB RAM minimum for the default 1-control-plane + 2-worker topology;
 - 25 GB free on the volume holding `~/.talosbox` (node disks are 20 GB sparse);
 - the Xcode command line tools and [Go 1.26](https://go.dev/doc/install) for the source build;
@@ -40,7 +41,10 @@ macOS requires:
 Suspend/resume is capability-gated rather than version-gated here: memory is preserved while
 the same `tbxd` process stays alive. VZ still warns and safely cold-boots after a daemon
 restart because Virtualization.framework device identity cannot be reconstructed, while QEMU
-retains its saved state across that restart.
+retains its saved state across that restart as long as the save's identity still matches the
+host: a save written under a different backend, architecture or machine type is refused
+outright, and a QEMU version change (a `brew upgrade` between suspend and resume) safely
+cold-boots instead of restoring.
 
 ## Hypervisor selection
 
@@ -51,7 +55,9 @@ cluster, so a cluster created as VZ stays VZ even if the daemon default changes 
 QEMU/HVF is best effort on macOS. Homebrew QEMU needs macOS 15+ to expose HVF; install it with
 `brew install qemu`, or use the QEMU package from nixpkgs. The installed binary must retain the
 `com.apple.security.hypervisor` entitlement. QEMU still runs unprivileged on the helper-owned
-datagram FD that vmnet hands to the VM.
+datagram FD that vmnet hands to the VM. Intel Macs run amd64 guests through
+`qemu-system-x86_64` with HVF and the `edk2-x86_64-code.fd` / `edk2-i386-vars.fd` firmware pair.
+There is no supported TCG fallback or cross-architecture guest promise.
 
 ```yaml
 clusters:
@@ -133,7 +139,16 @@ such as an inert guest-agent channel or filtered Image Factory egress. `INFO` li
 `tbx doctor` also prints an INFO `Hypervisors` section before the rest of the checks. Each line
 names one hypervisor, its availability, the current default source (`default=yes (source=compiled)`
 or `default=yes (source=TBX_HYPERVISOR)`), and the feature gates used by `tbx status`. The
-macOS QEMU hypervisor currently emits these availability/remediation pairs:
+macOS QEMU hypervisor currently emits these availability/remediation pairs. On a usable Intel
+Mac, the QEMU line begins exactly:
+
+```text
+qemu: availability=available (best-effort platform)
+```
+
+An unavailable Intel probe keeps its actual reason and remediation instead of the best-effort
+tag. In particular, verify that `sysctl kern.hv_support` prints `1`,
+`qemu-system-x86_64 --version` succeeds, and the x86_64 code/vars firmware pair is installed.
 
 - `qemu-system-<arch> was not found on PATH` -> `install QEMU: brew install qemu, then restart tbxd`
 - `QEMU does not list the hvf accelerator` -> `HVF not built in: Homebrew builds without HVF on macOS 14; upgrade to macOS 15+ and reinstall QEMU`
@@ -144,6 +159,24 @@ macOS QEMU hypervisor currently emits these availability/remediation pairs:
 - `hypervisor feature unsupported: QEMU <version> does not provide required machine type "<machine>"` -> `upgrade QEMU to 6.2 or newer: brew upgrade qemu, then restart tbxd`
 - `resolve QEMU binary path: <error>` -> `upgrade QEMU to 6.2 or newer: brew upgrade qemu, then restart tbxd`
 - `no matching EFI firmware pair found for <arch>` -> `reinstall QEMU so its edk2 firmware is present`
+
+### Report an Intel run
+
+Intel support is community-verified and does not set the Apple Silicon parity bar. Capture the
+host and tool identity before running the applicable QA charters:
+
+```sh
+uname -m
+sw_vers
+qemu-system-x86_64 --version
+tbx version
+sysctl kern.hv_support
+tbx doctor | grep 'qemu: availability='
+```
+
+Follow the report convention in the [QA coverage matrix](qa/MATRIX.md): open one GitHub issue
+labelled `qa-run`, title it `QA Intel macOS <date>`, and include the command output above plus each
+QA charter's PASS, FAIL, PASS-with-friction, or BLOCKED result and supporting evidence.
 
 ## macOS networking and ingress
 

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -63,15 +64,77 @@ func TestReadQEMUSaveRejectsMissingOrCorruptMetadata(t *testing.T) {
 	}
 }
 
-func TestValidateQEMUSaveRejectsCrossVersionRestore(t *testing.T) {
-	metadata := qemuSaveMetadata{
+func TestValidateQEMUSaveRejectsIdentityMismatch(t *testing.T) {
+	currentVersion := "8.2.2"
+	currentArchitecture := ArchitectureAMD64
+	currentMachine := "q35"
+	compatible := qemuSaveMetadata{
 		Schema:       qemuSaveSchema,
-		Backend:      "qemu",
-		QEMUVersion:  "8.2.1",
-		Architecture: ArchitectureAMD64,
-		Machine:      "q35",
+		Backend:      qemuSaveBackend,
+		QEMUVersion:  currentVersion,
+		Architecture: currentArchitecture,
+		Machine:      currentMachine,
 	}
-	if err := validateQEMUSave(metadata, "8.2.2", ArchitectureAMD64, "q35"); !errors.Is(err, ErrIncompatibleSave) {
-		t.Fatalf("validateQEMUSave() = %v, want ErrIncompatibleSave", err)
+
+	tests := []struct {
+		name     string
+		metadata qemuSaveMetadata
+		values   []string
+	}{
+		{
+			name: "backend",
+			metadata: func() qemuSaveMetadata {
+				metadata := compatible
+				metadata.Backend = "vz"
+				return metadata
+			}(),
+			values: []string{"vz", compatible.Backend},
+		},
+		{
+			name: "architecture",
+			metadata: func() qemuSaveMetadata {
+				metadata := compatible
+				metadata.Architecture = ArchitectureARM64
+				return metadata
+			}(),
+			values: []string{string(ArchitectureARM64), string(currentArchitecture)},
+		},
+		{
+			name: "machine",
+			metadata: func() qemuSaveMetadata {
+				metadata := compatible
+				metadata.Machine = "virt"
+				return metadata
+			}(),
+			values: []string{"virt", currentMachine},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateQEMUSave(test.metadata, currentArchitecture, currentMachine)
+			if !errors.Is(err, ErrIncompatibleSave) {
+				t.Fatalf("validateQEMUSave() = %v, want ErrIncompatibleSave", err)
+			}
+			for _, value := range test.values {
+				if !strings.Contains(err.Error(), value) {
+					t.Fatalf("validateQEMUSave() = %q, want identifying value %q", err, value)
+				}
+			}
+		})
+	}
+}
+
+func TestValidateQEMUSaveVersionIsSeparateFromIdentity(t *testing.T) {
+	metadata := qemuSaveMetadata{Schema: qemuSaveSchema, Backend: qemuSaveBackend, QEMUVersion: "8.2.1", Architecture: ArchitectureAMD64, Machine: "q35"}
+	if err := validateQEMUSave(metadata, ArchitectureAMD64, "q35"); err != nil {
+		t.Fatalf("validateQEMUSave() = %v, want a version-only difference to pass the identity check", err)
+	}
+	err := validateQEMUSaveVersion(metadata, "8.2.2")
+	if !errors.Is(err, ErrIncompatibleSave) || !strings.Contains(err.Error(), "8.2.1") || !strings.Contains(err.Error(), "8.2.2") {
+		t.Fatalf("validateQEMUSaveVersion() = %v, want ErrIncompatibleSave naming both versions", err)
+	}
+	if err := validateQEMUSaveVersion(metadata, "8.2.1"); err != nil {
+		t.Fatalf("validateQEMUSaveVersion() = %v, want nil", err)
 	}
 }

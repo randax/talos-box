@@ -51,10 +51,28 @@ func (h *qemuHypervisor) Launch(ctx context.Context, spec Spec) (Machine, error)
 	var incoming string
 	if spec.Restore != nil && spec.Restore.Path != "" {
 		metadata, err := readQEMUSave(spec.Restore.Path)
-		if err == nil {
-			err = validateQEMUSave(metadata, h.version.String(), h.architecture, h.system.Machine)
-		}
 		if err != nil {
+			reportRestoreFallback(spec.Restore, err)
+		} else if err := validateQEMUSave(metadata, h.architecture, h.system.Machine); err != nil {
+			// The refusal keeps the save file for the user to act on, but a
+			// machine retained from a same-daemon suspend still holds the
+			// node's console proxy and network attachment. Release it, or the
+			// advertised cold-boot recovery collides with those resources. A
+			// failed release keeps the machine retained so a later resume,
+			// start or shutdown can retry, and the refusal must then not
+			// carry ErrIncompatibleSave: that sentinel is what makes the
+			// daemon advertise an immediate cold boot, which these still-held
+			// resources would collide with.
+			if retained := h.takeSaved(spec.Restore.Path); retained != nil {
+				if closeErr := retained.Close(); closeErr != nil {
+					if retainErr := h.retain(spec.Restore.Path, retained); retainErr != nil {
+						closeErr = errors.Join(closeErr, retainErr)
+					}
+					return nil, fmt.Errorf("refusing incompatible save (%v): release suspended machine: %w", err, closeErr)
+				}
+			}
+			return nil, err
+		} else if err := validateQEMUSaveVersion(metadata, h.version.String()); err != nil {
 			reportRestoreFallback(spec.Restore, err)
 		} else if !h.capabilities.Suspend.Supported {
 			err = fmt.Errorf("%w: %s", ErrIncompatibleSave, h.capabilities.Suspend.Reason)
@@ -566,6 +584,11 @@ func waitQEMUMigration(ctx context.Context, client *qmpClient) error {
 	}
 }
 
+// Close releases the machine's host resources. It enters the terminal closed
+// state — and drops the owner's retention record — only once every fallible
+// release has succeeded: a failure leaves the machine open and still owned, so
+// a later Close can retry what remains. Already-released resources are nil'd,
+// which is what makes that retry idempotent.
 func (m *qemuMachine) Close() error {
 	m.closeMu.Lock()
 	defer m.closeMu.Unlock()
@@ -583,29 +606,36 @@ func (m *qemuMachine) Close() error {
 		m.opMu.Unlock()
 		return stopErr
 	}
-	m.closed = true
 	m.opMu.Unlock()
-	m.owner.forget(m)
 	if m.console != nil {
 		m.console.close()
+		m.console = nil
 	}
 	if m.consoleGuest != nil {
 		_ = m.consoleGuest.Close()
+		m.consoleGuest = nil
 	}
 	if m.guestAgent != nil {
 		_ = m.guestAgent.Close()
 		// The listener was detached from the path so QEMU could keep serving it;
 		// nothing else will unlink it.
 		_ = os.Remove(m.spec.GuestAgentSocketPath)
+		m.guestAgent = nil
 	}
 	if m.attachment != nil {
 		if err := m.attachment.Close(); err != nil {
 			return err
 		}
+		m.attachment = nil
 	}
 	if m.qmpPath != "" {
 		_ = os.Remove(m.qmpPath)
+		m.qmpPath = ""
 	}
+	m.opMu.Lock()
+	m.closed = true
+	m.opMu.Unlock()
+	m.owner.forget(m)
 	return nil
 }
 

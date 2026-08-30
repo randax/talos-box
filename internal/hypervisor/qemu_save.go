@@ -15,6 +15,7 @@ import (
 const qemuSaveOffset int64 = qemuIncomingOffset
 
 const qemuSaveSchema = 1
+const qemuSaveBackend = "qemu"
 
 type qemuSaveMetadata struct {
 	Schema       int          `json:"schema"`
@@ -26,7 +27,7 @@ type qemuSaveMetadata struct {
 
 func prepareQEMUSave(path string, metadata qemuSaveMetadata) (string, error) {
 	metadata.Schema = qemuSaveSchema
-	metadata.Backend = "qemu"
+	metadata.Backend = qemuSaveBackend
 	encoded, err := json.Marshal(metadata)
 	if err != nil {
 		return "", fmt.Errorf("encode QEMU save metadata: %w", err)
@@ -109,21 +110,38 @@ func readQEMUSave(path string) (qemuSaveMetadata, error) {
 	if err := json.Unmarshal(line, &metadata); err != nil {
 		return qemuSaveMetadata{}, fmt.Errorf("%w: decode save metadata: %v", ErrIncompatibleSave, err)
 	}
-	if metadata.Schema != qemuSaveSchema || metadata.Backend != "qemu" || metadata.QEMUVersion == "" || metadata.Machine == "" {
+	if metadata.Schema != qemuSaveSchema {
 		return qemuSaveMetadata{}, fmt.Errorf("%w: unrecognized QEMU save metadata", ErrIncompatibleSave)
+	}
+	if metadata.Backend == "" || metadata.QEMUVersion == "" || metadata.Architecture == "" || metadata.Machine == "" {
+		return qemuSaveMetadata{}, fmt.Errorf("%w: incomplete QEMU save metadata", ErrIncompatibleSave)
 	}
 	return metadata, nil
 }
 
-func validateQEMUSave(metadata qemuSaveMetadata, version string, architecture Architecture, machine string) error {
+// validateQEMUSave checks the save's identity — backend, architecture and
+// machine. A mismatch there means the save could only ever be misapplied, so
+// Launch refuses it outright rather than falling back to a cold boot.
+func validateQEMUSave(metadata qemuSaveMetadata, architecture Architecture, machine string) error {
 	switch {
-	case metadata.QEMUVersion != version:
-		return fmt.Errorf("%w: save uses QEMU %s, host has QEMU %s", ErrIncompatibleSave, metadata.QEMUVersion, version)
+	case metadata.Backend != qemuSaveBackend:
+		return fmt.Errorf("%w: save uses backend %q, current backend is %q", ErrIncompatibleSave, metadata.Backend, qemuSaveBackend)
 	case metadata.Architecture != architecture:
 		return fmt.Errorf("%w: save targets %s, host targets %s", ErrIncompatibleSave, metadata.Architecture, architecture)
 	case metadata.Machine != machine:
-		return fmt.Errorf("%w: save uses machine %s, host requires %s", ErrIncompatibleSave, metadata.Machine, machine)
+		return fmt.Errorf("%w: save uses machine %q, host requires %q", ErrIncompatibleSave, metadata.Machine, machine)
 	default:
 		return nil
 	}
+}
+
+// validateQEMUSaveVersion checks the QEMU release the save was written by. A
+// different release is the ordinary outcome of upgrading QEMU under a
+// suspended cluster, so Launch treats it as a cold-boot fallback rather than a
+// refusal: the user must be able to get the cluster back without downgrading.
+func validateQEMUSaveVersion(metadata qemuSaveMetadata, version string) error {
+	if metadata.QEMUVersion != version {
+		return fmt.Errorf("%w: save uses QEMU %q, host has QEMU %q", ErrIncompatibleSave, metadata.QEMUVersion, version)
+	}
+	return nil
 }

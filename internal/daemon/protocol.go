@@ -121,10 +121,15 @@ func (r Response) IsProgress() bool { return r.Stage != "" }
 
 // Info reports daemon wire compatibility details.
 type Info struct {
-	ProtocolVersion int    `json:"protocolVersion"`
-	Version         string `json:"version,omitempty"`
-	Executable      string `json:"executable,omitempty"`
-	PID             int    `json:"pid,omitempty"`
+	ProtocolVersion int `json:"protocolVersion"`
+	// Platform is the daemon's GOOS/GOARCH pair (for example "darwin/arm64").
+	// Doctor derives platform-tier wording (the Intel best-effort tag) from the
+	// process that owns the hypervisors rather than from the client's runtime,
+	// which may differ under Rosetta. Absent from older daemons.
+	Platform   string `json:"platform,omitempty"`
+	Version    string `json:"version,omitempty"`
+	Executable string `json:"executable,omitempty"`
+	PID        int    `json:"pid,omitempty"`
 	// BalloonReserveMiB is the host-memory reserve the daemon's
 	// provision-start gate actually measures against. It is read in the daemon
 	// process, where TBX_BALLOON_RESERVE_MIB takes effect, so a CLI reporting
@@ -145,13 +150,16 @@ type Info struct {
 
 // HypervisorInfo reports one daemon-probed backend and its feature gates.
 type HypervisorInfo struct {
-	Name                         hypervisor.Name   `json:"name"`
-	Available                    bool              `json:"available,omitempty"`
-	AvailabilityReason           string            `json:"availabilityReason,omitempty"`
-	AvailabilityRemediation      string            `json:"availabilityRemediation,omitempty"`
-	BalloonReadback              FeatureStatusInfo `json:"balloonReadback,omitempty"`
-	SuspendSurvivesDaemonRestart bool              `json:"suspendSurvivesDaemonRestart,omitempty"`
-	GuestAgent                   FeatureStatusInfo `json:"guestAgent,omitempty"`
+	Name                    hypervisor.Name   `json:"name"`
+	Available               bool              `json:"available,omitempty"`
+	AvailabilityReason      string            `json:"availabilityReason,omitempty"`
+	AvailabilityRemediation string            `json:"availabilityRemediation,omitempty"`
+	BalloonReadback         FeatureStatusInfo `json:"balloonReadback,omitempty"`
+	// Suspend is a pointer so a daemon predating the field decodes as nil —
+	// unknown — rather than as an authoritative "unsupported".
+	Suspend                      *FeatureStatusInfo `json:"suspend,omitempty"`
+	SuspendSurvivesDaemonRestart bool               `json:"suspendSurvivesDaemonRestart,omitempty"`
+	GuestAgent                   FeatureStatusInfo  `json:"guestAgent,omitempty"`
 }
 
 // FeatureStatusInfo is the daemon protocol representation of a feature gate.

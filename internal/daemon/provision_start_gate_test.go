@@ -410,6 +410,81 @@ func TestProvisionStartPreBalloonsRunningGuestsInsteadOfRefusing(t *testing.T) {
 	}
 }
 
+func TestProvisionStartPreBalloonsQEMUButExemptsVZMaintenance(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	const nodeMiB = 2048
+	qemu, err := cluster.New("mixed-qemu", 0, 1, 0, cluster.NodeDefaults{MemoryMiB: nodeMiB})
+	if err != nil {
+		t.Fatal(err)
+	}
+	qemu.Hypervisor = string(hypervisor.NameQEMU)
+	if err := cluster.Save(qemu); err != nil {
+		t.Fatal(err)
+	}
+	vz, err := cluster.New("mixed-vz", 1, 1, 0, cluster.NodeDefaults{MemoryMiB: nodeMiB})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vz.Hypervisor = string(hypervisor.NameVZ)
+	if err := cluster.Save(vz); err != nil {
+		t.Fatal(err)
+	}
+
+	qemuMachine := &fakeMachine{active: true}
+	vzMachine := &fakeMachine{active: true}
+	service := &Server{
+		hypervisors: fakeRegistry(hypervisor.NameQEMU, map[hypervisor.Name]hypervisor.Hypervisor{
+			hypervisor.NameQEMU: &fakeHypervisor{capabilities: hypervisor.Capabilities{
+				BalloonReadback: hypervisor.FeatureStatus{Supported: true},
+			}},
+			hypervisor.NameVZ: &fakeHypervisor{},
+		}),
+		vms: map[string]map[string]hypervisor.Machine{
+			qemu.Name: {qemu.Nodes[0].Name: qemuMachine},
+			vz.Name:   {vz.Nodes[0].Name: vzMachine},
+		},
+		nodeIPLookup: func(mac string, _ int) string {
+			if mac == vz.Nodes[0].MAC {
+				return vz.Nodes[0].IP
+			}
+			return qemu.Nodes[0].IP
+		},
+		nodeProbe: func(ip string) ProbeResult {
+			if ip == vz.Nodes[0].IP {
+				return ProbeResult{Dialed: true, TLS: true, MaintenanceCert: true}
+			}
+			return ProbeResult{}
+		},
+		hostPressure:    noHostPressure,
+		hostTotalMemory: plentifulHostMemory,
+	}
+	const shortfall = 512
+	service.hostFreeMemory = func() (int, error) {
+		return balloon.DefaultConfig().ReserveMiB + nodeMiB - shortfall, nil
+	}
+
+	warnings, _, err := service.checkProvisionStart(t.TempDir(), nodeMiB, false)
+	if err != nil {
+		t.Fatalf("checkProvisionStart() = %v, want QEMU reclaim to cover the mixed-host shortfall", err)
+	}
+	if joined := strings.Join(warnings, "\n"); !strings.Contains(joined, "pre-ballooned 512 MiB") {
+		t.Fatalf("checkProvisionStart() warnings = %q, want the pre-balloon narration", warnings)
+	}
+	if len(qemuMachine.memoryTargets) == 0 {
+		t.Fatal("QEMU node did not contribute reclaim")
+	}
+	if len(vzMachine.memoryTargets) != 0 {
+		t.Fatalf("VZ maintenance node targets = %v, want it exempt from reclaim", vzMachine.memoryTargets)
+	}
+	reclaimed := nodeMiB - qemuMachine.memoryTargets[len(qemuMachine.memoryTargets)-1]
+	if reclaimed < shortfall {
+		t.Fatalf("QEMU reclaim = %d MiB, want at least the %d MiB shortfall", reclaimed, shortfall)
+	}
+	if got := service.BalloonHoldMiB(); got != reclaimed {
+		t.Fatalf("BalloonHoldMiB() = %d, want the %d MiB QEMU reclaim held", got, reclaimed)
+	}
+}
+
 // The hold is measured from the configured size, not from the shortfall this
 // admission asked for: the balloon manager recomputes every target from
 // ConfiguredMiB, so a hold covering only the increment hands back whatever an

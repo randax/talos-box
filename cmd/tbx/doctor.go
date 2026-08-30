@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -702,7 +703,26 @@ func guestAgentFinding(
 
 const hypervisorProbeTimeout = 2 * time.Second
 
+var (
+	doctorGOOS   = runtime.GOOS
+	doctorGOARCH = runtime.GOARCH
+)
+
+// hypervisorPlatformTag labels support tiers that are a property of the
+// platform rather than of a probe. platform is the GOOS/GOARCH pair of the
+// process that owns the hypervisors: the daemon's when the inventory came over
+// the wire, this client's for a local probe.
+func hypervisorPlatformTag(platform string, name string) string {
+	if platform == "darwin/amd64" && name == string(hypervisor.NameQEMU) {
+		return "best-effort platform"
+	}
+	return ""
+}
+
 type doctorHypervisorInventory struct {
+	// platform is the inventory owner's GOOS/GOARCH pair (see
+	// hypervisorPlatformTag). Empty when an older daemon did not report one.
+	platform      string
 	items         []daemon.HypervisorInfo
 	defaultName   hypervisor.Name
 	defaultSource hypervisor.DefaultSource
@@ -717,7 +737,14 @@ func doctorHypervisors(deps doctorDependencies) doctorHypervisorInventory {
 	}
 	info, err := deps.daemonInfo()
 	if err == nil && len(info.Hypervisors) > 0 {
+		// A daemon predating Info.Platform reports none; fall back to this
+		// client's runtime, the pre-platform-field behaviour.
+		platform := info.Platform
+		if platform == "" {
+			platform = doctorGOOS + "/" + doctorGOARCH
+		}
 		inventory := doctorHypervisorInventory{
+			platform:      platform,
 			items:         info.Hypervisors,
 			defaultName:   info.DefaultHypervisor,
 			defaultSource: info.DefaultHypervisorSource,
@@ -759,13 +786,16 @@ func doctorHypervisors(deps doctorDependencies) doctorHypervisorInventory {
 		if entry.Availability.Available && entry.Hypervisor != nil {
 			capabilities := entry.Hypervisor.Capabilities()
 			item.BalloonReadback = daemon.NewFeatureStatusInfo(capabilities.BalloonReadback)
+			suspend := daemon.NewFeatureStatusInfo(capabilities.Suspend)
+			item.Suspend = &suspend
 			item.SuspendSurvivesDaemonRestart = capabilities.SuspendSurvivesDaemonRestart
 			item.GuestAgent = daemon.NewFeatureStatusInfo(capabilities.GuestAgent)
 		}
 		items = append(items, item)
 	}
 	return doctorHypervisorInventory{
-		items: items, defaultName: registry.Default.Name, defaultSource: registry.Default.Source, compiledName: registry.CompiledDefault, localProbeTag: localProbeTag,
+		platform: doctorGOOS + "/" + doctorGOARCH,
+		items:    items, defaultName: registry.Default.Name, defaultSource: registry.Default.Source, compiledName: registry.CompiledDefault, localProbeTag: localProbeTag,
 	}
 }
 
@@ -782,7 +812,16 @@ func hypervisorFindings(inventory doctorHypervisorInventory) []doctorFinding {
 	findings := make([]doctorFinding, 0, len(items))
 	for _, item := range items {
 		availability := "available"
+		if tag := hypervisorPlatformTag(inventory.platform, string(item.Name)); item.Available && tag != "" {
+			availability += " (" + tag + ")"
+		}
 		balloonReadback := featureGate(item.BalloonReadback)
+		// A daemon predating the suspend gate omits the field; that is not
+		// evidence of "unsupported", so say so.
+		suspend := "unknown"
+		if item.Suspend != nil {
+			suspend = featureGate(*item.Suspend)
+		}
 		suspendRestart := "unsupported"
 		if item.SuspendSurvivesDaemonRestart {
 			suspendRestart = "supported"
@@ -800,13 +839,13 @@ func hypervisorFindings(inventory doctorHypervisorInventory) []doctorFinding {
 			if len(details) != 0 {
 				availability += " (" + strings.Join(details, "; ") + ")"
 			}
-			balloonReadback, suspendRestart, guestAgent = "unavailable", "unavailable", "unavailable"
+			balloonReadback, suspend, suspendRestart, guestAgent = "unavailable", "unavailable", "unavailable", "unavailable"
 		}
 		defaultStatus := "no"
 		if item.Name == inventory.defaultName {
 			defaultStatus = "yes (source=" + string(inventory.defaultSource) + ")"
 		}
-		detail := fmt.Sprintf("%s: availability=%s; default=%s; balloon-readback=%s; suspend-survives-restart=%s; guest-agent=%s", item.Name, availability, defaultStatus, balloonReadback, suspendRestart, guestAgent)
+		detail := fmt.Sprintf("%s: availability=%s; default=%s; balloon-readback=%s; suspend=%s; suspend-survives-restart=%s; guest-agent=%s", item.Name, availability, defaultStatus, balloonReadback, suspend, suspendRestart, guestAgent)
 		if inventory.localProbeTag != "" {
 			detail += "; " + inventory.localProbeTag
 		}

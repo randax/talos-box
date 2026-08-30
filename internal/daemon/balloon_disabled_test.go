@@ -9,17 +9,20 @@ import (
 
 // A daemon built with TBX_DISABLE_BALLOON launches balloon-less guests, hides
 // them from the manager and counts no reclaimable memory (#513).
-func TestDisabledBalloonLaunchesWithoutDeviceAndReclaimsNothing(t *testing.T) {
+func TestDisabledBalloonQEMULaunchesWithoutDeviceAndReclaimsNothing(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	item, err := cluster.New("no-balloon", 0, 1, 0, cluster.NodeDefaults{CPUs: 2, MemoryMiB: 4096})
 	if err != nil {
 		t.Fatal(err)
 	}
+	item.Hypervisor = string(hypervisor.NameQEMU)
 	backend := &fakeHypervisor{capabilities: hypervisor.Capabilities{
 		BalloonReadback: hypervisor.FeatureStatus{Supported: true},
 	}}
 	service := &Server{
-		hypervisors:     singleFakeRegistry(backend),
+		hypervisors: fakeRegistry(hypervisor.NameQEMU, map[hypervisor.Name]hypervisor.Hypervisor{
+			hypervisor.NameQEMU: backend,
+		}),
 		vms:             make(map[string]map[string]hypervisor.Machine),
 		subnetSources:   emptySubnetSources(),
 		balloonDisabled: true,

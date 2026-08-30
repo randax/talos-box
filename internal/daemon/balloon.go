@@ -103,10 +103,14 @@ func (s *Server) Balloonables() map[string]balloon.Balloonable {
 	return s.balloonablesFrom(candidates)
 }
 
-// balloonablesFrom is the package-level constructor bound to this server's
-// target ledger and teardown latch.
+// balloonablesFrom binds the package-level constructor to this server's node
+// probe, target ledger and teardown latch.
 func (s *Server) balloonablesFrom(candidates map[string]balloonCandidate) map[string]balloon.Balloonable {
-	return balloonablesFrom(candidates, s.recordBalloonTarget, s.balloonQuiesced)
+	probe := s.nodeProbe
+	if probe == nil {
+		probe = probeAPID
+	}
+	return balloonablesFromWithProbe(candidates, probe, s.recordBalloonTarget, s.balloonQuiesced)
 }
 
 // quiesceBalloon takes the teardown latch: while any caller holds it the
@@ -145,6 +149,10 @@ func (s *Server) balloonablesLocked() map[string]balloon.Balloonable {
 // inventory. Callers must hold opMu.
 func (s *Server) balloonCandidatesLocked() map[string]balloonCandidate {
 	candidates := map[string]balloonCandidate{}
+	lookupIP := s.nodeIPLookup
+	if lookupIP == nil {
+		lookupIP = cluster.LookupIP
+	}
 	for clusterName, nodes := range s.vms {
 		item, err := cluster.Load(clusterName)
 		if err != nil {
@@ -171,7 +179,7 @@ func (s *Server) balloonCandidatesLocked() map[string]balloonCandidate {
 				machine:                 machine,
 				configuredMiB:           item.DefaultsFor(node.Role).MemoryMiB,
 				currentTargetMiB:        s.balloonTargetMiB(key),
-				ip:                      cluster.LookupIP(node.MAC, item.SubnetIndex),
+				ip:                      lookupIP(node.MAC, item.SubnetIndex),
 				tolerateDeviceNotActive: balloonReadback,
 				balloonReadback:         balloonReadback,
 			}
@@ -185,9 +193,13 @@ func (s *Server) balloonCandidatesLocked() map[string]balloonCandidate {
 
 // balloonablesFrom applies the eligibility rule to the captured candidates.
 func balloonablesFrom(candidates map[string]balloonCandidate, record func(string, int), quiesced func() bool) map[string]balloon.Balloonable {
+	return balloonablesFromWithProbe(candidates, probeAPID, record, quiesced)
+}
+
+func balloonablesFromWithProbe(candidates map[string]balloonCandidate, probe func(string) ProbeResult, record func(string, int), quiesced func() bool) map[string]balloon.Balloonable {
 	out := map[string]balloon.Balloonable{}
 	for key, e := range candidates {
-		if e.balloonReadback || (e.ip != "" && ClassifyPhase(true, probeAPID(e.ip)) == PhaseConfigured) {
+		if e.balloonReadback || (e.ip != "" && ClassifyPhase(true, probe(e.ip)) == PhaseConfigured) {
 			machine := balloonMachine{
 				machine:                 e.machine,
 				configuredMiB:           e.configuredMiB,
