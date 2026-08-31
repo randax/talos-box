@@ -890,13 +890,7 @@ func ciliumProbeTLSSecretState(ctx context.Context, transport http.RoundTripper,
 }
 
 func ciliumProbeTLSSecretMatches(object map[string]any, pki ingressPKI) error {
-	if secretType, _, _ := unstructured.NestedString(object, "type"); secretType != "kubernetes.io/tls" {
-		return fmt.Errorf("cilium ingress TLS Secret type = %q, want kubernetes.io/tls", secretType)
-	}
-	if tlsCert, _, _ := unstructured.NestedString(object, "data", "tls.crt"); tlsCert != encodeSecretData(pki.TLSCertPEM) {
-		return errors.New("cilium ingress TLS Secret does not match the on-disk leaf certificate")
-	}
-	return nil
+	return ingressTLSSecretExactObjectMatch(object, pki)
 }
 
 func ciliumProbePortNumber(path map[string]any) (int64, bool) {

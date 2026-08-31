@@ -255,6 +255,15 @@ func TestWaitForProbeRoutesCiliumDirectIPThroughTheWildcardIngress(t *testing.T)
 	if _, err := waitForProbe(ctx, mismatched, item, time.Millisecond, httpClient); err == nil || !strings.Contains(err.Error(), "TLS Secret") {
 		t.Fatalf("waitForProbe() with stale TLS Secret error = %v", err)
 	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+	staleKeySecret := secret.DeepCopy()
+	staleKeySecret.Data = map[string][]byte{corev1.TLSCertKey: pki.TLSCertPEM, corev1.TLSPrivateKeyKey: []byte("stale")}
+	mismatched = kubernetesfake.NewClientset(readyDeployment, ingressService, probeService, ingressClass, probeIngress, staleKeySecret)
+	if _, err := waitForProbe(ctx, mismatched, item, time.Millisecond, httpClient); err == nil || !strings.Contains(err.Error(), "TLS Secret") {
+		t.Fatalf("waitForProbe() with stale TLS key error = %v", err)
+	}
 }
 
 func TestLiveVIPSelectsTheCNIServiceAndHostRouting(t *testing.T) {
