@@ -16,6 +16,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +25,7 @@ import (
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/manifests"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -50,6 +53,74 @@ func TestWaitForCiliumRequiresOperatorAgentAndEnvoy(t *testing.T) {
 	defer cancel()
 	if err := waitForCilium(ctx, kubernetesfake.NewClientset(operator, agent), time.Millisecond); err == nil {
 		t.Fatal("Cilium passed without envoy")
+	}
+}
+
+func TestWaitForIngressTLSVerifiesTheHostnameWhileConnectingToTheVIP(t *testing.T) {
+	now := time.Date(2026, time.August, 31, 10, 0, 0, 0, time.UTC)
+	item := cluster.Cluster{Name: "demo", Domain: "workshop.internal", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true}}
+	pki, err := ensureIngressPKI(item, testIngressPKIPaths(t), ingressPKIOptions{Now: fixedTime(now), Rand: newDeterministicReader(20)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	transportFactory := func(config *tls.Config, _ func(context.Context, string, string) (net.Conn, error)) http.RoundTripper {
+		if config.ServerName != "probe.workshop.internal" {
+			t.Fatalf("TLS ServerName = %q", config.ServerName)
+		}
+		if _, err := pki.LeafCertificate.Verify(x509.VerifyOptions{DNSName: config.ServerName, Roots: config.RootCAs, CurrentTime: now.Add(time.Hour)}); err != nil {
+			t.Fatalf("generated certificate does not verify with readiness TLS config: %v", err)
+		}
+		return roundTripper(func(request *http.Request) (*http.Response, error) {
+			if request.URL.String() != "https://172.30.9.200/" {
+				t.Errorf("TLS probe URL = %s", request.URL)
+			}
+			if request.Host != "probe.workshop.internal" {
+				t.Errorf("TLS probe Host = %q", request.Host)
+			}
+			return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: http.NoBody, Header: make(http.Header)}, nil
+		})
+	}
+	if err := waitForIngressTLS(context.Background(), item, "172.30.9.200", pki, transportFactory); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRecreateLegacyCiliumProbeServiceTransitionsOnlyTheManagedLoadBalancer(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		service    *corev1.Service
+		wantDelete bool
+		wantError  bool
+	}{
+		{
+			name:       "managed legacy LoadBalancer",
+			service:    &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "lb-probe", Namespace: probeNamespace, Labels: map[string]string{"talosbox.dev/managed": "true"}}, Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer}},
+			wantDelete: true,
+		},
+		{
+			name:    "already ClusterIP",
+			service: &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "lb-probe", Namespace: probeNamespace, Labels: map[string]string{"talosbox.dev/managed": "true"}}, Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeClusterIP}},
+		},
+		{
+			name:      "unmanaged LoadBalancer",
+			service:   &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "lb-probe", Namespace: probeNamespace}, Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer}},
+			wantError: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := kubernetesfake.NewClientset(test.service)
+			err := recreateLegacyCiliumProbeService(context.Background(), client, time.Millisecond)
+			if (err != nil) != test.wantError {
+				t.Fatalf("recreateLegacyCiliumProbeService() error = %v", err)
+			}
+			deleted := false
+			for _, action := range client.Actions() {
+				deleted = deleted || action.GetVerb() == "delete" && action.GetResource().Resource == "services"
+			}
+			if deleted != test.wantDelete {
+				t.Fatalf("Service delete action = %t, want %t", deleted, test.wantDelete)
+			}
+		})
 	}
 }
 
@@ -300,6 +371,23 @@ type ciliumConvergedOptions struct {
 
 func ciliumConvergedServerWithOptions(t *testing.T, item cluster.Cluster, options ciliumConvergedOptions) (*httptest.Server, []byte) {
 	t.Helper()
+	if item.LB {
+		t.Setenv("HOME", t.TempDir())
+		if _, err := ensureIngressPKI(item, ingressPKIPathsForDir(filepath.Join(os.Getenv("HOME"), ".talosbox", "clusters", item.Name)), ingressPKIOptions{
+			Now:  func() time.Time { return time.Date(2026, time.August, 31, 10, 0, 0, 0, time.UTC) },
+			Rand: newDeterministicReader(11),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	originalHTTPProbe := ciliumDirectHTTPProbe
+	originalTLSProbe := ciliumDirectTLSProbe
+	ciliumDirectHTTPProbe = func(context.Context, cluster.Cluster, string, *http.Client) error { return nil }
+	ciliumDirectTLSProbe = func(context.Context, cluster.Cluster, string, ingressPKI) error { return nil }
+	t.Cleanup(func() {
+		ciliumDirectHTTPProbe = originalHTTPProbe
+		ciliumDirectTLSProbe = originalTLSProbe
+	})
 	hubbleCandidates, err := ciliumHubbleObjects(item)
 	if err != nil {
 		t.Fatal(err)
@@ -332,6 +420,18 @@ func ciliumConvergedServerWithOptions(t *testing.T, item cluster.Cluster, option
 			return
 		}
 		switch path {
+		case "/apis/networking.k8s.io/v1/ingressclasses/cilium":
+			if !item.LB {
+				writer.WriteHeader(http.StatusNotFound)
+				return
+			}
+			_, _ = writer.Write([]byte(`{"metadata":{"annotations":{"ingressclass.kubernetes.io/is-default-class":"true"}}}`))
+		case "/api/v1/namespaces/kube-system/services/cilium-ingress":
+			if !item.LB {
+				writer.WriteHeader(http.StatusNotFound)
+				return
+			}
+			_, _ = writer.Write([]byte(fmt.Sprintf(`{"metadata":{"annotations":{"lbipam.cilium.io/ips":"172.30.%d.200"}},"status":{"loadBalancer":{"ingress":[{"ip":"172.30.%d.200"}]}}}`, item.SubnetIndex, item.SubnetIndex)))
 		case "/apis/apps/v1/namespaces/kube-system/deployments/cilium-operator":
 			_, _ = writer.Write([]byte(`{"metadata":{"generation":1},"status":{"observedGeneration":1,"readyReplicas":1,"availableReplicas":1}}`))
 		case "/apis/apps/v1/namespaces/kube-system/daemonsets/cilium", "/apis/apps/v1/namespaces/kube-system/daemonsets/cilium-envoy":
@@ -356,6 +456,26 @@ func ciliumConvergedServerWithOptions(t *testing.T, item cluster.Cluster, option
 				return
 			}
 			_, _ = writer.Write([]byte(ciliumProbeObjectJSON))
+		case ciliumProbeIngressPath():
+			if !item.LB {
+				writer.WriteHeader(http.StatusNotFound)
+				return
+			}
+			if options.unmanagedProbe {
+				_, _ = writer.Write([]byte(`{}`))
+				return
+			}
+			_, _ = writer.Write([]byte(ciliumProbeIngressJSON))
+		case ciliumProbeTLSSecretPath():
+			if !item.LB {
+				writer.WriteHeader(http.StatusNotFound)
+				return
+			}
+			if options.unmanagedProbe {
+				_, _ = writer.Write([]byte(`{}`))
+				return
+			}
+			_, _ = writer.Write([]byte(ciliumProbeSecretJSON))
 		case "/apis/cilium.io/v2/ciliumloadbalancerippools/demo-pool":
 			if !item.LB {
 				writer.WriteHeader(http.StatusNotFound)
@@ -407,7 +527,9 @@ const ciliumOwnedObjectJSON = `{"metadata":{"annotations":{"talosbox.dev/announc
 const ciliumHubbleOwnedObjectJSON = `{"metadata":{"annotations":{"talosbox.dev/hubble-owned":"talosbox"}}}`
 const ciliumOwnedDeploymentJSON = `{"metadata":{"generation":1,"annotations":{"talosbox.dev/hubble-owned":"talosbox"}},"status":{"observedGeneration":1,"readyReplicas":1,"availableReplicas":1}}`
 const ciliumProbeDeploymentJSON = `{"metadata":{"generation":1,"labels":{"talosbox.dev/managed":"true"}},"status":{"observedGeneration":1,"readyReplicas":1,"availableReplicas":1}}`
-const ciliumProbeObjectJSON = `{"metadata":{"labels":{"talosbox.dev/managed":"true"}}}`
+const ciliumProbeObjectJSON = `{"metadata":{"labels":{"talosbox.dev/managed":"true"}},"spec":{"type":"ClusterIP"}}`
+const ciliumProbeIngressJSON = `{"metadata":{"labels":{"talosbox.dev/managed":"true"}}}`
+const ciliumProbeSecretJSON = `{"metadata":{"labels":{"talosbox.dev/managed":"true"}}}`
 const ciliumUnmanagedDeploymentJSON = `{"metadata":{"generation":1},"status":{"observedGeneration":1,"readyReplicas":1,"availableReplicas":1}}`
 
 func TestRenderCiliumUsesPinnedTalosValuesAndNativeLoadBalancer(t *testing.T) {
@@ -443,13 +565,39 @@ func TestRenderCiliumUsesPinnedTalosValuesAndNativeLoadBalancer(t *testing.T) {
 	if got := objectKinds(extras); got != "CiliumLoadBalancerIPPool,CiliumL2AnnouncementPolicy" {
 		t.Fatalf("Cilium extras = %s", got)
 	}
-	if got := objectKinds(probe); got != "Namespace,Deployment,Service" {
+	if got := objectKinds(probe); got != "Namespace,Deployment,Service,Ingress" {
 		t.Fatalf("Cilium probe = %s", got)
 	}
-	service := probe[len(probe)-1]
-	annotation, found, err := nestedStringField(service.Object, "metadata", "annotations", "lbipam.cilium.io/ips")
-	if err != nil || !found || annotation != "172.30.3.200" {
-		t.Fatalf("Cilium probe requested IP = %q, found=%t, err=%v", annotation, found, err)
+	ingressClass := findRenderedObject(t, objects, "IngressClass", "cilium")
+	if got := ingressClass.GetAnnotations()["ingressclass.kubernetes.io/is-default-class"]; got != "true" {
+		t.Fatalf("Cilium IngressClass default annotation = %q", got)
+	}
+	ingressService := findRenderedObject(t, objects, "Service", "cilium-ingress")
+	if ingressService.GetNamespace() != ciliumNamespace {
+		t.Fatalf("Cilium ingress Service namespace = %q, want %q", ingressService.GetNamespace(), ciliumNamespace)
+	}
+	if serviceType, _, _ := unstructured.NestedString(ingressService.Object, "spec", "type"); serviceType != "LoadBalancer" {
+		t.Fatalf("Cilium ingress Service type = %q", serviceType)
+	}
+	if got := ingressService.GetAnnotations()["lbipam.cilium.io/ips"]; got != "172.30.3.200" {
+		t.Fatalf("Cilium ingress Service requested IP = %q", got)
+	}
+	probeService := findRenderedObject(t, probe, "Service", "lb-probe")
+	if serviceType, _, _ := unstructured.NestedString(probeService.Object, "spec", "type"); serviceType != "ClusterIP" {
+		t.Fatalf("Cilium probe Service type = %q", serviceType)
+	}
+	probeIngress := findRenderedObject(t, probe, "Ingress", "lb-probe")
+	if probeIngress.GetLabels()["talosbox.dev/managed"] != "true" {
+		t.Fatal("Cilium probe Ingress is not talosbox-owned")
+	}
+	if ingressClassName, _, _ := unstructured.NestedString(probeIngress.Object, "spec", "ingressClassName"); ingressClassName != "cilium" {
+		t.Fatalf("Cilium probe Ingress class = %q", ingressClassName)
+	}
+	if host, _, _ := nestedStringField(probeIngress.Object, "spec", "rules", "0", "host"); host != "*.demo.k8s.test" {
+		t.Fatalf("Cilium probe Ingress host = %q", host)
+	}
+	if _, found, _ := unstructured.NestedFieldNoCopy(probeIngress.Object, "spec", "defaultBackend"); found {
+		t.Fatal("Cilium probe Ingress uses spec.defaultBackend")
 	}
 	for _, object := range objects {
 		image, found, err := nestedStringField(object.Object, "spec", "template", "spec", "containers", "0", "image")
@@ -462,7 +610,7 @@ func TestRenderCiliumUsesPinnedTalosValuesAndNativeLoadBalancer(t *testing.T) {
 	}
 }
 
-func TestCiliumValuesHaveNoIngressOrHubble(t *testing.T) {
+func TestCiliumValuesEnableIngressWithoutHubble(t *testing.T) {
 	facts := manifests.Facts{Cluster: "demo", SubnetIndex: 3, LB: true}
 	values := manifests.CiliumValues(facts)
 	for _, wanted := range []string{
@@ -471,7 +619,10 @@ func TestCiliumValuesHaveNoIngressOrHubble(t *testing.T) {
 		"k8sServiceHost: localhost",
 		"k8sServicePort: 7445",
 		"hostLegacyRouting: true",
-		"enabled: false",
+		"ingressController:\n  enabled: true\n  default: true\n  loadbalancerMode: shared\n  enforceHttps: false",
+		"defaultSecretNamespace: talosbox-system",
+		"defaultSecretName: ingress-wildcard-tls",
+		"lbipam.cilium.io/ips: \"172.30.3.200\"",
 		"hubble:\n  enabled: false\n  tls:\n    auto:\n      method: cronJob\n  relay:\n    enabled: false\n  ui:\n    enabled: false",
 		"qps: 10",
 		"burst: 20",
@@ -480,7 +631,7 @@ func TestCiliumValuesHaveNoIngressOrHubble(t *testing.T) {
 			t.Errorf("Cilium values missing %q:\n%s", wanted, values)
 		}
 	}
-	for _, forbidden := range []string{"loadbalancerMode", "lbipam.cilium.io/ips", "default: true"} {
+	for _, forbidden := range []string{"enforceHttps: true", "spec.defaultBackend"} {
 		if strings.Contains(values, forbidden) {
 			t.Errorf("Cilium values unexpectedly contain %q:\n%s", forbidden, values)
 		}
@@ -920,7 +1071,7 @@ func TestCiliumReconcileSurfacesSandboxHintOnAPIServerDeadline(t *testing.T) {
 	_, err := reconciler.reconcile(ctx, cluster.Cluster{
 		Name:               "demo",
 		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium},
-	}, &rest.Config{Host: "http://127.0.0.1:1"}, nil)
+	}, &rest.Config{Host: "http://127.0.0.1:1"}, nil, ingressPKI{})
 	if err == nil {
 		t.Fatal("Cilium reconcile passed against a closed API server port")
 	}

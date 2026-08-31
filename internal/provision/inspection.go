@@ -267,6 +267,9 @@ func inspectProvisioning(item cluster.Cluster) (inspection, error) {
 			namespace: ciliumNamespace,
 		}
 		namespaces, chart, extras, probe := partitionCiliumObjects(objects)
+		if item.LB {
+			probe = append(probe, inspectionIngressTLSSecretObject())
+		}
 		result.values = manifests.CiliumValues(manifestFacts(item))
 		result.objects, err = encodeInspectionObjects(append(namespaces, chart...))
 		if err != nil {
