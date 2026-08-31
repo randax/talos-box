@@ -17,24 +17,28 @@ func unsupportedTrustPlatform(goos string) error {
 	return fmt.Errorf("tbx trust is not supported on %s; install the cluster ingress CA manually", goos)
 }
 
-func (c cli) installDarwinTrust(name, caPath, fingerprint string) (*trustReceipt, error) {
+func planDarwinTrust(name, fingerprint string) (*trustReceipt, error) {
 	home, err := trustUserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("find home directory: %w", err)
 	}
 	keychain := filepath.Join(home, "Library", "Keychains", "login.keychain-db")
+	return &trustReceipt{Cluster: name, Fingerprint: fingerprint, Store: "login keychain", Driver: darwinTrustDriver, Path: keychain}, nil
+}
+
+func (c cli) performDarwinTrust(receipt trustReceipt, caPath string) error {
 	security, err := trustLookPath("/usr/bin/security")
 	if err != nil {
-		return nil, fmt.Errorf("find macOS security tool: %w", err)
+		return fmt.Errorf("find macOS security tool: %w", err)
 	}
 	if _, err := fmt.Fprintln(c.out, "macOS will show an interactive approval prompt for this trust change; approve it to continue."); err != nil {
-		return nil, err
+		return err
 	}
-	command := trustCommand{Name: security, Args: []string{"add-trusted-cert", "-r", "trustRoot", "-k", keychain, caPath}}
+	command := trustCommand{Name: security, Args: []string{"add-trusted-cert", "-r", "trustRoot", "-k", receipt.Path, caPath}}
 	if err := trustRunCommand(command, c.in, c.out, c.err); err != nil {
-		return nil, fmt.Errorf("install ingress CA in macOS login keychain: %w", err)
+		return fmt.Errorf("install ingress CA in macOS login keychain: %w", err)
 	}
-	return &trustReceipt{Cluster: name, Fingerprint: fingerprint, Store: "login keychain", Driver: darwinTrustDriver, Path: keychain}, nil
+	return nil
 }
 
 func (c cli) removeDarwinTrust(receipt trustReceipt) error {
@@ -81,7 +85,7 @@ type linuxTrustDriver struct {
 	Refresh  trustCommand
 }
 
-func (c cli) installLinuxTrust(name, caPath string, caPEM []byte, fingerprint string) (*trustReceipt, error) {
+func (c cli) planLinuxTrust(name, caPath, fingerprint string) (*trustReceipt, error) {
 	driver, nixos, err := detectLinuxTrustDriver()
 	if err != nil {
 		return nil, err
@@ -92,11 +96,12 @@ func (c cli) installLinuxTrust(name, caPath string, caPEM []byte, fingerprint st
 	}
 	filename := fmt.Sprintf("talosbox-%s-ingress-ca.crt", name)
 	destination := filepath.Join(driver.StoreDir, filename)
-	action := trustSystemAction{Operation: trustOperationInstall, Driver: driver.Name, Fingerprint: fingerprint, Destination: destination}
-	if err := executeLinuxTrustAction(action, caPEM); err != nil {
-		return nil, err
-	}
 	return &trustReceipt{Cluster: name, Fingerprint: fingerprint, Store: driver.StoreDir, Driver: driver.Name, Path: destination}, nil
+}
+
+func performLinuxTrust(receipt trustReceipt, caPEM []byte) error {
+	action := trustSystemAction{Operation: trustOperationInstall, Driver: receipt.Driver, Fingerprint: receipt.Fingerprint, Destination: receipt.Path}
+	return executeLinuxTrustAction(action, caPEM)
 }
 
 func (c cli) removeLinuxTrust(receipt trustReceipt) error {

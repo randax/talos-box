@@ -198,6 +198,260 @@ func TestDarwinTrustCancellationReturnsFailureWithoutReceipt(t *testing.T) {
 	}
 }
 
+func TestTrustInstallWritesPendingReceiptBeforePlatformMutation(t *testing.T) {
+	for _, goos := range []string{"darwin", "linux"} {
+		t.Run(goos, func(t *testing.T) {
+			fixture := newTrustFixture(t, goos)
+			fixture.osRelease = []byte("ID=ubuntu\n")
+			assertPending := func() {
+				t.Helper()
+				receipt, err := readTrustReceipt(fixture.cluster)
+				if err != nil {
+					t.Fatalf("read receipt before mutation: %v", err)
+				}
+				if !receipt.Pending || !receipt.InstalledAt.IsZero() {
+					t.Fatalf("receipt before mutation = %+v, want pending without installation time", receipt)
+				}
+			}
+			switch goos {
+			case "darwin":
+				trustRunCommand = func(command trustCommand, _ io.Reader, _, _ io.Writer) error {
+					if command.Args[0] == "add-trusted-cert" {
+						assertPending()
+					}
+					return nil
+				}
+			case "linux":
+				trustSudoReexec = func(action trustSystemAction, _ []byte) error {
+					if action.Operation == trustOperationInstall {
+						assertPending()
+					}
+					return nil
+				}
+			}
+
+			command := cli{out: &fixture.stdout, err: &fixture.stderr, daemon: nil}
+			if err := command.run([]string{"trust", "install", fixture.cluster}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestTrustInstallPerformFailureRollsBackPendingReceipt(t *testing.T) {
+	for _, goos := range []string{"darwin", "linux"} {
+		t.Run(goos, func(t *testing.T) {
+			fixture := newTrustFixture(t, goos)
+			fixture.osRelease = []byte("ID=ubuntu\n")
+			performErr := errors.New("mutation failed")
+			trustRunCommand = func(trustCommand, io.Reader, io.Writer, io.Writer) error { return performErr }
+			trustSudoReexec = func(trustSystemAction, []byte) error { return performErr }
+
+			command := cli{out: &fixture.stdout, err: &fixture.stderr, daemon: nil}
+			err := command.run([]string{"trust", "install", fixture.cluster})
+			if !errors.Is(err, performErr) {
+				t.Fatalf("install error = %v, want platform mutation failure", err)
+			}
+			if _, err := readTrustReceipt(fixture.cluster); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("pending receipt remains after failed mutation: %v", err)
+			}
+		})
+	}
+}
+
+func TestTrustInstallPerformAndRollbackFailuresAreBothReported(t *testing.T) {
+	for _, goos := range []string{"darwin", "linux"} {
+		t.Run(goos, func(t *testing.T) {
+			fixture := newTrustFixture(t, goos)
+			fixture.osRelease = []byte("ID=ubuntu\n")
+			performErr := errors.New("mutation failed")
+			rollbackErr := errors.New("rollback failed")
+			trustRunCommand = func(trustCommand, io.Reader, io.Writer, io.Writer) error { return performErr }
+			trustSudoReexec = func(trustSystemAction, []byte) error { return performErr }
+			receiptPath, err := trustReceiptPath(fixture.cluster)
+			if err != nil {
+				t.Fatal(err)
+			}
+			trustRemove = func(path string) error {
+				if path == receiptPath {
+					return rollbackErr
+				}
+				return os.Remove(path)
+			}
+
+			command := cli{out: &fixture.stdout, err: &fixture.stderr, daemon: nil}
+			err = command.run([]string{"trust", "install", fixture.cluster})
+			if !errors.Is(err, performErr) || !strings.Contains(err.Error(), rollbackErr.Error()) || !strings.Contains(err.Error(), "leftover pending trust receipt") || !strings.Contains(err.Error(), receiptPath) {
+				t.Fatalf("install error = %v, want mutation and rollback failures", err)
+			}
+		})
+	}
+}
+
+func TestTrustInstallFinalizeFailureCanBeRecoveredWithoutRemutation(t *testing.T) {
+	for _, goos := range []string{"darwin", "linux"} {
+		t.Run(goos, func(t *testing.T) {
+			fixture := newTrustFixture(t, goos)
+			fixture.osRelease = []byte("ID=ubuntu\n")
+			installed := false
+			mutations := 0
+			var anchorPath string
+			originalRead := trustReadFile
+			trustReadFile = func(path string) ([]byte, error) {
+				if installed && path == anchorPath {
+					return fixture.certPEM, nil
+				}
+				return originalRead(path)
+			}
+			trustRunCommand = func(command trustCommand, _ io.Reader, stdout, _ io.Writer) error {
+				switch command.Args[0] {
+				case "add-trusted-cert":
+					mutations++
+					installed = true
+				case "find-certificate":
+					if !installed {
+						return errors.New("not found")
+					}
+					_, _ = io.WriteString(stdout, "SHA-256 hash: "+fixture.fingerprint+"\n")
+				}
+				return nil
+			}
+			trustSudoReexec = func(action trustSystemAction, _ []byte) error {
+				anchorPath = action.Destination
+				if action.Operation == trustOperationInstall {
+					mutations++
+					installed = true
+				}
+				return nil
+			}
+			renames := 0
+			finalizeErr := errors.New("finalize failed")
+			trustRename = func(oldPath, newPath string) error {
+				renames++
+				if renames == 2 {
+					return finalizeErr
+				}
+				return os.Rename(oldPath, newPath)
+			}
+
+			command := cli{out: &fixture.stdout, err: &fixture.stderr, daemon: nil}
+			err := command.run([]string{"trust", "install", fixture.cluster})
+			if !errors.Is(err, finalizeErr) || !strings.Contains(err.Error(), "trust store was updated") || !strings.Contains(err.Error(), "trust remove") {
+				t.Fatalf("install error = %v, want actionable finalization failure", err)
+			}
+			receipt, err := readTrustReceipt(fixture.cluster)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !receipt.Pending || !receipt.InstalledAt.IsZero() {
+				t.Fatalf("receipt after failed finalization = %+v", receipt)
+			}
+			anchorPath = receipt.Path
+
+			if err := command.run([]string{"trust", "install", fixture.cluster}); err != nil {
+				t.Fatal(err)
+			}
+			if mutations != 1 {
+				t.Fatalf("platform mutation count = %d, want one", mutations)
+			}
+			receipt, err = readTrustReceipt(fixture.cluster)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if receipt.Pending || receipt.InstalledAt.IsZero() {
+				t.Fatalf("receipt after retry = %+v, want finalized", receipt)
+			}
+		})
+	}
+}
+
+func TestTrustRemoveCleansPendingReceiptAfterFinalizeFailure(t *testing.T) {
+	for _, goos := range []string{"darwin", "linux"} {
+		t.Run(goos, func(t *testing.T) {
+			fixture := newTrustFixture(t, goos)
+			fixture.osRelease = []byte("ID=ubuntu\n")
+			installed := false
+			trustRunCommand = func(command trustCommand, _ io.Reader, stdout, _ io.Writer) error {
+				switch command.Args[0] {
+				case "add-trusted-cert":
+					installed = true
+				case "find-certificate":
+					if !installed {
+						return errors.New("not found")
+					}
+					_, _ = io.WriteString(stdout, "SHA-256 hash: "+fixture.fingerprint+"\n")
+				case "delete-certificate":
+					installed = false
+				}
+				return nil
+			}
+			var anchorPath string
+			originalRead := trustReadFile
+			trustReadFile = func(path string) ([]byte, error) {
+				if installed && path == anchorPath {
+					return fixture.certPEM, nil
+				}
+				return originalRead(path)
+			}
+			trustSudoReexec = func(action trustSystemAction, _ []byte) error {
+				anchorPath = action.Destination
+				installed = action.Operation == trustOperationInstall
+				return nil
+			}
+			renames := 0
+			trustRename = func(oldPath, newPath string) error {
+				renames++
+				if renames == 2 {
+					return errors.New("finalize failed")
+				}
+				return os.Rename(oldPath, newPath)
+			}
+
+			command := cli{out: &fixture.stdout, err: &fixture.stderr, daemon: nil}
+			if err := command.run([]string{"trust", "install", fixture.cluster}); err == nil {
+				t.Fatal("install unexpectedly finalized")
+			}
+			if err := command.run([]string{"trust", "remove", fixture.cluster}); err != nil {
+				t.Fatal(err)
+			}
+			if installed {
+				t.Fatal("platform trust entry remains after pending receipt removal")
+			}
+			if _, err := readTrustReceipt(fixture.cluster); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("pending receipt remains after remove: %v", err)
+			}
+		})
+	}
+}
+
+func TestDarwinTrustRemovePendingAbsentEntrySkipsDelete(t *testing.T) {
+	fixture := newTrustFixture(t, "darwin")
+	receipt, err := planDarwinTrust(fixture.cluster, fixture.fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt.Pending = true
+	if err := writeTrustReceipt(*receipt); err != nil {
+		t.Fatal(err)
+	}
+	var commands []trustCommand
+	trustRunCommand = func(command trustCommand, _ io.Reader, _, _ io.Writer) error {
+		commands = append(commands, command)
+		return errors.New("not found")
+	}
+
+	command := cli{out: &fixture.stdout, err: &fixture.stderr, daemon: nil}
+	if err := command.run([]string{"trust", "remove", fixture.cluster}); err != nil {
+		t.Fatal(err)
+	}
+	if len(commands) != 1 || commands[0].Args[0] != "find-certificate" {
+		t.Fatalf("commands = %+v, want lookup without deletion", commands)
+	}
+	if _, err := readTrustReceipt(fixture.cluster); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pending receipt remains: %v", err)
+	}
+}
+
 func TestNixOSTrustInstallPrintsDeclarationWithoutMutation(t *testing.T) {
 	fixture := newTrustFixture(t, "linux")
 	fixture.osRelease = []byte("ID=nixos\n")

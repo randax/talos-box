@@ -209,8 +209,8 @@ require 'sudo systemctl restart tbx-helper.service' "$systemd_harness"
 require 'prepare_workdir "tbx-systemd-packaging-e2e.XXXXXX"' "$systemd_harness"
 require 'state_backup="$workdir/reservations.json.backup"' "$systemd_harness"
 require 'state_backup_moved_flag="$workdir/reservations-backup.moved"' "$systemd_harness"
-require 'sudo mv "$state_file" "$state_backup"' "$systemd_harness"
 require 'touch "$state_backup_moved_flag"' "$systemd_harness"
+require 'sudo mv "$state_file" "$state_backup"' "$systemd_harness"
 require "retry 'periodic net.sync reservation and DHCP recovery' 19 5" "$systemd_harness"
 require 'fresh DHCP exchange and maintenance reachability' "$systemd_harness"
 require 'sudo test -e "$state_file" || return 1' "$systemd_harness"
@@ -225,8 +225,8 @@ require 'sudo rm -f -- "$state_file"' "$systemd_harness"
 require 'sudo mv "$state_backup" "$state_file"' "$systemd_harness"
 state_backup_move_line=$(grep -nF 'sudo mv "$state_file" "$state_backup"' "$systemd_harness" | head -n 1 | cut -d: -f1)
 state_backup_flag_line=$(grep -nF 'touch "$state_backup_moved_flag"' "$systemd_harness" | head -n 1 | cut -d: -f1)
-if [[ -z "$state_backup_move_line" || -z "$state_backup_flag_line" || $state_backup_move_line -ge $state_backup_flag_line ]]; then
-  printf 'packaged-systemd recovery must mark the move only after the sudo move succeeds in %s\n' "$systemd_harness" >&2
+if [[ -z "$state_backup_move_line" || -z "$state_backup_flag_line" || $state_backup_flag_line -ge $state_backup_move_line ]]; then
+  printf 'packaged-systemd recovery must arm state restoration before the destructive move in %s\n' "$systemd_harness" >&2
   exit 1
 fi
 require '/usr/bin/tbx system restart' "$systemd_harness"

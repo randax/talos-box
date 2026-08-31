@@ -28,6 +28,7 @@ type trustReceipt struct {
 	Store       string    `json:"store"`
 	Driver      string    `json:"driver"`
 	Path        string    `json:"path"`
+	Pending     bool      `json:"pending,omitempty"`
 	InstalledAt time.Time `json:"installedAt"`
 }
 
@@ -98,6 +99,13 @@ func (c cli) installTrust(name string) error {
 				return validateErr
 			}
 			if matched {
+				if receipt.Pending {
+					if err := finalizeTrustReceipt(receipt); err != nil {
+						return trustReceiptFinalizeError(name, err)
+					}
+					_, err = fmt.Fprintf(c.out, "installed ingress CA trust for cluster %s (%s)\n", name, receipt.Store)
+					return err
+				}
 				_, err = fmt.Fprintf(c.out, "ingress CA for cluster %s is already installed (%s)\n", name, receipt.Store)
 				return err
 			}
@@ -111,9 +119,9 @@ func (c cli) installTrust(name string) error {
 	var receipt *trustReceipt
 	switch trustGOOS() {
 	case "darwin":
-		receipt, err = c.installDarwinTrust(name, caPath, fingerprint)
+		receipt, err = planDarwinTrust(name, fingerprint)
 	case "linux":
-		receipt, err = c.installLinuxTrust(name, caPath, caPEM, fingerprint)
+		receipt, err = c.planLinuxTrust(name, caPath, fingerprint)
 	default:
 		err = unsupportedTrustPlatform(trustGOOS())
 	}
@@ -123,12 +131,47 @@ func (c cli) installTrust(name string) error {
 	if receipt == nil { // NixOS prints declarative instructions and mutates nothing.
 		return nil
 	}
-	receipt.InstalledAt = trustNow().UTC()
+	receipt.Pending = true
 	if err := writeTrustReceipt(*receipt); err != nil {
 		return err
 	}
+	switch receipt.Driver {
+	case darwinTrustDriver:
+		err = c.performDarwinTrust(*receipt, caPath)
+	case linuxDebianDriver, linuxFedoraDriver, linuxP11KitDriver:
+		err = performLinuxTrust(*receipt, caPEM)
+	default:
+		err = fmt.Errorf("unsupported trust driver %q", receipt.Driver)
+	}
+	if err != nil {
+		return rollbackPendingTrustReceipt(name, err)
+	}
+	if err := finalizeTrustReceipt(*receipt); err != nil {
+		return trustReceiptFinalizeError(name, err)
+	}
 	_, err = fmt.Fprintf(c.out, "installed ingress CA trust for cluster %s (%s)\n", name, receipt.Store)
 	return err
+}
+
+func finalizeTrustReceipt(receipt trustReceipt) error {
+	receipt.Pending = false
+	receipt.InstalledAt = trustNow().UTC()
+	return writeTrustReceipt(receipt)
+}
+
+func rollbackPendingTrustReceipt(name string, performErr error) error {
+	path, err := trustReceiptPath(name)
+	if err != nil {
+		return fmt.Errorf("%w; also failed to locate the leftover pending trust receipt for rollback: %v", performErr, err)
+	}
+	if err := trustRemove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("%w; also failed to remove the leftover pending trust receipt %s: %v", performErr, path, err)
+	}
+	return performErr
+}
+
+func trustReceiptFinalizeError(name string, err error) error {
+	return fmt.Errorf("trust store was updated but the receipt could not be finalized for cluster %s: %w; re-run `tbx trust install %s` to finalize it or `tbx trust remove %s` to undo it", name, err, name, name)
 }
 
 func (c cli) removeTrust(name string) error {
@@ -148,6 +191,15 @@ func (c cli) removeTrust(name string) error {
 	case darwinTrustDriver:
 		if trustGOOS() != "darwin" {
 			return fmt.Errorf("trust receipt for cluster %q belongs to macOS; remove it on macOS", name)
+		}
+		if receipt.Pending {
+			matched, matchErr := c.darwinTrustEntryMatches(name, receipt, receipt.Fingerprint)
+			if matchErr != nil {
+				return matchErr
+			}
+			if !matched {
+				break
+			}
 		}
 		err = c.removeDarwinTrust(receipt)
 	case linuxDebianDriver, linuxFedoraDriver, linuxP11KitDriver:
