@@ -97,7 +97,7 @@ func run() (err error) {
 	if err := daemon.SyncHelperState(); err != nil {
 		log.Printf("startup helper state sync: %v", err)
 	}
-	stopHostNetworkingMaintenance := startHostNetworkingMaintenance()
+	stopHostNetworkingMaintenance := startHostNetworkingMaintenance(server)
 	// registry mirrors are bound per cluster gateway by the daemon (see #39).
 
 	if disabled, raw := balloon.DisableSetting(); disabled {
