@@ -215,6 +215,57 @@ func TestCiliumValuesSizeClientRateLimitForL2Announcements(t *testing.T) {
 	}
 }
 
+func TestCiliumValuesEnableSharedIngressAtTheFirstLoadBalancerAddress(t *testing.T) {
+	var values struct {
+		IngressController struct {
+			Enabled                bool   `yaml:"enabled"`
+			Default                bool   `yaml:"default"`
+			LoadBalancerMode       string `yaml:"loadbalancerMode"`
+			EnforceHTTPS           bool   `yaml:"enforceHttps"`
+			DefaultSecretNamespace string `yaml:"defaultSecretNamespace"`
+			DefaultSecretName      string `yaml:"defaultSecretName"`
+			SecretsNamespace       struct {
+				Create bool   `yaml:"create"`
+				Name   string `yaml:"name"`
+				Sync   bool   `yaml:"sync"`
+			} `yaml:"secretsNamespace"`
+			Service struct {
+				Annotations map[string]string `yaml:"annotations"`
+			} `yaml:"service"`
+		} `yaml:"ingressController"`
+	}
+	if err := yaml.Unmarshal([]byte(CiliumValues(Facts{Cluster: "demo", SubnetIndex: 17, CNI: "cilium", LB: true})), &values); err != nil {
+		t.Fatal(err)
+	}
+	ingress := values.IngressController
+	if !ingress.Enabled || !ingress.Default || ingress.LoadBalancerMode != "shared" || ingress.EnforceHTTPS {
+		t.Fatalf("ingress controller mode = enabled:%t default:%t mode:%q enforceHTTPS:%t", ingress.Enabled, ingress.Default, ingress.LoadBalancerMode, ingress.EnforceHTTPS)
+	}
+	if ingress.DefaultSecretNamespace != "talosbox-system" || ingress.DefaultSecretName != "ingress-wildcard-tls" {
+		t.Errorf("default ingress secret = %s/%s", ingress.DefaultSecretNamespace, ingress.DefaultSecretName)
+	}
+	if !ingress.SecretsNamespace.Create || ingress.SecretsNamespace.Name != "cilium-secrets" || !ingress.SecretsNamespace.Sync {
+		t.Errorf("ingress secrets namespace = %+v", ingress.SecretsNamespace)
+	}
+	if got := ingress.Service.Annotations["lbipam.cilium.io/ips"]; got != "172.30.17.200" {
+		t.Errorf("ingress service pinned IP = %q, want 172.30.17.200", got)
+	}
+}
+
+func TestCiliumValuesDisableIngressWithoutLoadBalancerSupport(t *testing.T) {
+	var values struct {
+		IngressController struct {
+			Enabled bool `yaml:"enabled"`
+		} `yaml:"ingressController"`
+	}
+	if err := yaml.Unmarshal([]byte(CiliumValues(Facts{Cluster: "demo", CNI: "cilium"})), &values); err != nil {
+		t.Fatal(err)
+	}
+	if values.IngressController.Enabled {
+		t.Fatal("ingress controller is enabled on cilium with lb:false")
+	}
+}
+
 func TestCiliumValuesMakeHubbleRelayAndUIFollowIntent(t *testing.T) {
 	for _, tt := range []struct {
 		name   string
