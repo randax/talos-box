@@ -269,7 +269,7 @@ trust-anchor mutation and refresh:
 | Distribution family | Anchor directory | Refresh command |
 |---|---|---|
 | Debian/Ubuntu | `/usr/local/share/ca-certificates` | `update-ca-certificates` |
-| Fedora/RHEL | `/etc/pki/ca-trust/source/anchors` | `update-ca-trust extract` |
+| Fedora/RHEL/CentOS | `/etc/pki/ca-trust/source/anchors` | `update-ca-trust extract` |
 | Arch/p11-kit | `/etc/ca-certificates/trust-source/anchors` | `trust extract-compat` |
 
 Unsupported mutable distributions fail clearly and name those three supported anchor directories;
