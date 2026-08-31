@@ -10,6 +10,7 @@ depot_e2e="$root/.depot/workflows/e2e.yml"
 depot_floor="$root/.depot/workflows/floor-e2e.yml"
 harness="$root/scripts/ci/linux-kvm-e2e.sh"
 storage_harness="$root/scripts/ci/linux-kvm-storage-e2e.sh"
+systemd_harness="$root/scripts/qa/linux-systemd-packaging-e2e.sh"
 lib="$root/scripts/ci/kvm-e2e-lib.sh"
 
 require() {
@@ -172,6 +173,45 @@ for checked_harness in "$harness" "$storage_harness"; do
 done
 require 'console e2e' "$harness"
 require 'console e2es' "$storage_harness"
+
+# The packaged-systemd lane is deliberately separate from the two init-agnostic
+# CI harnesses. It must install the checkout package and exercise the live unit,
+# forwarding, DHCP persistence/recovery, and supervised restart contracts.
+if [[ ! -x "$systemd_harness" ]]; then
+  printf 'expected executable packaged-systemd QA harness at %s\n' "$systemd_harness" >&2
+  exit 1
+fi
+require '--i-know-this-installs-system-files' "$systemd_harness"
+require 'readlink /proc/1/exe' "$systemd_harness"
+require 'systemctl is-system-running' "$systemd_harness"
+require 'sudo cp -a "$root/packaging/linux/." /' "$systemd_harness"
+require 'systemd-sysusers' "$systemd_harness"
+require 'sudo systemctl daemon-reload' "$systemd_harness"
+require 'systemctl --user daemon-reload' "$systemd_harness"
+require 'enable --now tbx-helper.socket' "$systemd_harness"
+require 'enable --now tbxd.socket' "$systemd_harness"
+require 'AmbientCapabilities' "$systemd_harness"
+require 'CapabilityBoundingSet' "$systemd_harness"
+require '/proc/sys/net/ipv4/ip_forward' "$systemd_harness"
+require '/proc/sys/net/ipv4/conf/$bridge/forwarding' "$systemd_harness"
+require '/var/lib/tbx/reservations.json' "$systemd_harness"
+require "ss -H -ulpn 'sport = :67'" "$systemd_harness"
+require 'nft list table inet tbx' "$systemd_harness"
+require '--data-urlencode "host=$target"' "$systemd_harness"
+require 'assert_routed_dial "$vip_a" "$vip_b"' "$systemd_harness"
+require 'assert_routed_dial "$vip_b" "$vip_a"' "$systemd_harness"
+require 'sudo systemctl restart tbx-helper.service' "$systemd_harness"
+require 'sudo mv "$state_file" "$state_backup"' "$systemd_harness"
+require "retry 'periodic net.sync reservation and DHCP recovery' 19 5" "$systemd_harness"
+require 'fresh DHCP exchange and maintenance reachability' "$systemd_harness"
+require '/usr/bin/tbx system restart' "$systemd_harness"
+require 'systemctl --user restart tbxd.service' "$systemd_harness"
+require "grep -Fq -- '--force'" "$systemd_harness"
+require 'cluster destroy "$cluster_b" --force' "$systemd_harness"
+require 'cluster destroy "$cluster_a" --force' "$systemd_harness"
+require 'dump_failure_diagnostics() (' "$systemd_harness"
+require 'journalctl -u tbx-helper.socket -u tbx-helper.service' "$systemd_harness"
+require 'journalctl --user -u tbxd.socket -u tbxd.service' "$systemd_harness"
 
 for kvm_workflow in "$depot_e2e" "$depot_floor"; do
   if grep -Eq -- 'setfacl| acl|udev' "$kvm_workflow"; then
