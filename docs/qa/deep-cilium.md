@@ -4,8 +4,8 @@
 |---|---|
 | **Tier** | Deep (one feature area exercised against defaults) |
 | **Platform** | macOS + Linux (platform-specific charters marked) |
-| **Estimated duration** | 75–90 min (includes the 30-minute steady-state blackout baseline) |
-| **Destructive** | Creates and destroys clusters `qa-cil` and `qa-hub`; does not touch other clusters or host config |
+| **Estimated duration** | 90–105 min (includes the 30-minute steady-state blackout baseline and browser trust check) |
+| **Destructive** | Creates and destroys clusters `qa-cil` and `qa-hub`; temporarily changes host ingress trust for `qa-cil` and removes it before cleanup |
 | **Runbook version** | against talos-box main @ the commit recorded in your report |
 
 ## How to execute this runbook (agent instructions)
@@ -31,16 +31,33 @@ Steps:
 2. Follow `tbx status qa-cil` until it reports the provisioned end state (record the phase progression it shows).
 3. Export credentials exactly as the status hints print them (kubeconfig/talosconfig exports).
 4. `kubectl get nodes -o wide` and `kubectl -n kube-system get pods -l k8s-app=cilium`
-5. `curl -sv http://<cluster-subnet>.200/ --max-time 10` (the `.200` ingress VIP; expect connection-level success — any HTTP answer, including 404, proves the LB path).
+5. Inspect the ingress path:
+   - `kubectl get ingressclass cilium -o yaml`
+   - `kubectl -n kube-system get service cilium-ingress -o wide`
+   - `kubectl -n talosbox-system get deployment,service,ingress lb-probe -o yaml`
+   - `kubectl -n talosbox-system get secret ingress-wildcard-tls -o yaml`
+   - `kubectl -n cilium-secrets get secret ingress-wildcard-tls -o yaml`
+6. `curl --fail -sv -H 'Host: probe.qa-cil.k8s.test' http://<cluster-subnet>.200/ --max-time 10`.
 
 Expected observations:
 - Status narrates provisioning progress and lands on a state distinguishing Ready-without-LB from live-VIP; final state reports the VIP live.
 - All 3 nodes `configured` (TLS probe), Kubernetes nodes Ready, Cilium pods Running.
 - kube-proxy is absent (`kubectl -n kube-system get ds kube-proxy` → NotFound) — Cilium replaces it.
-- The VIP at `.200` accepts TCP (L2-announced by default; BGP is off).
-- Cilium's built-in ingress controller is disabled (no `cilium-ingress` service).
+- `IngressClass/cilium` is annotated as the default class.
+- The shared `kube-system/cilium-ingress` LoadBalancer owns exactly `.200` (L2-announced by default; BGP is off).
+- `talosbox-system/lb-probe` is a ready Deployment plus ClusterIP Service. Its managed
+  `Ingress/lb-probe` has `ingressClassName: cilium`, host and TLS host
+  `*.qa-cil.k8s.test`, and `secretName: ingress-wildcard-tls`; it has no
+  `spec.defaultBackend`.
+- The `talosbox-system/ingress-wildcard-tls` Secret is type `kubernetes.io/tls`, and
+  Cilium has synced it to `cilium-secrets` under the same name. Decode `tls.crt` with
+  `openssl x509 -noout -ext subjectAltName` and require the wildcard SAN
+  `DNS:*.qa-cil.k8s.test`.
+- The direct-IP HTTP request returns 200 with the explicit probe Host header and is not
+  redirected to HTTPS.
 
-Pass criteria: nodes Ready, Cilium Running, `.200` answers on TCP.
+Pass criteria: nodes Ready, Cilium Running, every ingress/TLS object matches, and the
+Host-routed direct `.200` probe returns HTTP 200.
 
 On failure: capture `tbx status -o json qa-cil`, `kubectl -n kube-system get pods -A -o wide`, `cilium status` if available via `kubectl exec`, and the create narration.
 
@@ -50,11 +67,11 @@ On failure: capture `tbx status -o json qa-cil`, `kubectl -n kube-system get pod
 
 Steps:
 1. `tbx manifests qa-cil` (section `all`), then individually: `machine`, `values`, `objects`, `extras`, `cilium-values`, `lb-pool`, `l2`, `mirrors`, `k8s`, `talos`. Also run `tbx manifests qa-cil balloon` once: that section is deprecated and MUST error, pointing at `machine` — record the exact text.
-2. Spot-check three claims against the live cluster: the LB pool range in `lb-pool` matches the `.200–.239` convention; `mirrors` shows the single catch-all `http://<gateway>:5059` endpoint with `skipFallback: true`; `machine` carries the `machine.kernel.modules` entry for `virtio_balloon` (SPEC §8's printed-snippet MUST — the `balloon` alias is gone; whether ballooning is actually running is attested from `~/.talosbox/tbxd.log` lines of the form `balloon <cluster>/<node>: target=<n>MiB (configured=… hostFree=… reserve=… deficit=…)`, macOS only).
+2. Spot-check the live cluster against the output: the LB pool range in `lb-pool` matches the `.200–.239` convention; `values` has `ingressController.enabled: true`, `default: true`, `loadbalancerMode: shared`, `enforceHttps: false`, default Secret `talosbox-system/ingress-wildcard-tls`, secret sync through `cilium-secrets`, and the exact `.200` `lbipam.cilium.io/ips` annotation; `mirrors` shows the single catch-all `http://<gateway>:5059` endpoint with `skipFallback: true`; `machine` carries the `machine.kernel.modules` entry for `virtio_balloon` (SPEC §8's printed-snippet MUST — the `balloon` alias is gone; whether ballooning is actually running is attested from `~/.talosbox/tbxd.log` lines of the form `balloon <cluster>/<node>: target=<n>MiB (configured=… hostFree=… reserve=… deficit=…)`, macOS only).
 
 Expected observations: every listed section renders without error; `balloon` errors with a redirect to `machine`; `metallb-values`/`metallb-extras` are refused or empty on the cilium path (flannel-only sections — record the exact behavior); rendered values match live objects (`kubectl get ciliumloadbalancerippools -o yaml` vs `lb-pool`).
 
-Pass criteria: all listed sections render, `balloon` errors as documented, and the three spot-checks match.
+Pass criteria: all listed sections render, `balloon` errors as documented, and every spot-check matches.
 
 On failure: capture the mismatching section output and the live object.
 
@@ -82,7 +99,7 @@ Steps:
 2. Force the lease to move off that node. Which verb is legitimate depends on the topology — a defaults cluster has ONE control-plane node, and removing it would be cluster-fatal, so check the announcer's role first (`kubectl get node <announcer> -o wide` / the `node-role.kubernetes.io/control-plane` label):
    - **Announcer is a worker**: `tbx node remove qa-cil <announcing-worker>` (the supported verb; do not improvise cordon+drain). Since #314 the RPC answers as soon as the node is gone and the post-mutation reconcile continues in the background — follow it in `~/.talosbox/tbxd.log` rather than waiting on the CLI.
    - **Announcer is the sole control-plane node**: do NOT remove it. Hand the lease over instead by bouncing that node's Cilium agent — `kubectl -n kube-system delete pod -l k8s-app=cilium --field-selector spec.nodeName=<announcer>` — and record that this charter ran the handover variant, which measures lease re-announcement rather than node loss. (Alternative, if you want the removal variant on a defaults cluster: `tbx node add qa-cil --role worker`, wait for the lease to land on a worker, then remove that worker.)
-3. Time how long `.200` is unreachable (`while ! curl -s --max-time 1 http://<subnet>.200/ >/dev/null; do date; sleep 2; done`).
+3. Time how long `.200` is unreachable (`while ! curl --fail -s --max-time 1 -H 'Host: probe.qa-cil.k8s.test' http://<subnet>.200/ >/dev/null; do date; sleep 2; done`).
 
 Expected observations:
 - **macOS**: since the GARP work, no observed VIP outage at 2 s polling is the expected result — a zero-outage measurement is a clean PASS, not an anomaly. If GARP does not take, the fallback is macOS ARP revalidation (tens of seconds); anything under ~60 s is still a PASS. Record the measured window either way; only materially slower than ~60 s is worth reporting as friction.
@@ -100,7 +117,7 @@ L2-announcement lease holder and `renewTime`, and Cilium logs containing leader-
 For example, run these concurrently and retain their raw output:
 
 ```sh
-while true; do code="$(curl -sS -o /dev/null --max-time 1 -w '%{http_code}' http://<subnet>.200/ || true)"; printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${code:-000}"; sleep 0.2; done
+while true; do code="$(curl -sS -o /dev/null --max-time 1 -H 'Host: probe.qa-cil.k8s.test' -w '%{http_code}' http://<subnet>.200/ || true)"; printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${code:-000}"; sleep 0.2; done
 kubectl -n kube-system get leases -w -o yaml
 kubectl -n kube-system logs -l k8s-app=cilium --prefix --timestamps -f
 ```
@@ -123,9 +140,64 @@ Only after the baseline, run a deliberate Cilium-pod deletion as a separate foll
 documented 40–50 second macOS failover must not contaminate the steady-state baseline. This
 procedure classifies ownership and captures correlations; it makes no root-cause claim.
 
-### C5 — Destroy and cleanup (always run)
+### C5 — Exact-host ingress, HTTPS trust, and inter-cluster `/dial` (depends on C1 and C3)
 
-Steps: `tbx cluster destroy qa-cil --force`, `tbx cluster destroy qa-hub --force`, verify `tbx status` clean and `~/.talosbox/clusters/` has no `qa-cil`/`qa-hub`.
+**Goal**: prove that an attendee Ingress wins over the talosbox wildcard, uses the curated
+default certificate, is browser-trusted, and leaves the direct-IP inter-cluster probe intact.
+
+Steps:
+1. Apply the walkthrough's nginx Deployment, ClusterIP Service, and explicit Ingress to
+   `qa-cil`, changing the host to `nginx.qa-cil.k8s.test`. Keep
+   `ingressClassName: cilium` and the TLS host, and do not set a TLS `secretName`.
+2. Record the `.200` VIPs for `qa-cil` and `qa-hub`. Require the wildcard fallback to return
+   200 with `curl --fail -H 'Host: anything.qa-cil.k8s.test' http://<qa-cil-vip>/`.
+3. Run `tbx trust install qa-cil`. On macOS approve the documented interactive login-keychain
+   prompt; on conventional Linux record the selected trust-store driver. On NixOS apply the
+   printed `security.pki.certificates` declaration and rebuild instead.
+4. Restart an already-open browser and visit `https://nginx.qa-cil.k8s.test/`. Also run:
+
+   ```sh
+   curl --fail --cacert ~/.talosbox/clusters/qa-cil/ingress-ca.crt \
+     --resolve nginx.qa-cil.k8s.test:443:<qa-cil-vip> \
+     https://nginx.qa-cil.k8s.test/
+   ```
+
+5. Exercise `/dial` in both directions. The outer request must connect directly to the source
+   `.200`, carry `Host: probe.<source-domain>`, and ask agnhost to dial the sibling by
+   `probe.<sibling-domain>` on port 80 with protocol `http`, request `hostname`, and one try.
+   For example, for `qa-cil` to `qa-hub`:
+
+   ```sh
+   curl --fail --get -H 'Host: probe.qa-cil.k8s.test' \
+     --data-urlencode 'host=probe.qa-hub.k8s.test' \
+     --data-urlencode 'port=80' --data-urlencode 'protocol=http' \
+     --data-urlencode 'request=hostname' --data-urlencode 'tries=1' \
+     http://<qa-cil-vip>/dial | jq -e '(.errors | length) == 0 and (.responses | length) > 0'
+   ```
+
+   Repeat with `qa-cil` and `qa-hub` reversed, then require `tbx doctor` to report the
+   `inter-cluster` check as `PASS`.
+6. Run `tbx trust remove qa-cil`; on NixOS remove the declarative entry and rebuild instead.
+   Record that the browser no longer trusts a fresh connection.
+
+Expected observations: the arbitrary hostname still reaches the talosbox wildcard probe; the
+exact nginx hostname returns nginx content instead of the agnhost probe; browser and curl HTTPS
+verification succeed with the per-cluster CA; both `/dial` directions return non-empty responses
+with no errors. The nginx namespace contains no copy of `ingress-wildcard-tls`.
+
+Pass criteria: wildcard fallback, exact-host precedence, hostname-verified HTTPS, browser trust,
+and both direct-IP `/dial` directions pass; removal withdraws host trust.
+
+On failure: capture both Ingresses, the shared Service and endpoints, both TLS Secrets' metadata,
+the decoded leaf certificate, curl verbose output, browser/version, `/dial` JSON, and the
+`inter-cluster` doctor line.
+
+### C6 — Destroy and cleanup (always run)
+
+Steps: make a best-effort `tbx trust remove qa-cil` first (or remove and rebuild the NixOS
+declaration), then run `tbx cluster destroy qa-cil --force` and
+`tbx cluster destroy qa-hub --force`; verify `tbx status` clean,
+`~/.talosbox/clusters/` has no `qa-cil`/`qa-hub`, and no `qa-cil` trust remains.
 
 Pass criteria: no residue.
 
@@ -143,7 +215,8 @@ Pass criteria: no residue.
 | C2 manifests parity | | | |
 | C3 hubble | | | |
 | C4 L2 failover | | | |
-| C5 destroy | | | |
+| C5 ingress/TLS/dial | | | |
+| C6 destroy | | | |
 
 ### Friction log
 ### Failures

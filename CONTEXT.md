@@ -8,11 +8,15 @@ The default posture of talosbox: it provides the substrate — VMs, networking, 
 
 ## Provisioning path
 
-The opt-in fast path that goes beyond the substrate: talosbox generates and applies machine config, bootstraps the cluster, and installs a curated CNI. Both curated paths continue through LB extras to a live ingress VIP by default — Cilium via its native LB-IPAM and L2/BGP announcements, flannel via talosbox-shipped MetalLB (L2 only). Choosing the provisioning path never changes the substrate-only default for other clusters.
+The opt-in fast path that goes beyond the substrate: talosbox generates and applies machine config, bootstraps the cluster, and installs a curated CNI. Cilium continues through a shared ingress controller with wildcard TLS; flannel continues only through a LoadBalancer path backed by talosbox-shipped MetalLB. Choosing the provisioning path never changes the substrate-only default for other clusters.
 
 ## Curated CNI
 
-A CNI from talosbox's fixed, tested set (initially `cilium` and `flannel`). Each curated CNI has a known answer to how it reaches the production-style networking model's end state — a working LoadBalancer path and the ingress VIP — whether natively (Cilium) or via a talosbox-shipped companion (flannel + MetalLB). Arbitrary user-supplied CNIs are not a supported concept.
+A CNI from talosbox's fixed, tested set (initially `cilium` and `flannel`). Cilium owns the curated ingress and LoadBalancer end state; flannel owns only the LoadBalancer end state through its talosbox-shipped MetalLB companion. Arbitrary user-supplied CNIs are not a supported concept.
+
+## Ingress trust
+
+Explicit host trust in a curated Cilium cluster's own ingress CA, making its wildcard HTTPS names browser-trusted without joining ingress trust to Talos control-plane trust.
 
 ## Curated CSI
 

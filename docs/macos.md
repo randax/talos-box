@@ -232,6 +232,35 @@ Follow the report convention in the [QA coverage matrix](qa/MATRIX.md): open one
 labelled `qa-run`, title it `QA Intel macOS <date>`, and include the command output above plus each
 QA charter's PASS, FAIL, PASS-with-friction, or BLOCKED result and supporting evidence.
 
+## Trust curated Cilium ingress
+
+A provisioned Cilium cluster with `lb: true` has its own ingress CA and a wildcard certificate
+for `*.<cluster-domain>`. Install that CA into the current user's login keychain explicitly:
+
+```sh
+tbx trust install <cluster>
+```
+
+Before invoking macOS's `security add-trusted-cert`, `tbx` says that an interactive approval
+prompt will appear. Approve it to continue; cancellation or any keychain failure leaves no
+successful trust receipt. Restart browsers that were already open before testing the HTTPS name.
+Later, remove exactly the recorded CA with:
+
+```sh
+tbx trust remove <cluster>
+```
+
+The non-secret receipt is `~/.talosbox/trust/<cluster>.json`, so removal still identifies the
+certificate after cluster deletion. Cluster destruction does not remove host trust automatically.
+The PKI files live under `~/.talosbox/clusters/<cluster>/`: `ingress-ca.crt`,
+`ingress-ca.key`, `ingress-tls.crt`, and `ingress-tls.key`, all mode `0600` inside the private
+cluster directory. The root CA lasts ten years. The wildcard leaf lasts no more than 397 days
+and is renewed during reconciliation when 30 days or fewer remain; its only DNS name is
+`*.<cluster-domain>`, not the domain apex.
+
+This command does not apply to flannel, whose curated path has no ingress certificate, and
+Windows trust installation remains deferred.
+
 ## macOS networking and ingress
 
 Each cluster gets one pinned vmnet shared-mode network at `172.30.<n>.0/24`, created by the

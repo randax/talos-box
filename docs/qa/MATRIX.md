@@ -10,6 +10,7 @@ All runbooks follow the format decided in [#214](https://github.com/randax/talos
 |---|---|---|---|
 | [smoke-macos](smoke-macos.md) | covered | platform-N/A | macOS-specific preflight/DNS mechanics |
 | [smoke-linux](smoke-linux.md) | platform-N/A | covered | Linux-specific preflight (kvm, units, resolvectl) |
+| [systemd-packaging-linux](systemd-packaging-linux.md) | platform-N/A | covered | Disposable real-systemd host only; operator-run per release on each available package-target distro, not merge-gating CI |
 | [deep-cilium](deep-cilium.md) | covered | covered | C4 failover expectations differ per platform; on macOS a zero-outage result (no VIP outage at 2 s polling, post-GARP) is expected, with ARP revalidation up to ~60 s as the fallback |
 | [deep-flannel](deep-flannel.md) | covered | covered | |
 | [deep-storage](deep-storage.md) | covered | covered | |
