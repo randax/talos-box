@@ -28,6 +28,7 @@ BLOCKED unless all of the following are true:
 - `sudo` authorization is available for installation and failure diagnostics; authorize it at the harness prompt.
 - Go, QEMU/KVM, nftables, iproute2, curl, jq, make, systemd-sysusers, and the other commands named by the harness preflight are installed.
 - No clusters are configured under the current user's `~/.talosbox/clusters` directory.
+- `/var/lib/tbx/reservations.json` is absent or empty before the run. A non-empty file means the host already carries helper state; preserve that machine or restore/delete the file before using this disposable-host harness.
 - Outbound network access is available for Talos images and curated Flannel provisioning dependencies.
 
 The harness refuses to proceed without a deliberately alarming opt-in flag. The flag acknowledges system mutation; it is not a bypass for any other preflight refusal.
@@ -49,7 +50,7 @@ Do not run the helper or daemon by hand alongside the harness. Do not substitute
 3. Cluster `qa-sd-a` enables global and bridge forwarding. Its reservation file is `tbx:tbx` mode `0600` and contains the cluster's actual node name, MAC, and reserved IP. DHCP listens on that cluster bridge, `table inet tbx` names its bridge/subnet, and the guest answers at its reserved address.
 4. Minimal provisioned cluster `qa-sd-b` supplies a second real data plane. Direct VIP requests and `/dial` requests run in both directions, proving traffic crosses host routing/nftables rather than merely reading a sysctl or curling one host-local VIP.
 5. A normal `systemctl restart tbx-helper.service` restores both DHCP listeners.
-6. The stronger #514 sequence stops the helper, moves `reservations.json` aside, starts from empty persisted state, and polls for up to about 90 seconds for periodic `net.sync` to restore the file and both DHCP listeners.
+6. The stronger #514 sequence stops the helper, moves `reservations.json` aside, starts from empty persisted state, and polls for up to about 90 seconds for periodic `net.sync` to restore the file and both DHCP listeners. The harness then restores the original pre-run file on exit instead of leaving the recovered test copy behind.
 7. A node stop/start after recovery returns to the same reserved address with the maintenance API reachable, requiring a fresh DHCP exchange.
 8. An unforced `tbx system restart` is refused under supervision: both running cluster names precede `systemctl --user restart tbxd.service`, no `--force` suggestion appears, and the daemon PID is unchanged.
 9. Both clusters are destroyed and their bridges, DHCP listeners, reservation entries, and nftables bridge/subnet entries disappear.
