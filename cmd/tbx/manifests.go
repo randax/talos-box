@@ -58,6 +58,8 @@ func clusterFromSummary(item daemon.ClusterSummary) cluster.Cluster {
 		Schematic:          item.Schematic,
 		TalosVersion:       item.TalosVersion,
 		ProvisioningIntent: item.ProvisioningIntent,
+		Domain:             item.Domain,
+		AllowUnsafeDomain:  item.AllowUnsafeDomain,
 		Nodes:              nodes,
 	}
 }
