@@ -144,7 +144,7 @@ func (c cli) installTrust(name string) error {
 		err = fmt.Errorf("unsupported trust driver %q", receipt.Driver)
 	}
 	if err != nil {
-		return rollbackPendingTrustReceipt(name, err)
+		return c.recoverFailedTrustInstall(name, *receipt, err)
 	}
 	if err := finalizeTrustReceipt(*receipt); err != nil {
 		return trustReceiptFinalizeError(name, err)
@@ -157,6 +157,19 @@ func finalizeTrustReceipt(receipt trustReceipt) error {
 	receipt.Pending = false
 	receipt.InstalledAt = trustNow().UTC()
 	return writeTrustReceipt(receipt)
+}
+
+// recoverFailedTrustInstall decides what a failed platform mutation leaves
+// behind. The pending receipt is deleted only when the store positively holds
+// no trace of this CA — a Linux refresh can fail after the anchor is written,
+// and deleting the receipt then would orphan an anchor `tbx trust remove`
+// could no longer find. Any mutation or doubt keeps the receipt.
+func (c cli) recoverFailedTrustInstall(name string, receipt trustReceipt, performErr error) error {
+	state, stateErr := c.trustEntryState(name, receipt, receipt.Fingerprint)
+	if stateErr == nil && state == trustEntryAbsent {
+		return rollbackPendingTrustReceipt(name, performErr)
+	}
+	return fmt.Errorf("%w; the trust store may already hold this CA, so its pending receipt was kept — run `tbx trust remove %s` to undo the installation, or `tbx trust install %s` to retry", performErr, name, name)
 }
 
 func rollbackPendingTrustReceipt(name string, performErr error) error {
@@ -193,11 +206,14 @@ func (c cli) removeTrust(name string) error {
 			return fmt.Errorf("trust receipt for cluster %q belongs to macOS; remove it on macOS", name)
 		}
 		if receipt.Pending {
-			matched, matchErr := c.darwinTrustEntryMatches(name, receipt, receipt.Fingerprint)
-			if matchErr != nil {
-				return matchErr
+			// The pending mutation may never have happened. Skip the keychain
+			// delete only when the probe positively finds no matching entry;
+			// an ambiguous lookup keeps the receipt so removal can be retried.
+			state, stateErr := c.darwinTrustEntryState(name, receipt, receipt.Fingerprint)
+			if stateErr != nil {
+				return fmt.Errorf("cannot tell whether the pending ingress CA reached the keychain: %w; the trust receipt was kept — re-run `tbx trust remove %s`", stateErr, name)
 			}
-			if !matched {
+			if state != trustEntryPresent {
 				break
 			}
 		}
@@ -291,15 +307,20 @@ func writeTrustReceipt(receipt trustReceipt) error {
 	return nil
 }
 
-func (c cli) installedTrustEntryMatches(clusterName string, receipt trustReceipt, fingerprint string) (bool, error) {
+func (c cli) trustEntryState(clusterName string, receipt trustReceipt, fingerprint string) (trustEntryState, error) {
 	switch receipt.Driver {
 	case darwinTrustDriver:
-		return c.darwinTrustEntryMatches(clusterName, receipt, fingerprint)
+		return c.darwinTrustEntryState(clusterName, receipt, fingerprint)
 	case linuxDebianDriver, linuxFedoraDriver, linuxP11KitDriver:
-		return linuxTrustEntryMatches(receipt, fingerprint)
+		return linuxTrustEntryState(receipt, fingerprint)
 	default:
-		return false, fmt.Errorf("trust receipt for cluster %q names unsupported driver %q", clusterName, receipt.Driver)
+		return trustEntryAbsent, fmt.Errorf("trust receipt for cluster %q names unsupported driver %q", clusterName, receipt.Driver)
 	}
+}
+
+func (c cli) installedTrustEntryMatches(clusterName string, receipt trustReceipt, fingerprint string) (bool, error) {
+	state, err := c.trustEntryState(clusterName, receipt, fingerprint)
+	return state == trustEntryPresent, err
 }
 
 func runTrustCommandLive(command trustCommand, stdin io.Reader, stdout, stderr io.Writer) error {

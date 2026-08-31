@@ -177,8 +177,11 @@ func TestDarwinTrustCancellationReturnsFailureWithoutReceipt(t *testing.T) {
 	securityPath := "/test-bin/security"
 	trustLookPath = func(name string) (string, error) { return securityPath, nil }
 	var commands []trustCommand
-	trustRunCommand = func(command trustCommand, _ io.Reader, _, _ io.Writer) error {
+	trustRunCommand = func(command trustCommand, _ io.Reader, _, stderr io.Writer) error {
 		commands = append(commands, command)
+		if command.Args[0] == "find-certificate" {
+			return securityNotFound(stderr)
+		}
 		return cancelled
 	}
 
@@ -187,8 +190,8 @@ func TestDarwinTrustCancellationReturnsFailureWithoutReceipt(t *testing.T) {
 	if !errors.Is(err, cancelled) {
 		t.Fatalf("error = %v, want cancellation", err)
 	}
-	if len(commands) != 1 || commands[0].Name != securityPath {
-		t.Fatalf("commands = %+v, want injected security executable", commands)
+	if len(commands) != 2 || commands[0].Name != securityPath || commands[0].Args[0] != "add-trusted-cert" || commands[1].Args[0] != "find-certificate" {
+		t.Fatalf("commands = %+v, want install then absence probe", commands)
 	}
 	if !strings.Contains(fixture.stdout.String(), "interactive approval prompt") {
 		t.Fatalf("prompt warning was not printed before execution:\n%s", fixture.stdout.String())
@@ -244,7 +247,12 @@ func TestTrustInstallPerformFailureRollsBackPendingReceipt(t *testing.T) {
 			fixture := newTrustFixture(t, goos)
 			fixture.osRelease = []byte("ID=ubuntu\n")
 			performErr := errors.New("mutation failed")
-			trustRunCommand = func(trustCommand, io.Reader, io.Writer, io.Writer) error { return performErr }
+			trustRunCommand = func(command trustCommand, _ io.Reader, _, stderr io.Writer) error {
+				if command.Args[0] == "find-certificate" {
+					return securityNotFound(stderr)
+				}
+				return performErr
+			}
 			trustSudoReexec = func(trustSystemAction, []byte) error { return performErr }
 
 			command := cli{out: &fixture.stdout, err: &fixture.stderr, daemon: nil}
@@ -266,7 +274,12 @@ func TestTrustInstallPerformAndRollbackFailuresAreBothReported(t *testing.T) {
 			fixture.osRelease = []byte("ID=ubuntu\n")
 			performErr := errors.New("mutation failed")
 			rollbackErr := errors.New("rollback failed")
-			trustRunCommand = func(trustCommand, io.Reader, io.Writer, io.Writer) error { return performErr }
+			trustRunCommand = func(command trustCommand, _ io.Reader, _, stderr io.Writer) error {
+				if command.Args[0] == "find-certificate" {
+					return securityNotFound(stderr)
+				}
+				return performErr
+			}
 			trustSudoReexec = func(trustSystemAction, []byte) error { return performErr }
 			receiptPath, err := trustReceiptPath(fixture.cluster)
 			if err != nil {
@@ -424,7 +437,54 @@ func TestTrustRemoveCleansPendingReceiptAfterFinalizeFailure(t *testing.T) {
 	}
 }
 
-func TestDarwinTrustRemovePendingAbsentEntrySkipsDelete(t *testing.T) {
+// securityNotFound emulates `security find-certificate` positively reporting
+// an absent item: errSecItemNotFound text on stderr plus a non-zero exit.
+func securityNotFound(stderr io.Writer) error {
+	_, _ = io.WriteString(stderr, "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.\n")
+	return errors.New("exit status 44")
+}
+
+func TestTrustInstallFailureKeepsPendingReceiptWhenStoreStateUnknown(t *testing.T) {
+	for _, goos := range []string{"darwin", "linux"} {
+		t.Run(goos, func(t *testing.T) {
+			fixture := newTrustFixture(t, goos)
+			fixture.osRelease = []byte("ID=ubuntu\n")
+			performErr := errors.New("mutation failed")
+			switch goos {
+			case "darwin":
+				// Every security invocation fails without the not-found
+				// marker: the probe cannot tell whether the keychain changed.
+				trustRunCommand = func(trustCommand, io.Reader, io.Writer, io.Writer) error { return performErr }
+			case "linux":
+				// The refresh step fails after the anchor was written: the
+				// probe finds this cluster's CA already at the anchor path.
+				trustSudoReexec = func(action trustSystemAction, _ []byte) error { return performErr }
+				originalRead := trustReadFile
+				trustReadFile = func(path string) ([]byte, error) {
+					if strings.HasPrefix(filepath.Base(path), "talosbox-") && strings.HasSuffix(path, ".crt") {
+						return fixture.certPEM, nil
+					}
+					return originalRead(path)
+				}
+			}
+
+			command := cli{out: &fixture.stdout, err: &fixture.stderr, daemon: nil}
+			err := command.run([]string{"trust", "install", fixture.cluster})
+			if !errors.Is(err, performErr) || !strings.Contains(err.Error(), "pending receipt was kept") || !strings.Contains(err.Error(), "tbx trust remove") {
+				t.Fatalf("install error = %v, want kept-receipt recovery guidance", err)
+			}
+			receipt, readErr := readTrustReceipt(fixture.cluster)
+			if readErr != nil {
+				t.Fatalf("pending receipt was deleted despite unknown store state: %v", readErr)
+			}
+			if !receipt.Pending {
+				t.Fatalf("receipt = %+v, want pending", receipt)
+			}
+		})
+	}
+}
+
+func TestDarwinTrustRemovePendingAmbiguousLookupKeepsReceipt(t *testing.T) {
 	fixture := newTrustFixture(t, "darwin")
 	receipt, err := planDarwinTrust(fixture.cluster, fixture.fingerprint)
 	if err != nil {
@@ -437,7 +497,36 @@ func TestDarwinTrustRemovePendingAbsentEntrySkipsDelete(t *testing.T) {
 	var commands []trustCommand
 	trustRunCommand = func(command trustCommand, _ io.Reader, _, _ io.Writer) error {
 		commands = append(commands, command)
-		return errors.New("not found")
+		return errors.New("keychain is locked")
+	}
+
+	command := cli{out: &fixture.stdout, err: &fixture.stderr, daemon: nil}
+	err = command.run([]string{"trust", "remove", fixture.cluster})
+	if err == nil || !strings.Contains(err.Error(), "cannot tell whether the pending ingress CA reached the keychain") {
+		t.Fatalf("remove error = %v, want ambiguous-lookup refusal", err)
+	}
+	if len(commands) != 1 || commands[0].Args[0] != "find-certificate" {
+		t.Fatalf("commands = %+v, want lookup only, no deletion attempt", commands)
+	}
+	if _, err := readTrustReceipt(fixture.cluster); err != nil {
+		t.Fatalf("pending receipt was deleted after an ambiguous lookup: %v", err)
+	}
+}
+
+func TestDarwinTrustRemovePendingAbsentEntrySkipsDelete(t *testing.T) {
+	fixture := newTrustFixture(t, "darwin")
+	receipt, err := planDarwinTrust(fixture.cluster, fixture.fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt.Pending = true
+	if err := writeTrustReceipt(*receipt); err != nil {
+		t.Fatal(err)
+	}
+	var commands []trustCommand
+	trustRunCommand = func(command trustCommand, _ io.Reader, _, stderr io.Writer) error {
+		commands = append(commands, command)
+		return securityNotFound(stderr)
 	}
 
 	command := cli{out: &fixture.stdout, err: &fixture.stderr, daemon: nil}
@@ -616,7 +705,7 @@ func TestTrustInstallReinstallsDarwinEntryRemovedOutOfBand(t *testing.T) {
 			return nil
 		case "find-certificate":
 			if installedFingerprint == "" {
-				return errors.New("certificate not found")
+				return securityNotFound(stderr)
 			}
 			_, err := io.WriteString(stdout, "SHA-256 hash: "+installedFingerprint+"\n")
 			return err
@@ -662,7 +751,7 @@ func TestTrustInstallReinstallsDarwinEntrySwappedOutOfBand(t *testing.T) {
 			return nil
 		case "find-certificate":
 			if installedFingerprint == "" {
-				return errors.New("certificate not found")
+				return securityNotFound(stderr)
 			}
 			_, err := io.WriteString(stdout, "SHA-256 hash: "+installedFingerprint+"\n")
 			return err

@@ -53,20 +53,43 @@ func (c cli) removeDarwinTrust(receipt trustReceipt) error {
 	return nil
 }
 
-func (c cli) darwinTrustEntryMatches(clusterName string, receipt trustReceipt, expectedFingerprint string) (bool, error) {
+// trustEntryState is what a trust-store probe positively established about
+// this cluster's CA. An ambiguous probe returns an error instead of a state:
+// callers must never treat "could not look" as "not installed".
+type trustEntryState int
+
+const (
+	// trustEntryAbsent: the store holds no trace of this CA at its location.
+	trustEntryAbsent trustEntryState = iota
+	// trustEntryPresent: the store holds exactly this CA (fingerprint match).
+	trustEntryPresent
+	// trustEntryForeign: something occupies this CA's location that is not it —
+	// a rotated or partially written certificate. The store was mutated.
+	trustEntryForeign
+)
+
+func (c cli) darwinTrustEntryState(clusterName string, receipt trustReceipt, expectedFingerprint string) (trustEntryState, error) {
 	security, err := trustLookPath("/usr/bin/security")
 	if err != nil {
-		return false, fmt.Errorf("find macOS security tool: %w", err)
+		return trustEntryAbsent, fmt.Errorf("find macOS security tool: %w", err)
 	}
 	command := trustCommand{
 		Name: security,
 		Args: []string{"find-certificate", "-Z", "-c", ingressCACommonName(clusterName), receipt.Path},
 	}
-	var stdout bytes.Buffer
-	if err := trustRunCommand(command, nil, &stdout, io.Discard); err != nil {
-		return false, nil
+	var stdout, stderr bytes.Buffer
+	if err := trustRunCommand(command, nil, &stdout, &stderr); err != nil {
+		// errSecItemNotFound is the one failure that positively means absent;
+		// every other failure leaves the keychain state unknown.
+		if strings.Contains(stdout.String()+stderr.String(), "could not be found") {
+			return trustEntryAbsent, nil
+		}
+		return trustEntryAbsent, fmt.Errorf("query macOS login keychain for the ingress CA: %w: %s", err, strings.TrimSpace(stderr.String()))
 	}
-	return outputContainsFingerprint(stdout.String(), expectedFingerprint), nil
+	if outputContainsFingerprint(stdout.String(), expectedFingerprint) {
+		return trustEntryPresent, nil
+	}
+	return trustEntryForeign, nil
 }
 
 const (
@@ -224,22 +247,27 @@ func verifyTrustAnchorFingerprint(path, expectedFingerprint string) error {
 	return fmt.Errorf("refuse to remove trust anchor %s: it changed since installation; remove it manually", path)
 }
 
-func linuxTrustEntryMatches(receipt trustReceipt, expectedFingerprint string) (bool, error) {
+func linuxTrustEntryState(receipt trustReceipt, expectedFingerprint string) (trustEntryState, error) {
 	if expectedFingerprint == "" {
-		return false, errors.New("expected trust-anchor fingerprint is empty")
+		return trustEntryAbsent, errors.New("expected trust-anchor fingerprint is empty")
 	}
 	data, err := trustReadFile(receipt.Path)
 	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
+		return trustEntryAbsent, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("read trust anchor %s: %w", receipt.Path, err)
+		return trustEntryAbsent, fmt.Errorf("read trust anchor %s: %w", receipt.Path, err)
 	}
 	fingerprint, err := trustCertificateFingerprint(data)
 	if err != nil {
-		return false, nil
+		// An unparsable file at the talosbox anchor path is still a mutation —
+		// most likely this install's own partial write.
+		return trustEntryForeign, nil
 	}
-	return fingerprint == expectedFingerprint, nil
+	if fingerprint == expectedFingerprint {
+		return trustEntryPresent, nil
+	}
+	return trustEntryForeign, nil
 }
 
 func detectLinuxTrustDriver() (linuxTrustDriver, bool, error) {
