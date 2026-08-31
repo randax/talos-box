@@ -38,6 +38,11 @@ macOS requires:
   `tbx` does not replace the installed helper: when a release changes the helper protocol, every
   helper call fails with a protocol mismatch naming the `system install` to rerun.
 
+Homebrew builds QEMU without HVF on macOS 14/Sonoma. Upgrade to macOS 15 or newer, reinstall
+QEMU (`brew reinstall qemu` or equivalent), restart `tbxd`, and rerun `tbx doctor`. This
+Homebrew-build constraint does not apply to the QEMU package from nixpkgs; keep the two package
+sources distinct when diagnosing HVF availability.
+
 Suspend/resume is capability-gated rather than version-gated here: memory is preserved while
 the same `tbxd` process stays alive. VZ still warns and safely cold-boots after a daemon
 restart because Virtualization.framework device identity cannot be reconstructed, while QEMU
@@ -48,9 +53,22 @@ cold-boots instead of restoring.
 
 ## Hypervisor selection
 
-VZ stays the zero-install default on Apple Silicon. `TBX_HYPERVISOR` selects QEMU only when you
-want the optional path; otherwise the compiled default stays in effect. The resolved choice is recorded on the
-cluster, so a cluster created as VZ stays VZ even if the daemon default changes later.
+VZ stays the zero-install default on Apple Silicon. A cluster's `clusters[].hypervisor` value
+overrides `TBX_HYPERVISOR`, which overrides the compiled default. `TBX_HYPERVISOR` must be present
+in `tbxd`'s own environment; setting it only in an unrelated client shell does not select the
+daemon default.
+
+The daemon stores the resolved choice on the cluster at creation time. `tbx up` refuses to
+silently change it when a later `talosbox.yaml` disagrees:
+
+```text
+cluster "<name>": hypervisor is immutable (cluster has "<old>", talosbox.yaml wants "<new>"); destroy and recreate the cluster to change the hypervisor
+```
+
+A cluster created as VZ therefore stays VZ even if the daemon default changes later. Flipping
+`TBX_HYPERVISOR` or upgrading to a binary with a different compiled default affects only clusters
+created afterward without an explicit `hypervisor`; it never changes an existing cluster's stored
+choice.
 
 QEMU/HVF is best effort on macOS. Homebrew QEMU needs macOS 15+ to expose HVF; install it with
 `brew install qemu`, or use the QEMU package from nixpkgs. The installed binary must retain the
@@ -71,6 +89,27 @@ TBX_HYPERVISOR=qemu tbx system restart --force
 
 For a self-supervised launchd job, put `TBX_HYPERVISOR` in the job plist's
 `EnvironmentVariables` dictionary, then kickstart that job with `launchctl kickstart -k <domain>/<label>`.
+
+### Local e2e battery
+
+The local battery builds first (and ad-hoc codesigns on Darwin), then runs the e2e-tagged suite.
+The default lane uses the hypervisor on `tbx doctor`'s unique `default=yes` line, which is VZ on
+Apple Silicon unless the daemon default was changed. Pin QEMU explicitly to exercise that lane, or
+run both lanes back to back—VZ first, then QEMU—as separate test invocations sharing one build:
+
+```sh
+make e2e
+TBX_E2E_HYPERVISOR=qemu make e2e
+make e2e-all
+```
+
+The harness validates `TBX_E2E_HYPERVISOR` and renders the selection into every generated
+cluster's YAML (`hypervisor: qemu` in the QEMU lane); it never relies on the daemon's
+`TBX_HYPERVISOR` default. If doctor's `INFO Hypervisors:` inventory says the selected backend is
+unavailable, the relevant tests skip with doctor's reason and remediation. A malformed or missing
+inventory or an invalid selector fails instead of skipping. The QEMU lane's mixed-hypervisor and
+balloon/suspend cases require Apple Silicon hardware; on Intel, VZ does not exist and the mixed
+case also skips because VZ is unavailable, so the QEMU-only battery is not meaningful there.
 
 ## Install host dependencies
 
@@ -139,15 +178,27 @@ such as an inert guest-agent channel or filtered Image Factory egress. `INFO` li
 `tbx doctor` also prints an INFO `Hypervisors` section before the rest of the checks. Each line
 names one hypervisor, its availability, the current default source (`default=yes (source=compiled)`
 or `default=yes (source=TBX_HYPERVISOR)`), and the feature gates used by `tbx status`. The
-macOS QEMU hypervisor currently emits these availability/remediation pairs. On a usable Intel
-Mac, the QEMU line begins exactly:
+macOS QEMU hypervisor currently emits these availability/remediation pairs. On Apple Silicon, a
+fully available QEMU backend that is not the default reads exactly:
 
 ```text
-qemu: availability=available (best-effort platform)
+INFO Hypervisors: qemu: availability=available; default=no; balloon-readback=supported; suspend=supported; suspend-survives-restart=supported; guest-agent=supported
 ```
 
-An unavailable Intel probe keeps its actual reason and remediation instead of the best-effort
-tag. In particular, verify that `sysctl kern.hv_support` prints `1`,
+When `TBX_HYPERVISOR` selects that backend as the daemon default, the line reads:
+
+```text
+INFO Hypervisors: qemu: availability=available; default=yes (source=TBX_HYPERVISOR); balloon-readback=supported; suspend=supported; suspend-survives-restart=supported; guest-agent=supported
+```
+
+On a usable Intel Mac with QEMU 8.2 or newer and the compiled default selected, the QEMU line reads exactly:
+
+```text
+INFO Hypervisors: qemu: availability=available (best-effort platform); default=yes (source=compiled); balloon-readback=supported; suspend=supported; suspend-survives-restart=supported; guest-agent=supported
+```
+
+An unavailable probe keeps its own reason and remediation text unchanged on every platform
+instead of gaining the best-effort platform tag. On Intel, verify that `sysctl kern.hv_support` prints `1`,
 `qemu-system-x86_64 --version` succeeds, and the x86_64 code/vars firmware pair is installed.
 
 - `qemu-system-<arch> was not found on PATH` -> `install QEMU: brew install qemu, then restart tbxd`
@@ -159,6 +210,9 @@ tag. In particular, verify that `sysctl kern.hv_support` prints `1`,
 - `hypervisor feature unsupported: QEMU <version> does not provide required machine type "<machine>"` -> `upgrade QEMU to 6.2 or newer: brew upgrade qemu, then restart tbxd`
 - `resolve QEMU binary path: <error>` -> `upgrade QEMU to 6.2 or newer: brew upgrade qemu, then restart tbxd`
 - `no matching EFI firmware pair found for <arch>` -> `reinstall QEMU so its edk2 firmware is present`
+
+Use the [QEMU hypervisor deep-dive QA charter](qa/deep-hypervisor-qemu.md) for the complete
+backend-parity procedure and evidence requirements.
 
 ### Report an Intel run
 
