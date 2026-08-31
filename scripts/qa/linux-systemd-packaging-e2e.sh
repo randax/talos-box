@@ -77,10 +77,14 @@ cleanup() {
     /usr/bin/tbx cluster destroy "$cluster_a" --force 2>/dev/null || true
   fi
   if [[ -n "$state_backup_moved_flag" && -f "$state_backup_moved_flag" ]]; then
-    if ! restore_state_backup; then
-      printf 'FAILED to restore %s from %s\n' "$state_file" "$state_backup" >&2
-      return 1
+    if sudo test -e "$state_backup"; then
+      if ! restore_state_backup; then
+        # keep the armed flag: it marks that live state still needs manual restoration
+        printf 'FAILED to restore %s from %s\n' "$state_file" "$state_backup" >&2
+        return 1
+      fi
     fi
+    rm -f -- "$state_backup_moved_flag"
   fi
   if [[ "$workdir_owned" == true && -f "$workdir/.talosbox-e2e-owned" ]]; then
     rm -rf -- "$workdir"
@@ -89,7 +93,6 @@ cleanup() {
 trap cleanup EXIT
 
 restore_state_backup() {
-  sudo test -e "$state_backup"
   sudo rm -f -- "$state_file"
   sudo mv "$state_backup" "$state_file"
 }
@@ -286,8 +289,8 @@ retry 'second DHCP listener after normal restart' 30 1 dhcp_listener_on "$(bridg
 
 sudo systemctl stop tbx-helper.service
 sudo test -e "$state_file"
-sudo mv "$state_file" "$state_backup"
 touch "$state_backup_moved_flag"
+sudo mv "$state_file" "$state_backup"
 sudo systemctl start tbx-helper.service
 
 periodic_sync_recovered() {
