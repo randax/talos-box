@@ -36,6 +36,7 @@ All runbooks follow the format decided in [#214](https://github.com/randax/talos
 | Linux QEMU-identity-mismatch restore degradation | Requires two QEMU versions on one host | scenario-suspend-storage C4 marks it SKIPPED |
 | Per-cluster Talos version / curated extensions ([#201](https://github.com/randax/talos-box/issues/201)) | Not yet shipped; runbooks cover main | new deep runbook when it lands (map #211 out-of-scope note) |
 | Best-effort distros (Debian, openSUSE) and non-Ubuntu tier-one | Runbooks are platform-parameterized; no hardware in the executed set yet | same runbooks, new hardware |
+| 24h VZ-vs-QEMU stability soak | Human-run, 24 wall-clock hours; not yet executed | [deep-hypervisor-qemu C7](deep-hypervisor-qemu.md#c7--24-hour-matched-vz-vs-qemu-stability-soak-human-run), runs when a day of hands-off host time is available |
 
 ## Tier semantics
 
