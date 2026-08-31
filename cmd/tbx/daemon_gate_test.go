@@ -253,7 +253,7 @@ func TestCallFailsEveryVerbWhenAStaleDaemonCannotBeRestarted(t *testing.T) {
 	}
 	// tbx system restart refuses a supervised daemon in turn, so the gate must
 	// hand over the supervisor's own command instead of that dead end
-	if !strings.Contains(err.Error(), "run: "+supervisorRestartCommand()) {
+	if !strings.Contains(err.Error(), "run: `"+supervisorRestartCommand()+"`") {
 		t.Fatalf("error = %q, want the supervisor's restart command", err)
 	}
 	if strings.Contains(err.Error(), "run: tbx system restart") {
