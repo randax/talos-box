@@ -508,14 +508,24 @@ func ciliumIngressResourcesReady(ctx context.Context, client kubernetes.Interfac
 		return errors.New("cilium wildcard probe Ingress is not ready")
 	}
 	wildcard := "*." + item.EffectiveDomain()
+	if len(ingress.Spec.Rules) != 1 || ingress.Spec.Rules[0].HTTP == nil || len(ingress.Spec.Rules[0].HTTP.Paths) != 1 {
+		return errors.New("cilium wildcard probe Ingress does not match the cluster domain")
+	}
+	path := ingress.Spec.Rules[0].HTTP.Paths[0]
 	if ingress.Labels["talosbox.dev/managed"] != "true" || ingress.Spec.IngressClassName == nil || *ingress.Spec.IngressClassName != "cilium" ||
 		len(ingress.Spec.Rules) != 1 || ingress.Spec.Rules[0].Host != wildcard || len(ingress.Spec.TLS) != 1 ||
-		ingress.Spec.TLS[0].SecretName != ingressTLSSecretName || len(ingress.Spec.TLS[0].Hosts) != 1 || ingress.Spec.TLS[0].Hosts[0] != wildcard {
+		ingress.Spec.TLS[0].SecretName != ingressTLSSecretName || len(ingress.Spec.TLS[0].Hosts) != 1 || ingress.Spec.TLS[0].Hosts[0] != wildcard ||
+		path.Path != "/" || path.PathType == nil || string(*path.PathType) != "Prefix" || path.Backend.Service == nil ||
+		path.Backend.Service.Name != "lb-probe" || path.Backend.Service.Port.Number != 80 {
 		return errors.New("cilium wildcard probe Ingress does not match the cluster domain")
+	}
+	pki, err := loadIngressPKIForCluster(item)
+	if err != nil {
+		return err
 	}
 	secret, err := client.CoreV1().Secrets(probeNamespace).Get(ctx, ingressTLSSecretName, metav1.GetOptions{})
 	if err != nil || secret.Labels["talosbox.dev/managed"] != "true" || secret.Type != "kubernetes.io/tls" ||
-		len(secret.Data["tls.crt"]) == 0 || len(secret.Data["tls.key"]) == 0 {
+		!bytes.Equal(secret.Data["tls.crt"], pki.TLSCertPEM) {
 		return errors.New("cilium ingress TLS Secret is not ready")
 	}
 	return nil
