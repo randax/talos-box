@@ -181,7 +181,7 @@ func captureE2EDaemonEnvState(t *testing.T) e2eDaemonEnvState {
 		t.Fatalf("read running daemon info from %s: %v", socketPath, err)
 	}
 	state := e2eDaemonEnvState{reserveMiB: info.BalloonReserveMiB}
-	compiled := balloon.DefaultConfig().ReserveMiB
+	compiled := compiledBalloonReserveMiB()
 	if state.reserveMiB == 0 {
 		state.reserveMiB = compiled
 	}
@@ -190,6 +190,19 @@ func captureE2EDaemonEnvState(t *testing.T) e2eDaemonEnvState {
 		state.hypervisorEnv = string(info.DefaultHypervisor)
 	}
 	return state
+}
+
+// compiledBalloonReserveMiB is balloon.DefaultConfig's reserve with the
+// TBX_BALLOON_RESERVE_MIB override stripped: DefaultConfig reads the CURRENT
+// process environment, so a test shell sharing the daemon's custom reserve
+// would otherwise be misread as the compiled default. Safe because these
+// tests never run in parallel.
+func compiledBalloonReserveMiB() int {
+	if v, ok := os.LookupEnv("TBX_BALLOON_RESERVE_MIB"); ok {
+		_ = os.Unsetenv("TBX_BALLOON_RESERVE_MIB")
+		defer func() { _ = os.Setenv("TBX_BALLOON_RESERVE_MIB", v) }()
+	}
+	return balloon.DefaultConfig().ReserveMiB
 }
 
 // env renders the captured daemon environment as restart overrides, with any
