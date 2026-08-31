@@ -2,7 +2,12 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
+	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net"
@@ -1075,29 +1080,63 @@ var (
 	hintGOOS              = runtime.GOOS
 	trustInstalledForHint = trustReceiptAndCertPresent
 	trustHintUserHomeDir  = os.UserHomeDir
+	trustHintReadFile     = os.ReadFile
 	trustHintStat         = os.Stat
 )
 
 // trustReceiptAndCertPresent is deliberately a local filesystem observation:
 // status rendering must never invoke a platform keychain or trust-store tool.
-// The receipt says tbx completed installation, while the CA presence ensures
-// the hint does not claim trust for a cluster whose PKI is incomplete.
+// The receipt says tbx completed installation, while the on-disk CA's current
+// fingerprint proves that receipt still matches this cluster's ingress PKI.
 func trustReceiptAndCertPresent(name string) bool {
 	home, err := trustHintUserHomeDir()
 	if err != nil {
 		return false
 	}
-	paths := []string{
-		filepath.Join(home, ".talosbox", "trust", name+".json"),
-		filepath.Join(home, ".talosbox", "clusters", name, "ingress-ca.crt"),
-	}
-	for _, path := range paths {
+	receiptPath := filepath.Join(home, ".talosbox", "trust", name+".json")
+	certPath := filepath.Join(home, ".talosbox", "clusters", name, "ingress-ca.crt")
+	for _, path := range []string{receiptPath, certPath} {
 		info, err := trustHintStat(path)
 		if err != nil || !info.Mode().IsRegular() {
 			return false
 		}
 	}
-	return true
+	receiptData, err := trustHintReadFile(receiptPath)
+	if err != nil {
+		return false
+	}
+	var receipt struct {
+		Cluster     string `json:"cluster"`
+		Fingerprint string `json:"fingerprint"`
+	}
+	if err := json.Unmarshal(receiptData, &receipt); err != nil {
+		return false
+	}
+	if receipt.Cluster != name || receipt.Fingerprint == "" {
+		return false
+	}
+	certificateData, err := trustHintReadFile(certPath)
+	if err != nil {
+		return false
+	}
+	fingerprint, err := trustHintCertificateFingerprint(certificateData)
+	if err != nil {
+		return false
+	}
+	return receipt.Fingerprint == fingerprint
+}
+
+func trustHintCertificateFingerprint(data []byte) (string, error) {
+	block, _ := pem.Decode(data)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return "", errors.New("PEM does not contain a certificate")
+	}
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return "", fmt.Errorf("parse certificate: %w", err)
+	}
+	digest := sha256.Sum256(certificate.Raw)
+	return strings.ToUpper(hex.EncodeToString(digest[:])), nil
 }
 
 // resolverBypassNote warns that the most obvious DNS tools do not see the name
