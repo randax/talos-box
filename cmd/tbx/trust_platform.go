@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -62,7 +64,7 @@ type linuxTrustDriver struct {
 	Refresh  trustCommand
 }
 
-func (c cli) installLinuxTrust(name, caPath, fingerprint string) (*trustReceipt, error) {
+func (c cli) installLinuxTrust(name, caPath string, caPEM []byte, fingerprint string) (*trustReceipt, error) {
 	driver, nixos, err := detectLinuxTrustDriver()
 	if err != nil {
 		return nil, err
@@ -73,23 +75,23 @@ func (c cli) installLinuxTrust(name, caPath, fingerprint string) (*trustReceipt,
 	}
 	filename := fmt.Sprintf("talosbox-%s-ingress-ca.crt", name)
 	destination := filepath.Join(driver.StoreDir, filename)
-	action := trustSystemAction{Operation: trustOperationInstall, Driver: driver.Name, Source: caPath, Destination: destination}
-	if err := executeLinuxTrustAction(action); err != nil {
+	action := trustSystemAction{Operation: trustOperationInstall, Driver: driver.Name, Fingerprint: fingerprint, Destination: destination}
+	if err := executeLinuxTrustAction(action, caPEM); err != nil {
 		return nil, err
 	}
 	return &trustReceipt{Cluster: name, Fingerprint: fingerprint, Store: driver.StoreDir, Driver: driver.Name, Path: destination}, nil
 }
 
 func (c cli) removeLinuxTrust(receipt trustReceipt) error {
-	action := trustSystemAction{Operation: trustOperationRemove, Driver: receipt.Driver, Destination: receipt.Path}
-	return executeLinuxTrustAction(action)
+	action := trustSystemAction{Operation: trustOperationRemove, Driver: receipt.Driver, Fingerprint: receipt.Fingerprint, Destination: receipt.Path}
+	return executeLinuxTrustAction(action, nil)
 }
 
-func executeLinuxTrustAction(action trustSystemAction) error {
+func executeLinuxTrustAction(action trustSystemAction, stdin []byte) error {
 	if trustEUID() != 0 {
-		return trustSudoReexec(action)
+		return trustSudoReexec(action, stdin)
 	}
-	return applyLinuxTrustAction(action)
+	return applyLinuxTrustAction(action, bytesReader(stdin))
 }
 
 func (c cli) runTrustSystemAction(args []string) error {
@@ -102,11 +104,11 @@ func (c cli) runTrustSystemAction(args []string) error {
 	if trustGOOS() != "linux" {
 		return errors.New("internal trust-store action is available only on Linux")
 	}
-	action := trustSystemAction{Operation: trustOperation(args[0]), Driver: args[1], Source: args[2], Destination: args[3]}
-	return applyLinuxTrustAction(action)
+	action := trustSystemAction{Operation: trustOperation(args[0]), Driver: args[1], Fingerprint: args[2], Destination: args[3]}
+	return applyLinuxTrustAction(action, os.Stdin)
 }
 
-func applyLinuxTrustAction(action trustSystemAction) error {
+func applyLinuxTrustAction(action trustSystemAction, stdin io.Reader) error {
 	driver, err := linuxTrustDriverByName(action.Driver, trustLookPath)
 	if err != nil {
 		return err
@@ -116,17 +118,17 @@ func applyLinuxTrustAction(action trustSystemAction) error {
 	}
 	switch action.Operation {
 	case trustOperationInstall:
-		if action.Source == "" {
-			return errors.New("trust install source is empty")
-		}
-		install, err := trustLookPath("install")
+		certificatePEM, err := readValidatedTrustCertificatePEM(stdin, action.Fingerprint)
 		if err != nil {
-			return fmt.Errorf("find install tool: %w", err)
+			return fmt.Errorf("validate %s trust anchor: %w", driver.Name, err)
 		}
-		if err := trustRunCommand(trustCommand{Name: install, Args: []string{"-m", "0644", action.Source, action.Destination}}, nil, os.Stdout, os.Stderr); err != nil {
+		if err := writeLinuxTrustAnchor(action.Destination, certificatePEM); err != nil {
 			return fmt.Errorf("write %s trust anchor: %w", driver.Name, err)
 		}
 	case trustOperationRemove:
+		if err := verifyTrustAnchorFingerprint(action.Destination, action.Fingerprint); err != nil {
+			return err
+		}
 		if err := trustRemove(action.Destination); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("remove %s trust anchor: %w", driver.Name, err)
 		}
@@ -137,6 +139,67 @@ func applyLinuxTrustAction(action trustSystemAction) error {
 		return fmt.Errorf("refresh %s trust store: %w", driver.Name, err)
 	}
 	return nil
+}
+
+func bytesReader(data []byte) io.Reader {
+	if len(data) == 0 {
+		return nil
+	}
+	return bytes.NewReader(data)
+}
+
+func readValidatedTrustCertificatePEM(stdin io.Reader, expectedFingerprint string) ([]byte, error) {
+	if stdin == nil {
+		return nil, errors.New("trust install certificate input is empty")
+	}
+	data, err := io.ReadAll(stdin)
+	if err != nil {
+		return nil, fmt.Errorf("read certificate input: %w", err)
+	}
+	fingerprint, err := trustCertificateFingerprint(data)
+	if err != nil {
+		return nil, err
+	}
+	if expectedFingerprint == "" {
+		return nil, errors.New("expected certificate fingerprint is empty")
+	}
+	if fingerprint != expectedFingerprint {
+		return nil, fmt.Errorf("certificate fingerprint changed before the privileged trust-store update (expected %s, got %s)", expectedFingerprint, fingerprint)
+	}
+	return data, nil
+}
+
+func writeLinuxTrustAnchor(path string, certificatePEM []byte) error {
+	file, err := trustOpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if errors.Is(err, os.ErrExist) {
+		file, err = trustOpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o644)
+	}
+	if err != nil {
+		return err
+	}
+	defer func() { _ = file.Close() }()
+	if _, err := file.Write(certificatePEM); err != nil {
+		return err
+	}
+	return file.Chmod(0o644)
+}
+
+func verifyTrustAnchorFingerprint(path, expectedFingerprint string) error {
+	if expectedFingerprint == "" {
+		return errors.New("expected trust-anchor fingerprint is empty")
+	}
+	data, err := trustReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read trust anchor %s: %w", path, err)
+	}
+	fingerprint, fingerprintErr := trustCertificateFingerprint(data)
+	if fingerprintErr == nil && fingerprint == expectedFingerprint {
+		return nil
+	}
+	return fmt.Errorf("refuse to remove trust anchor %s: it changed since installation; remove it manually", path)
 }
 
 func detectLinuxTrustDriver() (linuxTrustDriver, bool, error) {
@@ -163,18 +226,16 @@ func selectLinuxTrustDriver(osRelease []byte, lookup func(string) (string, error
 	case id == "debian" || id == "ubuntu" || containsString(like, "debian") || containsString(like, "ubuntu"):
 		driver, err := linuxTrustDriverByName(linuxDebianDriver, lookup)
 		return driver, false, err
-	case id == "fedora" || id == "rhel" || id == "centos" || id == "rocky" || id == "almalinux" || containsString(like, "fedora") || containsString(like, "rhel"):
+	case id == "fedora" || id == "rhel" || id == "centos" || containsString(like, "fedora") || containsString(like, "rhel") || containsString(like, "centos"):
 		driver, err := linuxTrustDriverByName(linuxFedoraDriver, lookup)
 		return driver, false, err
 	case id == "arch" || containsString(like, "arch"):
 		driver, err := linuxTrustDriverByName(linuxP11KitDriver, lookup)
 		return driver, false, err
 	default:
-		if _, err := lookup("trust"); err == nil {
-			driver, driverErr := linuxTrustDriverByName(linuxP11KitDriver, lookup)
-			return driver, false, driverErr
-		}
-		return linuxTrustDriver{}, false, fmt.Errorf("unsupported Linux trust store for distribution %q", id)
+		return linuxTrustDriver{}, false, fmt.Errorf(
+			"unsupported Linux trust store for distribution %q; supported anchor directories are %s, %s, and %s",
+			id, linuxDebianStore, linuxFedoraStore, linuxP11KitStore)
 	}
 }
 

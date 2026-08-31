@@ -1,6 +1,13 @@
 package daemon
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
@@ -367,30 +374,87 @@ func TestHintsOmitTrustInstallForTrustedCiliumDomain(t *testing.T) {
 
 func TestTrustHintDetectionRequiresReceiptAndIngressCA(t *testing.T) {
 	originalHome := trustHintUserHomeDir
+	originalReadFile := trustHintReadFile
 	originalStat := trustHintStat
 	t.Cleanup(func() {
 		trustHintUserHomeDir = originalHome
+		trustHintReadFile = originalReadFile
 		trustHintStat = originalStat
 	})
 	trustHintUserHomeDir = func() (string, error) { return "/test-home", nil }
-	present := map[string]bool{
-		filepath.Join("/test-home", ".talosbox", "trust", "demo.json"):                 true,
-		filepath.Join("/test-home", ".talosbox", "clusters", "demo", "ingress-ca.crt"): true,
-	}
+	receiptPath := filepath.Join("/test-home", ".talosbox", "trust", "demo.json")
+	certPath := filepath.Join("/test-home", ".talosbox", "clusters", "demo", "ingress-ca.crt")
+	present := map[string]bool{receiptPath: true, certPath: true}
 	trustHintStat = func(path string) (os.FileInfo, error) {
 		if !present[path] {
 			return nil, os.ErrNotExist
 		}
 		return regularFileInfo{name: filepath.Base(path)}, nil
 	}
+	certPEM := trustHintTestCA(t)
+	fingerprint, err := trustHintCertificateFingerprint(certPEM)
+	if err != nil {
+		t.Fatalf("fingerprint: %v", err)
+	}
+	files := map[string][]byte{
+		receiptPath: []byte(`{"cluster":"demo","fingerprint":"` + fingerprint + `"}`),
+		certPath:    certPEM,
+	}
+	trustHintReadFile = func(path string) ([]byte, error) {
+		data, ok := files[path]
+		if !ok {
+			return nil, os.ErrNotExist
+		}
+		return data, nil
+	}
 
 	if !trustReceiptAndCertPresent("demo") {
 		t.Fatal("receipt plus CA was not detected")
 	}
-	delete(present, filepath.Join("/test-home", ".talosbox", "clusters", "demo", "ingress-ca.crt"))
+	files[receiptPath] = []byte(`{"cluster":"demo","fingerprint":"DIFFERENT"}`)
+	if trustReceiptAndCertPresent("demo") {
+		t.Fatal("receipt with a stale fingerprint was detected as installed")
+	}
+	files[receiptPath] = []byte(`{"cluster":"other","fingerprint":"` + fingerprint + `"}`)
+	if trustReceiptAndCertPresent("demo") {
+		t.Fatal("receipt for another cluster was detected as installed")
+	}
+	files[receiptPath] = []byte(`not json`)
+	if trustReceiptAndCertPresent("demo") {
+		t.Fatal("invalid receipt JSON was detected as installed")
+	}
+	files[receiptPath] = []byte(`{"cluster":"demo","fingerprint":"` + fingerprint + `"}`)
+	files[certPath] = []byte("not a certificate")
+	if trustReceiptAndCertPresent("demo") {
+		t.Fatal("invalid ingress CA was detected as installed")
+	}
+	files[certPath] = certPEM
+	delete(present, certPath)
 	if trustReceiptAndCertPresent("demo") {
 		t.Fatal("receipt without CA was detected as installed")
 	}
+}
+
+func trustHintTestCA(t *testing.T) []byte {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test ingress CA"},
+		NotBefore:             time.Unix(0, 0),
+		NotAfter:              time.Unix(0, 0).AddDate(10, 0, 0),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }
 
 type regularFileInfo struct{ name string }

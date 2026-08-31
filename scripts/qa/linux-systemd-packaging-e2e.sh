@@ -73,8 +73,9 @@ cleanup() {
     /usr/bin/tbx cluster destroy "$cluster_b" --force 2>/dev/null || true
     /usr/bin/tbx cluster destroy "$cluster_a" --force 2>/dev/null || true
   fi
-  if [[ -n "$state_backup" ]]; then
-    sudo rm -f -- "$state_backup" 2>/dev/null || true
+  if [[ -n "$state_backup" && -e "$state_backup" ]]; then
+    sudo rm -f -- "$state_file" 2>/dev/null || true
+    sudo mv "$state_backup" "$state_file" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -84,6 +85,11 @@ trap cleanup EXIT
   refuse "pass $opt_in only on a disposable host"
 }
 [[ "$(uname -s)" == Linux ]] || refuse 'Linux is required'
+case "$(uname -m)" in
+  x86_64) qemu_system_bin=qemu-system-x86_64 ;;
+  aarch64) qemu_system_bin=qemu-system-aarch64 ;;
+  *) refuse "unsupported architecture $(uname -m): need qemu-system-x86_64 or qemu-system-aarch64" ;;
+esac
 [[ "$(readlink /proc/1/exe)" == */systemd ]] || refuse 'PID 1 is not systemd'
 system_state=$(systemctl is-system-running 2>/dev/null || true)
 [[ "$system_state" == running || "$system_state" == degraded ]] ||
@@ -93,7 +99,7 @@ test -w /dev/kvm || refuse '/dev/kvm is not writable'
 for group in tbx kvm; do
   id -nG | tr ' ' '\n' | grep -Fxq "$group" || refuse "caller lacks active $group group membership"
 done
-for command in awk bridge cmp curl find getconf go ip jq make nft pgrep qemu-system-x86_64 readlink ss stat sudo systemctl systemd-sysusers; do
+for command in awk bridge cmp curl find getconf go ip jq make nft pgrep "$qemu_system_bin" readlink ss stat sudo systemctl systemd-sysusers; do
   command -v "$command" >/dev/null || refuse "required command is missing: $command"
 done
 [[ $(getconf _NPROCESSORS_ONLN) -ge 4 ]] || refuse 'at least 4 logical CPUs are required'
@@ -109,6 +115,9 @@ if sudo ss -H -ulpn 'sport = :67' | grep -q .; then
 fi
 if sudo nft list table inet tbx >/dev/null 2>&1; then
   refuse 'table inet tbx already exists'
+fi
+if sudo test -s "$state_file"; then
+  refuse "$state_file already exists and is non-empty; preserve that host or restore/delete the file before running this harness"
 fi
 
 # Do not take over an existing user installation. Exact-name conflicts and any
@@ -262,10 +271,6 @@ periodic_sync_recovered() {
   dhcp_listener_on "$(bridge_for_cluster "$cluster_b")"
 }
 retry 'periodic net.sync reservation and DHCP recovery' 19 5 periodic_sync_recovered
-
-# Removing the old file was intentional; the recovered file is authoritative.
-sudo rm -f -- "$state_backup"
-state_backup=""
 
 node_a=$(status_json "$cluster_a" | jq -er '.[0].nodes[0].name')
 reserved_ip_a=$(status_json "$cluster_a" | jq -er '.[0].nodes[0].ip')

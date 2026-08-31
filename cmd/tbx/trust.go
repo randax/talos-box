@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
@@ -48,7 +49,7 @@ const (
 type trustSystemAction struct {
 	Operation   trustOperation
 	Driver      string
-	Source      string
+	Fingerprint string
 	Destination string
 }
 
@@ -105,7 +106,7 @@ func (c cli) installTrust(name string) error {
 	case "darwin":
 		receipt, err = c.installDarwinTrust(name, caPath, fingerprint)
 	case "linux":
-		receipt, err = c.installLinuxTrust(name, caPath, fingerprint)
+		receipt, err = c.installLinuxTrust(name, caPath, caPEM, fingerprint)
 	default:
 		err = unsupportedTrustPlatform(trustGOOS())
 	}
@@ -165,8 +166,8 @@ func (c cli) removeTrust(name string) error {
 }
 
 func trustCertificateFingerprint(data []byte) (string, error) {
-	block, _ := pem.Decode(data)
-	if block == nil || block.Type != "CERTIFICATE" {
+	block, rest := pem.Decode(data)
+	if block == nil || block.Type != "CERTIFICATE" || len(bytes.TrimSpace(rest)) != 0 {
 		return "", errors.New("PEM does not contain a certificate")
 	}
 	certificate, err := x509.ParseCertificate(block.Bytes)
@@ -239,7 +240,7 @@ func runTrustCommandLive(command trustCommand, stdin io.Reader, stdout, stderr i
 	return process.Run()
 }
 
-func reexecTrustWithSudo(action trustSystemAction) error {
+func reexecTrustWithSudo(action trustSystemAction, stdin []byte) error {
 	executable, err := trustExecutable()
 	if err != nil {
 		return fmt.Errorf("find tbx executable: %w", err)
@@ -249,9 +250,9 @@ func reexecTrustWithSudo(action trustSystemAction) error {
 		return fmt.Errorf("find sudo: %w", err)
 	}
 	command := trustCommand{Name: sudo, Args: []string{
-		executable, "trust", "_system", string(action.Operation), action.Driver, action.Source, action.Destination,
+		executable, "trust", "_system", string(action.Operation), action.Driver, action.Fingerprint, action.Destination,
 	}}
-	if err := trustRunCommand(command, os.Stdin, os.Stdout, os.Stderr); err != nil {
+	if err := trustRunCommand(command, bytes.NewReader(stdin), os.Stdout, os.Stderr); err != nil {
 		return fmt.Errorf("run sudo trust-store update: %w", err)
 	}
 	return nil
@@ -270,6 +271,7 @@ var (
 	trustRemove        = os.Remove
 	trustRename        = os.Rename
 	trustStat          = os.Stat
+	trustOpenFile      = os.OpenFile
 	trustLookPath      = exec.LookPath
 	trustEUID          = os.Geteuid
 	trustExecutable    = os.Executable

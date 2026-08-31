@@ -121,3 +121,29 @@ func TestMaintainHelperStateLogsFailureAndRetriesNextTick(t *testing.T) {
 		t.Fatalf("logs = %q, want one helper-unavailable failure", logs)
 	}
 }
+
+func TestMaintainHelperStateSkipsQueuedTickAfterStop(t *testing.T) {
+	originalAfterTick := afterHelperStateTick
+	t.Cleanup(func() { afterHelperStateTick = originalAfterTick })
+
+	stop := make(chan struct{})
+	ticks := make(chan time.Time, 1)
+	done := make(chan struct{})
+	called := make(chan struct{}, 1)
+	afterHelperStateTick = func() { close(stop) }
+	go func() {
+		defer close(done)
+		maintainHelperState(stop, ticks, func() error {
+			called <- struct{}{}
+			return nil
+		}, func(string, ...any) {})
+	}()
+
+	ticks <- time.Time{}
+	<-done
+	select {
+	case <-called:
+		t.Fatal("queued tick still synced helper state after stop")
+	default:
+	}
+}

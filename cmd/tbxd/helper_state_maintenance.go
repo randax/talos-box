@@ -7,6 +7,8 @@ import (
 
 const helperStateMaintenanceEvery = time.Minute
 
+var afterHelperStateTick = func() {}
+
 type helperStateSyncer interface {
 	TrySyncHelperState() error
 }
@@ -45,6 +47,12 @@ func maintainHelperState(
 		case <-stop:
 			return
 		case <-ticks:
+			afterHelperStateTick()
+			select {
+			case <-stop:
+				return
+			default:
+			}
 			if err := syncHelperState(); err != nil {
 				logf("periodic helper state sync failed; retrying next tick: %v", err)
 			}

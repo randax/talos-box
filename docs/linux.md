@@ -263,13 +263,17 @@ tbx trust install <cluster>
 tbx trust remove <cluster>
 ```
 
-`tbx` detects the distribution and uses `sudo` only for the trust-anchor mutation and refresh:
+`tbx` maps only explicit `ID`/`ID_LIKE` distribution families and uses `sudo` only for the
+trust-anchor mutation and refresh:
 
 | Distribution family | Anchor directory | Refresh command |
 |---|---|---|
 | Debian/Ubuntu | `/usr/local/share/ca-certificates` | `update-ca-certificates` |
-| Fedora/RHEL | `/etc/pki/ca-trust/source/anchors` | `update-ca-trust extract` |
+| Fedora/RHEL/CentOS | `/etc/pki/ca-trust/source/anchors` | `update-ca-trust extract` |
 | Arch/p11-kit | `/etc/ca-certificates/trust-source/anchors` | `trust extract-compat` |
+
+Unsupported mutable distributions fail clearly and name those three supported anchor directories;
+there is no generic `trust`-binary fallback.
 
 On NixOS no host file is changed. `tbx trust install <cluster>` prints a declarative
 `security.pki.certificates` entry that reads the cluster's `ingress-ca.crt`; add it to
@@ -278,12 +282,13 @@ removal is likewise a declarative NixOS configuration change rather than `tbx tr
 
 Restart browsers that were already open after changing trust. The non-secret receipt on mutable
 distributions is `~/.talosbox/trust/<cluster>.json`, so `tbx trust remove` can identify the exact
-anchor after cluster deletion; destroy does not remove host trust automatically. The PKI files
-live under `~/.talosbox/clusters/<cluster>/`: `ingress-ca.crt`, `ingress-ca.key`,
-`ingress-tls.crt`, and `ingress-tls.key`, all mode `0600` inside the private cluster directory.
-The root CA lasts ten years. The wildcard leaf lasts no more than 397 days and is renewed during
-reconciliation when 30 days or fewer remain; its only DNS name is `*.<cluster-domain>`, not the
-domain apex.
+anchor after cluster deletion, and removal refuses if that anchor's fingerprint no longer matches
+the receipt. Destroy does not remove host trust automatically. The PKI files live under
+`~/.talosbox/clusters/<cluster>/`: `ingress-ca.crt`, `ingress-ca.key`, `ingress-tls.crt`, and
+`ingress-tls.key`, all mode `0600` inside the private cluster directory. The root CA lasts ten
+years. The wildcard leaf lasts no more than 397 days from issuance time, is renewed during
+reconciliation when 30 days or fewer remain, and is backdated by five minutes to tolerate small
+clock skew; its only DNS name is `*.<cluster-domain>`, not the domain apex.
 
 This command does not apply to flannel, whose curated path has no ingress certificate. Windows
 trust installation, including WSL-to-Windows browser trust, remains deferred.
