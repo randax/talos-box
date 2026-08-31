@@ -165,9 +165,10 @@ func mergeE2EEnv(base, overrides []string) []string {
 // TBX_HYPERVISOR default or a custom balloon reserve the user's daemon was
 // started with.
 type e2eDaemonEnvState struct {
-	reserveMiB     int
-	reserveDefault bool
-	hypervisorEnv  string // TBX_HYPERVISOR value to carry, "" for none
+	reserveMiB      int
+	reserveDefault  bool
+	hypervisorEnv   string // TBX_HYPERVISOR value to carry, "" for none
+	balloonDisabled bool   // the daemon launches guests without a balloon device
 }
 
 func captureE2EDaemonEnvState(t *testing.T) e2eDaemonEnvState {
@@ -180,7 +181,10 @@ func captureE2EDaemonEnvState(t *testing.T) e2eDaemonEnvState {
 	if err != nil {
 		t.Fatalf("read running daemon info from %s: %v", socketPath, err)
 	}
-	state := e2eDaemonEnvState{reserveMiB: info.BalloonReserveMiB}
+	state := e2eDaemonEnvState{
+		reserveMiB:      info.BalloonReserveMiB,
+		balloonDisabled: info.BalloonDisabled,
+	}
 	compiled := compiledBalloonReserveMiB()
 	if state.reserveMiB == 0 {
 		state.reserveMiB = compiled
@@ -206,15 +210,36 @@ func compiledBalloonReserveMiB() int {
 }
 
 // env renders the captured daemon environment as restart overrides, with any
-// extra overrides appended so they win in mergeE2EEnv. An empty value means
-// "unset" to both consumers: the registry treats an empty TBX_HYPERVISOR as
-// no override, and the balloon manager treats an empty reserve as default.
+// extra overrides appended so they win in mergeE2EEnv. Every setting is
+// rendered explicitly so nothing ambient leaks into a replacement daemon: an
+// empty value means "unset" to all three consumers — the registry treats an
+// empty TBX_HYPERVISOR as no override, and the balloon manager treats an
+// empty reserve as default and an empty TBX_DISABLE_BALLOON as balloon-on.
+// TBX_DISABLE_BALLOON matters beyond policy: a QEMU save's device identity
+// depends on it, so a replacement daemon flipping it cold-boots the save.
 func (s e2eDaemonEnvState) env(overrides ...string) []string {
-	env := []string{"TBX_HYPERVISOR=" + s.hypervisorEnv, "TBX_BALLOON_RESERVE_MIB="}
+	env := []string{"TBX_HYPERVISOR=" + s.hypervisorEnv, "TBX_BALLOON_RESERVE_MIB=", "TBX_DISABLE_BALLOON="}
 	if !s.reserveDefault {
 		env[1] = "TBX_BALLOON_RESERVE_MIB=" + strconv.Itoa(s.reserveMiB)
 	}
+	if s.balloonDisabled {
+		env[2] = "TBX_DISABLE_BALLOON=1"
+	}
 	return append(env, overrides...)
+}
+
+// differsFromAmbient reports whether a restart inheriting the test process's
+// environment would give the daemon different settings than the captured
+// state — the condition under which a test that restarts the daemon must
+// register a restoration cleanup.
+func (s e2eDaemonEnvState) differsFromAmbient() bool {
+	if s.hypervisorEnv != os.Getenv(hypervisor.DefaultEnv) {
+		return true
+	}
+	if s.reserveMiB != balloon.DefaultConfig().ReserveMiB {
+		return true
+	}
+	return s.balloonDisabled != balloon.Disabled()
 }
 
 func binPath(t *testing.T, name string) string {
@@ -316,6 +341,21 @@ func registerE2EClusterCleanup(t *testing.T, name string, cleanupOutput *strings
 		if err != nil && !strings.Contains(output, "does not exist") {
 			t.Errorf("cleanup cluster %q: %v\n%s", name, err, output)
 		}
+	})
+}
+
+// registerE2ECleanupOutputReport logs the destroy transcript accumulated in
+// cleanupOutput after every later-registered cleanup has run — register it
+// FIRST at a call site (LIFO makes it run last), before any daemon-restore
+// and cluster-destroy registrations that write into the builder. Like
+// failure diagnostics, it reports only when the test failed.
+func registerE2ECleanupOutputReport(t *testing.T, cleanupOutput *strings.Builder) {
+	t.Helper()
+	t.Cleanup(func() {
+		if !t.Failed() || cleanupOutput.Len() == 0 {
+			return
+		}
+		t.Logf("e2e cleanup output:\n%s", cleanupOutput.String())
 	})
 }
 

@@ -23,11 +23,17 @@ func TestQEMUSuspendSurvivesDaemonRestartE2E(t *testing.T) {
 	}
 	requireNoForeignClusters(t)
 	daemonEnv := captureE2EDaemonEnvState(t)
-	if daemonEnv.hypervisorEnv != "" || !daemonEnv.reserveDefault {
+	// LIFO: the cleanup-output report is registered first so it runs last,
+	// after the cluster destroy has filled the builder.
+	var cleanupOutput strings.Builder
+	registerE2ECleanupOutputReport(t, &cleanupOutput)
+	if daemonEnv.hypervisorEnv != "" || daemonEnv.differsFromAmbient() {
 		// The mid-test restart deliberately clears TBX_HYPERVISOR (the proof
 		// needs the stored cluster state to win, not an env default), so a
-		// daemon started with overrides must get them back afterwards. LIFO:
-		// registered first, this runs after the owned cluster is destroyed.
+		// daemon started with overrides — or whose effective state differs
+		// from what this process's environment would pass through — must get
+		// its full captured state back afterwards. LIFO: registered before
+		// the destroy, so it runs after the owned cluster is gone.
 		t.Cleanup(func() {
 			output, err := runTBXCommand(t, daemonEnv.env(), e2eCleanupTimeout, "system", "restart", "--force")
 			if err != nil {
@@ -43,7 +49,6 @@ func TestQEMUSuspendSurvivesDaemonRestartE2E(t *testing.T) {
 	}
 	configPath := writeE2EConfig(t, yaml)
 	logOffset := captureTBXDLogOffset(t)
-	var cleanupOutput strings.Builder
 	registerE2EClusterCleanup(t, name, &cleanupOutput)
 	registerE2EFailureDiagnostics(t, logOffset)
 	runTBX(t, "up", "-f", configPath)
@@ -115,6 +120,7 @@ func TestUpRefusesHypervisorDriftE2E(t *testing.T) {
 	configPath := writeE2EConfig(t, yaml)
 	logOffset := captureTBXDLogOffset(t)
 	var cleanupOutput strings.Builder
+	registerE2ECleanupOutputReport(t, &cleanupOutput)
 	registerE2EClusterCleanup(t, name, &cleanupOutput)
 	registerE2EFailureDiagnostics(t, logOffset)
 	runTBX(t, "up", "-f", configPath)

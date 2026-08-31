@@ -132,9 +132,14 @@ func TestQEMUBalloonReadbackInMaintenanceE2E(t *testing.T) {
 	}
 	newReserveMiB := hostFreeMiB + 2048
 
-	// Restore the captured daemon environment — reserve AND any
-	// TBX_HYPERVISOR default — after the owned cluster is destroyed (LIFO:
-	// this runs last because it is registered first).
+	// LIFO: the cleanup-output report is registered first so it runs last,
+	// after the destroy below has filled the builder.
+	var cleanupOutput strings.Builder
+	registerE2ECleanupOutputReport(t, &cleanupOutput)
+
+	// Restore the captured daemon environment — reserve, balloon-disable
+	// mode AND any TBX_HYPERVISOR default — after the owned cluster is
+	// destroyed (LIFO: registered before the destroy, so it runs after it).
 	t.Cleanup(func() {
 		output, err := runTBXCommand(t, daemonEnv.env(), e2eCleanupTimeout, "system", "restart", "--force")
 		if err != nil {
@@ -163,7 +168,6 @@ func TestQEMUBalloonReadbackInMaintenanceE2E(t *testing.T) {
 		t.Fatalf("render balloon e2e config: %v", err)
 	}
 	configPath := writeE2EConfig(t, yaml)
-	var cleanupOutput strings.Builder
 	registerE2EClusterCleanup(t, name, &cleanupOutput)
 	registerE2EFailureDiagnostics(t, logOffset)
 	runTBX(t, "up", "--force", "-f", configPath)

@@ -27,6 +27,7 @@ func TestConsoleE2E(t *testing.T) {
 	configPath := writeE2EConfig(t, yaml)
 	logOffset := captureTBXDLogOffset(t)
 	var cleanupOutput strings.Builder
+	registerE2ECleanupOutputReport(t, &cleanupOutput)
 	registerE2EClusterCleanup(t, name, &cleanupOutput)
 	registerE2EFailureDiagnostics(t, logOffset)
 	runTBX(t, "up", "-f", configPath)

@@ -60,8 +60,8 @@ On failure: capture the full doctor transcript, Homebrew QEMU version/package fa
 **Goal**: explicit YAML wins over the daemon environment, the daemon environment wins over the compiled default, and stored backend identity cannot drift.
 
 Steps:
-1. Record the current daemon default and source with `tbx doctor | grep 'INFO Hypervisors:'`; record whether the original effective default came from `compiled` or `TBX_HYPERVISOR` so it can be restored, and if it came from `TBX_HYPERVISOR`, record that original value.
-2. With no clusters running, run `TBX_HYPERVISOR=qemu tbx system restart --force`, then `tbx doctor | grep 'INFO Hypervisors:'`; the QEMU line must contain `default=yes (source=TBX_HYPERVISOR)`. Next run `TBX_HYPERVISOR=vz tbx system restart --force`, then rerun doctor; the VZ line must contain the same source field. This proves `TBX_HYPERVISOR` overrides the compiled default.
+1. Record the **daemon environment snapshot** before the first restart, from daemon-backed diagnostics (`tbx doctor`): the effective hypervisor default and its source (`compiled` or `TBX_HYPERVISOR`, and if the latter, the value), the effective balloon reserve from the `host-pressure` line and whether it is the compiled default, and whether ballooning is disabled (doctor reports `TBX_DISABLE_BALLOON`). Every restart in this runbook must carry the snapshot values for the settings it does not deliberately change, and C8 restores the snapshot in full — a restart with only the variable under test silently replaces the other settings with whatever the operator shell happens to export.
+2. With no clusters running, run `TBX_HYPERVISOR=qemu TBX_BALLOON_RESERVE_MIB=<snapshot-reserve-or-empty> TBX_DISABLE_BALLOON=<1-if-snapshot-disabled-else-empty> tbx system restart --force`, then `tbx doctor | grep 'INFO Hypervisors:'`; the QEMU line must contain `default=yes (source=TBX_HYPERVISOR)`. Next run the same restart with `TBX_HYPERVISOR=vz`, then rerun doctor; the VZ line must contain the same source field. This proves `TBX_HYPERVISOR` overrides the compiled default while the snapshot keeps the balloon settings unchanged. (An empty value means "unset" to the daemon for all three variables.)
 3. Write `/tmp/qa-hv-qemu.yaml` with the following content, run `tbx up -f /tmp/qa-hv-qemu.yaml`, then run `tbx status qa-hv -o json | python3 -m json.tool`. With the daemon default still VZ, status must report QEMU, proving `clusters[].hypervisor` wins over `TBX_HYPERVISOR`.
 
    ```yaml
@@ -85,7 +85,7 @@ Steps:
    ```
 
 5. Run `tbx status qa-hv -o json | python3 -m json.tool`; it must still report the original QEMU hypervisor and a running cluster.
-6. Capture the evidence, then run `tbx cluster destroy qa-hv --force`. Restore the daemon's original environment: if the original source was compiled, run `env -u TBX_HYPERVISOR tbx system restart --force`; otherwise rerun the restart with the originally recorded `TBX_HYPERVISOR=<value>`.
+6. Capture the evidence, then run `tbx cluster destroy qa-hv --force`. Restore the full daemon environment snapshot: `TBX_HYPERVISOR=<snapshot-value-or-empty> TBX_BALLOON_RESERVE_MIB=<snapshot-reserve-or-empty> TBX_DISABLE_BALLOON=<1-if-snapshot-disabled-else-empty> tbx system restart --force` (empty when the snapshot recorded compiled/default/enabled respectively).
 
 Expected observations: doctor identifies the selected host default and its source; explicit QEMU YAML creates QEMU while the daemon default is VZ; the opposite YAML is rejected before any backend change; persisted state remains QEMU and running after the refusal.
 
@@ -98,9 +98,9 @@ On failure: capture both YAML files, both doctor inventories, the exact failing 
 **Goal**: a maintenance-phase QEMU guest accepts a synthetic balloon target and reports the applied target through the daemon log.
 
 Steps:
-1. Run `tbx doctor | tee /tmp/qa-balloon-doctor-before.txt`. Record the daemon's current effective `BalloonReserveMiB` from the `host-pressure` line (or directly from `daemon.info` when using an instrumented client), including whether it is the compiled default; also record whether doctor says `TBX_DISABLE_BALLOON` is active. If ballooning is disabled, mark FAIL with remediation rather than continuing.
+1. Run `tbx doctor | tee /tmp/qa-balloon-doctor-before.txt`. Record the daemon environment snapshot as in C3 step 1 (or reuse it if C3 already ran and restored): the effective `BalloonReserveMiB` from the `host-pressure` line (or directly from `daemon.info` when using an instrumented client) and whether it is the compiled default, the hypervisor default/source, and whether doctor says `TBX_DISABLE_BALLOON` is active. If ballooning is disabled, mark FAIL with remediation rather than continuing.
 2. Read the same doctor `host-pressure` line's `<n> MiB free memory` value as `hostAvailable`, corroborate it with `memory_pressure`, and set `syntheticReserve = hostAvailable + 2048`.
-3. In one shell, run `export TBX_BALLOON_RESERVE_MIB=<syntheticReserve>` followed by `tbx system restart --force`; rerun doctor and confirm its balloon-reserve arithmetic reflects the synthetic reserve.
+3. Restart with the synthetic reserve while carrying the rest of the snapshot: `TBX_BALLOON_RESERVE_MIB=<syntheticReserve> TBX_HYPERVISOR=<snapshot-value-or-empty> TBX_DISABLE_BALLOON=<1-if-snapshot-disabled-else-empty> tbx system restart --force`; rerun doctor and confirm its balloon-reserve arithmetic reflects the synthetic reserve and the hypervisor default is unchanged.
 4. Record the current end of `~/.talosbox/tbxd.log` before provisioning with `offset=$(wc -l < ~/.talosbox/tbxd.log)`; only lines written after this offset count.
 5. Write `/tmp/qa-balloon.yaml` with the following content; the absent `cni` is intentional. Run `tbx up --force -f /tmp/qa-balloon.yaml`.
 
@@ -119,7 +119,7 @@ Steps:
 
 6. Run `tbx status qa-balloon -o json | python3 -m json.tool`; confirm the backend is `qemu` and every `nodes[].phase` equals `maintenance`.
 7. Starting from the recorded offset, watch only newly appended log output with `tail -n +$((offset+1)) -f ~/.talosbox/tbxd.log | grep 'balloon qa-balloon/'` until a line appears in the shape `balloon qa-balloon/<node>: target=<n>MiB (configured=4096 hostFree=... reserve=... deficit=...)`. Stop the tail and verify `1024 <= target < 4096`.
-8. Run `tbx cluster destroy qa-balloon --force`. Restore the captured reserve immediately: if it was the compiled default, run `unset TBX_BALLOON_RESERVE_MIB` and then `tbx system restart --force`; otherwise export the captured value and restart. Confirm doctor reports the restored reserve.
+8. Run `tbx cluster destroy qa-balloon --force`. Restore the full daemon environment snapshot immediately: `TBX_HYPERVISOR=<snapshot-value-or-empty> TBX_BALLOON_RESERVE_MIB=<snapshot-reserve-or-empty> TBX_DISABLE_BALLOON=<1-if-snapshot-disabled-else-empty> tbx system restart --force`. Confirm doctor reports the restored reserve and default.
 
 Expected observations: the QEMU cluster remains in maintenance, a new cluster-specific balloon line reports an applied target between 1024 MiB inclusive and 4096 MiB exclusive, and the synthetic reserve is removed after cleanup.
 
@@ -144,7 +144,7 @@ Steps:
    ```
 
 2. Run `tbx cluster suspend qa-suspend`, wait at least 5 seconds, then run `tbx status qa-suspend`; status must report the cluster suspended.
-3. Run `tbx system restart` without `--force`. Acceptance is part of the proof; do not set `TBX_HYPERVISOR` on the replacement daemon.
+3. Run `TBX_BALLOON_RESERVE_MIB=<snapshot-reserve-or-empty> TBX_DISABLE_BALLOON=<1-if-snapshot-disabled-else-empty> tbx system restart` without `--force` and without `TBX_HYPERVISOR`. Acceptance is part of the proof, and the stored cluster identity must win without an environment default; the balloon settings must be carried because a QEMU save's device identity depends on `TBX_DISABLE_BALLOON` — a replacement daemon flipping it would cold-boot the save.
 4. Run `tbx status qa-suspend`; its output must not contain `will cold-boot`.
 5. Run `tbx cluster resume qa-suspend | tee /tmp/qa-suspend-resume.txt`; output must contain `guest clocks resume about` and must not contain `cold-boot`.
 6. Run `tbx status qa-suspend -o json | python3 -m json.tool`; confirm the cluster is running on QEMU.
@@ -244,11 +244,11 @@ On failure: preserve the complete collector artifacts, workload manifest and dig
 Steps:
 1. Destroy every cluster created in this run by exact name: run `tbx cluster destroy qa-hv --force`, `tbx cluster destroy qa-balloon --force`, `tbx cluster destroy qa-suspend --force`, `tbx cluster destroy qa-mixed-vz --force`, `tbx cluster destroy qa-mixed-qemu --force`, `tbx cluster destroy qa-soak-vz --force`, and `tbx cluster destroy qa-soak-qemu --force` for each name that exists.
 2. Run `tbx status -o json | python3 -m json.tool` and `tbx cluster list -o json | python3 -m json.tool`; confirm none of those exact names remains.
-3. If C4's `TBX_BALLOON_RESERVE_MIB` override was not already restored, restore the captured value now, omitting the variable entirely when the captured value was the compiled default, and run `tbx system restart --force`.
-4. If C3's `TBX_HYPERVISOR` daemon default was not already restored, restore the value captured in C3 step 1: if its original source was compiled, run `env -u TBX_HYPERVISOR tbx system restart --force`; otherwise run `TBX_HYPERVISOR=<original-value> tbx system restart --force` with the recorded original value.
+3. If any charter left the daemon with settings differing from the daemon environment snapshot (C3/C4 step 1) — the hypervisor default, the balloon reserve, or the balloon-disable mode — restore the complete snapshot with one restart: `TBX_HYPERVISOR=<snapshot-value-or-empty> TBX_BALLOON_RESERVE_MIB=<snapshot-reserve-or-empty> TBX_DISABLE_BALLOON=<1-if-snapshot-disabled-else-empty> tbx system restart --force` (empty means unset for all three).
+4. Rerun `tbx doctor` and confirm the Hypervisors default/source and the `host-pressure` reserve match the snapshot recorded before the first restart.
 5. Run `pgrep -fl 'qemu-system-(aarch64|x86_64)'`; expect no QEMU process left by this runbook. Do not run `tbx system uninstall` and do not remove the helper.
 
-Expected observations: every runbook cluster is absent from status and cluster-list JSON, the daemon has its original balloon reserve and `TBX_HYPERVISOR` default, no runbook-owned QEMU process remains, and the helper installation is untouched.
+Expected observations: every runbook cluster is absent from status and cluster-list JSON, the daemon has its original balloon reserve, balloon-disable mode, and `TBX_HYPERVISOR` default, no runbook-owned QEMU process remains, and the helper installation is untouched.
 
 Pass criteria: zero cluster or QEMU-process residue, original daemon balloon configuration and `TBX_HYPERVISOR` default restored, and helper still installed.
 

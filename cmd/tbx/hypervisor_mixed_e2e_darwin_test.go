@@ -68,6 +68,7 @@ func TestMixedHypervisorsInterClusterE2E(t *testing.T) {
 
 	logOffset := captureTBXDLogOffset(t)
 	var cleanupOutput strings.Builder
+	registerE2ECleanupOutputReport(t, &cleanupOutput)
 	registerE2EClusterCleanup(t, vzName, &cleanupOutput)
 	registerE2EClusterCleanup(t, qemuName, &cleanupOutput)
 	registerE2EFailureDiagnostics(t, logOffset)
