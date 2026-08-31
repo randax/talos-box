@@ -359,6 +359,15 @@ func TestCiliumConvergedRejectsUnmanagedAnnouncement(t *testing.T) {
 	}
 }
 
+func TestCiliumConvergedRejectsTLSSecretKeyDrift(t *testing.T) {
+	item := cluster.Cluster{Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true}}
+	server, kubeconfig := ciliumConvergedServerWithOptions(t, item, ciliumConvergedOptions{staleProbeTLSKey: true})
+	defer server.Close()
+	if err := CiliumConverged(context.Background(), kubeconfig, item); err == nil || !strings.Contains(err.Error(), "on-disk leaf pair") {
+		t.Fatalf("CiliumConverged() error = %v, want stale TLS Secret error", err)
+	}
+}
+
 func TestCiliumConvergedIngressPKIRejectsCertificateDueForRenewal(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	item := cluster.Cluster{Name: "demo", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true}}
@@ -394,19 +403,25 @@ func TestCiliumProbeIngressMatchesExactWildcardRoute(t *testing.T) {
 }
 
 func TestCiliumProbeTLSSecretMatchesExactLeafCertificate(t *testing.T) {
-	pki := ingressPKI{TLSCertPEM: []byte("leaf certificate")}
+	pki := ingressPKI{TLSCertPEM: []byte("leaf certificate"), TLSKeyPEM: []byte("leaf key")}
 	var object map[string]any
-	if err := json.Unmarshal([]byte(ciliumProbeSecretJSON(pki, false)), &object); err != nil {
+	if err := json.Unmarshal([]byte(ciliumProbeSecretJSON(pki, false, false)), &object); err != nil {
 		t.Fatal(err)
 	}
 	if err := ciliumProbeTLSSecretMatches(object, pki); err != nil {
 		t.Fatal(err)
 	}
-	if err := json.Unmarshal([]byte(ciliumProbeSecretJSON(pki, true)), &object); err != nil {
+	if err := json.Unmarshal([]byte(ciliumProbeSecretJSON(pki, true, false)), &object); err != nil {
 		t.Fatal(err)
 	}
-	if err := ciliumProbeTLSSecretMatches(object, pki); err == nil || !strings.Contains(err.Error(), "on-disk leaf certificate") {
-		t.Fatalf("ciliumProbeTLSSecretMatches() error = %v, want stale certificate error", err)
+	if err := ciliumProbeTLSSecretMatches(object, pki); err == nil || !strings.Contains(err.Error(), "on-disk leaf pair") {
+		t.Fatalf("ciliumProbeTLSSecretMatches() error = %v, want stale leaf pair error", err)
+	}
+	if err := json.Unmarshal([]byte(ciliumProbeSecretJSON(pki, false, true)), &object); err != nil {
+		t.Fatal(err)
+	}
+	if err := ciliumProbeTLSSecretMatches(object, pki); err == nil || !strings.Contains(err.Error(), "on-disk leaf pair") {
+		t.Fatalf("ciliumProbeTLSSecretMatches() key drift error = %v, want stale leaf pair error", err)
 	}
 }
 
@@ -417,6 +432,7 @@ func ciliumConvergedServer(t *testing.T, item cluster.Cluster, staleBGP bool) (*
 type ciliumConvergedOptions struct {
 	staleBGP              bool
 	staleHubble           bool
+	staleProbeTLSKey      bool
 	unmanagedProbe        bool
 	unmanagedAnnouncement bool
 }
@@ -531,7 +547,7 @@ func ciliumConvergedServerWithOptions(t *testing.T, item cluster.Cluster, option
 				_, _ = writer.Write([]byte(`{}`))
 				return
 			}
-			_, _ = writer.Write([]byte(ciliumProbeSecretJSON(pki, false)))
+			_, _ = writer.Write([]byte(ciliumProbeSecretJSON(pki, false, options.staleProbeTLSKey)))
 		case "/apis/cilium.io/v2/ciliumloadbalancerippools/demo-pool":
 			if !item.LB {
 				writer.WriteHeader(http.StatusNotFound)
@@ -597,12 +613,16 @@ func ciliumProbeIngressJSON(item cluster.Cluster, drifted bool) string {
 		host, ingressTLSSecretName, host, service)
 }
 
-func ciliumProbeSecretJSON(pki ingressPKI, stale bool) string {
+func ciliumProbeSecretJSON(pki ingressPKI, staleCert, staleKey bool) string {
 	tlsCert := encodeSecretData(pki.TLSCertPEM)
-	if stale {
+	if staleCert {
 		tlsCert = encodeSecretData([]byte("stale"))
 	}
-	return fmt.Sprintf(`{"metadata":{"labels":{"talosbox.dev/managed":"true"}},"type":"kubernetes.io/tls","data":{"tls.crt":"%s","tls.key":"ignored"}}`, tlsCert)
+	tlsKey := encodeSecretData(pki.TLSKeyPEM)
+	if staleKey {
+		tlsKey = encodeSecretData([]byte("stale"))
+	}
+	return fmt.Sprintf(`{"metadata":{"labels":{"talosbox.dev/managed":"true"}},"type":"kubernetes.io/tls","data":{"tls.crt":"%s","tls.key":"%s"}}`, tlsCert, tlsKey)
 }
 
 func TestRenderCiliumUsesPinnedTalosValuesAndNativeLoadBalancer(t *testing.T) {

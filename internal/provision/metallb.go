@@ -20,6 +20,7 @@ import (
 	"helm.sh/helm/v3/pkg/engine"
 	"helm.sh/helm/v3/pkg/releaseutil"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -524,8 +525,7 @@ func ciliumIngressResourcesReady(ctx context.Context, client kubernetes.Interfac
 		return err
 	}
 	secret, err := client.CoreV1().Secrets(probeNamespace).Get(ctx, ingressTLSSecretName, metav1.GetOptions{})
-	if err != nil || secret.Labels["talosbox.dev/managed"] != "true" || secret.Type != "kubernetes.io/tls" ||
-		!bytes.Equal(secret.Data["tls.crt"], pki.TLSCertPEM) {
+	if err != nil || secret.Labels["talosbox.dev/managed"] != "true" || ingressTLSSecretExactMatch(string(secret.Type), secret.Data[corev1.TLSCertKey], secret.Data[corev1.TLSPrivateKeyKey], pki) != nil {
 		return errors.New("cilium ingress TLS Secret is not ready")
 	}
 	return nil

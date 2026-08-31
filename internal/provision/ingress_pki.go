@@ -109,6 +109,12 @@ func loadIngressPKI(item cluster.Cluster, paths ingressPKIPaths, options ingress
 	}
 	pki, err := loadIngressCA(paths)
 	if err != nil {
+		if ingressInterruptedFirstGeneration(paths, existing) {
+			if err := removeIngressPKIFiles(paths); err != nil {
+				return ingressPKI{}, err
+			}
+			return createIngressPKI(item, paths, now().UTC(), random)
+		}
 		return ingressPKI{}, ingressPKICorruptError(paths, err)
 	}
 	for _, path := range []string{paths.CACert, paths.CAKey} {
@@ -143,11 +149,12 @@ func createIngressPKI(item cluster.Cluster, paths ingressPKIPaths, now time.Time
 	if err != nil {
 		return ingressPKI{}, err
 	}
+	notBefore := now.Add(-ingressBackdateSkew)
 	caTemplate := &x509.Certificate{
 		SerialNumber:          serial,
 		Subject:               pkix.Name{CommonName: item.Name + " talos-box ingress CA"},
-		NotBefore:             now.Add(-ingressBackdateSkew),
-		NotAfter:              now.AddDate(10, 0, 0),
+		NotBefore:             notBefore,
+		NotAfter:              notBefore.AddDate(10, 0, 0),
 		IsCA:                  true,
 		BasicConstraintsValid: true,
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
@@ -188,7 +195,8 @@ func renewIngressLeaf(pki *ingressPKI, paths ingressPKIPaths, wildcard string, n
 	if err != nil {
 		return err
 	}
-	notAfter := now.Add(ingressLeafLifetime)
+	notBefore := now.Add(-ingressBackdateSkew)
+	notAfter := notBefore.Add(ingressLeafLifetime)
 	if notAfter.After(pki.CACertificate.NotAfter) {
 		notAfter = pki.CACertificate.NotAfter
 	}
@@ -196,7 +204,7 @@ func renewIngressLeaf(pki *ingressPKI, paths ingressPKIPaths, wildcard string, n
 		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: wildcard},
 		DNSNames:     []string{wildcard},
-		NotBefore:    now.Add(-ingressBackdateSkew),
+		NotBefore:    notBefore,
 		NotAfter:     notAfter,
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
@@ -357,6 +365,59 @@ func secureIngressPKIFile(path string) error {
 	return nil
 }
 
+func ingressInterruptedFirstGeneration(paths ingressPKIPaths, existing ingressPKIExistingState) bool {
+	if ingressLeafPairComplete(paths) {
+		return false
+	}
+	if !existing.CACert || !existing.CAKey {
+		return true
+	}
+	caCertPEM, err := readIngressPKIFile(paths.CACert)
+	if err != nil {
+		return false
+	}
+	if _, err := decodePEMCertificate(caCertPEM); err != nil {
+		return true
+	}
+	caKeyPEM, err := readIngressPKIFile(paths.CAKey)
+	if err != nil {
+		return false
+	}
+	if _, err := decodePEMKey(caKeyPEM); err != nil {
+		return true
+	}
+	return false
+}
+
+func ingressLeafPairComplete(paths ingressPKIPaths) bool {
+	tlsCertPEM, err := readIngressPKIFile(paths.TLSCert)
+	if err != nil {
+		return false
+	}
+	tlsKeyPEM, err := readIngressPKIFile(paths.TLSKey)
+	if err != nil {
+		return false
+	}
+	leaf, err := decodePEMCertificate(tlsCertPEM)
+	if err != nil {
+		return false
+	}
+	tlsKey, err := decodePEMKey(tlsKeyPEM)
+	if err != nil {
+		return false
+	}
+	return publicKeysEqual(&tlsKey.PublicKey, leaf.PublicKey)
+}
+
+func removeIngressPKIFiles(paths ingressPKIPaths) error {
+	for _, path := range []string{paths.CACert, paths.CAKey, paths.TLSCert, paths.TLSKey} {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove ingress PKI %s: %w", filepath.Base(path), err)
+		}
+	}
+	return nil
+}
+
 func ingressPKICorruptError(paths ingressPKIPaths, err error) error {
 	return fmt.Errorf("ingress PKI in %s is incomplete or corrupt: %w; restore it or delete ingress-ca.crt, ingress-ca.key, ingress-tls.crt, and ingress-tls.key, then rerun `tbx up`",
 		filepath.Dir(paths.CACert), err)
@@ -422,11 +483,17 @@ func writeSecurePair(firstPath string, firstData []byte, secondPath string, seco
 	}
 	firstInstalled = true
 	firstTemp = ""
+	if ingressPKIPublishHook != nil {
+		ingressPKIPublishHook(firstPath)
+	}
 	if err = os.Rename(secondTemp, secondPath); err != nil {
 		return err
 	}
 	secondInstalled = true
 	secondTemp = ""
+	if ingressPKIPublishHook != nil {
+		ingressPKIPublishHook(secondPath)
+	}
 	return nil
 }
 
@@ -516,3 +583,5 @@ func inspectionIngressTLSSecretObject() unstructured.Unstructured {
 }
 
 func encodeSecretData(data []byte) string { return base64.StdEncoding.EncodeToString(data) }
+
+var ingressPKIPublishHook func(path string)

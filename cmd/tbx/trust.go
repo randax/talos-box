@@ -93,10 +93,17 @@ func (c cli) installTrust(name string) error {
 	}
 	if receipt, err := readTrustReceipt(name); err == nil {
 		if receipt.Fingerprint == fingerprint {
-			_, err = fmt.Fprintf(c.out, "ingress CA for cluster %s is already installed (%s)\n", name, receipt.Store)
-			return err
+			matched, validateErr := c.installedTrustEntryMatches(name, receipt, fingerprint)
+			if validateErr != nil {
+				return validateErr
+			}
+			if matched {
+				_, err = fmt.Fprintf(c.out, "ingress CA for cluster %s is already installed (%s)\n", name, receipt.Store)
+				return err
+			}
+		} else {
+			return fmt.Errorf("cluster %q has a different trusted CA recorded; run `tbx trust remove %s` before installing the current CA", name, name)
 		}
-		return fmt.Errorf("cluster %q has a different trusted CA recorded; run `tbx trust remove %s` before installing the current CA", name, name)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -230,6 +237,17 @@ func writeTrustReceipt(receipt trustReceipt) error {
 		return fmt.Errorf("install trust receipt: %w", err)
 	}
 	return nil
+}
+
+func (c cli) installedTrustEntryMatches(clusterName string, receipt trustReceipt, fingerprint string) (bool, error) {
+	switch receipt.Driver {
+	case darwinTrustDriver:
+		return c.darwinTrustEntryMatches(clusterName, receipt, fingerprint)
+	case linuxDebianDriver, linuxFedoraDriver, linuxP11KitDriver:
+		return linuxTrustEntryMatches(receipt, fingerprint)
+	default:
+		return false, fmt.Errorf("trust receipt for cluster %q names unsupported driver %q", clusterName, receipt.Driver)
+	}
 }
 
 func runTrustCommandLive(command trustCommand, stdin io.Reader, stdout, stderr io.Writer) error {

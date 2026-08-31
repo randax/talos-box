@@ -11,6 +11,9 @@ cluster_a=qa-sd-a
 cluster_b=qa-sd-b
 state_file=/var/lib/tbx/reservations.json
 state_backup=""
+workdir=""
+workdir_owned=false
+state_backup_moved_flag=""
 cleanup_needed=false
 
 # shellcheck source=scripts/ci/kvm-e2e-lib.sh disable=SC1091
@@ -73,12 +76,29 @@ cleanup() {
     /usr/bin/tbx cluster destroy "$cluster_b" --force 2>/dev/null || true
     /usr/bin/tbx cluster destroy "$cluster_a" --force 2>/dev/null || true
   fi
-  if [[ -n "$state_backup" && -e "$state_backup" ]]; then
-    sudo rm -f -- "$state_file" 2>/dev/null || true
-    sudo mv "$state_backup" "$state_file" 2>/dev/null || true
+  if [[ -n "$state_backup_moved_flag" && -f "$state_backup_moved_flag" ]]; then
+    if ! restore_state_backup; then
+      printf 'FAILED to restore %s from %s\n' "$state_file" "$state_backup" >&2
+      return 1
+    fi
+  fi
+  if [[ "$workdir_owned" == true && -f "$workdir/.talosbox-e2e-owned" ]]; then
+    rm -rf -- "$workdir"
   fi
 }
 trap cleanup EXIT
+
+restore_state_backup() {
+  sudo test -e "$state_backup"
+  sudo rm -f -- "$state_file"
+  sudo mv "$state_backup" "$state_file"
+}
+
+delete_state_backup() {
+  sudo test -e "$state_backup"
+  sudo rm -f -- "$state_backup"
+  rm -f -- "$state_backup_moved_flag"
+}
 
 [[ $# -eq 1 && $1 == "$opt_in" ]] || {
   usage
@@ -107,6 +127,9 @@ memory_kib=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
 [[ ${memory_kib:-0} -ge $((8 * 1024 * 1024)) ]] || refuse 'at least 8 GiB available memory is required'
 required_bytes=$((40 * 1024 * 1024 * 1024))
 [[ $(available_bytes "$root") -ge $required_bytes ]] || refuse 'at least 40 GiB free disk is required'
+prepare_workdir "tbx-systemd-packaging-e2e.XXXXXX"
+state_backup="$workdir/reservations.json.backup"
+state_backup_moved_flag="$workdir/reservations-backup.moved"
 [[ -d /sys/class/net/lo ]] || refuse 'the host network namespace is unavailable'
 [[ -c /dev/net/tun ]] || refuse '/dev/net/tun is required'
 sudo true || refuse 'sudo authorization is required'
@@ -116,8 +139,11 @@ fi
 if sudo nft list table inet tbx >/dev/null 2>&1; then
   refuse 'table inet tbx already exists'
 fi
-if sudo test -s "$state_file"; then
-  refuse "$state_file already exists and is non-empty; preserve that host or restore/delete the file before running this harness"
+if sudo test -e "$state_file"; then
+  refuse "$state_file already exists; restore or remove it before running this harness"
+fi
+if sudo test -e "$state_backup"; then
+  refuse "$state_backup already exists; restore or remove the stale backup before running this harness"
 fi
 
 # Do not take over an existing user installation. Exact-name conflicts and any
@@ -259,18 +285,20 @@ retry 'first DHCP listener after normal restart' 30 1 dhcp_listener_on "$(bridge
 retry 'second DHCP listener after normal restart' 30 1 dhcp_listener_on "$(bridge_for_cluster "$cluster_b")"
 
 sudo systemctl stop tbx-helper.service
-state_backup="${state_file}.qa-$(date +%s)"
+sudo test -e "$state_file"
 sudo mv "$state_file" "$state_backup"
+touch "$state_backup_moved_flag"
 sudo systemctl start tbx-helper.service
 
 periodic_sync_recovered() {
-  [[ -f "$state_file" ]] || return 1
+  sudo test -e "$state_file" || return 1
   reservation_has_cluster "$cluster_a" || return 1
   reservation_has_cluster "$cluster_b" || return 1
   dhcp_listener_on "$(bridge_for_cluster "$cluster_a")" || return 1
   dhcp_listener_on "$(bridge_for_cluster "$cluster_b")"
 }
 retry 'periodic net.sync reservation and DHCP recovery' 19 5 periodic_sync_recovered
+delete_state_backup
 
 node_a=$(status_json "$cluster_a" | jq -er '.[0].nodes[0].name')
 reserved_ip_a=$(status_json "$cluster_a" | jq -er '.[0].nodes[0].ip')
