@@ -3,9 +3,11 @@ package provision
 import (
 	"bytes"
 	"crypto/x509"
+	"errors"
 	"io"
 	mathrand "math/rand"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -30,11 +32,11 @@ func TestEnsureIngressPKICreatesAndReusesWildcardCertificates(t *testing.T) {
 	if !first.CACertificate.IsCA {
 		t.Fatal("CA certificate is not a CA")
 	}
-	if got, want := first.CACertificate.NotAfter, now.AddDate(10, 0, 0); !got.Equal(want) {
-		t.Fatalf("CA NotAfter = %s, want %s", got, want)
-	}
 	if got, want := first.CACertificate.NotBefore, now.Add(-ingressBackdateSkew); !got.Equal(want) {
 		t.Fatalf("CA NotBefore = %s, want %s", got, want)
+	}
+	if got, want := first.CACertificate.NotAfter.Sub(first.CACertificate.NotBefore), first.CACertificate.NotBefore.AddDate(10, 0, 0).Sub(first.CACertificate.NotBefore); got != want {
+		t.Fatalf("CA lifetime = %s, want %s", got, want)
 	}
 	if got := first.LeafCertificate.DNSNames; len(got) != 1 || got[0] != "*.demo.lab.internal" {
 		t.Fatalf("leaf SANs = %v, want only *.demo.lab.internal", got)
@@ -42,8 +44,8 @@ func TestEnsureIngressPKICreatesAndReusesWildcardCertificates(t *testing.T) {
 	if got, want := first.LeafCertificate.NotBefore, now.Add(-ingressBackdateSkew); !got.Equal(want) {
 		t.Fatalf("leaf NotBefore = %s, want %s", got, want)
 	}
-	if got := first.LeafCertificate.NotAfter.Sub(now); got > ingressLeafLifetime {
-		t.Fatalf("leaf lifetime from issuance time = %s, want <= %s", got, ingressLeafLifetime)
+	if got := first.LeafCertificate.NotAfter.Sub(first.LeafCertificate.NotBefore); got != ingressLeafLifetime {
+		t.Fatalf("leaf lifetime = %s, want %s", got, ingressLeafLifetime)
 	}
 	for _, path := range []string{paths.CACert, paths.CAKey, paths.TLSCert, paths.TLSKey} {
 		info, err := os.Stat(path)
@@ -101,6 +103,9 @@ func TestEnsureIngressPKIRenewsOnlyTheLeafNearExpiry(t *testing.T) {
 	}
 	if got := second.LeafCertificate.DNSNames; len(got) != 1 || got[0] != "*.demo.k8s.test" {
 		t.Fatalf("renewed leaf SANs = %v", got)
+	}
+	if got := second.LeafCertificate.NotAfter.Sub(second.LeafCertificate.NotBefore); got != ingressLeafLifetime {
+		t.Fatalf("renewed leaf lifetime = %s, want %s", got, ingressLeafLifetime)
 	}
 }
 
@@ -225,34 +230,165 @@ func TestEnsureIngressPKIRepairsBrokenLeafFiles(t *testing.T) {
 	}
 }
 
+func TestEnsureIngressPKIRecoversIncompleteCorruptCAWithoutLeafPair(t *testing.T) {
+	now := time.Date(2026, time.August, 31, 10, 0, 0, 0, time.UTC)
+	item := cluster.Cluster{Name: "demo"}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(t *testing.T, paths ingressPKIPaths)
+	}{
+		{
+			name: "missing CA key",
+			mutate: func(t *testing.T, paths ingressPKIPaths) {
+				t.Helper()
+				if err := os.Remove(paths.CAKey); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "corrupt CA certificate",
+			mutate: func(t *testing.T, paths ingressPKIPaths) {
+				t.Helper()
+				if err := os.WriteFile(paths.CACert, []byte("not a certificate"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			paths := testIngressPKIPaths(t)
+			first, err := ensureIngressPKI(item, paths, ingressPKIOptions{
+				Now:  fixedTime(now),
+				Rand: newDeterministicReader(11),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(paths.TLSCert); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(paths.TLSKey); err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(t, paths)
+			second, err := ensureIngressPKI(item, paths, ingressPKIOptions{
+				Now:  fixedTime(now.Add(48 * time.Hour)),
+				Rand: newDeterministicReader(12),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertIngressPKIHealthy(t, item, paths, second)
+			if bytes.Equal(first.CACertPEM, second.CACertPEM) && bytes.Equal(first.CAKeyPEM, second.CAKeyPEM) {
+				t.Fatal("interrupted first generation reused the incomplete CA")
+			}
+		})
+	}
+}
+
 func TestEnsureIngressPKIRefusesCorruptCAWithRecoveryGuidance(t *testing.T) {
 	now := time.Date(2026, time.August, 31, 10, 0, 0, 0, time.UTC)
-	paths := testIngressPKIPaths(t)
 	item := cluster.Cluster{Name: "demo"}
-	if _, err := ensureIngressPKI(item, paths, ingressPKIOptions{
-		Now:  fixedTime(now),
-		Rand: newDeterministicReader(11),
-	}); err != nil {
-		t.Fatal(err)
+
+	for _, test := range []struct {
+		name   string
+		mutate func(t *testing.T, paths ingressPKIPaths)
+	}{
+		{
+			name: "missing CA key",
+			mutate: func(t *testing.T, paths ingressPKIPaths) {
+				t.Helper()
+				if err := os.Remove(paths.CAKey); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "corrupt CA certificate",
+			mutate: func(t *testing.T, paths ingressPKIPaths) {
+				t.Helper()
+				if err := os.WriteFile(paths.CACert, []byte("not a certificate"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			paths := testIngressPKIPaths(t)
+			if _, err := ensureIngressPKI(item, paths, ingressPKIOptions{
+				Now:  fixedTime(now),
+				Rand: newDeterministicReader(13),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(t, paths)
+			_, err := ensureIngressPKI(item, paths, ingressPKIOptions{
+				Now:  fixedTime(now.Add(48 * time.Hour)),
+				Rand: newDeterministicReader(14),
+			})
+			if err == nil {
+				t.Fatal("corrupt ingress CA was accepted")
+			}
+			if !strings.Contains(err.Error(), filepath.Dir(paths.CACert)) {
+				t.Fatalf("error %q did not name the cluster directory", err)
+			}
+			if !strings.Contains(err.Error(), "restore it or delete ingress-ca.crt, ingress-ca.key, ingress-tls.crt, and ingress-tls.key") {
+				t.Fatalf("error %q did not include recovery guidance", err)
+			}
+			if !strings.Contains(err.Error(), "rerun `tbx up`") {
+				t.Fatalf("error %q did not tell the user to rerun tbx up", err)
+			}
+		})
 	}
-	if err := os.Remove(paths.CAKey); err != nil {
-		t.Fatal(err)
+}
+
+func TestEnsureIngressPKIRecoversFromPublicationCrashes(t *testing.T) {
+	if crashAfter := os.Getenv("TBX_INGRESS_PKI_CRASH_AFTER"); crashAfter != "" {
+		dir := os.Getenv("TBX_INGRESS_PKI_DIR")
+		if dir == "" {
+			t.Fatal("TBX_INGRESS_PKI_DIR is empty")
+		}
+		ingressPKIPublishHook = func(path string) {
+			if filepath.Base(path) == crashAfter {
+				os.Exit(86)
+			}
+		}
+		defer func() { ingressPKIPublishHook = nil }()
+		_, _ = ensureIngressPKI(cluster.Cluster{Name: "demo"}, ingressPKIPathsForDir(dir), ingressPKIOptions{
+			Now:  fixedTime(time.Date(2026, time.August, 31, 10, 0, 0, 0, time.UTC)),
+			Rand: newDeterministicReader(14),
+		})
+		t.Fatalf("expected simulated crash after publishing %s", crashAfter)
 	}
-	_, err := ensureIngressPKI(item, paths, ingressPKIOptions{
-		Now:  fixedTime(now.Add(48 * time.Hour)),
-		Rand: newDeterministicReader(12),
-	})
-	if err == nil {
-		t.Fatal("corrupt ingress CA was accepted")
-	}
-	if !strings.Contains(err.Error(), filepath.Dir(paths.CACert)) {
-		t.Fatalf("error %q did not name the cluster directory", err)
-	}
-	if !strings.Contains(err.Error(), "restore it or delete ingress-ca.crt, ingress-ca.key, ingress-tls.crt, and ingress-tls.key") {
-		t.Fatalf("error %q did not include recovery guidance", err)
-	}
-	if !strings.Contains(err.Error(), "rerun `tbx up`") {
-		t.Fatalf("error %q did not tell the user to rerun tbx up", err)
+
+	item := cluster.Cluster{Name: "demo"}
+	now := time.Date(2026, time.August, 31, 10, 0, 0, 0, time.UTC)
+	for _, crashAfter := range []string{"ingress-ca.crt", "ingress-ca.key", "ingress-tls.crt", "ingress-tls.key"} {
+		t.Run(crashAfter, func(t *testing.T) {
+			dir := t.TempDir()
+			cmd := exec.Command(os.Args[0], "-test.run", "^TestEnsureIngressPKIRecoversFromPublicationCrashes$")
+			cmd.Env = append(os.Environ(),
+				"TBX_INGRESS_PKI_CRASH_AFTER="+crashAfter,
+				"TBX_INGRESS_PKI_DIR="+dir,
+			)
+			err := cmd.Run()
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) || exitErr.ExitCode() != 86 {
+				t.Fatalf("crash runner error = %v, want exit status 86", err)
+			}
+
+			paths := ingressPKIPathsForDir(dir)
+			pki, err := ensureIngressPKI(item, paths, ingressPKIOptions{
+				Now:  fixedTime(now.Add(2 * time.Hour)),
+				Rand: newDeterministicReader(15),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertIngressPKIHealthy(t, item, paths, pki)
+		})
 	}
 }
 
@@ -282,6 +418,24 @@ func TestIngressTLSSecretObjectCarriesExactPEMBytes(t *testing.T) {
 	}
 	if got, _, _ := unstructured.NestedString(secret.Object, "data", "tls.key"); got != encodeSecretData(pki.TLSKeyPEM) {
 		t.Fatal("tls.key payload did not match the generated PEM")
+	}
+}
+
+func assertIngressPKIHealthy(t *testing.T, item cluster.Cluster, paths ingressPKIPaths, pki ingressPKI) {
+	t.Helper()
+	if !pki.CACertificate.IsCA {
+		t.Fatal("CA certificate is not a CA")
+	}
+	if err := pki.LeafCertificate.VerifyHostname("probe." + item.EffectiveDomain()); err != nil {
+		t.Fatalf("VerifyHostname() error = %v", err)
+	}
+	reloaded, err := loadIngressPKI(item, paths, ingressPKIOptions{})
+	if err != nil {
+		t.Fatalf("reload ingress PKI: %v", err)
+	}
+	if !bytes.Equal(reloaded.CACertPEM, pki.CACertPEM) || !bytes.Equal(reloaded.CAKeyPEM, pki.CAKeyPEM) ||
+		!bytes.Equal(reloaded.TLSCertPEM, pki.TLSCertPEM) || !bytes.Equal(reloaded.TLSKeyPEM, pki.TLSKeyPEM) {
+		t.Fatal("reloaded ingress PKI differs from the generated files")
 	}
 }
 
