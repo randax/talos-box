@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/randax/talos-box/internal/cluster"
@@ -184,14 +185,20 @@ func TestProbeVIPFromClusterUsesSourceAndSiblingDomainsForCilium(t *testing.T) {
 }
 
 func TestInterClusterFindingCarriesCiliumDomainsIntoBothProbeLegs(t *testing.T) {
+	var seenMu sync.Mutex
 	var seen []string
 	finding := interClusterFinding(liveCiliumClusterStatuses(), nil, func(request *http.Request) (*http.Response, error) {
+		seenMu.Lock()
 		seen = append(seen, request.Host+" "+request.URL.String())
+		seenMu.Unlock()
 		return jsonResponse(`{"responses":["lb-probe-1"]}`), nil
 	})
 	if finding.level != "PASS" {
 		t.Fatalf("level = %s (%s), want PASS", finding.level, finding.detail)
 	}
+	seenMu.Lock()
+	gotSeen := append([]string(nil), seen...)
+	seenMu.Unlock()
 	for _, want := range []string{
 		"probe.qa-core.k8s.test http://172.30.0.200/",
 		"probe.qa-edge.k8s.test http://172.30.1.200/",
@@ -199,13 +206,13 @@ func TestInterClusterFindingCarriesCiliumDomainsIntoBothProbeLegs(t *testing.T) 
 		"probe.qa-edge.k8s.test http://172.30.1.200/dial?host=probe.qa-core.k8s.test&port=80&protocol=http&request=hostname&tries=1",
 	} {
 		found := false
-		for _, got := range seen {
+		for _, got := range gotSeen {
 			if got == want {
 				found = true
 			}
 		}
 		if !found {
-			t.Fatalf("missing probe request %q in %v", want, seen)
+			t.Fatalf("missing probe request %q in %v", want, gotSeen)
 		}
 	}
 }
