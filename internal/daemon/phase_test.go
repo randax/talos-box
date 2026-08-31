@@ -1,7 +1,13 @@
 package daemon
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
@@ -385,8 +391,7 @@ func TestTrustHintDetectionRequiresReceiptAndIngressCA(t *testing.T) {
 		}
 		return regularFileInfo{name: filepath.Base(path)}, nil
 	}
-	certificate := selfSigned(t, "ingress-ca")
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Certificate[0]})
+	certPEM := trustHintTestCA(t)
 	fingerprint, err := trustHintCertificateFingerprint(certPEM)
 	if err != nil {
 		t.Fatalf("fingerprint: %v", err)
@@ -428,6 +433,28 @@ func TestTrustHintDetectionRequiresReceiptAndIngressCA(t *testing.T) {
 	if trustReceiptAndCertPresent("demo") {
 		t.Fatal("receipt without CA was detected as installed")
 	}
+}
+
+func trustHintTestCA(t *testing.T) []byte {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test ingress CA"},
+		NotBefore:             time.Unix(0, 0),
+		NotAfter:              time.Unix(0, 0).AddDate(10, 0, 0),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }
 
 type regularFileInfo struct{ name string }

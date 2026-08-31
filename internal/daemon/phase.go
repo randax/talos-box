@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -1127,13 +1128,16 @@ func trustReceiptAndCertPresent(name string) bool {
 }
 
 func trustHintCertificateFingerprint(data []byte) (string, error) {
-	block, _ := pem.Decode(data)
-	if block == nil || block.Type != "CERTIFICATE" {
-		return "", errors.New("PEM does not contain a certificate")
+	block, rest := pem.Decode(data)
+	if block == nil || block.Type != "CERTIFICATE" || len(bytes.TrimSpace(rest)) != 0 {
+		return "", errors.New("PEM does not contain exactly one certificate")
 	}
 	certificate, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
 		return "", fmt.Errorf("parse certificate: %w", err)
+	}
+	if !certificate.IsCA {
+		return "", errors.New("certificate is not a CA")
 	}
 	digest := sha256.Sum256(certificate.Raw)
 	return strings.ToUpper(hex.EncodeToString(digest[:])), nil

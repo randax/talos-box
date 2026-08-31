@@ -65,7 +65,6 @@ func TestSelectLinuxTrustDriver(t *testing.T) {
 func TestApplyLinuxTrustActionUsesSelectedDriverCommands(t *testing.T) {
 	fixture := newTrustFixture(t, "linux")
 	toolPaths := map[string]string{
-		"install":                "/test-bin/install",
 		"update-ca-certificates": "/test-bin/update-ca-certificates",
 		"update-ca-trust":        "/test-bin/update-ca-trust",
 		"trust":                  "/test-bin/trust",
@@ -78,19 +77,40 @@ func TestApplyLinuxTrustActionUsesSelectedDriverCommands(t *testing.T) {
 				t.Fatal(err)
 			}
 			destination := filepath.Join(driver.StoreDir, "talosbox-demo-ingress-ca.crt")
+			writtenPath := filepath.Join(t.TempDir(), "anchor.crt")
+			var openCalls []struct {
+				path  string
+				flags int
+				perm  os.FileMode
+			}
+			trustOpenFile = func(path string, flags int, perm os.FileMode) (*os.File, error) {
+				openCalls = append(openCalls, struct {
+					path  string
+					flags int
+					perm  os.FileMode
+				}{path: path, flags: flags, perm: perm})
+				return os.OpenFile(writtenPath, flags, perm)
+			}
 			var commands []trustCommand
 			trustRunCommand = func(command trustCommand, _ io.Reader, _, _ io.Writer) error {
 				commands = append(commands, command)
 				return nil
 			}
 			if err := applyLinuxTrustAction(trustSystemAction{
-				Operation: trustOperationInstall, Driver: driverName, Source: fixture.certPath, Destination: destination,
-			}); err != nil {
+				Operation: trustOperationInstall, Driver: driverName, Fingerprint: fixture.fingerprint, Destination: destination,
+			}, bytes.NewReader(fixture.certPEM)); err != nil {
 				t.Fatal(err)
 			}
-			wantInstall := trustCommand{Name: toolPaths["install"], Args: []string{"-m", "0644", fixture.certPath, destination}}
-			if len(commands) != 2 || !reflect.DeepEqual(commands[0], wantInstall) || !reflect.DeepEqual(commands[1], driver.Refresh) {
-				t.Fatalf("commands = %+v, want install %+v then injected refresh %+v", commands, wantInstall, driver.Refresh)
+			if len(openCalls) != 1 || openCalls[0].path != destination || openCalls[0].perm != 0o644 || openCalls[0].flags != os.O_WRONLY|os.O_CREATE|os.O_EXCL {
+				t.Fatalf("open calls = %+v", openCalls)
+			}
+			if len(commands) != 1 || !reflect.DeepEqual(commands[0], driver.Refresh) {
+				t.Fatalf("commands = %+v, want injected refresh %+v", commands, driver.Refresh)
+			}
+			if got, err := os.ReadFile(writtenPath); err != nil {
+				t.Fatal(err)
+			} else if !bytes.Equal(got, fixture.certPEM) {
+				t.Fatalf("written PEM = %q, want %q", got, fixture.certPEM)
 			}
 		})
 	}
@@ -100,8 +120,10 @@ func TestTrustInstallAndRemoveReceiptLifecycleAfterClusterDeletion(t *testing.T)
 	fixture := newTrustFixture(t, "linux")
 	fixture.osRelease = []byte("ID=ubuntu\n")
 	var actions []trustSystemAction
-	trustSudoReexec = func(action trustSystemAction) error {
+	var installPEM [][]byte
+	trustSudoReexec = func(action trustSystemAction, stdin []byte) error {
 		actions = append(actions, action)
+		installPEM = append(installPEM, append([]byte(nil), stdin...))
 		return nil
 	}
 
@@ -125,8 +147,11 @@ func TestTrustInstallAndRemoveReceiptLifecycleAfterClusterDeletion(t *testing.T)
 	} else if info.Mode().Perm() != 0o600 {
 		t.Fatalf("receipt mode = %o, want 600", info.Mode().Perm())
 	}
-	if len(actions) != 1 || actions[0].Operation != trustOperationInstall || actions[0].Driver != receipt.Driver || actions[0].Destination != receipt.Path {
+	if len(actions) != 1 || actions[0].Operation != trustOperationInstall || actions[0].Driver != receipt.Driver || actions[0].Destination != receipt.Path || actions[0].Fingerprint != receipt.Fingerprint {
 		t.Fatalf("install actions = %+v, receipt = %+v", actions, receipt)
+	}
+	if len(installPEM) != 1 || !bytes.Equal(installPEM[0], fixture.certPEM) {
+		t.Fatalf("install stdin = %q, want CA PEM", installPEM)
 	}
 
 	if err := os.Remove(fixture.certPath); err != nil {
@@ -135,8 +160,11 @@ func TestTrustInstallAndRemoveReceiptLifecycleAfterClusterDeletion(t *testing.T)
 	if err := command.run([]string{"trust", "remove", fixture.cluster}); err != nil {
 		t.Fatal(err)
 	}
-	if len(actions) != 2 || actions[1].Operation != trustOperationRemove || actions[1].Destination != receipt.Path {
+	if len(actions) != 2 || actions[1].Operation != trustOperationRemove || actions[1].Destination != receipt.Path || actions[1].Fingerprint != receipt.Fingerprint {
 		t.Fatalf("actions after remove = %+v", actions)
+	}
+	if len(installPEM) != 2 || len(installPEM[1]) != 0 {
+		t.Fatalf("remove unexpectedly passed stdin = %q", installPEM)
 	}
 	if _, err := readTrustReceipt(fixture.cluster); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("receipt remains after removal: %v", err)
@@ -174,7 +202,13 @@ func TestNixOSTrustInstallPrintsDeclarationWithoutMutation(t *testing.T) {
 	fixture := newTrustFixture(t, "linux")
 	fixture.osRelease = []byte("ID=nixos\n")
 	mutated := false
-	trustSudoReexec = func(trustSystemAction) error { mutated = true; return nil }
+	trustStat = func(path string) (os.FileInfo, error) {
+		if path == "/etc/NIXOS" {
+			return regularFileInfo{name: "NIXOS"}, nil
+		}
+		return os.Stat(path)
+	}
+	trustSudoReexec = func(trustSystemAction, []byte) error { mutated = true; return nil }
 	trustRunCommand = func(trustCommand, io.Reader, io.Writer, io.Writer) error { mutated = true; return nil }
 
 	command := cli{out: &fixture.stdout, err: &fixture.stderr, daemon: nil}
@@ -218,7 +252,7 @@ func TestTrustInstallIsIdempotent(t *testing.T) {
 func TestTrustRemoveUninstalledIsCleanNoop(t *testing.T) {
 	fixture := newTrustFixture(t, "linux")
 	called := false
-	trustSudoReexec = func(trustSystemAction) error { called = true; return nil }
+	trustSudoReexec = func(trustSystemAction, []byte) error { called = true; return nil }
 	command := cli{out: &fixture.stdout, err: &fixture.stderr, daemon: nil}
 	if err := command.run([]string{"trust", "remove", fixture.cluster}); err != nil {
 		t.Fatal(err)
@@ -247,12 +281,14 @@ func TestTrustCommandRegistrationAndHelp(t *testing.T) {
 }
 
 type trustFixture struct {
-	cluster   string
-	home      string
-	certPath  string
-	osRelease []byte
-	stdout    bytes.Buffer
-	stderr    bytes.Buffer
+	cluster     string
+	home        string
+	certPath    string
+	certPEM     []byte
+	fingerprint string
+	osRelease   []byte
+	stdout      bytes.Buffer
+	stderr      bytes.Buffer
 }
 
 func newTrustFixture(t *testing.T, goos string) *trustFixture {
@@ -262,7 +298,13 @@ func newTrustFixture(t *testing.T, goos string) *trustFixture {
 	if err := os.MkdirAll(filepath.Dir(fixture.certPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(fixture.certPath, testTrustCertificate(t), 0o600); err != nil {
+	fixture.certPEM = testTrustCertificate(t)
+	fingerprint, err := trustCertificateFingerprint(fixture.certPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.fingerprint = fingerprint
+	if err := os.WriteFile(fixture.certPath, fixture.certPEM, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -275,6 +317,7 @@ func newTrustFixture(t *testing.T, goos string) *trustFixture {
 	originalRemove := trustRemove
 	originalRename := trustRename
 	originalStat := trustStat
+	originalOpen := trustOpenFile
 	originalLookup := trustLookPath
 	originalEUID := trustEUID
 	originalNow := trustNow
@@ -290,6 +333,7 @@ func newTrustFixture(t *testing.T, goos string) *trustFixture {
 		trustRemove = originalRemove
 		trustRename = originalRename
 		trustStat = originalStat
+		trustOpenFile = originalOpen
 		trustLookPath = originalLookup
 		trustEUID = originalEUID
 		trustNow = originalNow
@@ -315,12 +359,18 @@ func newTrustFixture(t *testing.T, goos string) *trustFixture {
 	trustMkdirAll = os.MkdirAll
 	trustRemove = os.Remove
 	trustRename = os.Rename
-	trustStat = os.Stat
+	trustStat = func(path string) (os.FileInfo, error) {
+		if path == "/etc/NIXOS" {
+			return nil, os.ErrNotExist
+		}
+		return os.Stat(path)
+	}
+	trustOpenFile = os.OpenFile
 	trustLookPath = func(name string) (string, error) { return filepath.Join("/test-bin", name), nil }
 	trustEUID = func() int { return 1000 }
 	trustNow = func() time.Time { return time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC) }
 	trustRunCommand = func(trustCommand, io.Reader, io.Writer, io.Writer) error { return nil }
-	trustSudoReexec = func(trustSystemAction) error { return nil }
+	trustSudoReexec = func(trustSystemAction, []byte) error { return nil }
 	return fixture
 }
 
@@ -372,5 +422,117 @@ func TestDarwinRemoveUsesRecordedFingerprint(t *testing.T) {
 	wantDelete := trustCommand{Name: securityPath, Args: []string{"delete-certificate", "-Z", receipt.Fingerprint, receipt.Path}}
 	if !reflect.DeepEqual(commands[1], wantDelete) {
 		t.Fatalf("delete command = %+v, want %+v", commands[1], wantDelete)
+	}
+}
+
+type regularFileInfo struct{ name string }
+
+func (i regularFileInfo) Name() string     { return i.name }
+func (regularFileInfo) Size() int64        { return 0 }
+func (regularFileInfo) Mode() os.FileMode  { return 0o600 }
+func (regularFileInfo) ModTime() time.Time { return time.Time{} }
+func (regularFileInfo) IsDir() bool        { return false }
+func (regularFileInfo) Sys() any           { return nil }
+
+func TestApplyLinuxTrustActionRejectsCertificateFingerprintMismatch(t *testing.T) {
+	fixture := newTrustFixture(t, "linux")
+	trustLookPath = func(name string) (string, error) { return filepath.Join("/test-bin", name), nil }
+	trustOpenFile = func(string, int, os.FileMode) (*os.File, error) {
+		t.Fatal("mismatched certificate should not be written")
+		return nil, nil
+	}
+	err := applyLinuxTrustAction(trustSystemAction{
+		Operation:   trustOperationInstall,
+		Driver:      linuxDebianDriver,
+		Fingerprint: strings.Repeat("A", len(fixture.fingerprint)),
+		Destination: filepath.Join(linuxDebianStore, "talosbox-demo-ingress-ca.crt"),
+	}, bytes.NewReader(fixture.certPEM))
+	if err == nil || !strings.Contains(err.Error(), "fingerprint changed") {
+		t.Fatalf("applyLinuxTrustAction() error = %v, want fingerprint mismatch", err)
+	}
+}
+
+func TestTrustSystemInstallReadsValidatedCertificateFromStdin(t *testing.T) {
+	fixture := newTrustFixture(t, "linux")
+	trustEUID = func() int { return 0 }
+	writtenPath := filepath.Join(t.TempDir(), "anchor.crt")
+	trustOpenFile = func(path string, flags int, perm os.FileMode) (*os.File, error) {
+		if path != filepath.Join(linuxDebianStore, "talosbox-demo-ingress-ca.crt") {
+			t.Fatalf("destination path = %q", path)
+		}
+		return os.OpenFile(writtenPath, flags, perm)
+	}
+	var refreshed []trustCommand
+	trustRunCommand = func(command trustCommand, _ io.Reader, _, _ io.Writer) error {
+		refreshed = append(refreshed, command)
+		return nil
+	}
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write(fixture.certPEM); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	originalStdin := os.Stdin
+	os.Stdin = reader
+	t.Cleanup(func() { os.Stdin = originalStdin })
+	command := cli{out: &fixture.stdout, err: &fixture.stderr, daemon: nil}
+	if err := command.run([]string{"trust", "_system", "install", linuxDebianDriver, fixture.fingerprint, filepath.Join(linuxDebianStore, "talosbox-demo-ingress-ca.crt")}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(writtenPath); err != nil {
+		t.Fatal(err)
+	} else if !bytes.Equal(got, fixture.certPEM) {
+		t.Fatalf("written PEM = %q, want %q", got, fixture.certPEM)
+	}
+	if len(refreshed) != 1 || refreshed[0].Name != "/test-bin/update-ca-certificates" {
+		t.Fatalf("refresh commands = %+v", refreshed)
+	}
+}
+
+func TestApplyLinuxTrustActionRefusesRemovingChangedAnchor(t *testing.T) {
+	fixture := newTrustFixture(t, "linux")
+	otherPEM := testTrustCertificate(t)
+	trustReadFile = func(path string) ([]byte, error) {
+		if path == filepath.Join(linuxDebianStore, "talosbox-demo-ingress-ca.crt") {
+			return otherPEM, nil
+		}
+		return os.ReadFile(path)
+	}
+	trustRemove = func(string) error {
+		t.Fatal("changed anchor should not be removed")
+		return nil
+	}
+	trustRunCommand = func(trustCommand, io.Reader, io.Writer, io.Writer) error {
+		t.Fatal("changed anchor should not refresh trust store")
+		return nil
+	}
+	err := applyLinuxTrustAction(trustSystemAction{
+		Operation:   trustOperationRemove,
+		Driver:      linuxDebianDriver,
+		Fingerprint: fixture.fingerprint,
+		Destination: filepath.Join(linuxDebianStore, "talosbox-demo-ingress-ca.crt"),
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "remove it manually") {
+		t.Fatalf("applyLinuxTrustAction() error = %v, want manual removal refusal", err)
+	}
+}
+
+func TestSelectLinuxTrustDriverRejectsUnknownTrustStoreEvenWhenTrustExists(t *testing.T) {
+	lookup := func(name string) (string, error) {
+		return filepath.Join("/test-bin", name), nil
+	}
+	_, _, err := selectLinuxTrustDriver([]byte("ID=opensuse\n"), lookup)
+	if err == nil {
+		t.Fatal("unknown distro unexpectedly mapped to a trust driver")
+	}
+	for _, want := range []string{"unsupported Linux trust store", linuxDebianStore, linuxFedoraStore, linuxP11KitStore} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q missing %q", err, want)
+		}
 	}
 }
