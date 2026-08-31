@@ -232,7 +232,19 @@ func TestTrustInstallIsIdempotent(t *testing.T) {
 	fixture := newTrustFixture(t, "darwin")
 	trustLookPath = func(name string) (string, error) { return "/test-bin/security", nil }
 	runs := 0
-	trustRunCommand = func(trustCommand, io.Reader, io.Writer, io.Writer) error { runs++; return nil }
+	trustRunCommand = func(command trustCommand, _ io.Reader, stdout, _ io.Writer) error {
+		runs++
+		switch {
+		case reflect.DeepEqual(command.Args, []string{"add-trusted-cert", "-r", "trustRoot", "-k", filepath.Join(fixture.home, "Library", "Keychains", "login.keychain-db"), fixture.certPath}):
+			return nil
+		case reflect.DeepEqual(command.Args, []string{"find-certificate", "-Z", "-c", "demo talos-box ingress CA", filepath.Join(fixture.home, "Library", "Keychains", "login.keychain-db")}):
+			_, err := io.WriteString(stdout, "SHA-256 hash: "+fixture.fingerprint+"\n")
+			return err
+		default:
+			t.Fatalf("unexpected trust command: %+v", command)
+			return nil
+		}
+	}
 	command := cli{out: &fixture.stdout, err: &fixture.stderr, daemon: nil}
 
 	if err := command.run([]string{"trust", "install", fixture.cluster}); err != nil {
@@ -241,11 +253,202 @@ func TestTrustInstallIsIdempotent(t *testing.T) {
 	if err := command.run([]string{"trust", "install", fixture.cluster}); err != nil {
 		t.Fatal(err)
 	}
-	if runs != 1 {
-		t.Fatalf("security command ran %d times, want one", runs)
+	if runs != 2 {
+		t.Fatalf("security command ran %d times, want add+validate", runs)
 	}
 	if !strings.Contains(fixture.stdout.String(), "already installed") {
 		t.Fatalf("idempotent result is unclear:\n%s", fixture.stdout.String())
+	}
+}
+
+func TestTrustInstallReinstallsLinuxAnchorRemovedOutOfBand(t *testing.T) {
+	fixture := newTrustFixture(t, "linux")
+	fixture.osRelease = []byte("ID=ubuntu\n")
+	var actions []trustSystemAction
+	trustSudoReexec = func(action trustSystemAction, stdin []byte) error {
+		actions = append(actions, action)
+		if action.Operation != trustOperationInstall {
+			t.Fatalf("unexpected Linux trust action: %+v", action)
+		}
+		if !bytes.Equal(stdin, fixture.certPEM) {
+			t.Fatalf("install stdin = %q, want CA PEM", stdin)
+		}
+		return nil
+	}
+	command := cli{out: &fixture.stdout, err: &fixture.stderr, daemon: nil}
+	if err := command.run([]string{"trust", "install", fixture.cluster}); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := readTrustReceipt(fixture.cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.stdout.Reset()
+	trustReadFile = func(path string) ([]byte, error) {
+		if path == linuxOSReleasePath {
+			return fixture.osRelease, nil
+		}
+		if path == receipt.Path {
+			return nil, os.ErrNotExist
+		}
+		return os.ReadFile(path)
+	}
+	if err := command.run([]string{"trust", "install", fixture.cluster}); err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 2 {
+		t.Fatalf("Linux install actions = %+v", actions)
+	}
+	if strings.Contains(fixture.stdout.String(), "already installed") {
+		t.Fatalf("removed anchor incorrectly short-circuited:\n%s", fixture.stdout.String())
+	}
+}
+
+func TestTrustInstallReinstallsLinuxAnchorSwappedOutOfBand(t *testing.T) {
+	fixture := newTrustFixture(t, "linux")
+	fixture.osRelease = []byte("ID=ubuntu\n")
+	var actions []trustSystemAction
+	trustSudoReexec = func(action trustSystemAction, stdin []byte) error {
+		actions = append(actions, action)
+		if action.Operation != trustOperationInstall {
+			t.Fatalf("unexpected Linux trust action: %+v", action)
+		}
+		if !bytes.Equal(stdin, fixture.certPEM) {
+			t.Fatalf("install stdin = %q, want CA PEM", stdin)
+		}
+		return nil
+	}
+	command := cli{out: &fixture.stdout, err: &fixture.stderr, daemon: nil}
+	if err := command.run([]string{"trust", "install", fixture.cluster}); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := readTrustReceipt(fixture.cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherPEM := testTrustCertificate(t)
+	fixture.stdout.Reset()
+	trustReadFile = func(path string) ([]byte, error) {
+		if path == linuxOSReleasePath {
+			return fixture.osRelease, nil
+		}
+		if path == receipt.Path {
+			return otherPEM, nil
+		}
+		return os.ReadFile(path)
+	}
+	if err := command.run([]string{"trust", "install", fixture.cluster}); err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 2 {
+		t.Fatalf("Linux install actions = %+v", actions)
+	}
+	if strings.Contains(fixture.stdout.String(), "already installed") {
+		t.Fatalf("swapped anchor incorrectly short-circuited:\n%s", fixture.stdout.String())
+	}
+}
+
+func TestTrustInstallReinstallsDarwinEntryRemovedOutOfBand(t *testing.T) {
+	fixture := newTrustFixture(t, "darwin")
+	securityPath := "/test-bin/security"
+	trustLookPath = func(string) (string, error) { return securityPath, nil }
+	var commands []trustCommand
+	installedFingerprint := ""
+	trustRunCommand = func(command trustCommand, _ io.Reader, stdout, stderr io.Writer) error {
+		commands = append(commands, command)
+		switch command.Args[0] {
+		case "add-trusted-cert":
+			installedFingerprint = fixture.fingerprint
+			return nil
+		case "find-certificate":
+			if installedFingerprint == "" {
+				return errors.New("certificate not found")
+			}
+			_, err := io.WriteString(stdout, "SHA-256 hash: "+installedFingerprint+"\n")
+			return err
+		default:
+			t.Fatalf("unexpected security command: %+v", command)
+			_, _ = io.WriteString(stderr, "unexpected command")
+			return nil
+		}
+	}
+	command := cli{out: &fixture.stdout, err: &fixture.stderr, daemon: nil}
+	if err := command.run([]string{"trust", "install", fixture.cluster}); err != nil {
+		t.Fatal(err)
+	}
+	installedFingerprint = ""
+	fixture.stdout.Reset()
+	if err := command.run([]string{"trust", "install", fixture.cluster}); err != nil {
+		t.Fatal(err)
+	}
+	if len(commands) != 3 {
+		t.Fatalf("security commands = %+v", commands)
+	}
+	if strings.Contains(fixture.stdout.String(), "already installed") {
+		t.Fatalf("removed keychain entry incorrectly short-circuited:\n%s", fixture.stdout.String())
+	}
+}
+
+func TestTrustInstallReinstallsDarwinEntrySwappedOutOfBand(t *testing.T) {
+	fixture := newTrustFixture(t, "darwin")
+	securityPath := "/test-bin/security"
+	trustLookPath = func(string) (string, error) { return securityPath, nil }
+	var commands []trustCommand
+	otherPEM := testTrustCertificate(t)
+	otherFingerprint, err := trustCertificateFingerprint(otherPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	installedFingerprint := ""
+	trustRunCommand = func(command trustCommand, _ io.Reader, stdout, stderr io.Writer) error {
+		commands = append(commands, command)
+		switch command.Args[0] {
+		case "add-trusted-cert":
+			installedFingerprint = fixture.fingerprint
+			return nil
+		case "find-certificate":
+			if installedFingerprint == "" {
+				return errors.New("certificate not found")
+			}
+			_, err := io.WriteString(stdout, "SHA-256 hash: "+installedFingerprint+"\n")
+			return err
+		default:
+			t.Fatalf("unexpected security command: %+v", command)
+			_, _ = io.WriteString(stderr, "unexpected command")
+			return nil
+		}
+	}
+	command := cli{out: &fixture.stdout, err: &fixture.stderr, daemon: nil}
+	if err := command.run([]string{"trust", "install", fixture.cluster}); err != nil {
+		t.Fatal(err)
+	}
+	installedFingerprint = otherFingerprint
+	fixture.stdout.Reset()
+	if err := command.run([]string{"trust", "install", fixture.cluster}); err != nil {
+		t.Fatal(err)
+	}
+	if len(commands) != 3 {
+		t.Fatalf("security commands = %+v", commands)
+	}
+	if strings.Contains(fixture.stdout.String(), "already installed") {
+		t.Fatalf("swapped keychain entry incorrectly short-circuited:\n%s", fixture.stdout.String())
+	}
+}
+
+func TestTrustInstallRefusesReplacingDifferentRecordedCA(t *testing.T) {
+	fixture := newTrustFixture(t, "linux")
+	fixture.osRelease = []byte("ID=ubuntu\n")
+	command := cli{out: &fixture.stdout, err: &fixture.stderr, daemon: nil}
+	if err := command.run([]string{"trust", "install", fixture.cluster}); err != nil {
+		t.Fatal(err)
+	}
+	otherPEM := testTrustCertificate(t)
+	if err := os.WriteFile(fixture.certPath, otherPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := command.run([]string{"trust", "install", fixture.cluster})
+	if err == nil || !strings.Contains(err.Error(), "different trusted CA recorded") {
+		t.Fatalf("second install error = %v, want recorded-CA refusal", err)
 	}
 }
 

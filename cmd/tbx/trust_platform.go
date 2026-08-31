@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -46,6 +47,22 @@ func (c cli) removeDarwinTrust(receipt trustReceipt) error {
 		return fmt.Errorf("remove ingress CA from macOS login keychain: %w", err)
 	}
 	return nil
+}
+
+func (c cli) darwinTrustEntryMatches(clusterName string, receipt trustReceipt, expectedFingerprint string) (bool, error) {
+	security, err := trustLookPath("/usr/bin/security")
+	if err != nil {
+		return false, fmt.Errorf("find macOS security tool: %w", err)
+	}
+	command := trustCommand{
+		Name: security,
+		Args: []string{"find-certificate", "-Z", "-c", ingressCACommonName(clusterName), receipt.Path},
+	}
+	var stdout bytes.Buffer
+	if err := trustRunCommand(command, nil, &stdout, io.Discard); err != nil {
+		return false, nil
+	}
+	return outputContainsFingerprint(stdout.String(), expectedFingerprint), nil
 }
 
 const (
@@ -202,6 +219,24 @@ func verifyTrustAnchorFingerprint(path, expectedFingerprint string) error {
 	return fmt.Errorf("refuse to remove trust anchor %s: it changed since installation; remove it manually", path)
 }
 
+func linuxTrustEntryMatches(receipt trustReceipt, expectedFingerprint string) (bool, error) {
+	if expectedFingerprint == "" {
+		return false, errors.New("expected trust-anchor fingerprint is empty")
+	}
+	data, err := trustReadFile(receipt.Path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read trust anchor %s: %w", receipt.Path, err)
+	}
+	fingerprint, err := trustCertificateFingerprint(data)
+	if err != nil {
+		return false, nil
+	}
+	return fingerprint == expectedFingerprint, nil
+}
+
 func detectLinuxTrustDriver() (linuxTrustDriver, bool, error) {
 	if _, err := trustStat("/etc/NIXOS"); err == nil {
 		return linuxTrustDriver{}, true, nil
@@ -284,6 +319,24 @@ func parseOSRelease(data []byte) map[string]string {
 func containsString(values []string, wanted string) bool {
 	for _, value := range values {
 		if value == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func ingressCACommonName(clusterName string) string {
+	return clusterName + " talos-box ingress CA"
+}
+
+var trustFingerprintPattern = regexp.MustCompile(`SHA-256 hash:\s*([0-9A-Fa-f]+)`)
+
+func outputContainsFingerprint(output, expectedFingerprint string) bool {
+	if expectedFingerprint == "" {
+		return false
+	}
+	for _, match := range trustFingerprintPattern.FindAllStringSubmatch(output, -1) {
+		if len(match) == 2 && strings.EqualFold(match[1], expectedFingerprint) {
 			return true
 		}
 	}
