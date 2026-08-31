@@ -363,21 +363,32 @@ func (a clusterActivity) suspendedRecovery() string {
 	}
 	resumes := make([]string, 0, len(a.suspended))
 	for _, name := range a.suspended {
-		resumes = append(resumes, "tbx cluster resume "+name)
+		resumes = append(resumes, "`tbx cluster resume "+name+"`")
 	}
 	return "clear the saved state with: " + strings.Join(resumes, ", ") +
-		" (or tbx cluster destroy <name> to discard it)"
+		" (or `tbx cluster destroy <name>` to discard it)"
 }
 
-// restartRefusal is the one refusal both the protocol gate and `tbx system
-// restart` print when a restart would disturb clusters: it names what was
-// found, how to clear a suspension, and the force that proceeds regardless.
-func restartRefusal(activity clusterActivity) string {
+// clusterImpactDescription names the clusters a daemon restart would disturb
+// and how to clear any saved memory that prevents a safe restart.
+func clusterImpactDescription(activity clusterActivity) string {
 	message := "restarting tbxd stops these clusters: " + activity.describe()
 	if recovery := activity.suspendedRecovery(); recovery != "" {
 		message += "; " + recovery
 	}
-	return message + "; re-run: tbx system restart --force to restart anyway"
+	return message
+}
+
+const unsupervisedRestartSuffix = "re-run: `tbx system restart --force` to restart anyway"
+
+// restartRefusal is the refusal both the protocol gate and an unsupervised
+// `tbx system restart` print when a restart would disturb clusters.
+func restartRefusal(activity clusterActivity) string {
+	return clusterImpactDescription(activity) + "; " + unsupervisedRestartSuffix
+}
+
+func supervisedRestartSuffix() string {
+	return fmt.Sprintf("tbx will not restart a supervised tbxd — run: `%s`", supervisorRestartCommand())
 }
 
 // supervisionRefusal is the one refusal both the protocol gate and `tbx system
@@ -392,9 +403,9 @@ func restartRefusal(activity clusterActivity) string {
 func supervisionRefusal(state supervision, reason string) string {
 	switch state {
 	case supervisionConfirmed:
-		return fmt.Sprintf("%s; tbx will not restart a supervised tbxd — run: %s", reason, supervisorRestartCommand())
+		return reason + "; " + supervisedRestartSuffix()
 	case supervisionInferred:
-		return fmt.Sprintf("%s; re-run: tbx system restart --force to replace it in place, or restart it through its supervisor: %s",
+		return fmt.Sprintf("%s; re-run: `tbx system restart --force` to replace it in place, or restart it through its supervisor: `%s`",
 			reason, supervisorRestartCommand())
 	default:
 		return ""

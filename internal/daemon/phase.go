@@ -1,8 +1,14 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
+	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net"
@@ -557,7 +563,15 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 		}
 		if status.CNI == cluster.CNICilium && status.LB && status.KubernetesReady {
 			if status.VIPLive {
-				hints = append(hints, fmt.Sprintf("Kubernetes is Ready; Cilium LB-IPAM VIP is live at http://%s/.%s", status.VIP, credentialExports(status.Name)))
+				domain := status.Domain
+				if domain == "" {
+					domain = status.Name + "." + cluster.DefaultDomainSuffix
+				}
+				trustHint := ""
+				if !trustInstalledForHint(status.Name) {
+					trustHint = fmt.Sprintf(" Install its browser-trust CA: tbx trust install %s.", shellquote.Quote(status.Name))
+				}
+				hints = append(hints, fmt.Sprintf("Kubernetes is Ready; Cilium LB-IPAM ingress is live at https://probe.%s/.%s%s", domain, trustHint, credentialExports(status.Name)))
 			} else {
 				hints = append(hints, fmt.Sprintf("Kubernetes is Ready; %s.%s", vipSettlingNote(status, "Cilium LB-IPAM"), credentialExports(status.Name)))
 				vipNoted = true
@@ -1063,7 +1077,71 @@ func (c ClusterStatus) controlPlaneOr(fallback NodeStatus) NodeStatus {
 
 // hintGOOS is the host platform the hints are written for. It is a variable so
 // a test can exercise the macOS-only wording from any host.
-var hintGOOS = runtime.GOOS
+var (
+	hintGOOS              = runtime.GOOS
+	trustInstalledForHint = trustReceiptAndCertPresent
+	trustHintUserHomeDir  = os.UserHomeDir
+	trustHintReadFile     = os.ReadFile
+	trustHintStat         = os.Stat
+)
+
+// trustReceiptAndCertPresent is deliberately a local filesystem observation:
+// status rendering must never invoke a platform keychain or trust-store tool.
+// The receipt says tbx completed installation, while the on-disk CA's current
+// fingerprint proves that receipt still matches this cluster's ingress PKI.
+func trustReceiptAndCertPresent(name string) bool {
+	home, err := trustHintUserHomeDir()
+	if err != nil {
+		return false
+	}
+	receiptPath := filepath.Join(home, ".talosbox", "trust", name+".json")
+	certPath := filepath.Join(home, ".talosbox", "clusters", name, "ingress-ca.crt")
+	for _, path := range []string{receiptPath, certPath} {
+		info, err := trustHintStat(path)
+		if err != nil || !info.Mode().IsRegular() {
+			return false
+		}
+	}
+	receiptData, err := trustHintReadFile(receiptPath)
+	if err != nil {
+		return false
+	}
+	var receipt struct {
+		Cluster     string `json:"cluster"`
+		Fingerprint string `json:"fingerprint"`
+	}
+	if err := json.Unmarshal(receiptData, &receipt); err != nil {
+		return false
+	}
+	if receipt.Cluster != name || receipt.Fingerprint == "" {
+		return false
+	}
+	certificateData, err := trustHintReadFile(certPath)
+	if err != nil {
+		return false
+	}
+	fingerprint, err := trustHintCertificateFingerprint(certificateData)
+	if err != nil {
+		return false
+	}
+	return receipt.Fingerprint == fingerprint
+}
+
+func trustHintCertificateFingerprint(data []byte) (string, error) {
+	block, rest := pem.Decode(data)
+	if block == nil || block.Type != "CERTIFICATE" || len(bytes.TrimSpace(rest)) != 0 {
+		return "", errors.New("PEM does not contain exactly one certificate")
+	}
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return "", fmt.Errorf("parse certificate: %w", err)
+	}
+	if !certificate.IsCA {
+		return "", errors.New("certificate is not a CA")
+	}
+	digest := sha256.Sum256(certificate.Raw)
+	return strings.ToUpper(hex.EncodeToString(digest[:])), nil
+}
 
 // resolverBypassNote warns that the most obvious DNS tools do not see the name
 // the hint just handed out. macOS keeps tbx's per-domain entries under

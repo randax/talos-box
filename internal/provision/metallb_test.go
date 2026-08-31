@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +17,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -174,6 +177,134 @@ func TestWaitForProbeRequiresExpectedVIPAndAResponse(t *testing.T) {
 	})
 }
 
+func TestWaitForProbeRoutesCiliumDirectIPThroughTheWildcardIngress(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	item := cluster.Cluster{Name: "demo", SubnetIndex: 2, Domain: "workshop.internal", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true}}
+	pki, err := ensureIngressPKI(item, ingressPKIPathsForDir(filepath.Join(os.Getenv("HOME"), ".talosbox", "clusters", item.Name)), ingressPKIOptions{
+		Now:  fixedTime(time.Date(2026, time.August, 31, 10, 0, 0, 0, time.UTC)),
+		Rand: newDeterministicReader(21),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	readyDeployment := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "lb-probe", Namespace: probeNamespace, Generation: 1}, Status: appsv1.DeploymentStatus{ObservedGeneration: 1, ReadyReplicas: 1, AvailableReplicas: 1}}
+	ingressService := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "cilium-ingress", Namespace: ciliumNamespace}, Status: corev1.ServiceStatus{LoadBalancer: corev1.LoadBalancerStatus{Ingress: []corev1.LoadBalancerIngress{{IP: "172.30.2.200"}}}}}
+	probeService := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "lb-probe", Namespace: probeNamespace}, Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeClusterIP}}
+	ingressClass := &networkingv1.IngressClass{ObjectMeta: metav1.ObjectMeta{Name: "cilium", Annotations: map[string]string{"ingressclass.kubernetes.io/is-default-class": "true"}}}
+	className := "cilium"
+	pathType := networkingv1.PathTypePrefix
+	probeIngress := &networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{Name: "lb-probe", Namespace: probeNamespace, Labels: map[string]string{"talosbox.dev/managed": "true"}},
+		Spec: networkingv1.IngressSpec{
+			IngressClassName: &className,
+			TLS:              []networkingv1.IngressTLS{{Hosts: []string{"*.workshop.internal"}, SecretName: ingressTLSSecretName}},
+			Rules: []networkingv1.IngressRule{{
+				Host: "*.workshop.internal",
+				IngressRuleValue: networkingv1.IngressRuleValue{HTTP: &networkingv1.HTTPIngressRuleValue{
+					Paths: []networkingv1.HTTPIngressPath{{
+						Path:     "/",
+						PathType: &pathType,
+						Backend: networkingv1.IngressBackend{Service: &networkingv1.IngressServiceBackend{
+							Name: "lb-probe",
+							Port: networkingv1.ServiceBackendPort{Number: 80},
+						}},
+					}},
+				}},
+			}},
+		},
+	}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: ingressTLSSecretName, Namespace: probeNamespace, Labels: map[string]string{"talosbox.dev/managed": "true"}}, Type: corev1.SecretTypeTLS, Data: map[string][]byte{corev1.TLSCertKey: pki.TLSCertPEM, corev1.TLSPrivateKeyKey: pki.TLSKeyPEM}}
+	client := kubernetesfake.NewClientset(readyDeployment, ingressService, probeService, ingressClass, probeIngress, secret)
+	httpClient := &http.Client{Transport: roundTripper(func(request *http.Request) (*http.Response, error) {
+		if request.URL.String() != "http://172.30.2.200/" {
+			t.Errorf("probe URL = %s", request.URL)
+		}
+		if request.Host != "probe.workshop.internal" {
+			t.Errorf("probe Host = %q", request.Host)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Header: make(http.Header)}, nil
+	})}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	vip, err := waitForProbe(ctx, client, item, time.Millisecond, httpClient)
+	if err != nil || vip != "172.30.2.200" {
+		t.Fatalf("waitForProbe() = %q, %v", vip, err)
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+	missingIngress := kubernetesfake.NewClientset(readyDeployment, ingressService, probeService, ingressClass, secret)
+	if _, err := waitForProbe(ctx, missingIngress, item, time.Millisecond, httpClient); err == nil || !strings.Contains(err.Error(), "Ingress") {
+		t.Fatalf("waitForProbe() without wildcard Ingress error = %v", err)
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+	driftedIngress := probeIngress.DeepCopy()
+	driftedIngress.Spec.Rules[0].HTTP = nil
+	withoutHTTP := kubernetesfake.NewClientset(readyDeployment, ingressService, probeService, ingressClass, driftedIngress, secret)
+	if _, err := waitForProbe(ctx, withoutHTTP, item, time.Millisecond, httpClient); err == nil || !strings.Contains(err.Error(), "Ingress") {
+		t.Fatalf("waitForProbe() with drifted wildcard Ingress error = %v", err)
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+	staleSecret := secret.DeepCopy()
+	staleSecret.Data = map[string][]byte{corev1.TLSCertKey: []byte("stale"), corev1.TLSPrivateKeyKey: pki.TLSKeyPEM}
+	mismatched := kubernetesfake.NewClientset(readyDeployment, ingressService, probeService, ingressClass, probeIngress, staleSecret)
+	if _, err := waitForProbe(ctx, mismatched, item, time.Millisecond, httpClient); err == nil || !strings.Contains(err.Error(), "TLS Secret") {
+		t.Fatalf("waitForProbe() with stale TLS Secret error = %v", err)
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+	staleKeySecret := secret.DeepCopy()
+	staleKeySecret.Data = map[string][]byte{corev1.TLSCertKey: pki.TLSCertPEM, corev1.TLSPrivateKeyKey: []byte("stale")}
+	mismatched = kubernetesfake.NewClientset(readyDeployment, ingressService, probeService, ingressClass, probeIngress, staleKeySecret)
+	if _, err := waitForProbe(ctx, mismatched, item, time.Millisecond, httpClient); err == nil || !strings.Contains(err.Error(), "TLS Secret") {
+		t.Fatalf("waitForProbe() with stale TLS key error = %v", err)
+	}
+}
+
+func TestLiveVIPSelectsTheCNIServiceAndHostRouting(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		item      cluster.Cluster
+		namespace string
+		service   string
+		wantHost  string
+	}{
+		{
+			name:      "flannel remains IP literal",
+			item:      cluster.Cluster{Name: "demo", SubnetIndex: 4, ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel, LB: true}},
+			namespace: probeNamespace, service: "lb-probe", wantHost: "172.30.4.200",
+		},
+		{
+			name:      "Cilium selects shared ingress",
+			item:      cluster.Cluster{Name: "demo", SubnetIndex: 4, Domain: "demo.internal", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true}},
+			namespace: ciliumNamespace, service: "cilium-ingress", wantHost: "probe.demo.internal",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: test.service, Namespace: test.namespace}, Status: corev1.ServiceStatus{LoadBalancer: corev1.LoadBalancerStatus{Ingress: []corev1.LoadBalancerIngress{{IP: "172.30.4.200"}}}}}
+			client := kubernetesfake.NewClientset(service)
+			httpClient := &http.Client{Transport: roundTripper(func(request *http.Request) (*http.Response, error) {
+				if request.URL.String() != "http://172.30.4.200/" {
+					t.Errorf("probe URL = %s", request.URL)
+				}
+				if request.Host != test.wantHost {
+					t.Errorf("probe Host = %q, want %q", request.Host, test.wantHost)
+				}
+				return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Header: make(http.Header)}, nil
+			})}
+			vip, live := liveVIP(context.Background(), test.item, client, httpClient)
+			if vip != "172.30.4.200" || !live {
+				t.Fatalf("liveVIP() = %q, %t", vip, live)
+			}
+		})
+	}
+}
+
 func TestWaitForMetalLBRequiresControllerSpeakerAndWebhook(t *testing.T) {
 	controller := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "metallb-controller", Namespace: metalLBNamespace, Generation: 1}, Status: appsv1.DeploymentStatus{ObservedGeneration: 1, ReadyReplicas: 1, AvailableReplicas: 1}}
 	speaker := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: "metallb-speaker", Namespace: metalLBNamespace, Generation: 1}, Status: appsv1.DaemonSetStatus{ObservedGeneration: 1, DesiredNumberScheduled: 1, NumberReady: 1}}
@@ -221,6 +352,17 @@ func TestVIPHTTPClientDisablesProxyWithoutMutatingCaller(t *testing.T) {
 	original, ok := base.Transport.(*http.Transport)
 	if !ok || original.Proxy == nil {
 		t.Fatal("vipHTTPClient mutated the caller's transport")
+	}
+}
+
+func TestVIPHTTPClientRejectsRedirects(t *testing.T) {
+	client := vipHTTPClient(&http.Client{})
+	request, err := http.NewRequest(http.MethodGet, "http://172.30.2.200/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.CheckRedirect(request, []*http.Request{request}); !errors.Is(err, http.ErrUseLastResponse) {
+		t.Fatalf("CheckRedirect() error = %v, want ErrUseLastResponse", err)
 	}
 }
 

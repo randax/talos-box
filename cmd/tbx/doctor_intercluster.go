@@ -36,6 +36,8 @@ const interClusterProbeBodyLimit = 64 << 10
 type vipTarget struct {
 	cluster string
 	vip     string
+	cni     string
+	domain  string
 }
 
 // interClusterFinding validates that the paths between running clusters carry
@@ -67,7 +69,7 @@ func interClusterFinding(statuses []daemon.ClusterStatus, statusErr error, do ht
 		}
 		running++
 		if status.VIP != "" && status.VIPLive {
-			targets = append(targets, vipTarget{cluster: status.Name, vip: status.VIP})
+			targets = append(targets, vipTarget{cluster: status.Name, vip: status.VIP, cni: string(status.CNI), domain: status.Domain})
 		}
 	}
 	if running < 2 {
@@ -85,7 +87,7 @@ func interClusterFinding(statuses []daemon.ClusterStatus, statusErr error, do ht
 	var problems, advisories []string
 	reachable := make(map[string]bool, len(targets))
 	for _, target := range targets {
-		if err := probeVIPFromHost(do, target.vip); err != nil {
+		if err := probeVIPFromHost(do, target); err != nil {
 			problems = append(problems, fmt.Sprintf("host → %s VIP %s: %v", target.cluster, target.vip, err))
 			continue
 		}
@@ -145,15 +147,19 @@ func runSiblingProbes(do httpDo, pairs []siblingProbe) []error {
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
-			results[i] = probeVIPFromCluster(do, pair.source.vip, pair.sibling.vip)
+			results[i] = probeVIPFromCluster(do, pair.source, pair.sibling)
 		}()
 	}
 	wait.Wait()
 	return results
 }
 
-func probeVIPFromHost(do httpDo, vip string) error {
-	response, err := getWithTimeout(do, "http://"+vip+"/", interClusterProbeTimeout)
+func probeVIPFromHost(do httpDo, target vipTarget) error {
+	request, err := probeRequest("http://"+target.vip+"/", target)
+	if err != nil {
+		return err
+	}
+	response, err := getWithTimeout(do, request, interClusterProbeTimeout)
 	if err != nil {
 		return err
 	}
@@ -175,22 +181,30 @@ func isInterClusterProbeUnavailable(err error) bool {
 
 // probeVIPFromCluster asks the lb-probe behind sourceVIP to dial targetVIP, so
 // the probe travels the cluster-to-sibling path rather than the host's.
-func probeVIPFromCluster(do httpDo, sourceVIP, targetVIP string) error {
+func probeVIPFromCluster(do httpDo, sourceVIP, targetVIP vipTarget) error {
+	host := targetVIP.vip
+	if targetVIP.cni == "cilium" {
+		host = "probe." + targetVIP.domain
+	}
 	query := url.Values{
-		"host":     {targetVIP},
+		"host":     {host},
 		"port":     {"80"},
 		"request":  {"hostname"},
 		"protocol": {"http"},
 		"tries":    {"1"},
 	}
-	response, err := getWithTimeout(do, "http://"+sourceVIP+"/dial?"+query.Encode(), interClusterDialProbeTimeout)
+	request, err := probeRequest("http://"+sourceVIP.vip+"/dial?"+query.Encode(), sourceVIP)
+	if err != nil {
+		return err
+	}
+	response, err := getWithTimeout(do, request, interClusterDialProbeTimeout)
 	if err != nil {
 		// The host leg already proved sourceVIP answers, so a dial request to
 		// that same VIP that never comes back is the sibling path dropping
 		// traffic, not an unreachable dialer. That is the #388 symptom, and it
 		// is a failure, not an advisory.
 		return fmt.Errorf("no answer within %s from the lb-probe behind %s, whose own VIP answers the host: %w",
-			interClusterDialProbeTimeout, sourceVIP, err)
+			interClusterDialProbeTimeout, sourceVIP.vip, err)
 	}
 	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusOK {
@@ -217,13 +231,20 @@ func probeVIPFromCluster(do httpDo, sourceVIP, targetVIP string) error {
 	return nil
 }
 
-func getWithTimeout(do httpDo, target string, timeout time.Duration) (*http.Response, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+func probeRequest(target string, probe vipTarget) (*http.Request, error) {
+	request, err := http.NewRequest(http.MethodGet, target, nil)
 	if err != nil {
-		cancel()
 		return nil, err
 	}
+	if probe.cni == "cilium" && probe.domain != "" {
+		request.Host = "probe." + probe.domain
+	}
+	return request, nil
+}
+
+func getWithTimeout(do httpDo, request *http.Request, timeout time.Duration) (*http.Response, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	request = request.Clone(ctx)
 	response, err := do(request)
 	if err != nil {
 		cancel()

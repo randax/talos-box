@@ -20,9 +20,9 @@ BLOCKED unless: `tbx version` recorded; `tbx doctor` exits 0; no cluster `qa-fla
 
 ## Charters
 
-### C1 — Flannel + MetalLB reaches a live ingress VIP
+### C1 — Flannel + MetalLB reaches a live LoadBalancer probe VIP
 
-**Goal**: the second curated path: Talos-managed flannel plus tbx-shipped MetalLB (L2 only).
+**Goal**: the second curated LoadBalancer path: Talos-managed flannel plus tbx-shipped MetalLB (L2 only), without a curated ingress controller.
 
 Steps:
 1. `tbx cluster create qa-fla --cni flannel`
@@ -30,7 +30,7 @@ Steps:
 3. `kubectl -n kube-system get pods | grep -i flannel` and `kubectl get pods -A | grep -i metallb`
 4. `curl -sv http://<subnet>.200/ --max-time 10`
 
-Expected observations: flannel running as the CNI; MetalLB pods Running with an IPAddressPool covering `.200–.239` and an L2Advertisement; `.200` accepts TCP; **status prints the flannel NetworkPolicy limitation** (flannel enforces no NetworkPolicies) — quote it in the report.
+Expected observations: flannel running as the CNI; MetalLB pods Running with an IPAddressPool covering `.200–.239` and an L2Advertisement; `talosbox-system/lb-probe` remains a `LoadBalancer` Service assigned `.200` and answers HTTP directly; there is no curated ingress controller or wildcard TLS path; **status prints the flannel NetworkPolicy limitation** (flannel enforces no NetworkPolicies) — quote it in the report.
 
 Pass criteria: nodes Ready, MetalLB announcing, `.200` answers, limitation hint present.
 
@@ -92,7 +92,7 @@ Pass criteria: no residue.
 
 | Charter | Verdict | Duration | Notes |
 |---|---|---|---|
-| C1 flannel+metallb VIP | | | |
+| C1 flannel+metallb lb-probe VIP | | | |
 | C2 bgp rejected | | | |
 | C3 metallb manifests | | | |
 | C4 netpol limitation | | | |

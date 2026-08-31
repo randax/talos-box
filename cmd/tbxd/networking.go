@@ -146,7 +146,7 @@ func (d hostNetworkingDrift) description() string {
 	return strings.Join(names, ", ")
 }
 
-func startHostNetworkingMaintenance() func() {
+func startHostNetworkingMaintenance(_ *daemon.Server) func() {
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	ticker := time.NewTicker(hostNetworkingCheckEvery)

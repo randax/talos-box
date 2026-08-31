@@ -80,6 +80,8 @@ func (c cli) run(args []string) error {
 		return c.runLogs(args[1:])
 	case "system":
 		return c.runSystem(args[1:])
+	case "trust":
+		return c.runTrust(args[1:])
 	case "doctor":
 		return c.runDoctor(args[1:])
 	case "version", "--version", "-v":
@@ -105,6 +107,7 @@ var groupUsages = map[string]string{
 	"snapshot": "usage: tbx snapshot create|restore|list|delete",
 	"cache":    "usage: tbx cache pull|prune|warm|list [<image-ref>] [-o json]",
 	"system":   "usage: tbx system install|uninstall|restart [--force]|status|logs",
+	"trust":    "usage: tbx trust install|remove <cluster>",
 	"mirror":   "usage: tbx mirror offline [on|off]",
 	"bgp":      "usage: tbx bgp enable|disable|status <cluster> [--quiet]",
 }
@@ -836,6 +839,7 @@ Commands:
   mirror offline [on|off]
   cache pull|prune|warm|list [<image-ref>] [-o json]
   system install|uninstall|restart [--force]|status|logs
+  trust install|remove <cluster>
   logs [cluster] [--follow] [--lines n]
   doctor
   version (also --version, -v)

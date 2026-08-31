@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"slices"
 	"strings"
@@ -62,7 +64,9 @@ type CiliumReconciler struct {
 	// only. It changes nothing about the apply path; it is the one piece of
 	// context that makes a control plane which never starts diagnosable
 	// (see annotateAPIServerTimeout).
-	MirrorOffline bool
+	MirrorOffline          bool
+	LoadIngressPKI         func(cluster.Cluster) (ingressPKI, error)
+	NewHTTPSProbeTransport func(*tls.Config, func(context.Context, string, string) (net.Conn, error)) http.RoundTripper
 }
 
 // Reconcile installs Cilium before waiting for Kubernetes Nodes to become
@@ -73,14 +77,26 @@ func (r CiliumReconciler) Reconcile(ctx context.Context, item cluster.Cluster, k
 	if err != nil {
 		return LoadBalancerResult{}, err
 	}
+	var ingressPKI ingressPKI
+	if item.LB {
+		loader := r.LoadIngressPKI
+		if loader == nil {
+			loader = loadIngressPKIForCluster
+		}
+		ingressPKI, err = loader(item)
+		if err != nil {
+			return LoadBalancerResult{}, fmt.Errorf("load ingress PKI: %w", err)
+		}
+		objects = append(objects, ingressTLSSecretObject(ingressPKI))
+	}
 	config, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
 	if err != nil {
 		return LoadBalancerResult{}, fmt.Errorf("parse kubeconfig for Cilium apply: %w", err)
 	}
-	return r.reconcile(ctx, item, config, objects)
+	return r.reconcile(ctx, item, config, objects, ingressPKI)
 }
 
-func (r CiliumReconciler) reconcile(ctx context.Context, item cluster.Cluster, config *rest.Config, objects []unstructured.Unstructured) (LoadBalancerResult, error) {
+func (r CiliumReconciler) reconcile(ctx context.Context, item cluster.Cluster, config *rest.Config, objects []unstructured.Unstructured, ingressPKI ingressPKI) (LoadBalancerResult, error) {
 	if r.PollInterval <= 0 {
 		r.PollInterval = time.Second
 	}
@@ -141,6 +157,9 @@ func (r CiliumReconciler) reconcile(ctx context.Context, item cluster.Cluster, c
 		if err := applyAll(ctx, dynamicClient, mapper, extras); err != nil {
 			return LoadBalancerResult{}, err
 		}
+		if err := recreateLegacyCiliumProbeService(ctx, clientset, r.PollInterval); err != nil {
+			return LoadBalancerResult{}, err
+		}
 		if err := applyAll(ctx, dynamicClient, mapper, probe); err != nil {
 			return LoadBalancerResult{}, err
 		}
@@ -158,6 +177,9 @@ func (r CiliumReconciler) reconcile(ctx context.Context, item cluster.Cluster, c
 	}
 	vip, err := waitForProbe(ctx, clientset, item, r.PollInterval, r.HTTPClient)
 	if err != nil {
+		return LoadBalancerResult{}, err
+	}
+	if err := waitForIngressTLS(ctx, item, vip, ingressPKI, r.NewHTTPSProbeTransport); err != nil {
 		return LoadBalancerResult{}, err
 	}
 	return LoadBalancerResult{VIP: vip, Narration: ciliumNarration(item, true)}, nil
@@ -411,6 +433,35 @@ func deleteStaleCiliumAnnouncements(ctx context.Context, client dynamic.Interfac
 	return nil
 }
 
+func recreateLegacyCiliumProbeService(ctx context.Context, client kubernetes.Interface, interval time.Duration) error {
+	service, err := client.CoreV1().Services(probeNamespace).Get(ctx, "lb-probe", metav1.GetOptions{})
+	switch {
+	case apierrors.IsNotFound(err):
+		return nil
+	case err != nil:
+		return fmt.Errorf("get Cilium probe Service: %w", err)
+	}
+	if service.Spec.Type != "LoadBalancer" {
+		return nil
+	}
+	if service.Labels["talosbox.dev/managed"] != "true" {
+		return errors.New("refuse to replace unmanaged Cilium probe Service")
+	}
+	if err := client.CoreV1().Services(probeNamespace).Delete(ctx, "lb-probe", metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete legacy Cilium probe Service: %w", err)
+	}
+	return poll(ctx, GateLoadBalancerVIP, interval, func(ctx context.Context) error {
+		_, err := client.CoreV1().Services(probeNamespace).Get(ctx, "lb-probe", metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return errors.New("legacy Cilium probe Service deletion is still pending")
+	})
+}
+
 func getDynamicObject(
 	ctx context.Context,
 	client dynamic.Interface,
@@ -493,6 +544,13 @@ func CiliumConverged(ctx context.Context, kubeconfig []byte, item cluster.Cluste
 		}
 	}
 	if item.LB {
+		if err := ciliumDefaultIngressClassState(ctx, transport, server); err != nil {
+			return err
+		}
+		vip, err := ciliumIngressServiceState(ctx, transport, server, item)
+		if err != nil {
+			return err
+		}
 		if err := ciliumOwnedObjectState(ctx, transport, server, "/apis/cilium.io/v2/ciliumloadbalancerippools/"+item.Name+"-pool", announcementOwnershipAnnotation, fieldManager); err != nil {
 			return err
 		}
@@ -518,7 +576,23 @@ func CiliumConverged(ctx context.Context, kubeconfig []byte, item cluster.Cluste
 		if err := ciliumOwnedWorkloadReady(ctx, transport, server, ciliumProbeDeploymentPath(), "deployment", "talosbox.dev/managed", "true"); err != nil {
 			return err
 		}
-		if err := ciliumOwnedObjectState(ctx, transport, server, ciliumProbeServicePath(), "talosbox.dev/managed", "true"); err != nil {
+		if err := ciliumProbeServiceState(ctx, transport, server); err != nil {
+			return err
+		}
+		pki, err := ciliumConvergedIngressPKI(item, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		if err := ciliumProbeIngressState(ctx, transport, server, item); err != nil {
+			return err
+		}
+		if err := ciliumProbeTLSSecretState(ctx, transport, server, pki); err != nil {
+			return err
+		}
+		if err := ciliumDirectHTTPProbe(ctx, item, vip, nil); err != nil {
+			return err
+		}
+		if err := ciliumDirectTLSProbe(ctx, item, vip, pki); err != nil {
 			return err
 		}
 	} else {
@@ -539,8 +613,25 @@ func CiliumConverged(ctx context.Context, kubeconfig []byte, item cluster.Cluste
 		if err := ciliumObjectState(ctx, transport, server, ciliumProbeServicePath(), false); err != nil {
 			return err
 		}
+		if err := ciliumObjectState(ctx, transport, server, ciliumProbeIngressPath(), false); err != nil {
+			return err
+		}
+		if err := ciliumObjectState(ctx, transport, server, ciliumProbeTLSSecretPath(), false); err != nil {
+			return err
+		}
 	}
 	return ciliumHubbleConverged(ctx, transport, server, item)
+}
+
+func ciliumConvergedIngressPKI(item cluster.Cluster, now time.Time) (ingressPKI, error) {
+	pki, err := loadIngressPKIForCluster(item)
+	if err != nil {
+		return ingressPKI{}, err
+	}
+	if ingressLeafDueForRenewal(pki.LeafCertificate, now) {
+		return ingressPKI{}, errors.New("ingress certificate is due for renewal")
+	}
+	return pki, nil
 }
 
 func ciliumL2Path(name string) string {
@@ -563,6 +654,100 @@ func ciliumProbeServicePath() string {
 	return "/api/v1/namespaces/" + probeNamespace + "/services/lb-probe"
 }
 
+func ciliumProbeIngressPath() string {
+	return "/apis/networking.k8s.io/v1/namespaces/" + probeNamespace + "/ingresses/lb-probe"
+}
+
+func ciliumProbeTLSSecretPath() string {
+	return "/api/v1/namespaces/" + probeNamespace + "/secrets/" + ingressTLSSecretName
+}
+
+func ciliumDefaultIngressClassState(ctx context.Context, transport http.RoundTripper, server string) error {
+	response, err := ciliumGet(ctx, transport, server, "/apis/networking.k8s.io/v1/ingressclasses/cilium")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("cilium default ingressclass: %s", response.Status)
+	}
+	var object struct {
+		Metadata struct {
+			Annotations map[string]string `json:"annotations"`
+		} `json:"metadata"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&object); err != nil {
+		return fmt.Errorf("decode cilium ingressclass: %w", err)
+	}
+	if object.Metadata.Annotations["ingressclass.kubernetes.io/is-default-class"] != "true" {
+		return errors.New("cilium ingressclass is not the default")
+	}
+	return nil
+}
+
+func ciliumIngressServiceState(ctx context.Context, transport http.RoundTripper, server string, item cluster.Cluster) (string, error) {
+	response, err := ciliumGet(ctx, transport, server, "/api/v1/namespaces/"+ciliumNamespace+"/services/cilium-ingress")
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("cilium ingress service: %s", response.Status)
+	}
+	var service struct {
+		Metadata struct {
+			Annotations map[string]string `json:"annotations"`
+		} `json:"metadata"`
+		Status struct {
+			LoadBalancer struct {
+				Ingress []struct {
+					IP string `json:"ip"`
+				} `json:"ingress"`
+			} `json:"loadBalancer"`
+		} `json:"status"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&service); err != nil {
+		return "", fmt.Errorf("decode cilium ingress service: %w", err)
+	}
+	want := fmt.Sprintf("172.30.%d.200", item.SubnetIndex)
+	if service.Metadata.Annotations["lbipam.cilium.io/ips"] != want {
+		return "", fmt.Errorf("cilium ingress service annotation = %q, want %s", service.Metadata.Annotations["lbipam.cilium.io/ips"], want)
+	}
+	if len(service.Status.LoadBalancer.Ingress) != 1 || service.Status.LoadBalancer.Ingress[0].IP != want {
+		return "", fmt.Errorf("cilium ingress service VIP = %v, want %s", service.Status.LoadBalancer.Ingress, want)
+	}
+	return want, nil
+}
+
+func ciliumProbeServiceState(ctx context.Context, transport http.RoundTripper, server string) error {
+	response, err := ciliumGet(ctx, transport, server, ciliumProbeServicePath())
+	if err != nil {
+		return err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("cilium desired object %s: %s", ciliumProbeServicePath(), response.Status)
+	}
+	var object struct {
+		Metadata struct {
+			Labels map[string]string `json:"labels"`
+		} `json:"metadata"`
+		Spec struct {
+			Type string `json:"type"`
+		} `json:"spec"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&object); err != nil {
+		return fmt.Errorf("decode Cilium object %s: %w", ciliumProbeServicePath(), err)
+	}
+	if object.Metadata.Labels["talosbox.dev/managed"] != "true" {
+		return errors.New("cilium probe Service is not owned by talosbox")
+	}
+	if object.Spec.Type != "ClusterIP" {
+		return fmt.Errorf("cilium probe Service type = %s, want ClusterIP", object.Spec.Type)
+	}
+	return nil
+}
+
 func ciliumObjectState(ctx context.Context, transport http.RoundTripper, server, path string, present bool) error {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, server+path, nil)
 	if err != nil {
@@ -583,24 +768,11 @@ func ciliumObjectState(ctx context.Context, transport http.RoundTripper, server,
 }
 
 func ciliumOwnedObjectState(ctx context.Context, transport http.RoundTripper, server, path, key, value string) error {
-	response, err := ciliumGet(ctx, transport, server, path)
+	object, err := ciliumDesiredObject(ctx, transport, server, path)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = response.Body.Close() }()
-	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("cilium desired object %s: %s", path, response.Status)
-	}
-	var object struct {
-		Metadata struct {
-			Annotations map[string]string `json:"annotations"`
-			Labels      map[string]string `json:"labels"`
-		} `json:"metadata"`
-	}
-	if err := json.NewDecoder(response.Body).Decode(&object); err != nil {
-		return fmt.Errorf("decode Cilium object %s: %w", path, err)
-	}
-	if object.Metadata.Annotations[key] != value && object.Metadata.Labels[key] != value {
+	if object.GetAnnotations()[key] != value && object.GetLabels()[key] != value {
 		return fmt.Errorf("cilium desired object %s is not owned by talosbox", path)
 	}
 	return nil
@@ -610,23 +782,11 @@ func ciliumOwnedObjectState(ctx context.Context, transport http.RoundTripper, se
 // resource names are stable, but ownership prevents a coincidental attendee
 // resource from being treated as talosbox's declarative announcement set.
 func ciliumAnnouncementState(ctx context.Context, transport http.RoundTripper, server, path string) error {
-	response, err := ciliumGet(ctx, transport, server, path)
+	object, err := ciliumDesiredObject(ctx, transport, server, path)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = response.Body.Close() }()
-	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("cilium desired announcement %s: %s", path, response.Status)
-	}
-	var object struct {
-		Metadata struct {
-			Annotations map[string]string `json:"annotations"`
-		} `json:"metadata"`
-	}
-	if err := json.NewDecoder(response.Body).Decode(&object); err != nil {
-		return fmt.Errorf("decode Cilium announcement %s: %w", path, err)
-	}
-	if object.Metadata.Annotations[announcementOwnershipAnnotation] != fieldManager {
+	if object.GetAnnotations()[announcementOwnershipAnnotation] != fieldManager {
 		return fmt.Errorf("cilium desired announcement %s is not owned by talosbox", path)
 	}
 	return nil
@@ -638,6 +798,120 @@ func ciliumGet(ctx context.Context, transport http.RoundTripper, server, path st
 		return nil, err
 	}
 	return (&http.Client{Transport: transport}).Do(request)
+}
+
+func ciliumDesiredObject(ctx context.Context, transport http.RoundTripper, server, path string) (unstructured.Unstructured, error) {
+	response, err := ciliumGet(ctx, transport, server, path)
+	if err != nil {
+		return unstructured.Unstructured{}, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		return unstructured.Unstructured{}, fmt.Errorf("cilium desired object %s: %s", path, response.Status)
+	}
+	object := map[string]any{}
+	if err := json.NewDecoder(response.Body).Decode(&object); err != nil {
+		return unstructured.Unstructured{}, fmt.Errorf("decode Cilium object %s: %w", path, err)
+	}
+	return unstructured.Unstructured{Object: object}, nil
+}
+
+func ciliumProbeIngressState(ctx context.Context, transport http.RoundTripper, server string, item cluster.Cluster) error {
+	object, err := ciliumDesiredObject(ctx, transport, server, ciliumProbeIngressPath())
+	if err != nil {
+		return err
+	}
+	if object.GetLabels()["talosbox.dev/managed"] != "true" {
+		return fmt.Errorf("cilium desired object %s is not owned by talosbox", ciliumProbeIngressPath())
+	}
+	wildcard := "*." + item.EffectiveDomain()
+	if className, _, _ := unstructured.NestedString(object.Object, "spec", "ingressClassName"); className != "cilium" {
+		return fmt.Errorf("cilium probe Ingress class = %q, want cilium", className)
+	}
+	if !ciliumProbeIngressMatches(object.Object, wildcard) {
+		return fmt.Errorf("cilium probe Ingress does not match wildcard route %s -> lb-probe:80", wildcard)
+	}
+	return nil
+}
+
+func ciliumProbeIngressMatches(object map[string]any, wildcard string) bool {
+	tls, found, err := unstructured.NestedSlice(object, "spec", "tls")
+	if err != nil || !found || len(tls) != 1 {
+		return false
+	}
+	tlsEntry, ok := tls[0].(map[string]any)
+	if !ok {
+		return false
+	}
+	tlsHosts, found, err := unstructured.NestedStringSlice(tlsEntry, "hosts")
+	if err != nil || !found || len(tlsHosts) != 1 || tlsHosts[0] != wildcard {
+		return false
+	}
+	secretName, _, _ := unstructured.NestedString(tlsEntry, "secretName")
+	if secretName != ingressTLSSecretName {
+		return false
+	}
+	rules, found, err := unstructured.NestedSlice(object, "spec", "rules")
+	if err != nil || !found || len(rules) != 1 {
+		return false
+	}
+	rule, ok := rules[0].(map[string]any)
+	if !ok {
+		return false
+	}
+	host, _, _ := unstructured.NestedString(rule, "host")
+	if host != wildcard {
+		return false
+	}
+	paths, found, err := unstructured.NestedSlice(rule, "http", "paths")
+	if err != nil || !found || len(paths) != 1 {
+		return false
+	}
+	path, ok := paths[0].(map[string]any)
+	if !ok {
+		return false
+	}
+	actualPath, _, _ := unstructured.NestedString(path, "path")
+	pathType, _, _ := unstructured.NestedString(path, "pathType")
+	serviceName, _, _ := unstructured.NestedString(path, "backend", "service", "name")
+	port, ok := ciliumProbePortNumber(path)
+	return ok && actualPath == "/" && pathType == "Prefix" && serviceName == "lb-probe" && port == 80
+}
+
+func ciliumProbeTLSSecretState(ctx context.Context, transport http.RoundTripper, server string, pki ingressPKI) error {
+	object, err := ciliumDesiredObject(ctx, transport, server, ciliumProbeTLSSecretPath())
+	if err != nil {
+		return err
+	}
+	if object.GetLabels()["talosbox.dev/managed"] != "true" {
+		return fmt.Errorf("cilium desired object %s is not owned by talosbox", ciliumProbeTLSSecretPath())
+	}
+	return ciliumProbeTLSSecretMatches(object.Object, pki)
+}
+
+func ciliumProbeTLSSecretMatches(object map[string]any, pki ingressPKI) error {
+	return ingressTLSSecretExactObjectMatch(object, pki)
+}
+
+func ciliumProbePortNumber(path map[string]any) (int64, bool) {
+	value, found, err := unstructured.NestedFieldNoCopy(path, "backend", "service", "port", "number")
+	if err != nil || !found {
+		return 0, false
+	}
+	switch typed := value.(type) {
+	case int:
+		return int64(typed), true
+	case int32:
+		return int64(typed), true
+	case int64:
+		return typed, true
+	case float32:
+		return int64(typed), float32(int64(typed)) == typed
+	case float64:
+		return int64(typed), float64(int64(typed)) == typed
+	default:
+		return 0, false
+	}
 }
 
 func ciliumOwnedWorkloadReady(ctx context.Context, transport http.RoundTripper, server, path, kind, key, value string) error {
@@ -784,16 +1058,120 @@ metadata:
   namespace: %s
   labels:
     talosbox.dev/managed: "true"
-  annotations:
-    lbipam.cilium.io/ips: 172.30.%d.200
 spec:
-  type: LoadBalancer
+  type: ClusterIP
   selector:
     app: talosbox-lb-probe
   ports:
     - port: 80
       targetPort: 8080
-`, probeNamespace, probeNamespace, probeNamespace, item.SubnetIndex)
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: lb-probe
+  namespace: %s
+  labels:
+    talosbox.dev/managed: "true"
+spec:
+  ingressClassName: cilium
+  tls:
+    - hosts:
+        - "*.%s"
+      secretName: ingress-wildcard-tls
+  rules:
+    - host: "*.%s"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: lb-probe
+                port:
+                  number: 80
+`, probeNamespace, probeNamespace, probeNamespace, probeNamespace, item.EffectiveDomain(), item.EffectiveDomain())
+}
+
+var ciliumDirectHTTPProbe = func(ctx context.Context, item cluster.Cluster, vip string, httpClient *http.Client) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+vip+"/", nil)
+	if err != nil {
+		return err
+	}
+	setProbeHost(request, item)
+	response, err := vipHTTPClient(httpClient).Do(request)
+	if err != nil {
+		return err
+	}
+	if err := response.Body.Close(); err != nil {
+		return fmt.Errorf("close LoadBalancer probe response: %w", err)
+	}
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("LoadBalancer probe response = %s", response.Status)
+	}
+	return nil
+}
+
+var ciliumDirectTLSProbe = func(ctx context.Context, item cluster.Cluster, vip string, pki ingressPKI) error {
+	return waitForIngressTLS(ctx, item, vip, pki, nil)
+}
+
+func waitForIngressTLS(
+	ctx context.Context,
+	item cluster.Cluster,
+	vip string,
+	pki ingressPKI,
+	newTransport func(*tls.Config, func(context.Context, string, string) (net.Conn, error)) http.RoundTripper,
+) error {
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pki.CACertPEM) {
+		return errors.New("load ingress CA for HTTPS readiness")
+	}
+	tlsConfig := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		RootCAs:    pool,
+		ServerName: "probe." + item.EffectiveDomain(),
+	}
+	client := &http.Client{
+		Timeout:       2 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		Transport: newIngressHTTPSProbeTransport(tlsConfig, func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var dialer net.Dialer
+			return dialer.DialContext(ctx, network, net.JoinHostPort(vip, "443"))
+		}, newTransport),
+	}
+	return poll(ctx, GateIngressTLS, defaultPollInterval, func(ctx context.Context) error {
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+vip+"/", nil)
+		if err != nil {
+			return terminal(err)
+		}
+		setProbeHost(request, item)
+		response, err := client.Do(request)
+		if err != nil {
+			return err
+		}
+		if err := response.Body.Close(); err != nil {
+			return fmt.Errorf("close LoadBalancer TLS probe response: %w", err)
+		}
+		if response.StatusCode != http.StatusOK {
+			return fmt.Errorf("LoadBalancer TLS probe response = %s", response.Status)
+		}
+		return nil
+	})
+}
+
+func newIngressHTTPSProbeTransport(
+	tlsConfig *tls.Config,
+	dialContext func(context.Context, string, string) (net.Conn, error),
+	override func(*tls.Config, func(context.Context, string, string) (net.Conn, error)) http.RoundTripper,
+) http.RoundTripper {
+	if override != nil {
+		return override(tlsConfig, dialContext)
+	}
+	transport := defaultProxylessTransport()
+	transport.TLSClientConfig = tlsConfig
+	transport.DialContext = dialContext
+	return transport
 }
 
 func partitionCiliumObjects(objects []unstructured.Unstructured) (namespaces, chart, extras, probe []unstructured.Unstructured) {
@@ -809,7 +1187,7 @@ func partitionCiliumObjects(objects []unstructured.Unstructured) (namespaces, ch
 			} else {
 				namespaces = append(namespaces, object)
 			}
-		case "Deployment", "Service":
+		case "Deployment", "Service", "Ingress", "Secret":
 			if object.GetNamespace() == probeNamespace {
 				probe = append(probe, object)
 			} else {

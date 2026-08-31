@@ -7,8 +7,10 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 
+	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/daemon"
 )
 
@@ -21,8 +23,27 @@ func jsonResponse(body string) *http.Response {
 
 func liveClusterStatuses() []daemon.ClusterStatus {
 	return []daemon.ClusterStatus{
-		{Name: "qa-core", Running: true, VIP: "172.30.0.200", VIPLive: true},
-		{Name: "qa-edge", Running: true, VIP: "172.30.1.200", VIPLive: true},
+		{
+			Name: "qa-core", Running: true, VIP: "172.30.0.200", VIPLive: true,
+			Domain: "qa-core.k8s.test", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel},
+		},
+		{
+			Name: "qa-edge", Running: true, VIP: "172.30.1.200", VIPLive: true,
+			Domain: "qa-edge.k8s.test", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNIFlannel},
+		},
+	}
+}
+
+func liveCiliumClusterStatuses() []daemon.ClusterStatus {
+	return []daemon.ClusterStatus{
+		{
+			Name: "qa-core", Running: true, VIP: "172.30.0.200", VIPLive: true,
+			Domain: "qa-core.k8s.test", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium},
+		},
+		{
+			Name: "qa-edge", Running: true, VIP: "172.30.1.200", VIPLive: true,
+			Domain: "qa-edge.k8s.test", ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium},
+		},
 	}
 }
 
@@ -129,6 +150,70 @@ func TestInterClusterFinding(t *testing.T) {
 				t.Fatalf("detail = %q, want it to contain %q", finding.detail, tt.wantDetail)
 			}
 		})
+	}
+}
+
+func TestProbeVIPFromHostSetsCiliumWildcardHost(t *testing.T) {
+	var sawHost string
+	err := probeVIPFromHost(func(request *http.Request) (*http.Response, error) {
+		sawHost = request.Host
+		return jsonResponse(`{}`), nil
+	}, vipTarget{vip: "172.30.0.200", cni: "cilium", domain: "qa-core.k8s.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sawHost != "probe.qa-core.k8s.test" {
+		t.Fatalf("Host header = %q, want probe.qa-core.k8s.test", sawHost)
+	}
+}
+
+func TestProbeVIPFromClusterUsesSourceAndSiblingDomainsForCilium(t *testing.T) {
+	source := vipTarget{vip: "172.30.0.200", cni: "cilium", domain: "qa-core.k8s.test"}
+	sibling := vipTarget{vip: "172.30.1.200", cni: "cilium", domain: "qa-edge.k8s.test"}
+	err := probeVIPFromCluster(func(request *http.Request) (*http.Response, error) {
+		if request.Host != "probe.qa-core.k8s.test" {
+			t.Fatalf("outer Host header = %q", request.Host)
+		}
+		if request.URL.String() != "http://172.30.0.200/dial?host=probe.qa-edge.k8s.test&port=80&protocol=http&request=hostname&tries=1" {
+			t.Fatalf("dial URL = %s", request.URL.String())
+		}
+		return jsonResponse(`{"responses":["lb-probe-1"]}`), nil
+	}, source, sibling)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInterClusterFindingCarriesCiliumDomainsIntoBothProbeLegs(t *testing.T) {
+	var seenMu sync.Mutex
+	var seen []string
+	finding := interClusterFinding(liveCiliumClusterStatuses(), nil, func(request *http.Request) (*http.Response, error) {
+		seenMu.Lock()
+		seen = append(seen, request.Host+" "+request.URL.String())
+		seenMu.Unlock()
+		return jsonResponse(`{"responses":["lb-probe-1"]}`), nil
+	})
+	if finding.level != "PASS" {
+		t.Fatalf("level = %s (%s), want PASS", finding.level, finding.detail)
+	}
+	seenMu.Lock()
+	gotSeen := append([]string(nil), seen...)
+	seenMu.Unlock()
+	for _, want := range []string{
+		"probe.qa-core.k8s.test http://172.30.0.200/",
+		"probe.qa-edge.k8s.test http://172.30.1.200/",
+		"probe.qa-core.k8s.test http://172.30.0.200/dial?host=probe.qa-edge.k8s.test&port=80&protocol=http&request=hostname&tries=1",
+		"probe.qa-edge.k8s.test http://172.30.1.200/dial?host=probe.qa-core.k8s.test&port=80&protocol=http&request=hostname&tries=1",
+	} {
+		found := false
+		for _, got := range gotSeen {
+			if got == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("missing probe request %q in %v", want, gotSeen)
+		}
 	}
 }
 

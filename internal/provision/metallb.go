@@ -20,6 +20,7 @@ import (
 	"helm.sh/helm/v3/pkg/engine"
 	"helm.sh/helm/v3/pkg/releaseutil"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -83,7 +84,12 @@ func LiveVIP(ctx context.Context, item cluster.Cluster, kubeconfig []byte) (stri
 	if err != nil {
 		return "", false
 	}
-	service, err := clientset.CoreV1().Services(probeNamespace).Get(ctx, "lb-probe", metav1.GetOptions{})
+	return liveVIP(ctx, item, clientset, nil)
+}
+
+func liveVIP(ctx context.Context, item cluster.Cluster, clientset kubernetes.Interface, httpClient *http.Client) (string, bool) {
+	namespace, name := vipService(item)
+	service, err := clientset.CoreV1().Services(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil || len(service.Status.LoadBalancer.Ingress) != 1 {
 		return "", false
 	}
@@ -100,7 +106,8 @@ func LiveVIP(ctx context.Context, item cluster.Cluster, kubeconfig []byte) (stri
 	if err != nil {
 		return vip, false
 	}
-	response, err := vipHTTPClient(nil).Do(request)
+	setProbeHost(request, item)
+	response, err := vipHTTPClient(httpClient).Do(request)
 	if err != nil {
 		return vip, false
 	}
@@ -446,7 +453,8 @@ func waitForMetalLB(ctx context.Context, client kubernetes.Interface, interval t
 func waitForProbe(ctx context.Context, client kubernetes.Interface, item cluster.Cluster, interval time.Duration, httpClient *http.Client) (string, error) {
 	var vip string
 	err := poll(ctx, GateLoadBalancerVIP, interval, func(ctx context.Context) error {
-		service, err := client.CoreV1().Services(probeNamespace).Get(ctx, "lb-probe", metav1.GetOptions{})
+		namespace, name := vipService(item)
+		service, err := client.CoreV1().Services(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return err
 		}
@@ -461,11 +469,17 @@ func waitForProbe(ctx context.Context, client kubernetes.Interface, item cluster
 		if !deploymentReadyForProbe(ctx, client) {
 			return errors.New("LoadBalancer probe deployment is not Ready")
 		}
+		if item.CNI == cluster.CNICilium {
+			if err := ciliumIngressResourcesReady(ctx, client, item); err != nil {
+				return err
+			}
+		}
 		client := vipHTTPClient(httpClient)
 		request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+vip+"/", nil)
 		if err != nil {
 			return err
 		}
+		setProbeHost(request, item)
 		response, err := client.Do(request)
 		if err != nil {
 			return err
@@ -479,6 +493,55 @@ func waitForProbe(ctx context.Context, client kubernetes.Interface, item cluster
 		return nil
 	})
 	return vip, err
+}
+
+func ciliumIngressResourcesReady(ctx context.Context, client kubernetes.Interface, item cluster.Cluster) error {
+	probeService, err := client.CoreV1().Services(probeNamespace).Get(ctx, "lb-probe", metav1.GetOptions{})
+	if err != nil || probeService.Spec.Type != "ClusterIP" {
+		return errors.New("cilium probe ClusterIP Service is not ready")
+	}
+	ingressClass, err := client.NetworkingV1().IngressClasses().Get(ctx, "cilium", metav1.GetOptions{})
+	if err != nil || ingressClass.Annotations["ingressclass.kubernetes.io/is-default-class"] != "true" {
+		return errors.New("cilium IngressClass is not the default")
+	}
+	ingress, err := client.NetworkingV1().Ingresses(probeNamespace).Get(ctx, "lb-probe", metav1.GetOptions{})
+	if err != nil {
+		return errors.New("cilium wildcard probe Ingress is not ready")
+	}
+	wildcard := "*." + item.EffectiveDomain()
+	if len(ingress.Spec.Rules) != 1 || ingress.Spec.Rules[0].HTTP == nil || len(ingress.Spec.Rules[0].HTTP.Paths) != 1 {
+		return errors.New("cilium wildcard probe Ingress does not match the cluster domain")
+	}
+	path := ingress.Spec.Rules[0].HTTP.Paths[0]
+	if ingress.Labels["talosbox.dev/managed"] != "true" || ingress.Spec.IngressClassName == nil || *ingress.Spec.IngressClassName != "cilium" ||
+		len(ingress.Spec.Rules) != 1 || ingress.Spec.Rules[0].Host != wildcard || len(ingress.Spec.TLS) != 1 ||
+		ingress.Spec.TLS[0].SecretName != ingressTLSSecretName || len(ingress.Spec.TLS[0].Hosts) != 1 || ingress.Spec.TLS[0].Hosts[0] != wildcard ||
+		path.Path != "/" || path.PathType == nil || string(*path.PathType) != "Prefix" || path.Backend.Service == nil ||
+		path.Backend.Service.Name != "lb-probe" || path.Backend.Service.Port.Number != 80 {
+		return errors.New("cilium wildcard probe Ingress does not match the cluster domain")
+	}
+	pki, err := loadIngressPKIForCluster(item)
+	if err != nil {
+		return err
+	}
+	secret, err := client.CoreV1().Secrets(probeNamespace).Get(ctx, ingressTLSSecretName, metav1.GetOptions{})
+	if err != nil || secret.Labels["talosbox.dev/managed"] != "true" || ingressTLSSecretExactMatch(string(secret.Type), secret.Data[corev1.TLSCertKey], secret.Data[corev1.TLSPrivateKeyKey], pki) != nil {
+		return errors.New("cilium ingress TLS Secret is not ready")
+	}
+	return nil
+}
+
+func vipService(item cluster.Cluster) (namespace, name string) {
+	if item.CNI == cluster.CNICilium {
+		return ciliumNamespace, "cilium-ingress"
+	}
+	return probeNamespace, "lb-probe"
+}
+
+func setProbeHost(request *http.Request, item cluster.Cluster) {
+	if item.CNI == cluster.CNICilium {
+		request.Host = "probe." + item.EffectiveDomain()
+	}
 }
 
 func deploymentReady(deployment *appsv1.Deployment) bool {
@@ -513,6 +576,7 @@ func vipHTTPClient(httpClient *http.Client) *http.Client {
 		httpClient = &http.Client{Timeout: 2 * time.Second}
 	}
 	client := *httpClient
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	switch transport := client.Transport.(type) {
 	case nil:
 		client.Transport = defaultProxylessTransport()

@@ -2,6 +2,8 @@
 
 package main
 
+import "github.com/randax/talos-box/internal/daemon"
+
 func configureHostNetworking() {}
 
-func startHostNetworkingMaintenance() func() { return func() {} }
+func startHostNetworkingMaintenance(_ *daemon.Server) func() { return func() {} }

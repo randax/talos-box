@@ -188,6 +188,7 @@ type credentialPaths struct {
 	secrets     string
 	talosconfig string
 	kubeconfig  string
+	ingress     ingressPKIPaths
 }
 
 // Reconcile brings a curated CNI path to a usable Kubernetes API. It follows
@@ -346,6 +347,11 @@ func Reconcile(ctx context.Context, request Request) (Result, error) {
 			return Result{}, fmt.Errorf("write kubeconfig: %w", err)
 		}
 		if request.Cluster.CNI == cluster.CNICilium {
+			if request.Cluster.LB {
+				if _, err := ensureIngressPKI(request.Cluster, generated.paths.ingress, ingressPKIOptions{}); err != nil {
+					return Result{}, fmt.Errorf("prepare ingress PKI: %w", err)
+				}
+			}
 			if request.LoadBalancer == nil {
 				return Result{}, errors.New("cilium provisioning requires a Kubernetes reconciler")
 			}
@@ -793,7 +799,9 @@ func credentials(name string) (credentialPaths, error) {
 	}
 	return credentialPaths{
 		dir: dir, secrets: filepath.Join(dir, "secrets.yaml"),
-		talosconfig: filepath.Join(dir, "talosconfig"), kubeconfig: filepath.Join(dir, "kubeconfig"),
+		talosconfig: filepath.Join(dir, "talosconfig"),
+		kubeconfig:  filepath.Join(dir, "kubeconfig"),
+		ingress:     ingressPKIPathsForDir(dir),
 	}, nil
 }
 

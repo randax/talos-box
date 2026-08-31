@@ -18,15 +18,17 @@ Without `cni`, it deliberately stops there so workshops can teach Talos bootstra
 installation themselves. Declaring `cni: cilium|flannel` opts into the curated path: `tbx`
 generates and applies Talos machine config, bootstraps Kubernetes, and reconciles the pinned CNI
 and optional LoadBalancer resources from the host. Declaring `csi: longhorn|local-path`
-(requires `cni`) adds curated persistent storage to the same path (§9). Ingress controllers and attendee workloads
-remain **attendee work**; Cilium's built-in ingress controller is disabled.
+(requires `cni`) adds curated persistent storage to the same path (§9). With Cilium and
+`lb: true`, the curated path also enables Cilium's shared ingress controller at `.200`, installs
+a per-cluster wildcard TLS certificate, and keeps attendee `Ingress` objects behind the same VIP.
+Attendee workloads and arbitrary ingress installations remain **attendee work**.
 
 Out of scope ([original map](https://github.com/randax/talos-box/issues/1),
 [Linux map](https://github.com/randax/talos-box/issues/71)): workshop curriculum,
 instructor-side orchestration, Windows/WSL2 hosts, machines under 16 GB RAM,
 rootless Linux networking, and arbitrary application or ingress installation. The curated
-CNI/LoadBalancer path is an explicit opt-in; substrate-only clusters retain the original manual
-workflow and guided hints (§10).
+Cilium ingress path is an explicit opt-in, not arbitrary ingress installation; substrate-only
+clusters retain the original manual workflow and guided hints (§10).
 
 ## 2. Supported platforms
 
@@ -201,7 +203,7 @@ cluster:
 |---|---|
 | `.1` | host: gateway, NAT, DNS/mirror bind, BGP peer, inter-cluster router |
 | `.2–.179` | node DHCP range (vmnet dynamic leases on macOS; deterministic reservations on Linux) |
-| `.200–.239` | Cilium LB-IPAM pool; **`.200` is the ingress VIP by convention** |
+| `.200–.239` | LoadBalancer pool; for curated Cilium, **`.200` is the shared ingress VIP** and the talosbox probe sits behind a wildcard `Ingress`; flannel keeps `.200` on the `lb-probe` LoadBalancer |
 | `.240–.254` | reserved (tool-owned) |
 
 On macOS, pinned shared-mode vmnet interfaces only intercommunicate within the same subnet. To

@@ -3,8 +3,8 @@
 This walkthrough uses talosbox's curated Cilium path. `tbx` generates and applies the
 Talos machine configuration, bootstraps Kubernetes, renders the pinned Cilium chart on
 the host, applies it with server-side apply, and waits for its own LoadBalancer probe to
-answer. Cilium's ingress controller is deliberately disabled; applications request
-ordinary `LoadBalancer` Services instead.
+answer through Cilium's shared ingress controller. Applications publish ordinary
+`Ingress` objects at HTTPS names under the cluster domain.
 
 Prerequisites: `tbx` installed, its platform helper active, and `tbx doctor` passing.
 On macOS, activate the helper with `sudo tbx system install`. On Linux, follow the
@@ -18,8 +18,9 @@ tbx cluster create demo --cp 1 --workers 2 --cni cilium
 ```
 
 The default `lb: true` selects Cilium LB-IPAM with L2 announcements. The address pool
-is `172.30.<subnet>.200-172.30.<subnet>.239`; talosbox reserves `.200` for its durable
-end-state probe. The command narrates each provisioning stage with its `≈` manual
+is `172.30.<subnet>.200-172.30.<subnet>.239`; Cilium's shared `cilium-ingress`
+LoadBalancer owns `.200`, and talosbox routes its durable probe through a wildcard
+Ingress on that VIP. The command narrates each provisioning stage with its `≈` manual
 equivalent. Add `--quiet` to suppress that narration without hiding the final result.
 
 Provisioning is observed-state driven. If the command is interrupted, rerun:
@@ -40,7 +41,8 @@ export KUBECONFIG=~/.talosbox/clusters/demo/kubeconfig
 kubectl get nodes
 ```
 
-The ready status names the live probe URL. Deleting either derived credential file is
+The ready status names `https://probe.demo.k8s.test/` and, until trust is installed,
+prints `tbx trust install demo`. Deleting either derived credential file is
 safe: `tbx up` re-mints it from the cluster's `secrets.yaml` without modifying
 `~/.talos/config` or `~/.kube/config`.
 
@@ -59,10 +61,12 @@ tbx manifests demo extras   > cilium-extras.yaml
 - `machine` contains `cni.name: none`, `cluster.proxy.disabled: true`, and the
   subnet-specific catch-all registry mirror document.
 - `values` contains the pinned Talos-compatible Cilium values. There is no arbitrary
-  Helm-values passthrough, and `ingressController.enabled` is false.
+  Helm-values passthrough; it enables the default shared ingress controller, assigns its
+  Service `.200`, disables forced HTTPS redirects, and names the wildcard default Secret.
 - `objects` contains the exact pinned chart render that `tbx` applies.
 - `extras` contains the LB-IPAM pool, L2 or BGP announcements, and the talosbox-owned
-  probe objects. With `lb: false`, no LB extras are emitted.
+  ClusterIP probe, wildcard Ingress, and TLS Secret reference. With `lb: false`, no LB
+  or ingress extras are emitted.
 
 These sections are the hand-managed fork surface. Apply the machine prerequisite when
 generating Talos configuration for a substrate-only cluster, bootstrap it, then apply
@@ -70,9 +74,12 @@ generating Talos configuration for a substrate-only cluster, bootstrap it, then 
 to establish its CRDs before applying `extras`. The output is subnet- and
 cluster-specific, so review names and addresses before reusing a saved fork elsewhere.
 
-## 4. Deploy nginx as a LoadBalancer Service
+## 4. Deploy nginx behind the shared ingress
 
-The talosbox probe owns `.200`, so this example requests `.201` from the same pool:
+The nginx Service stays inside the cluster. Its explicit Cilium Ingress claims the exact
+`nginx.demo.k8s.test` host, which takes precedence over talosbox's wildcard probe route.
+The TLS entry intentionally has no `secretName`: Cilium uses the curated default wildcard
+Secret rather than looking for a Secret in the `default` namespace.
 
 ```yaml
 # nginx.yaml
@@ -100,25 +107,64 @@ apiVersion: v1
 kind: Service
 metadata:
   name: nginx
-  annotations:
-    lbipam.cilium.io/ips: 172.30.0.201
 spec:
-  type: LoadBalancer
+  type: ClusterIP
   selector:
     app: nginx
   ports:
     - port: 80
       targetPort: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nginx
+spec:
+  ingressClassName: cilium
+  tls:
+    - hosts:
+        - nginx.demo.k8s.test
+  rules:
+    - host: nginx.demo.k8s.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nginx
+                port:
+                  number: 80
 ```
 
 ```sh
 kubectl apply -f nginx.yaml
-kubectl get service nginx --watch
-curl -i http://172.30.0.201/
+kubectl get ingress nginx
+tbx trust install demo
 ```
 
-For a cluster whose subnet index is not `0`, replace the third octet in the requested
-address. `tbx status demo` shows the cluster subnet and the talosbox probe VIP.
+On macOS, approve the interactive login-keychain trust prompt. On Linux, `tbx` selects the
+host's conventional trust-store driver and uses `sudo` only for the anchor write and store
+refresh; on NixOS it prints the `security.pki.certificates` declaration to apply instead.
+Restart any browser that was already open, then visit:
+
+```text
+https://nginx.demo.k8s.test/
+```
+
+The page should load without a certificate warning. As a browser-independent fallback, use
+the generated CA directly; `--resolve` also separates ingress verification from host DNS:
+
+```sh
+curl --cacert ~/.talosbox/clusters/demo/ingress-ca.crt \
+  --resolve nginx.demo.k8s.test:443:<demo-vip> \
+  https://nginx.demo.k8s.test/
+```
+
+Take `<demo-vip>` from `tbx status demo`. If the cluster uses a custom domain, replace
+`demo.k8s.test` in the Ingress, browser URL, and curl command with that exact domain. When the
+cluster no longer needs browser trust, run `tbx trust remove demo`; on NixOS remove the
+declarative entry and rebuild. Destroying the cluster does not remove trust automatically.
 
 ## Optional Cilium features
 

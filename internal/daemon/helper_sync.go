@@ -32,6 +32,19 @@ func SyncHelperState() error {
 	return SyncHelperClusters(clusters)
 }
 
+// TrySyncHelperState reasserts the daemon's authoritative reservation set when
+// no lifecycle operation is changing it. The operation lock stays held from
+// the state read through delivery so an older snapshot cannot be sent after a
+// newer mutation commits.
+func (s *Server) TrySyncHelperState() error {
+	if !s.opMu.TryLock() {
+		return nil
+	}
+	defer s.opMu.Unlock()
+
+	return SyncHelperState()
+}
+
 // SyncHelperClusters pushes an explicit reservation set. A mutation that must
 // not be committed without its reservation (node add) syncs the proposed set
 // first and saves only once the helper holds it.

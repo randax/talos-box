@@ -190,6 +190,10 @@ a WSL restart, and a Windows reboot remain host shutdowns and stop the guests.
 Do not use `tbx system install` on Linux. That command currently installs the macOS launchd
 helper; Linux installation is owned by packages and systemd units.
 
+The destructive, disposable-host-only [systemd packaging QA lane](qa/systemd-packaging-linux.md)
+validates these installed binaries and units against a real systemd PID 1. It is a release QA
+runbook, not a workstation installation check or merge-gating CI job.
+
 Upgrading `tbx`/`tbxd` can also require a new `tbx-helper`: the helper speaks a versioned
 protocol, and a mismatch is refused with `helper protocol mismatch`. Recover by upgrading the
 `tbx-helper` package (or reinstalling the binary and units as above) and restarting the service:
@@ -248,6 +252,46 @@ Host-memory readings are macOS-only for the same reason, so memory ballooning is
 Linux: `tbxd` records one `balloon: manager inactive: …` line in `tbx logs` at startup and never
 polls, and the provision-start host-pressure gate stands down silently instead of warning on every
 operation. Size clusters against the host by hand and watch `free -h` and `swapon --show`.
+
+## Trust curated Cilium ingress
+
+A provisioned Cilium cluster with `lb: true` has its own ingress CA and a wildcard certificate
+for `*.<cluster-domain>`. Install and remove the CA explicitly:
+
+```sh
+tbx trust install <cluster>
+tbx trust remove <cluster>
+```
+
+`tbx` maps only explicit `ID`/`ID_LIKE` distribution families and uses `sudo` only for the
+trust-anchor mutation and refresh:
+
+| Distribution family | Anchor directory | Refresh command |
+|---|---|---|
+| Debian/Ubuntu | `/usr/local/share/ca-certificates` | `update-ca-certificates` |
+| Fedora/RHEL/CentOS | `/etc/pki/ca-trust/source/anchors` | `update-ca-trust extract` |
+| Arch/p11-kit | `/etc/ca-certificates/trust-source/anchors` | `trust extract-compat` |
+
+Unsupported mutable distributions fail clearly and name those three supported anchor directories;
+there is no generic `trust`-binary fallback.
+
+On NixOS no host file is changed. `tbx trust install <cluster>` prints a declarative
+`security.pki.certificates` entry that reads the cluster's `ingress-ca.crt`; add it to
+`configuration.nix` and rebuild the system. Because that path does not create a receipt,
+removal is likewise a declarative NixOS configuration change rather than `tbx trust remove`.
+
+Restart browsers that were already open after changing trust. The non-secret receipt on mutable
+distributions is `~/.talosbox/trust/<cluster>.json`, so `tbx trust remove` can identify the exact
+anchor after cluster deletion, and removal refuses if that anchor's fingerprint no longer matches
+the receipt. Destroy does not remove host trust automatically. The PKI files live under
+`~/.talosbox/clusters/<cluster>/`: `ingress-ca.crt`, `ingress-ca.key`, `ingress-tls.crt`, and
+`ingress-tls.key`, all mode `0600` inside the private cluster directory. The root CA lasts ten
+years. The wildcard leaf lasts no more than 397 days from issuance time, is renewed during
+reconciliation when 30 days or fewer remain, and is backdated by five minutes to tolerate small
+clock skew; its only DNS name is `*.<cluster-domain>`, not the domain apex.
+
+This command does not apply to flannel, whose curated path has no ingress certificate. Windows
+trust installation, including WSL-to-Windows browser trust, remains deferred.
 
 ## Linux networking and ingress
 

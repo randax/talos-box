@@ -25,6 +25,7 @@ const (
 	GateHubble              Gate = "Hubble workloads"
 	GateMetalLB             Gate = "MetalLB workloads"
 	GateLoadBalancerVIP     Gate = "LoadBalancer VIP"
+	GateIngressTLS          Gate = "ingress TLS"
 	GateLonghorn            Gate = "Longhorn workloads"
 	GateLonghornScheduling  Gate = "Longhorn node scheduling"
 	GateLocalPath           Gate = "local-path provisioner"

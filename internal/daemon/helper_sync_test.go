@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/hypervisor"
@@ -72,6 +74,142 @@ func TestSyncHelperStateWrapsConnectFailure(t *testing.T) {
 	err := SyncHelperState()
 	if err == nil || !strings.Contains(err.Error(), "sync helper state") || !strings.Contains(err.Error(), "helper unavailable") {
 		t.Fatalf("SyncHelperState() error = %v, want a wrapped connect failure", err)
+	}
+}
+
+func TestTrySyncHelperStateReadsAndSyncsOnceWhileHoldingOperationLock(t *testing.T) {
+	item, err := cluster.New("maintenance-sync", 0, 1, 0, cluster.NodeDefaults{CPUs: 1, MemoryMiB: 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &Server{}
+	client := &fakeSyncClient{onSync: func() {
+		if service.opMu.TryLock() {
+			service.opMu.Unlock()
+			t.Error("operation lock was not held while syncing helper state")
+		}
+	}}
+	originalConnect, originalList := connectSyncHelper, listClustersForSync
+	connectSyncHelper = func() (helperSyncClient, error) { return client, nil }
+	listClustersForSync = func() ([]cluster.Cluster, error) {
+		if service.opMu.TryLock() {
+			service.opMu.Unlock()
+			t.Error("operation lock was not held while reading cluster state")
+		}
+		return []cluster.Cluster{item}, nil
+	}
+	t.Cleanup(func() {
+		connectSyncHelper, listClustersForSync = originalConnect, originalList
+	})
+
+	if err := service.TrySyncHelperState(); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.synced) != 1 || len(client.synced[0]) != 1 || client.synced[0][0].Name != item.Name {
+		t.Fatalf("synced clusters = %+v, want exactly one sync of %q", client.synced, item.Name)
+	}
+	if client.closed != 1 {
+		t.Fatalf("client closes = %d, want 1", client.closed)
+	}
+}
+
+func TestTrySyncHelperStateSkipsImmediatelyWhenOperationLockIsBusy(t *testing.T) {
+	service := &Server{}
+	service.opMu.Lock()
+	defer service.opMu.Unlock()
+
+	listed := false
+	originalList := listClustersForSync
+	listClustersForSync = func() ([]cluster.Cluster, error) {
+		listed = true
+		return nil, nil
+	}
+	t.Cleanup(func() { listClustersForSync = originalList })
+
+	done := make(chan error, 1)
+	go func() { done <- service.TrySyncHelperState() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("TrySyncHelperState blocked behind a busy operation lock")
+	}
+	if listed {
+		t.Fatal("cluster state was read although the operation lock was busy")
+	}
+}
+
+func TestTrySyncHelperStateCannotSendOldSnapshotAfterMutationCommits(t *testing.T) {
+	old, err := cluster.New("old-snapshot", 0, 1, 0, cluster.NodeDefaults{CPUs: 1, MemoryMiB: 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &Server{}
+	snapshotRead := make(chan struct{})
+	connectEntered := make(chan struct{})
+	allowSync := make(chan struct{})
+	mutationCommitted := make(chan struct{})
+	var sequenceMu sync.Mutex
+	var sequence []string
+	client := &fakeSyncClient{onSync: func() {
+		sequenceMu.Lock()
+		sequence = append(sequence, "old snapshot synced")
+		sequenceMu.Unlock()
+	}}
+
+	originalConnect, originalList := connectSyncHelper, listClustersForSync
+	listClustersForSync = func() ([]cluster.Cluster, error) {
+		close(snapshotRead)
+		return []cluster.Cluster{old}, nil
+	}
+	connectSyncHelper = func() (helperSyncClient, error) {
+		close(connectEntered)
+		<-allowSync
+		return client, nil
+	}
+	t.Cleanup(func() {
+		connectSyncHelper, listClustersForSync = originalConnect, originalList
+	})
+
+	maintenanceDone := make(chan error, 1)
+	go func() { maintenanceDone <- service.TrySyncHelperState() }()
+	<-snapshotRead
+	go func() {
+		service.opMu.Lock()
+		sequenceMu.Lock()
+		sequence = append(sequence, "new mutation committed")
+		sequenceMu.Unlock()
+		close(mutationCommitted)
+		service.opMu.Unlock()
+	}()
+	<-connectEntered
+
+	prematureCommit := false
+	select {
+	case <-mutationCommitted:
+		prematureCommit = true
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(allowSync)
+	if err := <-maintenanceDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-mutationCommitted:
+	case <-time.After(time.Second):
+		t.Fatal("new mutation did not acquire the operation lock after maintenance completed")
+	}
+	if prematureCommit {
+		t.Fatal("new mutation committed between maintenance state read and helper sync")
+	}
+
+	sequenceMu.Lock()
+	defer sequenceMu.Unlock()
+	want := []string{"old snapshot synced", "new mutation committed"}
+	if fmt.Sprint(sequence) != fmt.Sprint(want) {
+		t.Fatalf("event order = %v, want %v", sequence, want)
 	}
 }
 
