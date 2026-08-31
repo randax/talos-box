@@ -73,8 +73,9 @@ func (c cli) runSystem(args []string) error {
 
 // restartDaemon replaces the running tbxd with one spawned from this build, so
 // a protocol skew has a named recovery command instead of a pid hunt (#290).
-// A restart stops every VM the daemon runs, so running clusters are named and
-// the restart only proceeds with an explicit --force.
+// A restart stops every VM the daemon runs, so running clusters are named.
+// Unsupervised replacement proceeds only with --force; confirmed supervision
+// always directs the operator to the supervisor instead.
 func (c cli) restartDaemon(force bool) error {
 	socketPath, err := daemon.SocketPath()
 	if err != nil {
@@ -103,14 +104,14 @@ func (c cli) restartDaemon(force bool) error {
 			return err
 		}
 	}
-	if err := refuseSupervisedRestart(force); err != nil {
+	// The cluster query is bounded because it is served under the daemon's
+	// operation lock. It runs before the supervision decision so a refusal can
+	// name the clusters the supervisor-controlled restart will affect.
+	activity, activityErr := daemonClusterActivity(socketPath)
+	if err := refuseSupervisedRestart(force, activity, activityErr); err != nil {
 		return err
 	}
-	// the cluster query runs only after the supervision and force checks, and
-	// under a deadline: it is served under the daemon's operation lock, so a
-	// long suspend or destroy must never be able to hang --force
-	activity, activityErr := daemonClusterActivity(socketPath)
-	if activityErr != nil {
+	if activityErr != nil && force {
 		// A daemon too busy to answer cluster.list is exactly the one whose
 		// shutdown takes minutes, so the stop-wait must not collapse to the
 		// base timeout. On-disk state still names every configured node; the
@@ -151,12 +152,18 @@ func (c cli) restartDaemon(force bool) error {
 // inferred unit file — every packaged install ships one, whether or not it is
 // in use — is refused without --force but yields to it, so the recovery chain
 // does not dead-end on a file that proves nothing.
-func refuseSupervisedRestart(force bool) error {
+func refuseSupervisedRestart(force bool, activity clusterActivity, activityErr error) error {
 	state, reason := supervisedDaemon()
 	if state == supervisionConfirmed || (state == supervisionInferred && !force) {
-		// supervisionRefusal is shared with the protocol gate in client.go, so
-		// the two callers cannot name different ways out of the same state
-		return errors.New(supervisionRefusal(state, reason))
+		parts := make([]string, 0, 2)
+		switch {
+		case activityErr != nil:
+			parts = append(parts, fmt.Sprintf("cluster activity could not be determined (%v)", activityErr))
+		case !activity.empty():
+			parts = append(parts, clusterImpactDescription(activity))
+		}
+		parts = append(parts, supervisionRefusal(state, reason))
+		return errors.New(strings.Join(parts, "; "))
 	}
 	return nil
 }

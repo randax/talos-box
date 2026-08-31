@@ -723,7 +723,7 @@ func TestGateOnInferredSupervisionNamesTheForcedRestart(t *testing.T) {
 	if err == nil {
 		t.Fatal("a stale daemon under an inferred supervisor must fail the gated verb")
 	}
-	for _, want := range []string{"tbx system restart --force", supervisorRestartCommand(), reason} {
+	for _, want := range []string{"`tbx system restart --force`", "`" + supervisorRestartCommand() + "`", reason} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error = %q, want %q", err, want)
 		}
@@ -790,6 +790,7 @@ func TestBusyHandshakeRetriesOnceAndWarnsBeforeSkipping(t *testing.T) {
 // unit file alone must not make the restart unavailable.
 func TestSystemRestartForceReplacesAnInferredSupervisedDaemon(t *testing.T) {
 	fake := newFakeDaemon(t, daemon.ProtocolVersion-1)
+	fake.runs("alpha")
 	terminated := stubDaemonRestart(t, fake, func() (supervision, string) {
 		return supervisionInferred, "tbxd may be managed by /usr/lib/systemd/user/tbxd.service"
 	})
@@ -797,8 +798,8 @@ func TestSystemRestartForceReplacesAnInferredSupervisedDaemon(t *testing.T) {
 	command := cli{out: &stdout, err: &stderr}
 
 	err := command.run([]string{"system", "restart"})
-	if err == nil || !strings.Contains(err.Error(), supervisorRestartCommand()) {
-		t.Fatalf("error = %v, want a refusal naming the supervisor command", err)
+	if err == nil || !strings.Contains(err.Error(), "alpha") || !strings.Contains(err.Error(), "`"+supervisorRestartCommand()+"`") {
+		t.Fatalf("error = %v, want a refusal naming cluster impact and the supervisor command", err)
 	}
 	if !strings.Contains(err.Error(), "--force") {
 		t.Fatalf("error = %q, want the force escape named", err)
@@ -820,18 +821,173 @@ func TestSystemRestartForceReplacesAnInferredSupervisedDaemon(t *testing.T) {
 // tbx's to kill at any force level.
 func TestSystemRestartForceStillRefusesAConfirmedSupervisor(t *testing.T) {
 	fake := newFakeDaemon(t, daemon.ProtocolVersion)
+	fake.runs("alpha")
 	terminated := stubDaemonRestart(t, fake, func() (supervision, string) {
 		return supervisionConfirmed, "tbxd is managed by systemd (--user unit tbxd.socket)"
 	})
+	spawned := stubDaemonSpawn(t, func() {})
 	var stdout, stderr bytes.Buffer
 	command := cli{out: &stdout, err: &stderr}
 
 	err := command.run([]string{"system", "restart", "--force"})
-	if err == nil || !strings.Contains(err.Error(), supervisorRestartCommand()) {
-		t.Fatalf("error = %v, want --force refused with the supervisor command", err)
+	if err == nil || !strings.Contains(err.Error(), "alpha") || !strings.Contains(err.Error(), "`"+supervisorRestartCommand()+"`") {
+		t.Fatalf("error = %v, want --force refused with cluster impact and the supervisor command", err)
+	}
+	if strings.Contains(err.Error(), "--force") {
+		t.Fatalf("error = %q, confirmed supervision must not offer --force", err)
 	}
 	if *terminated != 0 {
 		t.Fatal("a confirmed supervised daemon must never be terminated")
+	}
+	if *spawned != 0 {
+		t.Fatal("a confirmed supervised daemon must never spawn a replacement")
+	}
+}
+
+func TestSystemRestartConfirmedSupervisorNamesRunningClustersFirst(t *testing.T) {
+	fake := newFakeDaemon(t, daemon.ProtocolVersion)
+	steps := make([]string, 0, 2)
+	stubRunningClusters(t, func(string) (clusterActivity, error) {
+		steps = append(steps, "activity")
+		return clusterActivity{running: []string{"alpha", "beta"}}, nil
+	})
+	reason := "tbxd is managed by its test supervisor"
+	terminated := stubDaemonRestart(t, fake, func() (supervision, string) {
+		steps = append(steps, "supervision")
+		return supervisionConfirmed, reason
+	})
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr}
+
+	err := command.run([]string{"system", "restart"})
+	if err == nil {
+		t.Fatal("a confirmed supervised daemon must refuse replacement")
+	}
+	message := err.Error()
+	commandIndex := strings.Index(message, "`"+supervisorRestartCommand()+"`")
+	if commandIndex < 0 {
+		t.Fatalf("error = %q, want the injected supervisor command", message)
+	}
+	for _, cluster := range []string{"alpha", "beta"} {
+		clusterIndex := strings.Index(message, cluster)
+		if clusterIndex < 0 || clusterIndex > commandIndex {
+			t.Fatalf("error = %q, want cluster %q before the supervisor command", message, cluster)
+		}
+	}
+	if strings.Contains(message, "--force") {
+		t.Fatalf("error = %q, confirmed supervision must not offer --force", message)
+	}
+	if *terminated != 0 {
+		t.Fatal("a confirmed supervised daemon must never be terminated")
+	}
+	if !slices.Equal(steps, []string{"activity", "supervision"}) {
+		t.Fatalf("restart steps = %v, want activity queried before supervision", steps)
+	}
+}
+
+func TestSystemRestartConfirmedSupervisorExplainsUnsafeSuspension(t *testing.T) {
+	fake := newFakeDaemon(t, daemon.ProtocolVersion)
+	fake.suspends("gamma")
+	terminated := stubDaemonRestart(t, fake, func() (supervision, string) {
+		return supervisionConfirmed, "tbxd is managed by its test supervisor"
+	})
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr}
+
+	err := command.run([]string{"system", "restart"})
+	if err == nil {
+		t.Fatal("a confirmed supervised daemon must refuse replacement")
+	}
+	for _, want := range []string{
+		"gamma",
+		"suspended clusters lose their saved memory",
+		"`tbx cluster resume gamma`",
+		"`tbx cluster destroy <name>`",
+		"`" + supervisorRestartCommand() + "`",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q, want %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "--force") {
+		t.Fatalf("error = %q, confirmed supervision must not offer --force", err)
+	}
+	if *terminated != 0 {
+		t.Fatal("a confirmed supervised daemon must never be terminated")
+	}
+}
+
+func TestSystemRestartConfirmedSupervisorReportsUnknownActivity(t *testing.T) {
+	fake := newFakeDaemon(t, daemon.ProtocolVersion)
+	terminated := stubDaemonRestart(t, fake, func() (supervision, string) {
+		return supervisionConfirmed, "tbxd is managed by its test supervisor"
+	})
+	queryErr := errors.New("cluster.list refused")
+	stubRunningClusters(t, func(string) (clusterActivity, error) {
+		return clusterActivity{}, queryErr
+	})
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr}
+
+	err := command.run([]string{"system", "restart"})
+	if err == nil {
+		t.Fatal("a confirmed supervised daemon must refuse replacement")
+	}
+	message := err.Error()
+	unknownIndex := strings.Index(message, "cluster activity could not be determined")
+	commandIndex := strings.Index(message, "`"+supervisorRestartCommand()+"`")
+	if unknownIndex < 0 || commandIndex < 0 || unknownIndex > commandIndex {
+		t.Fatalf("error = %q, want unknown activity before the supervisor command", message)
+	}
+	if !strings.Contains(message, queryErr.Error()) {
+		t.Fatalf("error = %q, want query failure %q", message, queryErr)
+	}
+	if strings.Contains(message, "--force") {
+		t.Fatalf("error = %q, confirmed supervision must not offer --force", message)
+	}
+	if *terminated != 0 {
+		t.Fatal("a confirmed supervised daemon must never be terminated")
+	}
+}
+
+func TestSystemRestartBusyDaemonPromptlyRefusesConfirmedSupervisor(t *testing.T) {
+	shortenHandshakeTimeout(t)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	scripted := newScriptedDaemon(t, func(_ int, connection net.Conn, _ *daemon.Request) {
+		<-release
+		_ = connection.Close()
+	})
+	terminated := stubRestartProcesses(t, func() {
+		t.Error("a confirmed supervised daemon must not spawn a replacement")
+	})
+	previous := supervisedDaemon
+	t.Cleanup(func() { supervisedDaemon = previous })
+	supervisedDaemon = func() (supervision, string) {
+		return supervisionConfirmed, "tbxd is managed by its test supervisor"
+	}
+	var stdout, stderr bytes.Buffer
+	command := cli{out: &stdout, err: &stderr}
+
+	done := make(chan error, 1)
+	go func() { done <- command.run([]string{"system", "restart", "--force"}) }()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "cluster activity could not be determined") ||
+			!strings.Contains(err.Error(), "`"+supervisorRestartCommand()+"`") {
+			t.Fatalf("error = %v, want bounded unknown-activity supervised refusal", err)
+		}
+		if strings.Contains(err.Error(), "--force") {
+			t.Fatalf("error = %q, confirmed supervision must not offer --force", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("a busy daemon hung the supervised restart refusal")
+	}
+	if *terminated != 0 {
+		t.Fatal("a confirmed supervised daemon must never be terminated")
+	}
+	if ops := scripted.recordedOps(); !slices.Contains(ops, "daemon.info") || !slices.Contains(ops, "cluster.list") {
+		t.Fatalf("daemon ops = %v, want the busy handshake followed by a bounded cluster.list query", ops)
 	}
 }
 
