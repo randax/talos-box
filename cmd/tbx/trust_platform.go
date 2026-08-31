@@ -177,6 +177,11 @@ func applyLinuxTrustAction(action trustSystemAction, stdin io.Reader) error {
 		if err := trustRemove(action.Destination); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("remove %s trust anchor: %w", driver.Name, err)
 		}
+		// A crashed install can strand the atomic-publication temp file; some
+		// trust stores scan every file in the anchor directory, so sweep it.
+		if err := trustRemove(action.Destination + ".tmp"); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove %s trust anchor temp file: %w", driver.Name, err)
+		}
 	default:
 		return fmt.Errorf("unknown trust-store operation %q", action.Operation)
 	}
@@ -214,19 +219,32 @@ func readValidatedTrustCertificatePEM(stdin io.Reader, expectedFingerprint strin
 	return data, nil
 }
 
-func writeLinuxTrustAnchor(path string, certificatePEM []byte) error {
-	file, err := trustOpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-	if errors.Is(err, os.ErrExist) {
-		file, err = trustOpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o644)
-	}
+// writeLinuxTrustAnchor publishes the anchor atomically: a short or failed
+// write must never leave malformed content at the final path, where the next
+// trust-store refresh would read it.
+func writeLinuxTrustAnchor(path string, certificatePEM []byte) (err error) {
+	temporary := path + ".tmp"
+	file, err := trustOpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = file.Close() }()
-	if _, err := file.Write(certificatePEM); err != nil {
+	defer func() {
+		if err != nil {
+			_ = trustRemove(temporary)
+		}
+	}()
+	if _, err = file.Write(certificatePEM); err != nil {
+		_ = file.Close()
 		return err
 	}
-	return file.Chmod(0o644)
+	if err = file.Chmod(0o644); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err = file.Close(); err != nil {
+		return err
+	}
+	return trustRename(temporary, path)
 }
 
 func verifyTrustAnchorFingerprint(path, expectedFingerprint string) error {
@@ -241,7 +259,13 @@ func verifyTrustAnchorFingerprint(path, expectedFingerprint string) error {
 		return fmt.Errorf("read trust anchor %s: %w", path, err)
 	}
 	fingerprint, fingerprintErr := trustCertificateFingerprint(data)
-	if fingerprintErr == nil && fingerprint == expectedFingerprint {
+	if fingerprintErr != nil {
+		// Unparsable content at the talosbox-owned anchor path can only be a
+		// failed write of ours, never a legitimate foreign CA — removal is the
+		// cleanup the install-failure guidance promised.
+		return nil
+	}
+	if fingerprint == expectedFingerprint {
 		return nil
 	}
 	return fmt.Errorf("refuse to remove trust anchor %s: it changed since installation; remove it manually", path)

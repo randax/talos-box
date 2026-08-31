@@ -77,7 +77,8 @@ func TestApplyLinuxTrustActionUsesSelectedDriverCommands(t *testing.T) {
 				t.Fatal(err)
 			}
 			destination := filepath.Join(driver.StoreDir, "talosbox-demo-ingress-ca.crt")
-			writtenPath := filepath.Join(t.TempDir(), "anchor.crt")
+			stage := t.TempDir()
+			writtenPath := filepath.Join(stage, "anchor.crt")
 			var openCalls []struct {
 				path  string
 				flags int
@@ -89,7 +90,13 @@ func TestApplyLinuxTrustActionUsesSelectedDriverCommands(t *testing.T) {
 					flags int
 					perm  os.FileMode
 				}{path: path, flags: flags, perm: perm})
-				return os.OpenFile(writtenPath, flags, perm)
+				return os.OpenFile(filepath.Join(stage, "anchor.crt.tmp"), flags, perm)
+			}
+			trustRename = func(oldPath, newPath string) error {
+				if oldPath != destination+".tmp" || newPath != destination {
+					t.Fatalf("rename %q -> %q, want temp file into anchor path", oldPath, newPath)
+				}
+				return os.Rename(filepath.Join(stage, "anchor.crt.tmp"), writtenPath)
 			}
 			var commands []trustCommand
 			trustRunCommand = func(command trustCommand, _ io.Reader, _, _ io.Writer) error {
@@ -101,7 +108,7 @@ func TestApplyLinuxTrustActionUsesSelectedDriverCommands(t *testing.T) {
 			}, bytes.NewReader(fixture.certPEM)); err != nil {
 				t.Fatal(err)
 			}
-			if len(openCalls) != 1 || openCalls[0].path != destination || openCalls[0].perm != 0o644 || openCalls[0].flags != os.O_WRONLY|os.O_CREATE|os.O_EXCL {
+			if len(openCalls) != 1 || openCalls[0].path != destination+".tmp" || openCalls[0].perm != 0o644 || openCalls[0].flags != os.O_WRONLY|os.O_CREATE|os.O_TRUNC {
 				t.Fatalf("open calls = %+v", openCalls)
 			}
 			if len(commands) != 1 || !reflect.DeepEqual(commands[0], driver.Refresh) {
@@ -1001,12 +1008,20 @@ func TestApplyLinuxTrustActionRejectsCertificateFingerprintMismatch(t *testing.T
 func TestTrustSystemInstallReadsValidatedCertificateFromStdin(t *testing.T) {
 	fixture := newTrustFixture(t, "linux")
 	trustEUID = func() int { return 0 }
-	writtenPath := filepath.Join(t.TempDir(), "anchor.crt")
+	stage := t.TempDir()
+	writtenPath := filepath.Join(stage, "anchor.crt")
+	anchorPath := filepath.Join(linuxDebianStore, "talosbox-demo-ingress-ca.crt")
 	trustOpenFile = func(path string, flags int, perm os.FileMode) (*os.File, error) {
-		if path != filepath.Join(linuxDebianStore, "talosbox-demo-ingress-ca.crt") {
-			t.Fatalf("destination path = %q", path)
+		if path != anchorPath+".tmp" {
+			t.Fatalf("write path = %q, want the atomic-publication temp file", path)
 		}
-		return os.OpenFile(writtenPath, flags, perm)
+		return os.OpenFile(filepath.Join(stage, "anchor.crt.tmp"), flags, perm)
+	}
+	trustRename = func(oldPath, newPath string) error {
+		if oldPath != anchorPath+".tmp" || newPath != anchorPath {
+			t.Fatalf("rename %q -> %q, want temp file into anchor path", oldPath, newPath)
+		}
+		return os.Rename(filepath.Join(stage, "anchor.crt.tmp"), writtenPath)
 	}
 	var refreshed []trustCommand
 	trustRunCommand = func(command trustCommand, _ io.Reader, _, _ io.Writer) error {
@@ -1065,6 +1080,71 @@ func TestApplyLinuxTrustActionRefusesRemovingChangedAnchor(t *testing.T) {
 	}, nil)
 	if err == nil || !strings.Contains(err.Error(), "remove it manually") {
 		t.Fatalf("applyLinuxTrustAction() error = %v, want manual removal refusal", err)
+	}
+}
+
+func TestApplyLinuxTrustActionRemovesMalformedAnchor(t *testing.T) {
+	fixture := newTrustFixture(t, "linux")
+	anchorPath := filepath.Join(linuxDebianStore, "talosbox-demo-ingress-ca.crt")
+	trustLookPath = func(name string) (string, error) { return filepath.Join("/test-bin", name), nil }
+	trustReadFile = func(path string) ([]byte, error) {
+		if path == anchorPath {
+			return []byte("not a certificate: interrupted write"), nil
+		}
+		return os.ReadFile(path)
+	}
+	var removed []string
+	trustRemove = func(path string) error {
+		removed = append(removed, path)
+		if path == anchorPath {
+			return nil
+		}
+		return os.ErrNotExist
+	}
+	refreshed := false
+	trustRunCommand = func(trustCommand, io.Reader, io.Writer, io.Writer) error {
+		refreshed = true
+		return nil
+	}
+	err := applyLinuxTrustAction(trustSystemAction{
+		Operation:   trustOperationRemove,
+		Driver:      linuxDebianDriver,
+		Fingerprint: fixture.fingerprint,
+		Destination: anchorPath,
+	}, nil)
+	if err != nil {
+		t.Fatalf("malformed anchor removal failed: %v", err)
+	}
+	if len(removed) != 2 || removed[0] != anchorPath || removed[1] != anchorPath+".tmp" {
+		t.Fatalf("removed = %v, want the anchor then its temp file", removed)
+	}
+	if !refreshed {
+		t.Fatal("trust store was not refreshed after removing the malformed anchor")
+	}
+}
+
+func TestWriteLinuxTrustAnchorLeavesNothingAtFinalPathOnFailure(t *testing.T) {
+	fixture := newTrustFixture(t, "linux")
+	_ = fixture
+	stage := t.TempDir()
+	anchorPath := filepath.Join(stage, "talosbox-demo-ingress-ca.crt")
+	trustOpenFile = func(path string, flags int, perm os.FileMode) (*os.File, error) {
+		if path != anchorPath+".tmp" {
+			t.Fatalf("write path = %q, want the temp file", path)
+		}
+		return os.OpenFile(path, flags, perm)
+	}
+	renameErr := errors.New("rename failed")
+	trustRename = func(_, _ string) error { return renameErr }
+	err := writeLinuxTrustAnchor(anchorPath, []byte("certificate bytes"))
+	if !errors.Is(err, renameErr) {
+		t.Fatalf("writeLinuxTrustAnchor() error = %v, want rename failure", err)
+	}
+	if _, statErr := os.Stat(anchorPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("final anchor path exists after failed publication: %v", statErr)
+	}
+	if _, statErr := os.Stat(anchorPath + ".tmp"); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("temp file survived failed publication: %v", statErr)
 	}
 }
 
