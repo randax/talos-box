@@ -557,7 +557,15 @@ func hintsAt(status ClusterStatus, now time.Time) []string {
 		}
 		if status.CNI == cluster.CNICilium && status.LB && status.KubernetesReady {
 			if status.VIPLive {
-				hints = append(hints, fmt.Sprintf("Kubernetes is Ready; Cilium LB-IPAM VIP is live at http://%s/.%s", status.VIP, credentialExports(status.Name)))
+				domain := status.Domain
+				if domain == "" {
+					domain = status.Name + "." + cluster.DefaultDomainSuffix
+				}
+				trustHint := ""
+				if !trustInstalledForHint(status.Name) {
+					trustHint = fmt.Sprintf(" Install its browser-trust CA: tbx trust install %s.", shellquote.Quote(status.Name))
+				}
+				hints = append(hints, fmt.Sprintf("Kubernetes is Ready; Cilium LB-IPAM ingress is live at https://probe.%s/.%s%s", domain, trustHint, credentialExports(status.Name)))
 			} else {
 				hints = append(hints, fmt.Sprintf("Kubernetes is Ready; %s.%s", vipSettlingNote(status, "Cilium LB-IPAM"), credentialExports(status.Name)))
 				vipNoted = true
@@ -1063,7 +1071,34 @@ func (c ClusterStatus) controlPlaneOr(fallback NodeStatus) NodeStatus {
 
 // hintGOOS is the host platform the hints are written for. It is a variable so
 // a test can exercise the macOS-only wording from any host.
-var hintGOOS = runtime.GOOS
+var (
+	hintGOOS              = runtime.GOOS
+	trustInstalledForHint = trustReceiptAndCertPresent
+	trustHintUserHomeDir  = os.UserHomeDir
+	trustHintStat         = os.Stat
+)
+
+// trustReceiptAndCertPresent is deliberately a local filesystem observation:
+// status rendering must never invoke a platform keychain or trust-store tool.
+// The receipt says tbx completed installation, while the CA presence ensures
+// the hint does not claim trust for a cluster whose PKI is incomplete.
+func trustReceiptAndCertPresent(name string) bool {
+	home, err := trustHintUserHomeDir()
+	if err != nil {
+		return false
+	}
+	paths := []string{
+		filepath.Join(home, ".talosbox", "trust", name+".json"),
+		filepath.Join(home, ".talosbox", "clusters", name, "ingress-ca.crt"),
+	}
+	for _, path := range paths {
+		info, err := trustHintStat(path)
+		if err != nil || !info.Mode().IsRegular() {
+			return false
+		}
+	}
+	return true
+}
 
 // resolverBypassNote warns that the most obvious DNS tools do not see the name
 // the hint just handed out. macOS keeps tbx's per-domain entries under

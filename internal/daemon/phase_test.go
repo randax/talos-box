@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -297,6 +299,10 @@ func TestHintsReportCiliumStorageProvisioning(t *testing.T) {
 }
 
 func TestHintsDescribeCiliumReadyWithAndWithoutLoadBalancer(t *testing.T) {
+	originalTrustInstalled := trustInstalledForHint
+	t.Cleanup(func() { trustInstalledForHint = originalTrustInstalled })
+	trustInstalledForHint = func(string) bool { return false }
+
 	for _, test := range []struct {
 		name   string
 		intent cluster.ProvisioningIntent
@@ -309,7 +315,7 @@ func TestHintsDescribeCiliumReadyWithAndWithoutLoadBalancer(t *testing.T) {
 			intent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true},
 			vip:    "172.30.4.200",
 			live:   true,
-			wants:  []string{"Cilium LB-IPAM", "http://172.30.4.200/"},
+			wants:  []string{"Cilium LB-IPAM", "https://probe.demo.k8s.test/", "tbx trust install demo"},
 		},
 		{
 			name:   "load balancer disabled",
@@ -335,6 +341,66 @@ func TestHintsDescribeCiliumReadyWithAndWithoutLoadBalancer(t *testing.T) {
 		})
 	}
 }
+
+func TestHintsOmitTrustInstallForTrustedCiliumDomain(t *testing.T) {
+	originalTrustInstalled := trustInstalledForHint
+	t.Cleanup(func() { trustInstalledForHint = originalTrustInstalled })
+	trustInstalledForHint = func(name string) bool { return name == "demo" }
+
+	status := ClusterStatus{
+		Name:               "demo",
+		Domain:             "lab.internal",
+		ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true},
+		KubernetesReady:    true,
+		VIP:                "172.30.4.200",
+		VIPLive:            true,
+		Nodes:              []NodeStatus{{Role: cluster.RoleControlPlane, Phase: PhaseConfigured}},
+	}
+	joined := strings.Join(Hints(status), "\n")
+	if !strings.Contains(joined, "https://probe.lab.internal/") {
+		t.Fatalf("hints missing custom-domain HTTPS endpoint:\n%s", joined)
+	}
+	if strings.Contains(joined, "tbx trust install") {
+		t.Fatalf("hints include trust installation after receipt detection:\n%s", joined)
+	}
+}
+
+func TestTrustHintDetectionRequiresReceiptAndIngressCA(t *testing.T) {
+	originalHome := trustHintUserHomeDir
+	originalStat := trustHintStat
+	t.Cleanup(func() {
+		trustHintUserHomeDir = originalHome
+		trustHintStat = originalStat
+	})
+	trustHintUserHomeDir = func() (string, error) { return "/test-home", nil }
+	present := map[string]bool{
+		filepath.Join("/test-home", ".talosbox", "trust", "demo.json"):                 true,
+		filepath.Join("/test-home", ".talosbox", "clusters", "demo", "ingress-ca.crt"): true,
+	}
+	trustHintStat = func(path string) (os.FileInfo, error) {
+		if !present[path] {
+			return nil, os.ErrNotExist
+		}
+		return regularFileInfo{name: filepath.Base(path)}, nil
+	}
+
+	if !trustReceiptAndCertPresent("demo") {
+		t.Fatal("receipt plus CA was not detected")
+	}
+	delete(present, filepath.Join("/test-home", ".talosbox", "clusters", "demo", "ingress-ca.crt"))
+	if trustReceiptAndCertPresent("demo") {
+		t.Fatal("receipt without CA was detected as installed")
+	}
+}
+
+type regularFileInfo struct{ name string }
+
+func (i regularFileInfo) Name() string     { return i.name }
+func (regularFileInfo) Size() int64        { return 0 }
+func (regularFileInfo) Mode() os.FileMode  { return 0o600 }
+func (regularFileInfo) ModTime() time.Time { return time.Time{} }
+func (regularFileInfo) IsDir() bool        { return false }
+func (regularFileInfo) Sys() any           { return nil }
 
 func TestHintsDoNotInferFlannelKubernetesReadiness(t *testing.T) {
 	status := ClusterStatus{
