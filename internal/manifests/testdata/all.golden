@@ -65,7 +65,19 @@ k8sClientRateLimit:
   qps: 10
   burst: 20
 ingressController:
-  enabled: false
+  enabled: true
+  default: true
+  loadbalancerMode: shared
+  enforceHttps: false
+  defaultSecretNamespace: talosbox-system
+  defaultSecretName: ingress-wildcard-tls
+  secretsNamespace:
+    create: true
+    name: cilium-secrets
+    sync: true
+  service:
+    annotations:
+      lbipam.cilium.io/ips: "172.30.0.200"
 hubble:
   enabled: false
   tls:

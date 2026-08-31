@@ -89,13 +89,13 @@ spec:
 `, f.Cluster)
 }
 
-// CiliumValues renders the curated, Talos-safe Cilium value surface. The
-// ingress controller deliberately remains attendee-owned: talosbox proves the
-// LoadBalancer path with its own probe instead of claiming the workshop VIP.
+// CiliumValues renders the curated, Talos-safe Cilium value surface. The shared
+// ingress Service owns the first address in the cluster's LoadBalancer pool.
 func CiliumValues(f Facts) string {
 	// The manual Cilium values surface retains its historic L2 default. The
 	// provisioner names Cilium explicitly and turns L2 off with lb: false.
 	l2Enabled := !f.BGP && (f.CNI != "cilium" || f.LB)
+	ingressEnabled := f.CNI != "cilium" || f.LB
 	// The announcement mode is a chart value, not an object: switching it rewrites
 	// cilium-config, and an agent reads that file once at startup. rollOutCiliumPods
 	// stamps the ConfigMap's checksum into the pod templates, so applying the new
@@ -144,7 +144,19 @@ k8sClientRateLimit:
   qps: %d
   burst: %d
 ingressController:
-  enabled: false
+  enabled: %t
+  default: true
+  loadbalancerMode: shared
+  enforceHttps: false
+  defaultSecretNamespace: talosbox-system
+  defaultSecretName: ingress-wildcard-tls
+  secretsNamespace:
+    create: true
+    name: cilium-secrets
+    sync: true
+  service:
+    annotations:
+      lbipam.cilium.io/ips: %q
 hubble:
   enabled: %t
   tls:
@@ -154,7 +166,7 @@ hubble:
     enabled: %t
   ui:
     enabled: %t
-`, l2Enabled, f.BGP, ciliumClientQPS, ciliumClientBurst, f.Hubble, f.Hubble, f.Hubble)
+`, l2Enabled, f.BGP, ciliumClientQPS, ciliumClientBurst, ingressEnabled, f.hostIP(200), f.Hubble, f.Hubble, f.Hubble)
 }
 
 // BGPPolicy renders Cilium's BGP v2 resources for "host as ToR": every node

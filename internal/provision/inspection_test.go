@@ -27,6 +27,7 @@ func TestRenderInspectionMatchesCiliumProvisioningInputs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	wantExtras += "---\n" + mustEncodeInspectionObject(t, inspectionIngressTLSSecretObject())
 	for section, want := range map[string]string{"objects": wantObjects, "extras": wantExtras} {
 		got, err := RenderInspection(item, section)
 		if err != nil {
@@ -45,6 +46,15 @@ func TestRenderInspectionMatchesCiliumProvisioningInputs(t *testing.T) {
 			t.Fatalf("machine patch missing %q:\n%s", want, machine)
 		}
 	}
+}
+
+func mustEncodeInspectionObject(t *testing.T, object unstructured.Unstructured) string {
+	t.Helper()
+	encoded, err := encodeInspectionObjects([]unstructured.Unstructured{object})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
 }
 
 func TestRenderInspectionMatchesMetalLBProvisioningInputs(t *testing.T) {
@@ -541,6 +551,24 @@ func TestRenderInspectionIndependentSections(t *testing.T) {
 	}
 	if strings.Contains(values, "apiVersion:") || !strings.Contains(values, "kubeProxyReplacement") {
 		t.Fatalf("values section unexpectedly contains rendered objects:\n%s", values)
+	}
+}
+
+func TestRenderInspectionRedactsIngressPrivateKeyMaterial(t *testing.T) {
+	item := cluster.Cluster{Name: "demo", SubnetIndex: 2, ProvisioningIntent: cluster.ProvisioningIntent{CNI: cluster.CNICilium, LB: true}}
+	extras, err := RenderInspection(item, "extras")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"kind: Secret", "name: ingress-wildcard-tls", "kind: Ingress", "secretName: ingress-wildcard-tls"} {
+		if !strings.Contains(extras, want) {
+			t.Fatalf("Cilium extras missing %q:\n%s", want, extras)
+		}
+	}
+	for _, forbidden := range []string{"BEGIN EC PRIVATE KEY", "tls.key:"} {
+		if strings.Contains(extras, forbidden) {
+			t.Fatalf("Cilium extras leaked %q:\n%s", forbidden, extras)
+		}
 	}
 }
 

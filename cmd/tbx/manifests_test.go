@@ -3,6 +3,8 @@ package main
 import (
 	"strings"
 	"testing"
+
+	"github.com/randax/talos-box/internal/daemon"
 )
 
 func TestRunManifestsCiliumInspectionSurface(t *testing.T) {
@@ -143,6 +145,22 @@ func TestRunManifestsCNIFlagRendersTheNamedCuratedPath(t *testing.T) {
 	)
 	if !strings.Contains(stdout, "kubeProxyReplacement: true") {
 		t.Fatalf("tbx manifests --cni cilium values missing Cilium values:\n%s", stdout)
+	}
+}
+
+func TestClusterFromSummaryPreservesDomainFlags(t *testing.T) {
+	item := clusterFromSummary(daemon.ClusterSummary{
+		Name: "demo", SubnetIndex: 5, ControlPlanes: 1, Workers: 2,
+		Domain: "demo.lab.internal", AllowUnsafeDomain: true,
+	})
+	if item.Domain != "demo.lab.internal" {
+		t.Fatalf("Domain = %q, want demo.lab.internal", item.Domain)
+	}
+	if !item.AllowUnsafeDomain {
+		t.Fatal("AllowUnsafeDomain = false, want true")
+	}
+	if got := item.EffectiveDomain(); got != "demo.lab.internal" {
+		t.Fatalf("EffectiveDomain() = %q, want demo.lab.internal", got)
 	}
 }
 
