@@ -497,26 +497,26 @@ func waitForProbe(ctx context.Context, client kubernetes.Interface, item cluster
 func ciliumIngressResourcesReady(ctx context.Context, client kubernetes.Interface, item cluster.Cluster) error {
 	probeService, err := client.CoreV1().Services(probeNamespace).Get(ctx, "lb-probe", metav1.GetOptions{})
 	if err != nil || probeService.Spec.Type != "ClusterIP" {
-		return errors.New("Cilium probe ClusterIP Service is not ready")
+		return errors.New("cilium probe ClusterIP Service is not ready")
 	}
 	ingressClass, err := client.NetworkingV1().IngressClasses().Get(ctx, "cilium", metav1.GetOptions{})
 	if err != nil || ingressClass.Annotations["ingressclass.kubernetes.io/is-default-class"] != "true" {
-		return errors.New("Cilium IngressClass is not the default")
+		return errors.New("cilium IngressClass is not the default")
 	}
 	ingress, err := client.NetworkingV1().Ingresses(probeNamespace).Get(ctx, "lb-probe", metav1.GetOptions{})
 	if err != nil {
-		return errors.New("Cilium wildcard probe Ingress is not ready")
+		return errors.New("cilium wildcard probe Ingress is not ready")
 	}
 	wildcard := "*." + item.EffectiveDomain()
 	if ingress.Labels["talosbox.dev/managed"] != "true" || ingress.Spec.IngressClassName == nil || *ingress.Spec.IngressClassName != "cilium" ||
 		len(ingress.Spec.Rules) != 1 || ingress.Spec.Rules[0].Host != wildcard || len(ingress.Spec.TLS) != 1 ||
 		ingress.Spec.TLS[0].SecretName != ingressTLSSecretName || len(ingress.Spec.TLS[0].Hosts) != 1 || ingress.Spec.TLS[0].Hosts[0] != wildcard {
-		return errors.New("Cilium wildcard probe Ingress does not match the cluster domain")
+		return errors.New("cilium wildcard probe Ingress does not match the cluster domain")
 	}
 	secret, err := client.CoreV1().Secrets(probeNamespace).Get(ctx, ingressTLSSecretName, metav1.GetOptions{})
 	if err != nil || secret.Labels["talosbox.dev/managed"] != "true" || secret.Type != "kubernetes.io/tls" ||
 		len(secret.Data["tls.crt"]) == 0 || len(secret.Data["tls.key"]) == 0 {
-		return errors.New("Cilium ingress TLS Secret is not ready")
+		return errors.New("cilium ingress TLS Secret is not ready")
 	}
 	return nil
 }

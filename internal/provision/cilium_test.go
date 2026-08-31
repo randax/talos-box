@@ -431,7 +431,7 @@ func ciliumConvergedServerWithOptions(t *testing.T, item cluster.Cluster, option
 				writer.WriteHeader(http.StatusNotFound)
 				return
 			}
-			_, _ = writer.Write([]byte(fmt.Sprintf(`{"metadata":{"annotations":{"lbipam.cilium.io/ips":"172.30.%d.200"}},"status":{"loadBalancer":{"ingress":[{"ip":"172.30.%d.200"}]}}}`, item.SubnetIndex, item.SubnetIndex)))
+			_, _ = fmt.Fprintf(writer, `{"metadata":{"annotations":{"lbipam.cilium.io/ips":"172.30.%d.200"}},"status":{"loadBalancer":{"ingress":[{"ip":"172.30.%d.200"}]}}}`, item.SubnetIndex, item.SubnetIndex)
 		case "/apis/apps/v1/namespaces/kube-system/deployments/cilium-operator":
 			_, _ = writer.Write([]byte(`{"metadata":{"generation":1},"status":{"observedGeneration":1,"readyReplicas":1,"availableReplicas":1}}`))
 		case "/apis/apps/v1/namespaces/kube-system/daemonsets/cilium", "/apis/apps/v1/namespaces/kube-system/daemonsets/cilium-envoy":
