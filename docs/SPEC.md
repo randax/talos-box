@@ -24,11 +24,15 @@ a per-cluster wildcard TLS certificate, and keeps attendee `Ingress` objects beh
 Attendee workloads and arbitrary ingress installations remain **attendee work**.
 
 Out of scope ([original map](https://github.com/randax/talos-box/issues/1),
-[Linux map](https://github.com/randax/talos-box/issues/71)): workshop curriculum,
-instructor-side orchestration, Windows/WSL2 hosts, machines under 16 GB RAM,
-rootless Linux networking, and arbitrary application or ingress installation. The curated
-Cilium ingress path is an explicit opt-in, not arbitrary ingress installation; substrate-only
-clusters retain the original manual workflow and guided hints (§10).
+[Linux map](https://github.com/randax/talos-box/issues/71),
+[WSL2 map](https://github.com/randax/talos-box/issues/456)): workshop curriculum,
+instructor-side orchestration, **native Windows hosts** — a `tbx.exe` with a Hyper-V/WHP
+backend, named-pipe IPC, and a Windows service model — Windows 10 hosts, machines under
+16 GB RAM, rootless Linux networking, and arbitrary application or ingress installation.
+Windows 11 hosts running talosbox inside a supported Ubuntu LTS WSL2 distro are supported
+through the Linux substrate (§2). The curated Cilium ingress path is an explicit opt-in,
+not arbitrary ingress installation; substrate-only clusters retain the original manual
+workflow and guided hints (§10).
 
 ## 2. Supported platforms
 
@@ -39,10 +43,21 @@ All supported hosts require **16 GB RAM minimum**.
 | macOS | Apple Silicon (arm64) | macOS 14 (Sonoma) | Virtualization.framework; optional QEMU/HVF | VZ is the default; QEMU/HVF is the verified optional path on macOS 15+ |
 | macOS | Intel (amd64) | macOS 15 / QEMU 6.2 | Optional QEMU/HVF | Best effort only: community-verified, never on the parity bar |
 | Ubuntu LTS | amd64, arm64 | Ubuntu 22.04 / QEMU 6.2 | QEMU/KVM | Tier one; suspend requires QEMU 8.2+, normally Ubuntu 24.04+ |
+| Windows 11 + WSL2 | amd64 | Windows 11 build 22000 / Store WSL 2.x / Ubuntu LTS / QEMU 6.2 | QEMU/KVM inside the WSL2 VM | Tier one; NAT networking mode |
 | Fedora | amd64, arm64 | Current stable / QEMU 6.2 | QEMU/KVM | Tier one |
 | Arch Linux | amd64, arm64 | Rolling / QEMU 6.2 | QEMU/KVM | Tier one |
 | NixOS | amd64, arm64 | Current stable / QEMU 6.2 | QEMU/KVM | Tier-one design target; release support waits for the flake/module in #96 |
 | Debian, openSUSE | amd64, arm64 | QEMU 6.2 | QEMU/KVM | Best effort |
+
+WSL2 uses the ordinary Linux substrate inside the Ubuntu distro; Windows is host integration,
+not a second substrate. Three properties remain owned by WSL rather than talosbox. First, WSL2
+is a **size-by-hand host**: its memory view is the utility VM's cap, not trustworthy Windows
+host pressure, so automatic host-pressure and balloon policy stay disabled. Second, WSL's
+generated `/etc/resolv.conf` can bypass systemd-resolved even when route-only domain
+registration succeeds; guest DNS and explicit by-IP access remain available. Third, WSL's
+session lifetime is met by the packaged `tbxd.socket` user unit plus
+`loginctl enable-linger`; closing the last shell must not strand a session-scoped daemon,
+while `wsl --shutdown` and a Windows reboot remain host shutdowns.
 
 The Linux host and guest architectures must match; TCG emulation is never a fallback. KVM must
 be available through a readable+writable `/dev/kvm`, and the installed QEMU package must provide
@@ -196,6 +211,42 @@ host-side GARP machinery. Host networking is declarative desired state: bridge, 
 DHCP, DNS, and resolved registration are reconverged on helper startup because kernel state
 does not survive a reboot.
 
+### WSL2 host integration
+
+WSL2 is supported in **NAT networking mode only**. Windows-side clients reach cluster names
+through a PAC file and an HTTP CONNECT proxy served inside `tbxd` on one fixed Windows-loopback
+port. The prototype used `5390`; the production port is intentionally left to an implementation
+decision and is not fixed by this spec. The PAC sends only talosbox cluster domains through the
+proxy and leaves ordinary browsing direct. The proxy resolves cluster names in-process and
+connects to the selected Linux-side address without terminating TLS, rewriting SNI, installing a
+CA, or exposing the cluster subnets to Windows routing. A dead proxy must abandon the proxied
+request in about two seconds and must not break ordinary browsing.
+
+`tbx windows enable` writes the current Windows user's `AutoConfigURL`; it requires no elevation.
+It refuses to overwrite an occupied value, identifies the conflict, and points command-line users
+at `HTTPS_PROXY` instead. NRPT and hosts-file fallbacks are ruled out: NRPT needs privileged,
+mutable Windows DNS state and a reachable DNS listener, while the hosts file cannot express a
+wildcard. The PAC/proxy path is the supported Windows integration.
+
+Name coverage is exact rather than aspirational. Node names and the apiserver name resolve to
+node addresses. Every other name below a cluster domain resolves to that cluster's ingress VIP,
+which is permanently held by talosbox's own `lb-probe` end-state probe. The wildcard therefore
+proves the talosbox ingress end state from a Windows browser; it does **not** provide name-based
+access to attendee applications. Attendee workloads are reached at their own LoadBalancer
+addresses by IP literal.
+
+Two Windows users are two independent talosbox installations. Their state, PAC ownership, and
+cluster domains are not shared; only the machine-wide loopback port is shared. The proxy status
+path carries an opaque install id so a client can distinguish its own proxy, another user's
+talosbox proxy, and an unrelated port squatter without disclosing the user or filesystem path.
+
+The existing host-conflict subnet scan sees the WSL NAT prefix through the Linux `eth0` address
+and route and continues to allocate from `172.30.0.0/16`. A new collision is skipped during
+allocation. A collision discovered after a cluster already owns its subnet retains the
+never-fail attached-subnet warning; on WSL2 the warning additionally offers `wsl --shutdown` as
+the WSL-owned reset that can replace a stale NAT prefix. Effective mirrored mode is a `WARN`,
+never a `FAIL`; it does not become a second supported networking mode.
+
 **Subnets**: cluster *n* → `172.30.<n>.0/24` (base configurable). Layout, identical in every
 cluster:
 
@@ -235,7 +286,11 @@ changes. On Linux, the helper binds the cluster gateway's port 53 and passes the
 to the unprivileged DNS server; guest queries are forwarded upstream, and when
 systemd-resolved is available the helper registers `~<domain>` as a route-only domain on the
 bridge through D-Bus. Hosts without resolved retain guest and by-IP access, and `tbx doctor`
-prints the required `resolvectl` fallback without writing `/etc/resolv.conf`.
+prints the required `resolvectl` fallback without writing `/etc/resolv.conf`. Troubleshooting
+the apiserver is the same on every host substrate: its first browser contact can show the
+expected self-signed TLS interstitial because Talos control-plane trust is separate from curated
+ingress trust. Accepting that interstitial proves transport only; it is not name-based
+attendee-application access and does not install or merge either trust root.
 
 **BGP mode** (`tbx bgp enable <cluster>`): changing the mode on a live cluster reconciles both
 sides — the host speaker, then a forced CNI pass that re-renders Cilium with `bgpControlPlane`
@@ -659,11 +714,53 @@ These Linux channels are the release design, not a statement of current publicat
 #95, #96, and #101 close, the only documented Linux installation is the source-preview path
 in [Linux host setup](linux.md).
 
-On both platforms, `tbx doctor` verifies the platform helper, hypervisor, DNS/forwarding,
-routes, and external image access; host-capacity sampling is currently macOS-only. Linux adds
-the detailed KVM/QEMU, bridge/firewall, reverse-path filter, port, systemd-unit, group, and
-capability checks listed in
-[Linux host setup](linux.md#what-tbx-doctor-checks-on-linux).
+### Windows (WSL2)
+
+- Install and upgrade talosbox from the apt channel **inside** the supported Ubuntu LTS distro.
+  The package installs the same Linux binaries and system units, enables the `tbxd.socket` user
+  unit, and documents `loginctl enable-linger` so socket activation and running guests survive the
+  last terminal closing. There is no native Windows package or service.
+- Maintainer scripts in **every** package format must not restart `tbxd` or `tbx-helper`.
+  Upgrades replace the Linux artifacts and preserve the Linux rule that the operator chooses the
+  restart point after inspecting running and suspended clusters. `wsl --shutdown` is never an
+  upgrade step. It retains only its two narrow roles: refreshing WSL-owned host/session state
+  (including stale supplementary groups under linger), and deliberately applying or resetting
+  WSL configuration/network state such as `.wslconfig` or a stale NAT-subnet collision.
+- The future `docs/windows.md`, written by the build effort, documents enabling systemd, the apt
+  channel, the socket unit and linger, `tbx windows enable`, PAC ownership/conflicts, NAT-mode
+  support, and the Windows-browser checks. It recommends a Windows-side
+  `%UserProfile%\.wslconfig` block of this form, substituting a memory value equal to host RAM minus
+  enough headroom for Windows:
+
+  ```toml
+  [wsl2]
+  memory=24GB # example only: choose host RAM minus Windows headroom
+
+  [experimental]
+  autoMemoryReclaim=disabled
+  ```
+
+  WSL's default cap is only 50% of host RAM, which is commonly too small for a workshop cluster.
+  `autoMemoryReclaim` belongs under `[experimental]` and stays disabled while clusters run so WSL
+  does not reclaim underneath the guest-memory policy. The guide warns that WSL swap consumes the
+  Windows disk and is not a substitute for RAM sizing; do not use a large swap allocation to hide
+  a host that cannot keep Talos guests resident.
+
+On every platform, `tbx doctor` verifies the platform helper, hypervisor, DNS/forwarding, routes,
+and external image access; host-capacity sampling is currently macOS-only. Linux adds the detailed
+KVM/QEMU, bridge/firewall, reverse-path filter, port, systemd-unit, group, and capability checks
+listed in [Linux host setup](linux.md#what-tbx-doctor-checks-on-linux). WSL2 additionally prints an
+INFO-only `wsl` inventory line for WSL version, distro, Windows build, effective networking mode,
+and NAT prefix. If Windows interop is disabled, the line prints the Linux-side facts it has and
+says the Windows side was unreadable; the line never WARNs or FAILs by itself.
+
+WSL re-verdicts follow the same rule as every other doctor verdict: `FAIL` means this host cannot
+run clusters and is the only verdict that makes doctor exit non-zero. A broken optional capability
+is at most `WARN`; a WSL-owned observation is `INFO` or `SKIP`. Thus unusable KVM can still fail,
+the generated-`resolv.conf` bypass and unsupported mirrored reachability can only warn in the
+checks that own those capabilities, and size-by-hand host pressure remains unmeasured rather than
+inventing a failure. WSL-specific diagnosis must not turn a usable by-IP cluster host into a
+failing preflight.
 
 ## 12. Verification gates and risk register
 
@@ -703,15 +800,37 @@ Implementation must close these before v1 ships:
   and the Nix flake/module (#95, #96, #101). Documentation must not expose placeholder URLs.
 - **G9 — Linux full-cluster CI**: run build/unit on amd64+arm64 and the substrate-only
   1-control-plane + 2-worker KVM e2e on amd64, with a hard writable-`/dev/kvm` gate (#97).
+- **G10 — WSL2 real-hardware QA**: on real Windows 11 hardware with Store WSL2 and the
+  supported Ubuntu LTS distro, run the complete manual WSL2 battery. At minimum it must prove:
+  a Windows browser reaches the ingress wildcard and talosbox's own end-state probe; after
+  `wsl --shutdown`, the first `tbx` command restores a working PAC URL; first contact with the
+  apiserver shows the expected self-signed TLS interstitial; and stopping the proxy makes the
+  cluster request fail in about two seconds while ordinary browsing remains direct and usable.
+- **G11 — hosted WSL2 install lane**: an optional hosted, non-KVM lane may install the Linux
+  package in WSL2 and run `tbx doctor` to protect packaging, interop, and verdict output. It is
+  not a cluster gate: hosted Windows runners cannot provide `/dev/kvm` inside their WSL2 VM.
+
+**WSL2 prerequisites**: release support also requires the six Linux-wide defects tracked by
+[#502](https://github.com/randax/talos-box/issues/502),
+[#468](https://github.com/randax/talos-box/issues/468),
+[#497](https://github.com/randax/talos-box/issues/497),
+[#514](https://github.com/randax/talos-box/issues/514),
+[#515](https://github.com/randax/talos-box/issues/515), and
+[#503](https://github.com/randax/talos-box/issues/503) to be resolved and closed before WSL2
+release support; none blocks starting the WSL2 work. WSL2 must not fork fixes for route exits,
+platform-specific probes, durable user services, desired-state reconvergence, restart safety, or
+tunnel-aware subnet selection away from Linux.
 
 ## 13. Asset index
 
 - Research: `docs/research/` on branches `research/hypervisor-stack`,
   `research/talos-boot-mechanics`, `research/macos-networking-substrate`,
-  `research/qemu-qmp-parity`, `research/linux-l2-bgp-vip`, and
-  `research/distro-packaging-lsm`
+  `research/qemu-qmp-parity`, `research/linux-l2-bgp-vip`,
+  `research/distro-packaging-lsm`, `research/wsl2-env-baseline`,
+  `research/wsl2-networking-modes`, and `research/wsl2-ci-feasibility`
 - Prototypes: `prototypes/talos-vz-boot/` on branches `prototype/talos-vz-boot` (boot
   validation) and `prototype/vmnet-arp` (ARP filter, Alpine serial harness, raw-image and
-  registry experiments)
-- Decision indexes: [macOS wayfinder map](https://github.com/randax/talos-box/issues/1) and
-  [Linux parity map](https://github.com/randax/talos-box/issues/71)
+  registry experiments), plus `prototype/wsl2-smoke` and `prototype/wsl2-pac-proxy`
+- Decision indexes: [macOS wayfinder map](https://github.com/randax/talos-box/issues/1),
+  [Linux parity map](https://github.com/randax/talos-box/issues/71), and
+  [WSL2 wayfinder map](https://github.com/randax/talos-box/issues/456)

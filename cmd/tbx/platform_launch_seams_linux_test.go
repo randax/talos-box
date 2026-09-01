@@ -9,6 +9,9 @@ import (
 )
 
 func pinPlatformLaunchSeams() {
+	linuxHelperCapabilityReport = func() (helperCapabilityReport, error) {
+		return helperCapabilityReport{}, fmt.Errorf("linuxHelperCapabilityReport is not stubbed in this test")
+	}
 	hasSystemd = func() bool { return false }
 	queryUserLinger = func(int) (bool, error) {
 		return false, fmt.Errorf("queryUserLinger is not stubbed in this test")

@@ -50,6 +50,18 @@ The VM engine a cluster's nodes run on, one of a fixed set the host substrate kn
 
 A host feature whose availability is detected at runtime and reported with a reason. An unavailable capability disables only that feature rather than making the whole host unsupported.
 
+## Doctor verdict
+
+The classification of a host observation by its effect on cluster viability. `FAIL` means this host cannot run clusters and is the only verdict that makes doctor exit non-zero; breakage of a capability that disables only one feature is at most `WARN`.
+
+## Subnet index
+
+The internal allocation slot that selects a cluster's fixed `172.30.<n>.0/24` from the shared `172.30.0.0/16` pool. It is assigned and retained with the cluster rather than requested by the user, so an existing cluster whose slot collides is a re-attachment problem, not a rejected user-facing subnet-index choice.
+
+## Ingress wildcard
+
+The catch-all below a cluster domain: every non-node name resolves to the cluster's ingress VIP, which talosbox's own end-state probe permanently holds. It proves the curated ingress path; it does not provide name-based access to attendee applications, whose own LoadBalancer addresses are reached by IP literal.
+
 ## Size-by-hand host
 
 A host substrate whose memory readings cannot be trusted for automatic management, so balloon and host-pressure features stand down permanently there and the user sizes resources manually. Declared per substrate, not detected: being size-by-hand is a property of the platform, not a capability gate.

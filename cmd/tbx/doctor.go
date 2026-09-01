@@ -24,6 +24,7 @@ import (
 	"github.com/randax/talos-box/internal/hypervisor"
 	"github.com/randax/talos-box/internal/shellquote"
 	"github.com/randax/talos-box/internal/version"
+	"github.com/randax/talos-box/internal/wsl"
 )
 
 type doctorDependencies struct {
@@ -59,20 +60,19 @@ type doctorDependencies struct {
 	hypervisors     func(context.Context) (hypervisor.Registry, error)
 	command         commandOutput
 	readFile        func(string) ([]byte, error)
+	wslIdentity     func() wsl.Identity
 	accessRW        func(string) error
 	listenPacket    func(string, string) (net.PacketConn, error)
 	listenStream    func(string, string) (io.Closer, error)
 	doHTTP          httpDo
 	// doVIPHTTP probes cluster VIPs. It is separate from doHTTP because those
 	// addresses are host-local and must never go through an HTTP proxy.
-	doVIPHTTP httpDo
-	platform  func() []doctorFinding
+	doVIPHTTP          httpDo
+	platformCheckNames func() []string
+	platform           func() []doctorFinding
 }
 
-// doctorHelp answers `tbx doctor --help`. It names every check the command can
-// report and states the exit-code contract, which is the fact a script needs
-// and used to live only in the platform docs (#419).
-func doctorHelp() string {
+func doctorHelpForPlatform(platformChecks []string) string {
 	var b strings.Builder
 	b.WriteString(`tbx doctor checks whether this host can run talos-box clusters, and whether the
 clusters that already exist are wired up. Every check is read-only: doctor
@@ -108,8 +108,16 @@ Checks:
                       extension, WARN when a content filter is active on a
                       memory-tagging host (the #513 kernel-panic exposure)
 `)
-	if names := platformDoctorCheckNames(); len(names) > 0 {
-		fmt.Fprintf(&b, "\nOn this platform doctor also checks: %s.\n", strings.Join(names, ", "))
+	for _, check := range platformChecks {
+		if check == "wsl" {
+			b.WriteString(`  wsl                 INFO-only WSL generation/version, distro, Windows build,
+                      networking mode, and NAT prefix
+`)
+			break
+		}
+	}
+	if len(platformChecks) > 0 {
+		fmt.Fprintf(&b, "\nOn this platform doctor also checks: %s.\n", strings.Join(platformChecks, ", "))
 	}
 	b.WriteString(`
 Exit code:
@@ -167,12 +175,20 @@ func (c cli) runDoctor(args []string) error {
 
 func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) error {
 	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help") {
-		_, err := fmt.Fprint(c.out, doctorHelp())
+		var platformChecks []string
+		if deps.platformCheckNames != nil {
+			platformChecks = deps.platformCheckNames()
+		}
+		_, err := fmt.Fprint(c.out, doctorHelpForPlatform(platformChecks))
 		return err
 	}
 	if len(args) != 0 {
 		return errors.New("usage: tbx doctor")
 	}
+	// Establish platform identity before any diagnostic consumes it. This is a
+	// no-op on platforms that do not register an identity provider; Linux
+	// registers a OnceValue shared by its platform checks and later consumers.
+	_ = doctorWSLIdentity(deps)
 	if deps.daemonInfo != nil {
 		// One daemon.info call feeds the balloon findings and the hypervisor
 		// inventory; its bound lives in doctorCall like every other diagnostic.
@@ -425,6 +441,13 @@ func (c cli) runDoctorWithDependencies(args []string, deps doctorDependencies) e
 		return errors.New("one or more doctor checks failed")
 	}
 	return nil
+}
+
+func doctorWSLIdentity(deps doctorDependencies) wsl.Identity {
+	if deps.wslIdentity == nil {
+		return wsl.Identity{}
+	}
+	return deps.wslIdentity()
 }
 
 func talosServicesFindings(statuses []daemon.ClusterStatus, statusErr, clusterErr error, now time.Time) []doctorFinding {
@@ -1014,6 +1037,7 @@ func (c cli) doctorDependencies() doctorDependencies {
 		doVIPHTTP: newDoctorVIPHTTPClient().Do,
 	}
 	platformDoctorDependencies(&deps)
+	deps.platformCheckNames = platformDoctorCheckNames
 	return deps
 }
 

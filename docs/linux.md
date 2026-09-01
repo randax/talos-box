@@ -225,6 +225,7 @@ configured bridge or running cluster report `SKIP` before one exists.
 |---|---|---|
 | `runtime-compat` | The client, daemon, and helper agree on their versioned protocols. The runtime block above the findings names each executable path, version, protocol, and PID when available | A mismatch is a `FAIL` and makes doctor exit non-zero. Run the exact absolute-path `system restart --force` command printed by doctor, or use the client matching the running components |
 | `installations` | The active daemon is the client's sibling and PATH does not contain multiple distinct `tbx` executables | `WARN` only: choose one installation and remove competing PATH entries |
+| `wsl` | On WSL only, INFO inventory of WSL generation/version, distro, Windows build, effective networking mode, and the Linux-observed WSL NAT prefix. The row is absent on bare Linux, and an unreadable Windows side remains INFO | No remediation and never a `WARN` or `FAIL`; use the fields to explain later WSL-specific capability findings |
 | `helper`, `helper-unit`, `helper-access` | The helper socket is enabled, reachable, and accessible to the current `tbx` group member | Enable `tbx-helper.socket`; add the user to `tbx`; then apply the group as `doctor` says: log out and back in, `loginctl terminate-user $USER` under a lingering session, or `wsl --shutdown` under WSL |
 | `helper-capabilities` | The helper has exactly `CAP_NET_ADMIN`, `CAP_NET_BIND_SERVICE`, and `CAP_NET_RAW` | Reinstall the current service unit and restart the helper |
 | `kvm` | `/dev/kvm` exists and is readable+writable | Enable KVM or add the user to the device's group |
@@ -247,6 +248,8 @@ configured bridge or running cluster report `SKIP` before one exists.
 
 `FAIL` makes `tbx doctor` exit non-zero. `WARN` identifies a degraded but usable configuration,
 such as QEMU 6.2 without suspend or a host without automatic systemd-resolved registration.
+The `wsl` inventory cannot change the exit code; mirrored-mode or future Windows-reach warnings
+belong to the capability check, not the inventory line.
 
 Host-memory readings are macOS-only for the same reason, so memory ballooning is inactive on
 Linux: `tbxd` records one `balloon: manager inactive: …` line in `tbx logs` at startup and never
