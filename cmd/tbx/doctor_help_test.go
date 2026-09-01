@@ -16,11 +16,13 @@ import (
 // contract — the command's most automation-relevant fact — documented only in
 // docs/macos.md (#419).
 func TestDoctorHelpDescribesChecksAndExitCodes(t *testing.T) {
+	platformNames := linuxPlatformNamesForHelp(wsl.NotWSL)
 	for _, flag := range []string{"-h", "--help"} {
 		t.Run(flag, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			command := cli{out: &stdout, err: &stderr}
-			if err := command.runDoctorWithDependencies([]string{flag}, doctorDependencies{}); err != nil {
+			deps := doctorDependencies{platformCheckNames: func() []string { return platformNames }}
+			if err := command.runDoctorWithDependencies([]string{flag}, deps); err != nil {
 				t.Fatalf("doctor %s = %v, want nil", flag, err)
 			}
 			help := stdout.String()
@@ -48,7 +50,7 @@ func TestDoctorHelpDescribesChecksAndExitCodes(t *testing.T) {
 					t.Errorf("doctor %s output missing %q:\n%s", flag, substring, help)
 				}
 			}
-			for _, name := range platformDoctorCheckNames() {
+			for _, name := range platformNames {
 				if !strings.Contains(help, name) {
 					t.Errorf("doctor %s output missing platform check %q:\n%s", flag, name, help)
 				}
@@ -82,7 +84,7 @@ func TestDoctorHelpNamesEveryCheckDoctorReports(t *testing.T) {
 	if err := command.runDoctorWithDependencies(nil, deps); err != nil {
 		t.Fatalf("doctor = %v, want nil with every probe unavailable", err)
 	}
-	help := doctorHelp()
+	help := doctorHelpForPlatform(linuxPlatformNamesForHelp(wsl.NotWSL))
 	seen := 0
 	for _, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
 		if strings.HasPrefix(line, "runtime:") || strings.HasPrefix(line, "  ") {

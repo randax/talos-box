@@ -229,12 +229,9 @@ func linuxPlatformDoctorFindings(
 	deps doctorDependencies,
 	helperCaps func() (helperCapabilityReport, error),
 ) []doctorFinding {
-	identity := wsl.Identity{}
-	if deps.wslIdentity != nil {
-		// Establish the WSL snapshot before any Linux capability probe. Every
-		// later consumer in this doctor run shares the same OnceValue (#553).
-		identity = deps.wslIdentity()
-	}
+	// Establish the WSL snapshot before any Linux capability probe. Every
+	// later consumer in this doctor run shares the same OnceValue (#553).
+	identity := doctorWSLIdentity(deps)
 	findings := []doctorFinding{
 		linuxKVMFinding(deps.accessRW, identity.KernelRelease),
 		linuxQEMUFinding(deps.command),

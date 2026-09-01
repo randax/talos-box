@@ -20,6 +20,12 @@ const (
 
 const notApplicable = "not applicable"
 
+var knownNonNATNetworkingModes = map[string]struct{}{
+	"bridged":     {},
+	"mirrored":    {},
+	"virtioproxy": {},
+}
+
 // Observation keeps an independently collected identity field and its
 // collection error. Callers render stable text instead of host-specific errors.
 type Observation struct {
@@ -113,7 +119,7 @@ func Detect(deps Detector) Identity {
 	switch {
 	case identity.Generation == WSL1:
 		identity.NATPrefix.Value = notApplicable
-	case identity.NetworkingMode.Err == nil && identity.NetworkingMode.Value != "nat":
+	case identity.NetworkingMode.Err == nil && knownNonNATNetworkingMode(identity.NetworkingMode.Value):
 		identity.NATPrefix.Value = notApplicable
 	case deps.NATPrefix == nil:
 		identity.NATPrefix.Err = errors.New("NAT prefix reader unavailable")
@@ -125,6 +131,11 @@ func Detect(deps Detector) Identity {
 		}
 	}
 	return identity
+}
+
+func knownNonNATNetworkingMode(mode string) bool {
+	_, ok := knownNonNATNetworkingModes[mode]
+	return ok
 }
 
 func commandObservation(command Command, name string, args ...string) Observation {

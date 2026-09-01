@@ -79,6 +79,98 @@ func TestLinuxPlatformDoctorIdentityIsCachedOncePerRun(t *testing.T) {
 	}
 }
 
+func TestPlatformDoctorDependenciesNativeLinuxSkipsWSLCommands(t *testing.T) {
+	t.Parallel()
+
+	deps, calls := platformRegistrationDependencies(t, "6.8.0-45-generic")
+	platformDoctorDependencies(&deps)
+	findings := deps.platform()
+	for _, finding := range findings {
+		if finding.check == "wsl" {
+			t.Fatalf("native Linux findings include WSL: %+v", findings)
+		}
+	}
+	for invocation := range calls {
+		if strings.HasPrefix(invocation, "wslinfo ") || strings.HasPrefix(invocation, "reg.exe ") {
+			t.Fatalf("native Linux invoked %q", invocation)
+		}
+	}
+}
+
+func TestPlatformDoctorDependenciesCachesWSLIdentity(t *testing.T) {
+	t.Parallel()
+
+	deps, calls := platformRegistrationDependencies(t, "5.15.167.4-microsoft-standard-WSL2")
+	platformDoctorDependencies(&deps)
+	findings := deps.platform()
+	_ = deps.wslIdentity()
+
+	wslFindings := 0
+	for _, finding := range findings {
+		if finding.check == "wsl" {
+			wslFindings++
+		}
+	}
+	if wslFindings != 1 {
+		t.Fatalf("WSL findings = %d, want 1: %+v", wslFindings, findings)
+	}
+	for _, invocation := range []string{
+		"wslinfo --version",
+		"wslinfo --networking-mode",
+		`reg.exe query HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion /v CurrentBuildNumber`,
+	} {
+		if calls[invocation] != 1 {
+			t.Errorf("%q calls = %d, want 1 (all calls: %v)", invocation, calls[invocation], calls)
+		}
+	}
+}
+
+func platformRegistrationDependencies(t *testing.T, osrelease string) (doctorDependencies, map[string]int) {
+	t.Helper()
+
+	isWSL := wsl.GenerationFromOSRelease(osrelease) != wsl.NotWSL
+	qemu, err := doctorQEMUSystemForArchitecture(runtime.GOARCH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := make(map[string]int)
+	command := func(name string, args ...string) ([]byte, error) {
+		invocation := strings.TrimSpace(name + " " + strings.Join(args, " "))
+		calls[invocation]++
+		switch invocation {
+		case "wslinfo --version":
+			if !isWSL {
+				t.Fatalf("unexpected command %q on native Linux", invocation)
+			}
+			return []byte("2.7.12"), nil
+		case "wslinfo --networking-mode":
+			if !isWSL {
+				t.Fatalf("unexpected command %q on native Linux", invocation)
+			}
+			return []byte("nat"), nil
+		case `reg.exe query HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion /v CurrentBuildNumber`:
+			if !isWSL {
+				t.Fatalf("unexpected command %q on native Linux", invocation)
+			}
+			return []byte("CurrentBuildNumber    REG_SZ    26100\n"), nil
+		case qemu.binary + " --version", "ip -o route show default", "systemctl is-enabled tbx-helper.socket", "id -Gn":
+			return nil, errors.New("probe unavailable")
+		default:
+			t.Fatalf("unexpected command %q", invocation)
+			return nil, nil
+		}
+	}
+	deps := linuxPlatformFindingDependencies()
+	deps.command = command
+	deps.readFile = func(path string) ([]byte, error) {
+		if path == doctorOSReleaseFile {
+			return []byte(osrelease), nil
+		}
+		return nil, os.ErrNotExist
+	}
+	return deps, calls
+}
+
 func TestLinuxPlatformDoctorCheckNamesAreRuntimeConditional(t *testing.T) {
 	t.Parallel()
 

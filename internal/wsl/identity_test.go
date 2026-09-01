@@ -61,10 +61,7 @@ func TestDetectNativeLinuxStopsBeforeWSLAndWindowsProbes(t *testing.T) {
 			fail("NATPrefix")
 			return "", nil
 		},
-		Windows: windowsInteropFunc(func() (string, error) {
-			fail("WindowsInterop")
-			return "", nil
-		}),
+		Windows: windows,
 	})
 	if identity.Generation != NotWSL || identity.IsWSL() || identity.IsWSL2() {
 		t.Fatalf("identity = %+v, want native Linux", identity)
@@ -226,6 +223,26 @@ func TestDetectMirroredModeDoesNotLabelTheInterfacePrefixAsNAT(t *testing.T) {
 	}
 }
 
-type windowsInteropFunc func() (string, error)
+func TestDetectUnknownNetworkingModeStillAttemptsNATPrefix(t *testing.T) {
+	t.Parallel()
 
-func (f windowsInteropFunc) WindowsBuild() (string, error) { return f() }
+	natCalled := false
+	identity := Detect(Detector{
+		ReadFile: func(string) ([]byte, error) { return []byte("5.15.167.4-microsoft-standard-WSL2"), nil },
+		Command: func(_ string, args ...string) ([]byte, error) {
+			if args[0] == "--version" {
+				return []byte("2.7.12"), nil
+			}
+			return []byte("future-mode"), nil
+		},
+		LookupEnv: func(string) (string, bool) { return "Ubuntu-24.04", true },
+		NATPrefix: func() (string, error) {
+			natCalled = true
+			return "", errors.New("route unavailable")
+		},
+		Windows: &stubWindowsInterop{build: "26100"},
+	})
+	if !natCalled || identity.NATPrefix.Err == nil || identity.NATPrefix.Value == notApplicable {
+		t.Fatalf("NAT prefix = %+v, called = %v; want attempted unreadable observation", identity.NATPrefix, natCalled)
+	}
+}

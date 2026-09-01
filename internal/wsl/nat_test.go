@@ -10,6 +10,8 @@ func TestNATPrefixUsesTheLowestMetricDefaultRouteInterface(t *testing.T) {
 	t.Parallel()
 
 	routes := []byte("Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n" +
+		"eth2\t010013AC\t010013AC\t0003\t0\t0\t1\t00000000\t0\t0\t0\n" +
+		"eth3\t00000000\t010013AC\t0003\t0\t0\t2\tF0FFFFFF\t0\t0\t0\n" +
 		"eth1\t00000000\t010013AC\t0003\t0\t0\t200\t00000000\t0\t0\t0\n" +
 		"eth0\t00000000\t010013AC\t0003\t0\t0\t100\t00000000\t0\t0\t0\n")
 	got, err := natPrefixFrom(
@@ -31,6 +33,26 @@ func TestNATPrefixUsesTheLowestMetricDefaultRouteInterface(t *testing.T) {
 	}
 	if got != "172.19.144.0/20" {
 		t.Fatalf("prefix = %q, want 172.19.144.0/20", got)
+	}
+}
+
+func TestLinuxRouteIPv4DecodesLittleEndianValues(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		value string
+		want  string
+	}{
+		{value: "010013AC", want: "172.19.0.1"},
+		{value: "F0FFFFFF", want: "255.255.255.240"},
+	}
+	for _, tt := range tests {
+		if got, err := linuxRouteIPv4(tt.value); err != nil || got.String() != tt.want {
+			t.Errorf("linuxRouteIPv4(%q) = %v, %v; want %s", tt.value, got, err, tt.want)
+		}
+	}
+	if _, err := linuxRouteIPv4("00E0FF"); err == nil {
+		t.Fatal("linuxRouteIPv4(short value) = nil error, want length error")
 	}
 }
 
