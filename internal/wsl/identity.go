@@ -23,6 +23,7 @@ const notApplicable = "not applicable"
 var knownNonNATNetworkingModes = map[string]struct{}{
 	"bridged":     {},
 	"mirrored":    {},
+	"none":        {},
 	"virtioproxy": {},
 }
 

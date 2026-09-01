@@ -64,6 +64,8 @@ type helperCapabilityReport struct {
 	EffectiveNames []string
 }
 
+var linuxHelperCapabilityReport = helperCapabilityReportFromHelper
+
 func (v doctorQEMUVersion) compare(other doctorQEMUVersion) int {
 	switch {
 	case v.major != other.major:
@@ -125,7 +127,7 @@ func platformDoctorDependencies(deps *doctorDependencies) {
 		deps.wslIdentity = sync.OnceValue(func() wsl.Identity { return wsl.Detect(detector) })
 	}
 	deps.platform = func() []doctorFinding {
-		return linuxPlatformDoctorFindings(*deps, helperCapabilityReportFromHelper)
+		return linuxPlatformDoctorFindings(*deps, linuxHelperCapabilityReport)
 	}
 }
 

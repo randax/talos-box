@@ -199,27 +199,33 @@ func TestDetectWSL1DoesNotInventANATPrefix(t *testing.T) {
 	}
 }
 
-func TestDetectMirroredModeDoesNotLabelTheInterfacePrefixAsNAT(t *testing.T) {
+func TestDetectKnownNonNATModesDoNotLabelTheInterfacePrefixAsNAT(t *testing.T) {
 	t.Parallel()
 
-	natCalled := false
-	identity := Detect(Detector{
-		ReadFile: func(string) ([]byte, error) { return []byte("5.15.167.4-microsoft-standard-WSL2"), nil },
-		Command: func(_ string, args ...string) ([]byte, error) {
-			if args[0] == "--version" {
-				return []byte("2.7.12"), nil
+	for _, mode := range []string{"bridged", "mirrored", "virtioproxy", "none"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+
+			natCalled := false
+			identity := Detect(Detector{
+				ReadFile: func(string) ([]byte, error) { return []byte("5.15.167.4-microsoft-standard-WSL2"), nil },
+				Command: func(_ string, args ...string) ([]byte, error) {
+					if args[0] == "--version" {
+						return []byte("2.7.12"), nil
+					}
+					return []byte(mode), nil
+				},
+				LookupEnv: func(string) (string, bool) { return "Ubuntu-24.04", true },
+				NATPrefix: func() (string, error) { natCalled = true; return "", nil },
+				Windows:   &stubWindowsInterop{build: "26100"},
+			})
+			if identity.NATPrefix.Value != notApplicable || identity.NATPrefix.Err != nil {
+				t.Fatalf("NAT prefix = %+v, want not applicable", identity.NATPrefix)
 			}
-			return []byte("mirrored"), nil
-		},
-		LookupEnv: func(string) (string, bool) { return "Ubuntu-24.04", true },
-		NATPrefix: func() (string, error) { natCalled = true; return "", nil },
-		Windows:   &stubWindowsInterop{build: "26100"},
-	})
-	if identity.NATPrefix.Value != notApplicable || identity.NATPrefix.Err != nil {
-		t.Fatalf("NAT prefix = %+v, want not applicable", identity.NATPrefix)
-	}
-	if natCalled {
-		t.Fatal("NAT prefix reader called for mirrored mode")
+			if natCalled {
+				t.Fatalf("NAT prefix reader called for %s mode", mode)
+			}
+		})
 	}
 }
 
