@@ -14,11 +14,13 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/daemon"
 	tbxdns "github.com/randax/talos-box/internal/dns"
 	"github.com/randax/talos-box/internal/helper"
+	"github.com/randax/talos-box/internal/wsl"
 )
 
 const (
@@ -90,11 +92,19 @@ func doctorCompareInt(left, right int) int {
 // linuxPlatformDoctorFindings runs them, so `tbx doctor --help` lists exactly
 // what this platform reports (#419).
 func platformDoctorCheckNames() []string {
-	return []string{
+	return linuxPlatformDoctorCheckNames(wsl.GenerationFromOSRelease(doctorOSRelease(os.ReadFile)))
+}
+
+func linuxPlatformDoctorCheckNames(generation wsl.Generation) []string {
+	names := []string{
 		"kvm", "qemu", "bridge-netfilter", "bridge-stp", "rp-filter",
 		"port-53", "port-67", "port-179",
 		"helper-unit", "helper-access", "helper-capabilities",
 	}
+	if generation == wsl.NotWSL {
+		return names
+	}
+	return append([]string{"wsl"}, names...)
 }
 
 func platformDoctorDependencies(deps *doctorDependencies) {
@@ -109,6 +119,10 @@ func platformDoctorDependencies(deps *doctorDependencies) {
 	}
 	deps.checkDirectDNS = func() error {
 		return checkLinuxDirectDNS(runningClusters, deps.readFile, tbxdns.Probe)
+	}
+	if deps.wslIdentity == nil {
+		detector := wsl.SystemDetector(wsl.ReadFile(deps.readFile), wsl.Command(deps.command))
+		deps.wslIdentity = sync.OnceValue(func() wsl.Identity { return wsl.Detect(detector) })
 	}
 	deps.platform = func() []doctorFinding {
 		return linuxPlatformDoctorFindings(*deps, helperCapabilityReportFromHelper)
@@ -215,8 +229,14 @@ func linuxPlatformDoctorFindings(
 	deps doctorDependencies,
 	helperCaps func() (helperCapabilityReport, error),
 ) []doctorFinding {
+	identity := wsl.Identity{}
+	if deps.wslIdentity != nil {
+		// Establish the WSL snapshot before any Linux capability probe. Every
+		// later consumer in this doctor run shares the same OnceValue (#553).
+		identity = deps.wslIdentity()
+	}
 	findings := []doctorFinding{
-		linuxKVMFinding(deps.accessRW, doctorOSRelease(deps.readFile)),
+		linuxKVMFinding(deps.accessRW, identity.KernelRelease),
 		linuxQEMUFinding(deps.command),
 		linuxBridgeNetfilterFinding(deps.readFile, deps.command),
 		linuxBridgeSTPFinding(deps.listConfig, deps.readFile),
@@ -225,8 +245,11 @@ func linuxPlatformDoctorFindings(
 		linuxPortFinding(67, "udp", deps.listConfig, deps.readFile, deps.command, deps.listenPacket, deps.listenStream),
 		linuxPortFinding(179, "tcp", deps.listConfig, deps.readFile, deps.command, deps.listenPacket, deps.listenStream),
 		linuxHelperUnitFinding(deps.command),
-		linuxHelperAccessFinding(deps.command, doctorOSRelease(deps.readFile)),
+		linuxHelperAccessFinding(deps.command, identity.KernelRelease),
 		linuxHelperCapabilitiesFinding(helperCaps),
+	}
+	if finding, ok := wslDoctorFinding(identity); ok {
+		findings = append([]doctorFinding{finding}, findings...)
 	}
 	return findings
 }

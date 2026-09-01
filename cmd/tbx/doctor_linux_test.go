@@ -7,15 +7,201 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/randax/talos-box/internal/cluster"
 	"github.com/randax/talos-box/internal/daemon"
+	"github.com/randax/talos-box/internal/hostpressure"
+	"github.com/randax/talos-box/internal/wsl"
 )
+
+func TestLinuxPlatformDoctorFindingsPrependsWSLWhenDetected(t *testing.T) {
+	t.Parallel()
+
+	windows := &countingWindowsInterop{build: "26100"}
+	detector := stubWSLDetector(t, "5.15.167.4-microsoft-standard-WSL2", windows)
+	deps := linuxPlatformFindingDependencies()
+	deps.wslIdentity = sync.OnceValue(func() wsl.Identity { return wsl.Detect(detector) })
+	findings := linuxPlatformDoctorFindings(deps, func() (helperCapabilityReport, error) {
+		return helperCapabilityReport{}, errors.New("unavailable")
+	})
+	want := append([]string{"wsl"}, linuxPlatformDoctorCheckNames(wsl.NotWSL)...)
+	if got := findingNames(findings); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("finding order = %v, want %v", got, want)
+	}
+	if findings[0].level != "INFO" || windows.calls != 1 {
+		t.Fatalf("first finding = %+v, Windows calls = %d", findings[0], windows.calls)
+	}
+}
+
+func TestLinuxPlatformDoctorFindingsOmitWSLOnNativeLinux(t *testing.T) {
+	t.Parallel()
+
+	windows := &countingWindowsInterop{build: "26100"}
+	detector := stubWSLDetector(t, "6.8.0-45-generic", windows)
+	deps := linuxPlatformFindingDependencies()
+	deps.wslIdentity = sync.OnceValue(func() wsl.Identity { return wsl.Detect(detector) })
+	findings := linuxPlatformDoctorFindings(deps, func() (helperCapabilityReport, error) {
+		return helperCapabilityReport{}, errors.New("unavailable")
+	})
+	want := linuxPlatformDoctorCheckNames(wsl.NotWSL)
+	if got := findingNames(findings); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("finding order = %v, want %v", got, want)
+	}
+	if windows.calls != 0 {
+		t.Fatalf("Windows calls = %d, want 0", windows.calls)
+	}
+}
+
+func TestLinuxPlatformDoctorIdentityIsCachedOncePerRun(t *testing.T) {
+	t.Parallel()
+
+	windows := &countingWindowsInterop{build: "26100"}
+	detector := stubWSLDetector(t, "5.15.167.4-microsoft-standard-WSL2", windows)
+	detections := 0
+	deps := linuxPlatformFindingDependencies()
+	deps.wslIdentity = sync.OnceValue(func() wsl.Identity {
+		detections++
+		return wsl.Detect(detector)
+	})
+	linuxPlatformDoctorFindings(deps, func() (helperCapabilityReport, error) {
+		return helperCapabilityReport{}, errors.New("unavailable")
+	})
+	_ = deps.wslIdentity()
+	if detections != 1 || windows.calls != 1 {
+		t.Fatalf("detections = %d, Windows calls = %d; want 1 each", detections, windows.calls)
+	}
+}
+
+func TestLinuxPlatformDoctorCheckNamesAreRuntimeConditional(t *testing.T) {
+	t.Parallel()
+
+	wantNative := []string{
+		"kvm", "qemu", "bridge-netfilter", "bridge-stp", "rp-filter",
+		"port-53", "port-67", "port-179", "helper-unit", "helper-access", "helper-capabilities",
+	}
+	if got := linuxPlatformDoctorCheckNames(wsl.NotWSL); fmt.Sprint(got) != fmt.Sprint(wantNative) {
+		t.Fatalf("native names = %v, want %v", got, wantNative)
+	}
+	for _, generation := range []wsl.Generation{wsl.WSL1, wsl.WSL2} {
+		names := linuxPlatformDoctorCheckNames(generation)
+		if len(names) != len(wantNative)+1 || names[0] != "wsl" {
+			t.Fatalf("generation %v names = %v", generation, names)
+		}
+		seen := 0
+		for _, name := range names {
+			if name == "wsl" {
+				seen++
+			}
+		}
+		if seen != 1 {
+			t.Fatalf("generation %v names contain wsl %d times", generation, seen)
+		}
+	}
+}
+
+func TestRunDoctorEmitsOneWSLInfoLineAndKeepsExitZero(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		identity wsl.Identity
+		want     string
+	}{
+		{name: "full", identity: completeWSLIdentity(), want: "INFO wsl: WSL2 2.7.12; distro Ubuntu-24.04; Windows build 26100; networking mode nat; NAT prefix 172.19.144.0/20"},
+		{name: "interop unreadable", identity: func() wsl.Identity {
+			identity := completeWSLIdentity()
+			identity.WindowsBuild = wsl.Observation{Err: errors.New("interop disabled")}
+			return identity
+		}(), want: "INFO wsl: WSL2 2.7.12; distro Ubuntu-24.04; Windows side unreadable; networking mode nat; NAT prefix 172.19.144.0/20"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			deps := linuxPassingDoctorDependencies()
+			deps.platform = func() []doctorFinding {
+				finding, _ := wslDoctorFinding(tt.identity)
+				return []doctorFinding{finding}
+			}
+			var output strings.Builder
+			if err := (cli{out: &output}).runDoctorWithDependencies(nil, deps); err != nil {
+				t.Fatalf("doctor = %v, WSL inventory must not affect exit status", err)
+			}
+			if count := strings.Count(output.String(), tt.want); count != 1 {
+				t.Fatalf("WSL line count = %d, want 1:\n%s", count, output.String())
+			}
+		})
+	}
+}
+
+type countingWindowsInterop struct {
+	build string
+	calls int
+}
+
+func (w *countingWindowsInterop) WindowsBuild() (string, error) {
+	w.calls++
+	return w.build, nil
+}
+
+func stubWSLDetector(t *testing.T, release string, windows wsl.WindowsInterop) wsl.Detector {
+	t.Helper()
+	return wsl.Detector{
+		ReadFile: func(string) ([]byte, error) { return []byte(release), nil },
+		Command: func(_ string, args ...string) ([]byte, error) {
+			if args[0] == "--version" {
+				return []byte("2.7.12"), nil
+			}
+			return []byte("nat"), nil
+		},
+		LookupEnv: func(string) (string, bool) { return "Ubuntu-24.04", true },
+		NATPrefix: func() (string, error) { return "172.19.144.0/20", nil },
+		Windows:   windows,
+	}
+}
+
+func linuxPlatformFindingDependencies() doctorDependencies {
+	unavailable := errors.New("unavailable")
+	return doctorDependencies{
+		accessRW:     func(string) error { return unavailable },
+		command:      func(string, ...string) ([]byte, error) { return nil, unavailable },
+		readFile:     func(string) ([]byte, error) { return nil, unavailable },
+		listConfig:   func() ([]cluster.Cluster, error) { return nil, nil },
+		listenPacket: func(string, string) (net.PacketConn, error) { return nil, unavailable },
+		listenStream: func(string, string) (io.Closer, error) { return nil, unavailable },
+	}
+}
+
+func findingNames(findings []doctorFinding) []string {
+	names := make([]string, 0, len(findings))
+	for _, finding := range findings {
+		names = append(names, finding.check)
+	}
+	return names
+}
+
+func linuxPassingDoctorDependencies() doctorDependencies {
+	pass := func() error { return nil }
+	return doctorDependencies{
+		checkHelper:     pass,
+		checkResolver:   pass,
+		checkDirectDNS:  pass,
+		checkForwarding: pass,
+		listClusters:    func() ([]daemon.ClusterSummary, error) { return nil, nil },
+		listConfig:      func() ([]cluster.Cluster, error) { return nil, nil },
+		getStatus:       func() ([]daemon.ClusterStatus, error) { return nil, nil },
+		listCache:       func() (daemon.CacheListResult, error) { return daemon.CacheListResult{}, nil },
+		hostPressure:    func() (hostpressure.Snapshot, error) { return hostpressure.Snapshot{}, nil },
+		command:         func(string, ...string) ([]byte, error) { return nil, nil },
+		doHTTP:          func(*http.Request) (*http.Response, error) { return &http.Response{Body: http.NoBody}, nil },
+	}
+}
 
 func TestLinuxSystemDNSUsesResolvedAndGetent(t *testing.T) {
 	t.Parallel()

@@ -24,6 +24,7 @@ import (
 	"github.com/randax/talos-box/internal/hypervisor"
 	"github.com/randax/talos-box/internal/shellquote"
 	"github.com/randax/talos-box/internal/version"
+	"github.com/randax/talos-box/internal/wsl"
 )
 
 type doctorDependencies struct {
@@ -59,6 +60,7 @@ type doctorDependencies struct {
 	hypervisors     func(context.Context) (hypervisor.Registry, error)
 	command         commandOutput
 	readFile        func(string) ([]byte, error)
+	wslIdentity     func() wsl.Identity
 	accessRW        func(string) error
 	listenPacket    func(string, string) (net.PacketConn, error)
 	listenStream    func(string, string) (io.Closer, error)
@@ -73,6 +75,10 @@ type doctorDependencies struct {
 // report and states the exit-code contract, which is the fact a script needs
 // and used to live only in the platform docs (#419).
 func doctorHelp() string {
+	return doctorHelpForPlatform(platformDoctorCheckNames())
+}
+
+func doctorHelpForPlatform(platformChecks []string) string {
 	var b strings.Builder
 	b.WriteString(`tbx doctor checks whether this host can run talos-box clusters, and whether the
 clusters that already exist are wired up. Every check is read-only: doctor
@@ -108,8 +114,16 @@ Checks:
                       extension, WARN when a content filter is active on a
                       memory-tagging host (the #513 kernel-panic exposure)
 `)
-	if names := platformDoctorCheckNames(); len(names) > 0 {
-		fmt.Fprintf(&b, "\nOn this platform doctor also checks: %s.\n", strings.Join(names, ", "))
+	for _, check := range platformChecks {
+		if check == "wsl" {
+			b.WriteString(`  wsl                 INFO-only WSL generation/version, distro, Windows build,
+                      networking mode, and NAT prefix
+`)
+			break
+		}
+	}
+	if len(platformChecks) > 0 {
+		fmt.Fprintf(&b, "\nOn this platform doctor also checks: %s.\n", strings.Join(platformChecks, ", "))
 	}
 	b.WriteString(`
 Exit code:
