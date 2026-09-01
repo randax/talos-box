@@ -20,11 +20,18 @@ const (
 
 const notApplicable = "not applicable"
 
+// knownNonNATNetworkingModes holds every mode string wslinfo can emit besides
+// nat (per Microsoft's wslinfo.cpp: bridged, mirrored, consomme, none, wsl1)
+// plus virtioproxy, Consomme's .wslconfig spelling, in case an older build
+// echoes the config value. An unknown future mode is not proof NAT is
+// inapplicable, so it still attempts the Linux-side prefix derivation.
 var knownNonNATNetworkingModes = map[string]struct{}{
 	"bridged":     {},
+	"consomme":    {},
 	"mirrored":    {},
 	"none":        {},
 	"virtioproxy": {},
+	"wsl1":        {},
 }
 
 // Observation keeps an independently collected identity field and its

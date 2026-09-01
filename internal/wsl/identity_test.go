@@ -202,7 +202,7 @@ func TestDetectWSL1DoesNotInventANATPrefix(t *testing.T) {
 func TestDetectKnownNonNATModesDoNotLabelTheInterfacePrefixAsNAT(t *testing.T) {
 	t.Parallel()
 
-	for _, mode := range []string{"bridged", "mirrored", "virtioproxy", "none"} {
+	for _, mode := range []string{"bridged", "consomme", "mirrored", "none", "virtioproxy", "wsl1"} {
 		t.Run(mode, func(t *testing.T) {
 			t.Parallel()
 
