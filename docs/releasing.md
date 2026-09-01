@@ -49,9 +49,9 @@ needs the entitlement, so a local build for use goes through `make build`.
    ```
 
 3. The tag triggers two things at once:
-   - **Depot CI `Floor e2e`** — the floor-version KVM e2e against the oldest
-     supported Talos (`TBX_E2E_TALOS_VERSION` in
-     `.depot/workflows/floor-e2e.yml`). This is the release gate.
+   - **GitHub Actions `Floor e2e`** — the floor-version KVM e2e against the
+     oldest supported Talos (`TBX_E2E_TALOS_VERSION` in
+     `.github/workflows/floor-e2e.yml`). This is the release gate.
    - **GitHub Actions `Release`** — its `gate` job refuses a tag that disagrees
      with `VERSION`, then waits (up to 60 minutes) for the floor lane's check
      run to pass. A red floor blocks the release by construction.

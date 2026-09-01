@@ -1,9 +1,5 @@
 name: CI
 
-# Only the lanes Depot CI cannot serve stay on GitHub Actions: macOS (no
-# sandboxes) and arm64 (x86_64 only). Everything else lives in
-# .depot/workflows/, and fork PRs — which Depot CI does not run — get their
-# Linux coverage from the arm64 job here.
 on:
   push:
     branches: [main]
@@ -11,6 +7,29 @@ on:
     branches: [main]
 
 jobs:
+  linux-amd64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26"
+          cache: true
+      - run: go build ./...
+      - name: lint
+        uses: golangci/golangci-lint-action@4afd733a84b1f43292c63897423277bb7f4313a9 # v8
+        with:
+          version: v2.12
+      - run: make test
+
+  nix:
+    name: Nix flake check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: DeterminateSystems/nix-installer-action@786fff0690178f1234e4e1fe9b536e94f5433196 # v20
+      - run: nix flake check "$GITHUB_WORKSPACE"
+
   build:
     runs-on: macos-15
     steps:

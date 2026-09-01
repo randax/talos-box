@@ -5,9 +5,8 @@ set -Eeuo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 workflow="$root/.github/workflows/ci.yml"
-depot_ci="$root/.depot/workflows/ci.yml"
-depot_e2e="$root/.depot/workflows/e2e.yml"
-depot_floor="$root/.depot/workflows/floor-e2e.yml"
+e2e_workflow="$root/.github/workflows/e2e.yml"
+floor_workflow="$root/.github/workflows/floor-e2e.yml"
 harness="$root/scripts/ci/linux-kvm-e2e.sh"
 storage_harness="$root/scripts/ci/linux-kvm-storage-e2e.sh"
 systemd_harness="$root/scripts/qa/linux-systemd-packaging-e2e.sh"
@@ -22,31 +21,27 @@ require() {
   fi
 }
 
-# GitHub Actions keeps only the lanes Depot CI cannot serve.
+# Fast lanes: every platform builds, lints, and tests on GitHub-hosted runners.
 require 'macos-15' "$workflow"
 require 'ubuntu-24.04-arm' "$workflow"
-
-# Fast lanes live in the Depot CI workflow.
-require 'depot-ubuntu-24.04-8' "$depot_ci"
-require 'depot-ubuntu-24.04-4' "$depot_ci"
-require 'nix flake check' "$depot_ci"
-require 'depot/cache-mount' "$depot_ci"
+require 'runs-on: ubuntu-24.04' "$workflow"
+require 'nix flake check' "$workflow"
 
 # KVM e2e lanes: merge-gating substrate + storage on PRs and main.
-require 'kvm-substrate' "$depot_e2e"
-require 'kvm-storage' "$depot_e2e"
-require 'scripts/ci/linux-kvm-e2e.sh' "$depot_e2e"
-require 'scripts/ci/linux-kvm-storage-e2e.sh' "$depot_e2e"
-require 'qemu-system-x86' "$depot_e2e"
-require 'socat nfs-ganesha nfs-ganesha-vfs rpcbind' "$depot_e2e"
+require 'kvm-substrate' "$e2e_workflow"
+require 'kvm-storage' "$e2e_workflow"
+require 'scripts/ci/linux-kvm-e2e.sh' "$e2e_workflow"
+require 'scripts/ci/linux-kvm-storage-e2e.sh' "$e2e_workflow"
+require 'qemu-system-x86' "$e2e_workflow"
+require 'socat nfs-ganesha nfs-ganesha-vfs rpcbind' "$e2e_workflow"
 
 # Floor lane is release-gating: version tags and manual dispatch only.
-require 'tags: ["v*"]' "$depot_floor"
-require 'workflow_dispatch' "$depot_floor"
-require 'TBX_E2E_TALOS_VERSION: v1.12.0' "$depot_floor"
-require 'scripts/ci/linux-kvm-e2e.sh' "$depot_floor"
+require 'tags: ["v*"]' "$floor_workflow"
+require 'workflow_dispatch' "$floor_workflow"
+require 'TBX_E2E_TALOS_VERSION: v1.12.0' "$floor_workflow"
+require 'scripts/ci/linux-kvm-e2e.sh' "$floor_workflow"
 
-for kvm_workflow in "$depot_e2e" "$depot_floor"; do
+for kvm_workflow in "$e2e_workflow" "$floor_workflow"; do
   require 'test -w /dev/kvm' "$kvm_workflow"
   require "sudo iptables -C FORWARD -i 'br-tbx+' -j ACCEPT" "$kvm_workflow"
   require "sudo iptables -I FORWARD 1 -i 'br-tbx+' -j ACCEPT" "$kvm_workflow"
@@ -238,11 +233,11 @@ require 'dump_failure_diagnostics() (' "$systemd_harness"
 require 'journalctl -u tbx-helper.socket -u tbx-helper.service' "$systemd_harness"
 require 'journalctl --user -u tbxd.socket -u tbxd.service' "$systemd_harness"
 
-for kvm_workflow in "$depot_e2e" "$depot_floor"; do
-  if grep -Eq -- 'setfacl| acl|udev' "$kvm_workflow"; then
-    printf '/dev/kvm is writable out of the box in CI sandboxes; no ACL or udev setup allowed in %s\n' "$kvm_workflow" >&2
-    exit 1
-  fi
+# GitHub-hosted runners expose /dev/kvm root-only; each KVM lane must open it
+# up before gating on writability.
+for kvm_workflow in "$e2e_workflow" "$floor_workflow"; do
+  require '/etc/udev/rules.d/99-kvm4all.rules' "$kvm_workflow"
+  require 'sudo udevadm trigger --name-match=kvm' "$kvm_workflow"
 done
 if grep -Fq -- 'systemctl' "$harness" || grep -Fq -- 'systemctl' "$storage_harness"; then
   printf 'e2e harnesses must stay init-agnostic: CI sandboxes have no systemd\n' >&2
@@ -261,7 +256,7 @@ if grep -Fq -- 'talosctl' "$storage_harness"; then
   exit 1
 fi
 release_workflow="$root/.github/workflows/release.yml"
-for pinned_workflow in "$workflow" "$release_workflow" "$depot_ci" "$depot_e2e" "$depot_floor"; do
+for pinned_workflow in "$workflow" "$release_workflow" "$e2e_workflow" "$floor_workflow"; do
   if grep -Eq 'uses: [^[:space:]]+@v[0-9]' "$pinned_workflow"; then
     printf 'CI workflows must pin actions to immutable commit SHAs (%s)\n' "$pinned_workflow" >&2
     exit 1

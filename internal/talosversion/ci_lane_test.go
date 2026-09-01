@@ -27,7 +27,7 @@ func TestCILanesCoverTheSupportedVersionWindow(t *testing.T) {
 		},
 		{
 			name:    "workflow",
-			path:    "../../.depot/workflows/floor-e2e.yml",
+			path:    "../../.github/workflows/floor-e2e.yml",
 			needles: []string{"TBX_E2E_TALOS_VERSION: " + Min},
 		},
 	}

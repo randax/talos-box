@@ -1,8 +1,8 @@
 name: Release
 
 # Releases are cut from v* tags and gated on the floor-version e2e that the
-# same tag triggers on Depot CI: a broken support-window floor stops the
-# release by construction. workflow_dispatch exists to rehearse the publish
+# same tag triggers (.github/workflows/floor-e2e.yml): a broken support-window
+# floor stops the release by construction. workflow_dispatch exists to rehearse the publish
 # path against an existing tag; its gate bypass is for rehearsals only.
 on:
   push:
@@ -43,11 +43,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Depot CI reports the floor lane as a check run named
-          # "Floor e2e / KVM floor-version e2e" on the tag's commit.
+          # GitHub Actions reports the floor lane as a check run named after
+          # the job, "KVM floor-version e2e", on the tag's commit.
           for attempt in $(seq 1 60); do
             state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs" \
-              --jq '[.check_runs[] | select(.name == "Floor e2e / KVM floor-version e2e")] | first | "\(.status) \(.conclusion)"' 2>/dev/null || echo "absent")
+              --jq '[.check_runs[] | select(.name == "KVM floor-version e2e")] | first | "\(.status) \(.conclusion)"' 2>/dev/null || echo "absent")
             echo "attempt $attempt: $state"
             case "$state" in
               "completed success") exit 0 ;;
